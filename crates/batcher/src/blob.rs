@@ -24,13 +24,16 @@ use crate::error::BatcherError;
 const USABLE_BYTES_PER_FIELD: usize = FIELD_ELEMENT_BYTES_USIZE - 1; // 31
 
 /// Total bytes one blob carries under the 31-byte-per-field scheme: 4096
-/// field elements times 31 bytes each equals 126_976.
+/// field elements times 31 bytes each equals `126_976`.
 pub const USABLE_BYTES_PER_BLOB: usize =
     (BYTES_PER_BLOB / FIELD_ELEMENT_BYTES_USIZE) * USABLE_BYTES_PER_FIELD;
 
 const LENGTH_HEADER_BYTES: usize = 4;
 
 /// Pack `payload` into one or more `Blob`s using the 31-byte safe encoding.
+///
+/// # Errors
+/// Returns an error when `payload`'s length overflows `u32`.
 pub fn pack_to_blobs(payload: &[u8]) -> Result<Vec<Blob>, BatcherError> {
     let len_u32: u32 = payload
         .len()
@@ -48,19 +51,18 @@ pub fn pack_to_blobs(payload: &[u8]) -> Result<Vec<Blob>, BatcherError> {
         return Ok(vec![blob]);
     }
 
-    let mut blobs = Vec::new();
-    let mut offset = 0;
-    while offset < prefixed.len() {
-        let end = (offset + USABLE_BYTES_PER_BLOB).min(prefixed.len());
-        let chunk = &prefixed[offset..end];
-        blobs.push(encode_one_blob(chunk));
-        offset = end;
-    }
-    Ok(blobs)
+    Ok(prefixed
+        .chunks(USABLE_BYTES_PER_BLOB)
+        .map(encode_one_blob)
+        .collect())
 }
 
 /// Inverse of [`pack_to_blobs`]. Returns the original payload bytes, stripped
 /// of the length prefix and trailing zero padding.
+///
+/// # Errors
+/// Returns an error when `blobs` is empty, or when the decoded length
+/// header is missing or declares more bytes than the blobs carry.
 pub fn unpack_from_blobs(blobs: &[Blob]) -> Result<Vec<u8>, BatcherError> {
     if blobs.is_empty() {
         return Err(BatcherError::Blob("no blobs to unpack".into()));
@@ -86,30 +88,41 @@ pub fn unpack_from_blobs(blobs: &[Blob]) -> Result<Vec<u8>, BatcherError> {
 
 /// Encode up to `USABLE_BYTES_PER_BLOB` bytes into one blob (zero-padded).
 fn encode_one_blob(chunk: &[u8]) -> Blob {
-    debug_assert!(chunk.len() <= USABLE_BYTES_PER_BLOB);
+    // `chunk.len() <= USABLE_BYTES_PER_BLOB` always holds: the only two
+    // callers are `pack_to_blobs`'s `.chunks(USABLE_BYTES_PER_BLOB)` (which
+    // bounds every element by construction) and the empty-payload branch,
+    // which passes the 4-byte header alone.
+    //
+    // A blob is always exactly BYTES_PER_BLOB (128 KiB) by the EIP-4844
+    // wire format; `Blob::new` needs it by value.
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "inherent to the EIP-4844 Blob type, not avoidable padding"
+    )]
     let mut blob_bytes = [0u8; BYTES_PER_BLOB];
-    let mut field_idx = 0;
-    let mut src = 0;
-    while src < chunk.len() {
-        let take = (chunk.len() - src).min(USABLE_BYTES_PER_FIELD);
-        let dst = field_idx * FIELD_ELEMENT_BYTES_USIZE;
-        // dst[0] stays zero (the high byte). The loop writes into dst[1..1+take].
-        blob_bytes[dst + 1..dst + 1 + take].copy_from_slice(&chunk[src..src + take]);
-        src += take;
-        field_idx += 1;
-    }
+    // Each field element's byte 0 stays zero (the high byte); a field
+    // writes into bytes [1, 1 + field.len()).
+    chunk
+        .chunks(USABLE_BYTES_PER_FIELD)
+        .enumerate()
+        .for_each(|(field_idx, field)| {
+            let dst = field_idx * FIELD_ELEMENT_BYTES_USIZE;
+            blob_bytes[dst + 1..dst + 1 + field.len()].copy_from_slice(field);
+        });
     Blob::new(blob_bytes)
 }
 
 /// Decode one blob to its 126976-byte payload area. This still includes any
 /// trailing zero padding. The caller strips it using the length header.
 fn decode_one_blob(blob: &Blob) -> Vec<u8> {
+    // `Blob` wraps a fixed-size `[u8; BYTES_PER_BLOB]`, so `as_slice()` is
+    // always exactly that length; the type guarantees it, not a runtime
+    // check.
     let raw: &[u8] = blob.as_slice();
-    debug_assert_eq!(raw.len(), BYTES_PER_BLOB);
-    let mut out = Vec::with_capacity(USABLE_BYTES_PER_BLOB);
-    for field_idx in 0..(BYTES_PER_BLOB / FIELD_ELEMENT_BYTES_USIZE) {
-        let dst = field_idx * FIELD_ELEMENT_BYTES_USIZE;
-        out.extend_from_slice(&raw[dst + 1..dst + FIELD_ELEMENT_BYTES_USIZE]);
-    }
-    out
+    raw.as_chunks::<FIELD_ELEMENT_BYTES_USIZE>()
+        .0
+        .iter()
+        .flat_map(|f| &f[1..])
+        .copied()
+        .collect()
 }

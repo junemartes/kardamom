@@ -45,10 +45,40 @@ Gradle wrapper (`./gradlew build`) and also needs a JDK 17 — the same one the
 
 ### Quick start
 
-[`just`](https://github.com/casey/just) installs everything for your platform:
+Install [mise](https://mise.jdx.dev/getting-started.html), then run from the
+repository root:
 
 ```sh
-just bootstrap   # install the Aeron toolchain + Foundry
+mise trust
+mise run setup       # install pinned tools and Ansible collections
+mise exec -- just check
+```
+
+The root [`mise.toml`](mise.toml) pins Rust (with Clippy, rustfmt and rust-src),
+JDK 17, Python, uv, CMake, Just, Foundry, jq, OpenTofu, Nomad, cosign, Ansible,
+ansible-lint, and yamllint. Ansible includes `requests` for the Docker modules.
+The collection versions live in
+[`requirements.yml`](deploy/cluster/ansible/requirements.yml). Mise installs
+them under the repo's ignored `.ansible/collections/` directory.
+
+For automatic tool selection, add `eval "$(mise activate zsh)"` to `~/.zshrc`
+(or `eval "$(mise activate bash)"` to `~/.bashrc`). After trusting the config,
+entering the repo installs any missing pinned tools. Then use `just` and
+`cargo` directly; mise also sets `JAVA_HOME`. Without shell activation,
+`mise exec -- just <recipe>` installs missing tools and runs the command with
+the repo's versions. Run `mise run setup` again when collection pins change.
+
+Mise manages user-space tools. Install Docker with Buildx and a running Linux
+daemon separately for cluster work. Native builds still need a C/C++ compiler,
+libclang, pkg-config, and platform libraries (`uuid-dev`, `libbsd-dev`, and
+`libssl-dev` on Debian/Ubuntu). The Gradle wrapper and Foundry configuration
+already select Gradle and Solidity compiler versions. CI keeps its existing
+tool installers; Rust's CI channel remains `stable`.
+
+The existing OS bootstrap is also available:
+
+```sh
+just bootstrap   # install native prerequisites and system tooling
 just check       # cargo check --workspace --all-features
 ```
 
@@ -57,7 +87,7 @@ systems, install the prerequisites manually (see below).
 
 ## Prerequisites (manual install)
 
-If you'd rather not use `just bootstrap`:
+If you'd rather not use `just bootstrap` (omit CMake and Java when using mise):
 
 | Platform        | Command |
 | --------------- | ------- |
@@ -66,13 +96,15 @@ If you'd rather not use `just bootstrap`:
 | Fedora / RHEL   | `sudo dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config clang clang-devel java-17-openjdk-devel` |
 | Arch            | `sudo pacman -S --needed base-devel cmake pkgconf clang jdk17-openjdk` |
 
-Plus Foundry on every platform:
+Without mise, also install Foundry on every platform:
 
 ```sh
 curl -L https://foundry.paradigm.xyz | bash && foundryup
 ```
 
 ### JAVA_HOME
+
+Mise sets `JAVA_HOME` when its tools are active. For a manual installation:
 
 The Aeron archive build needs a **JDK 17+**. On macOS in particular, cmake's
 `FindJava` resolves through `/usr/libexec/java_home`, which prefers whatever
@@ -105,8 +137,19 @@ features; launch your editor from a shell where `JAVA_HOME` is set so the
 | `just check-aeron`       | Targeted check that just the Aeron bindings compile. |
 | `just aeron-driver-up`   | Start a host-native Aeron Media Driver (jar cached locally). |
 | `just aeron-driver-down` | Stop the Media Driver started by `aeron-driver-up`. |
-| `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Vagrant, Ansible, Docker…). |
+| `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Ansible, Docker, OpenTofu, the Nomad CLI). |
 | `just cluster-doctor`    | Check the host has everything `deploy/cluster/` needs. |
+| `just container-up`      | Create and provision the container cluster, publish images, and deploy workloads. |
+| `just container-test [shard]` | Run a shard against the existing cluster (default: `SHARD` or `load`). |
+| `just shard [shard]`     | Run a shard with its full cluster lifecycle. |
+| `just container-diagnostics` | Collect node and job state after a failure. |
+| `just container-down`    | Destroy the cluster containers and their volumes. |
+| `just container-reset`   | Destroy the cluster, then create a fresh chain. |
+
+All [cluster recipes](deploy/cluster/README.md#quick-start) run directly from
+the repository root, including `just images`, `just deploy`, `just smoke`,
+`just validate`, `just check-contract`, and `just clean`. Their relative paths
+are resolved from `deploy/cluster/`.
 
 All build/test recipes set `JAVA_HOME` to a detected JDK 17+ automatically.
 
@@ -138,5 +181,6 @@ targets:
 Spec and current coverage: `docs/agents/chain-semantics-e2e-suite-spec.md`.
 
 **Chaos** — *does the pipeline survive faults under load?*
-`deploy/cluster/scripts/chaos.sh`, run by the other `cluster-e2e.yml` shards.
+`crates/chaos` (one test per shard in `tests/shards.rs`), run by the other
+`cluster-e2e.yml` shards.
 Failure modes and where each is verified: `docs/failure-modes.md`.

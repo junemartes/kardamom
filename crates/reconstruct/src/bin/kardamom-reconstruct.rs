@@ -20,8 +20,10 @@ use alloy_provider::ProviderBuilder;
 use anyhow::{Context, bail};
 use clap::Parser;
 use kardamom_batcher::da_store::FsBlobStore;
+use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
-use kardamom_reconstruct::reconstruct_state;
+use kardamom_reconstruct::Reconstruction;
+use kardamom_state::Durability;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -58,6 +60,44 @@ struct Cli {
     /// (chaos-suite gate).
     #[arg(long)]
     expect_root: Option<B256>,
+
+    /// Skip the fdatasync of each block commit. Only for a check that
+    /// reads the result on the same host after this process exits and then
+    /// discards it: one sync per block is most of the run time on a slow
+    /// disk. Never for a state an operator keeps: the tool refuses it
+    /// together with `--executor-image`, whose output outlives this
+    /// process.
+    #[arg(long, conflicts_with = "executor_image")]
+    no_sync: bool,
+
+    /// Write the image an executor resumes on: after the root check,
+    /// remove the trie, the hashed mirror and the stored root, which an
+    /// executor's trie-off writer would leave stale. Needs a payload that
+    /// carries the canonical cursor through the last block.
+    #[arg(long)]
+    executor_image: bool,
+
+    /// Optional last L2 block to re-execute. The posted batches must
+    /// reach it; later blocks are left out, so the root compares with a
+    /// state committed at that block.
+    #[arg(long)]
+    through_block: Option<u64>,
+}
+
+/// Keep the blocks through `through`, and refuse a batch set that ends
+/// before it.
+fn truncate(blocks: Vec<BlockFrame>, through: Option<u64>) -> anyhow::Result<Vec<BlockFrame>> {
+    let Some(through) = through else {
+        return Ok(blocks);
+    };
+    let end = blocks.iter().map(|b| b.block_number).max().unwrap_or(0);
+    if end < through {
+        bail!("posted batches end at block {end}, before block {through}");
+    }
+    Ok(blocks
+        .into_iter()
+        .filter(|b| b.block_number <= through)
+        .collect())
 }
 
 #[tokio::main]
@@ -93,13 +133,23 @@ async fn main() -> anyhow::Result<()> {
 
     let store = FsBlobStore::open(&cli.da_store).context("open DA blob store")?;
     let blocks = recover_blocks(&descriptors, &store).context("recover blocks from DA store")?;
+    let blocks = truncate(blocks, cli.through_block)?;
     info!(
         blocks = blocks.len(),
         "recovered blocks from DA; re-executing"
     );
 
-    let outcome = reconstruct_state(&cli.state_dir, chain_id, &accounts, &code, &blocks)
-        .context("re-execute reconstructed blocks")?;
+    let durability = if cli.no_sync {
+        Durability::SafeNoSync
+    } else {
+        Durability::Durable
+    };
+    let outcome = Reconstruction {
+        state_dir: &cli.state_dir,
+        durability,
+    }
+    .run(chain_id, &accounts, &code, &blocks)
+    .context("re-execute reconstructed blocks")?;
 
     info!(
         head_block = outcome.head_block,
@@ -108,10 +158,19 @@ async fn main() -> anyhow::Result<()> {
         state_root = %outcome.state_root,
         "reconstruction complete"
     );
-    // Machine-readable line for scripts and chaos assertions.
+    // Machine-readable line for scripts and chaos assertions. The cursor
+    // is the canonical end index a consumer resumes from; `none` means the
+    // last block's payload predates the field, so the state is correct
+    // and not resumable.
     println!(
-        "reconstructed head={} blocks={} txs={} state_root={:#x}",
-        outcome.head_block, outcome.blocks_applied, outcome.txs_applied, outcome.state_root
+        "reconstructed head={} blocks={} txs={} state_root={:#x} end_tx_idx={}",
+        outcome.head_block,
+        outcome.blocks_applied,
+        outcome.txs_applied,
+        outcome.state_root,
+        outcome
+            .head_end_tx_idx
+            .map_or("none".to_string(), |end| end.to_string())
     );
 
     if let Some(expected) = cli.expect_root
@@ -123,5 +182,41 @@ async fn main() -> anyhow::Result<()> {
             expected
         );
     }
+    if cli.executor_image {
+        if outcome.head_end_tx_idx.is_none() {
+            bail!(
+                "block {} carries no canonical cursor (a version 2 payload): an executor cannot resume on this state",
+                outcome.head_block
+            );
+        }
+        kardamom_reconstruct::strip_to_executor_image(&cli.state_dir)
+            .context("write the executor image")?;
+        info!("executor image written: trie, hashed mirror and stored root removed");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(n: u64) -> BlockFrame {
+        BlockFrame {
+            block_number: n,
+            ..BlockFrame::default()
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_the_blocks_through_the_target_and_refuses_a_short_set() {
+        let blocks = || vec![block(1), block(2), block(3)];
+        let kept = truncate(blocks(), Some(2)).unwrap();
+        assert_eq!(
+            kept.iter().map(|b| b.block_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(truncate(blocks(), None).unwrap().len(), 3);
+        let err = truncate(blocks(), Some(4)).unwrap_err().to_string();
+        assert!(err.contains("end at block 3, before block 4"), "{err}");
+    }
 }

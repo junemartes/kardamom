@@ -1,0 +1,213 @@
+name: release
+
+# The image build behind every deployment. It runs on each push to main and
+# on each vMAJOR.MINOR.PATCH tag. It builds the service binaries and the
+# cluster jar one time, and ansible/images.yml wraps them into the image set.
+# The role pushes the set to ghcr.io/<owner> and signs each image and the
+# digest manifest (cosign keyless, public Rekor). The job also pushes one
+# release bundle, kardamom-release:<tag>: a tar file with the manifest, the
+# settlement deployer, and their signature bundles.
+#
+#   push to main   images tagged main-<12 hex of the commit>
+#   tag v1.2.3     images tagged v1.2.3, and a GitHub release that carries
+#                  images.digests, the signed kardamom-deploy binary, and
+#                  SHA256SUMS
+#
+# The signing identity is this file at the ref that started the run. A
+# verifier can pin that identity, so a rename of this file breaks each
+# such verification.
+#
+# The images role signs when the job has an OIDC token (id-token: write).
+# No input of this workflow turns the signing off.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  images:
+    name: build, push, sign
+    # Pinned (not ubuntu-latest): the binaries and libaeron.so run in the
+    # ubuntu:24.04 ci-service image, so the runner glibc must match that base.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write   # docker push to ghcr.io
+      id-token: write   # cosign keyless signing
+    outputs:
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A tag gives the images a release identity. Only reviewed history
+      # gets one.
+      - name: Refuse a tag that is not on main
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "ERROR: ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main." >&2
+            exit 1
+          fi
+
+      - name: Select the registry and the image tag
+        id: ref
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="main-${GITHUB_SHA::12}"
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "TAG=${tag}" >> "${GITHUB_ENV}"
+          # A Docker reference is lowercase.
+          echo "REGISTRY=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "${GITHUB_ENV}"
+          echo "DIGEST_MANIFEST=${RUNNER_TEMP}/assets/images.digests" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/assets"
+
+      - name: Install system build deps (Aeron C client)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/foundry
+      - uses: ./.github/actions/solc-cache
+      # The cache of the cluster-e2e build holds the same x86-64-v3 objects.
+      # This job reads it and does not save: its smaller build must not
+      # replace the cache that cluster-e2e fills.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cluster-e2e
+          prefix-key: v1-rust-x86-64-v3
+          save-if: false
+      - uses: ./.github/actions/gradle-cache
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build cluster sealer jar (gradle shadowJar)
+        working-directory: cluster/sealer-service
+        run: ./gradlew :service:shadowJar --no-daemon
+
+      # rusteron compiles the Aeron C library with -march=native. The
+      # wrappers append x86-64-v3, so the images run on every fleet CPU and
+      # not only on the CPU of this runner.
+      - name: cargo build --release (service binaries)
+        env:
+          CC: ${{ github.workspace }}/scripts/ci/cc-x86-64-v3.sh
+          CXX: ${{ github.workspace }}/scripts/ci/cxx-x86-64-v3.sh
+        run: |
+          cargo build --release --locked \
+            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+            -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-state-mirror \
+            --bins
+          # The settlement-contract deployer. A first deployment to an L1
+          # with no settlement contract runs it on the deploy host.
+          cargo build --release --locked -p kardamom-deployer --bin kardamom-deploy
+
+      # The same Ansible setup as cluster-e2e.yml: the images role runs on
+      # this controller in the two workflows.
+      - name: Ansible docker collection
+        run: ansible-galaxy collection install ansible.posix community.docker
+      - name: Docker API client dependency for the Ansible interpreter
+        run: pipx inject ansible-core requests
+
+      # cosign reads the same Docker credentials for the signature push.
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      # REGISTRY, TAG and DIGEST_MANIFEST come from the environment. No
+      # REGISTRY_PUSH_NODE: this runner pushes directly.
+      - name: Build, push and sign the image set; sign the manifest
+        run: ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
+
+      # The images role installed the pinned cosign into its cache. The
+      # deployer gets the same keyless identity as the manifest.
+      - name: Sign the deployer binary
+        run: |
+          version="$(sed -n 's/^cosign_pinned_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          cosign="$(command -v cosign || echo "${HOME}/.cache/kardamom/cosign/${version}/cosign")"
+          assets="$(dirname "${DIGEST_MANIFEST}")"
+          cp target/release/kardamom-deploy "${assets}/kardamom-deploy"
+          "${cosign}" sign-blob --yes --bundle "${assets}/kardamom-deploy.sigbundle" "${assets}/kardamom-deploy"
+
+      # One artifact holds the deploy inputs of this build, so a deploy host
+      # reads them from the registry with the image tag and needs no other
+      # source. The members keep their own signatures.
+      - name: Push and sign the release bundle
+        run: |
+          version="$(sed -n 's/^cosign_pinned_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          cosign="$(command -v cosign || echo "${HOME}/.cache/kardamom/cosign/${version}/cosign")"
+          assets="$(dirname "${DIGEST_MANIFEST}")"
+          tar -C "${assets}" -cf "${RUNNER_TEMP}/kardamom-release.tar" \
+            images.digests images.digests.sigbundle kardamom-deploy kardamom-deploy.sigbundle
+          cd "${RUNNER_TEMP}"
+          "${cosign}" upload blob -f kardamom-release.tar "${REGISTRY}/kardamom-release:${TAG}" 2>&1 | tee upload.log
+          digest="$(grep -oE "kardamom-release@sha256:[0-9a-f]{64}" upload.log | tail -1 | cut -d@ -f2)"
+          test -n "${digest}"
+          "${cosign}" sign --yes "${REGISTRY}/kardamom-release@${digest}"
+
+      - name: Show the digest manifest
+        run: |
+          test -s "${DIGEST_MANIFEST}.sigbundle"
+          {
+            echo "### ${TAG} @ ${GITHUB_SHA}"
+            echo
+            echo '```'
+            cat "${DIGEST_MANIFEST}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ steps.ref.outputs.tag }}
+          path: ${{ runner.temp }}/assets
+          if-no-files-found: error
+
+  # A separate job, so the job that builds the code holds no write access to
+  # the repository contents.
+  publish:
+    name: publish the GitHub release
+    if: github.ref_type == 'tag'
+    needs: images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # gh release create / upload
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: images-${{ needs.images.outputs.tag }}
+          path: assets
+
+      - name: Attach the manifest and its signature bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          (cd assets && sha256sum images.digests images.digests.sigbundle kardamom-deploy kardamom-deploy.sigbundle > SHA256SUMS)
+          # A release made in the UI pushes the tag and starts this run too.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" assets/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes assets/*
+          fi

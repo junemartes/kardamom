@@ -1,9 +1,5 @@
-//! This module does cluster orchestration for the perf pipeline: purge
-//! the previous deployment, wipe node state, and re-run `ci-cluster.sh`,
-//! with `KEEP=1` and the load and chaos stages skipped, from the
-//! orchestrator container. This is the same bring-up path CI and
-//! `local-cluster.sh` use, so a perf run always measures a fresh chain
-//! with the current build.
+//! Ansible owns the perf cluster lifecycle, including reset and provisioning.
+//! Runtime CPU sampling and profiling helpers remain here.
 
 use std::process::Command;
 
@@ -25,25 +21,24 @@ pub const NODES: &[&str] = &[
     "kardamom-aux-0",
 ];
 
-pub const SEALER_NODES: &[&str] = &[
+const SEALER_NODES: &[&str] = &[
     "kardamom-sealer-0",
     "kardamom-sealer-1",
     "kardamom-sealer-2",
 ];
 
-const NOMAD_ADDR: &str = "http://192.168.56.10:4646";
-
 /// Run a command, and capture stdout. Errors with context on a
 /// non-zero exit code.
-pub fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new(program)
         .args(args)
         .output()
         .with_context(|| format!("spawn {program}"))?;
     if !out.status.success() {
         bail!(
-            "{program} {args:?} failed ({}):\n{}",
+            "{program} {args:?} failed ({}):\n{}\n{}",
             out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -51,139 +46,48 @@ pub fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
 }
 
 /// `docker exec <container> bash -c <script>`.
-pub fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
+pub(crate) fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
     sh("docker", &["exec", container, "bash", "-c", script])
 }
 
-/// Stop and purge every Nomad job, then wipe per-node state, so the
-/// next deploy starts a fresh chain with new-build allocations. This
-/// function parses `nomad job status` from its plain table output,
-/// because the `-t` template flag silently emits nothing for the list
-/// form. A periodic-batch child, such as `batcher/periodic-*`, is
-/// purged along with its parent.
-pub fn purge() -> anyhow::Result<()> {
-    println!("==> purging nomad jobs");
-    docker_exec(
-        "kardamom-control-0",
-        &format!(
-            r#"export NOMAD_ADDR={NOMAD_ADDR}
-for j in $(nomad job status 2>/dev/null | awk 'NR>1 && $1 !~ /\// {{print $1}}'); do
-  echo "   stop -purge $j"
-  nomad job stop -purge "$j" >/dev/null 2>&1 || true
-done"#
-        ),
-    )?;
-    std::thread::sleep(std::time::Duration::from_secs(10));
-
-    println!("==> wiping node state");
-    for node in NODES {
-        docker_exec(
-            node,
-            "rm -rf /opt/kardamom/state /opt/kardamom/cluster /opt/kardamom/archive \
-             /opt/kardamom/checkpoints /opt/kardamom/aeron-mount/* \
-             /opt/kardamom/batcher/* 2>/dev/null; \
-             mkdir -p /opt/kardamom/state /opt/kardamom/archive",
-        )
-        .with_context(|| format!("wipe {node}"))?;
-    }
-    Ok(())
-}
-
-/// Returns true when the cluster's control node container exists,
-/// whether running or not. This tells apart "redeploy over an existing
-/// cluster", which needs a purge first, from "the cluster is gone",
-/// for example a torn-down host after another session's teardown.
-/// Purging a missing cluster failed the whole `up` with "No such
-/// container: kardamom-control-0", even though ci-cluster.sh handles
-/// from-scratch creation fine.
-fn cluster_exists() -> bool {
-    sh("docker", &["inspect", "kardamom-control-0"]).is_ok()
-}
-
-/// Bring the stack up fresh: run `local-cluster.sh build`, which
-/// builds the reproducible builder and orchestrator image, then run
-/// `ci-cluster.sh` from a fresh orchestrator with `KEEP=1` and the
-/// load and chaos stages skipped. This function blocks until the
-/// deploy's smoke gates pass, and leaves the cluster running.
+/// Build and deploy a fresh chain through the same Ansible lifecycle as CI.
+///
+/// # Errors
+///
+/// Returns an error if the `ansible-playbook` run fails.
 pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
-    let root = repo_root.to_str().context("repo root not utf-8")?;
-    if !skip_build {
-        println!("==> building sealer jar");
-        let jar_dir = repo_root.join("cluster/sealer-service");
-        sh(
-            "bash",
-            &[
-                "-c",
-                &format!(
-                    "cd {} && ./gradlew :service:shadowJar -q",
-                    jar_dir.display()
-                ),
-            ],
-        )?;
-        println!("==> building service binaries + orchestrator image");
-        sh(
-            "bash",
-            &[
-                &format!("{root}/deploy/cluster/scripts/local-cluster.sh"),
-                "build",
-            ],
-        )?;
-    }
-    if cluster_exists() {
-        purge()?;
-    } else {
-        println!(
-            "==> no existing cluster (control-0 absent); skipping purge, ci-cluster.sh creates from scratch"
+    let playbook = repo_root.join("deploy/cluster/ansible/local.yml");
+    let vars = serde_json::json!({
+        "local_runner_operation": "reset",
+        "local_runner_build": !skip_build,
+        "local_runner_keep": true,
+        "local_runner_tests": false,
+    });
+    let out = Command::new("ansible-playbook")
+        .args(["-i", "localhost,"])
+        .arg(&playbook)
+        .args(["--extra-vars", &vars.to_string()])
+        .output()
+        .context("run Ansible cluster lifecycle")?;
+    if !out.status.success() {
+        bail!(
+            "cluster lifecycle failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
-
-    println!("==> deploying fresh cluster (ci-cluster.sh, KEEP=1, no load/chaos stages)");
-    let _ = sh("docker", &["rm", "-f", "kardamom-orch"]);
-    sh(
-        "docker",
-        &[
-            "run",
-            "-d",
-            "--name",
-            "kardamom-orch",
-            "--privileged",
-            "--network=host",
-            "--pid=host",
-            "-v",
-            "/var/run/docker.sock:/var/run/docker.sock",
-            "-v",
-            &format!("{root}:/work"),
-            "kardamom-orchestrator:latest",
-        ],
-    )?;
-    let out = sh(
-        "docker",
-        &[
-            "exec",
-            "-e",
-            "KEEP=1",
-            "-e",
-            "RUN_LOAD=0",
-            "-e",
-            "RUN_CHAOS=0",
-            "-e",
-            "REGISTRY_PUSH_NODE=control-0",
-            "kardamom-orch",
-            "bash",
-            "-lc",
-            "cd /work && deploy/cluster/scripts/ci-cluster.sh",
-        ],
-    )?;
-    let passes = out.matches("RESULT: PASS").count();
-    if passes < 2 {
-        bail!("ci-cluster.sh finished but smoke gates did not both pass (saw {passes})");
-    }
-    println!("==> cluster up; smoke + ingress-churn gates passed");
+    println!("{}", String::from_utf8_lossy(&out.stdout));
+    println!("==> cluster up; no gate ran (the perf run is the load)");
     Ok(())
 }
 
 /// Take one `docker stats` sample of a set of containers. Returns
 /// `(name, cpu%)` for each.
+///
+/// # Errors
+///
+/// Returns an error if the `docker stats` command fails, or if its
+/// output cannot be parsed.
 pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
     let mut args = vec!["stats", "--no-stream", "--format", "{{.Name}} {{.CPUPerc}}"];
     args.extend_from_slice(containers);
@@ -197,15 +101,29 @@ pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
         .collect())
 }
 
+/// Sample sealer CPU once, folding each container's percentage into
+/// `totals`.
+fn accumulate_cpu_sample(
+    totals: &mut std::collections::HashMap<String, f64>,
+) -> anyhow::Result<()> {
+    for (name, pct) in cpu_sample(SEALER_NODES)? {
+        *totals.entry(name).or_default() += pct;
+    }
+    Ok(())
+}
+
 /// The sealer node currently doing leader work: the busiest sealer
 /// container, sampled twice to avoid a transient spike. This result is
 /// meaningful only while load is flowing.
+///
+/// # Errors
+///
+/// Returns an error if the `docker stats` sampling fails, or if no
+/// sealer container is running.
 pub fn detect_sealer_leader() -> anyhow::Result<String> {
     let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for _ in 0..2 {
-        for (name, pct) in cpu_sample(SEALER_NODES)? {
-            *totals.entry(name).or_default() += pct;
-        }
+        accumulate_cpu_sample(&mut totals)?;
     }
     totals
         .into_iter()

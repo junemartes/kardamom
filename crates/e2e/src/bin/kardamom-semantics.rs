@@ -2,10 +2,11 @@
 //!
 //! The scenario drivers in `e2e::scenarios` talk only to external seams: the
 //! ingress JSON-RPC and the per-service `/metrics`. So the same code that
-//! runs against the single-host Target-L stack in `tests/chain_semantics.rs`
-//! also runs against the real 12-node DinD cluster. This binary points the
-//! drivers at cluster addresses instead of per-test temp ports. A difference
-//! between the two targets is itself a signal.
+//! runs against the single-host Target-L stack in
+//! `tests/chain_semantics/main.rs` also runs against the real 12-node
+//! `DinD` cluster. This binary points the drivers at cluster addresses
+//! instead of per-test temp ports. A difference between the two targets
+//! is itself a signal.
 //!
 //! `deploy/cluster/scripts/ci-cluster.sh` starts this binary (the
 //! `semantics` shard of `cluster-e2e.yml`) from the runner. The runner can
@@ -18,10 +19,10 @@
 //!
 //! ```text
 //! kardamom-semantics \
-//!   --rpc http://192.168.56.31:8545 --chain-id 412346 \
-//!   --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
-//!   --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
-//!   --validator-metrics 192.168.56.61:9006 \
+//!   --rpc http://<ingress-0>:8545 --chain-id 412346 \
+//!   --executor-metrics <executor-0>:9004,<executor-1>:9004,<executor-2>:9004 \
+//!   --sequencer-metrics <sequencer-0>:9001,<sequencer-1>:9001 \
+//!   --validator-metrics <aux-0>:9006 \
 //!   --cases nonce-unordered,nonce-gap,rpc-liveness,consistency
 //! ```
 
@@ -64,6 +65,10 @@ struct Args {
     /// skipped.
     #[arg(long)]
     ingress_metrics: Option<SocketAddr>,
+    /// The executor's account query address. Defaults to the chosen
+    /// executor's host on the deploy's query port (9024).
+    #[arg(long)]
+    executor_query: Option<SocketAddr>,
     /// The ingress's `--pending-receipt-timeout-ms` value. The nonce-gap
     /// case derives its latency limits from this value. It must match the
     /// deployment (30 s unless the job sets another value).
@@ -94,6 +99,10 @@ struct Args {
     settlement: Option<alloy_primitives::Address>,
 }
 
+/// The executor's account query port in the deploy
+/// (`ports.executor_nonce_query` in `group_vars/all.yml`).
+const EXECUTOR_QUERY_PORT: u16 = 9024;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -105,8 +114,16 @@ async fn main() -> Result<()> {
     let park = Duration::from_millis(args.pending_receipt_timeout_ms);
     // Set the client timeout above the server park time. This way, a gap
     // case sees the ingress's own -32000 error, not a client abort.
-    let rpc = L2Client::new(&args.rpc, park * 3 + Duration::from_secs(5))
-        .context("build ingress JSON-RPC client")?;
+    // `--pending-receipt-timeout-ms` is operator-supplied, so multiplying
+    // and adding it must not panic on an extreme value; `Duration` has no
+    // real "wrong" saturated result here, since a saturated timeout is
+    // just a very patient client.
+    let rpc = L2Client::new(
+        &args.rpc,
+        park.saturating_mul(3)
+            .saturating_add(Duration::from_secs(5)),
+    )
+    .context("build ingress JSON-RPC client")?;
 
     // Pick one executor replica that answers. A cluster always has three
     // replicas, and each one serves the same counters.
@@ -123,30 +140,128 @@ async fn main() -> Result<()> {
         // struct stays valid. The cases that read ingress metrics are
         // skipped below.
         ingress_metrics: args.ingress_metrics.unwrap_or(executor),
+        executor_query: args
+            .executor_query
+            .unwrap_or_else(|| SocketAddr::new(executor.ip(), EXECUTOR_QUERY_PORT)),
         executor_metrics: executor,
         sequencer_metrics: args.sequencer_metrics.clone(),
         validator_metrics: args.validator_metrics,
     };
 
     let base = args.account_base;
+    let l1 = match (&args.l1_rpc, args.settlement) {
+        (Some(r), Some(s)) => Some((r.as_str(), s)),
+        _ => None,
+    };
     for case in &args.cases {
-        println!("==> ===== SEMANTICS CASE: {case} =====");
-        let started = std::time::Instant::now();
-        let l1 = match (&args.l1_rpc, args.settlement) {
-            (Some(r), Some(s)) => Some((r.as_str(), s)),
-            _ => None,
-        };
-        let result = run_case(case, &target, base, args.ingress_metrics.is_some(), l1).await;
-        match result {
-            Ok(()) => println!("==> SEMANTICS CASE {case}: PASS ({:?})", started.elapsed()),
-            Err(e) => {
-                println!("SEMANTICS FAIL: case {case}: {e:#}");
-                std::process::exit(1);
-            }
-        }
+        run_and_report_case(case, &target, base, args.ingress_metrics.is_some(), l1).await;
     }
     println!("==> semantics verdict PASS ({} cases)", args.cases.len());
     Ok(())
+}
+
+/// Run one semantics case, print PASS/FAIL, and exit the process on the
+/// first failure — a case suite stops at the first violation.
+async fn run_and_report_case(
+    case: &str,
+    target: &Target,
+    base: usize,
+    have_ingress_metrics: bool,
+    l1: Option<(&str, alloy_primitives::Address)>,
+) {
+    println!("==> ===== SEMANTICS CASE: {case} =====");
+    let started = std::time::Instant::now();
+    match run_case(case, target, base, have_ingress_metrics, l1).await {
+        Ok(()) => println!("==> SEMANTICS CASE {case}: PASS ({:?})", started.elapsed()),
+        Err(e) => {
+            println!("SEMANTICS FAIL: case {case}: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// This shard's account range, anchored at the operator-supplied
+/// `--account-base`. Every case derives its own accounts from this as
+/// `base + offset`, checked: the sum must not silently wrap into another
+/// case's range.
+struct Accounts {
+    base: usize,
+}
+
+/// `nonce_params`'s sender count.
+const NONCE_SENDERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4).unwrap();
+/// `nonce_params`'s txs-per-sender count.
+const NONCE_TXS_PER_SENDER: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16).unwrap();
+/// `consistency_params`'s sender count.
+const CONSISTENCY_SENDERS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(3).unwrap();
+/// `consistency_params`'s transfers-per-sender count.
+const CONSISTENCY_TRANSFERS_PER_SENDER: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(12).unwrap();
+
+impl Accounts {
+    /// `self.base + offset`, checked.
+    ///
+    /// # Errors
+    /// Returns an error when `self.base + offset` overflows.
+    fn at(&self, offset: usize) -> Result<usize> {
+        self.base
+            .checked_add(offset)
+            .with_context(|| format!("--account-base {} + {offset} overflows", self.base))
+    }
+
+    /// `nonce_unordered::Params` for this shard. `txs_per_sender` is
+    /// smaller than Target-L's: the cluster's boundary tick is 2s (250ms
+    /// locally), so a larger run would spend the whole case waiting for
+    /// blocks, without proving more.
+    fn nonce_params(&self) -> nonce_unordered::Params {
+        nonce_unordered::Params {
+            senders: NONCE_SENDERS,
+            txs_per_sender: NONCE_TXS_PER_SENDER,
+            sender_base: self.base,
+            ..nonce_unordered::Params::default()
+        }
+    }
+
+    /// `consistency::Params` for this shard.
+    ///
+    /// # Errors
+    /// Returns an error when `self.base + 10` overflows.
+    fn consistency_params(&self) -> Result<consistency::Params> {
+        Ok(consistency::Params {
+            senders: CONSISTENCY_SENDERS,
+            transfers_per_sender: CONSISTENCY_TRANSFERS_PER_SENDER,
+            sender_base: self.at(10)?,
+            // Here tx_bal uses UDP multicast, not IPC. A dropped BAL leaves a
+            // block unverified, and the design allows this (it is never a
+            // divergence). This budget covers a few drops from the
+            // workload's own blocks. A validator that receives no BALs still
+            // goes over this budget.
+            max_bal_missing: 3.0,
+        })
+    }
+}
+
+/// Run the `l1-batch` case, or fail with a clear message when `--l1-rpc`
+/// and `--settlement` were not given.
+///
+/// # Errors
+/// Returns an error when `l1` is `None`, or under the same conditions as
+/// [`l1_batch::l1_batch`].
+async fn l1_batch_case(t: &Target, l1: Option<(&str, alloy_primitives::Address)>) -> Result<()> {
+    let Some((rpc, settlement)) = l1 else {
+        anyhow::bail!("the l1-batch case needs --l1-rpc and --settlement");
+    };
+    l1_batch::l1_batch(t, rpc, settlement).await
+}
+
+/// Print a note when ingress `/metrics` is unreachable.
+///
+/// Only the queue-depth probe needs ingress metrics, and Target L
+/// already covers it.
+fn warn_if_no_ingress_metrics(have_ingress_metrics: bool) {
+    if !have_ingress_metrics {
+        println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
+    }
 }
 
 async fn run_case(
@@ -156,45 +271,27 @@ async fn run_case(
     have_ingress_metrics: bool,
     l1: Option<(&str, alloy_primitives::Address)>,
 ) -> Result<()> {
+    let accounts = Accounts { base };
     match case {
-        "nonce-unordered" => {
-            nonce_unordered::run(
-                t,
-                nonce_unordered::Params {
-                    senders: 4,
-                    // Use a smaller count than Target L. The cluster's
-                    // boundary tick is 2 s (250 ms locally). A larger run
-                    // would spend the whole case waiting for blocks, without
-                    // proving more.
-                    txs_per_sender: 16,
-                    sender_base: base,
-                    ..nonce_unordered::Params::default()
-                },
-            )
-            .await
-        }
+        "nonce-unordered" => nonce_unordered::run(t, accounts.nonce_params()).await,
         "nonce-gap" => {
             nonce_gap::run(
                 t,
                 nonce_gap::Params {
-                    gapped: base + 5,
-                    bystander: base + 6,
-                    disorder: base + 7,
+                    gapped: accounts.at(5)?,
+                    bystander: accounts.at(6)?,
+                    disorder: accounts.at(7)?,
                 },
             )
             .await
         }
         "rpc-liveness" => {
-            if !have_ingress_metrics {
-                // Only the queue-depth probe needs ingress metrics, and
-                // Target L already covers it.
-                println!("    (ingress /metrics not reachable — queue-depth probe skipped)");
-            }
+            warn_if_no_ingress_metrics(have_ingress_metrics);
             rpc_liveness::run(
                 t,
                 rpc_liveness::Params {
-                    sender: base + 8,
-                    parked_sender: base + 9,
+                    sender: accounts.at(8)?,
+                    parked_sender: accounts.at(9)?,
                 },
             )
             .await
@@ -204,35 +301,15 @@ async fn run_case(
                 t.validator_metrics.is_some(),
                 "the consistency case needs --validator-metrics"
             );
-            consistency::run(
-                t,
-                consistency::Params {
-                    senders: 3,
-                    transfers_per_sender: 12,
-                    sender_base: base + 10,
-                    // Here tx_bal uses UDP multicast, not IPC. A dropped BAL
-                    // leaves a block unverified, and the design allows this
-                    // (it is never a divergence). This budget covers a few
-                    // drops from the workload's own blocks. A validator that
-                    // receives no BALs still goes over this budget.
-                    max_bal_missing: 3.0,
-                },
-            )
-            .await
+            consistency::run(t, accounts.consistency_params()?).await
         }
-        "l1-batch" => {
-            let (rpc, settlement) = match l1 {
-                Some(pair) => pair,
-                None => anyhow::bail!("the l1-batch case needs --l1-rpc and --settlement"),
-            };
-            l1_batch::l1_batch(t, rpc, settlement).await
-        }
+        "l1-batch" => l1_batch_case(t, l1).await,
         "rpc-vectors" => {
             rpc_vectors::run(
                 t,
                 rpc_vectors::Params {
-                    sender: base + 13,
-                    recipient: base + 14,
+                    sender: accounts.at(13)?,
+                    recipient: accounts.at(14)?,
                 },
             )
             .await
@@ -243,10 +320,9 @@ async fn run_case(
 
 /// First address whose `/metrics` answers.
 async fn pick_live(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    for a in addrs {
-        if e2e::harness::metrics::scrape(*a).await.is_ok() {
-            return Some(*a);
-        }
-    }
-    None
+    use futures::StreamExt;
+
+    let stream = futures::stream::iter(addrs)
+        .filter_map(|a| async move { e2e::harness::metrics::scrape(*a).await.ok().map(|_| *a) });
+    std::pin::pin!(stream).next().await
 }

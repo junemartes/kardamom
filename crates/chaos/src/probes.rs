@@ -1,0 +1,418 @@
+//! Read-only probes over the topology: the executor tier, the ingress
+//! pair, the validator, and the lane-0 sequencer replicas. Every probe
+//! returns `None` when no exporter answers.
+
+use std::net::Ipv4Addr;
+
+use crate::contract::NodeContract;
+use crate::metrics::{self, Scrape, Target};
+
+/// The executor gauge that only goes up: the pipeline-progress signal.
+pub const EXECUTOR_BLOCK_METRIC: &str = "kardamom_executor_block_number";
+/// The sealer boundary counter the executors re-export from cluster
+/// egress; the Java cluster node has no exporter of its own.
+pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
+pub const INGRESS_RECEIVED_METRIC: &str = "kardamom_ingress_tx_received_total";
+pub const EXECUTOR_PORT: u16 = 9004;
+/// The state mirror's exporter, on every executor node.
+pub const MIRROR_PORT: u16 = 9007;
+/// The ingress and the validator share this port on different nodes.
+pub const INGRESS_PORT: u16 = 9006;
+pub const VALIDATOR_PORT: u16 = 9006;
+/// Lane 0's metrics port: `9001 + 10 * lane`.
+pub const SEQUENCER_LANE0_PORT: u16 = 9001;
+/// The Nomad task name inside the `cluster` job.
+pub const CLUSTER_TASK: &str = "cluster";
+/// The sequencer samples a lane report prints; see
+/// [`Probes::sequencer_lane_report`].
+const LANE_REPORT_METRICS: &[&str] = &[
+    "kardamom_sequencer_pending_depth",
+    "kardamom_sequencer_resync_mode",
+    "kardamom_sequencer_nonce_lookup_requests_total",
+    "kardamom_sequencer_nonce_lookups_total",
+    "kardamom_sequencer_nonce_lookups_in_flight",
+    "kardamom_sequencer_receipt_floor_senders",
+    "kardamom_sequencer_receipt_floor_advances_total",
+];
+
+/// One node the probes address.
+#[derive(Debug, Clone)]
+pub struct Probed {
+    /// The host container name.
+    pub container: String,
+    pub ip: Ipv4Addr,
+}
+
+/// The probe set of one cluster.
+#[derive(Debug, Clone)]
+pub struct Probes {
+    scrape: Scrape,
+    /// The executor nodes, by index.
+    pub executors: Vec<Probed>,
+    /// The ingress nodes, by index. Their exporter binds loopback.
+    pub ingresses: Vec<Probed>,
+    /// The aux node that runs the validator.
+    pub validator: Probed,
+    /// The sequencer nodes, by index; lane 0 runs one replica on each.
+    pub sequencers: Vec<Probed>,
+}
+
+fn probed(contract: &NodeContract, role: &str) -> Vec<Probed> {
+    contract
+        .of_role(role)
+        .into_iter()
+        .map(|n| Probed {
+            container: n.container.clone(),
+            ip: n.ip,
+        })
+        .collect()
+}
+
+impl Probes {
+    /// The probes of the cluster the contract describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract has no aux node.
+    pub fn new(contract: &NodeContract) -> anyhow::Result<Self> {
+        let validator = probed(contract, "aux")
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("node contract has no aux node for the validator"))?;
+        Ok(Self {
+            scrape: Scrape::new(),
+            executors: probed(contract, "executor"),
+            ingresses: probed(contract, "ingress"),
+            validator,
+            sequencers: probed(contract, "sequencer"),
+        })
+    }
+
+    /// The scraper, for probes a case builds itself.
+    #[must_use]
+    pub fn scrape(&self) -> &Scrape {
+        &self.scrape
+    }
+
+    /// The executor target of index `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not an executor index of this cluster; the
+    /// shards address three executors by construction.
+    #[must_use]
+    pub fn executor_target(&self, i: usize) -> Target {
+        let e = &self.executors[i];
+        Target::bridged(e.ip, &e.container, EXECUTOR_PORT)
+    }
+
+    /// The state mirror target on executor node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not an executor index of this cluster.
+    #[must_use]
+    pub fn mirror_target(&self, i: usize) -> Target {
+        let e = &self.executors[i];
+        Target::bridged(e.ip, &e.container, MIRROR_PORT)
+    }
+
+    /// The first-sample value of `metric` on the mirror of executor
+    /// node `i`. `None` when the exporter does not answer.
+    pub async fn mirror_metric(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.mirror_target(i)).await?;
+        metrics::first(&body, metric)
+    }
+
+    /// The validator's loopback target.
+    #[must_use]
+    pub fn validator_target(&self) -> Target {
+        Target::loopback(&self.validator.container, VALIDATOR_PORT)
+    }
+
+    /// One ingress node's loopback target.
+    #[must_use]
+    pub fn ingress_target(&self, node: &Probed) -> Target {
+        Target::loopback(&node.container, INGRESS_PORT)
+    }
+
+    /// The lane-0 replica target on sequencer node `i`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not a sequencer index of this cluster.
+    #[must_use]
+    pub fn sequencer_lane0_target(&self, i: usize) -> Target {
+        self.sequencer_lane_target(i, 0)
+    }
+
+    /// The replica target of `lane` on sequencer node `i`. Lane `n`
+    /// exports on `9001 + 10 * n`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not a sequencer index of this cluster.
+    #[must_use]
+    pub fn sequencer_lane_target(&self, i: usize, lane: u8) -> Target {
+        let s = &self.sequencers[i];
+        let port = SEQUENCER_LANE0_PORT.saturating_add(u16::from(lane).saturating_mul(10));
+        Target::bridged(s.ip, &s.container, port)
+    }
+
+    /// One line per sequencer replica of lanes `0..lanes`: the samples
+    /// that explain a refused resize (parked entries by vslot, the
+    /// resync flag, the nonce lookups, the receipt floors). A replica
+    /// that does not answer reports `no answer`. This is the evidence a
+    /// failed scale step prints.
+    pub async fn sequencer_lane_report(&self, lanes: u8) -> Vec<String> {
+        let replicas =
+            (0..lanes).flat_map(|lane| (0..self.sequencers.len()).map(move |i| (i, lane)));
+        let mut out = Vec::new();
+        for (i, lane) in replicas {
+            out.push(self.lane_report_line(i, lane).await);
+        }
+        out
+    }
+
+    async fn lane_report_line(&self, i: usize, lane: u8) -> String {
+        let name = &self.sequencers[i].container;
+        let Some(body) = self
+            .scrape
+            .fetch(&self.sequencer_lane_target(i, lane))
+            .await
+        else {
+            return format!("lane {lane} on {name}: no answer");
+        };
+        format!(
+            "lane {lane} on {name}: {}",
+            metrics::samples_of_interest(&body, LANE_REPORT_METRICS).join(" | ")
+        )
+    }
+
+    /// One executor's `/metrics` body.
+    pub async fn exec_metrics(&self, i: usize) -> Option<String> {
+        self.scrape.fetch(&self.executor_target(i)).await
+    }
+
+    /// The first-sample value of `metric` on executor `i`.
+    pub async fn exec_metric(&self, i: usize, metric: &str) -> Option<i64> {
+        metrics::first(&self.exec_metrics(i).await?, metric)
+    }
+
+    /// The maximum of `metric` across every responding executor. A
+    /// replica that restarted can fairly report a low value while it
+    /// replays; the fleet maximum is the pipeline signal.
+    async fn executor_max(&self, metric: &str) -> Option<i64> {
+        let mut best = None;
+        for i in 0..self.executors.len() {
+            best = best.max(self.exec_metric(i, metric).await);
+        }
+        best
+    }
+
+    /// The pipeline-progress probe: the highest committed block any
+    /// executor reports.
+    pub async fn executor_progress(&self) -> Option<i64> {
+        self.executor_max(EXECUTOR_BLOCK_METRIC).await
+    }
+
+    /// The sealer boundary counter, which ticks about four times a
+    /// second even with no load.
+    pub async fn sealer_boundaries(&self) -> Option<i64> {
+        self.executor_max(SEALER_BOUNDARIES_METRIC).await
+    }
+
+    /// The submit counter summed across the ingress pair: the "is load
+    /// flowing" signal. `None` when no ingress answers.
+    pub async fn ingress_received(&self) -> Option<i64> {
+        self.ingress_counts().await.total()
+    }
+
+    /// The submit counter of each ingress, one entry per ingress.
+    pub async fn ingress_counts(&self) -> IngressCounts {
+        let mut counts = Vec::with_capacity(self.ingresses.len());
+        for node in &self.ingresses {
+            counts.push((node.container.clone(), self.ingress_sum(node).await));
+        }
+        IngressCounts(counts)
+    }
+
+    /// The submit counter of one ingress. An exporter that answers
+    /// without the counter reports zero: a counter exports only after
+    /// its first increment, and the load drives one ingress. `None`
+    /// means the scrape failed.
+    async fn ingress_sum(&self, node: &Probed) -> Option<i64> {
+        let body = self.scrape.fetch(&self.ingress_target(node)).await?;
+        Some(metrics::sum(&body, INGRESS_RECEIVED_METRIC).unwrap_or(0))
+    }
+
+    /// One validator metric, first sample. `None` on a failed scrape.
+    pub async fn val_metric(&self, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.validator_target()).await?;
+        metrics::first(&body, metric)
+    }
+
+    /// A validator metric a verdict needs. The scrape retries, then uses
+    /// the always-present committed-block gauge as a canary: canary up
+    /// and counter absent means a genuine zero, since a counter exports
+    /// only once incremented. A dead exporter is an error, never zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exporter does not answer five times.
+    pub async fn val_metric_required(&self, metric: &str, why: &str) -> anyhow::Result<i64> {
+        for _ in 0..5 {
+            if let Some(v) = self.val_metric_or_canary_zero(metric).await {
+                return Ok(v);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        Err(crate::chaos_fail!(
+            "validator exporter unscrapeable after 5 tries — refusing to treat a dead exporter as 0 ({why})"
+        ))
+    }
+
+    async fn val_metric_or_canary_zero(&self, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.validator_target()).await?;
+        metrics::first(&body, metric)
+            .or_else(|| metrics::first(&body, "validator_committed_block").map(|_| 0))
+    }
+
+    /// The summed samples of `metric` on lane 0's replica on sequencer
+    /// node `i`.
+    pub async fn seq_lane0_metric(&self, i: usize, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.sequencer_lane0_target(i)).await?;
+        metrics::sum(&body, metric)
+    }
+
+    /// The label-filtered sum of `metric` on lane 0's replica on
+    /// sequencer node `i`.
+    pub async fn seq_lane0_metric_where(&self, i: usize, metric: &str, label: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.sequencer_lane0_target(i)).await?;
+        metrics::sum_where(&body, metric, label)
+    }
+
+    /// The shard map version an ingress replica runs.
+    pub async fn ingress_map_version(&self, node: &Probed) -> Option<i64> {
+        let body = self.scrape.fetch(&self.ingress_target(node)).await?;
+        metrics::first(&body, "kardamom_ingress_shard_map_version")
+    }
+}
+
+/// The submit counters of the ingresses, one entry per ingress. A
+/// `None` value is an ingress that did not answer the scrape.
+///
+/// The injection gate compares the parts, not only the sum: a sum that
+/// skips a silent ingress falls below its own baseline. That reads as a
+/// stalled load, even while the other ingress accepts traffic.
+#[derive(Debug, Clone, Default)]
+pub struct IngressCounts(Vec<(String, Option<i64>)>);
+
+impl IngressCounts {
+    /// The total across the ingresses that answered. `None` when none
+    /// answered.
+    #[must_use]
+    pub fn total(&self) -> Option<i64> {
+        self.0
+            .iter()
+            .fold(None, |total, (_, v)| add_option(total, *v))
+    }
+
+    /// The new total, when one ingress counts more submissions than the
+    /// same ingress did in `base`. `None` while every ingress that
+    /// answers is at or below its own baseline.
+    #[must_use]
+    pub fn rose_over(&self, base: &Self) -> Option<i64> {
+        let rose = self
+            .0
+            .iter()
+            .any(|(node, now)| base.of(node).zip(*now).is_some_and(|(b, n)| n > b));
+        rose.then(|| self.total()).flatten()
+    }
+
+    /// The total when every ingress answered. A baseline that skips an
+    /// ingress cannot bound the traffic that flows past a frozen consumer.
+    #[must_use]
+    pub fn complete(&self) -> Option<i64> {
+        let all_answered = !self.0.is_empty() && self.0.iter().all(|(_, v)| v.is_some());
+        all_answered.then(|| self.total()).flatten()
+    }
+
+    /// The counters as a log line. A `?` marks a failed scrape.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.0
+            .iter()
+            .map(|(node, v)| v.map_or_else(|| format!("{node}=?"), |n| format!("{node}={n}")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn of(&self, node: &str) -> Option<i64> {
+        self.0.iter().find(|(n, _)| n == node).and_then(|(_, v)| *v)
+    }
+}
+
+fn add_option(total: Option<i64>, value: Option<i64>) -> Option<i64> {
+    match (total, value) {
+        (None, v) => v,
+        (Some(t), None) => Some(t),
+        (Some(t), Some(v)) => Some(t.saturating_add(v)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sum_over_the_pair_ignores_a_dark_replica_but_not_both() {
+        assert_eq!(add_option(None, None), None);
+        assert_eq!(add_option(None, Some(3)), Some(3));
+        assert_eq!(add_option(Some(3), None), Some(3));
+        assert_eq!(add_option(Some(3), Some(4)), Some(7));
+    }
+
+    fn counts(values: &[(&str, Option<i64>)]) -> IngressCounts {
+        IngressCounts(
+            values
+                .iter()
+                .map(|(node, v)| ((*node).to_string(), *v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_ingress_that_counts_more_proves_the_load_flows() {
+        let base = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", Some(20))]);
+        assert_eq!(now.rose_over(&base), Some(31));
+        assert_eq!(base.rose_over(&base), None);
+    }
+
+    #[test]
+    fn an_unreachable_ingress_never_reads_as_a_stalled_load() {
+        let base = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        // The second ingress fails its scrape, so the sum drops to 11.
+        // The first ingress still counts more than its own baseline.
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", None)]);
+        assert_eq!(now.rose_over(&base), Some(11));
+        assert_eq!(now.describe(), "ingress-0=11 ingress-1=?");
+    }
+
+    #[test]
+    fn a_complete_baseline_needs_every_ingress() {
+        let all = counts(&[("ingress-0", Some(10)), ("ingress-1", Some(20))]);
+        assert_eq!(all.complete(), Some(30));
+        let one = counts(&[("ingress-0", Some(10)), ("ingress-1", None)]);
+        assert_eq!(one.complete(), None);
+        assert_eq!(counts(&[]).complete(), None);
+    }
+
+    #[test]
+    fn an_ingress_with_no_baseline_proves_nothing() {
+        let base = counts(&[("ingress-0", None), ("ingress-1", Some(20))]);
+        let now = counts(&[("ingress-0", Some(11)), ("ingress-1", Some(20))]);
+        assert_eq!(now.rose_over(&base), None);
+    }
+}

@@ -10,16 +10,16 @@
 //!
 //! The batcher reads from `M + 1` archives, not one:
 //!
-//! - The **TxOrdering archive** carries the canonical orderer payload. It
+//! - The **`TxOrdering` archive** carries the canonical orderer payload. It
 //!   holds only `TxOrderingMessage` records (`TxRef + BoundaryStart`). Each
 //!   record is small.
-//! - The **per-sequencer tx_data archives** carry the bulk `TxEnvelope`
+//! - The **per-sequencer `tx_data` archives** carry the bulk `TxEnvelope`
 //!   bytes. There is one archive per sequencer. [`multi_archive_reader`]
 //!   opens each archive on demand.
 //!
 //! [`multi_archive_reader::MultiArchiveReader`] connects the two archives. It
 //! walks the ordering archive in canonical order. For each `TxRef`, it looks
-//! up the position in the matching tx_data index. It yields
+//! up the position in the matching `tx_data` index. It yields
 //! [`multi_archive_reader::ResolvedRecord`]s. The existing
 //! [`batch::BatchAccumulator`] can consume these records as-is.
 //!
@@ -42,6 +42,8 @@ pub mod prover_submit;
 pub mod recon;
 pub mod rereplicate;
 pub mod settlement;
+#[cfg(any(test, feature = "test-support", feature = "docker-e2e"))]
+pub mod testkit;
 
 pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
 pub use batcher::{Batcher, MockSender, PostedBatch, Sender};
@@ -50,8 +52,8 @@ pub use error::BatcherError;
 pub use frame::{BlockFrame, Kar1Payload, TxFrame};
 pub use l1::{BatchDescriptor, post_batch, read_posted_batches, recover_blocks};
 pub use multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
-pub use optimistic::{ClaimOutcome, WatchOutcome, claim_next_batch, watch_and_challenge};
-pub use prover_submit::{SubmitOutcome, submit_next_proof};
+pub use optimistic::{BatchClaimer, BatchWatcher, ClaimOutcome, WatchOutcome};
+pub use prover_submit::{ProofSubmitter, SubmitOutcome};
 pub use rereplicate::{
     HealReport, MirrorReport, diff_mirror, heal_from_mirror, mirror_archive, verify_mirror,
 };

@@ -1,8 +1,8 @@
 //! `BatchAccumulator` groups transactions into per-block batches at
 //! `BlockBoundaryStart` markers.
 //!
-//! The sealer emits boundaries onto B. Today, the
-//! batcher reads only tx_ordering. It never queries the live sequencer.
+//! The sealer emits boundaries onto B. The batcher reads only `tx_ordering`.
+//! It never queries the live sequencer.
 //!
 //! The accumulator is stream-oriented. It reads one ordered sequence of
 //! records, with transactions, remote-epoch records, and boundary markers
@@ -19,6 +19,8 @@
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
+use crate::multi_archive_reader::ResolvedRecord;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedTx {
     pub position: BPosition,
@@ -30,6 +32,9 @@ pub struct ClosedBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,
     pub end_tx_idx: BPosition,
+    /// The L1 block number of the newest epoch at or before this block,
+    /// from the boundary.
+    pub l1_origin: u64,
     /// Remote-epoch records leading this block (canonical-stream order).
     pub remote_epochs: Vec<RemoteEpochRecord>,
     pub txs: Vec<RecordedTx>,
@@ -42,6 +47,7 @@ pub struct BatchAccumulator {
 }
 
 impl BatchAccumulator {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -62,19 +68,38 @@ impl BatchAccumulator {
 
     /// Observe a boundary. Closes the current block and returns it. The next
     /// calls to `observe_tx` add to the next block.
-    pub fn observe_boundary(&mut self, b: BlockBoundaryStart) -> ClosedBlock {
+    pub fn observe_boundary(&mut self, b: &BlockBoundaryStart) -> ClosedBlock {
         let txs = std::mem::take(&mut self.pending);
         let remote_epochs = std::mem::take(&mut self.pending_remote_epochs);
         ClosedBlock {
             block_number: b.block_number,
             l2_timestamp: b.l2_timestamp,
             end_tx_idx: b.end_tx_idx,
+            l1_origin: b.l1_origin,
             remote_epochs,
             txs,
         }
     }
 
+    /// Feed one record resolved from the archive reader (or the live
+    /// reader stack). Returns the closed block at a `Boundary` record;
+    /// `None` for a `Tx` or `RemoteEpoch` record, which only buffer.
+    pub fn observe(&mut self, rec: ResolvedRecord) -> Option<ClosedBlock> {
+        match rec {
+            ResolvedRecord::Tx { position, env, .. } => {
+                self.observe_tx(env, position);
+                None
+            }
+            ResolvedRecord::RemoteEpoch { record, .. } => {
+                self.observe_remote_epoch(record);
+                None
+            }
+            ResolvedRecord::Boundary { marker, .. } => Some(self.observe_boundary(&marker)),
+        }
+    }
+
     /// Number of buffered txs not yet attributed to a block.
+    #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }

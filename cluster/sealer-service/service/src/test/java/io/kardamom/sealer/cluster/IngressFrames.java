@@ -93,6 +93,36 @@ final class IngressFrames {
         return buf;
     }
 
+    /** A {@code KIND_REPLAY_REQUEST} frame: {@code kind(1) | fromIndex(8 LE) | fromBlock(8 LE)}. */
+    static byte[] replayRequestFrame(final long fromIndex, final long fromBlock) {
+        return java.nio.ByteBuffer.allocate(1 + 2 * Long.BYTES)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(SealerWire.KIND_REPLAY_REQUEST)
+            .putLong(fromIndex)
+            .putLong(fromBlock)
+            .array();
+    }
+
+    /** The canonical id that {@link #recordFrame} gives to {@code idTag}. */
+    static byte[] recordId(final int idTag) {
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        id[0] = (byte) idTag;
+        id[31] = 0x5A;
+        return id;
+    }
+
+    /** A {@code KIND_VOID_REQUEST} frame: {@code [kind:6][voter_id:u8][index:u64 LE][tx_hash:32]}. */
+    static byte[] voidRequestFrame(final int voterId, final long index, final byte[] txHash32) {
+        final byte[] out = new byte[SealerWire.MIN_VOID_REQUEST_LEN];
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
+        buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_VOID_REQUEST);
+        buf.putByte(SealerWire.VOID_VOTER_OFFSET, (byte) voterId);
+        buf.putLong(SealerWire.VOID_INDEX_OFFSET, index, ByteOrder.LITTLE_ENDIAN);
+        buf.putBytes(SealerWire.VOID_HASH_OFFSET, txHash32);
+        buf.getBytes(0, out);
+        return out;
+    }
+
     /** A one-byte {@code KIND_SUBSCRIBE} consumer announcement. */
     static byte[] subscribeFrame() {
         return new byte[] {SealerWire.KIND_SUBSCRIBE};
@@ -110,10 +140,7 @@ final class IngressFrames {
         buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_INGRESS_RECORD);
         buf.putBytes(SealerWire.SENDER_OFFSET, sender20);
         buf.putLong(SealerWire.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
-        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
-        id[0] = (byte) idTag;
-        id[31] = 0x5A;
-        buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, id);
+        buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, recordId(idTag));
         buf.putByte(out.length - 1, (byte) idTag);
         buf.getBytes(0, out);
         return out;

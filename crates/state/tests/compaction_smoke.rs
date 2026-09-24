@@ -3,15 +3,12 @@
 //! equivalence; that is libmdbx's own responsibility.
 
 use kardamom_state::compact_to;
-use kardamom_state::env::{Durability, StateEnvBuilder};
+
+mod common;
 
 #[test]
 fn compact_emits_a_directory() {
-    let src_dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(src_dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
+    let (_src_dir, env) = common::temp_env();
 
     let dst_dir = tempfile::tempdir().unwrap();
     let dst = dst_dir.path().join("compacted");
@@ -26,11 +23,9 @@ fn compact_emits_a_directory() {
         dst.display()
     );
     let size = if dst.is_dir() {
-        std::fs::metadata(dst.join("mdbx.dat"))
-            .map(|m| m.len())
-            .unwrap_or(0)
+        std::fs::metadata(dst.join("mdbx.dat")).map_or(0, |m| m.len())
     } else {
-        std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&dst).map_or(0, |m| m.len())
     };
     assert!(
         size > 0,
@@ -41,11 +36,7 @@ fn compact_emits_a_directory() {
 
 #[test]
 fn compact_refuses_existing_destination() {
-    let src_dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(src_dir.path())
-        .durability(Durability::SafeNoSync)
-        .open()
-        .unwrap();
+    let (_src_dir, env) = common::temp_env();
 
     let dst_dir = tempfile::tempdir().unwrap();
     let dst = dst_dir.path().join("preexisting");

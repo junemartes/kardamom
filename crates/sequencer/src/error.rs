@@ -19,6 +19,10 @@ pub enum SequencerError {
     /// sequencer's pump.
     #[error("encode failed: {0}")]
     EncodeFailed(String),
+
+    /// The config `Sequencer::new` was built from failed validation.
+    #[error("config error: {0}")]
+    Config(#[from] crate::config::ConfigError),
 }
 
 #[cfg(test)]

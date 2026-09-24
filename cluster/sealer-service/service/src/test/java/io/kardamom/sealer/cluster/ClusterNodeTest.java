@@ -89,4 +89,35 @@ final class ClusterNodeTest {
         // A typo is fatal, never a silently disabled peer.
         assertThrows(IllegalStateException.class, () -> ClusterNode.parseRemoteOrigins("412347,abc"));
     }
+
+    @Test
+    void parseVoidConfigMakesAVoterMaskAndRefusesATypo() {
+        assertEquals(0L, ClusterNode.parseVoidConfig(null, 16).voterMask);
+        assertEquals(0, ClusterNode.parseVoidConfig(" ", 16).capacity, "no voters keeps no window");
+        assertEquals(0b1_0111L, ClusterNode.parseVoidConfig("0, 1,2,4,", 16).voterMask);
+        assertEquals(16, ClusterNode.parseVoidConfig("0", 16).capacity);
+        // A typo is fatal, never a silently smaller voter set.
+        assertThrows(IllegalStateException.class, () -> ClusterNode.parseVoidConfig("0,x", 16));
+        assertThrows(IllegalStateException.class, () -> ClusterNode.parseVoidConfig("64", 16));
+    }
+
+    @Test
+    void fileSyncLevelDefaultsToZeroAndRefusesAValueOutsideZeroToTwo() {
+        final String key = "kardamom.cluster.fileSyncLevel";
+        final String before = System.getProperty(key);
+        try {
+            System.clearProperty(key);
+            assertEquals(0, ClusterNode.fileSyncLevel());
+            System.setProperty(key, "2");
+            assertEquals(2, ClusterNode.fileSyncLevel());
+            System.setProperty(key, "3");
+            assertThrows(IllegalArgumentException.class, ClusterNode::fileSyncLevel);
+        } finally {
+            if (before == null) {
+                System.clearProperty(key);
+            } else {
+                System.setProperty(key, before);
+            }
+        }
+    }
 }

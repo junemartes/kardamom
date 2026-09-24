@@ -1,10 +1,4 @@
 //! Metric name constants for the executor.
-//!
-//! Emission sites:
-//!   - `actor.rs`: block-apply duration, state-commit duration, block-number
-//!     gauge.
-//!   - `executor.rs`: per-tx counter, from `execute_tx` and
-//!     `execute_deposit_tx` return values, checked in `actor::spawn_exec`.
 
 pub const TX_APPLIED_TOTAL: &str = "kardamom_executor_tx_applied_total";
 pub const BLOCK_APPLY_DURATION_SECONDS: &str = "kardamom_executor_block_apply_duration_seconds";
@@ -54,7 +48,14 @@ pub const FOOTPRINT_ORACLE_CP_RATIO: &str = "kardamom_executor_footprint_oracle_
 /// active. This stays at 0 while the feature is off. Once active, it advances
 /// once per block. If this counter stalls while `BLOCK_NUMBER` rises, the
 /// feature has stopped firing.
-pub const HEALTH_BEACON_BEATS_TOTAL: &str = "kardamom_executor_health_beacon_beats_total";
+pub(crate) const HEALTH_BEACON_BEATS_TOTAL: &str = "kardamom_executor_health_beacon_beats_total";
+
+/// Live queue depth of one `tx_data` subscription's tokio channel. The Aeron
+/// poll task feeds this channel and cannot block, so the channel is
+/// unbounded (see [`crate::bin_support::LiveTxDataSub`]): this gauge is the
+/// operator's signal that the engine reader has stalled and the channel is
+/// growing without limit.
+pub(crate) const TX_DATA_QUEUE_DEPTH: &str = "kardamom_executor_tx_data_queue_depth";
 
 // Full-resync fallback, for a replay-window overrun. The executor binary
 // bumps this when the cluster refuses REPLAY_FROM (`REPLAY_UNAVAILABLE`) and
@@ -79,6 +80,14 @@ pub fn describe() {
         "wall time spent committing state to the backing DB"
     );
     metrics::describe_gauge!(BLOCK_NUMBER, "most recently committed block number");
+    metrics::describe_counter!(
+        HEALTH_BEACON_BEATS_TOTAL,
+        "blocks closed with the health-check feature active"
+    );
+    metrics::describe_gauge!(
+        TX_DATA_QUEUE_DEPTH,
+        "live queue depth of one tx_data subscription's unbounded channel"
+    );
     metrics::describe_gauge!(
         SEALER_BLOCK_NUMBER,
         "sealer's block number per its latest boundary, observed at cluster egress"

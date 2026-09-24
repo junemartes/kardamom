@@ -1,11 +1,11 @@
 //! Outbound channel abstractions.
 //!
-//! Under the MDS topology, the sequencer does not publish to tx_data.
+//! Under the MDS topology, the sequencer does not publish to `tx_data`.
 //! That is the proxy's job. The sequencer only reads A and publishes
-//! B-refs: for each envelope it sees on its shard's tx_data (through
+//! B-refs: for each envelope it sees on its shard's `tx_data` (through
 //! [`crate::inbound::TxDataSubscriber`]), if the nonce gate matches, it
 //! publishes a tiny [`kardamom_types::TxRef`] onto the canonical orderer
-//! tx_ordering ([`TxOrderingRefPublisher`]). This is an Aeron concurrent
+//! `tx_ordering` ([`TxOrderingRefPublisher`]). This is an Aeron concurrent
 //! multi-publisher stream, ordered together with refs from the other P-1
 //! sequencers in this shard's group and sealer-emitted
 //! `BlockBoundaryStart` markers.
@@ -28,16 +28,17 @@
 pub mod cluster;
 
 use alloy_primitives::Address;
+use kardamom_log::aeron_live::TxErrorsPublisherHandle;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
-/// TxOrdering publisher contract, the canonical orderer. Publishes tiny
+/// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
 /// [`TxRef`]s for L2 transactions (about 41 bytes) into Aeron's concurrent
 /// multi-publisher stream, plus whole [`EpochRecord`]s for L1 epochs and
 /// [`RemoteEpochRecord`]s for peer chains. Every lane shares the
-/// tx_ordering channel, so all three interleave in one canonical order.
+/// `tx_ordering` channel, so all three interleave in one canonical order.
 ///
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`,
 /// so the state machine can rewind.
@@ -45,6 +46,11 @@ pub trait TxOrderingRefPublisher: Send {
     /// `sender` and `nonce` ride the ingress frame's guard header, for
     /// the sealer's per-sender contiguity guard. They are not part of the
     /// relayed record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SequencerError::Backpressure)` if the transport is
+    /// blocked.
     fn try_publish_ref(
         &mut self,
         r: &TxRef,
@@ -78,6 +84,11 @@ pub trait TxOrderingRefPublisher: Send {
     /// `try_publish_ref`. Epochs are not nonce-gated and have no pending
     /// state to rewind, so on `Backpressure` the caller retries the same
     /// epoch on the next tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SequencerError::Backpressure)` if the transport is
+    /// blocked.
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError>;
 
     /// Publish a [`RemoteEpochRecord`] observed on `tx_remote_epochs` as a
@@ -87,15 +98,33 @@ pub trait TxOrderingRefPublisher: Send {
     /// Same backpressure semantics — nothing is nonce-gated and there is no
     /// pending state to rewind, so on `Backpressure` the caller retries the
     /// same record next tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SequencerError::Backpressure)` if the transport is
+    /// blocked.
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
-/// TxErrors channel publisher. This is best-effort: the caller logs
+/// `TxErrors` channel publisher. This is best-effort: the caller logs
 /// errors and does not propagate them. The canonical state has already
 /// advanced, or the inbound transaction was rejected, so there is nothing
 /// to roll back.
 pub trait TxErrorPublisher: Send {
     fn publish_error(&mut self, e: TxError);
+}
+
+/// The live adapter. The sequencer publishes rejections (today: duplicate
+/// or past-nonce) on the `tx_errors` Aeron channel. Ingress reads them to
+/// release parked clients early. A publish failure is logged and dropped:
+/// the canonical state has already advanced, or the transaction was
+/// rejected, so there is nothing to roll back.
+impl TxErrorPublisher for TxErrorsPublisherHandle {
+    fn publish_error(&mut self, e: TxError) {
+        if let Err(err) = self.publish(&e) {
+            tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
+        }
+    }
 }
 
 // ===========================================================================
@@ -109,9 +138,9 @@ pub mod fakes {
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef};
 
-    use super::*;
+    use super::{SequencerError, TxError, TxErrorPublisher, TxOrderingRefPublisher};
 
-    /// In-memory tx_ordering publisher. Records every published `TxRef`,
+    /// In-memory `tx_ordering` publisher. Records every published `TxRef`,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
     /// can check the canonical sequence.
     #[derive(Default, Clone)]
@@ -221,7 +250,7 @@ mod tests {
     fn test_epoch(n: u64) -> EpochRecord {
         EpochRecord {
             l1_number: n,
-            l1_hash: B256::repeat_byte(n as u8),
+            l1_hash: B256::repeat_byte(u8::try_from(n).unwrap()),
             deposits: Vec::new(),
         }
     }

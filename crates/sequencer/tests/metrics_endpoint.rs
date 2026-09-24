@@ -1,7 +1,7 @@
 //! Smoke test: calling `kardamom_obs::init("sequencer", ...)` exposes
 //! `/metrics` with the expected counters.
 
-use std::net::{SocketAddr, TcpListener};
+use kardamom_obs::testkit::{free_port, scrape};
 
 #[tokio::test]
 async fn sequencer_metrics_endpoint_serves_expected_counters() {
@@ -24,23 +24,47 @@ async fn sequencer_metrics_endpoint_serves_expected_counters() {
         body.contains("service=\"sequencer\""),
         "missing service label"
     );
+    readiness_gauges(&format!("http://{addr}/metrics")).await;
 }
 
-fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let a = l.local_addr().unwrap();
-    drop(l);
-    a
+/// Readiness must distinguish a fresh idle replica from a missing exporter,
+/// and a replica that re-enters RESYNC must not retain its old zero gauge.
+async fn readiness_gauges(url: &str) {
+    use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig};
+    use std::time::{Duration, Instant};
+
+    let _seq = kardamom_sequencer::Sequencer::new(kardamom_sequencer::testkit::one_partition_cfg())
+        .unwrap();
+    let cfg = ResyncConfig::default();
+    let hold = Duration::from_millis(cfg.exit_hold_ms);
+    let stall = Duration::from_millis(cfg.publish_stall_ms);
+    let mut channel = ResyncChannel::open(cfg, 0).unwrap();
+    let body = scrape(url).await;
+    let depths: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("kardamom_sequencer_pending_depth{"))
+        .collect();
+    assert_eq!(depths.len(), 256);
+    assert!(depths.iter().all(|line| line.ends_with(" 0")));
+    assert_mode(&body, "1");
+
+    let now = Instant::now();
+    channel.watermark.store(1);
+    channel.controller.observe(now);
+    channel.controller.observe(now + hold);
+    assert!(!channel.controller.active());
+    assert_mode(&scrape(url).await, "0");
+
+    channel.controller.note_publish_stall(now + hold);
+    channel.controller.note_publish_stall(now + hold + stall);
+    assert!(channel.controller.active());
+    assert_mode(&scrape(url).await, "1");
 }
 
-async fn scrape(url: &str) -> String {
-    for _ in 0..40 {
-        if let Ok(r) = reqwest::get(url).await
-            && r.status().is_success()
-        {
-            return r.text().await.unwrap();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("exporter not ready at {url}");
+fn assert_mode(body: &str, value: &str) {
+    let mode = body
+        .lines()
+        .find(|line| line.starts_with("kardamom_sequencer_resync_mode{"))
+        .expect("RESYNC gauge exists");
+    assert_eq!(mode.split_whitespace().last(), Some(value));
 }

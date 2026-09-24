@@ -14,10 +14,10 @@
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
-# cluster egress 40231, refetch 40133/40143, metrics 9002 (the
-# validator holds 40230/40131/40141/9006).
+# cluster egress and refetch on Nomad dynamic ports, metrics 9002 (the
+# validator holds 9006 and its own dynamic ports).
 #
-# scripts/deploy.sh deploys the settlement address, with
+# ansible/deploy.yml deploys the settlement address, with
 # kardamom-deploy against anvil, and injects it at submit time:
 #   nomad run -var 'settlement_address=0x<addr>' batcher.nomad.hcl
 # The batcher EOA is anvil dev account #2, pre-funded. Its key below is
@@ -26,7 +26,7 @@
 # deploy/cluster, and the spec flags it.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
 variable "settlement_address" {
   type = string
@@ -42,7 +42,7 @@ variable "batcher_key" {
   default = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
 # mutable :dev tag in the task config. That fallback is a dev
@@ -54,8 +54,20 @@ variable "image_ref" {
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "l1_rpc" {
+  type        = string
+  description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
+  default     = "http://anvil.service.consul:8546"
+}
+
 job "batcher" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -95,13 +107,22 @@ job "batcher" {
 
     network {
       mode = "host"
+      # The cluster egress (response) port, unique per allocation. A
+      # fixed port sat in the node's ephemeral range, where the shared
+      # media driver's port-0 discovery sockets could take it first.
+      port "egress" {}
+      # The join-miss refetch ports: replayed fragments and archive
+      # control responses. Nomad picks them per allocation, below the
+      # ephemeral range, so no other process on the node holds them.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "batcher" {
       driver = "docker"
 
       config {
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-batcher:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-batcher:dev"
         # force_pull stays on for both paths; see the ingress job's
         # comment. The :dev fallback needs it. On the pinned path, the
         # 1.9.5 driver pulls the tag but resolves the image by digest,
@@ -126,16 +147,17 @@ job "batcher" {
           "--config", "/local/batcher.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This node's cluster-egress (response) endpoint, for the
-          # batcher's own cluster client session: 40231, distinct
-          # from the validator's 40230 on the same node.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40231",
+          # This allocation's cluster-egress (response) endpoint, for
+          # the batcher's own cluster client session: the node IP and a
+          # Nomad dynamic port, so it never clashes with the validator's
+          # on the same node.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Join-miss archive refetch (tx_data and tx_deposits). Same
-          # contract as the validator's flags, with distinct ports on
-          # the shared aux node.
-          "--replay-destination-endpoint", "${meta.node_ip}:40133",
-          "--archive-control-response-endpoint", "${meta.node_ip}:40143",
-          "--l1-rpc", "http://192.168.56.10:8546",
+          # contract as the validator's flags, on this allocation's
+          # dynamic ports.
+          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
+          "--l1-rpc", var.l1_rpc,
           "--settlement", "${var.settlement_address}",
           "--da-store", "/opt/kardamom/batcher/da",
           "--cursor-file", "/opt/kardamom/batcher/cursor.json",
@@ -162,6 +184,10 @@ job "batcher" {
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       # [cluster] ingress endpoints. Same contract as the executor's

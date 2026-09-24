@@ -24,6 +24,7 @@ library XChain {
     /// @notice Canonical predeploy addresses, mirrored in `xchain.rs`.
     address internal constant OUTBOX = 0x42000000000000000000000000000000000000E0;
     address internal constant INBOX = 0x42000000000000000000000000000000000000e1;
+    address internal constant CHECKPOINT_MARKER = 0x42000000000000000000000000000000000000e2;
 
     /// @notice Response requested by a message sender. Zeroed = none.
     /// @dev    Only the fully zeroed struct is "none" (`isNone`). A struct

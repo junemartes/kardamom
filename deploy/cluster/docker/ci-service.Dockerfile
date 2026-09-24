@@ -1,10 +1,9 @@
-# syntax=docker/dockerfile:1.7
 # =============================================================================
 # ci-service.Dockerfile — thin runtime image wrapping a PREBUILT kardamom
 # binary, for the container-based cluster e2e only.
 # =============================================================================
 #
-# The production image (service.Dockerfile) compiles the whole workspace inside
+# A multi-stage image would compile the whole workspace inside
 # the builder stage — correct, but ~30-60 min on a CI runner. For cluster-e2e
 # we instead `cargo build --release` ONCE on the runner (with the shared rust
 # cache) and copy the resulting binary in here, so each of the 7 images is a
@@ -18,7 +17,7 @@
 # the binaries + libaeron.so are built: a slim debian (bookworm, glibc 2.36)
 # can't load a libaeron.so built against the runner's newer glibc ("version
 # `GLIBC_2.38' not found"). cluster-e2e.yml pins runs-on to ubuntu-24.04 to keep
-# the build and runtime glibc aligned. (The production service.Dockerfile builds
+# the build and runtime glibc aligned. (A multi-stage image builds
 # and runs on bookworm throughout, so it stays self-consistent.)
 FROM ubuntu:24.04
 
@@ -30,7 +29,7 @@ RUN apt-get update && \
         ca-certificates libbsd0 libuuid1 libstdc++6 && \
     rm -rf /var/lib/apt/lists/*
 
-# The binaries link Aeron dynamically; ci-cluster.sh stages libaeron.so /
+# The binaries link Aeron dynamically; ansible/images.yml stages libaeron.so /
 # libaeron_archive_c_client.so (from the cargo build dir) into _aeronlibs/ in
 # the build context. Install them where the dynamic linker looks, else the
 # binary aborts at startup with "libaeron.so: cannot open shared object file".
@@ -40,7 +39,7 @@ RUN ldconfig
 # The prebuilt binary (build context = target/release).
 COPY ${BIN} /usr/local/bin/${BIN}
 
-# Same world-writable-aeron-dir rationale as service.Dockerfile: these run with
+# The world-writable aeron dir: these run with
 # host networking and bind-mount the shared aeron.dir; run as an unprivileged
 # user that can RW the driver's umask-0000 files.
 RUN groupadd --gid 10001 kardamom && \

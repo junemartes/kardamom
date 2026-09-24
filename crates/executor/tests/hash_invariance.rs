@@ -1,21 +1,26 @@
-//! Tests for write_set_hash: permutation invariance and sensitivity to value
+//! Tests for `write_set_hash`: permutation invariance and sensitivity to value
 //! changes.
 //!
 //! Property: take a `WriteSet` `ws`. Build `ws'` by inserting the same
 //! (addr, kind, key, value) tuples in a random shuffled order. Then
 //! `ws'.hash() == ws.hash()`. Sensitivity: a change to any single value
 //! flips the hash.
+//!
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "indices and counts here are bounded by the small fixed test fixtures, never near a truncation boundary"
+)]
 
 use alloy_primitives::{Address, B256, U256};
+use kardamom_engine::delta::AccountFields;
 use kardamom_engine::delta::WriteSet;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-fn build(
-    accounts: &[(Address, (u64, U256, B256))],
-    storage: &[((Address, B256), U256)],
-) -> WriteSet {
+fn build(accounts: &[(Address, AccountFields)], storage: &[((Address, B256), U256)]) -> WriteSet {
     let mut ws = WriteSet::default();
     for (a, c) in accounts {
         ws.accounts.push((*a, *c));
@@ -30,20 +35,24 @@ fn build(
     ws
 }
 
-type AccountVec = Vec<(Address, (u64, U256, B256))>;
+type AccountVec = Vec<(Address, AccountFields)>;
 type StorageVec = Vec<((Address, B256), U256)>;
 
 fn sample(seed: u64) -> (AccountVec, StorageVec) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_acc: u64 = 32;
     let n_sto: u64 = 128;
-    let accounts: Vec<(Address, (u64, U256, B256))> = (0..n_acc)
+    let accounts: AccountVec = (0..n_acc)
         .map(|i| {
             let mut a = [0u8; 20];
             rng.fill(&mut a);
             (
                 Address::from(a),
-                (i, U256::from(i * 7), B256::repeat_byte((i % 256) as u8)),
+                AccountFields {
+                    nonce: i,
+                    balance: U256::from(i * 7),
+                    code_hash: B256::repeat_byte((i % 256) as u8),
+                },
             )
         })
         .collect();
@@ -56,18 +65,29 @@ fn sample(seed: u64) -> (AccountVec, StorageVec) {
     (accounts, storage)
 }
 
+/// Shuffle a fresh clone of `accounts` and `storage` with `rng`, and
+/// assert the shuffled build's hash still equals `base`.
+fn assert_permutation_stable(
+    accounts: &AccountVec,
+    storage: &StorageVec,
+    base: B256,
+    rng: &mut ChaCha8Rng,
+) {
+    let mut a = accounts.clone();
+    let mut s = storage.clone();
+    a.shuffle(rng);
+    s.shuffle(rng);
+    assert_eq!(build(&a, &s).hash(), base);
+}
+
 #[test]
 fn permuting_input_does_not_change_hash() {
-    let (accounts, storage) = sample(0xDEADBEEF);
+    let (accounts, storage) = sample(0xDEAD_BEEF);
     let base = build(&accounts, &storage).hash();
 
-    let mut rng = ChaCha8Rng::seed_from_u64(0xC0FFEE);
+    let mut rng = ChaCha8Rng::seed_from_u64(0xC0_FFEE);
     for _ in 0..16 {
-        let mut a = accounts.clone();
-        let mut s = storage.clone();
-        a.shuffle(&mut rng);
-        s.shuffle(&mut rng);
-        assert_eq!(build(&a, &s).hash(), base);
+        assert_permutation_stable(&accounts, &storage, base, &mut rng);
     }
 }
 
@@ -85,6 +105,6 @@ fn flipping_one_balance_changes_hash() {
     let (accounts, storage) = sample(99);
     let base = build(&accounts, &storage).hash();
     let mut accounts_b = accounts.clone();
-    accounts_b[0].1.1 += U256::from(1u64);
+    accounts_b[0].1.balance += U256::from(1u64);
     assert_ne!(build(&accounts_b, &storage).hash(), base);
 }

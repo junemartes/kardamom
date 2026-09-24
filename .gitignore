@@ -1,4 +1,7 @@
 target
+mise.local.toml
+.mise.local.toml
+.ansible/
 docs/superpowers
 contracts/cache/
 contracts/out/
@@ -10,7 +13,8 @@ flame.folded
 flame.svg
 results/
 
-.claude
+.claude/*
+!.claude/settings.json
 
 # solc compiler blob (fetched, not source)
 soljson-latest.js
@@ -26,3 +30,6 @@ __pycache__/
 deploy/cluster/images.digests
 deploy/cluster/images.digests.sigbundle
 
+
+# dhat heap profiles written by crates/bench alloc_profile tests
+crates/bench/dhat-heap*.json

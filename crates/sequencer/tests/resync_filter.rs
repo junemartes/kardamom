@@ -1,69 +1,16 @@
-//! Driver-level tests for the receipt-floor resync filter (see
-//! docs/agents/sequencer-lag-resync-spec.md). A skip happens only with
-//! receipt proof, and only in resync mode. Everything unproven publishes
-//! (sole-survivor safety). Receipt floors unstick a cold-rejoined
-//! replica's buffered run, without ever publishing a canonical gap.
+//! Driver-level tests for the receipt-floor resync filter. A skip happens
+//! only with receipt proof, and only in resync mode. Everything unproven
+//! publishes (sole-survivor safety). Receipt floors unstick a
+//! cold-rejoined replica's buffered run, without ever publishing a
+//! canonical gap.
 
-use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, U256};
-use alloy_rlp::Encodable;
-use alloy_signer_local::PrivateKeySigner;
-use bytes::Bytes;
-use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
+use kardamom_types::TxDataLoc;
 
-use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedTxData;
-use kardamom_sequencer::outbound::fakes::{
-    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
-};
-use kardamom_sequencer::resync::{FloorUpdate, ResyncConfig, resync_channel};
+use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig};
 use kardamom_sequencer::sequencer::Sequencer;
-
-fn signer(seed: u64) -> PrivateKeySigner {
-    let mut k = [0u8; 32];
-    k[24..].copy_from_slice(&seed.to_be_bytes());
-    PrivateKeySigner::from_bytes(&k.into()).unwrap()
-}
-
-fn signed_tx_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
-    let tx = TxLegacy {
-        chain_id: Some(1),
-        nonce,
-        gas_price: 1_000_000_000,
-        gas_limit: 21_000,
-        to: Address::ZERO.into(),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let mut tx_mut = tx;
-    let sig = signer.sign_transaction_sync(&mut tx_mut).unwrap();
-    let alloy_env: ConsensusEnvelope = tx_mut.into_signed(sig).into();
-    let mut buf = Vec::with_capacity(256);
-    alloy_env.encode(&mut buf);
-    TxEnvelope {
-        correlation_id,
-        raw_tx: Bytes::from(buf),
-        sender: signer.address(),
-        tx_hash: Default::default(),
-    }
-}
-
-fn one_partition_cfg() -> SequencerConfig {
-    SequencerConfig {
-        partition_count: 1,
-        partition_index: 0,
-        sequencer_id: 0,
-        ..Default::default()
-    }
-}
-
-fn pos(offset: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: offset,
-    }
-}
+use kardamom_sequencer::testkit::{
+    Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
+};
 
 /// A sequencer with resync enabled. Returns the floor-update sender.
 /// The controller starts in resync mode (the startup trigger), which is
@@ -75,8 +22,13 @@ type ResyncTestRig = (
 );
 
 fn resync_sequencer_with_rejects() -> ResyncTestRig {
-    let mut seq = Sequencer::new(one_partition_cfg());
-    let (controller, floor_tx, reject_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
+    let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
+    let ResyncChannel {
+        controller,
+        floor_tx,
+        reject_tx,
+        ..
+    } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
     seq.enable_resync(controller);
     (seq, floor_tx, reject_tx)
 }
@@ -89,15 +41,9 @@ fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
 #[test]
 fn receipt_proven_nonce_is_skipped_unproven_published() {
     let s = signer(1);
-    let mut channel_a = ScriptedTxData::default();
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 1, 10)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 2, 11)));
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 1, 10));
+    rig.push(TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 2, 11));
     let (mut seq, floor_tx) = resync_sequencer();
 
     // A receipt for nonce 1 exists (the twin covered it), so the floor
@@ -109,22 +55,17 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     // notice. The transaction executed, so reporting it as a duplicate
     // to ingress would be spurious.
     floor_tx
-        .send(FloorUpdate {
-            deposit: false,
-            sender: s.address(),
-            executed_nonce: 1,
-            skip_reason: None,
-        })
+        .send(FloorUpdate::executed(s.address(), 1))
         .unwrap();
 
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    rig.step(&mut seq).unwrap();
+    rig.step(&mut seq).unwrap();
 
-    let refs = b.refs.lock().unwrap();
+    let refs = rig.refs();
     assert_eq!(refs.len(), 1, "nonce 1 skipped (proven), nonce 2 published");
     assert_eq!(refs[0].tx_data_position, pos(64));
     assert!(
-        rc.errors.lock().unwrap().is_empty(),
+        rig.errors().is_empty(),
         "a receipt-proven skip is not a client error"
     );
 }
@@ -135,21 +76,19 @@ fn sole_survivor_publishes_everything() {
     // mode must publish the full backlog. No accepted transaction is ever
     // dropped on inference.
     let s = signer(2);
-    let mut channel_a = ScriptedTxData::default();
+    let mut rig = Rig::default();
     for n in 0..3u64 {
-        channel_a.queue.push_back((
-            TxDataLoc::new(0, pos(64 * n as i32)),
+        rig.push(
+            TxDataLoc::new(0, pos(64 * i32::try_from(n).unwrap())),
             signed_tx_envelope(&s, n, n),
-        ));
+        );
     }
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
     let (mut seq, _floor_tx) = resync_sequencer();
 
     for _ in 0..3 {
-        seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+        rig.step(&mut seq).unwrap();
     }
-    assert_eq!(b.refs.lock().unwrap().len(), 3);
+    assert_eq!(rig.refs().len(), 3);
 }
 
 #[test]
@@ -159,37 +98,26 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
     // the buffered run can never become contiguous from 0. A receipt for
     // nonce 4 advances the floor to 5, and the run drains.
     let s = signer(3);
-    let mut channel_a = ScriptedTxData::default();
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 5, 50)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 6, 51)));
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 5, 50));
+    rig.push(TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 6, 51));
     let (mut seq, floor_tx) = resync_sequencer();
 
     // Both envelopes buffer as future (expected = 0, cold hydration).
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert!(b.refs.lock().unwrap().is_empty(), "stuck behind the gap");
+    rig.step(&mut seq).unwrap();
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().is_empty(), "stuck behind the gap");
 
     // Execution evidence arrives. Nonce 4 is receipted, so the floor becomes 5.
     floor_tx
-        .send(FloorUpdate {
-            deposit: false,
-            sender: s.address(),
-            executed_nonce: 4,
-            skip_reason: None,
-        })
+        .send(FloorUpdate::executed(s.address(), 4))
         .unwrap();
 
     // On the next iteration, the floor advances the state machine. The
     // buffered run 5,6 becomes contiguous and publishes. Floor 5 does not
     // prove that 5 and 6 executed, so the resync filter lets them through.
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    let refs = b.refs.lock().unwrap();
+    rig.step(&mut seq).unwrap();
+    let refs = rig.refs();
     assert_eq!(refs.len(), 2, "buffered run drained after floor advance");
 }
 
@@ -200,67 +128,45 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
 #[test]
 fn unconfirmed_refs_republish_until_receipt_confirms() {
     let s = signer(4);
-    let mut channel_a = ScriptedTxData::default();
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 40)));
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 1, 41)));
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 40));
+    rig.push(TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 1, 41));
     let (mut seq, floor_tx) = resync_sequencer();
 
     // Publish both refs at the default 15 second timeout. No republish churn.
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert_eq!(b.refs.lock().unwrap().len(), 2);
+    rig.step(&mut seq).unwrap();
+    rig.step(&mut seq).unwrap();
+    assert_eq!(rig.refs().len(), 2);
 
     // Confirm nonce 1. This is cumulative per sender, and retires both
     // (0 and 1).
     floor_tx
-        .send(FloorUpdate {
-            deposit: false,
-            sender: s.address(),
-            executed_nonce: 1,
-            skip_reason: None,
-        })
+        .send(FloorUpdate::executed(s.address(), 1))
         .unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    rig.step(&mut seq).unwrap();
 
     // With timeout 0, anything still unconfirmed would republish now.
     seq.set_confirm_timeout_ms(0);
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert_eq!(
-        b.refs.lock().unwrap().len(),
-        2,
-        "confirmed refs must never re-publish"
-    );
+    rig.step(&mut seq).unwrap();
+    assert_eq!(rig.refs().len(), 2, "confirmed refs must never re-publish");
 
     // A third, never-confirmed ref. With timeout 0, every iteration
     // rewinds and republishes it. This is the offer-is-not-commit
     // guarantee made recoverable.
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 2, 42)));
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap(); // publish #3
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap(); // republish #3
-    let n = b.refs.lock().unwrap().len();
+    rig.push(TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 2, 42));
+    rig.step(&mut seq).unwrap(); // publish #3
+    rig.step(&mut seq).unwrap(); // republish #3
+    let n = rig.refs().len();
     assert!(n >= 4, "unconfirmed ref must re-publish (got {n})");
 
     // Confirming it stops the churn.
     floor_tx
-        .send(FloorUpdate {
-            deposit: false,
-            sender: s.address(),
-            executed_nonce: 2,
-            skip_reason: None,
-        })
+        .send(FloorUpdate::executed(s.address(), 2))
         .unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    let stable = b.refs.lock().unwrap().len();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert_eq!(b.refs.lock().unwrap().len(), stable);
+    rig.step(&mut seq).unwrap();
+    let stable = rig.refs().len();
+    rig.step(&mut seq).unwrap();
+    assert_eq!(rig.refs().len(), stable);
 }
 
 /// A contiguity reject with a nonce below expected proves the ref
@@ -272,35 +178,28 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
 #[test]
 fn committed_proof_reject_retires_unconfirmed_entry() {
     let s = signer(5);
-    let mut channel_a = ScriptedTxData::default();
-    channel_a
-        .queue
-        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 60)));
-    let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryTxErrorPublisher::default();
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 60));
     let (mut seq, _floor_tx, reject_tx) = resync_sequencer_with_rejects();
 
     // Publish the sender's only transaction (nonce 0). No receipt will
     // ever confirm it, since nonce-0 receipts are excluded. So with
     // timeout 0 it republishes on every iteration: the infinite loop
     // this fix closes.
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert_eq!(b.refs.lock().unwrap().len(), 1);
+    rig.step(&mut seq).unwrap();
+    assert_eq!(rig.refs().len(), 1);
     seq.set_confirm_timeout_ms(0);
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    assert!(
-        b.refs.lock().unwrap().len() >= 2,
-        "unconfirmed nonce-0 churns"
-    );
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().len() >= 2, "unconfirmed nonce-0 churns");
 
     // The sealer answers a republish with a committed-proof reject
     // (nonce 0 below expected 1). The entry retires permanently.
     reject_tx.send((s.address(), 0, 1)).unwrap();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
-    let stable = b.refs.lock().unwrap().len();
-    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    rig.step(&mut seq).unwrap();
+    let stable = rig.refs().len();
+    rig.step(&mut seq).unwrap();
     assert_eq!(
-        b.refs.lock().unwrap().len(),
+        rig.refs().len(),
         stable,
         "committed-proof reject must stop the republish loop"
     );

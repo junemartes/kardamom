@@ -1,0 +1,37 @@
+min_version = "2026.3.10"
+
+[settings]
+# Enter hooks require this on the minimum supported mise version.
+experimental = true
+
+[env]
+ANSIBLE_COLLECTIONS_PATH = "{{config_root}}/.ansible/collections"
+
+[tools]
+rust = { version = "1.96.0", profile = "minimal", components = "clippy,rustfmt,rust-src" }
+java = "temurin-17.0.20+8"
+python = "3.12.14"
+uv = "0.12.17"
+cmake = "3.31.12"
+jq = "1.8.2"
+
+# Match the versions in .github/workflows and .github/actions.
+just = "1.49.0"
+foundry = "1.7.1"
+opentofu = "1.12.6"
+
+# Match deploy/cluster/ansible/group_vars/all.yml.
+nomad = "1.9.5"
+cosign = "3.1.3"
+
+# Include the controller's Docker API dependency and use the same core in lint.
+"pipx:ansible-core" = { version = "2.20.9", uvx_args = "--python 3.12.14 --with requests==2.34.2" }
+"pipx:ansible-lint" = { version = "26.8.0", uvx_args = "--python 3.12.14 --with ansible-core==2.20.9" }
+"pipx:yamllint" = { version = "1.38.0", uvx_args = "--python 3.12.14" }
+
+[hooks]
+enter = "mise install --quiet"
+
+[tasks.setup]
+description = "Install the pinned tools and Ansible collections"
+run = "ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml"

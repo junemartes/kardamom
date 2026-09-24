@@ -34,18 +34,22 @@
 //!     quietly fixed a gap would hide exactly the fault the no-skip rule
 //!     exists to catch.
 
+use std::future::Future;
+use std::num::NonZeroU32;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use kardamom_types::xchain::OutboxMessage;
 use tracing::{debug, error, warn};
 
-use crate::interop::feed::{
-    OutboxCursor, OutboxEventDto, SUBSCRIBE_OUTBOX_METHOD, UNSUBSCRIBE_OUTBOX_METHOD,
+use kardamom_interop_feed::{
+    Lag, OutboxCursor, OutboxEventDto, OutboxMessageDto, SUBSCRIBE_OUTBOX_METHOD,
+    UNSUBSCRIBE_OUTBOX_METHOD,
 };
+
 use crate::metrics;
 
 /// Errors a [`RemoteChainSource`] can surface.
@@ -61,7 +65,7 @@ pub enum RemoteSourceError {
     #[error("remote feed transport error: {0}")]
     Transport(String),
     /// A feed item this build cannot interpret (see
-    /// [`crate::interop::feed::FeedDecodeError`]).
+    /// [`kardamom_interop_feed::FeedDecodeError`]).
     #[error("remote feed decode error: {0}")]
     Decode(String),
     /// The feed's floor is above our cursor: the messages between are gone
@@ -84,7 +88,6 @@ pub enum RemoteSourceError {
 /// streaming source is stateful: it holds the live subscription and the
 /// partially-accumulated block. That also makes exclusive ownership the
 /// contract, so `Sync` is not required.
-#[async_trait]
 pub trait RemoteChainSource: Send + 'static {
     /// The peer chain this source observes. Configured, not inferred: it is an
     /// input to every derived message's `source_hash` and sender alias.
@@ -99,11 +102,14 @@ pub trait RemoteChainSource: Send + 'static {
     /// `cursor_seq` is authoritative on every call: a caller that did not
     /// advance (a publish it could not complete) gets the same batch again,
     /// which is safe precisely because re-derivation is byte-identical.
-    async fn next_batch(
+    fn next_batch(
         &mut self,
         cursor_seq: u64,
-    ) -> Result<Vec<OutboxMessage>, RemoteSourceError>;
+    ) -> impl Future<Output = Result<Vec<OutboxMessage>, RemoteSourceError>> + Send;
 }
+
+/// [`WsRemoteChainSource::new`]'s default reconnect budget.
+const DEFAULT_MAX_RECONNECT_ATTEMPTS: NonZeroU32 = NonZeroU32::new(8).unwrap();
 
 /// Production [`RemoteChainSource`]: a jsonrpsee WebSocket subscription to a
 /// peer validator's `kardamom_subscribeOutbox`.
@@ -122,7 +128,7 @@ pub struct WsRemoteChainSource {
     dest_chain_id: u64,
     url: String,
     reconnect_backoff: Duration,
-    max_reconnect_attempts: u32,
+    max_reconnect_attempts: NonZeroU32,
     // Held for its lifetime, not its API: dropping the client closes the
     // WebSocket out from under the subscription.
     client: Option<WsClient>,
@@ -143,7 +149,7 @@ impl WsRemoteChainSource {
             dest_chain_id,
             url: url.into(),
             reconnect_backoff: Duration::from_millis(250),
-            max_reconnect_attempts: 8,
+            max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
             client: None,
             subscription: None,
             cursor: None,
@@ -155,9 +161,10 @@ impl WsRemoteChainSource {
     /// the failure back to the watcher. Bounded rather than infinite so a dead
     /// peer surfaces on the watcher's tick metric instead of inside a silent
     /// retry loop.
-    pub fn with_reconnect(mut self, backoff: Duration, max_attempts: u32) -> Self {
+    #[must_use]
+    pub fn with_reconnect(mut self, backoff: Duration, max_attempts: NonZeroU32) -> Self {
         self.reconnect_backoff = backoff;
-        self.max_reconnect_attempts = max_attempts.max(1);
+        self.max_reconnect_attempts = max_attempts;
         self
     }
 
@@ -169,7 +176,10 @@ impl WsRemoteChainSource {
         self.pending.clear();
     }
 
-    async fn connect(&mut self, from: u64) -> Result<(), RemoteSourceError> {
+    async fn connect(
+        &mut self,
+        from: u64,
+    ) -> Result<Subscription<OutboxEventDto>, RemoteSourceError> {
         let client = WsClientBuilder::default()
             .build(&self.url)
             .await
@@ -183,40 +193,75 @@ impl WsRemoteChainSource {
             .await
             .map_err(|e| RemoteSourceError::Transport(format!("subscribe: {e}")))?;
         self.client = Some(client);
-        self.subscription = Some(subscription);
-        Ok(())
+        Ok(subscription)
     }
 
-    async fn ensure_subscribed(&mut self, from: u64) -> Result<(), RemoteSourceError> {
-        if self.subscription.is_some() {
-            return Ok(());
-        }
-        let mut last = None;
-        for attempt in 0..self.max_reconnect_attempts {
-            match self.connect(from).await {
-                Ok(()) => {
-                    debug!(
-                        target: "da_watcher::interop",
-                        origin = self.origin_chain_id,
-                        cursor = from,
-                        "subscribed to outbox feed"
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        target: "da_watcher::interop",
-                        origin = self.origin_chain_id,
-                        attempt,
-                        error = %e,
-                        "outbox feed subscribe failed; retrying"
-                    );
-                    last = Some(e);
-                    tokio::time::sleep(self.reconnect_backoff).await;
-                }
+    /// Ensure a live subscription at `from`, reconnecting with retry if
+    /// none is open, then return it. The borrow comes from this call, not
+    /// from re-reading the `Option` field, so a caller never needs its own
+    /// "just connected" assertion.
+    async fn ensure_subscribed(
+        &mut self,
+        from: u64,
+    ) -> Result<&mut Subscription<OutboxEventDto>, RemoteSourceError> {
+        let sub = match self.subscription.take() {
+            Some(sub) => sub,
+            None => self.connect_with_retry(from).await?,
+        };
+        Ok(self.subscription.insert(sub))
+    }
+
+    /// Retry [`try_connect`] up to `max_reconnect_attempts` times, pausing
+    /// `reconnect_backoff` between attempts. Only the last attempt's error
+    /// is returned: earlier ones are logged, since only the final attempt
+    /// decides whether the caller gives up.
+    async fn connect_with_retry(
+        &mut self,
+        from: u64,
+    ) -> Result<Subscription<OutboxEventDto>, RemoteSourceError> {
+        let last_attempt = self.max_reconnect_attempts.get() - 1;
+        for attempt in 0..last_attempt {
+            if let ControlFlow::Break(sub) = self.try_connect(from, attempt).await {
+                return Ok(sub);
             }
         }
-        Err(last.expect("at least one attempt"))
+        match self.try_connect(from, last_attempt).await {
+            ControlFlow::Break(sub) => Ok(sub),
+            ControlFlow::Continue(e) => Err(e),
+        }
+    }
+
+    /// One `ensure_subscribed` attempt: success breaks out of the retry
+    /// loop with the new subscription, failure logs, sleeps the reconnect
+    /// backoff, and hands back its error for the caller's final error if
+    /// every attempt fails.
+    async fn try_connect(
+        &mut self,
+        from: u64,
+        attempt: u32,
+    ) -> ControlFlow<Subscription<OutboxEventDto>, RemoteSourceError> {
+        match self.connect(from).await {
+            Ok(sub) => {
+                debug!(
+                    target: "da_watcher::interop",
+                    origin = self.origin_chain_id,
+                    cursor = from,
+                    "subscribed to outbox feed"
+                );
+                ControlFlow::Break(sub)
+            }
+            Err(e) => {
+                warn!(
+                    target: "da_watcher::interop",
+                    origin = self.origin_chain_id,
+                    attempt,
+                    error = %e,
+                    "outbox feed subscribe failed; retrying"
+                );
+                tokio::time::sleep(self.reconnect_backoff).await;
+                ControlFlow::Continue(e)
+            }
+        }
     }
 
     /// Fold one message into the block under construction, returning the
@@ -235,7 +280,7 @@ impl WsRemoteChainSource {
             return None;
         }
         let batch = std::mem::replace(&mut self.pending, vec![msg]);
-        self.close(batch)
+        Some(self.close(batch))
     }
 
     /// Fold a `head` event in: the origin closed every block through
@@ -251,19 +296,152 @@ impl WsRemoteChainSource {
             return None;
         }
         let batch = std::mem::take(&mut self.pending);
-        self.close(batch)
+        Some(self.close(batch))
     }
 
     /// Hand a closed batch back and record the cursor the caller is
     /// expected to advance to, so an un-advanced caller (backpressure) is
-    /// detected as a rewind and replayed.
-    fn close(&mut self, batch: Vec<OutboxMessage>) -> Option<Vec<OutboxMessage>> {
-        self.cursor = batch.iter().map(|m| m.seq).max().map(|s| s + 1);
-        Some(batch)
+    /// detected as a rewind and replayed. `checked_add` guards a
+    /// `seq == u64::MAX` message (unreachable in practice) from wrapping to
+    /// 0; falling back to `None` instead just forces the next call onto the
+    /// same resubscribe path an actually-rewound caller already takes.
+    fn close(&mut self, batch: Vec<OutboxMessage>) -> Vec<OutboxMessage> {
+        self.cursor = batch
+            .iter()
+            .map(|m| m.seq)
+            .max()
+            .and_then(|s| s.checked_add(1));
+        batch
     }
 }
 
-#[async_trait]
+impl WsRemoteChainSource {
+    /// One subscription event, decoded and folded into the open batch.
+    /// `Some` means a batch closed and the caller returns it; `None` means
+    /// the caller loops and reads the next event.
+    async fn step(&mut self, from: u64) -> Result<Option<Vec<OutboxMessage>>, RemoteSourceError> {
+        let subscription = self.ensure_subscribed(from).await?;
+        match subscription.next().await {
+            Some(Ok(OutboxEventDto::Message(dto))) => self.on_message(*dto),
+            Some(Ok(OutboxEventDto::Head { block_number })) => Ok(self.absorb_head(block_number)),
+            Some(Ok(OutboxEventDto::Lagged {
+                skipped,
+                floor_seq,
+                floor_block,
+            })) => self.on_lagged(from, skipped, floor_seq, floor_block),
+            Some(Err(e)) => {
+                self.on_stream_error(e);
+                Ok(None)
+            }
+            None => {
+                self.on_closed(from);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Decode one message DTO, count it, and fold it into the open batch.
+    fn on_message(
+        &mut self,
+        dto: OutboxMessageDto,
+    ) -> Result<Option<Vec<OutboxMessage>>, RemoteSourceError> {
+        let msg = dto
+            .into_outbox_message(self.origin_chain_id)
+            .map_err(|e| RemoteSourceError::Decode(e.to_string()))?;
+        ::metrics::counter!(
+            metrics::REMOTE_MESSAGES_RECEIVED_TOTAL,
+            "origin" => self.origin_chain_id.to_string()
+        )
+        .increment(1);
+        Ok(self.absorb(msg))
+    }
+
+    /// Handle a lag marker: terminal for the pair if it is above the
+    /// cursor (reading on would skip messages, which the no-skip rule
+    /// forbids); otherwise a peer bug the watcher tolerates by
+    /// re-subscribing.
+    fn on_lagged(
+        &mut self,
+        from: u64,
+        skipped: u64,
+        floor_seq: Option<u64>,
+        floor_block: Option<u64>,
+    ) -> Result<Option<Vec<OutboxMessage>>, RemoteSourceError> {
+        let Lag { floor, floor_block } = Lag::resolve(from, skipped, floor_seq, floor_block);
+        if floor > from {
+            error!(
+                target: "da_watcher::interop",
+                origin = self.origin_chain_id,
+                skipped,
+                cursor = from,
+                floor,
+                ?floor_block,
+                "outbox feed lagged: the peer cannot serve the cursor; \
+                 the pair must stop"
+            );
+            self.drop_session();
+            return Err(RemoteSourceError::Lagged {
+                cursor: from,
+                floor,
+                floor_block,
+            });
+        }
+        // A lag marker at or below the cursor is a peer bug, not a loss.
+        // Re-subscribe, paced by the watcher.
+        warn!(
+            target: "da_watcher::interop",
+            origin = self.origin_chain_id,
+            skipped,
+            cursor = from,
+            "outbox feed sent a lag marker below the cursor; re-subscribing"
+        );
+        ::metrics::counter!(
+            metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
+            "origin" => self.origin_chain_id.to_string(),
+            "cause" => "lagged"
+        )
+        .increment(1);
+        self.drop_session();
+        Ok(None)
+    }
+
+    /// An undecodable stream item: log, count, and re-subscribe from the
+    /// cursor.
+    fn on_stream_error(&mut self, e: impl std::fmt::Display) {
+        warn!(
+            target: "da_watcher::interop",
+            origin = self.origin_chain_id,
+            error = %e,
+            "outbox feed item undecodable; re-subscribing from cursor"
+        );
+        ::metrics::counter!(
+            metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
+            "origin" => self.origin_chain_id.to_string(),
+            "cause" => "stream_error"
+        )
+        .increment(1);
+        self.drop_session();
+    }
+
+    /// The subscription ended: log, count, and re-subscribe from the
+    /// cursor.
+    fn on_closed(&mut self, from: u64) {
+        warn!(
+            target: "da_watcher::interop",
+            origin = self.origin_chain_id,
+            cursor = from,
+            "outbox feed closed; re-subscribing from cursor"
+        );
+        ::metrics::counter!(
+            metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
+            "origin" => self.origin_chain_id.to_string(),
+            "cause" => "closed"
+        )
+        .increment(1);
+        self.drop_session();
+    }
+}
+
 impl RemoteChainSource for WsRemoteChainSource {
     fn origin_chain_id(&self) -> u64 {
         self.origin_chain_id
@@ -282,101 +460,8 @@ impl RemoteChainSource for WsRemoteChainSource {
         let from = cursor_seq;
 
         loop {
-            self.ensure_subscribed(from).await?;
-            let subscription = self.subscription.as_mut().expect("subscribed above");
-            match subscription.next().await {
-                Some(Ok(OutboxEventDto::Message(dto))) => {
-                    let msg = dto
-                        .into_outbox_message(self.origin_chain_id)
-                        .map_err(|e| RemoteSourceError::Decode(e.to_string()))?;
-                    ::metrics::counter!(
-                        metrics::REMOTE_MESSAGES_RECEIVED_TOTAL,
-                        "origin" => self.origin_chain_id.to_string()
-                    )
-                    .increment(1);
-                    if let Some(batch) = self.absorb(msg) {
-                        return Ok(batch);
-                    }
-                }
-                Some(Ok(OutboxEventDto::Head { block_number })) => {
-                    if let Some(batch) = self.absorb_head(block_number) {
-                        return Ok(batch);
-                    }
-                }
-                Some(Ok(OutboxEventDto::Lagged {
-                    skipped,
-                    floor_seq,
-                    floor_block,
-                })) => {
-                    // Reading on would skip messages, which the no-skip rule
-                    // forbids. A re-subscribe from the cursor gets the same
-                    // answer, so this is terminal for the pair.
-                    let floor = floor_seq.unwrap_or(from.saturating_add(skipped));
-                    if floor > from {
-                        error!(
-                            target: "da_watcher::interop",
-                            origin = self.origin_chain_id,
-                            skipped,
-                            cursor = from,
-                            floor,
-                            ?floor_block,
-                            "outbox feed lagged: the peer cannot serve the cursor; \
-                             the pair must stop"
-                        );
-                        self.drop_session();
-                        return Err(RemoteSourceError::Lagged {
-                            cursor: from,
-                            floor,
-                            floor_block,
-                        });
-                    }
-                    // A lag marker at or below the cursor is a peer bug, not
-                    // a loss. Re-subscribe, paced by the watcher.
-                    warn!(
-                        target: "da_watcher::interop",
-                        origin = self.origin_chain_id,
-                        skipped,
-                        cursor = from,
-                        "outbox feed sent a lag marker below the cursor; re-subscribing"
-                    );
-                    ::metrics::counter!(
-                        metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
-                        "origin" => self.origin_chain_id.to_string(),
-                        "cause" => "lagged"
-                    )
-                    .increment(1);
-                    self.drop_session();
-                }
-                Some(Err(e)) => {
-                    warn!(
-                        target: "da_watcher::interop",
-                        origin = self.origin_chain_id,
-                        error = %e,
-                        "outbox feed item undecodable; re-subscribing from cursor"
-                    );
-                    ::metrics::counter!(
-                        metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
-                        "origin" => self.origin_chain_id.to_string(),
-                        "cause" => "stream_error"
-                    )
-                    .increment(1);
-                    self.drop_session();
-                }
-                None => {
-                    warn!(
-                        target: "da_watcher::interop",
-                        origin = self.origin_chain_id,
-                        cursor = from,
-                        "outbox feed closed; re-subscribing from cursor"
-                    );
-                    ::metrics::counter!(
-                        metrics::REMOTE_FEED_RESUBSCRIBE_TOTAL,
-                        "origin" => self.origin_chain_id.to_string(),
-                        "cause" => "closed"
-                    )
-                    .increment(1);
-                    self.drop_session();
-                }
+            if let Some(batch) = self.step(from).await? {
+                return Ok(batch);
             }
         }
     }
@@ -386,7 +471,7 @@ impl RemoteChainSource for WsRemoteChainSource {
 pub mod fakes {
     use std::collections::VecDeque;
 
-    use super::*;
+    use super::{OutboxMessage, RemoteChainSource, RemoteSourceError};
 
     /// In-memory [`RemoteChainSource`] driven by a scripted queue of batches —
     /// the interop counterpart of [`crate::source::fakes::MockL1Source`], for
@@ -403,6 +488,7 @@ pub mod fakes {
     }
 
     impl ScriptedRemoteSource {
+        #[must_use]
         pub fn new(origin_chain_id: u64) -> Self {
             Self {
                 origin_chain_id,
@@ -416,7 +502,6 @@ pub mod fakes {
         }
     }
 
-    #[async_trait]
     impl RemoteChainSource for ScriptedRemoteSource {
         fn origin_chain_id(&self) -> u64 {
             self.origin_chain_id

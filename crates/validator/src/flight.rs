@@ -10,6 +10,7 @@
 //! plus both receipts, field by field, the moment a mismatch is proven.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 
 use kardamom_engine::actor::BufferedRecord;
@@ -26,7 +27,7 @@ const RING_CAP: usize = 6;
 
 struct BlockCapture {
     block: u64,
-    granularity: u16,
+    granularity: NonZeroU16,
     /// The exec env the block ran under, such as the boundary timestamp.
     /// The prover spool re-executes with capture under the same env.
     env: ExecEnv,
@@ -49,16 +50,20 @@ impl FlightRing {
         Arc::new(Self::default())
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<BlockCapture>> {
+        crate::lock_recover(&self.ring)
+    }
+
     /// Record a block's inputs. Call once per block, before execution.
     pub fn push(
         &self,
         block: u64,
-        granularity: u16,
+        granularity: NonZeroU16,
         env: ExecEnv,
         records: &[BufferedRecord],
         claims: Option<Arc<ClaimIndex>>,
     ) {
-        let mut g = self.ring.lock().expect("flight ring poisoned");
+        let mut g = self.lock();
         if g.len() >= RING_CAP {
             g.pop_front();
         }
@@ -73,8 +78,8 @@ impl FlightRing {
 
     /// Get one block's inputs back out of the ring; this is the prover
     /// spool's feed. Cheap, since record payloads are refcounted `Bytes`.
-    pub fn records_for(&self, block: u64) -> Option<(u16, ExecEnv, Vec<BufferedRecord>)> {
-        let g = self.ring.lock().expect("flight ring poisoned");
+    pub fn records_for(&self, block: u64) -> Option<(NonZeroU16, ExecEnv, Vec<BufferedRecord>)> {
+        let g = self.lock();
         g.iter()
             .find(|c| c.block == block)
             .map(|c| (c.granularity, c.env, c.records.clone()))
@@ -84,18 +89,26 @@ impl FlightRing {
     /// best-effort: failures only log. Recorder trouble must never mask
     /// the divergence stop.
     pub fn dump_receipt_divergence(&self, local: &Receipt, published: &Receipt) {
-        // This uses the same directory as the claim-path dumper. It can
-        // be overridden, so tests can check the file without /opt existing.
-        let dir =
-            std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
-        let dir = std::path::Path::new(&dir);
-        let path = dir.join(format!(
+        let file_name = format!(
             "receipt-divergence-{}-{}.json",
             local.block_number,
             local.tx_idx.as_index()
-        ));
-        let g = self.ring.lock().expect("flight ring poisoned");
-        let payload = serde_json::json!({
+        );
+        let payload = self.snapshot_json(local, published);
+        match write_flight_dump(&file_name, &payload) {
+            Ok(path) => {
+                tracing::error!(path = %path.display(), "receipt-divergence inputs dumped for offline replay");
+            }
+            Err(e) => tracing::warn!(error = %e, "receipt-divergence dump failed"),
+        }
+    }
+
+    /// Build the dump payload: both receipts plus the ring's recent block
+    /// inputs. The lock guard's scope ends here, before the caller writes
+    /// the file.
+    fn snapshot_json(&self, local: &Receipt, published: &Receipt) -> serde_json::Value {
+        let g = self.lock();
+        serde_json::json!({
             "local": receipt_json(local),
             "published": receipt_json(published),
             "ring": g.iter().map(|c| serde_json::json!({
@@ -104,18 +117,28 @@ impl FlightRing {
                 "records": crate::parallel::records_json(&c.records),
                 "claims": c.claims.as_deref().map(crate::parallel::claims_json),
             })).collect::<Vec<_>>(),
-        });
-        drop(g);
-        match std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&payload).unwrap_or_default(),
-        ) {
-            Ok(()) => {
-                tracing::error!(path = %path.display(), "receipt-divergence inputs dumped for offline replay");
-            }
-            Err(e) => tracing::warn!(error = %e, "receipt-divergence dump failed"),
-        }
+        })
     }
+}
+
+/// Write `payload` as pretty JSON to `file_name`, under the flight-dump
+/// directory (`KARDAMOM_FLIGHT_DIR`, defaulting to `/opt/kardamom/state`;
+/// overridable so tests can check the file without `/opt` existing).
+/// Shared by this ring's receipt-divergence dump and
+/// [`crate::parallel::dump_divergence_inputs`]'s claim-path dump — both
+/// write into the same directory, so one offline tool reads either.
+/// Returns the path written, for the caller's own log line; the caller
+/// decides how to log a write failure, since the two dumps' log fields
+/// differ (one names a block, the other does not).
+pub(crate) fn write_flight_dump(
+    file_name: &str,
+    payload: &serde_json::Value,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
+    let path = std::path::Path::new(&dir).join(file_name);
+    let bytes = serde_json::to_vec_pretty(payload).map_err(std::io::Error::other)?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 fn receipt_json(r: &Receipt) -> serde_json::Value {

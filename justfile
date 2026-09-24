@@ -11,8 +11,14 @@
 # `just bootstrap` installs all of the above for your platform.
 #
 # The multi-node cluster under `deploy/cluster/` needs a different set of HOST
-# tools (Vagrant + a VM provider, Ansible, Docker). `just cluster-bootstrap`
+# tools (Ansible, Docker, OpenTofu, the Nomad CLI). `just cluster-bootstrap`
 # installs those; `just cluster-doctor` checks them.
+
+# The only execution-spec-tests fixture pin. When you bump it, also update
+# `SPEC_ID` in crates/exec-core/src/block_env.rs and `FORK` in
+# crates/exec-core/tests/eest_state.rs. Follow the fork-bump procedure in
+# docs/agents/l1-client-suite-port-spec.md (hardfork-policy section).
+EEST_TAG := "tests@v20.0.1"
 
 _default:
     @just --list
@@ -148,6 +154,53 @@ check:
 clippy:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+# The judgment rules (R1, R5, R6, R7, R9, R10, R14, R15, R16) are not
+# checked here. Read the diff against docs/STYLE.md for those.
+# Mechanical style checks from docs/STYLE.md. Run before you open a PR.
+style:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    export PATH="$(just java-shim):$PATH"
+    export JAVA_HOME="$(just java-home)"
+    failed=0
+    step() {
+        echo "==> $1"
+        if ! "${@:2}"; then
+            echo "FAILED: $1" >&2
+            failed=1
+        fi
+    }
+    # R11, R2 (too_many_lines at the threshold in clippy.toml), R8 (unreachable_pub).
+    step "clippy pedantic" cargo clippy --workspace --all-targets --all-features --locked -- \
+        -D warnings -W clippy::pedantic -D unreachable_pub
+    step "rustfmt" cargo fmt --all -- --check
+    # R9, R13, R6, R11: patterns that a lint cannot express. Test files are exempt.
+    forbidden() {
+        local hits
+        hits="$(grep -rnE --include='*.rs' \
+            -e 'debug_assert!' -e '\.max\(1\)' -e '\bdyn\b' -e 'allow\(clippy::too_many_arguments\)' \
+            crates guest 2>/dev/null \
+            | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+        # `Box<` and `dyn` split over two lines by rustfmt: report the file and
+        # the line of the `Box<`.
+        local wrapped
+        wrapped="$(grep -rnE --include='*.rs' -A1 -e 'Box<$' crates guest 2>/dev/null \
+            | grep -E -B1 '^[^:]+-[0-9]+-\s*dyn ' \
+            | grep -E ':[0-9]+:' \
+            | grep -vE '/tests?/|_tests?\.rs:|/tests\.rs:|/test_support' || true)"
+        hits="${hits}${wrapped:+$'\n'$wrapped}"
+        if [ -n "$hits" ]; then
+            echo "$hits"
+            return 1
+        fi
+    }
+    step "forbidden patterns (debug_assert!, .max(1), dyn, allow(too_many_arguments))" forbidden
+    if [ "$failed" -ne 0 ]; then
+        echo "style check failed. See docs/STYLE.md." >&2
+        exit 1
+    fi
+    echo "style check passed."
+
 # Run the test suite across all features.
 test:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked
@@ -157,9 +210,140 @@ test:
 eest:
     #!/usr/bin/env bash
     set -euo pipefail
-    fixtures="$(scripts/fetch-eest-fixtures.sh | tail -1)"
+    fixtures="$(just eest-fixtures | tail -1)"
     KARDAMOM_EEST_FIXTURES="${fixtures}" \
         cargo test -p kardamom-exec-core --release --test eest_state -- --ignored --nocapture
+
+# The pinned execution-spec-tests release. CI reads it for its cache key.
+eest-tag:
+    @echo "{{ EEST_TAG }}"
+
+# It prints the fixture directory as the last line, and skips the download
+# when the files are already there.
+# Fetch the pinned EEST fixtures into <dest-root>/<tag>/ (default ~/.cache/kardamom/eest).
+eest-fixtures dest_root=(env('HOME') / ".cache/kardamom/eest"):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="{{ dest_root }}/{{ EEST_TAG }}"
+    if [[ -d "${dest}/fixtures" ]]; then
+        echo "eest fixtures {{ EEST_TAG }} already present" >&2
+        echo "${dest}/fixtures"
+        exit 0
+    fi
+    # URL-encode '@' in the release-asset path.
+    tag="{{ EEST_TAG }}"
+    url="https://github.com/ethereum/execution-specs/releases/download/${tag/@/%40}/fixtures.tar.gz"
+    mkdir -p "${dest}"
+    echo "fetching ${url}" >&2
+    curl -fsSL --retry 3 "${url}" -o "${dest}/fixtures.tar.gz"
+    # Keep only state_tests and release metadata. The blockchain and engine
+    # formats need a header chain and an Engine API. Kardamom does not have
+    # these (see the spec's non-goals). The full download is about 8.1 GB.
+    # The filtered set is about 1.5 GB.
+    tar -xzf "${dest}/fixtures.tar.gz" -C "${dest}" \
+        "fixtures/state_tests" "fixtures/.meta"
+    rm "${dest}/fixtures.tar.gz"
+    [[ -d "${dest}/fixtures" ]] || {
+        echo "unexpected tarball layout under ${dest}" >&2
+        exit 1
+    }
+    echo "${dest}/fixtures"
+
+# It runs the three DHAT harnesses and fails when allocs/op or bytes/op
+# exceed their ceilings. Wall time prints for reference only: it depends on
+# the machine.
+# DHAT allocation ceilings (perf/alloc-baselines.env).
+alloc-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source perf/alloc-baselines.env
+    run() { # <name> <dir> <test> <env...>
+        local name=$1 dir=$2 test=$3; shift 3
+        local raw="/tmp/alloc-gate-$name.log"
+        # Keep the full cargo output, including stderr. A compile or runtime
+        # failure must show in the log.
+        if ! (cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture) >"$raw" 2>&1; then
+            # The last 40 lines of a panicking test are its backtrace, so the
+            # panic itself scrolls away. Print the failure lines first.
+            echo "== $name: HARNESS FAILED (cargo test exit != 0); the failure lines:"
+            grep -nE "panicked at|assertion|^error(\[|:)|^thread .* panicked|FAILED" "$raw" | head -20 || true
+            echo "== $name: last 40 lines:"
+            tail -40 "$raw"
+            return 1
+        fi
+        local out
+        out=$(grep -E "allocs/(tx|op)|bytes/(tx|op)|wall/(tx|op)" "$raw" || true)
+        if [[ -z "$out" ]]; then
+            echo "== $name: NO MEASUREMENT LINES in harness output; last 40 lines:"
+            tail -40 "$raw"
+            return 1
+        fi
+        echo "== $name"; echo "$out"
+        local allocs bytes
+        allocs=$(echo "$out" | grep -E "allocs" | grep -oE "[0-9]+\.?[0-9]*" | head -1)
+        bytes=$(echo "$out" | grep -E "bytes" | grep -oE "[0-9]+" | head -1)
+        local max_a_var="${name^^}_MAX_ALLOCS" max_b_var="${name^^}_MAX_BYTES"
+        local max_a=${!max_a_var} max_b=${!max_b_var}
+        awk -v a="$allocs" -v ma="$max_a" -v b="$bytes" -v mb="$max_b" -v n="$name" 'BEGIN {
+            bad = 0
+            if (a+0 > ma+0) { printf "ALLOC REGRESSION: %s %.2f allocs/op > ceiling %.2f\n", n, a, ma; bad = 1 }
+            if (b+0 > mb+0) { printf "ALLOC REGRESSION: %s %d bytes/op > ceiling %d\n", n, b, mb; bad = 1 }
+            exit bad
+        }'
+    }
+    run engine    crates/bench     alloc_profile         KARDAMOM_PROFILE_OPS=mix
+    run sequencer crates/sequencer alloc_profile
+    run ingress   crates/bench     alloc_profile_ingress
+    echo "alloc gate: PASS (ceilings: perf/alloc-baselines.env)"
+
+# Run it after you change bench-contracts/src/BenchDefi.sol.
+# Regenerate crates/bench/src/load/defi_bytecode.rs from the compiled artifacts.
+bench-embed:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd bench-contracts
+    forge build >/dev/null
+    python3 - <<'EMBED'
+    import json
+    names = ["SwapPool", "Vault", "Clob"]
+    with open("../crates/bench/src/load/defi_bytecode.rs", "w") as f:
+        f.write("// This file is generated by `just bench-embed`. Do not edit it.\n")
+        f.write("// The source of truth is bench-contracts/src/BenchDefi.sol.\n\n")
+        for n in names:
+            j = json.load(open(f"out/BenchDefi.sol/{n}.json"))
+            code = j["bytecode"]["object"].removeprefix("0x")
+            f.write(f'pub const {n.upper()}_CREATION_HEX: &str = "{code}";\n')
+    print("ok")
+    EMBED
+
+# It mirrors the layout a checkout has: the service and operator binaries
+# under target/release, the shard test executable as kardamom-chaos-shards,
+# the Aeron shared libraries under their rusteron build directories, and the
+# sealer jar at its Gradle output path. A shard runner unpacks this over its
+# checkout and runs the cluster recipes with KARDAMOM_STAGED=1.
+# Stage everything a cluster-e2e shard runner needs into one directory.
+stage-dist dist:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dist="{{ dist }}"
+    rel=target/release
+    mkdir -p "$dist/$rel/build" "$dist/cluster/sealer-service/service/build/libs"
+    # The services the images wrap (the state mirror included), the settlement
+    # deployer and the semantics runner the stages spawn, the operator binary,
+    # and the archive tool the archive-corruption case runs on the host.
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror reconstruct deploy semantics cluster archive-rereplicate; do
+        cp "$rel/kardamom-$bin" "$dist/$rel/"
+    done
+    # The shard test executable carries a build hash; the newest one is this build's.
+    shards=$(ls -t "$rel"/deps/shards-* | grep -v '\.d$' | head -n 1)
+    cp "$shards" "$dist/$rel/kardamom-chaos-shards"
+    for lib in "$rel"/build/rusteron-archive-*/out/build/lib; do
+        build=$(basename "$(dirname "$(dirname "$(dirname "$lib")")")")
+        mkdir -p "$dist/$rel/build/$build/out/build/lib"
+        cp "$lib"/libaeron*.so "$dist/$rel/build/$build/out/build/lib/"
+    done
+    cp cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar "$dist/cluster/sealer-service/service/build/libs/"
+    find "$dist" -type f | sort
 
 # Targeted check that just the Aeron bindings compile.
 check-aeron:
@@ -302,22 +486,22 @@ test-e2e-local: aeron-jar cluster-jar
 # Multi-node cluster (deploy/cluster) — HOST dependencies.
 #
 # These recipes install the tools needed on this machine to run
-# `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
-# ansible.posix / community.docker collections), Docker with BuildKit, and the
-# Nomad CLI (deploy/cluster/scripts/deploy.sh drives the cluster's Nomad API
-# from the host). Nomad *servers/clients* and Consul run inside the VMs and
-# are installed by Ansible, not here. See deploy/cluster/README.md.
+# `just container-up`: Ansible (+ the ansible.posix /
+# community.docker collections), Docker with BuildKit, OpenTofu, and the
+# Nomad CLI (the Ansible workload role uses it to compile HCL locally). Nomad
+# *servers/clients* and Consul run inside the node containers and are
+# installed by Ansible, not here. See deploy/cluster/README.md.
 # ---------------------------------------------------------------------------
 
 # Host-side Nomad CLI version. Mirrors nomad_version in
-# deploy/cluster/ansible/group_vars/all.yml (checked by check-contract.py).
+# deploy/cluster/ansible/group_vars/all.yml (checked by ansible/contract.yml).
 NOMAD_VERSION := "1.9.5"
 
 # Install everything the HOST needs for the deploy/cluster workflow.
 cluster-bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Pinned Nomad CLI matching the in-VM agents (deploy.sh needs it on PATH).
+    # Pinned Nomad CLI matching the in-VM agents (Ansible deployment needs it on PATH).
     install_nomad() {
         command -v nomad >/dev/null 2>&1 && return 0
         local ver="{{NOMAD_VERSION}}" os arch zip
@@ -338,52 +522,35 @@ cluster-bootstrap:
     case "$os" in
     Darwin)
         command -v brew >/dev/null 2>&1 || { echo "Homebrew required — https://brew.sh" >&2; exit 1; }
-        echo ">> installing Vagrant + VirtualBox + Docker + Ansible via brew"
-        # VirtualBox is the practical Vagrant provider on macOS (libvirt is
-        # Linux-only). Casks may prompt for sudo / a kernel-extension approval.
-        brew install --cask vagrant virtualbox docker || true
-        brew install ansible
+        echo ">> installing Docker + Ansible + OpenTofu via brew"
+        brew install --cask docker || true
+        brew install ansible opentofu jq
         install_nomad
-        echo "   NOTE: VirtualBox support on Apple Silicon is limited; a Linux"
-        echo "   host with libvirt/qemu is the best-supported environment."
-        echo "   Start Docker Desktop before running 'make up'."
+        echo "   NOTE: the container cluster needs a Linux Docker daemon with"
+        echo "   privileged containers; Docker Desktop's Linux VM serves that."
         ;;
     Linux)
         . /etc/os-release 2>/dev/null || true
         echo ">> installing cluster host deps (distro: ${ID:-unknown})"
         if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update
-            # vagrant + libvirt/qemu provider, build deps for the
-            # vagrant-libvirt plugin (ruby-dev/libvirt-dev/gcc/make),
-            # ansible, and docker + buildx (BuildKit).
-            sudo apt-get install -y \
-                vagrant qemu-kvm libvirt-daemon-system libvirt-clients libvirt-dev \
-                dnsmasq-base ebtables ruby-dev gcc make \
-                ansible docker.io docker-buildx
+            sudo apt-get install -y ansible docker.io docker-buildx jq
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y vagrant @virtualization libvirt libvirt-devel qemu-kvm \
-                ansible docker gcc make ruby-devel
+            sudo dnf install -y ansible docker jq
         elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --needed --noconfirm vagrant libvirt qemu-full dnsmasq \
-                ansible docker
+            sudo pacman -S --needed --noconfirm ansible docker
         else
-            echo "Unsupported Linux distro. Install manually: vagrant, libvirt+qemu," >&2
-            echo "ansible, docker (see deploy/cluster/README.md)." >&2
+            echo "Unsupported Linux distro. Install manually: ansible, docker," >&2
+            echo "opentofu (see deploy/cluster/README.md)." >&2
             exit 1
         fi
-        # vagrant-libvirt provider plugin (idempotent).
-        if ! vagrant plugin list 2>/dev/null | grep -q vagrant-libvirt; then
-            echo ">> installing vagrant-libvirt plugin"
-            vagrant plugin install vagrant-libvirt
-        fi
         install_nomad
-        # Group membership so libvirt + docker work without sudo (needs re-login).
-        for grp in libvirt kvm docker; do
-            getent group "$grp" >/dev/null 2>&1 && sudo usermod -aG "$grp" "$USER" || true
-        done
-        sudo systemctl enable --now libvirtd docker 2>/dev/null || true
-        echo "   NOTE: log out/in (or run 'newgrp docker') so the libvirt/kvm/docker"
-        echo "   group memberships take effect."
+        command -v tofu >/dev/null 2>&1 || echo "   NOTE: install OpenTofu 1.12.6 (https://opentofu.org/docs/intro/install/)"
+        # Group membership so docker works without sudo (needs re-login).
+        getent group docker >/dev/null 2>&1 && sudo usermod -aG docker "$USER" || true
+        sudo systemctl enable --now docker 2>/dev/null || true
+        echo "   NOTE: log out/in (or run 'newgrp docker') so the docker group"
+        echo "   membership takes effect."
         ;;
     *)
         echo "Unsupported platform: $os. See deploy/cluster/README.md." >&2
@@ -391,15 +558,13 @@ cluster-bootstrap:
         ;;
     esac
     # Ansible Galaxy collections the playbook depends on.
-    echo ">> installing ansible collections (ansible.posix, community.docker)"
-    ansible-galaxy collection install ansible.posix community.docker
+    echo ">> installing ansible collections (ansible.posix, community.docker, community.general)"
+    ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
     echo
-    echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
-    echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
-    echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
-    echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
+    echo "   Images are pushed from inside the control node (REGISTRY_PUSH_NODE),"
+    echo "   where the registry name registry.service.consul resolves. This host's"
+    echo "   Docker daemon needs no insecure-registry entry."
 
 # Check that the HOST has everything deploy/cluster needs.
 cluster-doctor:
@@ -409,45 +574,80 @@ cluster-doctor:
     have() { command -v "$1" >/dev/null 2>&1; }
     chk() { if have "$1"; then echo "  ok    $1 — $("$1" --version 2>&1 | head -1)"; else echo "  MISS  $1 ($2)"; rc=1; fi; }
     echo ">> deploy/cluster host dependencies:"
-    chk vagrant "run 'just cluster-bootstrap'"
     chk ansible "run 'just cluster-bootstrap'"
     chk ansible-galaxy "ships with ansible"
+    chk jq "run 'just cluster-bootstrap'"
     chk docker "run 'just cluster-bootstrap'"
-    chk nomad "run 'just cluster-bootstrap' — deploy.sh drives the cluster API from the host"
-    if have virsh || have VBoxManage; then
-        echo "  ok    vm provider (libvirt or virtualbox)"
-    else
-        echo "  MISS  vm provider — install libvirt+qemu (Linux) or VirtualBox (macOS)"; rc=1
-    fi
-    for col in ansible.posix community.docker; do
+    chk nomad "run 'just cluster-bootstrap' — Ansible uses Nomad to compile job specs"
+    chk tofu "install OpenTofu 1.12.6 — terraform/containers creates the node containers"
+    for col in ansible.posix community.docker community.general; do
         if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
             echo "  ok    ansible collection $col"
         else
             echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
         fi
     done
-    # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
-    # registry_port in deploy/cluster/ansible/group_vars/all.yml.
+    # Images are pushed from inside the control node, so this host's daemon
+    # needs no insecure-registry entry; it only has to run.
     if docker info >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.10:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.10:5000"
-        else
-            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
-            echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
-        fi
+        echo "  ok    docker daemon running"
     else
-        echo "  WARN  docker daemon not running — cannot check insecure-registries"
-    fi
-    # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
-    if have cast; then
-        echo "  ok    cast — $(cast --version 2>&1 | head -1)"
-    else
-        echo "  WARN  cast not found — 'make smoke' needs foundry (repo: 'just bootstrap')"
+        echo "  WARN  docker daemon not running"
     fi
     if [[ "$rc" == "0" ]]; then
-        echo ">> all good — 'cd deploy/cluster && make up'"
+        echo ">> all good — 'just container-up'"
     else
         echo ">> missing dependencies; run 'just cluster-bootstrap'" >&2
     fi
     exit "$rc"
+
+# Cluster recipes run through their own justfile so paths and defaults stay
+# relative to deploy/cluster, whether invoked here or from that directory.
+
+# Wrap prebuilt service binaries and the sealer jar, then push their images.
+images:
+    @just --justfile deploy/cluster/justfile images
+
+# Converge workload jobs and settlement through Ansible.
+deploy:
+    @just --justfile deploy/cluster/justfile deploy
+
+# Submit a signed transfer; RPC_URL overrides the node contract address.
+smoke:
+    @just --justfile deploy/cluster/justfile smoke
+
+# Run all static deployment checks, reporting failures together.
+validate:
+    @just --justfile deploy/cluster/justfile validate
+
+# Verify values mirrored from group_vars/all.yml.
+check-contract:
+    @just --justfile deploy/cluster/justfile check-contract
+
+# Remove local built cluster images and the staged cluster jar.
+clean:
+    @just --justfile deploy/cluster/justfile clean
+
+# Create nodes, provision them, publish prebuilt images and deploy workloads.
+container-up:
+    @just --justfile deploy/cluster/justfile container-up
+
+# Run a shard against an existing cluster (default: SHARD or load).
+container-test $shard=env('SHARD', 'load'):
+    @just --justfile deploy/cluster/justfile container-test "$shard"
+
+# Run a shard end to end, including its cluster lifecycle, as CI does.
+shard $shard=env('SHARD', 'load'):
+    @just --justfile deploy/cluster/justfile shard "$shard"
+
+# Collect node and job state after a failure.
+container-diagnostics:
+    @just --justfile deploy/cluster/justfile container-diagnostics
+
+# Destroy node containers and their volumes.
+container-down:
+    @just --justfile deploy/cluster/justfile container-down
+
+# Destroy, then create a fresh chain, in that order.
+container-reset:
+    @just --justfile deploy/cluster/justfile container-reset

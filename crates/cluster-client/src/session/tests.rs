@@ -26,13 +26,37 @@ fn event(code: EventCode, correlation_id: i64, session: i64, detail: &str) -> Ve
     })
 }
 
-/// Drive a fresh driver to the Connected state, using the given session id.
-/// Return the driver.
-fn connected(session: i64) -> SessionDriver {
+/// A `Redirect` `SessionEvent`, encoded. The follower-answers-connect
+/// shape: `cluster_session_id: -1` (no session yet), `leadership_term_id:
+/// 0` (the follower does not know it).
+fn redirect_event(correlation_id: i64, leader: i32, endpoints: &str) -> Vec<u8> {
+    encode_session_event(&SessionEvent {
+        cluster_session_id: -1,
+        correlation_id,
+        leadership_term_id: 0,
+        leader_member_id: leader,
+        code: EventCode::Redirect,
+        detail: endpoints.to_string(),
+    })
+}
+
+/// Build a fresh driver and drive it to the point where its connect
+/// request is on the wire, decoding the correlation id it carries.
+/// Returns the driver (still `Connecting`) and that correlation id. Wraps
+/// the four-line prologue almost every establishing-state test starts
+/// with.
+fn connecting() -> (SessionDriver, i64) {
     let mut d = SessionDriver::new("ch", 1, 1_000);
     let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
         .unwrap()
         .correlation_id;
+    (d, corr)
+}
+
+/// Drive a fresh driver to the Connected state, using the given session id.
+/// Return the driver.
+fn connected(session: i64) -> SessionDriver {
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, session, 3, 1));
     assert!(d.is_connected());
     d
@@ -90,10 +114,7 @@ fn redirect_ignored_while_connected() {
 
 #[test]
 fn stale_correlation_rejection_ignored_while_connecting() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     // A rejection for some other correlation, from a previous process's attempt.
     let evs = d.on_egress(&event(EventCode::Error, corr + 555, 0, "nope"));
     assert!(evs.is_empty(), "stale rejection must not fail our connect");
@@ -118,10 +139,7 @@ fn first_poll_emits_connect_request() {
 
 #[test]
 fn ok_session_event_connects() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     let evs = d.on_egress(&ok_event(corr, 77, 3, 1));
     assert_eq!(
         evs,
@@ -134,11 +152,10 @@ fn ok_session_event_connects() {
 
 #[test]
 fn wrap_app_only_after_connected() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
+    let (mut d, corr) = connecting();
+    // Still Connecting: poll_outbound already emitted the connect
+    // request, but that alone does not flip the state.
     assert!(d.wrap_app(b"x", 0).is_none());
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
     d.on_egress(&ok_event(corr, 5, 9, 0));
     let framed = d.wrap_app(b"payload", 42).expect("connected");
     match decode_egress(&framed).unwrap() {
@@ -153,18 +170,8 @@ fn wrap_app_only_after_connected() {
 
 #[test]
 fn redirect_repoints_and_reconnects() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
-    let redirect = encode_session_event(&SessionEvent {
-        cluster_session_id: -1,
-        correlation_id: corr,
-        leadership_term_id: 0,
-        leader_member_id: 2,
-        code: EventCode::Redirect,
-        detail: "0=h0:9,1=h1:9,2=h2:9".into(),
-    });
+    let (mut d, corr) = connecting();
+    let redirect = redirect_event(corr, 2, "0=h0:9,1=h1:9,2=h2:9");
     let evs = d.on_egress(&redirect);
     assert_eq!(
         evs,
@@ -184,10 +191,7 @@ fn redirect_repoints_and_reconnects() {
 
 #[test]
 fn new_leader_event_updates_term_keeps_session() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     let nl = encode_new_leader_event(&NewLeaderEvent {
         leadership_term_id: 10,
@@ -216,10 +220,7 @@ fn new_leader_event_updates_term_keeps_session() {
 
 #[test]
 fn keep_alive_emitted_after_interval() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     // Before the interval: nothing.
     assert!(d.poll_outbound(500).is_empty());
@@ -238,10 +239,7 @@ fn keep_alive_emitted_after_interval() {
 
 #[test]
 fn session_message_for_other_session_ignored() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     let other = wrap_session_message(9, 999, 0, b"not-ours");
     assert!(d.on_egress(&other).is_empty());
@@ -254,10 +252,7 @@ fn session_message_for_other_session_ignored() {
 
 #[test]
 fn failed_session_reconnects_after_backoff() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     // The cluster closes the session, for example on a timeout during a quorum outage.
     let closed = encode_session_event(&SessionEvent {
@@ -307,18 +302,8 @@ fn unanswered_connect_reemits_after_timeout_with_rotate_hint() {
 
 #[test]
 fn redirect_connect_does_not_hint_rotation() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
-    let redirect = encode_session_event(&SessionEvent {
-        cluster_session_id: -1,
-        correlation_id: corr,
-        leadership_term_id: 0,
-        leader_member_id: 2,
-        code: EventCode::Redirect,
-        detail: "0=h0:9,1=h1:9,2=h2:9".into(),
-    });
+    let (mut d, corr) = connecting();
+    let redirect = redirect_event(corr, 2, "0=h0:9,1=h1:9,2=h2:9");
     d.on_egress(&redirect);
     // The redirect-driven connect must go to the member the cluster named,
     // not be rotated away from it.
@@ -326,18 +311,12 @@ fn redirect_connect_does_not_hint_rotation() {
     assert!(!d.take_rotate_hint());
 }
 
-// Regression test: a consumer whose session egress goes silent must be
-// able to force a re-establishment. This closes the old session, then runs
-// the normal Failed, backoff, connect self-heal. Without it, re-requesting
-// replay on a session with a dead egress image would loop forever, since
-// the cluster serves frames and REPLAY_DONE into an image that no longer
-// delivers.
+// A consumer whose session egress goes silent must be able to force a
+// re-establishment (see `SessionDriver::force_reconnect`). This closes the
+// old session, then runs the normal Failed, backoff, connect self-heal.
 #[test]
 fn force_reconnect_closes_old_session_and_reestablishes() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     assert!(d.is_connected());
 
@@ -351,7 +330,6 @@ fn force_reconnect_closes_old_session_and_reestablishes() {
         .unwrap(),
         (9, 5)
     );
-    // The old session is no longer usable for app messages.
     assert!(matches!(d.state(), SessionState::Failed(_)));
     assert!(d.wrap_app(b"x", 0).is_none());
 
@@ -379,10 +357,7 @@ fn force_reconnect_is_noop_unless_connected() {
 
 #[test]
 fn auth_rejected_fails_session() {
-    let mut d = SessionDriver::new("ch", 1, 1_000);
-    let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
-        .unwrap()
-        .correlation_id;
+    let (mut d, corr) = connecting();
     let rej = encode_session_event(&SessionEvent {
         cluster_session_id: -1,
         correlation_id: corr,

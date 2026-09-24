@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use signet_libmdbx::sys::PageSize;
+use signet_libmdbx::sys::{EnvironmentKind, PageSize};
 use signet_libmdbx::{DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, SyncMode};
 
 use crate::error::StateError;
@@ -27,7 +27,7 @@ pub enum Durability {
     Durable,
     /// `SafeNoSync` mode. Commit returns after the page-table flush, but
     /// skips fdatasync. Use it only in tests. This mode is unsafe on real
-    /// hosts, even with power-loss-protected (PLP) NVMe.
+    /// hosts, even with power-loss-protected (PLP) `NVMe`.
     SafeNoSync,
 }
 
@@ -60,6 +60,7 @@ impl StateEnvBuilder {
         }
     }
 
+    #[must_use]
     pub fn durability(mut self, d: Durability) -> Self {
         self.durability = d;
         self
@@ -74,6 +75,7 @@ impl StateEnvBuilder {
     /// because there is no copy-on-write isolation. This mode is opt-in,
     /// for benchmarking and for deployments that accept that risk. It is
     /// off by default.
+    #[must_use]
     pub fn write_map(mut self, yes: bool) -> Self {
         self.write_map = yes;
         self
@@ -90,11 +92,16 @@ impl StateEnvBuilder {
     ///
     /// The env must already exist and be initialized. `Durability` has no
     /// effect in this mode, because nothing syncs.
+    #[must_use]
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
     }
 
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the state directory cannot be created, or
+    /// if the underlying mdbx environment fails to open.
     pub fn open(self) -> Result<StateEnv, StateError> {
         if !self.read_only {
             std::fs::create_dir_all(&self.path)?;
@@ -131,23 +138,46 @@ impl StateEnvBuilder {
 
         let env = builder.open(&self.path)?;
 
-        // Create every named DB once, so handles are cached in the
-        // environment. A downstream read-only transaction then does not
-        // need to call `create_db`. Skip this step in read-only mode: the
-        // tables already exist, and a read-write transaction is not
-        // possible in that mode.
+        // This crate uses the no-write-map mode by default, the safest
+        // choice for arbitrary kernels and signet-libmdbx's own default.
+        // Check it here, once, at open time: a bad env kind then fails
+        // startup cleanly, instead of panicking the writer thread later
+        // and stranding every consumer of the snapshot channel.
+        if !matches!(
+            env.env_kind(),
+            EnvironmentKind::Default | EnvironmentKind::WriteMap
+        ) {
+            return Err(StateError::Recovery(format!(
+                "state env at {} opened with unexpected env kind {:?}",
+                self.path.display(),
+                env.env_kind()
+            )));
+        }
+
+        // Skip table creation in read-only mode: the tables already
+        // exist, and a read-write transaction is not possible in that
+        // mode.
         if !self.read_only {
-            let txn = env.begin_rw_sync()?;
-            for name in ALL_TABLES {
-                txn.create_db(Some(name), DatabaseFlags::empty())?;
-            }
-            txn.commit()?;
+            Self::create_all_tables(&env)?;
         }
 
         Ok(StateEnv {
             env: Arc::new(env),
             path: self.path,
         })
+    }
+
+    /// Create every named DB once, so handles are cached in the
+    /// environment. A downstream read-only transaction then does not
+    /// need to call `create_db`.
+    fn create_all_tables(env: &Environment) -> Result<(), StateError> {
+        let txn = env.begin_rw_sync()?;
+        ALL_TABLES.iter().try_for_each(|name| {
+            txn.create_db(Some(name), DatabaseFlags::empty())
+                .map(|_| ())
+        })?;
+        txn.commit()?;
+        Ok(())
     }
 }
 
@@ -159,11 +189,51 @@ pub struct StateEnv {
 }
 
 impl StateEnv {
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    #[must_use]
     pub fn raw(&self) -> &Environment {
         &self.env
+    }
+
+    /// Read the on-disk schema version, if the `meta` table has one. Opens
+    /// and ends its own transaction, so the borrow never outlives this call.
+    pub(crate) fn read_schema_version(&self) -> Result<Option<u32>, StateError> {
+        let txn = self.raw().begin_rw_sync()?;
+        let meta = txn.open_db(Some(crate::schema::TABLE_META))?;
+        crate::meta::read_meta_u32(&txn, meta, crate::meta::KEY_SCHEMA_VERSION)
+    }
+
+    /// Write the schema-version meta key on first start, or check it on a
+    /// later one. A version other than [`crate::meta::SCHEMA_VERSION`]
+    /// refuses to start: the compare happens outside any transaction scope,
+    /// so the check itself never blocks a concurrent read.
+    pub(crate) fn ensure_schema_version(&self) -> Result<(), StateError> {
+        use crate::meta::{KEY_SCHEMA_VERSION, SCHEMA_VERSION, encode_u32};
+        use signet_libmdbx::WriteFlags;
+
+        match self.read_schema_version()? {
+            None => {
+                let txn = self.raw().begin_rw_sync()?;
+                let meta = txn.open_db(Some(crate::schema::TABLE_META))?;
+                txn.put(
+                    meta,
+                    KEY_SCHEMA_VERSION,
+                    encode_u32(SCHEMA_VERSION),
+                    WriteFlags::UPSERT,
+                )?;
+                txn.commit()?;
+            }
+            Some(on_disk) if on_disk != SCHEMA_VERSION => {
+                return Err(StateError::Recovery(format!(
+                    "schema version mismatch: on-disk={on_disk}, code={SCHEMA_VERSION}"
+                )));
+            }
+            Some(_) => {}
+        }
+        Ok(())
     }
 }

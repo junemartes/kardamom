@@ -28,6 +28,10 @@ use crate::error::BatcherError;
 /// DA-network client implements it.
 pub trait BlobSource {
     /// Fetch the blob whose KZG versioned hash is `versioned_hash`.
+    ///
+    /// # Errors
+    /// Returns an error when no blob is stored under `versioned_hash`, or
+    /// when the stored bytes are not a valid blob.
     fn fetch_blob(&self, versioned_hash: B256) -> Result<Blob, BatcherError>;
 }
 
@@ -40,6 +44,9 @@ pub struct FsBlobStore {
 impl FsBlobStore {
     /// Open a blob store rooted at `dir`. Create the directory if it does
     /// not exist.
+    ///
+    /// # Errors
+    /// Returns an error when `dir` cannot be created.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, BatcherError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -53,24 +60,30 @@ impl FsBlobStore {
 
     /// Save `blob` under its `versioned_hash`. This is idempotent: storing
     /// the same blob again overwrites it with the same bytes.
+    ///
+    /// # Errors
+    /// Returns an error when the write to the store's directory fails.
     pub fn put(&self, versioned_hash: B256, blob: &Blob) -> Result<(), BatcherError> {
         std::fs::write(self.path_for(versioned_hash), blob.as_slice())?;
         Ok(())
     }
 
     /// Number of blobs currently held (counts `*.blob` files).
-    pub fn len(&self) -> usize {
-        std::fs::read_dir(&self.dir)
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
-                    .count()
-            })
-            .unwrap_or(0)
+    ///
+    /// # Errors
+    /// Returns an error when the store's directory cannot be read.
+    pub fn len(&self) -> Result<usize, BatcherError> {
+        let rd = std::fs::read_dir(&self.dir)?;
+        Ok(rd
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "blob"))
+            .count())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// # Errors
+    /// Returns an error when the store's directory cannot be read.
+    pub fn is_empty(&self) -> Result<bool, BatcherError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -86,6 +99,13 @@ impl BlobSource for FsBlobStore {
                 bytes.len()
             )));
         }
+        // A blob is always exactly BYTES_PER_BLOB (128 KiB) by the EIP-4844
+        // wire format; `Blob::new` needs it by value, so this stack array
+        // is inherent to the type, not avoidable padding.
+        #[allow(
+            clippy::large_stack_arrays,
+            reason = "inherent to the EIP-4844 Blob type, not avoidable padding"
+        )]
         let mut arr = [0u8; BYTES_PER_BLOB];
         arr.copy_from_slice(&bytes);
         Ok(Blob::new(arr))
@@ -101,12 +121,12 @@ mod tests {
     fn put_then_fetch_roundtrips_blob_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlobStore::open(dir.path()).unwrap();
-        assert!(store.is_empty());
+        assert!(store.is_empty().unwrap());
 
         let blobs = pack_to_blobs(b"kardamom da store round trip payload").unwrap();
         let vh = B256::repeat_byte(0x11);
         store.put(vh, &blobs[0]).unwrap();
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len().unwrap(), 1);
 
         let got = store.fetch_blob(vh).unwrap();
         assert_eq!(got.as_slice(), blobs[0].as_slice());

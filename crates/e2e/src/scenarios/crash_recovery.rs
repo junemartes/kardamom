@@ -17,6 +17,7 @@
 //! That check proves it under normal operation. This test proves it
 //! across an unclean process death.
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -24,7 +25,6 @@ use anyhow::{Context, Result};
 
 use super::Target;
 use crate::harness::l2;
-use crate::harness::metrics::poll_until;
 
 pub struct Params {
     /// Dev-mnemonic index of the pre-crash sender.
@@ -34,15 +34,17 @@ pub struct Params {
     /// reusing a sender across the crash would test the sequencer's
     /// recovery, not the executor's.
     pub after: usize,
-    pub txs_each: usize,
+    pub txs_each: NonZeroUsize,
 }
+
+const DEFAULT_TXS_EACH: NonZeroUsize = NonZeroUsize::new(12).unwrap();
 
 impl Default for Params {
     fn default() -> Self {
         Self {
             before: 13,
             after: 14,
-            txs_each: 12,
+            txs_each: DEFAULT_TXS_EACH,
         }
     }
 }
@@ -61,67 +63,65 @@ async fn submit_run(t: &Target, signer: &l2::DerivedSigner, n: usize, to: Addres
 /// The live half. The caller crashes and restarts the executor between
 /// the two phases (Target-L sends process signals; a Target-C runner
 /// would use `nomad alloc signal`), then runs the offline comparison.
+///
+/// # Errors
+/// Returns an error when a pre-crash transfer fails to send, or when no
+/// block commits within 30s.
 pub async fn phase_before_crash(t: &Target, p: &Params) -> Result<u64> {
-    let signers = l2::dev_signers(p.before.max(p.after) as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.before.max(p.after))?;
     let to = Address::from([0x9Bu8; 20]);
-    submit_run(t, &signers[p.before], p.txs_each, to).await?;
+    submit_run(t, &signers[p.before], p.txs_each.get(), to).await?;
 
     // Let the block that holds them commit. The receipt is published when
     // the transaction executes, but the block lands only at the next
     // sealer boundary. A crash before that would correctly lose it.
-    let committed = poll_until(
-        "executor commits the pre-crash work",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-        || async {
-            let b = t
-                .executor_metric(super::EXEC_BLOCK_NUMBER)
-                .await
-                .unwrap_or(0.0);
-            Ok((b > 0.0).then_some(b as u64))
-        },
-    )
-    .await?;
+    let committed = t
+        .wait_executor_block(
+            1,
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            "executor commits the pre-crash work",
+        )
+        .await?;
     Ok(committed)
 }
 
 /// The post-restart half. The chain must accept new work, and the
 /// restarted executor must catch back up to the validator.
+///
+/// # Errors
+/// Returns an error when the executor does not return to
+/// `pre_crash_block` within 60s, when a post-restart transfer fails to
+/// send, or when the chain does not advance past `pre_crash_block` within
+/// 30s.
 pub async fn phase_after_restart(t: &Target, p: &Params, pre_crash_block: u64) -> Result<()> {
-    let signers = l2::dev_signers(p.before.max(p.after) as u32 + 1)?;
+    let signers = l2::dev_signers_through(p.before.max(p.after))?;
     let to = Address::from([0x9Cu8; 20]);
 
     // The restarted executor must come back and pass its pre-crash block.
     // This proves it resumed, instead of stalling or restarting the
     // chain.
-    poll_until(
-        "restarted executor reaches its pre-crash block",
+    t.wait_executor_block(
+        pre_crash_block,
         Duration::from_secs(60),
         Duration::from_millis(500),
-        || async {
-            let b = t
-                .executor_metric(super::EXEC_BLOCK_NUMBER)
-                .await
-                .unwrap_or(0.0);
-            Ok((b as u64 >= pre_crash_block).then_some(()))
-        },
+        "restarted executor reaches its pre-crash block",
     )
     .await
     .context("executor did not return to its pre-crash height")?;
 
     // And the chain must still work.
-    submit_run(t, &signers[p.after], p.txs_each, to).await?;
-    poll_until(
-        "post-restart work commits",
+    submit_run(t, &signers[p.after], p.txs_each.get(), to).await?;
+    // `pre_crash_block` is a metric-derived value; a bad or adversarial
+    // reading must fail loudly, not silently wrap the threshold.
+    let past_pre_crash = pre_crash_block
+        .checked_add(1)
+        .context("pre_crash_block overflows")?;
+    t.wait_executor_block(
+        past_pre_crash,
         Duration::from_secs(30),
         Duration::from_millis(250),
-        || async {
-            let b = t
-                .executor_metric(super::EXEC_BLOCK_NUMBER)
-                .await
-                .unwrap_or(0.0);
-            Ok((b as u64 > pre_crash_block).then_some(()))
-        },
+        "post-restart work commits",
     )
     .await
     .context("chain did not advance past the pre-crash block after the restart")?;

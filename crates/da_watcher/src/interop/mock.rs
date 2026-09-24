@@ -2,7 +2,7 @@
 //! feed, and the simulated external validator the two-chain e2e harness drives.
 //!
 //! It is a REAL jsonrpsee WebSocket server implementing the real
-//! [`OutboxFeedApi`](crate::interop::feed::OutboxFeedApi), because the parts of
+//! `OutboxFeedApi` from `kardamom_interop_feed`, because the parts of
 //! the destination side most likely to be wrong are the transport ones:
 //! resume-from-cursor, reconnect, and lag recovery. An in-process channel would
 //! test the derivation rule (already covered in `kardamom_types::xchain`) and
@@ -17,8 +17,9 @@
 //! * **It does not repair its script.** [`MockInteropFeed::gap_next`] makes it
 //!   swallow messages, producing exactly the hole in the dense seq that the
 //!   no-skip rule exists to catch.
-//! * **It carries no finality stamps or anchor proofs.** v1 is feed-trust mode
-//!   (spec §10 tier T0); see [`crate::interop::feed`].
+//! * **It carries no finality stamps or anchor proofs.** v1 is feed-trust
+//!   mode: the watcher executes what the feed says, with no independent
+//!   check.
 //!
 //! ## Retention model
 //!
@@ -32,6 +33,7 @@
 //! [`MockInteropFeed::push_head`] scripts the origin's `head` event.
 
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -40,7 +42,7 @@ use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
 use kardamom_types::xchain::OutboxMessage;
 use tokio::sync::watch;
 
-use crate::interop::feed::{OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto};
+use kardamom_interop_feed::{OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto};
 
 /// One entry of the mock's retained script.
 #[derive(Clone, Debug)]
@@ -77,8 +79,9 @@ pub struct MockInteropFeed {
 impl MockInteropFeed {
     /// Bind a feed for `origin_chain_id` on an ephemeral loopback port.
     ///
-    /// Panics on bind failure: a test environment that cannot bind loopback is
-    /// broken in a way no caller can handle.
+    /// # Panics
+    /// Panics on bind failure: a test environment that cannot bind loopback
+    /// is broken in a way no caller can handle.
     pub async fn new(origin_chain_id: u64) -> Self {
         let state = Arc::new(FeedState {
             origin_chain_id,
@@ -104,12 +107,8 @@ impl MockInteropFeed {
         }
     }
 
-    /// The peer chain this feed claims to be.
-    pub fn origin_chain_id(&self) -> u64 {
-        self.state.origin_chain_id
-    }
-
     /// WebSocket endpoint to point a [`crate::interop::WsRemoteChainSource`] at.
+    #[must_use]
     pub fn url(&self) -> String {
         format!("ws://{}", self.addr)
     }
@@ -117,6 +116,10 @@ impl MockInteropFeed {
     /// Retain a message and serve it to every subscriber whose cursor is at or
     /// below its seq — unless [`Self::gap_next`] armed a swallow, in which case
     /// the message is dropped on the floor as a lossy feed would drop it.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn push_message(&self, msg: OutboxMessage) {
         {
             let mut swallow = self.state.swallow.lock().unwrap();
@@ -136,6 +139,11 @@ impl MockInteropFeed {
     /// Raise the feed floor: messages below `seq` are gone, and every
     /// subscribe with a cursor below `seq` gets a `Lagged` frame first —
     /// the real server's retention edge.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn set_floor(&self, seq: u64) {
         let len = {
             let mut floor = self.state.floor.lock().unwrap();
@@ -153,6 +161,11 @@ impl MockInteropFeed {
     /// Script a `head` event: the origin closed every block through
     /// `block`. A subscriber with an open batch from an earlier block
     /// closes it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn push_head(&self, block: u64) {
         let len = {
             let mut script = self.state.script.lock().unwrap();
@@ -165,6 +178,10 @@ impl MockInteropFeed {
     /// Make the feed swallow the next `n` pushed messages — a hole in the
     /// dense per-pair seq, which the destination must halt on rather than
     /// step over.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
     pub fn gap_next(&self, n: u64) {
         *self.state.swallow.lock().unwrap() += n;
     }
@@ -180,13 +197,13 @@ impl MockInteropFeed {
 
     /// How many subscriptions this feed has served since it started. Greater
     /// than one means a subscriber went through its resume path.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic while holding
+    /// it), which only happens after the test has already failed.
+    #[must_use]
     pub fn subscription_count(&self) -> usize {
         self.state.subscribed_dests.lock().unwrap().len()
-    }
-
-    /// The `dest_chain_id` each subscription asked for, in order.
-    pub fn subscribed_dests(&self) -> Vec<u64> {
-        self.state.subscribed_dests.lock().unwrap().clone()
     }
 }
 
@@ -230,7 +247,10 @@ impl OutboxFeedApiServer for FeedHandler {
                     FeedItem::Head(_) => None,
                 });
             let event = OutboxEventDto::Lagged {
-                skipped: floor - from,
+                // The enclosing `if from < floor` already rules out
+                // underflow. `saturating_sub` makes that visible at the
+                // arithmetic, not only at the branch.
+                skipped: floor.saturating_sub(from),
                 floor_seq: Some(floor),
                 floor_block,
             };
@@ -242,44 +262,119 @@ impl OutboxFeedApiServer for FeedHandler {
             from = floor;
         }
 
+        let mut ctx = DrainCtx {
+            handler: self,
+            sink: &sink,
+            from,
+            closed: &mut closed,
+            items: &mut items,
+        };
         let mut next = 0usize;
         loop {
-            loop {
-                let Some(item) = self.state.script.lock().unwrap().get(next).cloned() else {
-                    break;
-                };
-                next += 1;
-                let event = match item {
-                    // Honouring the cursor is the whole contract: a resumed
-                    // subscriber must see exactly the same suffix a fresh one
-                    // at that cursor would.
-                    FeedItem::Message(m) if m.seq < from => continue,
-                    FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
-                        OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
-                    )),
-                    FeedItem::Head(block) => OutboxEventDto::Head {
-                        block_number: block,
-                    },
-                };
-                let msg = serde_json::value::to_raw_value(&event)
-                    .map_err(|e| format!("serialize feed event: {e}"))?;
-                if sink.send(msg).await.is_err() {
-                    return Ok(());
-                }
-            }
-            tokio::select! {
-                () = sink.closed() => return Ok(()),
-                // An `Err` return, not `Ok(())`: jsonrpsee treats a clean
-                // return as "no further message" and leaves the subscriber
-                // waiting forever, which is a hang rather than the session
-                // drop this is meant to simulate.
-                _ = closed.changed() => return Err("feed session closed".into()),
-                r = items.changed() => {
-                    if r.is_err() {
-                        return Ok(());
-                    }
-                }
+            match ctx.drain_next(next).await {
+                ControlFlow::Break(result) => return result,
+                ControlFlow::Continue(n) => next = n,
             }
         }
     }
+}
+
+/// Fixed context for one [`FeedHandler::subscribe_outbox`] subscription's
+/// drain loop: the handler, the sink, the cursor floor, and the two wake
+/// signals. Only [`DrainCtx::drain_next`]'s own `next` parameter changes
+/// across calls.
+struct DrainCtx<'a> {
+    handler: &'a FeedHandler,
+    sink: &'a jsonrpsee::core::server::SubscriptionSink,
+    from: u64,
+    closed: &'a mut watch::Receiver<u64>,
+    items: &'a mut watch::Receiver<usize>,
+}
+
+impl DrainCtx<'_> {
+    /// One [`FeedHandler::subscribe_outbox`] pass: drain the script from
+    /// `next`, then wait for more items, sink close, or session close.
+    /// `Break` carries the subscription's final result; `Continue`
+    /// carries the next unsent script index to resume from.
+    async fn drain_next(&mut self, next: usize) -> ControlFlow<SubscriptionResult, usize> {
+        let next = match self.handler.drain_script(self.sink, self.from, next).await {
+            Ok(ControlFlow::Break(())) => return ControlFlow::Break(Ok(())),
+            Ok(ControlFlow::Continue(n)) => n,
+            Err(e) => return ControlFlow::Break(Err(e.into())),
+        };
+        tokio::select! {
+            () = self.sink.closed() => ControlFlow::Break(Ok(())),
+            // An `Err` return, not `Ok(())`: jsonrpsee treats a clean
+            // return as "no further message" and leaves the subscriber
+            // waiting forever, which is a hang rather than the session
+            // drop this is meant to simulate.
+            _ = self.closed.changed() => ControlFlow::Break(Err("feed session closed".into())),
+            r = self.items.changed() => match r {
+                Ok(()) => ControlFlow::Continue(next),
+                Err(_) => ControlFlow::Break(Ok(())),
+            },
+        }
+    }
+}
+
+impl FeedHandler {
+    /// Send every scripted item from `next` onward, at or after `from`.
+    /// Returns [`ControlFlow::Continue`] with the next unsent index once the
+    /// script is exhausted for now (the caller waits for more items), or
+    /// [`ControlFlow::Break`] once the sink closes (the caller should stop).
+    async fn drain_script(
+        &self,
+        sink: &jsonrpsee::core::server::SubscriptionSink,
+        from: u64,
+        mut next: usize,
+    ) -> Result<ControlFlow<(), usize>, String> {
+        loop {
+            match self.dispatch_one(sink, from, next).await? {
+                DispatchStep::Idle => return Ok(ControlFlow::Continue(next)),
+                DispatchStep::Sent => next += 1,
+                DispatchStep::ConsumerGone => return Ok(ControlFlow::Break(())),
+            }
+        }
+    }
+
+    /// Handle the one script item at `next`, if there is one: skip a
+    /// message that predates `from` (honouring the cursor is the whole
+    /// contract — a resumed subscriber must see exactly the same suffix a
+    /// fresh one at that cursor would), or send it. [`drain_script`]'s
+    /// loop is just this call plus the dispatch on its result.
+    async fn dispatch_one(
+        &self,
+        sink: &jsonrpsee::core::server::SubscriptionSink,
+        from: u64,
+        next: usize,
+    ) -> Result<DispatchStep, String> {
+        let Some(item) = self.state.script.lock().unwrap().get(next).cloned() else {
+            return Ok(DispatchStep::Idle);
+        };
+        let event = match item {
+            FeedItem::Message(m) if m.seq < from => return Ok(DispatchStep::Sent),
+            FeedItem::Message(m) => OutboxEventDto::Message(Box::new(
+                OutboxMessageDto::from_outbox_message(self.state.origin_chain_id, &m),
+            )),
+            FeedItem::Head(block) => OutboxEventDto::Head {
+                block_number: block,
+            },
+        };
+        let msg = serde_json::value::to_raw_value(&event)
+            .map_err(|e| format!("serialize feed event: {e}"))?;
+        if sink.send(msg).await.is_err() {
+            return Ok(DispatchStep::ConsumerGone);
+        }
+        Ok(DispatchStep::Sent)
+    }
+}
+
+/// [`FeedHandler::dispatch_one`]'s outcome: whether the script is
+/// exhausted for now, the item at that index was handled (sent, or
+/// skipped because it predates the cursor — either way the next call
+/// should try the following index), or the subscriber's sink is gone.
+enum DispatchStep {
+    Idle,
+    Sent,
+    ConsumerGone,
 }

@@ -12,10 +12,7 @@
 //! Aeron media driver, so the profiling recordings stay close to the
 //! dispatch window.
 //!
-//! This is the stand-in left in place after the removal of
-//! `kardamom-node`. It profiles ingress only. A full in-process Aeron
-//! pipeline harness, with a real sequencer, executor, and sealer so the
-//! flame graph also shows revm and ordering work, is a follow-up item.
+//! This harness profiles ingress only.
 //! Ingress emits no `tracing` spans, so the `tracing-flame` SVG is
 //! sparse for this stand-in. The `pprof` on-CPU sampler, which is
 //! frame-based and filtered to `kardamom_ingress` frames, gives the
@@ -32,6 +29,7 @@ mod inprocess;
 
 use std::fs::File;
 use std::io::BufWriter;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,8 +44,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::Benchmark;
 use crate::benchmark::Outputs;
-use crate::config::PPROF_HZ;
-use crate::report::{self, ReportInputs};
+use crate::pprof_guard::{PPROF_HZ, pprof_guard};
+use crate::report;
 use crate::workflow::BenchWorkflow;
 
 use flame::{
@@ -61,7 +59,7 @@ pub use inprocess::{InProcessIngress, spawn_inprocess_ingress};
 pub struct Harness<W: BenchWorkflow> {
     /// The chain ID the in-process ingress serves through `eth_chainId`.
     /// Workflows presign transactions against this ID.
-    pub chain_id: u64,
+    pub chain_id: NonZeroU64,
     /// The benchmark dispatcher this harness drives.
     pub bench: Benchmark<W>,
     /// The path to write the `tracing-flame` SVG to. The code merges
@@ -74,6 +72,22 @@ pub struct Harness<W: BenchWorkflow> {
     /// If set, record a `pprof` CPU sample over the dispatch window
     /// and write an inferno-flamegraph SVG to this path.
     pub pprof_out: Option<PathBuf>,
+}
+
+/// Flush the flame layer's buffered writes. The guard's `Drop` closes
+/// the underlying file when this function returns, before the caller
+/// reads it back, so no further write can race the read.
+///
+/// `flame_guard` is taken by value on purpose: it must drop at the end
+/// of this function, not the caller's.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "flame_guard must drop at this function's end, not the caller's"
+)]
+fn flush_folded(flame_guard: FlushGuard<BufWriter<File>>) -> anyhow::Result<()> {
+    flame_guard
+        .flush()
+        .map_err(|e| anyhow::anyhow!("flush flamegraph: {e}"))
 }
 
 impl<W: BenchWorkflow> Harness<W> {
@@ -98,9 +112,7 @@ impl<W: BenchWorkflow> Harness<W> {
     /// # Panics
     ///
     /// Panics if the fixed loopback address `"127.0.0.1:0"` fails to
-    /// parse. This cannot happen. It also panics, indirectly, if a
-    /// sender task panics mid-iteration, which poisons the per-task
-    /// accumulator mutex. See `Benchmark::dispatch`.
+    /// parse. This cannot happen.
     pub async fn run(self) -> anyhow::Result<()> {
         let (active, flame_guard) = self.init_tracing()?;
         let (client, ingress) = self.build_ingress_and_client().await?;
@@ -181,19 +193,16 @@ impl<W: BenchWorkflow> Harness<W> {
     /// executor reflects receipts regardless of partitioning, and the
     /// bench client drives one URL.
     async fn build_ingress_and_client(&self) -> anyhow::Result<(HttpClient, InProcessIngress)> {
-        spawn_inprocess_ingress(self.chain_id, 1, self.bench.max_in_flight as usize).await
+        spawn_inprocess_ingress(
+            self.chain_id,
+            NonZeroU32::MIN,
+            self.bench.max_in_flight as usize,
+        )
+        .await
     }
 
     fn build_pprof_guard(&self) -> anyhow::Result<Option<pprof::ProfilerGuard<'static>>> {
-        if self.pprof_out.is_none() {
-            return Ok(None);
-        }
-        let guard = pprof::ProfilerGuardBuilder::default()
-            .frequency(PPROF_HZ)
-            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-            .build()
-            .map_err(|e| anyhow::anyhow!("pprof guard build failed: {e}"))?;
-        Ok(Some(guard))
+        pprof_guard(self.pprof_out.as_ref(), PPROF_HZ)
     }
 
     fn log_dispatch_start(&self) {
@@ -213,23 +222,18 @@ impl<W: BenchWorkflow> Harness<W> {
     /// result to an inferno-flamegraph SVG at `self.flame_out`. This
     /// method cleans up the raw folded sidecar file on the way out.
     fn write_flame_output(&self, flame_guard: FlushGuard<BufWriter<File>>) -> anyhow::Result<()> {
-        flame_guard
-            .flush()
-            .map_err(|e| anyhow::anyhow!("flush flamegraph: {e}"))?;
-        // Drop the guard before reading, so no further writes race with this read.
-        drop(flame_guard);
+        flush_folded(flame_guard)?;
         let folded_tmp = self.folded_tmp_path();
         let raw_flame = std::fs::read_to_string(&folded_tmp)
             .map_err(|e| anyhow::anyhow!("read {}: {e}", folded_tmp.display()))?;
         let merged_flame = merge_folded_text(&raw_flame);
 
-        // The in-process ingress stand-in emits no `tracing` spans (only the
-        // node did). So the folded text is often just bare tokio-worker roots,
-        // which `merge_folded_text` drops, leaving nothing to render. Inferno
-        // fails on empty input, so skip the SVG and log instead. The `pprof`
-        // on-CPU path, which is frame-based, is the useful profiling output
-        // for this stand-in. The full pipeline harness restores span-based
-        // flame graphs.
+        // The in-process ingress stand-in emits no `tracing` spans. So the
+        // folded text is often just bare tokio-worker roots, which
+        // `merge_folded_text` drops, leaving nothing to render. Inferno
+        // fails on empty input, so skip the SVG and log instead. The
+        // `pprof` on-CPU path, which is frame-based, is the useful
+        // profiling output for this stand-in.
         if merged_flame.trim().is_empty() {
             let _ = std::fs::remove_file(&folded_tmp);
             tracing::warn!(
@@ -297,18 +301,7 @@ impl<W: BenchWorkflow> Harness<W> {
     }
 
     fn emit_report(&self, outputs: Outputs) -> anyhow::Result<()> {
-        let bench_report = report::build_report(
-            ReportInputs {
-                workload_name: self.bench.workflow.name(),
-                txs_per_task: self.bench.txs_per_task,
-                max_in_flight: self.bench.max_in_flight,
-                concurrency: self.bench.concurrency,
-                configured_timeout: self.bench.timeout,
-            },
-            &outputs.counters,
-            outputs.histograms,
-            outputs.measurement_duration,
-        );
+        let bench_report = self.bench.report(outputs);
         report::print_terminal(&bench_report);
         if let Some(path) = &self.report_json {
             report::write_json(path, &bench_report)?;

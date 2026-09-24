@@ -1,3 +1,9 @@
+> **Historical.** This is the original design of the cluster. The Vagrant
+> VM path it describes is retired: the container root (`terraform/containers`)
+> is the local profile. The Terraform root of the production profile is
+> not part of this repository. The
+> Ansible, Nomad and failure-model sections still apply.
+
 # Nomad + Ansible Deployment Backend — Design
 
 - **Date:** 2026-05-29
@@ -37,7 +43,7 @@ is greenfield and **additive** (new files under `deploy/cluster/`).
 
 **Goals**
 - One-command, reproducible bring-up of a 5-node kardamom cluster on a single
-  developer machine: `make up` ≈ `vagrant up` → build/push images → Ansible →
+  developer machine: `just container-up` ≈ `vagrant up` → build/push images → Ansible →
   `nomad run` → smoke test.
 - Real multi-host topology: services on different VMs communicate over Aeron
   **UDP**; a 3-node recorder quorum durably records `tx_ordering`.
@@ -110,7 +116,7 @@ concrete endpoints are rendered per-node (see §7). Stream-id schemes
 ```
 deploy/cluster/
   Vagrantfile                  # N libvirt/virtualbox VMs, static IPs, role tags
-  Makefile (or justfile)       # `make up` / `make down` / `make smoke` one-shot
+  justfile       # `just container-up` / `just container-down` / `just smoke` one-shot
   ansible/
     inventory.yml              # generated from Vagrant (static IPs + roles)
     site.yml
@@ -165,7 +171,7 @@ deploy/cluster/
 
 ## 9. Bring-up flow
 
-`make up`:
+`just container-up`:
 1. `vagrant up` — create/boot the 5 VMs with static IPs + role tags.
 2. Ansible `site.yml` — install Docker/Consul/Nomad/registry; mount tmpfs; set
    Nomad node metadata (`role`); start the cluster; wait for Nomad+Consul healthy.
@@ -176,7 +182,7 @@ deploy/cluster/
    da_watcher, batcher); wait for ingress JSON-RPC to bind.
 6. **Smoke test** (§10).
 
-`make down` tears down jobs + `vagrant destroy`.
+`just container-down` tears down jobs + `vagrant destroy`.
 
 ## 10. Verification / testing
 
@@ -191,7 +197,7 @@ deploy/cluster/
 - **CI note:** the full VM cluster is **not** run in GitHub CI (needs nested
   virtualization). CI validates only what is cheap: `ansible-lint`/`yamllint`,
   `nomad job validate` on the rendered specs, and `docker build` of the images.
-  The full `make up` smoke test is a documented, locally-run / self-hosted-runner
+  The full `just container-up` smoke test is a documented, locally-run / self-hosted-runner
   target.
 
 ## 11. Milestones (one spec, built in layers)
@@ -203,7 +209,7 @@ deploy/cluster/
    position advances).
 3. **Service pipeline:** the 6 service jobs + Consul-templated configs + UDP
    channels + genesis. Exit: full pipeline `running`, ingress JSON-RPC reachable.
-4. **Smoke test + one-shot + docs:** `make up`/`make smoke`/`make down`, README,
+4. **Smoke test + one-shot + docs:** `just container-up`/`just smoke`/`just container-down`, README,
    CI validate-only checks.
 
 ## 12. Risks & open questions
@@ -230,8 +236,8 @@ deploy/cluster/
 
 ## 13. Success criteria
 
-- `make up` on a clean machine yields a 5-node cluster running the full pipeline,
-  and `make smoke` submits transfers through ingress and gets successful receipts,
+- `just container-up` on a clean machine yields a 5-node cluster running the full pipeline,
+  and `just smoke` submits transfers through ingress and gets successful receipts,
   reproducibly.
 - All cluster definition lives in-repo under `deploy/cluster/` and is
-  version-controlled; no manual steps beyond `make up`.
+  version-controlled; no manual steps beyond `just container-up`.

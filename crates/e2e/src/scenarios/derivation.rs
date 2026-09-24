@@ -43,6 +43,9 @@ pub struct BlockOrigin {
 /// Anything that learns a block number from a receipt and then reads the
 /// headers table is racing that commit, and must wait instead of
 /// assuming.
+///
+/// # Errors
+/// Returns an error when the header does not appear within 30s.
 pub async fn await_block_origins_through(
     state_dir: &Path,
     block_number: u64,
@@ -69,6 +72,10 @@ pub async fn await_block_origins_through(
 /// headers over RPC (there is no `eth_getBlockByNumber`), so the state
 /// database is the only place to observe the origin, which is worth
 /// knowing on its own.
+///
+/// # Errors
+/// Returns an error when the state dir cannot be opened or the headers
+/// table cannot be read.
 pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
     let env = open_state_ro(state_dir)?;
     let headers = kardamom_state::read_all_headers(&env).context("read headers table")?;
@@ -83,68 +90,104 @@ pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
         .collect())
 }
 
+/// Send `count` filler L2 transfers from `signer` to `to`, at nonces
+/// `0..count`. Returns the hash of each one that actually landed (a
+/// transient send failure just skips that nonce; the spam is filler, not
+/// the thing under test).
+async fn send_filler_transfers(
+    t: &Target,
+    signer: &l2::DerivedSigner,
+    to: Address,
+    count: u64,
+) -> Result<Vec<alloy_primitives::B256>> {
+    let mut sender = l2::NudgeSender::new(signer.clone(), to, 0);
+    let mut sent = Vec::new();
+    for _ in 0..count {
+        if let Some(tx) = sender.send(&t.rpc, t.chain_id).await? {
+            sent.push(tx.hash);
+        }
+    }
+    Ok(sent)
+}
+
 /// Checks rules 1, 2, and 4 over the whole chain built so far.
 ///
 /// `l1_finalized` is the L1 finalized tip observed after the chain
 /// stopped growing. So this checks "the origin never exceeds finality"
 /// against a bound that can only have moved forward.
+///
+/// # Errors
+/// Returns an error when `blocks` is empty, when the origin regresses or
+/// skips an L1 block, or when an origin exceeds `l1_finalized`.
 pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64) -> Result<()> {
     anyhow::ensure!(!blocks.is_empty(), "no blocks were produced");
+    blocks.windows(2).try_for_each(|w| w[1].check_step(&w[0]))?;
+    blocks
+        .iter()
+        .try_for_each(|b| b.check_finalized(l1_finalized))
+}
 
-    let mut prev: Option<BlockOrigin> = None;
-    for b in blocks {
-        // `l1_origin == 0` means "no epoch adopted yet". These are the
-        // blocks a chain produces between genesis and its first epoch. The
-        // step out of 0 is the watcher's seed, which deliberately skips
-        // historical L1 (see the spec's Non-Goals). So this step is not a
-        // skip in the rule-2 sense.
-        //
-        // Known gap: because the seed starts where it does, deposits made
-        // in L1 blocks before it are unrecoverable, since nothing derives
-        // them. The spec's `l1_origin_genesis` edge case will close this
-        // gap. Until then, a chain's verifiable history starts at its
-        // first epoch, not at L1 genesis.
-        let crossing_the_seed = prev.is_some_and(|p| p.l1_origin == 0) && b.l1_origin > 0;
-        if let Some(p) = prev
-            && !crossing_the_seed
-        {
-            // Rule 1: monotonic. A regression would make deposit derivation
-            // ambiguous: two blocks would claim different origins for the
-            // same stretch of L1.
-            anyhow::ensure!(
-                b.l1_origin >= p.l1_origin,
-                "l1_origin regressed: block {} has origin {}, block {} had {}",
-                b.block_number,
-                b.l1_origin,
-                p.block_number,
-                p.l1_origin
-            );
-            // Rule 2: no skipping. Every L1 block between two origins must
-            // have had its own epoch, so the origin may step by only one. A
-            // jump means an epoch was dropped, along with any deposits it
-            // carried. This is exactly the censorship this design exists
-            // to prevent.
-            anyhow::ensure!(
-                b.l1_origin <= p.l1_origin + 1,
-                "l1_origin skipped from {} to {} between blocks {} and {}: \
-                 an epoch (and any deposits in it) was dropped",
-                p.l1_origin,
-                b.l1_origin,
-                p.block_number,
-                b.block_number
-            );
+impl BlockOrigin {
+    /// Rules 1 and 2 against `prev`, the block immediately before `self`:
+    /// the origin is monotonic and steps by at most one L1 block.
+    ///
+    /// `l1_origin == 0` means "no epoch adopted yet". These are the blocks
+    /// a chain produces between genesis and its first epoch. The step out
+    /// of 0 is the watcher's seed, which deliberately skips historical L1
+    /// (see the spec's Non-Goals), so that step is not a skip in the
+    /// rule-2 sense.
+    ///
+    /// Known gap: because the seed starts where it does, deposits made in
+    /// L1 blocks before it are unrecoverable, since nothing derives them.
+    /// The spec's `l1_origin_genesis` edge case will close this gap.
+    /// Until then, a chain's verifiable history starts at its first
+    /// epoch, not at L1 genesis.
+    fn check_step(&self, prev: &Self) -> Result<()> {
+        let crossing_the_seed = prev.l1_origin == 0 && self.l1_origin > 0;
+        if crossing_the_seed {
+            return Ok(());
         }
-        // Rule 4: the origin is always an L1 block that is already final.
+        // Rule 1: monotonic. A regression would make deposit derivation
+        // ambiguous: two blocks would claim different origins for the
+        // same stretch of L1.
         anyhow::ensure!(
-            b.l1_origin <= l1_finalized,
+            self.l1_origin >= prev.l1_origin,
+            "l1_origin regressed: block {} has origin {}, block {} had {}",
+            self.block_number,
+            self.l1_origin,
+            prev.block_number,
+            prev.l1_origin
+        );
+        // Rule 2: no skipping. Every L1 block between two origins must
+        // have had its own epoch, so the origin may step by only one. A
+        // jump means an epoch was dropped, along with any deposits it
+        // carried. This is exactly the censorship this design exists to
+        // prevent. `prev.l1_origin` is a state-DB-derived value;
+        // saturating keeps the comparison correct even at the u64
+        // boundary, where no step could count as a skip.
+        anyhow::ensure!(
+            self.l1_origin <= prev.l1_origin.saturating_add(1),
+            "l1_origin skipped from {} to {} between blocks {} and {}: \
+             an epoch (and any deposits in it) was dropped",
+            prev.l1_origin,
+            self.l1_origin,
+            prev.block_number,
+            self.block_number
+        );
+        Ok(())
+    }
+
+    /// Rule 4: the origin is always an L1 block that is already final.
+    fn check_finalized(&self, l1_finalized: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.l1_origin <= l1_finalized,
             "block {} claims origin {} beyond the L1 finalized tip {}",
-            b.block_number,
-            b.l1_origin,
+            self.block_number,
+            self.l1_origin,
             l1_finalized
         );
-        prev = Some(*b);
+        Ok(())
     }
-    Ok(())
 }
 
 /// The origin advances during ordinary operation, and the
@@ -153,9 +196,16 @@ pub fn assert_origin_sequence_is_sound(blocks: &[BlockOrigin], l1_finalized: u64
 /// This deliberately runs with no deposits. An idle L1 is the case where
 /// it is tempting to emit nothing at all, and rule 2 is exactly the rule
 /// that would break.
+///
+/// # Errors
+/// Returns an error when the origin sequence is unsound, or when the
+/// origin does not advance after L1 mines new blocks.
 pub async fn origin_advances_over_an_idle_l1(l1: &L1, state_dir: &Path) -> Result<()> {
     let start = read_block_origins(state_dir)?;
-    let start_origin = start.last().map(|b| b.l1_origin).unwrap_or(0);
+    let start_origin = start
+        .last()
+        .map(|b| b.l1_origin)
+        .context("no blocks at scenario start")?;
 
     // Advance L1 well past finality several times over.
     l1.mine(12).await?;
@@ -184,23 +234,23 @@ pub async fn origin_advances_over_an_idle_l1(l1: &L1, state_dir: &Path) -> Resul
 /// the epoch is atomic and forces a boundary, not because of timing luck.
 /// Under concurrent load, a design that only tends to put deposits early
 /// would fail this test.
+///
+/// # Errors
+/// Returns an error when the deposit or its receipt fails, when it does
+/// not land at index 0, or when its block does not open a new epoch.
 pub async fn deposits_lead_their_block_under_load(
     t: &Target,
     l1: &L1,
     state_dir: &Path,
 ) -> Result<()> {
-    let signers = l2::dev_signers(3)?;
+    let signers = l2::dev_signers_total(3)?;
     let beneficiary = &signers[1];
     let spammer = &signers[0];
 
-    // Keep L2 busy so the epoch lands amongst regular traffic.
-    let mut sent = Vec::new();
-    for nonce in 0..6u64 {
-        let tx = l2::sign_transfer(spammer, t.chain_id, nonce, signers[2].address, 1)?;
-        if t.rpc.send_raw(&tx.raw).await.result.is_ok() {
-            sent.push(tx.hash);
-        }
-    }
+    // Keep L2 busy so the epoch lands amongst regular traffic. Only the
+    // side effect (filler traffic landing) matters here; the returned
+    // hashes go unused, unlike `stalled_l1_does_not_stall_l2`'s count.
+    let _sent = send_filler_transfers(t, spammer, signers[2].address, 6).await?;
 
     let (block_hash, log_index) = l1
         .deposit_eth(beneficiary.address, U256::from(5_000_000_000_000_000u64))
@@ -210,8 +260,8 @@ pub async fn deposits_lead_their_block_under_load(
 
     let source_hash = kardamom_da_watcher::source_hash(block_hash, log_index);
     let receipt = await_l2_receipt(t, source_hash, "the deposit").await?;
-    let (block_number, tx_index) =
-        receipt_placement(&receipt).context("place the deposit receipt")?;
+    let placement = receipt_placement(&receipt).context("place the deposit receipt")?;
+    let (block_number, tx_index) = (placement.block, placement.index);
 
     // Rule 3: index 0 of its block. Not "early", and not "before the
     // transactions that happened to arrive later" — it must be first.
@@ -255,12 +305,17 @@ pub async fn deposits_lead_their_block_under_load(
 /// This is what the atomic epoch record buys: no one can split the group
 /// across blocks or reorder it, because it travels as a single canonical
 /// record.
+///
+/// # Errors
+/// Returns an error when the batch deposit or a receipt fails, when the
+/// deposits did not land in one L1 or L2 block, when they do not follow
+/// L1 log order, or when the resulting origin sequence is unsound.
 pub async fn multi_deposit_epoch_lands_in_log_order(
     t: &Target,
     l1: &L1,
     state_dir: &Path,
 ) -> Result<()> {
-    let signers = l2::dev_signers(5)?;
+    let signers = l2::dev_signers_total(5)?;
     let recipients: Vec<Address> = (2..5).map(|i| signers[i].address).collect();
 
     // Three deposits mined into a single L1 block, so they form one epoch.
@@ -286,8 +341,8 @@ pub async fn multi_deposit_epoch_lands_in_log_order(
     for (block_hash, _l1_number, log_index) in &receipts {
         let sh = kardamom_da_watcher::source_hash(*block_hash, *log_index);
         let r = await_l2_receipt(t, sh, "a batched deposit").await?;
-        let (bn, ti) = receipt_placement(&r).context("place a batched deposit receipt")?;
-        placements.push((*log_index, bn, ti));
+        let p = receipt_placement(&r).context("place a batched deposit receipt")?;
+        placements.push((*log_index, p.block, p.index));
     }
 
     let block = placements[0].1;
@@ -319,6 +374,11 @@ pub async fn multi_deposit_epoch_lands_in_log_order(
 /// ordinary transaction flow keeps running while the origin is frozen.
 /// That is the difference between a liveness alarm and a liveness
 /// failure.
+///
+/// # Errors
+/// Returns an error when no L2 tx is accepted or applied while L1 is
+/// idle, when the origin moves while L1 is frozen, or when it does not
+/// resume, or resumes unsoundly, once L1 comes back.
 pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path) -> Result<()> {
     // Anvil runs with block_time(1), so L1 must be told to stop. Simply
     // not mining would still leave it producing a block every second.
@@ -332,19 +392,14 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
         .map(|b| b.l1_origin)
         .context("no blocks before the stall")?;
     let applied_before = t
-        .executor_metric(super::EXEC_TX_APPLIED)
-        .await
+        .executor_metric_opt(super::EXEC_TX_APPLIED)
+        .await?
         .unwrap_or(0.0);
 
     // L2 keeps taking work with L1 completely idle.
-    let signers = l2::dev_signers(2)?;
-    let mut accepted = 0.0;
-    for nonce in 0..4u64 {
-        let tx = l2::sign_transfer(&signers[0], t.chain_id, nonce, signers[1].address, 1)?;
-        if t.rpc.send_raw(&tx.raw).await.result.is_ok() {
-            accepted += 1.0;
-        }
-    }
+    let signers = l2::dev_signers_total(2)?;
+    let sent = send_filler_transfers(t, &signers[0], signers[1].address, 4).await?;
+    let accepted = f64::from(u32::try_from(sent.len()).context("accepted count overflows u32")?);
     anyhow::ensure!(accepted > 0.0, "no L2 txs were accepted while L1 was idle");
     t.wait_executor_applied(applied_before + accepted, Duration::from_secs(20))
         .await
@@ -368,7 +423,10 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
     let resumed = read_block_origins(state_dir)?;
     let l1_finalized = l1.finalized_block_number().await?;
     assert_origin_sequence_is_sound(&resumed, l1_finalized)?;
-    let resumed_origin = resumed.last().map(|b| b.l1_origin).unwrap_or(0);
+    let resumed_origin = resumed
+        .last()
+        .map(|b| b.l1_origin)
+        .context("no blocks after L1 resumed")?;
     anyhow::ensure!(
         resumed_origin > frozen_origin,
         "origin did not resume after L1 restarted: {resumed_origin} vs {frozen_origin}"
@@ -381,6 +439,11 @@ pub async fn stalled_l1_does_not_stall_l2(t: &Target, l1: &L1, state_dir: &Path)
 /// This derives the expected set directly from L1 logs and compares it
 /// against what the chain executed. A later validator check will enforce
 /// this property. Checking it here shows the producer is already honest.
+///
+/// # Errors
+/// Returns an error when the chain never adopts an L1 origin within 60s,
+/// when reading L1 deposit logs fails, when a recorded deposit never
+/// executes on L2, or when one executes more than once.
 pub async fn every_l1_deposit_appears_exactly_once(
     t: &Target,
     l1: &L1,
@@ -426,8 +489,8 @@ pub async fn every_l1_deposit_appears_exactly_once(
 
     // A duplicate would mean the racing sequencers' re-offers were not
     // deduplicated, so the deposit would have minted twice.
-    for (sh, count) in &seen {
-        anyhow::ensure!(*count == 1, "deposit {sh} executed {count} times");
+    if let Some((sh, count)) = seen.iter().find(|(_, count)| **count != 1) {
+        anyhow::bail!("deposit {sh} executed {count} times");
     }
     Ok(())
 }

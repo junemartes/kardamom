@@ -4,13 +4,13 @@
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::B256;
-use crossbeam_channel::bounded;
-use kardamom_types::{BPosition, BlockBoundary, Receipt};
+use kardamom_types::{BlockBoundary, Receipt, ReceiptRows};
 
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
 
-use super::{ExecToCommit, TxReceiptsPublication, spawn_commit};
+use super::test_support::{feed_commits, pos};
+use super::{CommitLoop, ExecToCommit, TxReceiptsPublication};
 
 struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
 impl TxReceiptsPublication for RecordPub {
@@ -20,35 +20,42 @@ impl TxReceiptsPublication for RecordPub {
     }
 }
 
-#[test]
-fn commit_thread_preserves_order() {
-    let (tx, rx) = bounded::<ExecToCommit>(8);
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let pos0 = BPosition {
-        term_id: 0,
-        term_offset: 0,
-    };
-
-    tx.send(ExecToCommit::Receipt(Receipt {
-        tx_idx: pos0,
-        tx_hash: B256::repeat_byte(0xAA),
+fn receipt(tag: u8, offset: i32) -> Box<ReceiptRows> {
+    Box::new(ReceiptRows::bare(Receipt {
+        tx_idx: pos(offset),
+        tx_hash: B256::repeat_byte(tag),
         status: true,
         gas_used: 21_000,
         logs: Vec::new(),
         write_set_hash: B256::ZERO,
         ..Default::default()
     }))
-    .unwrap();
-    tx.send(ExecToCommit::Boundary(BlockBoundary {
-        block_number: 1,
-        end_tx_idx: pos0,
-        l2_timestamp: 100,
-        l1_origin: 0,
-    }))
-    .unwrap();
-    drop(tx);
+}
 
-    let h = spawn_commit(RecordPub(log.clone()), rx);
+#[test]
+fn commit_thread_preserves_order() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let pos0 = pos(0);
+
+    let rx = feed_commits(vec![
+        ExecToCommit::Receipt(Box::new(ReceiptRows::bare(Receipt {
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAA),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        }))),
+        ExecToCommit::Boundary(BlockBoundary {
+            block_number: 1,
+            end_tx_idx: pos0,
+            l2_timestamp: 100,
+            l1_origin: 0,
+        }),
+    ]);
+
+    let h = CommitLoop::new(RecordPub(log.clone()), rx).spawn();
     h.join().expect("no panic").expect("ok");
 
     let l = log.lock().unwrap();
@@ -58,7 +65,7 @@ fn commit_thread_preserves_order() {
 }
 
 /// Rejects the first `fails_left` publish attempts, then records each one.
-/// This simulates a transient NOT_CONNECTED error while the ingress
+/// This simulates a transient `NOT_CONNECTED` error while the ingress
 /// subscription is forming.
 struct FlakyPub {
     fails_left: u32,
@@ -81,32 +88,29 @@ impl TxReceiptsPublication for FlakyPub {
 // receipt lands.
 #[test]
 fn commit_thread_retries_until_delivered() {
-    let (tx, rx) = bounded::<ExecToCommit>(8);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let pos0 = BPosition {
-        term_id: 0,
-        term_offset: 0,
-    };
-    tx.send(ExecToCommit::Receipt(Receipt {
-        tx_idx: pos0,
-        tx_hash: B256::repeat_byte(0xAB),
-        status: true,
-        gas_used: 21_000,
-        logs: Vec::new(),
-        write_set_hash: B256::ZERO,
-        ..Default::default()
-    }))
-    .unwrap();
-    drop(tx);
+    let pos0 = pos(0);
+    let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
+        Receipt {
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAB),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        },
+    )))]);
 
     // The publisher rejects the first 3 attempts, then accepts.
-    let h = spawn_commit(
+    let h = CommitLoop::new(
         FlakyPub {
             fails_left: 3,
             log: log.clone(),
         },
         rx,
-    );
+    )
+    .spawn();
     // This must return Ok. The thread survived the transient failures.
     h.join()
         .expect("no panic")
@@ -115,21 +119,6 @@ fn commit_thread_retries_until_delivered() {
     let l = log.lock().unwrap();
     assert_eq!(l.len(), 1, "the receipt must be delivered, not dropped");
     assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
-}
-
-fn receipt(tag: u8, offset: i32) -> Receipt {
-    Receipt {
-        tx_idx: BPosition {
-            term_id: 0,
-            term_offset: offset,
-        },
-        tx_hash: B256::repeat_byte(tag),
-        status: true,
-        gas_used: 21_000,
-        logs: Vec::new(),
-        write_set_hash: B256::ZERO,
-        ..Default::default()
-    }
 }
 
 /// Records the batch from each `publish_receipts` call. This matches the
@@ -147,9 +136,10 @@ impl TxReceiptsPublication for BatchRecordPub {
         }
         Ok(())
     }
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
-        self.batches.lock().unwrap().push(receipts.to_vec());
-        (receipts.len(), None)
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        let receipts = items.iter().map(|i| i.receipt.clone()).collect();
+        self.batches.lock().unwrap().push(receipts);
+        (items.len(), None)
     }
 }
 
@@ -157,32 +147,27 @@ impl TxReceiptsPublication for BatchRecordPub {
 // boundary flushes the receipts gathered before it, and order is preserved.
 #[test]
 fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
-    let (tx, rx) = bounded::<ExecToCommit>(16);
-    for i in 0..5 {
-        tx.send(ExecToCommit::Receipt(receipt(i as u8, i * 64)))
-            .unwrap();
-    }
-    tx.send(ExecToCommit::Boundary(BlockBoundary {
+    let mut messages: Vec<ExecToCommit> = (0..5u8)
+        .map(|i| ExecToCommit::Receipt(receipt(i, i32::from(i) * 64)))
+        .collect();
+    messages.push(ExecToCommit::Boundary(BlockBoundary {
         block_number: 1,
-        end_tx_idx: BPosition {
-            term_id: 0,
-            term_offset: 4 * 64,
-        },
+        end_tx_idx: pos(4 * 64),
         l2_timestamp: 100,
         l1_origin: 0,
-    }))
-    .unwrap();
-    drop(tx);
+    }));
+    let rx = feed_commits(messages);
 
     let batches = Arc::new(Mutex::new(Vec::new()));
     let boundaries = Arc::new(Mutex::new(Vec::new()));
-    let h = spawn_commit(
+    let h = CommitLoop::new(
         BatchRecordPub {
             batches: batches.clone(),
             boundaries: boundaries.clone(),
         },
         rx,
-    );
+    )
+    .spawn();
     h.join().expect("no panic").expect("ok");
 
     let b = batches.lock().unwrap();
@@ -209,7 +194,8 @@ impl TxReceiptsPublication for PartialPub {
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
         Ok(())
     }
-    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+    fn publish_receipts(&mut self, items: &[ReceiptRows]) -> (usize, Option<ExecutorError>) {
+        let receipts: Vec<Receipt> = items.iter().map(|i| i.receipt.clone()).collect();
         if self.fail_once {
             self.fail_once = false;
             let n = self.accept.min(receipts.len());
@@ -219,7 +205,7 @@ impl TxReceiptsPublication for PartialPub {
                 .extend_from_slice(&receipts[..n]);
             return (n, Some(ExecutorError::TxReceiptsClosed));
         }
-        self.delivered.lock().unwrap().extend_from_slice(receipts);
+        self.delivered.lock().unwrap().extend_from_slice(&receipts);
         (receipts.len(), None)
     }
 }
@@ -228,22 +214,22 @@ impl TxReceiptsPublication for PartialPub {
 // is delivered exactly once, in order.
 #[test]
 fn commit_thread_resumes_batch_at_failed_suffix() {
-    let (tx, rx) = bounded::<ExecToCommit>(16);
-    for i in 0..6 {
-        tx.send(ExecToCommit::Receipt(receipt(i as u8, i * 64)))
-            .unwrap();
-    }
-    drop(tx);
+    let rx = feed_commits(
+        (0..6u8)
+            .map(|i| ExecToCommit::Receipt(receipt(i, i32::from(i) * 64)))
+            .collect(),
+    );
 
     let delivered = Arc::new(Mutex::new(Vec::new()));
-    let h = spawn_commit(
+    let h = CommitLoop::new(
         PartialPub {
             accept: 2,
             fail_once: true,
             delivered: delivered.clone(),
         },
         rx,
-    );
+    )
+    .spawn();
     h.join().expect("no panic").expect("ok");
 
     let d = delivered.lock().unwrap();
@@ -271,18 +257,14 @@ impl TxReceiptsPublication for DivergingPub {
 // immediately.
 #[test]
 fn commit_thread_fail_stops_on_divergence() {
-    let (tx, rx) = bounded::<ExecToCommit>(8);
-    tx.send(ExecToCommit::Receipt(Receipt {
-        tx_idx: BPosition {
-            term_id: 0,
-            term_offset: 0,
+    let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
+        Receipt {
+            tx_idx: pos(0),
+            ..Default::default()
         },
-        ..Default::default()
-    }))
-    .unwrap();
-    drop(tx);
+    )))]);
 
-    let h = spawn_commit(DivergingPub, rx);
+    let h = CommitLoop::new(DivergingPub, rx).spawn();
     let res = h.join().expect("no panic");
     assert!(
         matches!(res, Err(ExecutorError::Divergence(_))),

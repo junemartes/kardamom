@@ -1,3 +1,5 @@
+mod common;
+
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_log::codec::{access, encode, materialize};
@@ -27,15 +29,13 @@ fn log_codec_tx_ref_roundtrip() {
     // TxData still carries full TxEnvelopes (above). TxOrdering carries
     // tiny TxRef-based messages. This checks that both wire shapes encode
     // through the shared codec helpers.
-    let r = TxRef {
-        tx_hash: alloy_primitives::B256::ZERO,
-        shard_id: 2,
-        tx_data_position: BPosition {
+    let r = common::tx_ref(
+        2,
+        BPosition {
             term_id: 4,
             term_offset: 8192,
         },
-        tx_data_session_id: 0,
-    };
+    );
     let bytes = encode(&r).unwrap();
     // About 16 bytes on the wire (TxRef is sequencer_id: u8 plus
     // BPosition: i32+i32 plus padding). This hard-bounds it at 64 to give
@@ -58,15 +58,13 @@ fn log_codec_tx_ref_roundtrip() {
 
 #[test]
 fn log_codetx_receipts_channel_b_message_roundtrip() {
-    let m = TxOrderingMessage::TxRef(TxRef {
-        tx_hash: alloy_primitives::B256::ZERO,
-        shard_id: 3,
-        tx_data_position: BPosition {
+    let m = TxOrderingMessage::TxRef(common::tx_ref(
+        3,
+        BPosition {
             term_id: 1,
             term_offset: 4096,
         },
-        tx_data_session_id: 0,
-    });
+    ));
     let bytes = encode(&m).unwrap();
     let back: TxOrderingMessage = materialize(&bytes).unwrap();
     assert_eq!(back, m);

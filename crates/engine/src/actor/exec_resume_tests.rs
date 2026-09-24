@@ -1,27 +1,24 @@
-//! Phase 2 recovery: skip-count replay.
+//! Resume from a mid-chain cursor.
 //!
-//! On restart, the exec thread receives the canonical stream replayed
-//! from record 0. It must skip everything already committed (see
-//! [`ResumePoint`]). These tests drive the skip path with synthetic
-//! records, with no Aeron and no archive. They confirm the executor does
-//! not re-commit a replayed block or re-emit a replayed receipt, and
-//! still executes everything past the persisted cursor.
+//! On restart, the reader delivers only the records and boundaries past
+//! the last committed cursor, with absolute indices and counts. The exec
+//! thread must seed its own counters from that cursor (see
+//! [`ResumePoint`]) instead of starting at zero. These tests drive the
+//! resume path with synthetic records, with no Aeron and no archive. They
+//! confirm the executor aligns on a mid-chain boundary, does not
+//! re-commit an already-committed block, and does not re-emit an
+//! already-published receipt.
 
-use std::sync::{Arc, Mutex};
-
-use alloy_primitives::{U256, address};
+use alloy_primitives::address;
 use alloy_signer_local::PrivateKeySigner;
-use crossbeam_channel::bounded;
-use kardamom_types::BlockBoundaryStart;
-use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
-use crate::reader::{NoEpochCheck, ReaderToExec};
-use crate::state::{MockStateDatabase, StaticSnapshotSource};
+use crate::state::StaticSnapshotSource;
 
-use super::test_support::{ImmediateCommit, RecordingQueue, drain_commits, legacy, pos};
-use super::{ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
+use super::ResumePoint;
+use super::test_support::{
+    ExecRig, ImmediateCommit, boundary_msg, drain_commits, feed, funded, tx_msg,
+};
 
 #[test]
 fn resume_executes_from_cursor_with_absolute_counts() {
@@ -36,59 +33,25 @@ fn resume_executes_from_cursor_with_absolute_counts() {
     let to = address!("00000000000000000000000000000000000ABCDE");
     // The snapshot represents the post-block-1 state: the signer nonce is
     // already at 2.
-    let snap = MockStateDatabase::builder()
-        .account(
-            signer.address(),
-            U256::from(10u128.pow(18)),
-            2,
-            KECCAK_EMPTY,
-        )
-        .build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
-
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+    let snap = funded(&signer, 2);
+    let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
+    let rig = rig.start(ResumePoint {
+        block: 1,
+        record_count: 2,
+        l2_timestamp: 1_700_000_000,
+    });
 
     // Only post-cursor work: block 2's transaction and boundary, with
     // absolute keys.
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(2),
-            envelope: legacy(&signer, to, 2, 10),
-            position: pos(2),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 2,
-            end_tx_idx: pos(3),
-            l2_timestamp: 1_700_000_001,
-            l1_origin: 0,
-        }))
-        .unwrap();
-    drop(tx_r2e);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer, to, 2, 2, 10),
+        boundary_msg(2, 3, 1_700_000_001),
+    ]);
 
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
-        StaticSnapshotSource(snap),
-        ImmediateCommit,
-        RecordingQueue(writer_log.clone()),
-        ResumePoint {
-            block: 1,
-            record_count: 2,
-            l2_timestamp: 1_700_000_000,
-        },
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
-    );
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
-    let (receipt_blocks, boundaries) = drain_commits(rx_e2c);
+    let (receipt_blocks, boundaries) = drain_commits(&rx_e2c);
     // Block 2's single transaction produces a receipt attributed to block
     // 2, the seeded current_block. It is not attributed to block 1, which
     // would be a zero-seeded counter's value.
@@ -112,58 +75,24 @@ fn resume_after_empty_block_backlog() {
     // counter restarted from 1.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
-    let snap = MockStateDatabase::builder()
-        .account(
-            signer.address(),
-            U256::from(10u128.pow(18)),
-            0,
-            KECCAK_EMPTY,
-        )
-        .build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
-
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+    let snap = funded(&signer, 0);
+    let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
+    let rig = rig.start(ResumePoint {
+        block: 3,
+        record_count: 0,
+        l2_timestamp: 1_700_000_003,
+    });
 
     // Block 4: the first real transaction (count 0 to 1).
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(0),
-            envelope: legacy(&signer, to, 0, 10),
-            position: pos(0),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 4,
-            end_tx_idx: pos(1),
-            l2_timestamp: 1_700_000_004,
-            l1_origin: 0,
-        }))
-        .unwrap();
-    drop(tx_r2e);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer, to, 0, 0, 10),
+        boundary_msg(4, 1, 1_700_000_004),
+    ]);
 
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
-        StaticSnapshotSource(snap),
-        ImmediateCommit,
-        RecordingQueue(writer_log.clone()),
-        ResumePoint {
-            block: 3,
-            record_count: 0,
-            l2_timestamp: 1_700_000_003,
-        },
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
-    );
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
-    let (receipt_blocks, boundaries) = drain_commits(rx_e2c);
+    let (receipt_blocks, boundaries) = drain_commits(&rx_e2c);
     assert_eq!(
         receipt_blocks,
         vec![4],
@@ -183,52 +112,21 @@ fn resume_boundary_alignment_still_checked() {
     // seen, so the count is 6, but the boundary claims 10.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
-    let snap = MockStateDatabase::builder()
-        .account(
-            signer.address(),
-            U256::from(10u128.pow(18)),
-            0,
-            KECCAK_EMPTY,
-        )
-        .build();
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
-    let (tx_e2c, _rx_e2c) = bounded::<ExecToCommit>(8);
+    let snap = funded(&signer, 0);
 
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(5),
-            envelope: legacy(&signer, to, 0, 10),
-            position: pos(5),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 2,
-            end_tx_idx: pos(10),
-            l2_timestamp: 1_700_000_000,
-            l1_origin: 0,
-        }))
-        .unwrap();
-    drop(tx_r2e);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer, to, 5, 0, 10),
+        boundary_msg(2, 10, 1_700_000_000),
+    ]);
 
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
-        StaticSnapshotSource(snap),
-        ImmediateCommit,
-        RecordingQueue(Arc::new(Mutex::new(Vec::new()))),
-        ResumePoint {
+    let (rig, _writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
+    let (h, _rx_e2c) = rig
+        .start(ResumePoint {
             block: 1,
             record_count: 5,
             l2_timestamp: 1_700_000_000,
-        },
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
-    );
+        })
+        .spawn(rx_r2e);
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
 }
@@ -238,52 +136,18 @@ fn no_resume_executes_and_commits_block_one() {
     // resume=None is the fresh-start path: block 1 executes and commits.
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
-    let snap = MockStateDatabase::builder()
-        .account(
-            signer.address(),
-            U256::from(10u128.pow(18)),
-            0,
-            KECCAK_EMPTY,
-        )
-        .build();
-    let writer_log = Arc::new(Mutex::new(Vec::new()));
-    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
-    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+    let snap = funded(&signer, 0);
+    let (rig, writer_log) = ExecRig::recording(StaticSnapshotSource(snap), ImmediateCommit);
 
-    tx_r2e
-        .send(ReaderToExec::Tx {
-            tx_idx: TxIndex(0),
-            envelope: legacy(&signer, to, 0, 10),
-            position: pos(0),
-        })
-        .unwrap();
-    tx_r2e
-        .send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 1,
-            end_tx_idx: pos(1),
-            l2_timestamp: 1_700_000_000,
-            l1_origin: 0,
-        }))
-        .unwrap();
-    drop(tx_r2e);
+    let rx_r2e = feed(vec![
+        tx_msg(&signer, to, 0, 0, 10),
+        boundary_msg(1, 1, 1_700_000_000),
+    ]);
 
-    let h = spawn_exec(
-        ExecutorConfig::default(),
-        rx_r2e,
-        tx_e2c,
-        StaticSnapshotSource(snap),
-        ImmediateCommit,
-        RecordingQueue(writer_log.clone()),
-        ResumePoint::GENESIS,
-        None,
-        None,
-        None,
-        None::<NoEpochCheck>,
-        None,
-    );
+    let (h, rx_e2c) = rig.spawn(rx_r2e);
     h.join().expect("no panic").expect("exec ok");
 
-    let (receipt_blocks, boundaries) = drain_commits(rx_e2c);
+    let (receipt_blocks, boundaries) = drain_commits(&rx_e2c);
     assert_eq!(receipt_blocks, vec![1]);
     assert_eq!(boundaries, vec![1]);
     assert_eq!(writer_log.lock().unwrap().len(), 1);

@@ -1,0 +1,65 @@
+---
+- name: Validate optional L1 light client configuration
+  ansible.builtin.assert:
+    that:
+      - >-
+        (workloads_light_execution_rpc | length == 0 and workloads_light_consensus_rpc | length == 0)
+        or (workloads_light_execution_rpc | length > 0 and workloads_light_consensus_rpc | length > 0
+        and workloads_light_checkpoint | length > 0 and workloads_lockbox_address | length > 0)
+    fail_msg: The L1 light client requires execution RPC, consensus RPC, checkpoint and lockbox address.
+
+- name: Validate image provenance
+  ansible.builtin.import_tasks: provenance.yml
+
+- name: Check the settlement deployer when no address was supplied
+  ansible.builtin.stat:
+    path: "{{ workloads_deploy_binary }}"
+  register: workloads_deployer_stat
+  when: workloads_settlement_address | length == 0
+
+- name: Require a settlement address or the contract deployer
+  ansible.builtin.assert:
+    that: workloads_deployer_stat.stat.executable | default(false)
+    fail_msg: Build kardamom-deploy or supply workloads_settlement_address; the batcher needs a real settlement.
+  when: workloads_settlement_address | length == 0
+
+- name: Check contract deployer automation support
+  ansible.builtin.command:
+    argv: ["{{ workloads_deploy_binary }}", --owner, "{{ workloads_l1_owner }}", addresses, --help]
+  register: workloads_deployer_help
+  changed_when: false
+  check_mode: false
+  when: workloads_settlement_address | length == 0
+
+- name: Require a current contract deployer before changing jobs
+  ansible.builtin.assert:
+    that:
+      - "'--json' in workloads_deployer_help.stdout"
+      - "'--contract' in workloads_deployer_help.stdout"
+    fail_msg: Rebuild kardamom-deploy; this playbook requires addresses --contract --json.
+  when: workloads_settlement_address | length == 0
+
+- name: Explain the dev lockbox placeholder
+  ansible.builtin.debug:
+    msg: No lockbox address configured; the da-watcher deposit path is disabled by its placeholder.
+  when: workloads_lockbox_address | length == 0
+
+- name: Validate a supplied settlement before changing any jobs
+  ansible.builtin.assert:
+    that:
+      - workloads_settlement_address is match('^0x[0-9a-fA-F]{40}$')
+      - workloads_settlement_address != '0x0000000000000000000000000000000000000000'
+  when: workloads_settlement_address | length > 0
+
+- name: Read and validate routing before submitting any job
+  vars:
+    workloads_map: "{{ lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml }}"
+  ansible.builtin.assert:
+    that:
+      - partition_count in [1, 2, 4, 8]
+      - tx_ttl_ms is integer and tx_ttl_ms > 0
+      - workloads_map.version is integer and workloads_map.version >= 0
+      - workloads_map.table | length == 256
+      - workloads_map.table | select('integer') | list | length == 256
+      - workloads_map.table | min >= 0
+      - workloads_map.table | max < 8

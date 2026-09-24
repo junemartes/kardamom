@@ -9,44 +9,18 @@
 
 use std::path::{Path, PathBuf};
 
-fn main() {
+use anyhow::Context;
+
+#[path = "../deployer/build_support/sol_watch.rs"]
+mod sol_watch;
+
+fn main() -> anyhow::Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let workspace_root = manifest_dir.parent().and_then(Path::parent).context(
+        "CARGO_MANIFEST_DIR has two parent directories: crates/<name> under the workspace root",
+    )?;
     let contracts_root = workspace_root.join("contracts");
 
-    for entry in walk_sol_files(&contracts_root.join("src")) {
-        println!("cargo:rerun-if-changed={}", entry.display());
-    }
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("foundry.toml").display()
-    );
-}
-
-fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk_sol_files_into(dir, &mut out);
-    out
-}
-
-fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_sol_files_into(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("sol") {
-            out.push(path);
-        }
-    }
+    sol_watch::emit_sol_rerun_triggers(&contracts_root);
+    Ok(())
 }

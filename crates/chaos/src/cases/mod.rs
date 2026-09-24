@@ -1,0 +1,329 @@
+//! The cases. Each one holds only its injection and its case-specific
+//! assertions; the harness provides the load, the injection gate, and
+//! the common tail.
+
+use std::time::Duration;
+
+use crate::accounts::Pin;
+use crate::harness::Harness;
+use crate::knobs::Knobs;
+
+pub(crate) mod archive;
+pub(crate) mod cache;
+pub(crate) mod cluster;
+pub(crate) mod component;
+pub(crate) mod coordinated;
+pub(crate) mod fleet;
+pub(crate) mod resize;
+pub(crate) mod seq_retention;
+pub(crate) mod squeeze;
+pub(crate) mod validator;
+
+/// Every case, by its CI name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Case {
+    GracefulExecutor,
+    HardExecutor,
+    GracefulIngress,
+    HardIngress,
+    GracefulSequencer,
+    HardSequencer,
+    SequencerReplicaKill,
+    NodeFailureExecutor,
+    NodeReplaceExecutor,
+    StateCheckpointRestore,
+    ReplayWindowResync,
+    ClusterLeaderKill,
+    ClusterFollowerKill,
+    ClusterMemberRejoin,
+    NodeReplaceSealer,
+    ClusterQuorumLossRecover,
+    ClusterTotalLossRecover,
+    ExecutorFleetLossRecover,
+    ExecutorFleetWipeRecover,
+    ExecutorFleetTotalWipeRecover,
+    IngressPairLossRecover,
+    SequencerLaneLossRecover,
+    PipelineBlackoutRecover,
+    ArchiveDriverLoss,
+    ArchiveTxDataWipe,
+    ArchiveCorruption,
+    SequencerLapse,
+    RetentionOverrun,
+    RetentionOverrunValidator,
+    ValidatorLapse,
+    ValidatorJoin,
+    CpuSqueeze,
+    ResizeScaleOutIn,
+    LookupBlackout,
+    RedisPrimaryFreeze,
+    RedisPrimaryKill,
+    RedisPartitionIngress,
+    RedisTotalLossRecover,
+    MirrorKillRebuild,
+}
+
+const ALL: [Case; 39] = [
+    Case::GracefulExecutor,
+    Case::HardExecutor,
+    Case::GracefulIngress,
+    Case::HardIngress,
+    Case::GracefulSequencer,
+    Case::HardSequencer,
+    Case::SequencerReplicaKill,
+    Case::NodeFailureExecutor,
+    Case::NodeReplaceExecutor,
+    Case::StateCheckpointRestore,
+    Case::ReplayWindowResync,
+    Case::ClusterLeaderKill,
+    Case::ClusterFollowerKill,
+    Case::ClusterMemberRejoin,
+    Case::NodeReplaceSealer,
+    Case::ClusterQuorumLossRecover,
+    Case::ClusterTotalLossRecover,
+    Case::ExecutorFleetLossRecover,
+    Case::ExecutorFleetWipeRecover,
+    Case::ExecutorFleetTotalWipeRecover,
+    Case::IngressPairLossRecover,
+    Case::SequencerLaneLossRecover,
+    Case::PipelineBlackoutRecover,
+    Case::ArchiveDriverLoss,
+    Case::ArchiveTxDataWipe,
+    Case::ArchiveCorruption,
+    Case::SequencerLapse,
+    Case::RetentionOverrun,
+    Case::RetentionOverrunValidator,
+    Case::ValidatorLapse,
+    Case::ValidatorJoin,
+    Case::CpuSqueeze,
+    Case::ResizeScaleOutIn,
+    Case::LookupBlackout,
+    Case::RedisPrimaryFreeze,
+    Case::RedisPrimaryKill,
+    Case::RedisPartitionIngress,
+    Case::RedisTotalLossRecover,
+    Case::MirrorKillRebuild,
+];
+
+impl Case {
+    /// The case named `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown name, before any load or account
+    /// is spent.
+    pub fn parse(name: &str) -> anyhow::Result<Self> {
+        ALL.into_iter()
+            .find(|c| c.name() == name)
+            .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
+    }
+
+    /// The CI name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::GracefulExecutor => "graceful-executor",
+            Self::HardExecutor => "hard-executor",
+            Self::GracefulIngress => "graceful-ingress",
+            Self::HardIngress => "hard-ingress",
+            Self::GracefulSequencer => "graceful-sequencer",
+            Self::HardSequencer => "hard-sequencer",
+            Self::SequencerReplicaKill => "sequencer-replica-kill",
+            Self::NodeFailureExecutor => "node-failure-executor",
+            Self::NodeReplaceExecutor => "node-replace-executor",
+            Self::StateCheckpointRestore => "state-checkpoint-restore",
+            Self::ReplayWindowResync => "replay-window-resync",
+            Self::ClusterLeaderKill => "cluster-leader-kill",
+            Self::ClusterFollowerKill => "cluster-follower-kill",
+            Self::ClusterMemberRejoin => "cluster-member-rejoin",
+            Self::NodeReplaceSealer => "node-replace-sealer",
+            Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
+            Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
+            Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
+            Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
+            Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
+            Self::IngressPairLossRecover => "ingress-pair-loss-recover",
+            Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
+            Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
+            Self::ArchiveDriverLoss => "archive-driver-loss",
+            Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
+            Self::ArchiveCorruption => "archive-corruption",
+            Self::SequencerLapse => "sequencer-lapse",
+            Self::RetentionOverrun => "retention-overrun",
+            Self::RetentionOverrunValidator => "retention-overrun-validator",
+            Self::ValidatorLapse => "validator-lapse",
+            Self::ValidatorJoin => "validator-join",
+            Self::CpuSqueeze => "cpu-squeeze",
+            Self::ResizeScaleOutIn => "resize-scale-out-in",
+            Self::LookupBlackout => "lookup-blackout",
+            Self::RedisPrimaryFreeze => "redis-primary-freeze",
+            Self::RedisPrimaryKill => "redis-primary-kill",
+            Self::RedisPartitionIngress => "redis-partition-ingress",
+            Self::RedisTotalLossRecover => "redis-total-loss-recover",
+            Self::MirrorKillRebuild => "mirror-kill-rebuild",
+        }
+    }
+
+    /// Which funded account the case's load needs.
+    #[must_use]
+    pub fn pin(self) -> Pin {
+        match self {
+            Self::SequencerReplicaKill
+            | Self::SequencerLapse
+            | Self::GracefulSequencer
+            | Self::HardSequencer
+            | Self::SequencerLaneLossRecover
+            | Self::LookupBlackout => Pin::Shard0,
+            Self::ResizeScaleOutIn => Pin::MovesOnScaleOut,
+            _ => Pin::Any,
+        }
+    }
+
+    /// The per-case load window: the global window, widened to the
+    /// case's floor so the load still flows through its whole
+    /// inject-and-recover sequence.
+    #[must_use]
+    pub fn window(self, k: &Knobs) -> Duration {
+        let inject = k.inject_delay;
+        let floor = match self {
+            Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_secs(60),
+            Self::SequencerLapse => inject + k.seq_lapse + Duration::from_secs(60),
+            Self::RetentionOverrun | Self::RetentionOverrunValidator => {
+                inject + k.retention_freeze_cap + Duration::from_secs(120)
+            }
+            Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
+            Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_secs(300),
+            // The freeze, the election, and the recovery polls.
+            Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
+                inject + k.restart_slo + Duration::from_secs(300)
+            }
+            // The mirrors restart, wait for a checkpoint, and rebuild.
+            Self::MirrorKillRebuild => inject + k.restart_slo + Duration::from_secs(600),
+            // The node replacement; the Redis loss and three rebuilds; the
+            // total wipe, the rebuild from L1 and the install; or the
+            // blackout and the return of every job.
+            Self::NodeReplaceExecutor
+            | Self::RedisTotalLossRecover
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::PipelineBlackoutRecover => inject + k.reschedule_slo + Duration::from_secs(420),
+            Self::NodeReplaceSealer => {
+                inject + k.reschedule_slo + k.rejoin_slo + Duration::from_secs(300)
+            }
+            Self::CpuSqueeze => {
+                let cycle = k.squeeze.window + k.squeeze.release;
+                inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
+            }
+            _ => Duration::ZERO,
+        };
+        k.case_window.max(floor)
+    }
+
+    /// The load's per-submit retry count. The resize case rolls the
+    /// ingress the load submits to, so it gets a wide retry. The
+    /// quorum-loss case stalls ordering for about a minute, past the
+    /// ingress's 30 s parked-submit timeout; a refused submit leaves a
+    /// nonce hole, and every later transaction of that sender then
+    /// executes as failed, which the verdict would count as bad receipts.
+    /// Each attempt parks up to 30 s at the ingress while the stall
+    /// lasts, so six attempts cover the stall; sixty made the case take
+    /// 23 minutes and the shard hit its job timeout. A whole-fleet
+    /// outage lasts up to the reschedule SLO plus an election, so its
+    /// attempts cover that SLO in 30 s parks, plus two.
+    #[must_use]
+    pub fn load_retry(self, k: &Knobs) -> u32 {
+        match self {
+            Self::ResizeScaleOutIn => 60,
+            Self::ClusterQuorumLossRecover => 6,
+            Self::ClusterTotalLossRecover
+            | Self::ExecutorFleetLossRecover
+            | Self::ExecutorFleetWipeRecover
+            | Self::ExecutorFleetTotalWipeRecover
+            | Self::IngressPairLossRecover
+            | Self::SequencerLaneLossRecover
+            | Self::PipelineBlackoutRecover => {
+                u32::try_from(k.reschedule_slo.as_secs() / 30).unwrap_or(u32::MAX) + 2
+            }
+            _ => k.load_retry,
+        }
+    }
+
+    /// The case body: the injection and the case-specific assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the case's failure.
+    pub async fn run(self, h: &mut Harness) -> anyhow::Result<()> {
+        match self {
+            Self::GracefulExecutor => component::graceful_executor(h).await,
+            Self::HardExecutor => component::hard_executor(h).await,
+            Self::GracefulIngress => component::graceful_ingress(h).await,
+            Self::HardIngress => component::hard_ingress(h).await,
+            Self::GracefulSequencer => component::graceful_sequencer(h).await,
+            Self::HardSequencer => component::hard_sequencer(h).await,
+            Self::SequencerReplicaKill => component::sequencer_replica_kill(h).await,
+            Self::NodeFailureExecutor => component::node_failure_executor(h).await,
+            Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
+            Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
+            Self::ReplayWindowResync => component::replay_window_resync(h).await,
+            Self::ClusterLeaderKill => cluster::leader_kill(h).await,
+            Self::ClusterFollowerKill => cluster::follower_kill(h).await,
+            Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
+            Self::NodeReplaceSealer => cluster::node_replace_sealer(h).await,
+            Self::ClusterQuorumLossRecover => cluster::quorum_loss_recover(h).await,
+            Self::ClusterTotalLossRecover => fleet::cluster_total_loss_recover(h).await,
+            Self::ExecutorFleetLossRecover => fleet::executor_fleet_loss_recover(h).await,
+            Self::ExecutorFleetWipeRecover => fleet::executor_fleet_wipe_recover(h).await,
+            Self::ExecutorFleetTotalWipeRecover => {
+                fleet::executor_fleet_total_wipe_recover(h).await
+            }
+            Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
+            Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
+            Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
+            Self::ArchiveDriverLoss => archive::driver_loss(h).await,
+            Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
+            Self::ArchiveCorruption => archive::corruption(h).await,
+            Self::SequencerLapse => seq_retention::sequencer_lapse(h).await,
+            Self::RetentionOverrun => {
+                seq_retention::retention_overrun(h, seq_retention::Victim::Executor).await
+            }
+            Self::RetentionOverrunValidator => {
+                seq_retention::retention_overrun(h, seq_retention::Victim::Validator).await
+            }
+            Self::ValidatorLapse => validator::lapse(h).await,
+            Self::ValidatorJoin => validator::join(h).await,
+            Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
+            Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
+            Self::LookupBlackout => resize::lookup_blackout(h).await,
+            Self::RedisPrimaryFreeze => cache::redis_primary_freeze(h).await,
+            Self::RedisPrimaryKill => cache::redis_primary_kill(h).await,
+            Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
+            Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
+            Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_shard_case_parses_and_names_round_trip() {
+        for shard in [
+            crate::Shard::Executor,
+            crate::Shard::Ingress,
+            crate::Shard::Sequencer,
+            crate::Shard::Cluster,
+            crate::Shard::Fleet,
+            crate::Shard::Coordinated,
+            crate::Shard::Retention,
+            crate::Shard::Cache,
+        ] {
+            shard
+                .cases()
+                .iter()
+                .for_each(|name| assert_eq!(Case::parse(name).unwrap().name(), *name));
+        }
+        assert!(Case::parse("sealer-hard").is_err());
+    }
+}

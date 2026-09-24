@@ -49,7 +49,18 @@ refreshed whenever it stalls, not consulted once).
 
 ## Per-finding status
 
-### F02.1 [H] — ~~FIXED~~ REVERTED (RE-OPENED)
+### F02.1 [H] — ~~FIXED~~ ~~REVERTED (RE-OPENED)~~ CLOSED (2026-09-07)
+> **CLOSED by the executor nonce lookup** (dynamic sequencer sizing,
+> milestone 4, PR #270; `docs/specs/dynamic-sequencer-sizing.md` section
+> 3.4). The global hydration signal the reverted fix lacked now exists: a
+> park of a sender with no known receipt floor asks an executor for the
+> committed nonce, and the answer arrives as a `FloorUpdate` through the
+> same max-merge `advance_floor` path as a receipt. A committed nonce can
+> lag the truth but never lead it, so it cannot adopt a client-abandoned
+> hole. A restarted replica regains an established sender on the sender's
+> first park, with its twin stopped (e2e `s15`, chaos `lookup-blackout`).
+> The revert note below is history.
+>
 > **REVERTED post-CI (run 29687514869)**: the stream-adaptive floor
 > fast-forward adopted CLIENT-ABANDONED nonce holes (txs dropped at ingress
 > under overload / chaos outages — never on tx_data, so ordered by NOBODY)

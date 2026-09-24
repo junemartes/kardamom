@@ -1,6 +1,5 @@
 # kardamom-ingress is the eth JSON-RPC proxy. It runs active/active:
-# count=2, one per ingress-role node (ingress-0@192.168.56.31,
-# ingress-1@192.168.56.32).
+# count=2, one per ingress-role node (ingress-0, ingress-1).
 #
 # Invocation:
 #   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
@@ -9,28 +8,20 @@
 #
 # ingress.toml supplies the [cluster] Aeron Cluster (Raft) client
 # connection, for the on-quorum watermark observer. Other runtime
-# tuning goes through flags. channels.toml supplies the UDP multicast
-# channels. The on-quorum ack gate's durable watermark is no longer an
-# Aeron quorum_watermark stream. In the cluster-only topology, ingress
-# derives it from Aeron Cluster egress progress; see
+# tuning goes through flags. channels.toml supplies the Aeron streams
+# and the discovery scope. The on-quorum ack gate's durable watermark
+# comes from Aeron Cluster egress progress; see
 # crates/ingress/src/cluster.rs.
 #
-# tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel
-# and tx_receipts_executor_count drive ingress to open one
-# control-mode=manual subscription, and attach each executor replica's
-# per-replica endpoint (0 through N). It dedups the N identical receipt
-# copies by tx hash. executor_count comes from the log config; override
-# it at runtime with --executor-count or KARDAMOM_EXECUTOR_COUNT.
-# TODO(consul-watch): swap the static count for a Consul watch on an
-# `executor-receipts` service, so membership changes add or remove
-# destinations live.
+# tx_receipts: every ingress replica joins every executor publisher the
+# catalog lists and dedups the N identical receipt copies by tx hash.
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir. It uses host networking, so :8545 binds on the
 # ingress1 VM IP.
 #
 # This job uses file() for its templates, so submit it from the
-# deploy/cluster/ directory. scripts/deploy.sh does this.
+# deploy/cluster/ directory. ansible/deploy.yml does this.
 
 variable "ack_policy" {
   type        = string
@@ -38,7 +29,7 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
-# Digest-pinned image. scripts/deploy.sh
+# Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests), so the task runs exactly the bytes
 # that deploy pushed. The empty default falls back to the mutable :dev
@@ -46,14 +37,36 @@ variable "ack_policy" {
 # `nomad job run` during debugging, not a production path. A mutable
 # tag lets anyone with registry push access change what the next
 # restart runs.
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The account RPCs' executor queries go to executor-<i>.node.<datacenter>.consul."
+  default     = 3
+}
+
 variable "image_ref" {
   type        = string
   description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
   default     = ""
 }
 
+variable "datacenter" {
+  type        = string
+  description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
+  default     = "dc1"
+}
+
+variable "partition_count" {
+  type    = number
+  default = 2
+}
+
+variable "tx_ttl_ms" {
+  type    = number
+  default = 30000
+}
+
 job "ingress" {
-  datacenters = ["dc1"]
+  datacenters = [var.datacenter]
   type        = "service"
 
   constraint {
@@ -105,10 +118,20 @@ job "ingress" {
       port "jsonrpc" {
         static = 8545
       }
+      # The cluster egress (response) port of the on-quorum watermark
+      # client, unique per allocation. A fixed port sat in the node's
+      # ephemeral range, where the shared media driver's port-0
+      # discovery sockets could take it first.
+      port "egress" {}
     }
 
     task "ingress" {
       driver = "docker"
+
+      # The graceful drain: on stop, the ingress refuses new submits and
+      # lets the parked ones finish within the park bound (tx_ttl_ms in
+      # group_vars/all.yml). This gives it that long plus a margin.
+      kill_timeout = format("%ds", ceil(var.tx_ttl_ms / 1000) + 10)
 
       config {
         # This budget covers 8192 rpc connections, the WS feed,
@@ -120,7 +143,7 @@ job "ingress" {
         ulimit {
           nofile = "65536:65536"
         }
-        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-ingress:dev"
+        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-ingress:dev"
         # force_pull stays on for both paths. The mutable :dev
         # fallback needs it; a stale node-cached layer once caused a
         # crash-retry storm that stalled the deploy. On the
@@ -146,9 +169,16 @@ job "ingress" {
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           # The active shard count (M). Mirrors partition_count in
           # group_vars/all.yml. The ingress opens all 8 lanes and routes
-          # to the first M. check-contract.py checks this mirror.
-          "--shards", "2",
+          # to the first M. ansible/contract.yml checks this mirror.
+          "--shards", format("%d", var.partition_count),
+          # The versioned vslot-to-lane map (config/shard-map.toml). A
+          # resize re-renders it and rolls this job; see
+          # `kardamom-cluster scale-sequencers`.
+          "--shard-map", "/local/shard-map.toml",
           "--jsonrpc-bind", "0.0.0.0:8545",
+          # The submit park bound. It equals the sequencer transaction
+          # lifetime (tx_ttl_ms in group_vars/all.yml).
+          "--pending-receipt-timeout-ms", format("%d", var.tx_ttl_ms),
           # Use a stable per-replica id (alloc index 0 or 1). This
           # namespaces correlation_id, so the two active/active
           # replicas never collide. See
@@ -171,15 +201,26 @@ job "ingress" {
           "--chain-id", "412346",
           # Cluster mode: this node's cluster-egress (response)
           # endpoint, for the on-quorum watermark observer's Aeron
-          # Cluster client. The port, 40210 (cluster_egress_port),
-          # stays uniform; uniqueness comes from the ingress node_ip.
-          # This is consulted only when --ack-policy gates on quorum.
-          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
+          # Cluster client, on this allocation's dynamic port. This is
+          # consulted only when --ack-policy gates on quorum.
+          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
           # Record each per-shard tx_data publication to the archive,
           # so a restarted executor can replay full transaction
           # envelopes (Phase 2 crash recovery).
           "--archive-durability",
+          # The executor account query (executor_nonce_query port):
+          # eth_getBalance and eth_getTransactionCount ask one executor
+          # when the local account layer misses. Never on the submit
+          # path. Same list as the sequencer's nonce lookup.
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:9024"]),
         ]
+      }
+
+      env {
+        # Bind the exporter on the node, not loopback, so the monitoring
+        # job scrapes it off-node. The port is the ingress convention,
+        # 9006 (the validator uses the same number on the aux node).
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
       }
 
       # Presence-checked config. Content lives in config/ingress.toml.
@@ -188,12 +229,22 @@ job "ingress" {
         data        = file("config/ingress.toml")
       }
 
-      # Cluster LogConfig (UDP multicast channels). Comes from one
+      # The shard map, rendered by ansible/shard-map.yml.
+      template {
+        destination = "local/shard-map.toml"
+        data        = file("config/shard-map.toml")
+      }
+
+      # Cluster LogConfig (Aeron streams and discovery). Comes from one
       # source, config/channels.toml.tpl, and is read through
       # --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
+        # The template reads the archive records from Consul. A change
+        # there re-renders the file; the process reads it once at start
+        # and follows the catalog through discovery, so never restart.
+        change_mode = "noop"
       }
 
       resources {
@@ -201,6 +252,8 @@ job "ingress" {
         memory = 512
       }
 
+      # The RPC front door as a Consul service: the rpc-proxy pool is
+      # ingress-jsonrpc.service.consul.
       service {
         name     = "ingress-jsonrpc"
         port     = "jsonrpc"

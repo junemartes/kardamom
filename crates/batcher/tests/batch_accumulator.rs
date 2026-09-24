@@ -26,7 +26,7 @@ fn boundary_emits_block_with_pending_txs() {
     let mut acc = BatchAccumulator::new();
     acc.observe_tx(env(1), pos(0));
     acc.observe_tx(env(2), pos(64));
-    let closed = acc.observe_boundary(BlockBoundaryStart {
+    let closed = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 7,
         end_tx_idx: pos(128),
         l2_timestamp: 1234,
@@ -42,13 +42,13 @@ fn boundary_emits_block_with_pending_txs() {
 #[test]
 fn back_to_back_boundaries_emit_empty_blocks() {
     let mut acc = BatchAccumulator::new();
-    let _ = acc.observe_boundary(BlockBoundaryStart {
+    let _ = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 1,
         end_tx_idx: pos(0),
         l2_timestamp: 100,
         l1_origin: 0,
     });
-    let next = acc.observe_boundary(BlockBoundaryStart {
+    let next = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 2,
         end_tx_idx: pos(0),
         l2_timestamp: 200,
@@ -62,7 +62,7 @@ fn back_to_back_boundaries_emit_empty_blocks() {
 fn txs_interleave_correctly_across_three_blocks() {
     let mut acc = BatchAccumulator::new();
     acc.observe_tx(env(1), pos(0));
-    let b1 = acc.observe_boundary(BlockBoundaryStart {
+    let b1 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 1,
         end_tx_idx: pos(64),
         l2_timestamp: 100,
@@ -70,13 +70,13 @@ fn txs_interleave_correctly_across_three_blocks() {
     });
     acc.observe_tx(env(2), pos(64));
     acc.observe_tx(env(3), pos(128));
-    let b2 = acc.observe_boundary(BlockBoundaryStart {
+    let b2 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 2,
         end_tx_idx: pos(192),
         l2_timestamp: 200,
         l1_origin: 0,
     });
-    let b3 = acc.observe_boundary(BlockBoundaryStart {
+    let b3 = acc.observe_boundary(&BlockBoundaryStart {
         block_number: 3,
         end_tx_idx: pos(192),
         l2_timestamp: 300,

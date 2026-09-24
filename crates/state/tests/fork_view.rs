@@ -17,11 +17,7 @@ fn fork_reads_the_same_anchor_and_staleness_refuses() {
     let _ = writer.snapshot_rx.recv();
 
     // Commit block 1 and take its snapshot.
-    writer
-        .delta_tx
-        .send(common::simple_delta(1, addr, 100, 7, 999))
-        .unwrap();
-    let snap_at_1 = writer.snapshot_rx.recv().unwrap();
+    let snap_at_1 = common::commit_block(&writer, 1, addr, 100, 7, 999);
 
     // Fork while the writer is at block 1: anchors match, values match.
     let fork = snap_at_1
@@ -35,11 +31,7 @@ fn fork_reads_the_same_anchor_and_staleness_refuses() {
     );
 
     // Advance the writer to block 2.
-    writer
-        .delta_tx
-        .send(common::simple_delta(2, addr, 200, 7, 12345))
-        .unwrap();
-    let snap_at_2 = writer.snapshot_rx.recv().unwrap();
+    let snap_at_2 = common::commit_block(&writer, 2, addr, 200, 7, 12345);
 
     // The fork from before the advance still reads block-1 state,
     // because it owns its own transaction.

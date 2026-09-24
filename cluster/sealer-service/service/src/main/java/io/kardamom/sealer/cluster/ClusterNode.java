@@ -3,11 +3,13 @@ package io.kardamom.sealer.cluster;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.cluster.ClusterTool;
+import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
@@ -31,6 +33,8 @@ public final class ClusterNode {
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
     public static void main(final String[] args) {
+        // Every stdout line carries its time from here on (see the class).
+        System.setOut(new TimestampedOut(System.out));
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
@@ -61,6 +65,16 @@ public final class ClusterNode {
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
 
+        // Void voters: the ids of the consumers whose votes remove an entry
+        // that no consumer can execute (each executor, the validator, the
+        // batcher). Unset or empty refuses every void request. Every member
+        // must run the same list and the same window.
+        final VoidLedger.Config voidConfig = parseVoidConfig(
+            System.getProperty("kardamom.cluster.voidVoters", System.getenv("KARDAMOM_VOID_VOTERS")),
+            Integer.getInteger("kardamom.cluster.voidWindow", SealerWire.DEFAULT_RETENTION));
+        System.out.println("cluster void voters memberId=" + memberId
+            + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
         // Launch with a retry past the mark-file liveness window. A member
@@ -87,7 +101,8 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins, barrier));
+                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins,
+                        voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
@@ -110,6 +125,7 @@ public final class ClusterNode {
              ClusteredServiceContainer ignored2 = container) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
+            startJoinWatchdog(driver.consensusModule().context().electionStateCounter(), memberId);
             barrier.await();
         }
     }
@@ -157,9 +173,67 @@ public final class ClusterNode {
             + " intervalS=" + intervalS);
     }
 
+    /**
+     * Exits the process when the member never joins the cluster
+     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it).
+     *
+     * <p>A member can wedge inside its first election, after a successful
+     * launch, with no error and no exit. Aeron 1.44's
+     * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
+     * module spins in {@code Election.init} forever while the container
+     * reports healthy to Nomad (issue #195). PR #257 removed the known
+     * trigger. This watchdog covers the shape itself: an election that
+     * stays in INIT past the window is a wedge, never a slow join. See
+     * {@link JoinWatchdog} for why INIT is the only state it acts on.</p>
+     *
+     * <p>The exit is {@link Runtime#halt}, not {@link System#exit}. A
+     * graceful close joins the stuck agent thread and can hang the same
+     * way. The relaunch then goes through the mark-file retry loop above,
+     * which is the expected path after a hard exit. Exit code 3 marks the
+     * cause in the alloc's exit event.</p>
+     */
+    private static void startJoinWatchdog(final org.agrona.concurrent.status.AtomicCounter electionState,
+        final int memberId) {
+        final long windowS = Long.getLong("kardamom.cluster.joinWatchdogS", 60L);
+        if (windowS <= 0) {
+            System.out.println("cluster join watchdog DISABLED memberId=" + memberId);
+            return;
+        }
+        final JoinWatchdog watchdog = new JoinWatchdog(windowS * 1000L);
+        final Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(JOIN_WATCHDOG_POLL_MS);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (electionState.isClosed()) {
+                    return;
+                }
+                final long nowMs = System.currentTimeMillis();
+                final ElectionState state = ElectionState.get(electionState);
+                if (watchdog.observe(state, nowMs)) {
+                    System.out.println("cluster JOIN WEDGE memberId=" + memberId
+                        + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
+                        + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
+                    System.out.flush();
+                    Runtime.getRuntime().halt(JOIN_WEDGE_EXIT_CODE);
+                }
+            }
+        }, "kardamom-join-watchdog");
+        t.setDaemon(true);
+        t.start();
+        System.out.println("cluster join watchdog up memberId=" + memberId + " windowS=" + windowS);
+    }
+
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
+    /** How often the join watchdog samples the election state. */
+    static final long JOIN_WATCHDOG_POLL_MS = 1_000;
+    /** Process exit code when the join watchdog fires. */
+    static final int JOIN_WEDGE_EXIT_CODE = 3;
 
     /** Whether the launch failure is agrona's "active Mark file detected" guard. */
     static boolean isActiveMarkFile(final Throwable t) {
@@ -171,6 +245,25 @@ public final class ClusterNode {
             }
         }
         return false;
+    }
+
+    /**
+     * The file sync level of the Raft log and the archive
+     * ({@code -Dkardamom.cluster.fileSyncLevel}): 0 leaves a write in the
+     * page cache, 1 syncs the data of every write batch, 2 syncs the data
+     * and the file metadata. At level 0 an entry that a quorum
+     * acknowledged can exist only in the page caches of its members, and
+     * a power loss that takes them together drops it. A process kill, or
+     * a container kill, never shows this: the host kernel keeps the page
+     * cache.
+     */
+    static int fileSyncLevel() {
+        final int level = Integer.getInteger("kardamom.cluster.fileSyncLevel", 0);
+        if (level < 0 || level > 2) {
+            throw new IllegalArgumentException(
+                "kardamom.cluster.fileSyncLevel must be 0, 1 or 2, not " + level);
+        }
+        return level;
     }
 
     private static MediaDriver.Context driverContext(final String aeronDir) {
@@ -197,6 +290,9 @@ public final class ClusterNode {
             .controlChannel("aeron:udp?endpoint=" + me[4])
             .localControlChannel("aeron:ipc?term-length=64k")
             .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
+            // The catalog level must be at least the recording level.
+            .fileSyncLevel(fileSyncLevel())
+            .catalogFileSyncLevel(fileSyncLevel())
             .recordingEventsEnabled(false)
             .threadingMode(ArchiveThreadingMode.SHARED);
     }
@@ -210,6 +306,7 @@ public final class ClusterNode {
             .clusterMembers(clusterMembers)
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
+            .fileSyncLevel(fileSyncLevel())
             .ingressChannel("aeron:udp")
             // The cluster log uses Aeron's 64MB default term length. That
             // gives a 192MB log buffer for the log publication, plus 192MB
@@ -300,15 +397,48 @@ public final class ClusterNode {
         return out;
     }
 
+    /**
+     * Parse the void voter list, such as "0,1,2,3,4". The default window is
+     * the egress retention: a consumer cannot wait at an entry that the
+     * sealer can no longer replay, so a wider window is never used.
+     */
+    static VoidLedger.Config parseVoidConfig(final String raw, final int window) {
+        if (raw == null || raw.isBlank()) {
+            return VoidLedger.Config.DISABLED;
+        }
+        final long mask = java.util.Arrays.stream(raw.split(","))
+            .map(String::trim)
+            .filter(t -> !t.isEmpty())
+            .mapToInt(ClusterNode::parseVoterId)
+            .mapToLong(id -> 1L << id)
+            .reduce(0L, (a, b) -> a | b);
+        return new VoidLedger.Config(window, mask);
+    }
+
+    private static int parseVoterId(final String t) {
+        final int id;
+        try {
+            id = Integer.parseInt(t);
+        } catch (final NumberFormatException e) {
+            throw new IllegalStateException("kardamom.cluster.voidVoters: '" + t + "' is not a voter id", e);
+        }
+        if (id < 0 || id >= VoidLedger.MAX_VOTERS) {
+            throw new IllegalStateException(
+                "kardamom.cluster.voidVoters: id " + id + " outside [0, " + VoidLedger.MAX_VOTERS + ")");
+        }
+        return id;
+    }
+
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir, final String clusterDir, final int dedupCapacity,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
-            final ShutdownSignalBarrier barrier) {
+            final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
-            .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId, remoteOrigins));
+            .clusteredService(new SealerClusteredService(
+                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

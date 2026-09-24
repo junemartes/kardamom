@@ -1,0 +1,199 @@
+//! The CI shards: each one brings up its own cluster and runs one slice
+//! of the cases. The lists and the per-shard settings mirror the
+//! `cluster-e2e` workflow, so a local shard run behaves like CI.
+
+use crate::lifecycle::DeployVars;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shard {
+    Executor,
+    Ingress,
+    Sequencer,
+    Cluster,
+    Fleet,
+    Coordinated,
+    Retention,
+    Cache,
+}
+
+impl Shard {
+    /// The shard name in the workflow matrix.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Executor => "chaos-executor",
+            Self::Ingress => "chaos-ingress",
+            Self::Sequencer => "chaos-sequencer",
+            Self::Cluster => "chaos-cluster",
+            Self::Fleet => "chaos-fleet",
+            Self::Coordinated => "chaos-coordinated",
+            Self::Retention => "chaos-retention",
+            Self::Cache => "chaos-cache",
+        }
+    }
+
+    /// The cases of the shard, in run order. The sequencer shard runs
+    /// the two resize cases last: a resize leaves the shard map at a
+    /// later version, so the account-to-shard table no longer pins the
+    /// cases after it.
+    #[must_use]
+    pub fn cases(self) -> &'static [&'static str] {
+        match self {
+            Self::Executor => &[
+                "graceful-executor",
+                "hard-executor",
+                "node-failure-executor",
+                "node-replace-executor",
+                "state-checkpoint-restore",
+                "replay-window-resync",
+            ],
+            Self::Ingress => &[
+                "graceful-ingress",
+                "hard-ingress",
+                "archive-driver-loss",
+                "archive-tx-data-wipe",
+                "archive-corruption",
+            ],
+            Self::Sequencer => &[
+                "graceful-sequencer",
+                "hard-sequencer",
+                "sequencer-replica-kill",
+                "sequencer-lapse",
+                "validator-lapse",
+                "validator-join",
+                "lookup-blackout",
+                "resize-scale-out-in",
+            ],
+            Self::Cluster => &[
+                "cluster-leader-kill",
+                "cluster-follower-kill",
+                "cluster-member-rejoin",
+                "node-replace-sealer",
+                "cpu-squeeze",
+            ],
+            // Every replica of one role down at once. Each case waits
+            // for the whole fleet to return and then keeps the load on
+            // it, so the shard runs its own cluster.
+            // The sealer total loss runs last: its recovery is the
+            // open product issue, and a failure there must not hide
+            // the executor cases.
+            Self::Fleet => &[
+                "executor-fleet-loss-recover",
+                "executor-fleet-wipe-recover",
+                "executor-fleet-total-wipe-recover",
+                "redis-total-loss-recover",
+                "cluster-quorum-loss-recover",
+                "cluster-total-loss-recover",
+            ],
+            // Failures that cross the redundancy of a role. The case
+            // `pipeline-blackout-recover` exists and is not listed: after
+            // a kill of every pipeline node the executors crash-loop on a
+            // canonical entry whose transaction data no archive serves,
+            // an open product defect. It joins the list with that fix.
+            Self::Coordinated => &["ingress-pair-loss-recover", "sequencer-lane-loss-recover"],
+            Self::Retention => &["retention-overrun", "retention-overrun-validator"],
+            // The mirror rebuild runs last: it flushes the projection.
+            Self::Cache => &[
+                "redis-partition-ingress",
+                "redis-primary-kill",
+                "redis-primary-freeze",
+                "mirror-kill-rebuild",
+            ],
+        }
+    }
+
+    /// The deploy-time variables the shard's cluster needs. The cluster
+    /// shard deploys the sealer with a short snapshot interval so the
+    /// follower-kill case sees a snapshot; the retention shard deploys a
+    /// small egress retention so a freeze can overrun it.
+    #[must_use]
+    pub fn deploy_vars(self) -> DeployVars {
+        match self {
+            Self::Cluster => DeployVars {
+                cluster_snapshot_interval_s: Some(60),
+                cluster_retention: None,
+            },
+            Self::Retention => DeployVars {
+                cluster_snapshot_interval_s: None,
+                cluster_retention: Some(6144),
+            },
+            Self::Executor
+            | Self::Ingress
+            | Self::Sequencer
+            | Self::Fleet
+            | Self::Coordinated
+            | Self::Cache => DeployVars::default(),
+        }
+    }
+
+    /// The settings of the shard beyond the shared chaos knobs, as
+    /// `(name, value)` pairs, below the process environment. Every chaos
+    /// shard runs no load stage (`RUN_LOAD=0`), which is what lets the
+    /// resize case take a load-reserve account on the sequencer shard.
+    #[must_use]
+    pub fn env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Cluster => &[
+                ("RUN_LOAD", "0"),
+                ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
+                ("SQUEEZE_CYCLES", "3"),
+                ("SQUEEZE_S", "60"),
+                ("SQUEEZE_CPUS_PER_NODE", "0.4"),
+            ],
+            Self::Retention => &[("RUN_LOAD", "0"), ("KARDAMOM_CLUSTER_RETENTION", "6144")],
+            Self::Executor
+            | Self::Ingress
+            | Self::Sequencer
+            | Self::Fleet
+            | Self::Coordinated
+            | Self::Cache => &[("RUN_LOAD", "0")],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_shard_lists_distinct_cases_and_the_resize_runs_last() {
+        let all: Vec<&str> = [
+            Shard::Executor,
+            Shard::Ingress,
+            Shard::Sequencer,
+            Shard::Cluster,
+            Shard::Fleet,
+            Shard::Coordinated,
+            Shard::Retention,
+            Shard::Cache,
+        ]
+        .iter()
+        .flat_map(|s| s.cases().iter().copied())
+        .collect();
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(all.len(), unique.len(), "a case rides two shards");
+        assert_eq!(all.len(), 38);
+        assert_eq!(
+            Shard::Sequencer.cases().last(),
+            Some(&"resize-scale-out-in")
+        );
+        for shard in [
+            Shard::Executor,
+            Shard::Ingress,
+            Shard::Sequencer,
+            Shard::Cluster,
+            Shard::Fleet,
+            Shard::Coordinated,
+            Shard::Retention,
+            Shard::Cache,
+        ] {
+            assert!(
+                shard.env().contains(&("RUN_LOAD", "0")),
+                "{} runs no load stage",
+                shard.name()
+            );
+        }
+    }
+}

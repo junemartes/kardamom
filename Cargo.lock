@@ -783,6 +783,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1085,6 +1091,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-lock"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1170,6 +1187,15 @@ dependencies = [
  "cmake",
  "dunce",
  "fs_extra",
+]
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
 ]
 
 [[package]]
@@ -1527,6 +1553,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1689,7 +1726,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
+ "futures-core",
  "memchr",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2226,26 +2267,22 @@ dependencies = [
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
- "alloy-rlp",
  "alloy-signer-local",
  "alloy-sol-types",
  "anyhow",
- "async-trait",
  "bytes",
  "clap",
  "criterion 0.5.1",
- "crossbeam-channel",
- "hdrhistogram",
+ "futures",
  "hex",
  "jsonrpsee",
  "kardamom-batcher",
- "kardamom-bench",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-exec-core",
  "kardamom-ingress",
  "kardamom-log",
- "kardamom-sequencer",
+ "kardamom-obs",
  "kardamom-state",
  "kardamom-types",
  "libc",
@@ -2253,8 +2290,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -2388,6 +2423,26 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-listener"
+version = "5.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
+dependencies = [
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -2684,6 +2739,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
  "wasip2",
  "wasip3",
 ]
@@ -3277,6 +3333,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "impl-codec"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3707,6 +3773,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",
  "kardamom-log",
@@ -3714,7 +3781,6 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "proptest",
- "reqwest 0.13.4",
  "rkyv",
  "serde",
  "serde_json",
@@ -3732,6 +3798,7 @@ name = "kardamom-bench"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
@@ -3741,6 +3808,7 @@ dependencies = [
  "anyhow",
  "clap",
  "core_affinity",
+ "crossbeam-channel",
  "dhat",
  "hdrhistogram",
  "humantime",
@@ -3748,6 +3816,7 @@ dependencies = [
  "kardamom-engine",
  "kardamom-footprint",
  "kardamom-ingress",
+ "kardamom-obs",
  "kardamom-state",
  "kardamom-stm",
  "kardamom-types",
@@ -3761,6 +3830,49 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-flame",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-cache"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "arc-swap",
+ "dashmap",
+ "kardamom-types",
+ "metrics",
+ "redis",
+ "reqwest 0.13.4",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-chaos"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "anyhow",
+ "clap",
+ "kardamom-bench",
+ "kardamom-state",
+ "kardamom-types",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
  "tracing-subscriber 0.3.23",
 ]
 
@@ -3797,21 +3909,18 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-provider",
- "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
  "anyhow",
  "async-trait",
- "bytes",
  "clap",
  "jsonrpsee",
+ "kardamom-da-watcher",
  "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
  "metrics",
- "reqwest 0.13.4",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3826,6 +3935,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
+ "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
@@ -3835,9 +3945,10 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "clap",
+ "kardamom-deployer",
  "kardamom-types",
+ "rand 0.8.6",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -3848,12 +3959,7 @@ dependencies = [
 name = "kardamom-engine"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
- "alloy-eip7928",
- "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-primitives",
- "alloy-rlp",
  "alloy-signer-local",
  "anyhow",
  "bytes",
@@ -3866,14 +3972,14 @@ dependencies = [
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",
+ "kardamom-test-support",
  "kardamom-types",
  "metrics",
  "revm",
- "serde",
- "smallvec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
 ]
@@ -3885,13 +3991,13 @@ dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
  "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-signer-local",
  "alloy-trie",
  "bytes",
  "hashbrown 0.15.5",
+ "kardamom-test-support",
  "kardamom-types",
  "metrics",
  "revm",
@@ -3910,7 +4016,6 @@ dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
  "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-signer-local",
@@ -3919,7 +4024,6 @@ dependencies = [
  "clap",
  "criterion 0.5.1",
  "crossbeam-channel",
- "dashmap",
  "kardamom-cluster-adapter",
  "kardamom-engine",
  "kardamom-footprint",
@@ -3931,17 +4035,13 @@ dependencies = [
  "metrics",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
- "reqwest 0.13.4",
  "revm",
  "rkyv",
  "serde",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3967,21 +4067,22 @@ dependencies = [
  "bytes",
  "clap",
  "criterion 0.7.0",
+ "crossbeam-queue",
  "dashmap",
  "futures",
  "governor",
  "hyper",
  "jsonrpsee",
  "k256",
+ "kardamom-cache",
  "kardamom-cluster-adapter",
+ "kardamom-ingress",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
  "libc",
  "metrics",
  "nonzero_ext",
- "rand 0.9.4",
- "reqwest 0.13.4",
  "secp256k1 0.31.1",
  "serde",
  "serde_json",
@@ -4010,10 +4111,13 @@ name = "kardamom-log"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
  "bytes",
  "crossbeam-channel",
  "futures",
+ "if-addrs",
  "kardamom-types",
+ "reqwest 0.13.4",
  "rkyv",
  "rusteron-archive",
  "rusteron-client",
@@ -4045,20 +4149,19 @@ dependencies = [
 name = "kardamom-reconstruct"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
- "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
  "alloy-signer-local",
  "anyhow",
- "bytes",
  "clap",
  "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-reconstruct",
  "kardamom-state",
+ "kardamom-test-support",
  "kardamom-types",
  "serde_json",
  "tempfile",
@@ -4086,6 +4189,7 @@ dependencies = [
  "criterion 0.5.1",
  "crossbeam-channel",
  "dhat",
+ "kardamom-cache",
  "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-obs",
@@ -4094,7 +4198,6 @@ dependencies = [
  "metrics",
  "proptest",
  "rand 0.9.4",
- "reqwest 0.13.4",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -4110,7 +4213,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-trie",
- "arc-swap",
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
@@ -4118,10 +4220,31 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "rkyv",
+ "serde",
+ "serde_json",
  "signet-libmdbx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-state-mirror"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kardamom-cache",
+ "kardamom-log",
+ "kardamom-obs",
+ "kardamom-state",
+ "kardamom-types",
+ "metrics",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
  "tracing",
 ]
 
@@ -4131,7 +4254,6 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-primitives",
  "alloy-signer-local",
  "bytes",
@@ -4139,10 +4261,24 @@ dependencies = [
  "crossbeam-queue",
  "kardamom-exec-core",
  "kardamom-footprint",
+ "kardamom-test-support",
  "kardamom-types",
  "revm",
  "smallvec",
  "tracing",
+]
+
+[[package]]
+name = "kardamom-test-support"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "bytes",
+ "kardamom-types",
 ]
 
 [[package]]
@@ -4155,6 +4291,7 @@ dependencies = [
  "bytes",
  "rkyv",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -4162,27 +4299,25 @@ dependencies = [
 name = "kardamom-validator"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
  "alloy-contract",
  "alloy-eip7928",
- "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rlp",
- "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
  "anyhow",
  "async-trait",
  "bytes",
  "clap",
- "crossbeam-channel",
  "jsonrpsee",
+ "kardamom-cluster-adapter",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-exec-core",
  "kardamom-interop-feed",
  "kardamom-log",
  "kardamom-obs",
@@ -4190,6 +4325,7 @@ dependencies = [
  "kardamom-stm",
  "kardamom-types",
  "metrics",
+ "reqwest 0.13.4",
  "revm",
  "rkyv",
  "serde",
@@ -4200,7 +4336,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -4777,6 +4912,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parking"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5282,6 +5423,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.2",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5319,6 +5471,12 @@ dependencies = [
  "getrandom 0.3.4",
  "serde",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_xorshift"
@@ -5374,6 +5532,35 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redis"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e37a4ca5c6ca42aa3e6df2fd32b987a65d32a4c2159a6f3fe0fd1df306a2658f"
+dependencies = [
+ "arc-swap",
+ "arcstr",
+ "async-lock",
+ "backon",
+ "bytes",
+ "cfg-if",
+ "combine",
+ "futures-channel",
+ "futures-util",
+ "itoa",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "rand 0.10.2",
+ "ryu",
+ "sha1_smol",
+ "socket2",
+ "tokio",
+ "tokio-util",
+ "url",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5523,6 +5710,7 @@ dependencies = [
  "rustls-platform-verifier 0.7.0",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -6449,6 +6637,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -8071,6 +8265,12 @@ checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

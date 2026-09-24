@@ -1,0 +1,109 @@
+---
+- name: Validate deployment inputs and image provenance
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Initialize deployment state
+  ansible.builtin.set_fact:
+    workloads_jobs: {}
+
+- name: Deploy Aeron and the development L1
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
+    - {name: anvil}
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+- name: Discover the in-cluster L1 through the Nomad API
+  ansible.builtin.include_tasks: anvil.yml
+  when:
+    - workloads_l1_rpc | length == 0
+    - workloads_settlement_address | length == 0
+    - not ansible_check_mode
+
+- name: Resolve settlement before deploying its consumers
+  ansible.builtin.import_tasks: settlement.yml
+
+# Submit sequencers without waiting: they may need downstream subscribers.
+# Ingress must subscribe to receipts before executors start publishing them.
+- name: Deploy pipeline dependencies
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - name: cluster
+      retries: 100
+      vars:
+        cluster_retention: "{{ workloads_cluster_retention }}"
+        cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+        cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
+        cluster_remote_origins: "{{ workloads_remote_origins }}"
+    - name: sequencer
+      wait: false
+      vars:
+        shard_table: "{{ (lookup('file', workloads_cluster_dir ~ '/config/shard-map.toml') | community.general.from_toml).table | to_json }}"
+    # The cache before its readers and its writer: the ingress reads it,
+    # the state mirror writes it.
+    - {name: redis}
+    - {name: ingress}
+    - {name: executor, wait: false}
+    - {name: state-mirror, wait: false}
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+- name: Deploy optional L1 light client
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: l1-light-client
+      vars:
+        execution_rpc: "{{ workloads_light_execution_rpc }}"
+        consensus_rpc: "{{ workloads_light_consensus_rpc }}"
+        checkpoint: "{{ workloads_light_checkpoint }}"
+        network: "{{ workloads_light_network }}"
+  when: workloads_light_execution_rpc | length > 0
+
+- name: Deploy pipeline followers
+  ansible.builtin.include_tasks: job.yml
+  loop:
+    - name: validator
+      wait: false
+      vars:
+        l1_rpc_url: "{{ 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
+        lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
+    # The watcher derives the epochs the validator checks. With the light
+    # client deployed it reads L1 through the same client, so the epoch
+    # source is verified too, not only the check against it (issue #163).
+    - name: da-watcher
+      wait: false
+      vars: >-
+        {{ {'lockbox_address': workloads_lockbox_address}
+           | combine({'l1_rpc': 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port}
+                     if workloads_light_execution_rpc | length > 0 else {}) }}
+  loop_control:
+    loop_var: workloads_job
+    label: "{{ workloads_job.name }}"
+
+# Prometheus scrapes every service by its Consul node name, so it comes
+# up after the services it scrapes; Grafana provisions the dashboards.
+- name: Deploy monitoring
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: monitoring
+      wait: false
+
+- name: Wait for pipeline followers
+  ansible.builtin.include_tasks: wait.yml
+  loop: [sequencer, executor, state-mirror, validator, da-watcher, monitoring]
+  loop_control:
+    loop_var: workloads_wait_job
+  when: not ansible_check_mode
+
+- name: Deploy the live batcher
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: batcher
+      vars:
+        settlement_address: "{{ workloads_resolved_settlement }}"

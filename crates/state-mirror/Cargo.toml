@@ -1,0 +1,31 @@
+[package]
+name = "kardamom-state-mirror"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+# The state mirror: subscribes to `tx_receipts` on an executor node and
+# projects every batch's account rows and receipts into Redis, through
+# the monotone write rule. It rebuilds the projection from the executor's
+# newest checkpoint when it cannot resume. See
+# docs/specs/2026-09-13-redis-account-cache-design.md.
+
+[[bin]]
+name = "kardamom-state-mirror"
+path = "src/main.rs"
+
+[dependencies]
+kardamom-cache = { workspace = true }
+kardamom-log = { workspace = true }
+kardamom-state = { path = "../state" }
+kardamom-types = { workspace = true }
+kardamom-obs = { path = "../obs" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+metrics = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

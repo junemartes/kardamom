@@ -12,9 +12,6 @@ edition.workspace = true
 
 [dependencies]
 kardamom-exec-core = { workspace = true }
-smallvec.workspace = true
-alloy-eip7928.workspace = true
-alloy-rlp.workspace = true
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 # Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes
@@ -24,11 +21,8 @@ kardamom-state = { path = "../state" }
 kardamom-obs = { path = "../obs" }
 # P1 footprint shadow (`crate::shadow`): the P0 classifier/grader core.
 kardamom-footprint = { path = "../footprint" }
-serde = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
-alloy-consensus.workspace = true
-alloy-eips.workspace = true
 bytes.workspace = true
 metrics = { workspace = true }
 tracing.workspace = true
@@ -41,12 +35,24 @@ dashmap = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 toml = { workspace = true }
+# The signed-legacy-tx fixture `actor::fixtures` re-exports. Optional,
+# behind `test-support`, so a production build of this crate never links
+# a signer.
+kardamom-test-support = { workspace = true, optional = true }
+
+[features]
+# Exposes `actor::fixtures` (the signed-legacy-tx builder and the
+# channel-backed `ChannelHarness`) as `pub`, so an integration test in
+# another crate (`kardamom-validator`, `kardamom-executor`) can reach it
+# instead of copying it. Off by default: a production build never
+# compiles test fixtures in.
+test-support = ["dep:kardamom-test-support"]
 
 [dev-dependencies]
+kardamom-test-support = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
-alloy-network.workspace = true
-alloy-eips.workspace = true
 tempfile = { workspace = true }

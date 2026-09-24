@@ -21,6 +21,9 @@
 
 extern crate alloc;
 
+mod abi;
+mod rlp;
+
 pub mod ack_policy;
 pub mod boundary;
 pub mod delta;
@@ -29,15 +32,18 @@ pub mod envelope;
 pub mod epoch;
 pub mod genesis;
 pub mod limits;
+pub mod num;
 pub mod position;
 pub mod prover;
 pub mod receipt;
 pub mod shard_map;
 pub mod state;
+pub mod time;
 pub mod tx_error;
 pub mod tx_ordering;
 pub mod txref;
 pub mod upgrades;
+pub mod void;
 pub mod watermark;
 pub mod wire;
 pub mod withdrawals;
@@ -56,6 +62,7 @@ pub use prover::{
     BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
     PublicOutputs, batch_records_commitment,
 };
+pub use receipt::{AccountRow, ReceiptBatch, ReceiptRows};
 pub use receipt::{
     Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN, WireLog, tx_type_of,
 };
@@ -65,5 +72,6 @@ pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
 pub use txref::TxRef;
 pub use upgrades::{CHAIN_STATE, SYSTEM_UPGRADER, encode_set_feature};
+pub use void::VoidRecord;
 pub use watermark::{FsyncWatermark, QuorumWatermark};
 pub use witness::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};

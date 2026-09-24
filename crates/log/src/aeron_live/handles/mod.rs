@@ -4,6 +4,6 @@
 //! [`PubHandle`](super::PubHandle) or a typed subscription receiver. All
 //! are re-exported from `aeron_live`.
 
-pub mod simple;
-pub mod tx_data;
-pub mod tx_receipts;
+pub(super) mod simple;
+pub(super) mod tx_data;
+pub(super) mod tx_receipts;

@@ -3,18 +3,17 @@
 # Rendered into each sequencer alloc by nomad/sequencer.nomad.hcl. Schema:
 # crates/sequencer/src/config.rs (SequencerConfig).
 #
-# The sequencer runs as a Nomad *system* job across both workers (w1, w2).
-# This file supplies the static, node-independent defaults; the per-node
-# identity (partition_index / sequencer_id) is injected at launch via CLI
-# flags from Nomad node meta:
-#     --partition-count 2
-#     --partition-index ${meta.sequencer_id}
-#     --sequencer-id    ${meta.sequencer_id}
-# (kardamom-sequencer CLI flags override the config values; see
-# crates/sequencer/src/bin/kardamom-sequencer.rs.) The partition_index /
-# sequencer_id below are therefore placeholders that the CLI overrides.
+# The sequencer runs as one Nomad job group per lane (nomad/sequencer.nomad.hcl,
+# expanded by Nomad HCL). This file supplies the
+# static defaults; the lane identity is injected at launch via CLI flags:
+#     --partition-count <active lanes>
+#     --partition-index <lane>  --sequencer-id <lane>  --lane <lane>
+#     --vslots <the lane's slots under config/shard-map.toml>
+# (kardamom-sequencer CLI flags override the config values.) The
+# partition_index / sequencer_id below are placeholders that the CLI
+# overrides.
 
-# M = 2 sequencers (partition_count, from group_vars/all.yml partition_count).
+# The explicit per-lane CLI count overrides this development default.
 partition_count = 2
 
 # Overridden per-node by --partition-index ${meta.sequencer_id}.
@@ -37,9 +36,22 @@ max_pending_per_sender = 512
 backpressure_policy = "return_immediately"
 
 [cluster]
-ingress_endpoints = "0=192.168.56.51:40200,1=192.168.56.52:40200,2=192.168.56.53:40200"
+ingress_endpoints = "0=sealer-0.node.consul:40200,1=sealer-1.node.consul:40200,2=sealer-2.node.consul:40200"
 initial_leader_member_id = 0
 ingress_stream_id = 101
 egress_stream_id = 102
 keep_alive_interval_ms = 1000
 # egress_channel is set per-node by --cluster-egress-endpoint (the node IP differs).
+
+# The Redis layer (docs/specs/2026-09-13-redis-account-cache-design.md,
+# section 5.2 and section 6): the three sentinels by their node records,
+# the same list the state mirror uses. The readers are fail-open: with
+# Redis down, an admission check is skipped and counted, never a submit.
+# Authentication is deferred; see the spec's section 11 (flag day).
+[cache]
+sentinels = [
+  "redis://aux-0.node.consul:26379",
+  "redis://ingress-0.node.consul:26379",
+  "redis://ingress-1.node.consul:26379",
+]
+master_name = "kardamom"

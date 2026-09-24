@@ -10,13 +10,6 @@ use kardamom_batcher::archive_reader::{
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::NamedTempFile;
 
-fn pos(o: i32) -> BPosition {
-    BPosition {
-        term_id: 0,
-        term_offset: o,
-    }
-}
-
 fn tx(correlation: u64) -> TxEnvelope {
     TxEnvelope {
         correlation_id: correlation,
@@ -33,15 +26,20 @@ fn reads_two_interleaved_b_records() {
     let mut buf = Vec::new();
     append_frame(
         &mut buf,
-        pos(0),
-        &TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 3, pos(128), 0)),
+        BPosition::from_index(0),
+        &TxOrderingMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::ZERO,
+            3,
+            BPosition::from_index(128),
+            0,
+        )),
     );
     append_frame(
         &mut buf,
-        pos(64),
+        BPosition::from_index(64),
         &TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
-            end_tx_idx: pos(64),
+            end_tx_idx: BPosition::from_index(64),
             l2_timestamp: 1234,
             l1_origin: 0,
         }),
@@ -58,7 +56,7 @@ fn reads_two_interleaved_b_records() {
         panic!("expected ref first");
     };
     assert_eq!(r.shard_id, 3);
-    assert_eq!(r.tx_data_position, pos(128));
+    assert_eq!(r.tx_data_position, BPosition::from_index(128));
 
     let TxOrderingMessage::BoundaryStart(b) = &records[1].value else {
         panic!("expected boundary second");
@@ -70,8 +68,8 @@ fn reads_two_interleaved_b_records() {
 fn reads_per_sequencer_a_records() {
     // TxData carries raw `TxEnvelope` records. There is no enum wrapper.
     let mut buf = Vec::new();
-    append_frame(&mut buf, pos(0), &tx(1));
-    append_frame(&mut buf, pos(128), &tx(2));
+    append_frame(&mut buf, BPosition::from_index(0), &tx(1));
+    append_frame(&mut buf, BPosition::from_index(128), &tx(2));
 
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(&buf).unwrap();
@@ -80,15 +78,15 @@ fn reads_per_sequencer_a_records() {
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].value.correlation_id, 1);
-    assert_eq!(records[0].position, pos(0));
+    assert_eq!(records[0].position, BPosition::from_index(0));
     assert_eq!(records[1].value.correlation_id, 2);
-    assert_eq!(records[1].position, pos(128));
+    assert_eq!(records[1].position, BPosition::from_index(128));
 }
 
 #[test]
 fn truncated_active_segment_stops_cleanly() {
     let mut buf = Vec::new();
-    append_frame(&mut buf, pos(0), &tx(99));
+    append_frame(&mut buf, BPosition::from_index(0), &tx(99));
     buf.extend_from_slice(&[0xFFu8; 4]); // a partial frame header, too short
 
     let mut f = NamedTempFile::new().unwrap();
@@ -102,7 +100,7 @@ fn truncated_active_segment_stops_cleanly() {
 #[test]
 fn segment_path_uses_canonical_layout() {
     let dir = std::path::Path::new("/tmp/archive");
-    let p = TypedSegmentReader::<TxOrderingMessage>::segment_path(dir, 5, 16777216);
+    let p = TypedSegmentReader::<TxOrderingMessage>::segment_path(dir, 5, 16_777_216);
     assert_eq!(p, std::path::Path::new("/tmp/archive/5-16777216.rec"));
 }
 
@@ -112,9 +110,9 @@ fn zeroed_header_with_data_behind_is_corruption() {
     // clean live tail: that would be silent data loss. With real frames
     // behind the zeroed header, this must surface as Corruption.
     let mut buf = Vec::new();
-    append_frame(&mut buf, pos(0), &tx(1));
+    append_frame(&mut buf, BPosition::from_index(0), &tx(1));
     let wipe_at = buf.len();
-    append_frame(&mut buf, pos(128), &tx(2));
+    append_frame(&mut buf, BPosition::from_index(128), &tx(2));
     buf[wipe_at..wipe_at + 4].fill(0); // zero the second frame's length
 
     let mut f = NamedTempFile::new().unwrap();
@@ -135,7 +133,7 @@ fn zero_filled_tail_still_stops_cleanly() {
     // The legitimate case the corruption check must not flag: a
     // pre-allocated, zero-filled tail after the last real frame.
     let mut buf = Vec::new();
-    append_frame(&mut buf, pos(0), &tx(1));
+    append_frame(&mut buf, BPosition::from_index(0), &tx(1));
     buf.extend_from_slice(&[0u8; 256]);
 
     let mut f = NamedTempFile::new().unwrap();
@@ -149,7 +147,7 @@ fn zero_filled_tail_still_stops_cleanly() {
 #[test]
 fn undersized_frame_length_is_corruption() {
     let mut buf = Vec::new();
-    append_frame(&mut buf, pos(0), &tx(1));
+    append_frame(&mut buf, BPosition::from_index(0), &tx(1));
     let at = buf.len();
     buf.extend_from_slice(&8u32.to_le_bytes()); // len 8 < header size 16
     buf.extend_from_slice(&[0xAB; 12]);

@@ -1,11 +1,11 @@
 //! `eth_getStorageAt` on the validator's serving surface.
 //!
 //! The interop watcher reconciles its lane cursor with the destination's
-//! `Inbox.nextSeq[origin]` at startup (audit H9). Nothing served that slot
-//! before this: the ingress holds no state, and the validator served only
-//! the two `kardamom_subscribe*` feeds. This method reads one storage slot
-//! from the validator's own committed state, so the watcher's resume
-//! position comes from the chain and not from a local file alone.
+//! `Inbox.nextSeq[origin]` at startup. Nothing served that slot before
+//! this: the ingress holds no state, and the validator served only the two
+//! `kardamom_subscribe*` feeds. This method reads one storage slot from the
+//! validator's own committed state, so the watcher's resume position comes
+//! from the chain and not from a local file alone.
 //!
 //! Only the `latest` block tag is served. The validator keeps one committed
 //! state, and a historical read would need an archive this node does not
@@ -43,17 +43,56 @@ pub struct StateReadHandler {
 }
 
 impl StateReadHandler {
+    #[must_use]
     pub fn new(env: StateEnv) -> Self {
         Self { env }
     }
 }
 
-/// True for the block tags that name the committed state.
-fn is_latest(block: Option<&str>) -> bool {
-    matches!(
-        block,
-        None | Some("latest") | Some("finalized") | Some("safe") | Some("pending")
-    )
+/// Why `get_storage_at` could not answer.
+enum StateRpcError {
+    /// The caller asked for a block tag this node cannot serve.
+    UnsupportedBlock(String),
+    /// The state read itself failed (a task join, or the read transaction).
+    Read(String),
+}
+
+impl From<StateRpcError> for ErrorObjectOwned {
+    fn from(e: StateRpcError) -> Self {
+        match e {
+            StateRpcError::UnsupportedBlock(detail) => {
+                Self::owned(CODE_UNSUPPORTED_BLOCK, detail, None::<()>)
+            }
+            StateRpcError::Read(detail) => Self::owned(CODE_STATE, detail, None::<()>),
+        }
+    }
+}
+
+/// A block tag this node can serve: always the committed state, since the
+/// validator keeps no archive. Parsed once, so the handler carries no `if`.
+struct BlockTag;
+
+impl core::str::FromStr for BlockTag {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "latest" | "finalized" | "safe" | "pending" => Ok(Self),
+            other => Err(format!(
+                "eth_getStorageAt serves only the latest committed state, not {other:?}"
+            )),
+        }
+    }
+}
+
+impl BlockTag {
+    /// A missing tag reads as `latest`; a present one must parse as one of
+    /// the tags this node can serve.
+    fn parse(block: Option<&str>) -> Result<Self, StateRpcError> {
+        block.map_or(Ok(Self), |s| {
+            s.parse().map_err(StateRpcError::UnsupportedBlock)
+        })
+    }
 }
 
 #[jsonrpsee::core::async_trait]
@@ -64,27 +103,18 @@ impl StateReadApiServer for StateReadHandler {
         slot: U256,
         block: Option<String>,
     ) -> RpcResult<B256> {
-        if !is_latest(block.as_deref()) {
-            return Err(ErrorObjectOwned::owned(
-                CODE_UNSUPPORTED_BLOCK,
-                format!(
-                    "eth_getStorageAt serves only the latest committed state, not {:?}",
-                    block.unwrap_or_default()
-                ),
-                None::<()>,
-            ));
-        }
+        BlockTag::parse(block.as_deref())?;
         let env = self.env.clone();
         let key = B256::from(slot.to_be_bytes::<32>());
         // A read transaction blocks for a moment. Keep it off the server's
         // async workers.
-        let read = tokio::task::spawn_blocking(move || -> Result<U256, String> {
-            let snap = StateSnapshot::open(&env).map_err(|e| e.to_string())?;
-            snap.storage(address, key).map_err(|e| e.to_string())
+        let value = tokio::task::spawn_blocking(move || -> Result<U256, StateRpcError> {
+            let snap = StateSnapshot::open(&env).map_err(|e| StateRpcError::Read(e.to_string()))?;
+            snap.storage(address, key)
+                .map_err(|e| StateRpcError::Read(e.to_string()))
         })
         .await
-        .map_err(|e| ErrorObjectOwned::owned(CODE_STATE, e.to_string(), None::<()>))?;
-        let value = read.map_err(|e| ErrorObjectOwned::owned(CODE_STATE, e, None::<()>))?;
+        .map_err(|e| StateRpcError::Read(e.to_string()))??;
         Ok(B256::from(value.to_be_bytes::<32>()))
     }
 }
@@ -97,6 +127,7 @@ mod tests {
     use jsonrpsee::server::Server;
     use jsonrpsee::ws_client::WsClientBuilder;
     use kardamom_state::StateEnvBuilder;
+    use kardamom_types::xchain::Inbox;
 
     /// A fresh state env serves zero for every slot, over the real
     /// transport, and refuses a historical block tag.
@@ -112,7 +143,7 @@ mod tests {
             .build(format!("ws://{addr}"))
             .await
             .unwrap();
-        let slot = kardamom_types::xchain::inbox_next_seq_slot(412_346);
+        let slot = Inbox::next_seq_slot(412_346);
         let got: B256 = client
             .request(
                 "eth_getStorageAt",

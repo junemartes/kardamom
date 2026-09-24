@@ -2,7 +2,7 @@
 
 How each kardamom actor fails, what it costs, how it recovers, and where that
 behavior is verified. Grounded in the failover specs (`docs/agents/`), the
-chaos suite (`deploy/cluster/scripts/chaos.sh` — case names appear like
+chaos suite (`crates/chaos`, one case per function — case names appear like
 `cluster-leader-kill` throughout; most run in CI via
 `.github/workflows/cluster-e2e.yml`), and the recovery code itself.
 
@@ -46,7 +46,108 @@ with three distinct, tested modes:
   One node returning restores quorum, but this is the one case where client
   cluster *sessions* die (the outage exceeds the session timeout): re-election
   + session re-establishment + log replay takes ~50 s+ observed (SLO 180 s),
-  then the backlog drains gaplessly.
+  then the backlog drains gaplessly. The second node returns last, and the
+  pipeline must progress again with all three members.
+- **Total loss** (`cluster-total-loss-recover`) — all three nodes killed: no
+  member is left, the pipeline **must stall**. Every node returns with its
+  own log and snapshots, the members elect a leader among themselves, and
+  the backlog drains.
+  What this does not cover: all three members *wiped*. The failure model
+  owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
+  below.
+
+- **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
+  persistence; the executors' state is the truth. The whole redis job
+  (primary, replica, three sentinels) is stopped for 30 s: the readers
+  degrade to the executor query, the pipeline progresses, the mirrors retry
+  their writes. The job returns empty, the sentinels name a primary, and every
+  state mirror rebuilds the projection from its executor's newest checkpoint.
+  See `docs/specs/2026-09-13-redis-account-cache-design.md`, section 9.3.
+
+Every chaos case ends with a **recovery probe**: after the case load ended
+and the executors converged, two 30 s loads run at once, each at half the
+case rate. The first runs on the case's account from its next nonce, through
+the ingress the case load used: the sender that had transactions in flight
+during the outage. The second runs on the smoke gate's account, which no
+case load spends, through the other ingress: a sender with nothing in
+flight. Every offered transaction of both must get a receipt, and each must
+be accepted at a quarter of its rate or more. A failure of the first alone
+is a stuck sender; a failure of the second is a pipeline, or an ingress,
+that did not recover. The case load cannot prove either: a submit refused
+during the outage leaves a nonce hole, every later submit of that sender
+parks and fails, and the chaos verdict does not count a failed submit. The
+executor block gauge cannot prove it either: it advances on empty blocks.
+The first fleet-shard run showed the gap: after the quorum loss, 1,282 of
+1,524 submits never landed and the case still passed.
+
+**Coordinated failures** (`chaos-coordinated` shard). The single-replica
+cases prove that a twin covers a loss; these prove the recovery when no twin
+is left, or when the roles fail together:
+
+- **Both ingresses** (`ingress-pair-loss-recover`) — both ingress tasks
+  hard-killed: the whole client edge is gone. Nomad restarts both, both
+  exporters must answer, the pipeline must progress, and the probe submits
+  through each ingress.
+- **A whole sequencer lane** (`sequencer-lane-loss-recover`) — both replicas
+  of lane 0 hard-killed, one on each sequencer node. The lane's senders are
+  unordered until a replica returns with empty state and learns each
+  sender's floor from the executors. Both replicas must come back healthy
+  and `kardamom_sequencer_ref_below_floor` must read zero on both.
+- **Pipeline blackout** (`pipeline-blackout-recover`) — every ingress,
+  sequencer, sealer, executor and aux node killed at once; only the control
+  node stays, with the orchestrator and the L1. All nodes start in one call,
+  with no arranged order. Every job must return to its count, the sealers
+  must elect a leader within 180 s, both ingresses must be live, and the
+  pipeline must progress. **The case exists and is not in the shard yet: it
+  fails on an open product defect.** After the blackout every job returns and
+  a leader is elected, and then all three executors crash-loop on one
+  canonical entry whose transaction data no archive can serve (`join
+  timeout: TxRef ... not found within 30000 ms`, the archive refetch failing):
+  the sealer had ordered a reference to data that was lost with the nodes.
+  The chain is wedged for good. It joins the shard with that fix.
+
+**Removal of an entry that no consumer can execute (void).** The sealer
+orders a transaction reference before the archives make its data durable, so
+a failure such as the blackout above can leave an entry with no data. The
+sealer can remove such an entry with a canonical *void record*. The rule has
+no clock in it:
+
+- A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and
+  every archive refuses the range. A consumer that has the data never votes.
+- The sealer appends the void record only when **every** configured voter has
+  voted for the same `(index, tx_hash)`. One voter that is down blocks the
+  void, and the chain waits for it. This is the safe side: that voter can be
+  the one that executed the entry.
+- On a void the sealer removes the hash from its dedup window and sets the
+  sender's expected nonce back, so the sender can submit the same bytes again.
+
+Three constants bound the rule. Every member must run the same values.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `kardamom.cluster.voidVoters` | empty | The voter ids. Empty refuses every vote, which is the behavior before this rule. |
+| `kardamom.cluster.voidWindow` | 65536 (the egress retention) | The newest indices that a void can name. An older entry cannot be removed. |
+| `MAX_OPEN_VOTES` | 1024 | The most indices with open votes. More are refused. |
+
+The order path pays one 52-byte copy for each reference and no allocation.
+The votes and the window are in the snapshot (version 6). With voters
+configured, a full window adds 65536 x 68 bytes (about 4.4 MB) to each
+snapshot. A void needs the last vote before `voidWindow` more records are
+ordered after the entry: with live ingress at more than about 1000 records
+per second and a 60 s join budget, the entry leaves the window first, and the
+chain stops as it did before this rule. Status: the sealer
+side exists. No consumer votes yet, so `pipeline-blackout-recover` still
+fails until the consumer side lands.
+
+**Durability of the Raft log.** The kill-based cases above prove the
+restart logic, not the durability against a power loss: a process kill or a
+container kill leaves the host kernel and its page cache alive, so every
+member finds its whole log again. The sealer therefore syncs the Raft log and
+the archive to disk (`kardamom.cluster.fileSyncLevel`, deployed at 1: the
+data of every write batch). At level 0 an entry that a quorum acknowledged
+could exist only in the page caches of its members, and a rack-level power
+loss, the event `pipeline-blackout-recover` stands for, would drop it. Only
+a test that cuts the power of a VM can prove this end to end.
 
 ## Executor
 
@@ -63,6 +164,37 @@ with three distinct, tested modes:
   keep progressing; the returned node rejoins to 3/3. Replicas are
   deterministic state machines, so one dead or lagging replica never blocks
   the others.
+- **Whole-fleet loss** (`executor-fleet-loss-recover`) — all three executor
+  nodes killed at once, every exporter observed dark, then all three return.
+  Each executor resumes from its own state directory and catches up on the
+  backlog the sealers kept ordering, within the canonical retention window.
+- **Whole-fleet state loss** (`executor-fleet-wipe-recover`) — all three
+  executor tasks killed and every state DB wiped, with each node's own
+  checkpoints kept. No peer is live to serve a checkpoint, so every executor
+  must restore from its local checkpoint and replay the tail; the case
+  requires one restore line per executor. All three wiped *with* their
+  checkpoints has no live source at all: that is the rebuild-from-L1
+  backstop.
+- **Whole-fleet total loss** (`executor-fleet-total-wipe-recover`) — the
+  executor job stopped, and every state DB **and every checkpoint** wiped: no
+  executor holds state and no peer can serve any. The harness rebuilds an
+  executor image from L1 and the DA store on the host
+  (`kardamom-reconstruct --through-block --executor-image`), installs it on
+  every executor node, and starts the job. Every executor must resume from
+  the image's cursor, with a replay request the sealer accepts and with no
+  checkpoint restore or peer fetch, and the fleet must catch up. The
+  end-of-shard audit then compares the resumed executors with the validator
+  table by table. The job is stopped, not killed: an executor that starts on
+  an empty directory of a young chain replays from genesis on its own.
+- **Machine replacement** (`node-replace-executor`) — the node is replaced
+  through the Terraform root the way a cloud provider replaces a server: a
+  new address and empty volumes, then the substrate play a new machine
+  gets. Consul must forget the old record (the control node force-leaves
+  it), Nomad must place the lost executor on the new client, and the
+  executor must catch up from nothing. Nothing but the root's address plan
+  moves, since every peer resolves the node by name. A restarted node
+  (`node-failure-executor`) keeps its address and its disks; this is the
+  path that loses both.
 - **State-DB volume loss** (`state-checkpoint-restore`) — a *wiped* state DB
   (not just a process crash) would otherwise force a re-sync from genesis,
   replaying the entire canonical stream — unbounded as the chain ages. With
@@ -86,8 +218,11 @@ with three distinct, tested modes:
   checkpoint over `--checkpoint-serve-addr` (:9014) and a node that hits the
   refusal — or cold-starts with no checkpoint at all — fetches the newest
   qualifying peer checkpoint (`--checkpoint-peers`), parks the stale DB under
-  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor
-  (`kardamom_executor_resync_total` counts these by outcome). If no peer can
+  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor,
+  all in-process: the pipeline runs again in the same process, so a
+  revolution costs the fetch and the restore, and burns no orchestrator
+  restart attempt (#298; `kardamom_executor_resync_total` counts these by
+  outcome). If no peer can
   offer a checkpoint at/above the floor, the node stays down and says so: the
   remaining paths are an operator-restored checkpoint or rebuild-from-L1
   (`kardamom-reconstruct`).
@@ -114,6 +249,13 @@ with three distinct, tested modes:
   to the pipeline, so a replica dying after the ack but before its
   publication is durable can lose that tx. The `on-quorum` gate (ack only
   after the Raft cluster commits) exists for when that window matters.
+
+**Receipts across an ingress restart.** The receipt cache lives in the
+memory of one ingress process, so a restarted ingress holds no receipt from
+before its start. `eth_getTransactionReceipt` therefore asks an executor's
+state DB on a cache miss, and a receipt found there enters the cache. The
+`ingress-pair-loss-recover` chaos case kills both ingresses under load and
+requires every accepted transaction's receipt afterwards.
 
 ## Sequencer (2 shards × 2 racing replicas)
 
@@ -174,7 +316,10 @@ one.
 
 A replay-window overrun self-repairs like the executor's recovery-D loop
 (#143): fetch a peer checkpoint at/above the retention floor from an
-executor's serve endpoint, park the stale DB, exit; the restart adopts it —
+executor's serve endpoint, park the stale DB, and run the pipeline again in
+the same process; that revolution adopts it (#298, no exit and no
+orchestrator restart, so a lost race against the retention window costs one
+fetch, not one restart attempt) —
 including a marker-driven one-time hashed-mirror + trie bootstrap: executor
 checkpoints carry a trie FROZEN AT GENESIS (seeded into every env, never
 updated by the trie-off writer), so adoption must rebuild it wholesale — a
@@ -233,6 +378,18 @@ pruned by the consensus layer after ~18 days). The offline segment-file mode
 (`--channel-b-segment`, dry-run by default) remains for archive inspection
 and the corruption-heal tooling.
 
+**A skewed resume cursor is a refusal.** A consumer resumes at a record
+index and a block number, and the two select frames on separate axes. A
+pair that does not name one point of the stream would skip records or apply
+them twice, and no consumer-side check sees it, because the consumer seeds
+every counter from the same cursor. The sealer holds the boundaries, so it
+checks the index against the end of the block before the named one and the
+end of the named block, where it retains them, and answers
+`REPLAY_UNAVAILABLE` (`cluster REPLAY ... SKEWED`) for a pair outside. The
+refusal routes the consumer into its repair path. A cold start sends the
+block end exactly; a reconnect inside an open block sends an index between
+the two ends; a start from genesis has no boundary to check.
+
 ## Data-availability recovery (rebuild-from-L1)
 
 The bottom-of-the-stack backstop: even if **every** in-cluster durable copy is
@@ -250,6 +407,18 @@ the reconstructed root is byte-identical to the canonical one. The
 `reconstruct_l1_e2e` test proves the whole loop end-to-end against a real L1
 (anvil): post → discard the originals → read L1 → fetch blobs → re-execute →
 assert root parity.
+
+**The rebuilt state is resumable.** A KAR1 version 3 block carries its
+canonical end index and its L1 origin, which the rest of the payload cannot
+give: epoch markers and deposits take canonical slots and never reach the
+blob. So the rebuilt cursor, header rows and receipt positions equal the live
+chain's, and `--executor-image` writes the image an executor resumes on (the
+trie, the hashed mirror and the stored root removed, after the root check).
+The sealer refuses a resume whose index lies outside the block it names, so
+a wrong cursor is loud. A state rebuilt through a version 2 blob is correct
+and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
+which also gives the flag-day procedure for a wiped sealer set and the seed
+hook that would replace it.
 
 Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
 skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
@@ -382,6 +551,13 @@ check would pass against a feature that activated once and stopped.
 
 ## Known gaps (untested failure surface)
 
+- **All-wiped fleets** — the persisted-state stage of every shard now
+  rebuilds the state at the validator's drained head from L1 and the DA
+  store alone (`kardamom-reconstruct --through-block --expect-root`) and
+  requires the validator's committed root. No chaos case yet wipes all three
+  sealers or all three executors with their checkpoints and then rejoins
+  them from that rebuilt state: the executor resumes from a cluster cursor
+  the rebuilt database does not carry.
 - **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
   `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
   re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +
@@ -413,15 +589,18 @@ check would pass against a feature that activated once and stopped.
   `AttestingReceiptSink`, which tees leaves off the receipt stream (where the
   logs actually are) and flushes them per block boundary. Regression-tested
   end-to-end by `s2_bridge_withdrawal_round_trip`.
-- **The persisted `receipts` / `tx_hash_index` tables are always empty** —
-  same root cause, still open. Because `BlockDelta.receipts` is always empty,
-  the state writer never populates either table, so
-  `StateDatabase::{get_receipt, get_tx_position}` can only ever return `None`
-  and the documented "`eth_getTransactionReceipt(hash)` → `get_tx_position` →
-  `get_receipt`" read path cannot work. Receipts survive only in the ingress's
-  in-RAM cache, so a restart loses them. Populating the delta's receipts on
-  the executor's commit path would fix it, but it adds a per-tx clone to the
-  hot path — worth its own PR with a saturation run.
+- ~~**The persisted `receipts` / `tx_hash_index` tables are always empty**~~
+  — **CLOSED**. The executor's commit path fills the block delta's receipts
+  (`exec_boundary.rs`), so the state writer populates both tables; the
+  end-of-shard persisted-state audit requires a non-empty `receipts` table
+  and compares it across every executor and the validator. The read path
+  "`eth_getTransactionReceipt(hash)` → `get_tx_position` → `get_receipt`" is
+  live: the executor's query endpoint serves it, and the ingress falls back
+  to it when its own receipt cache misses. So a receipt survives an ingress
+  restart, and a client that got a hash from an accepted submit finds its
+  receipt afterwards. The fallback is bounded by the client's token bucket,
+  the query client's in-flight bound and its timeout; a shed query answers
+  `null`, the same as "not committed yet".
 - ~~**Validator ignores SIGTERM**~~ — **FIXED** (found by the
   chain-semantics suite's graceful-shutdown phase). The validator survived
   90 s+ of a single SIGTERM while the executor exited immediately from the

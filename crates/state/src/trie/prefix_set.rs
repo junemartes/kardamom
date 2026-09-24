@@ -8,13 +8,13 @@ use alloy_trie::Nibbles;
 /// `contains_prefix` answers: does any changed key live under this
 /// subtrie path?
 #[derive(Debug, Default, Clone)]
-pub struct PrefixSet {
+pub(crate) struct PrefixSet {
     keys: Vec<Nibbles>,
 }
 
 impl PrefixSet {
     /// Build from the changed hashed keys (`keccak(addr)` / `keccak(slot)`).
-    pub fn from_b256s(it: impl IntoIterator<Item = B256>) -> Self {
+    pub(crate) fn from_b256s(it: impl IntoIterator<Item = B256>) -> Self {
         let mut keys: Vec<Nibbles> = it
             .into_iter()
             .map(|h| Nibbles::unpack(h.as_slice()))
@@ -27,14 +27,17 @@ impl PrefixSet {
     /// Build from nibble paths directly. Proof-generation targets may be
     /// partial paths, a node position from the capture fixed point, which
     /// force the walker to descend exactly that far.
-    pub fn from_nibbles(it: impl IntoIterator<Item = Nibbles>) -> Self {
+    pub(crate) fn from_nibbles(it: impl IntoIterator<Item = Nibbles>) -> Self {
         let mut keys: Vec<Nibbles> = it.into_iter().collect();
         keys.sort_unstable();
         keys.dedup();
         Self { keys }
     }
 
-    pub fn is_empty(&self) -> bool {
+    // Exercised by `empty_set_contains_nothing`, not by production code.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
@@ -42,7 +45,8 @@ impl PrefixSet {
     /// the subtrie rooted at `prefix` contains a change. Keys are sorted,
     /// so the changed keys under `prefix` form a contiguous range. This
     /// checks the first key that is `>= prefix`.
-    pub fn contains_prefix(&self, prefix: &Nibbles) -> bool {
+    #[must_use]
+    pub(crate) fn contains_prefix(&self, prefix: &Nibbles) -> bool {
         let i = self.keys.partition_point(|k| k < prefix);
         self.keys.get(i).is_some_and(|k| k.starts_with(prefix))
     }

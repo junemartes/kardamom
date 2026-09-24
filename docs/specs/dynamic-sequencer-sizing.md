@@ -2,7 +2,9 @@
 
 - **Date:** 2026-09-03
 - **First draft:** 2026-08-31
-- **Status:** Draft. Design review in progress.
+- **Status:** Implemented. Milestones 1 to 8 landed as PRs #256, #268,
+  #269, #270, #271, #272, #273, and the doc repair (2026-09-07). See
+  section 6 for the deviations.
 - **Topic:** Change the number of active sequencer shards at run time. Keep
   the canonical log correct. Keep the availability cost bounded.
 - **Supersedes:** the non-goal "shard scaling" in
@@ -49,7 +51,7 @@ code survey found these facts:
 - The code default is M=8. The deploy runs M=2. A service that starts
   without the explicit flag opens the wrong fan.
 - Six copies of the value "2" exist across `group_vars`, the sequencer TOML
-  template, and five Nomad jobs. The script `check-contract.py` checks none
+  template, and five Nomad jobs. The original contract checker checks none
   of them. The script `chaos.sh` has a precomputed `keccak % 2` account
   table.
 - The Java sealer does not depend on M. It keys on the sender and on the
@@ -328,17 +330,20 @@ Residual effects:
 - **Nomad:** one job group per active lane, generated from the map version.
   Each group has `count = 2` and `distinct_hosts`. Replace the two
   hardcoded port pairs with a per-lane port lane. The metrics port is
-  `9001 + 10 * lane`. The egress port is `40210 + 10 * lane`. Document both
-  in `group_vars`. This supersedes the `--partition-offset` rotation. That
+  `9001 + 10 * lane`, documented in `group_vars`. The egress port is a
+  Nomad dynamic port per allocation: a fixed per-lane port sits in the
+  node's ephemeral range, and a replacement replica must not reuse the
+  endpoint of the replica it replaces on the node's shared media driver.
+  This supersedes the `--partition-offset` rotation. That
   formula guarantees cross-placement only when M equals the sequencer node
   count. Each group passes an explicit lane and vslot set instead.
 - **Ansible:** `node_classes.sequencer.count` follows the active lane
-  count. The hcloud path from the hybrid-fleet plan adds machines.
-- **Contract:** extend `check-contract.py`. It checks every mirror of the
-  map, the port lanes, the `tx_ttl` mirror, and the `ACCT_SHARD` table in
-  `chaos.sh`. Outside a resize, the ingress table must equal the union of
-  the sequencer vslot sets.
-- **Runbook:** a `scale-sequencers.sh` that runs the seven steps of
+  count. The cloud path from the hybrid-fleet plan adds machines.
+- **Contract:** `ansible/contract.yml` checks configuration mirrors and map
+  bounds. Compiled Nomad job tests check port lanes and overlap arguments.
+  Rust tests check rebalance behavior and funded-account routing. Outside a
+  resize, the ingress table equals the union of the sequencer vslot sets.
+- **Runbook:** a `kardamom-cluster scale-sequencers` command that runs the seven steps of
   section 3.5. It refuses to start a second resize while one is in flight.
   It refuses to start a resize while sealer backpressure is active. The
   runbook owns the overlap window. The contract check owns the steady
@@ -372,7 +377,7 @@ Residual effects:
    take-over.
 6. **Deploy.** Generated Nomad groups, port lanes, the ingress graceful
    drain and `kill_timeout`, the ingress re-render and roll,
-   `scale-sequencers.sh`, and the contract checks.
+   `kardamom-cluster scale-sequencers`, and the contract checks.
 7. **Verification.** An e2e resize-under-load scenario with nonce-gap
    assertions for moved senders. A chaos case: kill a new-shard replica
    during the overlap. A chaos case: all executors unreachable during a
@@ -385,6 +390,8 @@ Residual effects:
    the F02.1 status in `fixes-WP-SEQ.md`. Mark the superseded non-goal.
 
 ## 5. Risks and open questions
+
+See also section 6 for what the implementation changed.
 
 - **Same-nonce replacement during the overlap.** A replacement can race a
   laggard replica. The guard's `nonce < expected` path drops it as
@@ -406,3 +413,33 @@ Residual effects:
 - **Clock skew between replicas.** The expiry uses local clocks. The two
   replicas of a shard can expire an entry a few milliseconds apart. The
   effect is one spurious error at most. It cannot cause a loss.
+
+## 6. Implementation notes
+
+The implementation follows this spec with these deviations:
+
+- **Warm-up timer start (3.5, step 2).** The timer starts when the
+  sequencer is constructed, after every lane subscription opened, not when
+  the old-lane subscription reports connected. The Aeron runtime does not
+  expose the connected state. The margin in `shadow_warm_ms` (default
+  `tx_ttl_ms + 5000`) covers the join.
+- **Sequencer node count (3.8).** `node_classes.sequencer.count` does not
+  follow the active lane count. Two lanes share a node through the port
+  lane, and a resize adds no machines. The count only needs to stay at 2 or
+  more, so both replicas of a lane land on distinct nodes.
+- **Least-moves map (3.2).** `ShardMap::rebalance` moves slots only to the
+  lanes that gain. A lane that gains nothing runs through the resize with
+  no shadow phase, and the overlap job leaves its arguments byte-identical,
+  so Nomad does not restart it.
+- **Lookup trigger (3.4).** The core asks for a lookup on every park of a
+  sender with no known receipt floor, not only on the first cold envelope.
+  The lookup task dedups the senders in flight and bounds the retry rate to
+  one lookup per timeout per sender. So a timed-out lookup retries on the
+  sender's next park.
+- **Rebuffered entries (3.3).** A backpressure rebuffer carries no deadline
+  instead of a refreshed one. It waits on the publisher, not on a nonce
+  gap, and it lives until the publisher recovers. This is the behaviour
+  the section describes, with no heap growth under sustained backpressure.
+- **Explicit-set validation (3.2).** A replica with an explicit `vslots`
+  skips the identity-map checks, so a shard on lane 2 under a 3-lane map is
+  a valid config. `partition_count` then only labels the metrics.

@@ -37,7 +37,7 @@ async fn s6_validator_matches_executor() {
 }
 
 /// S7: prove the divergence tripwire actually fires. A corrupt BAL on
-/// the real tx_bal channel must halt the validator with the documented
+/// the real `tx_bal` channel must halt the validator with the documented
 /// exit code 2. This closes the docs/failure-modes.md "divergence
 /// injection" gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -116,18 +116,15 @@ async fn s9_executor_crash_recovery_is_consistent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
 async fn target_c_runner_drives_the_stack() {
-    let park = Duration::from_secs(4);
-    let stack = LocalStack::launch(StackConfig {
-        validator: true,
-        ingress: IngressOptions {
-            pending_receipt_timeout: park,
-            ..IngressOptions::default()
+    let park = PARK_4S;
+    let (_stack, t) = launch_with_park(
+        park,
+        StackConfig {
+            validator: true,
+            ..StackConfig::default()
         },
-        ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
-    let t = stack.target(client_timeout(park)).expect("target");
+    )
+    .await;
 
     let bin = e2e::harness::services::bin("kardamom-semantics").expect("semantics bin");
     let stdout = run_bin_ok(
@@ -139,7 +136,7 @@ async fn target_c_runner_drives_the_stack() {
                 "--sequencer-metrics",
                 &t.sequencer_metrics
                     .iter()
-                    .map(|a| a.to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
             ])
@@ -149,7 +146,7 @@ async fn target_c_runner_drives_the_stack() {
             ])
             .args([
                 "--pending-receipt-timeout-ms",
-                &park.as_millis().to_string(),
+                &park.as_duration().as_millis().to_string(),
             ])
             // A representative slice: one nonce case and the consistency case.
             // The cluster shard runs the full set. This just proves the

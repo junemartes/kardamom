@@ -4,18 +4,17 @@
 //! see either per tx, which is why the capture lives in
 //! `Executor::execute_tx` itself.
 
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, TxKind, U256, address, keccak256};
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::{Address, B256, U256, address, keccak256};
 use kardamom_exec_core::block_env::ExecEnv;
-use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::executor::{Executor, TouchSet};
 use kardamom_exec_core::state::MockStateDatabase;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_test_support::{LegacyTx, anvil_signer_0};
+use kardamom_types::TxEnvelope;
 
-const CHAIN_ID: u64 = 412346;
+mod common;
+use common::slot;
+
+const CHAIN_ID: u64 = 412_346;
 /// PUSH1 0, SLOAD, STOP. Reads slot 0, writes nothing.
 const READER: Address = address!("00000000000000000000000000000000000000AA");
 const READER_CODE: [u8; 4] = [0x60, 0x00, 0x54, 0x00];
@@ -33,34 +32,16 @@ fn bal_reader_code() -> Vec<u8> {
     code
 }
 
-fn signer() -> PrivateKeySigner {
-    // Anvil dev key #0. Public, for development only.
-    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        .parse()
-        .unwrap()
-}
-
 fn call(nonce: u64, to: Address) -> TxEnvelope {
-    let s = signer();
-    let mut tx = TxLegacy {
-        chain_id: Some(CHAIN_ID),
+    LegacyTx {
+        chain_id: CHAIN_ID,
+        to,
         nonce,
-        gas_price: 1_000_000_000,
         gas_limit: 100_000,
-        to: TxKind::Call(to),
-        value: U256::ZERO,
-        input: Default::default(),
-    };
-    let sig = s.sign_transaction_sync(&mut tx).unwrap();
-    let env = alloy_consensus::TxEnvelope::Legacy(tx.into_signed(sig));
-    let mut raw = Vec::new();
-    env.encode_2718(&mut raw);
-    TxEnvelope {
-        correlation_id: 0,
-        raw_tx: bytes::Bytes::from(raw),
-        sender: s.address(),
-        tx_hash: *env.tx_hash(),
+        gas_price: 1_000_000_000,
+        ..Default::default()
     }
+    .sign(&anvil_signer_0())
 }
 
 fn db() -> MockStateDatabase {
@@ -69,7 +50,7 @@ fn db() -> MockStateDatabase {
     let bal_reader_hash = keccak256(bal_reader_code());
     MockStateDatabase::builder()
         .account(
-            signer().address(),
+            anvil_signer_0().address(),
             U256::from(1000u64) * U256::from(10u64).pow(U256::from(18)),
             0,
             B256::ZERO,
@@ -100,15 +81,7 @@ fn sload_only_call_lands_in_reads() {
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, READER),
-            0,
-            0,
-            None,
-            Some(&mut touches),
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, READER), None, Some(&mut touches))
         .unwrap();
     assert!(receipt.status, "setup: call must succeed");
     assert!(
@@ -119,7 +92,7 @@ fn sload_only_call_lands_in_reads() {
     // target is not a pure account read. See the TouchSet doc.
     assert!(!touches.account_reads.contains(&READER));
     // The sender is written (nonce and gas), never a pure read.
-    assert!(!touches.account_reads.contains(&signer().address()));
+    assert!(!touches.account_reads.contains(&anvil_signer_0().address()));
 }
 
 #[test]
@@ -129,11 +102,8 @@ fn balance_subject_lands_in_account_reads() {
     let mut touches = TouchSet::default();
     let (receipt, _ws) = scope
         .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
+            slot(0, 0, 0, 0),
             &call(0, BAL_READER),
-            0,
-            0,
             None,
             Some(&mut touches),
         )
@@ -151,15 +121,7 @@ fn sstore_call_is_a_write_not_a_read() {
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let mut touches = TouchSet::default();
     let (receipt, ws) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, WRITER),
-            0,
-            0,
-            None,
-            Some(&mut touches),
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, WRITER), None, Some(&mut touches))
         .unwrap();
     assert!(receipt.status, "setup: call must succeed");
     assert!(
@@ -185,15 +147,7 @@ fn touches_none_is_a_no_op() {
     let db = db();
     let mut scope = Executor::new(&db, None, env()).unwrap();
     let (receipt, _) = scope
-        .execute_tx(
-            TxIndex(0),
-            BPosition::from_index(0),
-            &call(0, READER),
-            0,
-            0,
-            None,
-            None,
-        )
+        .execute_tx(slot(0, 0, 0, 0), &call(0, READER), None, None)
         .unwrap();
     assert!(receipt.status);
 }

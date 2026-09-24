@@ -2,9 +2,9 @@
 //! `kardamom_subscribeOutbox` / `kardamom_subscribeAttestations` and what a
 //! destination's watcher consumes.
 //!
-//! Shared by BOTH sides on purpose (`docs/specs/egress-node-spec.md` v2):
-//! `kardamom-validator` implements the server traits (the serving surfaces of
-//! the E1 config role), and `kardamom-da-watcher` speaks them as a client
+//! Both the validator and the watcher use these DTOs:
+//! `kardamom-validator` implements the server traits, and `kardamom-da-watcher`
+//! speaks them as a client
 //! (`WsRemoteChainSource`) and re-serves them from its protocol-faithful mock
 //! (`interop::mock::MockInteropFeed`). One copy of the DTOs, or the two
 //! processes drift apart in exactly the place a version skew is invisible.
@@ -21,14 +21,10 @@
 //! The conversion is the only place that difference is adjudicated
 //! ([`OutboxMessageDto::into_outbox_message`]).
 //!
-//! ## v1 runs in FEED-TRUST mode
+//! ## The wire carries no finality tier
 //!
-//! Spec §5 stamps every item with a finality tier (`Quorum`/`Anchored`) and
-//! carries an `AnchorProof`; §10 makes the L1-anchored tier mandatory before a
-//! message executes (and unconditional once value rides along). Neither is on
-//! this wire yet: a v1 destination believes its configured feed, which is the
-//! spec's T0 tier — development and test only. Anchoring events are a later
-//! slice and will arrive as ADDITIONAL [`OutboxEventDto`] variants plus
+//! A destination trusts its configured feed outright: development and test
+//! only. Anchoring will arrive as ADDITIONAL [`OutboxEventDto`] variants plus
 //! optional fields, so a `Message` decoded today still decodes then.
 //!
 //! ## Numbers on the wire
@@ -79,6 +75,7 @@ pub struct OutboxCursor {
 }
 
 impl OutboxCursor {
+    #[must_use]
     pub fn new(seq: u64) -> Self {
         Self { seq }
     }
@@ -94,6 +91,26 @@ pub struct CallbackDto {
     pub gas_limit: u64,
     /// Opaque correlation value, echoed back verbatim.
     pub context: B256,
+}
+
+impl From<Callback> for CallbackDto {
+    fn from(cb: Callback) -> Self {
+        Self {
+            target: cb.target,
+            gas_limit: cb.gas_limit,
+            context: cb.context,
+        }
+    }
+}
+
+impl From<CallbackDto> for Callback {
+    fn from(cb: CallbackDto) -> Self {
+        Self {
+            target: cb.target,
+            gas_limit: cb.gas_limit,
+            context: cb.context,
+        }
+    }
 }
 
 /// One outbox message as served by the origin's feed.
@@ -170,6 +187,36 @@ pub enum OutboxEventDto {
     Head { block_number: u64 },
 }
 
+/// A resolved lane floor, from one `OutboxEventDto::Lagged` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lag {
+    /// First seq the server serves.
+    pub floor: u64,
+    /// First origin block the server serves, when the server sent it.
+    pub floor_block: Option<u64>,
+}
+
+impl Lag {
+    /// Resolve the floor from a `Lagged` frame's raw fields, so every
+    /// consumer of [`OutboxEventDto::Lagged`] shares one fallback.
+    ///
+    /// Prefers `floor_seq`. An older server omits it; `from + skipped` is
+    /// the only floor consistent with that server's own `skipped` count,
+    /// since `from` is the cursor the subscriber asked to resume from.
+    #[must_use]
+    pub fn resolve(
+        from: u64,
+        skipped: u64,
+        floor_seq: Option<u64>,
+        floor_block: Option<u64>,
+    ) -> Self {
+        Self {
+            floor: floor_seq.unwrap_or(from.saturating_add(skipped)),
+            floor_block,
+        }
+    }
+}
+
 /// Why a feed item could not be turned into an [`OutboxMessage`].
 ///
 /// Every variant means the peer is running something this build does not
@@ -204,16 +251,18 @@ impl OutboxMessageDto {
             gas_limit: m.gas_limit,
             hops: m.hops,
             data: m.data.clone(),
-            callback: m.callback.map(|cb| CallbackDto {
-                target: cb.target,
-                gas_limit: cb.gas_limit,
-                context: cb.context,
-            }),
+            callback: m.callback.map(CallbackDto::from),
         }
     }
 
     /// Decode into the protocol type, checking the item against the origin the
     /// subscriber believes it is talking to.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FeedDecodeError::ForeignOrigin` if the item's
+    /// `origin_chain_id` does not match `expected_origin`, or
+    /// `FeedDecodeError::ValueTooLarge` if `value` exceeds `u128`.
     pub fn into_outbox_message(
         self,
         expected_origin: u64,
@@ -240,21 +289,14 @@ impl OutboxMessageDto {
             gas_limit: self.gas_limit,
             hops: self.hops,
             data: self.data,
-            callback: self
-                .callback
-                .map(|cb| Callback {
-                    target: cb.target,
-                    gas_limit: cb.gas_limit,
-                    context: cb.context,
-                })
-                .filter(|cb| !cb.is_zero()),
+            callback: self.callback.map(Callback::from).filter(|cb| !cb.is_zero()),
         })
     }
 }
 
 /// The origin-side feed surface (spec §5). Defined here, next to the DTOs,
 /// because it IS the contract: `kardamom-validator` implements this trait
-/// (the E1 serving surface), and `kardamom-da-watcher`'s mock implements it
+/// (the live serving implementation), and `kardamom-da-watcher`'s mock implements it
 /// so the destination side stays testable against a real server without a
 /// full origin stack.
 #[rpc(server, namespace = "kardamom")]
@@ -284,6 +326,7 @@ pub struct AttestationCursor {
 }
 
 impl AttestationCursor {
+    #[must_use]
     pub fn new(block_number: u64) -> Self {
         Self { block_number }
     }
@@ -292,14 +335,10 @@ impl AttestationCursor {
 /// One attestation: this validator's statement "I executed through
 /// `block_number` and got `state_root`".
 ///
-/// **E1 serves this UNSIGNED**: `signature` is absent until E2 lands
-/// per-validator attestation keys (interop P2 — one key per public validator,
-/// each attestation one quorum vote). The field is already on the wire as an
-/// optional so E2 is an additive change: a consumer built today keeps
-/// decoding, and a consumer that REQUIRES signatures treats `None` as an
-/// unusable attestation rather than a decode error. `validator_id` names the
-/// serving instance (operator-assigned; with E2 it becomes the key identity
-/// registered in the peer registry).
+/// `signature` is optional. A consumer that needs one treats `None` as an
+/// unusable attestation rather than a decode error, so adding signing later
+/// stays an additive wire change. `validator_id` names the serving instance
+/// (operator-assigned).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttestationDto {
@@ -313,14 +352,13 @@ pub struct AttestationDto {
     pub state_root: B256,
     /// The serving validator's identity.
     pub validator_id: String,
-    /// Signature over `(chain_id, block_number, state_root)` — absent until
-    /// E2 adds attestation keys.
+    /// Signature over `(chain_id, block_number, state_root)` — absent
+    /// until attestation signing keys exist.
     ///
     /// An attestation with `signature: None` carries NO authority. It is a
     /// plain statement from a socket, and anyone who can reach that socket
-    /// can produce one. A consumer must treat an unsigned attestation as
-    /// unusable for quorum, cross-check, or any other trust decision until
-    /// E2 lands. See `docs/specs/egress-node-spec.md`, section 5.
+    /// can produce one. A consumer treats an unsigned attestation as
+    /// unusable for quorum, cross-check, or any other trust decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Bytes>,
 }
@@ -339,8 +377,8 @@ pub enum AttestationEventDto {
     },
 }
 
-/// The attestation stream surface (spec §5). Served by every public
-/// validator; consumed by peer chains' quorum checks (E2) and monitoring.
+/// The attestation stream surface. Served by every public validator;
+/// consumed by peer chains' quorum checks and monitoring.
 #[rpc(server, namespace = "kardamom")]
 pub trait AttestationFeedApi {
     /// Stream this validator's per-block attestations, resuming at `cursor`.
@@ -371,6 +409,28 @@ mod tests {
                 context: B256::repeat_byte(0x1D),
             }),
         }
+    }
+
+    #[test]
+    fn lag_prefers_floor_seq_when_present() {
+        assert_eq!(
+            Lag::resolve(10, 5, Some(12), Some(40)),
+            Lag {
+                floor: 12,
+                floor_block: Some(40)
+            }
+        );
+    }
+
+    #[test]
+    fn lag_falls_back_to_from_plus_skipped_for_an_older_server() {
+        assert_eq!(
+            Lag::resolve(10, 5, None, None),
+            Lag {
+                floor: 15,
+                floor_block: None
+            }
+        );
     }
 
     #[test]
@@ -446,28 +506,6 @@ mod tests {
         assert_eq!(back, OutboxEventDto::Head { block_number: 77 });
     }
 
-    /// An all-zero callback on the wire is "none" (audit M5): both commit to
-    /// the zero hash, and the protocol type must not carry `Some(zero)`.
-    #[test]
-    fn zero_callback_decodes_as_none() {
-        let mut dto = OutboxMessageDto::from_outbox_message(5, &sample());
-        dto.callback = Some(CallbackDto {
-            target: Address::ZERO,
-            gas_limit: 0,
-            context: B256::ZERO,
-        });
-        assert_eq!(dto.into_outbox_message(5).unwrap().callback, None);
-    }
-
-    /// `hops` is required: an item without it is a protocol mismatch.
-    #[test]
-    fn a_message_without_hops_is_rejected() {
-        let dto = OutboxMessageDto::from_outbox_message(5, &sample());
-        let mut v = serde_json::to_value(&dto).unwrap();
-        v.as_object_mut().unwrap().remove("hops");
-        assert!(serde_json::from_value::<OutboxMessageDto>(v).is_err());
-    }
-
     #[test]
     fn cursor_is_an_object_so_anchoring_can_extend_it() {
         let v = serde_json::to_value(OutboxCursor::new(9)).unwrap();
@@ -496,6 +534,28 @@ mod tests {
         ));
     }
 
+    /// An all-zero callback on the wire is "none" (audit M5): both commit to
+    /// the zero hash, and the protocol type must not carry `Some(zero)`.
+    #[test]
+    fn zero_callback_decodes_as_none() {
+        let mut dto = OutboxMessageDto::from_outbox_message(5, &sample());
+        dto.callback = Some(CallbackDto {
+            target: Address::ZERO,
+            gas_limit: 0,
+            context: B256::ZERO,
+        });
+        assert_eq!(dto.into_outbox_message(5).unwrap().callback, None);
+    }
+
+    /// `hops` is required: an item without it is a protocol mismatch.
+    #[test]
+    fn a_message_without_hops_is_rejected() {
+        let dto = OutboxMessageDto::from_outbox_message(5, &sample());
+        let mut v = serde_json::to_value(&dto).unwrap();
+        v.as_object_mut().unwrap().remove("hops");
+        assert!(serde_json::from_value::<OutboxMessageDto>(v).is_err());
+    }
+
     /// A foreign destination must survive decoding so `derive_remote_epoch`
     /// can fail-stop on it; dropping it here would silently repair a fault.
     #[test]
@@ -506,9 +566,9 @@ mod tests {
         assert_eq!(dto.into_outbox_message(5).unwrap().dest_chain_id, 999);
     }
 
-    /// The attestation wire shape, pinned like the outbox frames. UNSIGNED in
-    /// E1: `signature` must be OMITTED when `None`, not serialized as null —
-    /// E2 adds it as a plain additive field.
+    /// The attestation wire shape, pinned like the outbox frames. Unsigned
+    /// today: `signature` must be OMITTED when `None`, not serialized as null,
+    /// so adding it later stays a plain additive field.
     #[test]
     fn attestation_wire_shape_is_pinned() {
         let dto = AttestationEventDto::Attestation(Box::new(AttestationDto {
@@ -525,7 +585,7 @@ mod tests {
         assert_eq!(v["validatorId"], "egress-1");
         assert!(
             v.as_object().unwrap().get("signature").is_none(),
-            "unsigned E1 attestations omit the field entirely"
+            "an unsigned attestation omits the field entirely"
         );
         let back: AttestationEventDto = serde_json::from_value(v).unwrap();
         assert_eq!(dto, back);

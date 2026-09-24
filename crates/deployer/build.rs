@@ -8,10 +8,14 @@
 //! Forge is the source of truth for contract compilation. This script only
 //! runs forge and embeds the result. It needs `forge` on the PATH.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
+
+#[path = "build_support/sol_watch.rs"]
+mod sol_watch;
 
 /// Solidity dependencies under `contracts/lib/`. `(dir_name, forge_install_spec)`.
 const LIB_DEPS: &[(&str, &str)] = &[
@@ -48,21 +52,7 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
-    // Add a rerun trigger for each .sol file, found recursively. This makes a
-    // new contract under contracts/src/<subdir>/ invalidate the cached build.
-    // Cargo's rerun-if-changed on a directory tracks only direct children,
-    // not subdirectories.
-    for entry in walk_sol_files(&contracts_root.join("src")) {
-        println!("cargo:rerun-if-changed={}", entry.display());
-    }
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("foundry.toml").display()
-    );
+    sol_watch::emit_sol_rerun_triggers(&contracts_root);
     println!(
         "cargo:rerun-if-changed={}",
         contracts_root.join("remappings.txt").display()
@@ -121,7 +111,9 @@ fn forge_build(contracts_root: &Path) -> Result<()> {
 }
 
 fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("OUT_DIR not set (cargo always sets it for build scripts)"))?;
     let out_file = out_dir.join("embedded_artifacts.rs");
 
     let mut body = String::new();
@@ -131,9 +123,15 @@ fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
             .join(format!("{contract_name}.sol"))
             .join(format!("{contract_name}.json"));
         let bin_path = write_creation_bin(&artifact_path, &out_dir, contract_name)?;
-        body.push_str(&format!(
-            "pub const {const_name}: &[u8] = include_bytes!({bin_path:?});\n"
-        ));
+        #[allow(
+            clippy::unnecessary_debug_formatting,
+            reason = "needs a quoted, escaped Rust string literal for include_bytes!, not a \
+                      plain path string from .display()"
+        )]
+        let _ = writeln!(
+            body,
+            "pub const {const_name}: &[u8] = include_bytes!({bin_path:?});"
+        );
     }
     std::fs::write(&out_file, body).with_context(|| format!("write {}", out_file.display()))?;
     Ok(())
@@ -167,13 +165,10 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return Err(anyhow!("odd-length hex string"));
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in s.as_bytes().chunks(2) {
-        let hi = hex_nibble(pair[0])?;
-        let lo = hex_nibble(pair[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| Ok((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
+        .collect::<Result<Vec<u8>>>()
 }
 
 fn hex_nibble(c: u8) -> Result<u8> {
@@ -182,29 +177,5 @@ fn hex_nibble(c: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         _ => Err(anyhow!("invalid hex char: {}", c as char)),
-    }
-}
-
-/// Return every `*.sol` file under `dir`, found recursively. This fills the
-/// `cargo:rerun-if-changed=...` list, so the build reruns when a contract is
-/// added or removed anywhere in the tree.
-fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk_sol_files_into(dir, &mut out);
-    out
-}
-
-fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_sol_files_into(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("sol") {
-            out.push(path);
-        }
     }
 }

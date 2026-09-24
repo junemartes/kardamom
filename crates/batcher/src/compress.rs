@@ -6,10 +6,14 @@ use crate::error::BatcherError;
 /// for tx-stream data.
 pub const DEFAULT_LEVEL: i32 = 9;
 
+/// # Errors
+/// Returns an error when zstd encoding fails.
 pub fn encode_zstd(input: &[u8], level: i32) -> Result<Vec<u8>, BatcherError> {
     zstd::stream::encode_all(input, level).map_err(|e| BatcherError::Compress(e.to_string()))
 }
 
+/// # Errors
+/// Returns an error when `input` is not valid zstd data.
 pub fn decode_zstd(input: &[u8]) -> Result<Vec<u8>, BatcherError> {
     zstd::stream::decode_all(input).map_err(|e| BatcherError::Compress(e.to_string()))
 }

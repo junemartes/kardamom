@@ -15,11 +15,7 @@ fn pre_n_snapshot_keeps_pre_n_view() {
     let _ = writer.snapshot_rx.recv();
 
     // Apply block 1. simple_delta stores `balance` literally (no offset).
-    writer
-        .delta_tx
-        .send(common::simple_delta(1, addr, 100, 7, 999))
-        .unwrap();
-    let snap_at_1 = writer.snapshot_rx.recv().unwrap();
+    let snap_at_1 = common::commit_block(&writer, 1, addr, 100, 7, 999);
     let (_, bal1, _) = snap_at_1.basic(addr).unwrap().unwrap();
     assert_eq!(bal1, U256::from(100u64));
     assert_eq!(
@@ -28,11 +24,7 @@ fn pre_n_snapshot_keeps_pre_n_view() {
     );
 
     // Apply block 2. This overwrites the slot.
-    writer
-        .delta_tx
-        .send(common::simple_delta(2, addr, 200, 7, 12345))
-        .unwrap();
-    let snap_at_2 = writer.snapshot_rx.recv().unwrap();
+    let snap_at_2 = common::commit_block(&writer, 2, addr, 200, 7, 12345);
 
     // The old snapshot must still see the old values.
     assert_eq!(

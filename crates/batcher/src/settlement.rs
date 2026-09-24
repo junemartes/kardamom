@@ -21,12 +21,10 @@ sol!(
 );
 
 /// Compute the versioned hash from the KZG commitment, for each blob. Used
-/// to assemble the contract calldata. Computing the KZG commitment from a
-/// blob needs the trusted setup. In v0, this function accepts either a
-/// precomputed commitment (passed in) or, for tests, a deterministic stub.
-/// The real broadcast path (a future task) uses
-/// `alloy-consensus::BlobTransactionSidecar`, which carries its own
-/// commitments.
+/// to assemble the contract calldata. This function accepts a precomputed
+/// commitment for each blob, so callers that already have one (or a
+/// deterministic test stub) need not recompute it from the trusted setup.
+#[must_use]
 pub fn versioned_hashes_from_commitments(commitments: &[[u8; 48]]) -> Vec<B256> {
     commitments
         .iter()
@@ -34,10 +32,8 @@ pub fn versioned_hashes_from_commitments(commitments: &[[u8; 48]]) -> Vec<B256> 
         .collect()
 }
 
-/// A placeholder that assembles the parameters `postBatch(...)` expects.
-/// The actual transaction broadcast (with sidecar) is a future task. This
-/// helper only packages the fields together, so the CLI and tests can
-/// inspect what would be sent.
+/// Assembles and validates the parameters `postBatch(...)` expects, so the
+/// CLI and tests can inspect what would be sent.
 #[derive(Clone, Debug)]
 pub struct PostBatchParams {
     pub settlement: Address,
@@ -50,6 +46,9 @@ pub struct PostBatchParams {
 }
 
 impl PostBatchParams {
+    /// # Errors
+    /// Returns an error when `blobs` and `versioned_hashes` have different
+    /// lengths, `blobs` is empty, or `l2_block_end < l2_block_start`.
     pub fn new(
         settlement: Address,
         prev_batch_index: u64,

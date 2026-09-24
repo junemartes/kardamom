@@ -39,6 +39,7 @@ impl ContractId {
     ];
 
     /// Canonical label hashed into the registry key.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "kardamom.l1.ETHLockbox",
@@ -49,6 +50,7 @@ impl ContractId {
     }
 
     /// Solidity signature of the impl's `initialize` method.
+    #[must_use]
     pub fn init_signature(self) -> &'static str {
         match self {
             // ETHLockbox.initialize(address _l2Minter, address _outputOracle)
@@ -67,6 +69,7 @@ impl ContractId {
     }
 
     /// Registry id: `keccak256(label)`.
+    #[must_use]
     pub fn id(self) -> B256 {
         keccak256(self.label().as_bytes())
     }
@@ -82,6 +85,7 @@ impl ContractId {
     /// semantics. A plain `abi_encode` of the tuple would add a leading
     /// offset, because the tuple has a dynamic member (the string). That
     /// would not match Solidity.
+    #[must_use]
     pub fn proxy_salt(self, l2_chain_id: u64) -> B256 {
         let encoded = (U256::from(l2_chain_id), self.id(), "proxy".to_string()).abi_encode_params();
         keccak256(encoded)
@@ -89,12 +93,14 @@ impl ContractId {
 
     /// Impl salt. It does not include `l2_chain_id`; the impl is shared
     /// across L2s. Computed as `keccak256(abi.encode(id, "impl", version))`.
+    #[must_use]
     pub fn impl_salt(self, version: u64) -> B256 {
         let encoded = (self.id(), "impl".to_string(), version).abi_encode();
         keccak256(encoded)
     }
 
     /// 4-byte selector of the init signature.
+    #[must_use]
     pub fn init_selector(self) -> [u8; 4] {
         let h = keccak256(self.init_signature().as_bytes());
         [h[0], h[1], h[2], h[3]]
@@ -103,6 +109,7 @@ impl ContractId {
     /// Creation bytecode for this contract, embedded at build time. The
     /// `every_contract_id_has_nonempty_creation_bytecode` test catches a new
     /// variant that is not wired through `build.rs`.
+    #[must_use]
     pub fn creation_bytecode(self) -> Bytes {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),

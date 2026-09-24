@@ -37,16 +37,17 @@ impl BPosition {
     ///
     /// This is not an Aeron byte position. It is the publisher-independent
     /// block-boundary alignment key carried by `BlockBoundaryStart.end_tx_idx`.
-    /// The key is the total count of canonical tx_ordering records (TxRef and
-    /// DepositRef) the sealer has republished through the end of a block. The
+    /// The key is the total count of canonical `tx_ordering` records (`TxRef` and
+    /// `DepositRef`) the sealer has republished through the end of a block. The
     /// executor compares it against its own processed-record count. Encoding
     /// it in `BPosition`, instead of adding a wire field, keeps the
-    /// tx_ordering and tx_receipts message formats unchanged. `from_index(0)`
+    /// `tx_ordering` and `tx_receipts` message formats unchanged. `from_index(0)`
     /// equals `ZERO`, so existing zero-initializers still mean "no records
     /// yet". Aeron byte positions are fragile across a multi-publisher merge,
     /// because each publisher has its own term space, and across
     /// offer-return versus frame-start frames. This is why alignment uses
     /// this logical count instead.
+    #[must_use]
     pub const fn from_index(idx: u64) -> Self {
         Self {
             term_id: (idx >> 32) as i32,
@@ -55,17 +56,22 @@ impl BPosition {
     }
 
     /// Decode the logical index encoded by [`Self::from_index`].
+    #[must_use]
     pub const fn as_index(self) -> u64 {
-        ((self.term_id as u32 as u64) << 32) | (self.term_offset as u32 as u64)
+        // The two i32 halves are bit patterns, not signed magnitudes: this
+        // reverses `from_index`'s split of one u64 into two 32-bit words.
+        // `u64::from` is not yet usable in a const fn, so widen with `as`;
+        // u32 to u64 cannot lose a value.
+        ((self.term_id.cast_unsigned() as u64) << 32) | (self.term_offset.cast_unsigned() as u64)
     }
 }
 
-/// Location of a `TxEnvelope` fragment on a tx_data stream: the Aeron
+/// Location of a `TxEnvelope` fragment on a `tx_data` stream: the Aeron
 /// publisher `session_id` plus the fragment-start [`BPosition`].
 ///
 /// The session id tells apart concurrent ingress publishers on one shard.
 /// Aeron positions are per session, so two active ingresses that publish to
-/// the same tx_data stream can produce the same `(term_id, term_offset)`.
+/// the same `tx_data` stream can produce the same `(term_id, term_offset)`.
 /// Pairing the position with `session_id` makes the executor's join key
 /// `(shard_id, session_id, position)` unique. This is an in-process locator,
 /// from the log to the sequencer or executor. Only `session_id` crosses the
@@ -78,6 +84,7 @@ pub struct TxDataLoc {
 }
 
 impl TxDataLoc {
+    #[must_use]
     pub const fn new(session_id: i32, position: BPosition) -> Self {
         Self {
             session_id,
@@ -97,8 +104,8 @@ mod tests {
             1,
             41,
             1_000_000,
-            u32::MAX as u64,
-            (u32::MAX as u64) + 1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
             u64::MAX,
         ] {
             assert_eq!(BPosition::from_index(idx).as_index(), idx, "idx={idx}");

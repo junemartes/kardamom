@@ -1,0 +1,157 @@
+# The container substrate of the local profile: one privileged systemd and
+# Docker-in-Docker container per node of the node-class model. The model
+# lives in ansible/group_vars/all.yml. This root reads it and materialises
+# the nodes. ansible/containers.yml reads the node contract output and
+# provisions the nodes with bootstrap.yml.
+#
+# The Docker network assigns every address; the model declares none. The
+# contract carries the assigned addresses for the provisioning run, and
+# every later lookup goes through Consul. A change of the node image
+# replaces every container and its root filesystem. Use `tofu destroy` and
+# `tofu apply` for a fresh chain.
+
+locals {
+  contract_path = startswith(var.contract_file, "/") ? var.contract_file : "${path.module}/${var.contract_file}"
+  docker_path   = startswith(var.docker_dir, "/") ? var.docker_dir : "${path.module}/${var.docker_dir}"
+  contract      = yamldecode(file(local.contract_path))
+  node_classes  = local.contract.node_classes
+
+  # <class>-<i>, the instance model of the contract.
+  nodes = merge([
+    for class, spec in local.node_classes : {
+      for i in range(spec.count) : "${class}-${i}" => {
+        name          = "${class}-${i}"
+        container     = "kardamom-${class}-${i}"
+        role          = class
+        tier          = spec.tier
+        index         = i
+        control_plane = class == "control"
+      }
+    }
+  ]...)
+
+  # The address plan: node names in sorted order, from address_offset up.
+  # A node keeps its address across a container restart, which the
+  # cluster members and every cached name resolution depend on. This
+  # root is the one place that assigns addresses; everything else reads
+  # the node contract or resolves a name.
+  names = sort(keys(local.nodes))
+  # A node's replacement generation moves its address past every
+  # generation-0 address, and renames its volumes.
+  generation = { for name in local.names : name => lookup(var.node_generation, name, 0) }
+  address    = { for name in local.names : name => cidrhost(var.subnet, var.address_offset + index(local.names, name) + local.generation[name] * length(local.names)) }
+
+  volumes = toset(["docker", "containerd"])
+  ready   = "s=$(systemctl is-system-running); [ \"$s\" = running ] || [ \"$s\" = degraded ]"
+}
+
+resource "docker_network" "this" {
+  name   = var.network_name
+  driver = "bridge"
+
+  options = {
+    "com.docker.network.bridge.name" = var.bridge_name
+  }
+
+  # The provider reads the gateway back into the set, so declare it with
+  # the subnet.
+  ipam_config {
+    subnet  = var.subnet
+    gateway = cidrhost(var.subnet, 1)
+  }
+
+  labels {
+    label = var.label
+    value = var.network_name
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(local.nodes) > 0
+      error_message = "The node-class model declares no node."
+    }
+  }
+}
+
+resource "docker_image" "node" {
+  name         = var.image_name
+  keep_locally = true
+
+  build {
+    context    = local.docker_path
+    dockerfile = "node.Dockerfile"
+    tag        = [var.image_name]
+  }
+
+  triggers = {
+    dockerfile = filesha256("${local.docker_path}/node.Dockerfile")
+  }
+}
+
+resource "docker_volume" "node" {
+  for_each = { for pair in setproduct(keys(local.nodes), local.volumes) : "${pair[0]}-${pair[1]}" => pair }
+
+  # A generation above 0 names a fresh volume, so a replaced node starts
+  # with empty disks.
+  name = local.generation[each.value[0]] == 0 ? "kardamom-${each.key}" : "kardamom-${each.key}-g${local.generation[each.value[0]]}"
+
+  labels {
+    label = var.label
+    value = var.network_name
+  }
+}
+
+resource "docker_container" "node" {
+  for_each = local.nodes
+
+  name     = each.value.container
+  hostname = each.value.name
+  image    = docker_image.node.image_id
+
+  # systemd and the inner dockerd need a privileged container on the host
+  # cgroup namespace with a writable cgroup tree and tmpfs run directories.
+  privileged    = true
+  cgroupns_mode = "host"
+  shm_size      = 512
+  tmpfs = {
+    "/run"      = ""
+    "/run/lock" = ""
+  }
+
+  volumes {
+    host_path      = "/sys/fs/cgroup"
+    container_path = "/sys/fs/cgroup"
+  }
+
+  volumes {
+    volume_name    = docker_volume.node["${each.key}-docker"].name
+    container_path = "/var/lib/docker"
+  }
+
+  volumes {
+    volume_name    = docker_volume.node["${each.key}-containerd"].name
+    container_path = "/var/lib/containerd"
+  }
+
+  networks_advanced {
+    name         = docker_network.this.name
+    ipv4_address = local.address[each.key]
+  }
+
+  labels {
+    label = var.label
+    value = var.network_name
+  }
+
+  # Apply returns when systemd inside the node is ready for Ansible.
+  healthcheck {
+    test         = ["CMD-SHELL", local.ready]
+    interval     = "2s" # Docker reports durations in its own form; keep the values in that form.
+    timeout      = "5s"
+    retries      = 3
+    start_period = "1m0s"
+  }
+
+  wait         = true
+  wait_timeout = var.ready_timeout
+}

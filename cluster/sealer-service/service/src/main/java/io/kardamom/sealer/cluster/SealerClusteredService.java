@@ -11,6 +11,7 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.RemoteOriginAdvance;
+import io.kardamom.sealer.VoidLedger;
 import java.nio.ByteOrder;
 import java.util.Optional;
 import java.util.Set;
@@ -67,6 +68,15 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private long lastBoundaryClockMs = 0L;
 
+    /**
+     * Boundary ticks this process applied, for the stdout heartbeat only.
+     * It is not part of the replicated state and is never snapshotted.
+     */
+    private long boundaryTicks = 0L;
+
+    /** One heartbeat line per this many boundary ticks (a minute at a 2 s tick). */
+    private static final long BOUNDARY_TICK_LOG_EVERY = 30L;
+
     /** Contiguity rejects emitted (logged at power-of-two counts). */
     private long rejectedFrameCount = 0;
 
@@ -75,15 +85,28 @@ public final class SealerClusteredService implements ClusteredService {
 
     // Scratch buffers for ingress id and sender extraction. Reuse them to
     // avoid a per-message allocation on the single cluster service thread.
+    private final VoidLedger.Config voidConfig;
+
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
 
     public SealerClusteredService(
-            int dedupCapacity, long tickIntervalMs, int memberId, Set<Long> remoteOrigins) {
+            int dedupCapacity,
+            long tickIntervalMs,
+            int memberId,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig) {
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
         this.memberId = memberId;
         this.remoteOrigins = Set.copyOf(remoteOrigins);
+        this.voidConfig = voidConfig;
+    }
+
+    /** A service that refuses every void request (no configured voters). */
+    public SealerClusteredService(
+            int dedupCapacity, long tickIntervalMs, int memberId, Set<Long> remoteOrigins) {
+        this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, VoidLedger.Config.DISABLED);
     }
 
     /** A service with interop disabled (an empty remote-origin allowlist). */
@@ -108,7 +131,7 @@ public final class SealerClusteredService implements ClusteredService {
             // would diverge from the rest of the cluster, which assumes the
             // snapshotted state (and the log replayed after it) is correct.
             final byte[] snapshot = SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy());
-            this.state = CanonicalSealerState.load(snapshot, dedupCapacity, remoteOrigins);
+            this.state = CanonicalSealerState.load(snapshot, dedupCapacity, remoteOrigins, voidConfig);
             // The retained deque is not snapshotted (v1). Nothing before the
             // restore point can ever be served, so the retention floors start
             // at the first frame this member can retain: record index
@@ -125,7 +148,7 @@ public final class SealerClusteredService implements ClusteredService {
                 + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
         } else {
             this.state = new CanonicalSealerState(
-                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins);
+                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -158,10 +181,26 @@ public final class SealerClusteredService implements ClusteredService {
         // Re-arming with the same correlation id is idempotent: Aeron replaces
         // the pending timer instead of scheduling a second one.
         scheduleBoundaryTimer();
+        // Log-driven, so every member prints it, also on replay. With the
+        // role lines it gives the order of the elections: which member led
+        // which term, and where in the log the term began.
+        System.out.println("cluster TERM memberId=" + memberId
+            + " leadershipTermId=" + leadershipTermId
+            + " leaderMemberId=" + leaderMemberId
+            + " logPosition=" + logPosition
+            + " role=" + cluster.role()
+            + " block=" + state.blockNumber());
     }
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
+        // Log every open and close. A client whose session the cluster
+        // closed without its knowledge offers into nothing, and these lines
+        // are the only record of when and why the cluster dropped it. Both
+        // callbacks are log-driven, so every member prints them, also on
+        // replay.
+        System.out.println("cluster SESSION open memberId=" + memberId
+            + " session=" + session.id());
         // Nothing session-specific to track: canonical state is global. But a
         // session opening is a log-driven moment where timer scheduling is
         // allowed, so use it to revive a dead boundary clock (see helper).
@@ -170,6 +209,8 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
+        System.out.println("cluster SESSION close memberId=" + memberId
+            + " session=" + session.id() + " reason=" + closeReason);
         egress.removeConsumer(session.id());
     }
 
@@ -211,6 +252,9 @@ public final class SealerClusteredService implements ClusteredService {
                 maybeReviveBoundaryClock();
                 return;
             }
+            case SealerWire.KIND_VOID_REQUEST:
+                onVoidRequest(buffer, offset, length);
+                return;
             case SealerWire.KIND_ORIGIN_RECORD:
                 onOriginRecord(buffer, offset, length);
                 maybeReviveBoundaryClock();
@@ -448,6 +492,32 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
+     * Count one consumer's vote to remove an entry that it cannot execute.
+     * The state decides. This method only relays the void record and logs
+     * each change of the count, so the failure dump shows which voter the
+     * void waits for. A repeated vote prints nothing: consumers send the
+     * vote again at an interval.
+     */
+    private void onVoidRequest(final DirectBuffer buffer, final int offset, final int length) {
+        if (length < SealerWire.MIN_VOID_REQUEST_LEN) {
+            onMalformedFrame("void-request", length);
+            return;
+        }
+        final int voterId = buffer.getByte(offset + SealerWire.VOID_VOTER_OFFSET) & 0xFF;
+        final long index = buffer.getLong(offset + SealerWire.VOID_INDEX_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        buffer.getBytes(offset + SealerWire.VOID_HASH_OFFSET, canonicalIdScratch);
+        final CanonicalSealerState.VoidOutcome outcome =
+            state.onVoidRequest(voterId, index, canonicalIdScratch);
+        if (outcome.vote == VoidLedger.Vote.REPEATED) {
+            return;
+        }
+        System.out.println("cluster VOID-VOTE memberId=" + memberId
+            + " voter=" + voterId + " index=" + index + " result=" + outcome.vote
+            + " votes=" + state.voids().votesFor(index) + "/" + state.voids().voterCount());
+        outcome.relayed.ifPresent(egress::offerRelayed);
+    }
+
+    /**
      * Answer a contiguity reject to the offering session. Sending it is
      * member-local egress IO, since only the leader's offer reaches the
      * client, exactly like record relaying. The rejection itself has no
@@ -474,6 +544,15 @@ public final class SealerClusteredService implements ClusteredService {
         }
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
+        boundaryTicks++;
+        if (boundaryTicks % BOUNDARY_TICK_LOG_EVERY == 0) {
+            // The proof that the boundary clock runs. A stall with a leader
+            // and no later TICK line is a dead clock; a stall with TICK
+            // lines is a block that does not reach the consumers.
+            System.out.println("cluster boundary-clock TICK memberId=" + memberId
+                + " block=" + state.blockNumber()
+                + " role=" + cluster.role());
+        }
         // Cluster timers are one-shot, so re-arm for the next tick.
         scheduleBoundaryTimer();
     }
