@@ -172,6 +172,20 @@ struct Args {
         default_value_t = 30_000
     )]
     pending_receipt_timeout_ms: u64,
+
+    /// How far past the newest block boundary this proxy stamps a
+    /// transaction's inclusion deadline. The sealer refuses an offer once
+    /// its own block number passes that deadline, which is what makes its
+    /// dedup window exact. It must equal the sealer's
+    /// `-Dkardamom.cluster.inclusionHorizonBlocks`: the proxy stamps with
+    /// it and the sealer holds an id until the deadline passes. See
+    /// `docs/agents/offer-inclusion-deadline-spec.md`.
+    #[arg(
+        long = "inclusion-horizon-blocks",
+        env = "KARDAMOM_INCLUSION_HORIZON_BLOCKS",
+        default_value = "64"
+    )]
+    inclusion_horizon_blocks: NonZeroU64,
     /// The executor query endpoints, `http://host:port`, comma
     /// separated. `eth_getBalance` and `eth_getTransactionCount` ask one
     /// of them when the local account layer misses. Empty means no
@@ -280,6 +294,7 @@ impl IngressService {
             // The mirror ids are the executor indexes. One when no count
             // is known: the Redis reader then polls `head:0` only.
             mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
+            inclusion_horizon_blocks: args.inclusion_horizon_blocks,
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;

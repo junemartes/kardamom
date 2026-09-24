@@ -181,11 +181,11 @@ class RemoteOriginRecordTest {
      */
     @Test
     void a_rejected_id_never_enters_the_dedup_window() {
-        CanonicalSealerState state = state(2);
+        CanonicalSealerState state = state(8);
         state.onRecord(id(1), payload("tx-a"));
         state.onRecord(id(2), payload("tx-b"));
-        assertEquals(2, state.dedupSize(), "window full");
-        one(state, id(3), CHAIN_X, 700L, 0L, "x0"); // evicts id(1), window = {2, 3}
+        one(state, id(3), CHAIN_X, 700L, 0L, "x0");
+        assertEquals(3, state.dedupSize(), "three accepted ids");
 
         RemoteOriginOutcome first = one(state, id(4), CHAIN_X, 701L, 5L, "x5-skip");
         assertTrue(first.rejected);
@@ -193,10 +193,16 @@ class RemoteOriginRecordTest {
         assertTrue(racingCopy.rejected, "the racing copy is rejected the same way");
         assertEquals(CanonicalSealerState.REMOTE_REJECT_SEQ_MISMATCH, racingCopy.reason);
 
-        // The window still holds exactly the two legitimate ids.
-        assertEquals(2, state.dedupSize());
-        assertFalse(state.firstSeen(id(2)), "id 2 was not evicted by a rejected id");
-        assertFalse(state.firstSeen(id(3)), "id 3 was not evicted by a rejected id");
+        // The window still holds exactly the three legitimate ids.
+        assertEquals(3, state.dedupSize());
+        assertEquals(
+                CanonicalSealerState.Admission.DUPLICATE,
+                state.firstSeen(id(2), state.blockNumber() + 1),
+                "id 2 is still held");
+        assertEquals(
+                CanonicalSealerState.Admission.DUPLICATE,
+                state.firstSeen(id(3), state.blockNumber() + 1),
+                "id 3 is still held");
     }
 
     /** Audit H3: an origin outside the allowlist never grows the peer map. */
@@ -393,14 +399,14 @@ class RemoteOriginRecordTest {
         CanonicalSealerState pre = state(8);
         pre.onRecord(id(1), payload("tx"));
         pre.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_000L);
-        byte[] v5 = pre.takeSnapshot(); // no peers yet: remoteCount = 0
-        // Append one v4 peer entry (origin 8 + anchor 8) and re-tag as v4.
+        // No peers yet: remoteCount = 0. Strip the version-7 per-id
+        // deadlines, append one v4 peer entry (origin 8 + anchor 8).
+        byte[] v5 = SealerStateFixtures.downgradeToVersion(pre.takeSnapshot(), 4);
         ByteBuffer v4 = ByteBuffer.allocate(v5.length + 16).order(ByteOrder.BIG_ENDIAN);
         v4.put(v5, 0, v5.length - PEER_AND_VOID_TAIL); // everything before remoteCount
         v4.putInt(1);
         v4.putLong(CHAIN_X);
         v4.putLong(700L);
-        v4.putInt(4, 4);
 
         CanonicalSealerState fromV4 = CanonicalSealerState.load(v4.array(), 8, ALLOW);
 
@@ -430,10 +436,10 @@ class RemoteOriginRecordTest {
         CanonicalSealerState pre = state(8);
         pre.onRecord(id(1), payload("tx"));
         pre.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_000L);
-        byte[] v5 = pre.takeSnapshot();
-        // Re-tag as v3 and drop what the later versions added after the trio.
+        // Strip the version-7 per-id deadlines, re-tag as v3, and drop what
+        // the later versions added after the trio.
+        byte[] v5 = SealerStateFixtures.downgradeToVersion(pre.takeSnapshot(), 3);
         byte[] v3 = java.util.Arrays.copyOf(v5, v5.length - PEER_AND_VOID_TAIL);
-        ByteBuffer.wrap(v3).order(ByteOrder.BIG_ENDIAN).putInt(4, 3);
 
         CanonicalSealerState fromV3 = CanonicalSealerState.load(v3, 8, ALLOW);
 

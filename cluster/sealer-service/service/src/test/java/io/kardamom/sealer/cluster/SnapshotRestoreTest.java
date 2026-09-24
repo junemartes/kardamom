@@ -88,8 +88,15 @@ class SnapshotRestoreTest {
         assertEquals(original.blockNumber(), restored.blockNumber());
         assertEquals(original.dedupSize(), restored.dedupSize());
         // Behavior check: a snapshotted id still dedups; a fresh id relays.
-        assertFalse(restored.firstSeen(canonicalId(4999)), "snapshotted id must still dedup");
-        assertTrue(restored.firstSeen(canonicalId(5001)), "unseen id must be fresh");
+        long open = restored.blockNumber();
+        assertEquals(
+                CanonicalSealerState.Admission.DUPLICATE,
+                restored.firstSeen(canonicalId(4999), open + 1),
+                "snapshotted id must still dedup");
+        assertEquals(
+                CanonicalSealerState.Admission.FRESH,
+                restored.firstSeen(canonicalId(5001), open + 1),
+                "unseen id must be fresh");
     }
 
     @Test

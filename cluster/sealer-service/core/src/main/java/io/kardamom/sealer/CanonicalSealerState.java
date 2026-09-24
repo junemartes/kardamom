@@ -8,6 +8,8 @@ import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
 /**
  * Deterministic canonical-ordering state machine for the Kardamom sealer.
@@ -20,7 +22,7 @@ import java.util.Set;
  * <p>Responsibilities:</p>
  * <ul>
  *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[])}).</li>
+ *       canonical ids ({@link #firstSeen(byte[], long)}).</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
  *       relays each first-seen record with its 0-based index and increases
  *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
@@ -59,6 +61,13 @@ public final class CanonicalSealerState {
     /** Default genesis block number. */
     public static final long GENESIS_BLOCK_NUMBER = 1L;
 
+    /**
+     * Default inclusion horizon, in blocks. It matches the proxy's
+     * {@code --inclusion-horizon-blocks} default: 16 s at the 250 ms
+     * production tick, 128 s at the 2000 ms container tick.
+     */
+    public static final long DEFAULT_INCLUSION_HORIZON_BLOCKS = 64L;
+
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
     /**
      * Version 2 added the contiguity-guard sender map. Version 3 adds the
@@ -74,7 +83,7 @@ public final class CanonicalSealerState {
      * (trust-on-first-sight). A cluster can upgrade in place without a
      * coordinated snapshot migration.
      */
-    private static final int SNAPSHOT_VERSION = 6;
+    private static final int SNAPSHOT_VERSION = 7;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -98,8 +107,21 @@ public final class CanonicalSealerState {
      * ids, wrapped in a read-only {@link ByteBuffer} for value-based
      * equality.
      */
-    private final LinkedHashSet<ByteBuffer> dedup;
+    private final LinkedHashMap<ByteBuffer, Long> dedup;
+    /**
+     * The ids of {@link #dedup}, grouped by the deadline that frees them.
+     * {@link #onTick} drops every group below the new block number in one
+     * step, instead of walking the whole window each tick.
+     */
+    private final TreeMap<Long, LinkedHashSet<ByteBuffer>> byDeadline;
     private final int dedupCapacity;
+    /**
+     * How far past the open block the sealer holds an id, and the deadline
+     * it assigns a marker. Replicated configuration: every member must
+     * agree on it, like {@link #dedupCapacity}, because it decides
+     * accept-or-reject inside the replicated state machine.
+     */
+    private final long inclusionHorizonBlocks;
 
     /**
      * Per-sender expected next nonce. This map is LRU-bounded at the dedup
@@ -240,12 +262,40 @@ public final class CanonicalSealerState {
      */
     public CanonicalSealerState(
             int dedupCapacity, long initialBlockNumber, Set<Long> remoteOrigins, VoidLedger.Config voidConfig) {
+        this(dedupCapacity, initialBlockNumber, remoteOrigins, voidConfig, DEFAULT_INCLUSION_HORIZON_BLOCKS);
+    }
+
+    /**
+     * The full constructor. {@code inclusionHorizonBlocks} bounds how long
+     * an id stays in the dedup window, and is the deadline the sealer
+     * assigns a marker. It is replicated configuration: every member must
+     * agree on it.
+     *
+     * @param dedupCapacity          hard cap on the window; a fresh record
+     *                               past it is refused, never evicted
+     * @param initialBlockNumber     the first block this state stamps
+     * @param remoteOrigins          the peer-chain allowlist
+     * @param voidConfig             the void ledger's configuration
+     * @param inclusionHorizonBlocks the deadline horizon, in blocks
+     */
+    public CanonicalSealerState(
+            int dedupCapacity,
+            long initialBlockNumber,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
+        if (inclusionHorizonBlocks <= 0) {
+            throw new IllegalArgumentException(
+                    "inclusionHorizonBlocks must be > 0, got " + inclusionHorizonBlocks);
+        }
         this.remoteOriginAllowlist = Set.copyOf(remoteOrigins);
         this.dedupCapacity = dedupCapacity;
-        this.dedup = new LinkedHashSet<>();
+        this.inclusionHorizonBlocks = inclusionHorizonBlocks;
+        this.dedup = new LinkedHashMap<>();
+        this.byDeadline = new TreeMap<>();
         this.expectedNonce = new LinkedHashMap<>(16, 0.75f, true) {
             @Override
             protected boolean removeEldestEntry(final Map.Entry<ByteBuffer, Long> eldest) {
@@ -261,26 +311,91 @@ public final class CanonicalSealerState {
         this.lastBoundaryCount = 0L;
     }
 
+    /** What the window did with an offered id. */
+    public enum Admission {
+        /** The id was not in the window, and is now. */
+        FRESH,
+        /** The id is already in the window. */
+        DUPLICATE,
+        /** The open block has passed the id's deadline. */
+        PAST_DEADLINE,
+        /** The window is at capacity; nothing was forgotten to make room. */
+        WINDOW_FULL
+    }
+
     /**
-     * Record {@code id32} in the dedup window. Returns {@code false} if the
-     * id is already present (a duplicate), or {@code true} if it is freshly
-     * inserted.
+     * Record {@code id32} in the dedup window under {@code deadline}, the
+     * last block this record may be ordered into.
      *
-     * <p>On a fresh insert, if the window then exceeds its capacity, the
-     * oldest inserted id is evicted. An evicted id becomes "fresh" again if
-     * it is seen later.</p>
+     * <p>The window holds an id until its deadline passes, and never
+     * evicts. So an id leaves only when no offer carrying it can be
+     * accepted again, which is what makes the dedup exact: a stalled
+     * replica's re-offer can never be read as fresh. {@link #dedupCapacity}
+     * stays a hard cap, but it means back-pressure now, not eviction.</p>
      *
-     * @param id32 a 32-byte canonical id (defensively copied)
+     * <p>The stored deadline is clamped to {@code blockNumber +
+     * inclusionHorizonBlocks}. The clamp only shortens, so it cannot admit
+     * a record the proxy's deadline would refuse, and it bounds the window
+     * by the horizon even if a proxy stamps a deadline far in the future.</p>
+     *
+     * @param id32     a 32-byte canonical id (defensively copied)
+     * @param deadline the last block this record may be ordered into
      */
-    public boolean firstSeen(byte[] id32) {
+    public Admission firstSeen(byte[] id32, long deadline) {
         checkId(id32);
         // Copy the array so the caller cannot change a stored key later.
         ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
-        if (dedup.contains(key)) {
-            return false; // the id is already present
+        if (dedup.containsKey(key)) {
+            return Admission.DUPLICATE;
         }
-        insertFresh(key);
-        return true;
+        if (blockNumber > deadline) {
+            return Admission.PAST_DEADLINE;
+        }
+        if (dedup.size() >= dedupCapacity) {
+            return Admission.WINDOW_FULL;
+        }
+        insertFresh(key, deadline);
+        return Admission.FRESH;
+    }
+
+    /**
+     * Drop every id whose deadline is below the open block. No offer
+     * carrying one of them can be accepted again, so forgetting them is
+     * safe by construction, and the window is bounded by the horizon
+     * rather than by a count.
+     */
+    private void pruneExpired() {
+        SortedMap<Long, LinkedHashSet<ByteBuffer>> expired = byDeadline.headMap(blockNumber);
+        for (LinkedHashSet<ByteBuffer> ids : expired.values()) {
+            for (ByteBuffer id : ids) {
+                dedup.remove(id);
+            }
+        }
+        expired.clear();
+    }
+
+    /** The deadline this sealer assigns a record that carries none. */
+    private long assignedDeadline() {
+        return saturatingAdd(blockNumber, inclusionHorizonBlocks);
+    }
+
+    /** Remove one id from the window and from its deadline group. */
+    private void forget(ByteBuffer key) {
+        Long held = dedup.remove(key);
+        if (held == null) {
+            return;
+        }
+        LinkedHashSet<ByteBuffer> group = byDeadline.get(held);
+        group.remove(key);
+        if (group.isEmpty()) {
+            byDeadline.remove(held);
+        }
+    }
+
+    /** {@code a + b}, held at {@link Long#MAX_VALUE} instead of wrapping. */
+    private static long saturatingAdd(long a, long b) {
+        long sum = a + b;
+        return ((a ^ sum) & (b ^ sum)) < 0 ? Long.MAX_VALUE : sum;
     }
 
     private static void checkId(byte[] id32) {
@@ -291,14 +406,14 @@ public final class CanonicalSealerState {
         }
     }
 
-    /** Insert a new key into the dedup window. Evict the oldest entry if the window is full. */
-    private void insertFresh(ByteBuffer key) {
-        dedup.add(key);
-        if (dedup.size() > dedupCapacity) {
-            Iterator<ByteBuffer> it = dedup.iterator();
-            it.next(); // the oldest inserted id (front of the FIFO)
-            it.remove();
-        }
+    /**
+     * Insert a new key, held until {@code deadline} passes. The caller has
+     * already checked the capacity, so this never forgets an id.
+     */
+    private void insertFresh(ByteBuffer key, long deadline) {
+        long held = Math.min(deadline, assignedDeadline());
+        dedup.put(key, held);
+        byDeadline.computeIfAbsent(held, d -> new LinkedHashSet<>()).add(key);
     }
 
     /**
@@ -314,26 +429,52 @@ public final class CanonicalSealerState {
      * </ul>
      */
     public static final class RecordOutcome {
-        public final Optional<Relayed> relayed;
-        public final boolean rejected;
-        public final long expectedNonce;
+        /** Which of the five outcomes this is. */
+        public enum Kind {
+            /** The id was already in the window: dropped, never counted. */
+            DUPLICATE,
+            /** Accepted: {@link RecordOutcome#relayed} holds the record. */
+            RELAYED,
+            /** The nonce was not the sender's expected next one. */
+            CONTIGUITY_REJECT,
+            /** The open block had passed the record's deadline. */
+            PAST_DEADLINE,
+            /** The window was at capacity, so no decision was taken. */
+            WINDOW_FULL
+        }
 
-        private RecordOutcome(Optional<Relayed> relayed, boolean rejected, long expectedNonce) {
+        public final Kind kind;
+        public final Optional<Relayed> relayed;
+        public final long expectedNonce;
+        /** The deadline that was passed. Meaningful for {@link Kind#PAST_DEADLINE}. */
+        public final long maxInclusionBlock;
+
+        private RecordOutcome(
+                Kind kind, Optional<Relayed> relayed, long expectedNonce, long maxInclusionBlock) {
+            this.kind = kind;
             this.relayed = relayed;
-            this.rejected = rejected;
             this.expectedNonce = expectedNonce;
+            this.maxInclusionBlock = maxInclusionBlock;
         }
 
         static RecordOutcome duplicate() {
-            return new RecordOutcome(Optional.empty(), false, 0L);
+            return new RecordOutcome(Kind.DUPLICATE, Optional.empty(), 0L, 0L);
         }
 
         static RecordOutcome relayed(Relayed r) {
-            return new RecordOutcome(Optional.of(r), false, 0L);
+            return new RecordOutcome(Kind.RELAYED, Optional.of(r), 0L, 0L);
         }
 
         static RecordOutcome rejected(long expectedNonce) {
-            return new RecordOutcome(Optional.empty(), true, expectedNonce);
+            return new RecordOutcome(Kind.CONTIGUITY_REJECT, Optional.empty(), expectedNonce, 0L);
+        }
+
+        static RecordOutcome pastDeadline(long maxInclusionBlock) {
+            return new RecordOutcome(Kind.PAST_DEADLINE, Optional.empty(), 0L, maxInclusionBlock);
+        }
+
+        static RecordOutcome windowFull() {
+            return new RecordOutcome(Kind.WINDOW_FULL, Optional.empty(), 0L, 0L);
         }
     }
 
@@ -356,7 +497,8 @@ public final class CanonicalSealerState {
      *
      * <p>{@code payload} is relayed as-is and is never parsed.</p>
      */
-    public RecordOutcome onRecord(byte[] canonicalId32, byte[] sender20, long nonce, byte[] payload) {
+    public RecordOutcome onRecord(
+            byte[] canonicalId32, byte[] sender20, long nonce, long deadline, byte[] payload) {
         checkId(canonicalId32);
         if (sender20 == null || sender20.length != SENDER_LEN) {
             throw new IllegalArgumentException(
@@ -364,8 +506,22 @@ public final class CanonicalSealerState {
                             + (sender20 == null ? "null" : sender20.length));
         }
         ByteBuffer key = ByteBuffer.wrap(canonicalId32.clone()).asReadOnlyBuffer();
-        if (dedup.contains(key)) {
+        if (dedup.containsKey(key)) {
             return RecordOutcome.duplicate();
+        }
+        // The deadline check runs after the dedup lookup, so a re-offer of
+        // a record that is still in the window is absorbed as a duplicate,
+        // exactly as before, and never reaches this check with a stale
+        // nonce. It runs before the contiguity guard, so an expired offer
+        // does not move a sender's expected nonce.
+        if (blockNumber > deadline) {
+            return RecordOutcome.pastDeadline(deadline);
+        }
+        if (dedup.size() >= dedupCapacity) {
+            // Back-pressure, not a verdict: nothing is forgotten to make
+            // room. The next tick that passes a deadline frees space, and
+            // the sequencer republishes.
+            return RecordOutcome.windowFull();
         }
         if (!isZeroSender(sender20)) {
             ByteBuffer senderKey = ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer();
@@ -376,7 +532,7 @@ public final class CanonicalSealerState {
             expectedNonce.put(senderKey, nonce + 1);
             voids.onReference(canonicalCount, canonicalId32, sender20, nonce);
         }
-        insertFresh(key);
+        insertFresh(key, deadline);
         long index = canonicalCount;
         canonicalCount++;
         return RecordOutcome.relayed(new Relayed(index, payload));
@@ -422,7 +578,7 @@ public final class CanonicalSealerState {
     }
 
     private Relayed appendVoid(VoidLedger.Entry entry) {
-        dedup.remove(ByteBuffer.wrap(entry.id).asReadOnlyBuffer());
+        forget(ByteBuffer.wrap(entry.id).asReadOnlyBuffer());
         expectedNonce.computeIfPresent(
             ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(), (sender, expected) -> entry.nonce);
         long voidIndex = canonicalCount;
@@ -436,14 +592,15 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Process a record without the contiguity guard (no sender identity).
-     * This is the pre-guard contract, kept for deposit-only callers and
-     * existing tests. It is equivalent to
-     * {@link #onRecord(byte[], byte[], long, byte[])} with the all-zero
-     * sender.
+     * Process a record without the contiguity guard (no sender identity)
+     * and without a deadline. This is the pre-guard contract, kept for
+     * deposit-only callers and existing tests. It is equivalent to
+     * {@link #onRecord(byte[], byte[], long, long, byte[])} with the
+     * all-zero sender and a deadline this sealer assigns.
      */
     public Optional<Relayed> onRecord(byte[] canonicalId32, byte[] payload) {
-        return onRecord(canonicalId32, new byte[SENDER_LEN], 0L, payload).relayed;
+        return onRecord(canonicalId32, new byte[SENDER_LEN], 0L, assignedDeadline(), payload)
+                .relayed;
     }
 
     private static boolean isZeroSender(byte[] sender20) {
@@ -477,6 +634,7 @@ public final class CanonicalSealerState {
         long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
         Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
         blockNumber++;
+        pruneExpired();
         lastL2Timestamp = l2Timestamp;
         lastBoundaryCount = canonicalCount;
         return boundary;
@@ -533,7 +691,11 @@ public final class CanonicalSealerState {
         }
         // Check dedup first. Checking monotonicity before dedup would reject
         // normal re-offers from racing sequencers as regressions.
-        if (!firstSeen(canonicalId32)) {
+        // A marker carries no deadline of its own: it is not a user
+        // submission. The sealer assigns one, for pruning only. A re-offer
+        // of a pruned marker id meets the origin guard below, which is
+        // what refuses it.
+        if (firstSeen(canonicalId32, assignedDeadline()) != Admission.FRESH) {
             return Optional.empty();
         }
         if (newL1Origin <= l1Origin) {
@@ -667,7 +829,7 @@ public final class CanonicalSealerState {
         // Dedup LOOKUP first: the racing watchers' normal re-offers carry
         // the position already adopted and would read as lane regressions
         // if checked before this.
-        if (dedup.contains(key)) {
+        if (dedup.containsKey(key)) {
             return RemoteOriginOutcome.duplicate();
         }
         if (!remoteOriginAllowlist.contains(originChainId)) {
@@ -702,7 +864,13 @@ public final class CanonicalSealerState {
             }
         }
         // Every check passed. Only now does the id enter the window.
-        insertFresh(key);
+        //
+        // A marker does not meet the window cap. Markers are a trickle (one
+        // per L1 block, one per peer batch) where transactions are a flood,
+        // and refusing one would stall that lane rather than shed load. The
+        // cap bounds the flood. Every member takes the same branch, so the
+        // replicated state stays identical.
+        insertFresh(key, assignedDeadline());
         Boundary forced = null;
         if (canonicalCount > lastBoundaryCount) {
             forced = onTick(leaderClockMillis);
@@ -819,7 +987,7 @@ public final class CanonicalSealerState {
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
-        int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN
+        int size = 4 + 4 + 8 + 8 + 4 + idCount * (CANONICAL_ID_LEN + 8)
                 + 4 + senderCount * (SENDER_LEN + 8)
                 + 8 + 8 + 8
                 + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
@@ -830,12 +998,16 @@ public final class CanonicalSealerState {
         buf.putLong(canonicalCount);
         buf.putLong(blockNumber);
         buf.putInt(idCount);
-        for (ByteBuffer id : dedup) {
-            ByteBuffer dup = id.duplicate();
+        // v7: each id carries the deadline that frees it. The map is
+        // insertion-ordered and mutated only by the replicated record
+        // sequence, so every member writes the same bytes.
+        for (Map.Entry<ByteBuffer, Long> e : dedup.entrySet()) {
+            ByteBuffer dup = e.getKey().duplicate();
             dup.rewind();
             byte[] raw = new byte[CANONICAL_ID_LEN];
             dup.get(raw);
             buf.put(raw);
+            buf.putLong(e.getValue());
         }
         buf.putInt(senderCount);
         for (Map.Entry<ByteBuffer, Long> e : expectedNonce.entrySet()) {
@@ -892,6 +1064,27 @@ public final class CanonicalSealerState {
      */
     public static CanonicalSealerState load(
             byte[] snapshot, int dedupCapacity, Set<Long> remoteOrigins, VoidLedger.Config voidConfig) {
+        return load(snapshot, dedupCapacity, remoteOrigins, voidConfig, DEFAULT_INCLUSION_HORIZON_BLOCKS);
+    }
+
+    /**
+     * {@link #load(byte[], int, Set, VoidLedger.Config)} with this member's
+     * inclusion horizon. The horizon is replicated configuration, so it
+     * comes from the deploy, not from the snapshot.
+     *
+     * @param snapshot               the bytes {@link #takeSnapshot()} wrote
+     * @param dedupCapacity          this member's configured window cap
+     * @param remoteOrigins          the peer-chain allowlist
+     * @param voidConfig             the void ledger's configuration
+     * @param inclusionHorizonBlocks the deadline horizon, in blocks
+     * @return the restored state
+     */
+    public static CanonicalSealerState load(
+            byte[] snapshot,
+            int dedupCapacity,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks) {
         ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
@@ -917,21 +1110,25 @@ public final class CanonicalSealerState {
                     "snapshot idCount " + idCount + " outside [0, dedupCapacity="
                             + dedupCapacity + "] — members must agree on the configured window");
         }
-        if ((long) idCount * CANONICAL_ID_LEN > buf.remaining()) {
+        int idEntryLen = version >= 7 ? CANONICAL_ID_LEN + 8 : CANONICAL_ID_LEN;
+        if ((long) idCount * idEntryLen > buf.remaining()) {
             throw new IllegalArgumentException(
                     "truncated snapshot: idCount " + idCount + " needs "
-                            + ((long) idCount * CANONICAL_ID_LEN) + " bytes, only "
+                            + ((long) idCount * idEntryLen) + " bytes, only "
                             + buf.remaining() + " remaining");
         }
 
-        CanonicalSealerState state =
-            new CanonicalSealerState(dedupCapacity, blockNumber, remoteOrigins, voidConfig);
+        CanonicalSealerState state = new CanonicalSealerState(
+                dedupCapacity, blockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
-            // Insert directly in FIFO order, without eviction or counting.
-            // The snapshot already reflects a window within capacity.
-            state.dedup.add(ByteBuffer.wrap(raw).asReadOnlyBuffer());
+            // A version below 7 has no deadline per id. Hold each one for a
+            // full horizon: the conservative direction, since an id held too
+            // long only absorbs a duplicate, while one freed too early could
+            // let a stale copy in.
+            long held = version >= 7 ? buf.getLong() : state.assignedDeadline();
+            state.insertFresh(ByteBuffer.wrap(raw).asReadOnlyBuffer(), held);
         }
         if (version >= 2) {
             int senderCount = buf.getInt();

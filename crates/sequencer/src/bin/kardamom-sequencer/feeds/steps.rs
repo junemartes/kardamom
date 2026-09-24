@@ -15,6 +15,31 @@ impl EgressWatermarkFeed {
     /// Forward one contiguity reject to the publish loop's reject
     /// channel. Drops it, with a warning, only when the channel is full:
     /// the confirm-timeout sweep still recovers a dropped reject, later.
+    /// Forward one past-deadline reject to the publish loop. A full
+    /// channel means the loop has stalled far past the horizon already,
+    /// and every ref in flight is late: dropping is safe, because the
+    /// confirm-timeout sweep still clears the ledger.
+    pub(super) fn forward_past_deadline(
+        &self,
+        sender: Address,
+        nonce: u64,
+        max_inclusion_block: u64,
+        at_block: u64,
+    ) {
+        match self
+            .deadline_tx
+            .try_send((sender, nonce, max_inclusion_block, at_block))
+        {
+            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    partition = self.partition,
+                    "past-deadline channel full; dropping"
+                );
+            }
+        }
+    }
+
     pub(super) fn forward_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) {
         match self.reject_tx.try_send((sender, nonce, expected)) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}

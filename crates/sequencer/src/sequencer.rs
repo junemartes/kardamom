@@ -495,7 +495,7 @@ impl Sequencer {
     /// Resync and unconfirmed-ledger bookkeeping. Runs first, on every
     /// `run_once` iteration, including idle ones, so boundary-silence
     /// detection keeps ticking.
-    fn resync_tick(&mut self) {
+    fn resync_tick<P: SequencerPorts>(&mut self, ports: &mut P) {
         // Take `r` out of `self` for the duration of the two `&mut self`
         // calls below: `self.resync` and `self` (for `self.unconfirmed`,
         // `self.state`) cannot both be borrowed mutably at once through a
@@ -505,6 +505,7 @@ impl Sequencer {
         };
         self.apply_receipt_drain(&mut r);
         self.apply_contiguity_rejects(&mut r);
+        self.apply_deadline_rejects(&mut r, ports);
         self.resync = Some(r);
         self.sweep_confirm_timeouts();
     }
@@ -569,6 +570,39 @@ impl Sequencer {
         }
         for (sender, expected) in rewinds {
             self.rewind_one_gap(sender, expected);
+        }
+    }
+
+    /// Apply the past-deadline rejects the sealer answered this shard
+    /// with. Each one is a transaction the chain will never order: drop it
+    /// from the unconfirmed ledger, so it never republishes, and tell the
+    /// client, so it can sign again instead of waiting out its timeout.
+    fn apply_deadline_rejects<P: SequencerPorts>(
+        &mut self,
+        r: &mut crate::resync::ResyncController,
+        ports: &mut P,
+    ) {
+        for (sender, nonce, max_inclusion_block, at_block) in r.drain_deadline_rejects() {
+            self.unconfirmed.drop_committed(sender, nonce);
+            warn!(
+                sender = ?sender,
+                nonce,
+                max_inclusion_block,
+                at_block,
+                "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
+            );
+            let (_, _, errors) = ports.split();
+            self.publish_error(
+                errors,
+                TxError {
+                    sender,
+                    nonce,
+                    reason: TxErrorReason::PastDeadline {
+                        max_inclusion_block,
+                        at_block,
+                    },
+                },
+            );
         }
     }
 
@@ -748,7 +782,7 @@ impl Sequencer {
     /// `tx_data` subscription closes.
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
-        self.resync_tick();
+        self.resync_tick(ports);
         let (channel_a, b, rc) = ports.split();
         self.expiry_tick(rc);
 

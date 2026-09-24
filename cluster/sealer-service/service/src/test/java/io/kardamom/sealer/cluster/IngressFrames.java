@@ -48,6 +48,8 @@ final class IngressFrames {
         pos += CanonicalSealerState.SENDER_LEN;
         buf.putLong(pos, 0L, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
+        buf.putLong(pos, Long.MAX_VALUE, ByteOrder.LITTLE_ENDIAN); // no deadline
+        pos += Long.BYTES;
         buf.putBytes(pos, canonicalId32);
         pos += canonicalId32.length;
         buf.putBytes(pos, canonicalId32); // opaque payload, relayed verbatim
@@ -130,16 +132,24 @@ final class IngressFrames {
 
     /**
      * A complete single-record ingress frame that a batch can embed: a guard
-     * header ({@code sender20} and {@code nonce}), a canonical id tagged with
-     * {@code idTag}, and a 1-byte payload.
+     * header ({@code sender20}, {@code nonce} and a deadline no block
+     * passes), a canonical id tagged with {@code idTag}, and a 1-byte
+     * payload.
      */
     static byte[] recordFrame(final int idTag, final byte[] sender20, final long nonce) {
+        return recordFrame(idTag, sender20, nonce, Long.MAX_VALUE);
+    }
+
+    /** {@link #recordFrame(int, byte[], long)} with an explicit deadline. */
+    static byte[] recordFrame(
+            final int idTag, final byte[] sender20, final long nonce, final long deadline) {
         final byte[] out = new byte[SealerWire.CANONICAL_ID_OFFSET
                 + CanonicalSealerState.CANONICAL_ID_LEN + 1];
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
         buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_INGRESS_RECORD);
         buf.putBytes(SealerWire.SENDER_OFFSET, sender20);
         buf.putLong(SealerWire.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(SealerWire.DEADLINE_OFFSET, deadline, ByteOrder.LITTLE_ENDIAN);
         buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, recordId(idTag));
         buf.putByte(out.length - 1, (byte) idTag);
         buf.getBytes(0, out);

@@ -79,6 +79,8 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Contiguity rejects emitted (logged at power-of-two counts). */
     private long rejectedFrameCount = 0;
+    private long pastDeadlineCount = 0;
+    private long windowFullCount = 0;
 
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
@@ -86,6 +88,12 @@ public final class SealerClusteredService implements ClusteredService {
     // Scratch buffers for ingress id and sender extraction. Reuse them to
     // avoid a per-message allocation on the single cluster service thread.
     private final VoidLedger.Config voidConfig;
+    /**
+     * The inclusion horizon, in blocks. Replicated configuration: every
+     * member must agree on it, because it bounds the dedup window and the
+     * deadline the sealer assigns a marker.
+     */
+    private final long inclusionHorizonBlocks;
 
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
@@ -96,6 +104,19 @@ public final class SealerClusteredService implements ClusteredService {
             int memberId,
             Set<Long> remoteOrigins,
             VoidLedger.Config voidConfig) {
+        this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, voidConfig,
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
+    }
+
+    /** The full constructor, with this member's inclusion horizon. */
+    public SealerClusteredService(
+            int dedupCapacity,
+            long tickIntervalMs,
+            int memberId,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks) {
+        this.inclusionHorizonBlocks = inclusionHorizonBlocks;
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
         this.memberId = memberId;
@@ -131,7 +152,8 @@ public final class SealerClusteredService implements ClusteredService {
             // would diverge from the rest of the cluster, which assumes the
             // snapshotted state (and the log replayed after it) is correct.
             final byte[] snapshot = SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy());
-            this.state = CanonicalSealerState.load(snapshot, dedupCapacity, remoteOrigins, voidConfig);
+            this.state = CanonicalSealerState.load(
+                snapshot, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks);
             // The retained deque is not snapshotted (v1). Nothing before the
             // restore point can ever be served, so the retention floors start
             // at the first frame this member can retain: record index
@@ -148,7 +170,8 @@ public final class SealerClusteredService implements ClusteredService {
                 + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
         } else {
             this.state = new CanonicalSealerState(
-                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig);
+                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
+                inclusionHorizonBlocks);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -476,6 +499,8 @@ public final class SealerClusteredService implements ClusteredService {
         buffer.getBytes(offset + SealerWire.CANONICAL_ID_OFFSET, canonicalIdScratch);
         buffer.getBytes(offset + SealerWire.SENDER_OFFSET, senderScratch);
         final long nonce = buffer.getLong(offset + SealerWire.NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long deadline =
+            buffer.getLong(offset + SealerWire.DEADLINE_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final int payloadOffset = offset + SealerWire.RELAY_OFFSET;
         final int payloadLength = length - SealerWire.RELAY_OFFSET;
         final byte[] payload = new byte[payloadLength];
@@ -483,12 +508,14 @@ public final class SealerClusteredService implements ClusteredService {
             buffer.getBytes(payloadOffset, payload);
         }
         final CanonicalSealerState.RecordOutcome outcome =
-            state.onRecord(canonicalIdScratch, senderScratch, nonce, payload);
-        if (outcome.rejected) {
-            onContiguityReject(session, nonce, outcome.expectedNonce);
-            return;
+            state.onRecord(canonicalIdScratch, senderScratch, nonce, deadline, payload);
+        switch (outcome.kind) {
+            case CONTIGUITY_REJECT -> onContiguityReject(session, nonce, outcome.expectedNonce);
+            case PAST_DEADLINE -> onPastDeadline(session, nonce, outcome.maxInclusionBlock);
+            case WINDOW_FULL -> onWindowFull(session, nonce);
+            case RELAYED -> outcome.relayed.ifPresent(egress::offerRelayed);
+            case DUPLICATE -> { }
         }
-        outcome.relayed.ifPresent(egress::offerRelayed);
     }
 
     /**
@@ -535,6 +562,40 @@ public final class SealerClusteredService implements ClusteredService {
                 + " totalRejected=" + rejectedFrameCount);
         }
         egress.offerContiguityReject(session, senderScratch, nonce, expected);
+    }
+
+    /**
+     * Answer one offer whose inclusion deadline the open block has passed.
+     * The record is not ordered, and no copy of it can be ordered later, so
+     * the sequencer reports it to the client instead of republishing.
+     */
+    private void onPastDeadline(
+            final ClientSession session, final long nonce, final long maxInclusionBlock) {
+        pastDeadlineCount++;
+        if (Long.bitCount(pastDeadlineCount) == 1) {
+            System.out.println("cluster PAST-DEADLINE memberId=" + memberId
+                + " nonce=" + nonce + " maxInclusionBlock=" + maxInclusionBlock
+                + " atBlock=" + state.blockNumber()
+                + " totalPastDeadline=" + pastDeadlineCount);
+        }
+        egress.offerPastDeadline(
+            session, senderScratch, nonce, maxInclusionBlock, state.blockNumber());
+    }
+
+    /**
+     * Answer one offer the dedup window had no room for. Nothing was
+     * forgotten to make room, so this is back-pressure: the next tick that
+     * passes a deadline frees space, and the sequencer republishes.
+     */
+    private void onWindowFull(final ClientSession session, final long nonce) {
+        windowFullCount++;
+        if (Long.bitCount(windowFullCount) == 1) {
+            System.out.println("cluster WINDOW-FULL memberId=" + memberId
+                + " nonce=" + nonce + " windowSize=" + state.dedupSize()
+                + " capacity=" + state.dedupCapacity()
+                + " totalWindowFull=" + windowFullCount);
+        }
+        egress.offerWindowFull(session, senderScratch, nonce);
     }
 
     @Override

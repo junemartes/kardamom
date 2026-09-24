@@ -172,9 +172,34 @@ pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
     let target = h.probes.sequencer_lane0_target(0);
     h.assert_replica_healthy(&target, Duration::from_secs(90))
         .await?;
+    report_past_deadline_refusals(h).await?;
     crate::log(
         "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy",
     );
+    Ok(())
+}
+
+/// Report how many of a thawed replica's re-offers the sealer refused for
+/// being late.
+///
+/// At this shard's horizon (64 blocks, 128 s at the 2000 ms container
+/// tick) a 30 s freeze expires nothing, so the count reads zero and
+/// reports the margin. A horizon below the freeze length turns it into
+/// the assertion the bounded dedup window could never make: the thawed
+/// backlog is refused rather than ordered a second time. See
+/// `docs/agents/offer-inclusion-deadline-spec.md`.
+async fn report_past_deadline_refusals(h: &Harness) -> anyhow::Result<()> {
+    let late = h
+        .evidence
+        .count_lines(
+            crate::probes::CLUSTER_TASK,
+            "PAST-DEADLINE",
+            crate::nomad::Streams::StdoutOnly,
+        )
+        .await?;
+    crate::log(format!(
+        "sequencer-lapse: past-deadline refusals in the sealer logs: {late}"
+    ));
     Ok(())
 }
 

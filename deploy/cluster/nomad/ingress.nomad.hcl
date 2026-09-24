@@ -65,6 +65,16 @@ variable "tx_ttl_ms" {
   default = 30000
 }
 
+# How far past the newest boundary this proxy stamps a transaction's
+# inclusion deadline. It must equal the sealer's
+# cluster_inclusion_horizon_blocks: the proxy stamps with it, and the
+# sealer holds a canonical id until that deadline passes. See
+# docs/agents/offer-inclusion-deadline-spec.md.
+variable "inclusion_horizon_blocks" {
+  type    = string
+  default = "64"
+}
+
 job "ingress" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -179,6 +189,7 @@ job "ingress" {
           # The submit park bound. It equals the sequencer transaction
           # lifetime (tx_ttl_ms in group_vars/all.yml).
           "--pending-receipt-timeout-ms", format("%d", var.tx_ttl_ms),
+          "--inclusion-horizon-blocks", var.inclusion_horizon_blocks,
           # Use a stable per-replica id (alloc index 0 or 1). This
           # namespaces correlation_id, so the two active/active
           # replicas never collide. See

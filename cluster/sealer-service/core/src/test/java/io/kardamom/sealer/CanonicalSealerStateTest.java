@@ -2,6 +2,7 @@ package io.kardamom.sealer;
 
 import static io.kardamom.sealer.SealerStateFixtures.id;
 import static io.kardamom.sealer.SealerStateFixtures.payload;
+import static io.kardamom.sealer.SealerStateFixtures.sender;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -9,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.kardamom.sealer.CanonicalSealerState.Admission;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -39,21 +41,113 @@ class CanonicalSealerStateTest {
         assertEquals(1L, state.canonicalCount(), "duplicate must NOT bump the count");
     }
 
+    /**
+     * The window never forgets an id whose deadline can still be met. This
+     * is what makes the dedup exact: a stalled replica's re-offer cannot be
+     * read as fresh, whatever the offer rate was in between.
+     */
     @Test
-    void dedup_window_evicts_fifo() {
-        // Capacity is 2.
-        CanonicalSealerState state = new CanonicalSealerState(2);
+    void the_window_holds_an_id_until_its_deadline_passes() {
+        CanonicalSealerState state = new CanonicalSealerState(64);
+        long open = state.blockNumber();
 
-        assertTrue(state.firstSeen(id(1)));
-        assertFalse(state.firstSeen(id(1)), "second sighting is a duplicate");
-        assertTrue(state.firstSeen(id(2)));
-        // The window holds [1, 2]. Adding 3 evicts 1, the oldest id.
-        assertTrue(state.firstSeen(id(3)));
-        assertFalse(state.firstSeen(id(2)), "2 still inside the window");
-        assertFalse(state.firstSeen(id(3)), "3 still inside the window");
-        // Id 1 was evicted. It is fresh again.
-        assertTrue(state.firstSeen(id(1)), "evicted id is fresh again");
-        assertEquals(2, state.dedupSize(), "window stays at capacity");
+        assertEquals(Admission.FRESH, state.firstSeen(id(1), open + 2));
+        assertEquals(
+                Admission.DUPLICATE,
+                state.firstSeen(id(1), open + 2),
+                "second sighting is a duplicate");
+
+        // Ticking to the deadline keeps the id: the block equal to the
+        // deadline may still order it.
+        state.onTick(1_000L);
+        state.onTick(2_000L);
+        assertEquals(open + 2, state.blockNumber());
+        assertEquals(
+                Admission.DUPLICATE, state.firstSeen(id(1), open + 2), "the deadline is inclusive");
+
+        // One more tick passes it. The id leaves the window, and a re-offer
+        // is refused for being late, never accepted as fresh.
+        state.onTick(3_000L);
+        assertEquals(0, state.dedupSize(), "an id past its deadline is gone");
+        assertEquals(Admission.PAST_DEADLINE, state.firstSeen(id(1), open + 2));
+    }
+
+    /**
+     * The deadline is inclusive, and it is checked after the dedup lookup,
+     * so a duplicate inside the window is still absorbed as a duplicate.
+     */
+    @Test
+    void an_offer_is_ordered_up_to_its_deadline_and_refused_after_it() {
+        CanonicalSealerState state = new CanonicalSealerState(64);
+        long open = state.blockNumber();
+
+        assertTrue(
+                state.onRecord(id(1), sender(1), 0L, open, payload("at the deadline"))
+                        .relayed
+                        .isPresent(),
+                "the block equal to the deadline may order the record");
+        assertTrue(
+                state.onRecord(id(3), sender(3), 0L, open + 5, payload("room to spare"))
+                        .relayed
+                        .isPresent());
+
+        state.onTick(1_000L);
+        CanonicalSealerState.RecordOutcome late =
+                state.onRecord(id(2), sender(2), 0L, open, payload("one block late"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.PAST_DEADLINE, late.kind);
+        assertEquals(open, late.maxInclusionBlock);
+        assertEquals(2L, state.canonicalCount(), "an expired offer is not counted");
+
+        // A stalled replica re-offers id 3 with the deadline it read from
+        // the envelope, which the open block has now passed. The id is
+        // still in the window, so the lookup answers first: this is a
+        // duplicate, not a late offer. That ordering is what stops a
+        // re-offer from reaching the contiguity guard with a stale nonce.
+        CanonicalSealerState.RecordOutcome again =
+                state.onRecord(id(3), sender(3), 0L, open, payload("re-offer"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.DUPLICATE, again.kind);
+    }
+
+    /** A full window answers with back-pressure, and counts nothing. */
+    @Test
+    void a_full_window_answers_with_back_pressure() {
+        CanonicalSealerState state = new CanonicalSealerState(1);
+        long far = state.blockNumber() + 10;
+        assertTrue(state.onRecord(id(1), sender(1), 0L, far, payload("a")).relayed.isPresent());
+        CanonicalSealerState.RecordOutcome full =
+                state.onRecord(id(2), sender(2), 0L, far, payload("b"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.WINDOW_FULL, full.kind);
+        assertEquals(1L, state.canonicalCount(), "back-pressure counts nothing");
+        assertEquals(1, state.dedupSize(), "back-pressure forgets nothing");
+    }
+
+    /** The capacity is back-pressure now: a full window forgets nothing. */
+    @Test
+    void a_full_window_refuses_instead_of_forgetting() {
+        CanonicalSealerState state = new CanonicalSealerState(2);
+        long far = state.blockNumber() + 10;
+
+        assertEquals(Admission.FRESH, state.firstSeen(id(1), far));
+        assertEquals(Admission.FRESH, state.firstSeen(id(2), far));
+        assertEquals(Admission.WINDOW_FULL, state.firstSeen(id(3), far));
+        assertEquals(2, state.dedupSize(), "nothing was forgotten to make room");
+        assertEquals(
+                Admission.DUPLICATE, state.firstSeen(id(1), far), "the oldest id is still held");
+    }
+
+    /**
+     * The sealer holds an id for its own horizon at most. A proxy that
+     * stamps a deadline far in the future cannot pin an id in the window.
+     */
+    @Test
+    void the_stored_deadline_is_clamped_to_the_horizon() {
+        CanonicalSealerState state =
+                new CanonicalSealerState(64, 1L, java.util.Set.of(), VoidLedger.Config.DISABLED, 2L);
+        assertEquals(Admission.FRESH, state.firstSeen(id(1), Long.MAX_VALUE));
+        state.onTick(1_000L);
+        state.onTick(2_000L);
+        state.onTick(3_000L);
+        assertEquals(0, state.dedupSize(), "the horizon bounds the window, not the stamp");
     }
 
     @Test
@@ -169,7 +263,10 @@ class CanonicalSealerStateTest {
         assertEquals(expectedCount, next.endTxIdx, "endTxIdx resumes from snapshotted count");
 
         // The dedup window also survives. A snapshotted id is still a duplicate.
-        assertFalse(restored.firstSeen(id(3)), "snapshotted id must still dedup");
+        assertEquals(
+                Admission.DUPLICATE,
+                restored.firstSeen(id(3), restored.blockNumber() + 1),
+                "snapshotted id must still dedup");
     }
 
     @Test

@@ -1,5 +1,6 @@
 package io.kardamom.sealer;
 
+import static io.kardamom.sealer.SealerStateFixtures.NO_DEADLINE;
 import static io.kardamom.sealer.SealerStateFixtures.id;
 import static io.kardamom.sealer.SealerStateFixtures.payload;
 import static io.kardamom.sealer.SealerStateFixtures.sender;
@@ -28,7 +29,10 @@ class VoidRequestTest {
 
     /** Order one reference from sender 1 at {@code nonce}, with id {@code nonce}. */
     private static long order(CanonicalSealerState state, int nonce) {
-        return state.onRecord(id(nonce), sender(1), nonce, payload("ref")).relayed.orElseThrow().index;
+        return state.onRecord(id(nonce), sender(1), nonce, NO_DEADLINE, payload("ref"))
+                .relayed
+                .orElseThrow()
+                .index;
     }
 
     @Test
@@ -98,14 +102,14 @@ class VoidRequestTest {
         long index = order(state, 5);
         order(state, 6);
         assertFalse(
-            state.onRecord(id(5), sender(1), 5, payload("ref")).relayed.isPresent(),
+            state.onRecord(id(5), sender(1), 5, NO_DEADLINE, payload("ref")).relayed.isPresent(),
             "before the void the window absorbs the same bytes as a duplicate");
 
         state.onVoidRequest(0, index, id(5));
 
-        CanonicalSealerState.RecordOutcome again = state.onRecord(id(5), sender(1), 5, payload("ref"));
+        CanonicalSealerState.RecordOutcome again = state.onRecord(id(5), sender(1), 5, NO_DEADLINE, payload("ref"));
         assertTrue(again.relayed.isPresent(), "same id and same nonce are fresh after the void");
-        assertFalse(again.rejected);
+        assertFalse(again.kind == CanonicalSealerState.RecordOutcome.Kind.CONTIGUITY_REJECT);
     }
 
     @Test
@@ -150,11 +154,11 @@ class VoidRequestTest {
     void a_version_5_snapshot_restores_an_empty_ledger() {
         CanonicalSealerState old = new CanonicalSealerState(8);
         long index = order(old, 5);
-        byte[] v6 = old.takeSnapshot();
-        // A disabled ledger writes two zero counts. Cut them and set the
-        // version field back, which is the exact version-5 byte layout.
+        // A disabled ledger writes two zero counts. Strip the version-7
+        // per-id deadlines, cut those counts, and set the version field
+        // back, which is the exact version-5 byte layout.
+        byte[] v6 = SealerStateFixtures.downgradeToVersion(old.takeSnapshot(), 5);
         byte[] v5 = java.util.Arrays.copyOf(v6, v6.length - 8);
-        ByteBuffer.wrap(v5).putInt(4, 5);
 
         CanonicalSealerState restored = CanonicalSealerState.load(v5, 8, Set.of(), THREE_VOTERS);
 

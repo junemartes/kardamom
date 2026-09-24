@@ -333,6 +333,13 @@ pub struct ResyncController {
     /// This confirms by reject, dropping the ledger entry.
     reject_rx: Receiver<(Address, u64, u64)>,
     reject_rx_dead: bool,
+    /// `(sender, nonce, max_inclusion_block, at_block)` past-deadline
+    /// rejects, forwarded by the egress-watermark thread. The sealer
+    /// refused a ref whose inclusion deadline the open block had passed.
+    /// No copy of it can be ordered later, so the publish loop drops the
+    /// ledger entry and tells the client, instead of republishing.
+    deadline_rx: Receiver<(Address, u64, u64, u64)>,
+    deadline_rx_dead: bool,
     watermark: SharedWatermark,
     last_watermark: u64,
     /// Set once the first boundary has been seen. A jump before the
@@ -341,6 +348,10 @@ pub struct ResyncController {
     stall_since: Option<Instant>,
     calm_since: Option<Instant>,
 }
+
+/// Bound on the past-deadline channel. Each entry means one transaction
+/// the chain will never order, which a healthy shard never produces.
+const DEADLINE_CHANNEL_BOUND: usize = 4096;
 
 /// Bound on floor updates drained per loop iteration, so a receipts burst
 /// cannot starve the publish path.
@@ -438,6 +449,7 @@ impl ResyncController {
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
         reject_rx: Receiver<(Address, u64, u64)>,
+        deadline_rx: Receiver<(Address, u64, u64, u64)>,
         watermark: SharedWatermark,
     ) -> Result<Self, ResyncConfigError> {
         let enter_threshold = cfg.enter_threshold()?;
@@ -451,6 +463,8 @@ impl ResyncController {
             floor_rx_dead: false,
             reject_rx,
             reject_rx_dead: false,
+            deadline_rx,
+            deadline_rx_dead: false,
             watermark,
             last_watermark: 0,
             watermark_seen: false,
@@ -560,6 +574,18 @@ impl ResyncController {
     ///   vanished, so rewind the unconfirmed ledger and republish.
     ///
     /// Bounded per iteration, like the floor drain.
+    /// Drain the past-deadline rejects the sealer answered this shard
+    /// with. Each one is a transaction that will never be ordered.
+    pub fn drain_deadline_rejects(&mut self) -> Vec<(Address, u64, u64, u64)> {
+        drain_bounded(
+            &self.deadline_rx,
+            &mut self.deadline_rx_dead,
+            FLOOR_DRAIN_PER_ITER,
+            self.partition,
+            "past-deadline producer disconnected",
+        )
+    }
+
     pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
         let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
@@ -705,6 +731,9 @@ pub struct ResyncChannel {
     pub controller: ResyncController,
     pub floor_tx: Sender<FloorUpdate>,
     pub reject_tx: Sender<(Address, u64, u64)>,
+    /// `(sender, nonce, max_inclusion_block, at_block)`. The sealer
+    /// refused these for being late, and no copy of them can be ordered.
+    pub deadline_tx: Sender<(Address, u64, u64, u64)>,
     pub watermark: SharedWatermark,
 }
 
@@ -742,13 +771,24 @@ impl ResyncChannel {
         })?;
         let (floor_tx, floor_rx) = crossbeam_channel::bounded(cap);
         let (reject_tx, reject_rx) = crossbeam_channel::bounded(cap);
+        // A past-deadline reject is rare next to a contiguity reject: it
+        // needs a replica to stall past the whole horizon. A small bound
+        // is enough, and it keeps the up-front allocation where it was.
+        let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(DEADLINE_CHANNEL_BOUND);
         let watermark = SharedWatermark::new();
-        let controller =
-            ResyncController::new(cfg, partition, floor_rx, reject_rx, watermark.clone())?;
+        let controller = ResyncController::new(
+            cfg,
+            partition,
+            floor_rx,
+            reject_rx,
+            deadline_rx,
+            watermark.clone(),
+        )?;
         Ok(Self {
             controller,
             floor_tx,
             reject_tx,
+            deadline_tx,
             watermark,
         })
     }
