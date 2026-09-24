@@ -138,7 +138,7 @@ public final class SealerWire {
      * generates this record itself. It removes the transaction reference at
      * {@code index} from the chain. Matches Rust {@code RT_VOID}.
      */
-    public static final byte RT_VOID = 4;
+    public static final byte RT_VOID = io.kardamom.sealer.VoidLedger.RT_VOID;
 
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;

@@ -74,7 +74,7 @@ public final class CanonicalSealerState {
      * (trust-on-first-sight). A cluster can upgrade in place without a
      * coordinated snapshot migration.
      */
-    private static final int SNAPSHOT_VERSION = 5;
+    private static final int SNAPSHOT_VERSION = 6;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -169,6 +169,13 @@ public final class CanonicalSealerState {
      */
     private final Set<Long> remoteOriginAllowlist;
 
+    /**
+     * The void ledger: which ordered transaction references can still be
+     * removed, and which voters have asked for a removal. See
+     * {@link #onVoidRequest}.
+     */
+    private VoidLedger voids;
+
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
 
@@ -221,6 +228,18 @@ public final class CanonicalSealerState {
      *        batches from; empty disables interop
      */
     public CanonicalSealerState(int dedupCapacity, long initialBlockNumber, Set<Long> remoteOrigins) {
+        this(dedupCapacity, initialBlockNumber, remoteOrigins, VoidLedger.Config.DISABLED);
+    }
+
+    /**
+     * Create a state at genesis with a remote-origin allowlist and a void
+     * configuration.
+     *
+     * @param voidConfig the void window and the voter set;
+     *        {@link VoidLedger.Config#DISABLED} refuses every void request
+     */
+    public CanonicalSealerState(
+            int dedupCapacity, long initialBlockNumber, Set<Long> remoteOrigins, VoidLedger.Config voidConfig) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
@@ -234,6 +253,7 @@ public final class CanonicalSealerState {
             }
         };
         this.remoteOrigins = new LinkedHashMap<>();
+        this.voids = new VoidLedger(voidConfig);
         this.canonicalCount = 0L;
         this.blockNumber = initialBlockNumber;
         this.l1Origin = 0L;
@@ -354,11 +374,65 @@ public final class CanonicalSealerState {
                 return RecordOutcome.rejected(expected.longValue());
             }
             expectedNonce.put(senderKey, nonce + 1);
+            voids.onReference(canonicalCount, canonicalId32, sender20, nonce);
         }
         insertFresh(key);
         long index = canonicalCount;
         canonicalCount++;
         return RecordOutcome.relayed(new Relayed(index, payload));
+    }
+
+    /** The result of one void request: the vote, and the void record when the vote decided it. */
+    public static final class VoidOutcome {
+        public final VoidLedger.Vote vote;
+        public final Optional<Relayed> relayed;
+
+        private VoidOutcome(VoidLedger.Vote vote, Optional<Relayed> relayed) {
+            this.vote = vote;
+            this.relayed = relayed;
+        }
+    }
+
+    /**
+     * Count the vote of one consumer for the removal of the transaction
+     * reference at {@code index}. The consumer votes when it has no envelope
+     * for the entry and every archive refuses the range.
+     *
+     * <p>When every configured voter has voted, the state removes the entry:</p>
+     * <ul>
+     *   <li>It appends a void record, which takes the next canonical index.
+     *       Every consumer drops the entry when it reads the record.</li>
+     *   <li>It removes the hash from the dedup window. The sender submits
+     *       the same signed bytes again, and the window must not absorb them
+     *       as a duplicate.</li>
+     *   <li>It sets the sender's expected nonce back to the nonce of the
+     *       entry. If it did not, the contiguity guard would refuse the new
+     *       submit. An evicted sender re-seeds on its next record, so it
+     *       needs no change.</li>
+     * </ul>
+     *
+     * <p>A void never waits on a clock. The decision is a function of the
+     * ordered votes only, so every member appends the same record at the
+     * same index.</p>
+     */
+    public VoidOutcome onVoidRequest(int voterId, long index, byte[] txHash32) {
+        checkId(txHash32);
+        VoidLedger.Tally tally = voids.onVote(voterId, index, txHash32, canonicalCount);
+        return new VoidOutcome(tally.vote, tally.entry.map(this::appendVoid));
+    }
+
+    private Relayed appendVoid(VoidLedger.Entry entry) {
+        dedup.remove(ByteBuffer.wrap(entry.id).asReadOnlyBuffer());
+        expectedNonce.computeIfPresent(
+            ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(), (sender, expected) -> entry.nonce);
+        long voidIndex = canonicalCount;
+        canonicalCount++;
+        return new Relayed(voidIndex, VoidLedger.payload(entry));
+    }
+
+    /** The void ledger, for the vote counts that the service logs. */
+    public VoidLedger voids() {
+        return voids;
     }
 
     /**
@@ -737,7 +811,9 @@ public final class CanonicalSealerState {
      * and the version-4 peer map after the trio, so version-1 through
      * version-3 parsing stays byte-identical and older snapshots keep
      * loading. Version 5 widens each peer entry by 9 bytes (the lane
-     * cursor); a version-4 snapshot is parsed with the 16-byte entry.</p>
+     * cursor); a version-4 snapshot is parsed with the 16-byte entry.
+     * Version 6 adds the void ledger after the peer map: see
+     * {@link VoidLedger#writeTo}.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
@@ -746,7 +822,8 @@ public final class CanonicalSealerState {
         int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN
                 + 4 + senderCount * (SENDER_LEN + 8)
                 + 8 + 8 + 8
-                + 4 + remoteCount * REMOTE_ENTRY_LEN_V5;
+                + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
+                + voids.snapshotLen(canonicalCount);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -781,6 +858,8 @@ public final class CanonicalSealerState {
             buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
             buf.putLong(e.getValue().nextSeq);
         }
+        // v6 tail: the void window, then the open votes.
+        voids.writeTo(buf, canonicalCount);
         return buf.array();
     }
 
@@ -801,6 +880,18 @@ public final class CanonicalSealerState {
      * state), but its next record is rejected.
      */
     public static CanonicalSealerState load(byte[] snapshot, int dedupCapacity, Set<Long> remoteOrigins) {
+        return load(snapshot, dedupCapacity, remoteOrigins, VoidLedger.Config.DISABLED);
+    }
+
+    /**
+     * Restore a state with a remote-origin allowlist and a void
+     * configuration. The void configuration is not snapshot content. A
+     * snapshot from before version 6 restores an empty ledger: an entry from
+     * before the snapshot cannot be removed, and a consumer that waits at
+     * one stops as it did before.
+     */
+    public static CanonicalSealerState load(
+            byte[] snapshot, int dedupCapacity, Set<Long> remoteOrigins, VoidLedger.Config voidConfig) {
         ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
@@ -833,7 +924,8 @@ public final class CanonicalSealerState {
                             + buf.remaining() + " remaining");
         }
 
-        CanonicalSealerState state = new CanonicalSealerState(dedupCapacity, blockNumber, remoteOrigins);
+        CanonicalSealerState state =
+            new CanonicalSealerState(dedupCapacity, blockNumber, remoteOrigins, voidConfig);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
@@ -891,6 +983,9 @@ public final class CanonicalSealerState {
                 // and seeds its cursor from its next record.
                 state.remoteOrigins.put(originChainId, new RemotePeer(anchorNumber, nextSeqKnown, nextSeq));
             }
+        }
+        if (version >= 6) {
+            state.voids = VoidLedger.readFrom(buf, voidConfig);
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
