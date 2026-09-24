@@ -41,9 +41,24 @@ shortens, so it admits nothing the stamp would not.
 **Still open:** test-plan item 4. `sequencer-lapse` now reports how many
 re-offers the sealer refused for being late, but at the shard's 64-block horizon
 (128 s at the 2000 ms container tick) a 30 s freeze expires nothing, so the count
-reads zero. Making it the assertion this document asks for needs the shard's
-horizon set below its freeze length, on both the proxy and the sealer, and a
-cluster run to confirm the thawed backlog is refused rather than re-ordered.
+reads zero.
+
+Two things to get right when this becomes an assertion.
+
+- **The freeze must outlast the horizon, not merely approach it.** The dedup
+  lookup runs before the deadline check, and the twin's copy of a frozen
+  replica's transaction carries the same canonical id. While that id is still in
+  the window, the thawed replica's re-offer is absorbed as a duplicate, which is
+  the ordinary path and asserts nothing new. Only once the id's deadline has
+  passed does it leave the window, and only then is the re-offer refused as
+  late. So the freeze has to exceed the horizon, plus the margin the sealer's
+  clamp may take off.
+- **Lowering the horizon shard-wide is the wrong lever.** It applies to every
+  case in the shard, including the ones that stall the pipeline on purpose
+  (`cpu-squeeze`), where a short deadline would expire honest transactions and
+  the load's strict accounting would read that as loss. A dedicated case with a
+  freeze longer than the default horizon costs about three minutes of shard time
+  and leaves every other case untouched.
 
 ## Goal
 
