@@ -345,10 +345,22 @@ async fn spawn_node() -> anyhow::Result<Node> {
     })))
 }
 
+/// Attempts at the image build. The build installs packages from the
+/// distribution mirrors, and a reset there fails the whole test run.
+const IMAGE_BUILD_ATTEMPTS: u32 = 3;
+
+/// How long to wait before building the image again.
+const IMAGE_BUILD_RETRY_DELAY: Duration = Duration::from_secs(10);
+
 /// Runs `docker build` for the Aeron image once per test run; this is
 /// idempotent. This shells out to the docker CLI because
 /// testcontainers has no "build if missing" helper. Cached layers make
 /// repeat runs fast.
+///
+/// The build runs `apt-get` against the distribution mirrors, so it fails
+/// whenever one of them resets a connection. That is not a fault in the
+/// code under test, so the build runs again rather than failing the run.
+/// Cached layers make a retry cheap: it resumes at the failed step.
 async fn ensure_image_built() -> anyhow::Result<()> {
     use tokio::process::Command;
     let image_ref = format!("{AERON_IMAGE_NAME}:{AERON_IMAGE_TAG}");
@@ -361,13 +373,27 @@ async fn ensure_image_built() -> anyhow::Result<()> {
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let ctx = format!("{manifest_dir}/docker/aeron");
-    let status = Command::new("docker")
-        .args(["build", "-t", &image_ref, &ctx])
-        .status()
-        .await?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("docker build failed (status {status:?})"));
+    let mut attempt = 1;
+    loop {
+        let status = Command::new("docker")
+            .args(["build", "-t", &image_ref, &ctx])
+            .status()
+            .await?;
+        if status.success() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return Ok(());
+        }
+        if attempt == IMAGE_BUILD_ATTEMPTS {
+            return Err(anyhow::anyhow!(
+                "docker build failed after {IMAGE_BUILD_ATTEMPTS} attempts (status {status:?})"
+            ));
+        }
+        eprintln!(
+            "aeron image build attempt {attempt} of {IMAGE_BUILD_ATTEMPTS} failed; \
+             building again in {}s",
+            IMAGE_BUILD_RETRY_DELAY.as_secs()
+        );
+        tokio::time::sleep(IMAGE_BUILD_RETRY_DELAY).await;
+        attempt += 1;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(())
 }
