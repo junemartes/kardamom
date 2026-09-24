@@ -114,6 +114,10 @@ pub(crate) struct EgressWatermarkFeed {
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
+    /// `(sender, nonce, max_inclusion_block, at_block)`: the refs the
+    /// sealer refused for being late. The publish loop drops each one and
+    /// tells the client.
+    deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     /// Anchored at feed start, not `None`. The cluster emits a boundary
     /// every tick, so "never seen a boundary" past the silence window is
@@ -130,11 +134,13 @@ impl EgressWatermarkFeed {
         partition: u32,
         watermark: SharedWatermark,
         reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+        deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
     ) -> Self {
         Self {
             silence_ms,
             partition,
             watermark,
+            deadline_tx,
             reject_tx,
             last_boundary_at: Some(Instant::now()),
         }
@@ -225,14 +231,14 @@ impl EgressWatermarkFeed {
     /// `frame` was either, so the caller does not also check it for a
     /// boundary.
     ///
-    /// Both travel the contiguity-reject channel, which is the publish
-    /// loop's rewind path:
+    /// The two go to different places, because their remedies differ.
     ///
     /// - A window-full reject asks for the same ref again once the window
-    ///   prunes, so it rewinds from its own nonce.
-    /// - A past-deadline reject can never be accepted again, so it takes
-    ///   the "already committed" branch (`nonce < expected`), which drops
-    ///   the ledger entry instead of republishing it forever.
+    ///   prunes. It takes the contiguity-reject channel, the publish
+    ///   loop's rewind path, rewinding from its own nonce.
+    /// - A past-deadline reject can never be accepted, whoever offers it.
+    ///   It takes its own channel, so the publish loop drops the ledger
+    ///   entry and tells the client to sign again.
     fn on_deadline_frame(&mut self, frame: &[u8]) -> bool {
         match frame.first() {
             Some(&wire::EGRESS_KIND_PAST_DEADLINE) => {
@@ -251,7 +257,7 @@ impl EgressWatermarkFeed {
                         at_block,
                         "sealer past-deadline reject received; dropping the ref"
                     );
-                    self.forward_contiguity_reject(sender, nonce, nonce.saturating_add(1));
+                    self.forward_past_deadline(sender, nonce, max_inclusion_block, at_block);
                 }
                 true
             }

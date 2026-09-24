@@ -355,6 +355,7 @@ impl ResyncWiring {
             controller,
             floor_tx,
             reject_tx,
+            deadline_tx,
             watermark,
         } = kardamom_sequencer::resync::ResyncChannel::open(
             cfg.resync.clone(),
@@ -367,6 +368,7 @@ impl ResyncWiring {
             cfg.partition_index,
             watermark,
             reject_tx,
+            deadline_tx,
         )
         .spawn(cluster_egress, shutdown.clone());
 
