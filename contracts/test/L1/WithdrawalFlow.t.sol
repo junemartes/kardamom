@@ -192,7 +192,7 @@ contract WithdrawalFlowTest is Test {
     function test_revert_rolls_back_outputs_and_blocks_discarded_withdrawals() public {
         vm.deal(ALICE_L1, 10 ether);
         vm.prank(ALICE_L1);
-        lockbox.depositETH{value: 5 ether}(ALICE_L2, 0, hex"");
+        lockbox.depositETH{value: 5 ether}(ALICE_L2, 21_000, hex"");
 
         // Discarded history: Alice withdraws 4 ether at L2 block 100.
         bytes32 wlBad = _leaf(0, ALICE_L2, ALICE_L1, 4 ether);
