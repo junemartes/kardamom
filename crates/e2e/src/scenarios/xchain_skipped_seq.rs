@@ -192,7 +192,7 @@ pub async fn gap_halts_pair_not_chain(
     // clean shutdown would hide the halt from the orchestrator.
     let exit = watcher
         .proc
-        .wait_exit(Duration::from_secs(60))
+        .wait_exit(Duration::from_mins(1))
         .context("watcher did not exit after the seq gap — it skipped or stalled")?;
     anyhow::ensure!(
         exit.is_some_and(|code| code != 0),

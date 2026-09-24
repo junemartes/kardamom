@@ -583,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn join_submit_tasks_gives_up_at_deadline() {
         let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        tasks.spawn(async { tokio::time::sleep(Duration::from_mins(1)).await });
         join_submit_tasks(&mut tasks, Instant::now() + Duration::from_millis(50)).await;
         assert_eq!(tasks.len(), 1, "wedged task left behind after the deadline");
     }

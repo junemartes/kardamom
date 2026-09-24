@@ -97,7 +97,7 @@ pub(crate) async fn node_failure_executor(h: &mut Harness) -> anyhow::Result<()>
         dark_after.as_secs()
     ));
     h.assert_count("executor", 2, h.knobs.restart_slo).await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
     crate::log(format!(
         "node-failure: docker start {victim} (node returns)"
     ));
@@ -121,7 +121,7 @@ pub(crate) async fn node_replace_executor(h: &mut Harness) -> anyhow::Result<()>
     h.replace_node("executor-2", "node-replace").await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
     crate::log(
         "node-replace: executor placed on the new executor-2; waiting for it to catch up from empty disks",
     );
@@ -148,7 +148,7 @@ pub(crate) async fn state_checkpoint_restore(h: &mut Harness) -> anyhow::Result<
     wipe_state(h, &victim, "state-checkpoint-restore").await?;
     crate::log("state-checkpoint-restore: re-replicating checkpoints from executor-1");
     copy_checkpoint(h, &donor, &victim, baseline).await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
     h.evidence
@@ -156,7 +156,7 @@ pub(crate) async fn state_checkpoint_restore(h: &mut Harness) -> anyhow::Result<
             job: "executor",
             needle: RESTORED,
             baseline,
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_mins(2),
             interval: Duration::from_secs(6),
             streams: Streams::Both,
             fail_msg: "state-checkpoint-restore: executor-0 did NOT restore from checkpoint — fell back to genesis re-sync",
@@ -180,7 +180,7 @@ pub(crate) async fn replay_window_resync(h: &mut Harness) -> anyhow::Result<()> 
     crate::log("replay-window-resync: killing executor-1 + wiping its state DB and checkpoints");
     h.inject_hard(&[&victim], "executor").await?;
     wipe_state(h, &victim, "replay-window-resync").await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await?;
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
     h.assert_count("executor", 3, h.knobs.reschedule_slo)
         .await?;
     let (hs, victim_ref): (&Harness, &str) = (h, &victim);

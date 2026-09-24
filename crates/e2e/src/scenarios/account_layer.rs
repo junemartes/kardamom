@@ -206,7 +206,7 @@ pub async fn rows_verified(t: &Target, p: &Params) -> Result<()> {
     t.wait_validator_metric_above(
         VALIDATOR_ROWS_VERIFIED,
         0.0,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(250),
         "the validator verified the batch rows",
     )

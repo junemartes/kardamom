@@ -14,7 +14,7 @@
 //!   executor processes all 200 txs in B's canonical order, and emits
 //!   200 receipts in the same order.
 //! - `tx_ref_arriving_before_envelope_still_joins`: a race test. It
-//!   simulates about 30 ms of A-publisher lag. The `tx_ordering` reader
+//!   simulates about 30 ms of `tx_data` publisher lag. The `tx_ordering` reader
 //!   must spin and pick up the envelope once it lands.
 //!
 #![allow(

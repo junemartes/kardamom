@@ -21,7 +21,7 @@ fn spec(id: &str, topic: &str) -> RegistrationSpec {
             ]),
         },
         ttl: Duration::from_secs(10),
-        deregister_after: Duration::from_secs(60),
+        deregister_after: Duration::from_mins(1),
     }
 }
 

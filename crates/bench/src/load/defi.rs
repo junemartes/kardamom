@@ -279,8 +279,8 @@ pub fn deployment_txs(signers: &SignerSet, params: TxPlanParams) -> anyhow::Resu
 // merely slow one is waited out. The overall cap stays as a backstop
 // against waiting forever on a chain that advances but never includes
 // the transaction.
-const STALL_LIMIT: Duration = Duration::from_secs(60);
-const HARD_CAP: Duration = Duration::from_secs(600);
+const STALL_LIMIT: Duration = Duration::from_mins(1);
+const HARD_CAP: Duration = Duration::from_mins(10);
 
 async fn head_block(client: &HttpClient) -> Option<u64> {
     client

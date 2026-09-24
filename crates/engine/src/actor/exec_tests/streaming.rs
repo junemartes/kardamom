@@ -5,7 +5,6 @@ use alloy_primitives::{U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_types::BlockBoundary;
 
-use crate::exec_types::TxIndex;
 use crate::reader::ReaderToExec;
 use crate::state::StaticSnapshotSource;
 
@@ -82,22 +81,17 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
     let snap = crate::state::MockStateDatabase::builder().build();
 
     let rx_r2e = feed(vec![
-        ReaderToExec::Deposit {
-            tx_idx: TxIndex(0),
-            deposit: kardamom_types::Deposit {
-                source_hash: alloy_primitives::B256::repeat_byte(0x11),
-                from,
-                to: Some(from),
-                mint: 10u128.pow(18),
-                value: U256::ZERO,
-                gas_limit: 100_000,
-                is_system_transaction: false,
-                input: bytes::Bytes::default(),
-            },
-            position: pos(0),
-        },
+        ReaderToExec::Deposit(kardamom_types::Deposit {
+            source_hash: alloy_primitives::B256::repeat_byte(0x11),
+            from,
+            to: Some(from),
+            mint: 10u128.pow(18),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            is_system_transaction: false,
+            input: bytes::Bytes::default(),
+        }),
         ReaderToExec::Tx {
-            tx_idx: TxIndex(1),
             envelope: legacy(&signer, to, 1, 1_000),
             position: pos(64),
         },

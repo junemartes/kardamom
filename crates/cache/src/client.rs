@@ -538,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn a_cache_with_no_address_fails_at_once() {
         let outcome =
-            AccountCache::connect_waiting(&CacheConfig::default(), Duration::from_secs(60)).await;
+            AccountCache::connect_waiting(&CacheConfig::default(), Duration::from_mins(1)).await;
         let Err(error) = outcome else {
             panic!("a cache with no address must fail");
         };

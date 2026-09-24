@@ -10,6 +10,7 @@ use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta};
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 
+use super::exec_state::{BlockState, CommitPipeline};
 use super::exec_thread::{ExecState, Flow};
 use super::ports::StateWriterQueue;
 use super::types::{BalHandoff, BlockExecStrategy, ExecToCommit};
@@ -34,9 +35,10 @@ impl<W: ExecPorts> ExecState<W> {
         // Destructure by field: `delta` is borrowed mutably, while
         // `apply_block_close_actions` reads `parent` and `snapshot`.
         let Self {
-            delta,
-            parent,
-            snapshot,
+            block: BlockState { delta, .. },
+            commits: CommitPipeline {
+                parent, snapshot, ..
+            },
             ..
         } = self;
 
@@ -64,9 +66,9 @@ impl<W: ExecPorts> ExecState<W> {
     /// executor applied. `BlockBoundaryStart.end_tx_idx` carries the
     /// sealer's cumulative count of canonical records (`TxRef` and
     /// `DepositRef`) republished through the end of this block, encoded
-    /// through `BPosition::from_index`. `expected_tx_idx` tracks the same
-    /// count on the executor side: it advances once per applied Tx or
-    /// Deposit, and never resets. The two values must match.
+    /// through `BPosition::from_index`. `next_tx_idx` tracks the same
+    /// count on the executor side: it advances once per record, and never
+    /// resets. The two values must match.
     ///
     /// A mismatch means the executor's view of the canonical stream
     /// diverged from the sealer's: a lost, extra, or reordered record.
@@ -78,7 +80,7 @@ impl<W: ExecPorts> ExecState<W> {
         end_tx_idx: BPosition,
     ) -> Result<(), ExecutorError> {
         let want = end_tx_idx.as_index();
-        let have = self.expected_tx_idx.0;
+        let have = self.cursor.next_tx_idx.0;
         if want != have {
             tracing::error!(
                 block = block_number,
@@ -103,21 +105,21 @@ impl<W: ExecPorts> ExecState<W> {
     /// leaves the buffer and delta untouched: the streaming arms already
     /// built them.
     fn run_block_exec(&mut self, block_number: u64) -> Result<Flow, ExecutorError> {
-        let Some(exec_block) = self.block_exec.as_ref() else {
+        let Some(exec_block) = self.hooks.block_exec.as_ref() else {
             return Ok(Flow::Continue);
         };
         let env = self.exec_env(block_number);
         let apply_start = Instant::now();
         let out = exec_block.execute_block(
-            &self.snapshot,
-            self.parent.as_ref(),
-            &self.buffered,
+            &self.commits.snapshot,
+            self.commits.parent.as_ref(),
+            &self.block.buffered,
             env,
             block_number,
         )?;
-        *self.block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-        self.buffered.clear();
-        self.delta = out.delta;
+        *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+        self.block.buffered.clear();
+        self.block.delta = out.delta;
         // BAL parity across strategies: a capturing strategy hands its
         // folded per-block Bal here, so the boundary handoff below
         // publishes it the same way the streaming capture would. If a
@@ -126,8 +128,8 @@ impl<W: ExecPorts> ExecState<W> {
         // degrade to the sequential fallback with no signal. So this
         // combination logs a warning.
         match out.bal {
-            Some(b) => self.block_bal = b,
-            None if self.bal_tx.is_some() => {
+            Some(b) => self.block.bal = b,
+            None if self.hooks.bal_tx.is_some() => {
                 tracing::warn!(
                     block = block_number,
                     "block-exec strategy returned no BAL while BAL \
@@ -146,7 +148,7 @@ impl<W: ExecPorts> ExecState<W> {
             .try_for_each(|r| self.send_receipt(r, Vec::new()));
         let flow = match (head, last) {
             (ControlFlow::Continue(()), Some(r)) => {
-                let rows = self.delta.account_rows();
+                let rows = self.block.delta.account_rows();
                 self.send_receipt(r, rows)
             }
             (flow, _) => flow,
@@ -164,9 +166,9 @@ impl<W: ExecPorts> ExecState<W> {
         receipt: kardamom_types::Receipt,
         accounts: Vec<kardamom_types::AccountRow>,
     ) -> ControlFlow<()> {
-        self.block_receipts.push(receipt.clone());
+        self.block.receipts.push(receipt.clone());
         let item = kardamom_types::ReceiptRows { receipt, accounts };
-        match self.tx.send(ExecToCommit::Receipt(Box::new(item))) {
+        match self.io.tx.send(ExecToCommit::Receipt(Box::new(item))) {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         }
@@ -180,7 +182,7 @@ impl<W: ExecPorts> ExecState<W> {
     /// dropped send also means the publisher is gone mid-shutdown; this is
     /// not fatal.
     fn handoff_bal(&mut self, boundary: &BlockBoundary, pending: &PendingDelta) {
-        let Some(btx) = self.bal_tx.as_ref() else {
+        let Some(btx) = self.hooks.bal_tx.as_ref() else {
             return;
         };
         let block_number = boundary.block_number;
@@ -189,7 +191,7 @@ impl<W: ExecPorts> ExecState<W> {
             BalHandoff {
                 boundary: boundary.clone(),
                 delta: bal_delta,
-                bal: std::mem::take(&mut self.block_bal),
+                bal: std::mem::take(&mut self.block.bal),
             },
             block_number,
             BAL_HANDOFF,
@@ -202,16 +204,16 @@ impl<W: ExecPorts> ExecState<W> {
     /// counted, not the chain. Skips empty blocks; there is nothing to
     /// grade.
     fn handoff_shadow(&mut self, block_number: u64) {
-        let Some(stx) = self.shadow_tx.as_ref() else {
+        let Some(stx) = self.hooks.shadow_tx.as_ref() else {
             return;
         };
-        if self.shadow_captures.is_empty() && self.shadow_serial == 0 {
+        if self.block.shadow_captures.is_empty() && self.block.shadow_serial == 0 {
             return;
         }
         let blk = crate::shadow::ShadowBlock {
             block_number,
-            captures: std::mem::take(&mut self.shadow_captures),
-            serial_records: std::mem::take(&mut self.shadow_serial),
+            captures: std::mem::take(&mut self.block.shadow_captures),
+            serial_records: std::mem::take(&mut self.block.shadow_serial),
         };
         stx.try_handoff(blk, block_number, SHADOW_HANDOFF, || {
             metrics::counter!(
@@ -242,7 +244,7 @@ impl<W: ExecPorts> ExecState<W> {
 
         // Record the block's total execution time. Only record this when
         // the block had at least one tx; skip empty blocks.
-        if let Some(elapsed) = self.block_apply_elapsed.take() {
+        if let Some(elapsed) = self.block.apply_elapsed.take() {
             metrics::histogram!(crate::metrics::BLOCK_APPLY_DURATION_SECONDS)
                 .record(elapsed.as_secs_f64());
         }
@@ -250,7 +252,7 @@ impl<W: ExecPorts> ExecState<W> {
         // Block-close protocol actions (L1-governed feature flags).
         //
         // This call must happen here: after every record of the block has
-        // landed in `self.delta` (through the streaming arms above, or the
+        // landed in `self.block.delta` (through the streaming arms above, or the
         // whole-block strategy's fold above), and before the code takes the
         // delta for the writer. This order lets an upgrade deposit activate a
         // feature for the very block that carried it, and puts the actions'
@@ -288,37 +290,39 @@ impl<W: ExecPorts> ExecState<W> {
         // that window re-executes the block on recovery and re-publishes
         // byte-identical receipts. So tx_receipts is at-least-once, and
         // every consumer must dedup on `tx_idx` (ingress already does).
-        let pending = std::mem::take(&mut self.delta);
+        let pending = std::mem::take(&mut self.block.delta);
         // The block's execution scope dies with the block. The next block
         // gets a new parent layer and block env, and, once commits settle, a
         // fresh snapshot. This drop is unconditional: a scope reused across a
         // boundary would execute against the previous block's parent and env.
-        self.scope = None;
+        self.block.scope = None;
         self.handoff_bal(&boundary, &pending);
         self.handoff_shadow(block_number);
-        match self.parent.as_mut() {
+        match self.commits.parent.as_mut() {
             Some(m) => m.merge_from(&pending),
-            None => self.parent = Some(pending.clone()),
+            None => self.commits.parent = Some(pending.clone()),
         }
-        self.inflight.push_back((boundary.clone(), pending.clone()));
+        self.commits
+            .inflight
+            .push_back((boundary.clone(), pending.clone()));
         let bd: BlockDelta =
-            pending.finalize(block_number, std::mem::take(&mut self.block_receipts));
+            pending.finalize(block_number, std::mem::take(&mut self.block.receipts));
 
         // Submit without waiting. The commit settles at a later boundary's
         // sweep, or at the end of the stream.
-        self.sw_queue.submit(boundary, bd)?;
+        self.io.sw_queue.submit(boundary, bd)?;
         // `block_number` comes from `BlockBoundaryStart` on the wire; a
         // corrupt value near `u64::MAX` must not wrap the next block back
         // to 0 and re-execute the chain.
-        self.current_block = block_number.saturating_add(1);
-        self.tx_index_in_block = 0;
-        self.cumulative_gas_used = 0;
+        self.cursor.block = block_number.saturating_add(1);
+        self.block.tx_index = 0;
+        self.block.cumulative_gas_used = 0;
         // The next block's wall-clock timestamp arrives in its own
         // BlockBoundaryStart. Until then, keep the previous value as a
         // deterministic placeholder, for any tx that races ahead of the
         // sealer. In v0 the sealer is single-leader, so this branch is
         // purely defensive.
-        self.current_l2_ts = l2_timestamp;
+        self.cursor.l2_ts = l2_timestamp;
         Ok(Flow::Continue)
     }
 }

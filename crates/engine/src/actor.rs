@@ -28,11 +28,12 @@
 //!   tx_data[0..M]    tx_ordering
 //!        │                │
 //!        ▼                ▼
-//!   ┌─────────┐     ┌──────────┐
-//!   │M readers│──►  │B reader  │──► exec ──► commit ──► tx_receipts
-//!   │ (insert │join │(lookup+  │
-//!   │ buffer) │buf  │ forward) │
-//!   └─────────┘     └──────────┘
+//!   ┌─────────┐     ┌─────────────┐
+//!   │M readers│──►  │tx_ordering  │──► exec ──► commit ──► tx_receipts
+//!   │ (insert │join │reader       │
+//!   │ buffer) │buf  │(lookup +    │
+//!   │         │     │ forward)    │
+//!   └─────────┘     └─────────────┘
 //! ```
 //!
 //! In production, each of the M+1 reader threads that talks to Aeron owns
@@ -40,8 +41,8 @@
 //! OS thread. The threads coordinate through the `DashMap` join buffer and
 //! crossbeam channels.
 //!
-//! Module layout: this file holds the actor's assembly ([`Executor::new`]
-//! and [`Executor::run`]).
+//! Module layout: this file holds the actor's assembly ([`Executor::new`],
+//! [`Executor::spawn`], and [`Executor::run`]).
 //! The parts live in separate modules:
 //!
 //! - [`wiring`]: the [`EngineWiring`] port-type bundle and the grouped run
@@ -63,7 +64,6 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, bounded};
 
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 use crate::reader::{JoinBuffer, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 mod commit_thread;
@@ -109,10 +109,11 @@ pub(crate) use exec_thread::{ExecHooks, ExecInputs, ExecState};
 pub(crate) use types::ExecToCommit;
 
 /// The executor actor: the config, the inbound subscriptions, the outbound
-/// ports, the resume cursor, and the role hooks. [`Self::run`] spawns the
+/// ports, the resume cursor, and the role hooks. [`Self::spawn`] starts the
 /// M+3 threads (M `tx_data` readers, one `tx_ordering` reader, one exec
-/// thread, and one commit thread) and blocks until the `tx_ordering`
-/// subscription closes, or until an error occurs.
+/// thread, and one commit thread) and returns their handles. [`Self::run`]
+/// spawns them and blocks until the `tx_ordering` subscription closes, or
+/// until an error occurs.
 pub struct Executor<W: EngineWiring> {
     cfg: ExecutorConfig,
     inbound: Inbound<W>,
@@ -158,6 +159,14 @@ impl<W: EngineWiring + 'static> Executor<W> {
     /// reports a fatal error (for example, a `BoundaryMisaligned` or a
     /// proven receipt divergence).
     pub fn run(self) -> Result<(), ExecutorError> {
+        self.spawn().join()
+    }
+
+    /// Spawn the reader, exec, and commit threads and return their handles
+    /// without joining. [`Threads::join`] is the safe join; a caller that
+    /// joins the handles itself must join the pipeline before the `tx_data`
+    /// readers (see [`Threads`]).
+    pub fn spawn(self) -> Threads {
         let Self {
             cfg,
             inbound,
@@ -179,7 +188,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
             remote_epoch_observer,
         } = hooks;
 
-        let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg, &start);
+        let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth.get());
 
         let exec = ExecState::<W>::spawn(ExecInputs {
@@ -206,7 +215,6 @@ impl<W: EngineWiring + 'static> Executor<W> {
             exec,
             commit,
         }
-        .join()
     }
 }
 
@@ -230,7 +238,7 @@ impl<W: EngineWiring + 'static> Inbound<W> {
     /// handles are enough to surface an error. Returns the `tx_data`
     /// handles, the `tx_ordering` handle, and the exec thread's inbound
     /// channel.
-    fn spawn_readers(self, cfg: &ExecutorConfig, start: &ResumePoint) -> SpawnedReaders {
+    fn spawn_readers(self, cfg: &ExecutorConfig) -> SpawnedReaders {
         let Inbound {
             tx_data,
             tx_ordering,
@@ -247,10 +255,6 @@ impl<W: EngineWiring + 'static> Inbound<W> {
             buffer,
             cfg: cfg.reader.clone(),
             exec_out: tx_r2e,
-            // The canonical source delivers records from the start cursor.
-            // The reader checks indices assigned here against absolute
-            // boundary counts.
-            start_tx_idx: TxIndex(start.record_count),
             recovery_factory: join_recovery,
         });
         (tx_data_handles, tx_ordering_handle, rx_r2e)
@@ -258,13 +262,15 @@ impl<W: EngineWiring + 'static> Inbound<W> {
 }
 
 /// The M+3 spawned threads: M `tx_data` readers, one `tx_ordering` reader,
-/// one exec thread, one commit thread. Owns every handle, so `join`
-/// enforces the one join order that is safe.
-struct Threads {
-    tx_data: Vec<JoinHandle<ThreadResult>>,
-    tx_ordering: JoinHandle<ThreadResult>,
-    exec: JoinHandle<ThreadResult>,
-    commit: JoinHandle<ThreadResult>,
+/// one exec thread, one commit thread. [`Self::join`] enforces the one join
+/// order that is safe: the pipeline first, then the `tx_data` readers. A
+/// caller that joins the handles itself must keep that order, because a
+/// `tx_data` reader blocks in `next()` until its subscription closes.
+pub struct Threads {
+    pub(crate) tx_data: Vec<JoinHandle<ThreadResult>>,
+    pub(crate) tx_ordering: JoinHandle<ThreadResult>,
+    pub(crate) exec: JoinHandle<ThreadResult>,
+    pub(crate) commit: JoinHandle<ThreadResult>,
 }
 
 impl Threads {
@@ -274,7 +280,7 @@ impl Threads {
     ///
     /// Returns `Err` when any thread reports a fatal error (for example, a
     /// `BoundaryMisaligned` in exec).
-    fn join(self) -> Result<(), ExecutorError> {
+    pub fn join(self) -> Result<(), ExecutorError> {
         let Threads {
             tx_data,
             tx_ordering,
