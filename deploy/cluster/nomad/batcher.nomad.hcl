@@ -60,6 +60,12 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The void voter ids come from it."
+  default     = 3
+}
+
 variable "l1_rpc" {
   type        = string
   description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
@@ -152,6 +158,9 @@ job "batcher" {
           # Nomad dynamic port, so it never clashes with the validator's
           # on the same node.
           "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+          # The void voter id: the second id after the executors'
+          # (cluster.nomad.hcl builds the sealer's voter list the same way).
+          "--void-voter-id", format("%d", var.executor_count + 1),
           # Join-miss archive refetch (tx_data and tx_deposits). Same
           # contract as the validator's flags, on this allocation's
           # dynamic ports.

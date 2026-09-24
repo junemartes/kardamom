@@ -69,11 +69,16 @@ Q-of-N recorder design is preserved, marked superseded, in
 
 ## Host prerequisites
 
-**Quickest path:** from the repo root, `just cluster-bootstrap` installs the
-host tools below for your platform, and `just cluster-doctor` verifies them.
+**Quickest path:** from the repo root, `mise trust` then `mise run setup`
+installs the pinned CLI tools and Ansible collections. See the root
+[quick start](../../README.md#quick-start) for shell activation and native
+prerequisites. Install and start Docker separately, then run
+`mise exec -- just cluster-doctor` to check the host.
+`just cluster-bootstrap` remains available for OS-level installation.
 
 - Ansible (`ansible-playbook`) + collections:
-  `ansible-galaxy collection install ansible.posix community.docker community.general`.
+  `ansible-galaxy collection install -r deploy/cluster/ansible/requirements.yml`
+  from the repository root.
 - Docker (with the Buildx plugin) for the node containers and the image
   builds. The daemon must run privileged containers; on macOS or Windows
   that is Docker Desktop's Linux VM.
@@ -89,24 +94,29 @@ host tools below for your platform, and `just cluster-doctor` verifies them.
   images` / `just container-up` stage it into the `kardamom-cluster` image and
   fail loudly if it is missing.
 - The **Rust service binaries** in `target/release` (`cargo build --release
-  --bins` of the service crates, or the artifact of `scripts/ci/stage-cluster-dist.sh`):
+  --bins` of the service crates, or the artifact of `just stage-dist`):
   the image role wraps prebuilt binaries; nothing compiles inside an image.
 - **OpenTofu** (1.12.6, the version the CI pins).
 - Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
 
 ## Quick start
 
-Requires `just` 1.49.0 or newer. From the repository root, use
-`just --justfile deploy/cluster/justfile <recipe>`, or run in this directory:
+Requires `just` 1.49.0 or newer. Run these commands from the repository root
+or from this directory:
 
 ```sh
-cd deploy/cluster
 just container-up      # tofu apply → node contract → ansible/cluster.yml
 just container-test    # one shard's gates against that cluster (default: load)
 just container-down    # tofu destroy: containers and their volumes
 just container-reset   # destroy, then a fresh chain
 just shard chaos-executor   # one shard end to end, the way CI runs it
 ```
+
+All cluster recipes are also available from the root, including `just images`,
+`just deploy`, `just smoke`, `just validate`, `just check-contract`,
+`just container-diagnostics`, and `just clean`. The root shortcuts run in
+`deploy/cluster`, so relative paths and environment overrides behave the same
+as when invoked from this directory.
 
 The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in
 `crates/chaos/tests/shards.rs` (`load`, `semantics`, `chaos-executor`,
@@ -160,7 +170,7 @@ into the new node.
 
 CI builds once: a `build` job compiles the service binaries, the shard test
 executable, the operator binary and the sealer jar, and stages them as one
-artifact (`scripts/ci/stage-cluster-dist.sh`, the checkout's own layout). A
+artifact (`just stage-dist`, the checkout's own layout). A
 shard runner unpacks it and runs `just shard <name>` with `KARDAMOM_STAGED=1`,
 with no Rust toolchain, JDK or Foundry, and `container-diagnostics` on
 failure. `KARDAMOM_STAGED=1` makes the justfile run
@@ -277,8 +287,13 @@ may briefly reject a mismatched pair, but will never trust a partial manifest.
 `.github/workflows/release.yml` runs the same playbook against GHCR. A push to
 `main` publishes `ghcr.io/<owner>/kardamom-<image>:main-<commit>`. A
 `vMAJOR.MINOR.PATCH` tag on `main` publishes `:vMAJOR.MINOR.PATCH` and makes a
-GitHub release. The release carries `images.digests`, `images.digests.sigbundle`
-and `SHA256SUMS`. A `main` run keeps the same files as the workflow artifact
+GitHub release. The release carries `images.digests`, `images.digests.sigbundle`,
+the signed settlement deployer (`kardamom-deploy`, `kardamom-deploy.sigbundle`)
+and `SHA256SUMS`. A deployment passes the deployer as `DEPLOY_BIN`.
+
+Each run also pushes the release bundle `ghcr.io/<owner>/kardamom-release:<tag>`.
+It is one tar file with `images.digests`, `kardamom-deploy`, and their signature
+bundles. A deploy host can read it from the registry with the image tag. A `main` run keeps the same files as the workflow artifact
 `images-main-<commit>`.
 
 The job signs each image and the manifest as
@@ -473,7 +488,7 @@ binaries one `build` job staged):
 | `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
 | `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **member-rejoin** / **node-replace-sealer** / **cpu-squeeze** |
 | `chaos-fleet` | every replica of one role down at once: **cluster-quorum-loss-recover** (2 of 3 sealers) / **cluster-total-loss-recover** (all 3 sealers) / **executor-fleet-loss-recover** (all 3 executor nodes) / **executor-fleet-wipe-recover** (all 3 executor tasks, state DBs wiped, local checkpoints kept) / **executor-fleet-total-wipe-recover** (the executor job stopped, state DBs and checkpoints wiped, an executor image rebuilt from L1 installed on every node) / **redis-total-loss-recover** (the whole redis job stopped, then started empty; every mirror rebuilds from a checkpoint); every case ends with a recovery probe load that must land every transaction |
-| `chaos-coordinated` | failures that cross a role's redundancy or the roles: **ingress-pair-loss-recover** (both ingress tasks) / **sequencer-lane-loss-recover** (both replicas of lane 0; no ref may sit below a floor) (`pipeline-blackout-recover`, every pipeline node killed at once, exists and waits for a product fix before it joins the shard) |
+| `chaos-coordinated` | failures that cross a role's redundancy or the roles: **ingress-pair-loss-recover** (both ingress tasks) / **sequencer-lane-loss-recover** (both replicas of lane 0; no ref may sit below a floor) / **pipeline-blackout-recover** (every pipeline node killed at once; the consumers void an entry whose data the kill lost) |
 
 `kardamom-load` is the harness (`crates/bench/src/load/`, run in process);
 `crates/chaos` injects the failures under steady load and asserts Nomad

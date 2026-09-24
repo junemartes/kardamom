@@ -3,9 +3,10 @@
 
 use crossbeam_channel::Sender;
 
+use kardamom_cluster_adapter::OfferOutcome;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
+    BPosition, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage, VoidRecord,
 };
 
 use crate::delta::ParentState;
@@ -40,8 +41,8 @@ pub trait TxDataSubscription: Send {
 /// Subscription to `tx_ordering`, the canonical orderer.
 ///
 /// Yields tiny [`TxOrderingMessage`] records (`TxRef`, `DepositRef`, or
-/// `BoundaryStart`), each tagged with its canonical `BPosition`. The
-/// `BPosition` is the system's canonical L2 tx ordering (invariant I1).
+/// `BoundaryStart`), each tagged with its canonical `BPosition` — the
+/// system's canonical L2 tx order on `tx_ordering` (invariant I1).
 ///
 /// In production: `kardamom_log::TxOrderingSubscriber`, on a dedicated OS
 /// thread. In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.
@@ -51,6 +52,13 @@ pub trait TxOrderingSubscription: Send {
     /// Returns `Err(ExecutorError::TxOrderingClosed)` when the subscription
     /// closes cleanly, or another `ExecutorError` on a transport failure.
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
+
+    /// Ask the sealer to void `void`, as voter `voter_id`. The default has
+    /// no sealer to ask, so it reports no connection. Only the cluster
+    /// subscription has a session that carries the vote.
+    fn vote(&mut self, _voter_id: u8, _void: &VoidRecord) -> OfferOutcome {
+        OfferOutcome::NotConnected
+    }
 }
 
 /// Archive-backed envelope recovery for join misses.
@@ -116,6 +124,12 @@ impl JoinRecovery {
         Ok(self
             .refetcher
             .fetch_tx_data(stream_id, session_id, from, sink)?)
+    }
+
+    /// The `tx_data` archives that a refetch asks now, as `host:port`.
+    #[must_use]
+    pub fn tx_data_archives(&self) -> Vec<String> {
+        self.refetcher.tx_data_archives()
     }
 }
 

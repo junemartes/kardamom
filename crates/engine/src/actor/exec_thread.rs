@@ -94,32 +94,15 @@ impl<W: ExecPorts> ExecState<W> {
     /// Dispatch one canonical-stream message to its handler.
     fn dispatch(&mut self, msg: ReaderToExec) -> Result<Flow, ExecutorError> {
         match msg {
-            ReaderToExec::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => self.on_tx(tx_idx, envelope, position),
-            ReaderToExec::Epoch {
-                tx_idx,
-                epoch,
-                position,
-            } => self.on_epoch(tx_idx, &epoch, position),
-            ReaderToExec::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => self.on_deposit(tx_idx, deposit, position),
-            ReaderToExec::RemoteEpoch {
-                tx_idx,
-                record,
-                position,
-            } => self.on_remote_epoch(tx_idx, &record, position),
+            ReaderToExec::Tx { envelope, position } => self.on_tx(envelope, position),
+            ReaderToExec::Epoch(epoch) => self.on_epoch(&epoch),
+            ReaderToExec::Deposit(deposit) => self.on_deposit(deposit),
+            ReaderToExec::RemoteEpoch(record) => self.on_remote_epoch(&record),
             ReaderToExec::XChain {
-                tx_idx,
                 origin_chain_id,
                 message,
-                position,
-            } => self.on_xchain(tx_idx, origin_chain_id, message, position),
+            } => self.on_xchain(origin_chain_id, message),
+            ReaderToExec::Vacant { position } => self.on_vacant(position),
             ReaderToExec::Boundary(start) => self.on_boundary(&start),
         }
     }
@@ -129,13 +112,13 @@ impl<W: ExecPorts> ExecState<W> {
     /// in flight, the wait blocks indefinitely, because there is nothing to
     /// settle.
     fn recv_next(&self) -> Recv {
-        if self.inflight.is_empty() {
-            match self.rx.recv() {
+        if self.commits.inflight.is_empty() {
+            match self.io.rx.recv() {
                 Ok(m) => Recv::Msg(m),
                 Err(_) => Recv::Closed,
             }
         } else {
-            match self.rx.recv_timeout(IDLE_SETTLE_PROBE) {
+            match self.io.rx.recv_timeout(IDLE_SETTLE_PROBE) {
                 Ok(m) => Recv::Msg(m),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => Recv::IdleProbe,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Recv::Closed,

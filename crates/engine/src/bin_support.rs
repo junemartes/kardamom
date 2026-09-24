@@ -132,7 +132,7 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
     if resuming {
         Duration::from_secs(30)
     } else {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     }
 }
 
@@ -345,8 +345,10 @@ pub fn cluster_replay_cursor(start: &crate::ResumePoint) -> crate::reader::clust
 /// Cluster (Raft) egress, behind the replay and dedup adapter. This is
 /// public so a binary's `EngineWiring` can name it as its `TxOrdering`
 /// type, without a direct `kardamom-cluster-adapter` dependency.
-pub type LiveTxOrderingSub =
-    crate::reader::cluster::ClusterTxOrderingSubscription<kardamom_cluster_adapter::LiveEgress>;
+pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscription<
+    kardamom_cluster_adapter::LiveEgress,
+    kardamom_cluster_adapter::LiveIngress,
+>;
 
 /// Spawn a dedicated cluster Aeron runtime, on its own thread, using the
 /// same aeron dir. The cluster session must never contend with `tx_data` or

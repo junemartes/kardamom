@@ -90,7 +90,7 @@ contract WithdrawalFlowTest is Test {
         // 1. Deposits fund the lockbox (the on-ramp already works).
         vm.deal(ALICE_L1, 10 ether);
         vm.prank(ALICE_L1);
-        lockbox.depositETH{value: 6 ether}(ALICE_L2, 0, hex"");
+        lockbox.depositETH{value: 6 ether}(ALICE_L2, 21_000, hex"");
         assertEq(address(lockbox).balance, 6 ether);
 
         // 2. Two withdrawals were initiated on L2 in this output's block range.
@@ -132,7 +132,7 @@ contract WithdrawalFlowTest is Test {
     function test_challenge_blocks_finalization() public {
         vm.deal(ALICE_L1, 10 ether);
         vm.prank(ALICE_L1);
-        lockbox.depositETH{value: 5 ether}(ALICE_L2, 0, hex"");
+        lockbox.depositETH{value: 5 ether}(ALICE_L2, 21_000, hex"");
 
         bytes32 wlAlice = _leaf(0, ALICE_L2, ALICE_L1, 1 ether);
         bytes32 withdrawalsRoot = _hashLeaf(wlAlice); // single-leaf tree
@@ -161,7 +161,7 @@ contract WithdrawalFlowTest is Test {
     function test_challenged_range_reattested_and_finalized() public {
         vm.deal(ALICE_L1, 10 ether);
         vm.prank(ALICE_L1);
-        lockbox.depositETH{value: 5 ether}(ALICE_L2, 0, hex"");
+        lockbox.depositETH{value: 5 ether}(ALICE_L2, 21_000, hex"");
 
         // Bad output for range ending at block 100 gets challenged away.
         vm.prank(ATTESTER);
@@ -192,7 +192,7 @@ contract WithdrawalFlowTest is Test {
     function test_revert_rolls_back_outputs_and_blocks_discarded_withdrawals() public {
         vm.deal(ALICE_L1, 10 ether);
         vm.prank(ALICE_L1);
-        lockbox.depositETH{value: 5 ether}(ALICE_L2, 0, hex"");
+        lockbox.depositETH{value: 5 ether}(ALICE_L2, 21_000, hex"");
 
         // Discarded history: Alice withdraws 4 ether at L2 block 100.
         bytes32 wlBad = _leaf(0, ALICE_L2, ALICE_L1, 4 ether);

@@ -110,3 +110,9 @@ pub const MAX_MESSAGE_GAS: u64 = 10_000_000;
 /// Largest `data` length the origin `Outbox` accepts for one message. This
 /// mirrors `Outbox.MAX_DATA_BYTES` (`contracts/src/L2/Outbox.sol`).
 pub const MAX_DATA_BYTES: usize = 65_536;
+
+/// Largest hop budget of a user-initiated send. Mirrors `Outbox.MAX_HOPS`.
+/// A send made inside a delivery carries one hop less than the delivery it
+/// runs in, so one paid send starts at most this many derived sends along
+/// any chain of deliveries.
+pub const MAX_HOPS: u8 = 4;

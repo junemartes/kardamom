@@ -143,18 +143,30 @@ contract CheckpointMarker {
     }
 
     /// @dev Opens `round` at this block and sends its marker on every lane.
+    ///      The Outbox hop rule (audit H6) bounds the marker echo: the timer
+    ///      starts a chain of markers at `Outbox.MAX_HOPS`, and a marker
+    ///      received with budget `h` forwards with `h - 1`. A marker
+    ///      received with no budget opens the round and forwards nothing. In
+    ///      a mesh every peer is one hop from the timer, so the cut is
+    ///      complete before the budget ends.
     function _open(uint64 round, uint64 trigger) internal {
         lastRound = round;
         roundBlock[round] = uint64(block.number);
         emit RoundOpened(round, uint64(block.number), trigger);
 
+        uint8 hops = Outbox(XChain.OUTBOX).MAX_HOPS();
+        if (XChain.inbox().inDelivery()) {
+            uint8 current = XChain.inbox().currentHops();
+            if (current == 0) return;
+            hops = current - 1;
+        }
         bytes memory data = abi.encodeCall(this.onMarker, (round));
         XChain.Callback memory noCb = XChain.Callback(address(0), 0, bytes32(0));
         uint256 n = _peers.length;
         for (uint256 i = 0; i < n; i++) {
             uint64 dest = _peers[i];
             uint64 seq = Outbox(XChain.OUTBOX)
-                .sendMessage(dest, XChain.CHECKPOINT_MARKER, MARKER_GAS, data, noCb);
+                .sendMessage(dest, XChain.CHECKPOINT_MARKER, MARKER_GAS, hops, data, noCb);
             emit MarkerSent(round, dest, seq);
         }
     }

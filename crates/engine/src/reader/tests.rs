@@ -3,10 +3,9 @@
 use std::thread;
 use std::time::Duration;
 
-use super::join::{DedupWindow, TxDataKey};
+use super::join::TxDataKey;
 use super::*;
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::bounded;
@@ -37,14 +36,10 @@ fn drain(rx: &crossbeam_channel::Receiver<ReaderToExec>) -> Vec<ReaderToExec> {
 }
 
 /// Assert that `got` is the `i`th deposit of an expanded epoch: it must
-/// carry slot `1 + i` (deposits occupy slots 1..=N, in L1 log order) and
-/// `expected`'s source hash.
+/// carry `expected`'s source hash.
 fn assert_deposit_at(i: usize, expected: &Deposit, got: &ReaderToExec) {
     match got {
-        ReaderToExec::Deposit {
-            tx_idx, deposit, ..
-        } => {
-            assert_eq!(*tx_idx, TxIndex(1 + i as u64));
+        ReaderToExec::Deposit(deposit) => {
             assert_eq!(deposit.source_hash, expected.source_hash);
         }
         other => panic!("expected Deposit at {i}, got {other:?}"),
@@ -52,10 +47,7 @@ fn assert_deposit_at(i: usize, expected: &Deposit, got: &ReaderToExec) {
 }
 
 /// Assert that `got` is the `i`th message of an expanded remote-epoch
-/// record for `origin`: it must carry slot `1 + i` (its own slot
-/// position, not the record's shared position — every position-keyed
-/// receipt consumer needs a distinct position per message) and
-/// `expected`'s source hash.
+/// record for `origin`: it must carry `expected`'s source hash.
 pub(super) fn assert_xchain_at(
     i: usize,
     origin: u64,
@@ -64,19 +56,11 @@ pub(super) fn assert_xchain_at(
 ) {
     match got {
         ReaderToExec::XChain {
-            tx_idx,
             origin_chain_id,
             message,
-            position,
         } => {
-            assert_eq!(*tx_idx, TxIndex(1 + i as u64));
             assert_eq!(*origin_chain_id, origin);
             assert_eq!(message.source_hash, expected.source_hash);
-            assert_eq!(
-                *position,
-                BPosition::from_index(1 + i as u64),
-                "message {i} must carry its own slot position"
-            );
         }
         other => panic!("expected XChain at {i}, got {other:?}"),
     }
@@ -141,7 +125,6 @@ pub(super) fn run_ordering(
         buffer: buf,
         cfg,
         exec_out: tx,
-        start_tx_idx: TxIndex::ZERO,
         recovery_factory: None,
     });
     h.join().expect("no panic")?;
@@ -210,21 +193,11 @@ fn channel_b_reader_emits_tx_and_boundary_in_canonical_order() {
     .expect("ok");
     assert_eq!(out.len(), 3);
     match &out[0] {
-        ReaderToExec::Tx {
-            tx_idx, position, ..
-        } => {
-            assert_eq!(*tx_idx, TxIndex(0));
-            assert_eq!(*position, pos(0));
-        }
+        ReaderToExec::Tx { position, .. } => assert_eq!(*position, pos(0)),
         _ => panic!("expected Tx"),
     }
     match &out[1] {
-        ReaderToExec::Tx {
-            tx_idx, position, ..
-        } => {
-            assert_eq!(*tx_idx, TxIndex(1));
-            assert_eq!(*position, pos(16));
-        }
+        ReaderToExec::Tx { position, .. } => assert_eq!(*position, pos(16)),
         _ => panic!("expected Tx"),
     }
     match &out[2] {
@@ -274,12 +247,7 @@ fn channel_b_reader_expands_an_epoch_into_marker_plus_deposits() {
     .expect("ok");
     assert_eq!(out.len(), 5, "marker + 3 deposits + boundary");
     match &out[0] {
-        ReaderToExec::Epoch {
-            tx_idx, epoch: e, ..
-        } => {
-            assert_eq!(*tx_idx, TxIndex(0));
-            assert_eq!(e.l1_number, 4_242);
-        }
+        ReaderToExec::Epoch(e) => assert_eq!(e.l1_number, 4_242),
         other => panic!("expected Epoch marker, got {other:?}"),
     }
     for (i, expected) in deposits.iter().enumerate() {
@@ -289,31 +257,6 @@ fn channel_b_reader_expands_an_epoch_into_marker_plus_deposits() {
         ReaderToExec::Boundary(b) => assert_eq!(b.end_tx_idx, pos(4)),
         other => panic!("expected Boundary, got {other:?}"),
     }
-}
-
-/// A duplicate epoch from a racing sequencer must dispatch nothing. A
-/// second expansion would double-apply every deposit in it.
-#[test]
-fn channel_b_reader_drops_a_duplicate_epoch() {
-    let epoch = EpochRecord {
-        l1_number: 7,
-        l1_hash: alloy_primitives::B256::repeat_byte(0xE2),
-        deposits: vec![Deposit {
-            source_hash: alloy_primitives::B256::repeat_byte(0xD9),
-            mint: 5,
-            ..Default::default()
-        }],
-    };
-    let out = run_ordering(
-        vec![
-            Ok((pos(0), TxOrderingMessage::Epoch(epoch.clone()))),
-            Ok((pos(2), TxOrderingMessage::Epoch(epoch))),
-        ],
-        JoinBuffer::new(),
-        ReaderConfig::default(),
-    )
-    .expect("ok");
-    assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
 }
 
 /// Race test: `TxRef` arrives before its envelope. The B reader spins,
@@ -352,7 +295,6 @@ fn channel_b_reader_tolerates_a_publisher_lag() {
         buffer: buf,
         cfg,
         exec_out: tx,
-        start_tx_idx: TxIndex::ZERO,
         recovery_factory: None,
     });
     h.join().expect("no panic").expect("ok");
@@ -391,52 +333,6 @@ fn channel_b_reader_join_timeout_aborts() {
             ..
         })
     ));
-}
-
-/// Duplicate `TxRef`s, from MDS racing-sequencer republications, collapse
-/// to a single exec dispatch. The join-buffer entry is taken only once.
-#[test]
-fn channel_b_reader_dedups_racing_sequencer_txrefs() {
-    let signer = PrivateKeySigner::random();
-    let buf = JoinBuffer::new();
-    let env = envelope(&signer, 0);
-    buf.insert(TxDataKey::new(2, 0, pos(0)), env.clone());
-
-    let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash, 2, pos(0), 0));
-    let out = run_ordering(
-        vec![
-            Ok((pos(0), dup.clone())),
-            Ok((pos(16), dup.clone())),
-            Ok((pos(32), dup)),
-        ],
-        buf,
-        ReaderConfig::default(),
-    )
-    .expect("ok");
-    assert_eq!(out.len(), 1, "P duplicates must collapse to one dispatch");
-    match &out[0] {
-        ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash, env.tx_hash),
-        _ => panic!("expected Tx"),
-    }
-}
-
-#[test]
-fn dedup_window_rejects_known_ids_and_evicts_fifo() {
-    let id = |b: u8| alloy_primitives::B256::repeat_byte(b);
-    let mut w = DedupWindow::new(std::num::NonZeroUsize::new(2).expect("2 is nonzero"));
-
-    assert!(w.first_seen(id(1)));
-    assert!(!w.first_seen(id(1)), "second sighting is a duplicate");
-    assert!(w.first_seen(id(2)));
-    // Window is [1, 2]; inserting 3 evicts 1 (oldest first).
-    assert!(w.first_seen(id(3)));
-    assert!(!w.first_seen(id(2)), "2 still inside the window");
-    assert!(!w.first_seen(id(3)), "3 still inside the window");
-    // 1 was evicted above, so it counts as fresh again (and its
-    // insertion evicts 2, keeping the window at capacity).
-    assert!(w.first_seen(id(1)), "evicted id is fresh again");
-    assert_eq!(w.seen.len(), 2);
-    assert_eq!(w.fifo.len(), 2);
 }
 
 /// Core proof for the I-A invariant. Under active/active ingress, two
@@ -542,4 +438,62 @@ fn reader_joins_two_sessions_at_same_position() {
         }
         _ => panic!("expected Tx"),
     }
+}
+
+fn range_absent(archive: &str) -> super::ports::JoinRecoveryError {
+    kardamom_log::error::LogError::RangeAbsent {
+        archive: archive.to_owned(),
+        detail: "recording 3 ended at position 2994688".to_owned(),
+    }
+    .into()
+}
+
+#[test]
+fn an_entry_is_unjoinable_only_when_every_archive_refused() {
+    let archives = vec!["10.0.0.1:8010".to_owned(), "10.0.0.2:8010".to_owned()];
+    let mut refused = super::join::RefusedArchives::default();
+    assert!(!refused.covers(&archives));
+
+    refused.note(&range_absent("10.0.0.1:8010"));
+    assert!(
+        !refused.covers(&archives),
+        "the second archive is still unknown"
+    );
+
+    refused.note(&range_absent("10.0.0.2:8010"));
+    assert!(refused.covers(&archives));
+}
+
+#[test]
+fn an_archive_that_did_not_answer_is_not_a_refusal() {
+    let archives = vec!["10.0.0.1:8010".to_owned(), "10.0.0.2:8010".to_owned()];
+    let mut refused = super::join::RefusedArchives::default();
+    refused.note(&range_absent("10.0.0.1:8010"));
+    refused.note(
+        &kardamom_log::error::LogError::Aeron("refetch: no endpoint reachable".into()).into(),
+    );
+
+    assert!(!refused.covers(&archives));
+}
+
+#[test]
+fn no_known_archive_is_no_answer() {
+    let mut refused = super::join::RefusedArchives::default();
+    refused.note(&range_absent("10.0.0.1:8010"));
+
+    assert!(!refused.covers(&[]));
+}
+
+#[test]
+fn a_join_with_no_recovery_times_out_and_is_not_unjoinable() {
+    let buffer = JoinBuffer::new();
+    let cfg = ReaderConfig {
+        join_timeout: Duration::from_millis(5),
+        ..ReaderConfig::default()
+    };
+    let mut recovery = None;
+    let tx_ref = kardamom_types::TxRef::default();
+    let wait = super::join::JoinWait::new(&buffer, &mut recovery, &tx_ref, &cfg).unwrap();
+
+    assert!(matches!(wait.run(), super::join::JoinOutcome::TimedOut));
 }

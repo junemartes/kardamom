@@ -183,7 +183,7 @@ impl<'a> ConsistencyRun<'a> {
             .wait_validator_metric_above(
                 super::VALIDATOR_BLOCKS_VERIFIED,
                 verified_before,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
                 Duration::from_millis(500),
                 "validator verifies the probe blocks",
             )

@@ -104,6 +104,12 @@ async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow::Result<()>
 /// Every job must return to its count, the sealers must elect a leader,
 /// an executor exporter must answer, both ingresses must be live, and
 /// the pipeline must progress.
+///
+/// The kill can lose the transaction data of an entry that the sealers
+/// already ordered. No consumer can execute that entry. Each consumer asks
+/// the sealer to void it, and the chain moves again only after the void
+/// record. The case prints the number of voided entries as evidence. It
+/// does not assert the number: a kill between two entries loses nothing.
 pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "pipeline-blackout-recover";
     let nodes = h.nodes.pipeline_nodes().await?;
@@ -127,5 +133,17 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     crate::log(format!("{ctx}: members elected memberId={leader}"));
     await_exporter_back(h, ctx).await?;
     h.assert_ingress_pair_live(ctx).await?;
-    h.assert_executor_progress(Duration::from_secs(180)).await
+    h.assert_executor_progress(Duration::from_mins(3)).await?;
+    let voided = h
+        .evidence
+        .count_lines(
+            CLUSTER_TASK,
+            "result=DECIDED",
+            crate::nomad::Streams::StdoutOnly,
+        )
+        .await?;
+    crate::log(format!(
+        "{ctx}: void decisions in the sealer logs: {voided} (one line per member per entry)"
+    ));
+    Ok(())
 }

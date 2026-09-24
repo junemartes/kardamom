@@ -1,6 +1,5 @@
 //! The `tx_ordering` reader's remote-epoch expansion: the marker plus one
-//! dispatch per message, and the racing-sequencer duplicate drop. The
-//! fixtures live in the sibling `tests` module.
+//! dispatch per message. The fixtures live in the sibling `tests` module.
 
 use std::num::NonZeroU64;
 
@@ -9,7 +8,6 @@ use kardamom_types::{BlockBoundaryStart, TxOrderingMessage};
 
 use super::tests::{assert_xchain_at, pos, run_ordering};
 use super::{JoinBuffer, ReaderConfig, ReaderToExec};
-use crate::exec_types::TxIndex;
 
 fn remote_record(origin: u64, first_seq: u64, n: NonZeroU64) -> RemoteEpochRecord {
     let message_at = |seq: u64| XChainMessage {
@@ -58,8 +56,7 @@ fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
     .expect("ok");
     assert_eq!(out.len(), 4, "marker + 2 messages + boundary");
     match &out[0] {
-        ReaderToExec::RemoteEpoch { tx_idx, record, .. } => {
-            assert_eq!(*tx_idx, TxIndex(0));
+        ReaderToExec::RemoteEpoch(record) => {
             assert_eq!(record.origin_chain_id, origin);
             assert_eq!(record.first_seq, 5);
         }
@@ -72,21 +69,4 @@ fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
         ReaderToExec::Boundary(b) => assert_eq!(b.end_tx_idx, pos(3)),
         other => panic!("expected Boundary, got {other:?}"),
     }
-}
-
-/// A duplicate remote epoch from a racing sequencer must dispatch
-/// nothing. A second expansion would double-deliver every message.
-#[test]
-fn channel_b_reader_drops_a_duplicate_remote_epoch() {
-    let rec = remote_record(412_346, 0, NonZeroU64::new(1).expect("1 is nonzero"));
-    let out = run_ordering(
-        vec![
-            Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
-            Ok((pos(2), TxOrderingMessage::RemoteEpoch(rec))),
-        ],
-        JoinBuffer::new(),
-        ReaderConfig::default(),
-    )
-    .expect("ok");
-    assert_eq!(out.len(), 2, "one marker + one message, not two of each");
 }

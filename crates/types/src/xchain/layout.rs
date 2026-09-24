@@ -46,10 +46,11 @@ impl Outbox {
     /// Solidity signature of `Outbox.sendMessage`. The callback struct
     /// flattens to its tuple type, as in [`super::INBOX_DELIVER_SIGNATURE`].
     pub const SEND_MESSAGE_SIGNATURE: &str =
-        "sendMessage(uint64,address,uint64,bytes,(address,uint64,bytes32))";
-    /// Solidity signature of the `Outbox.MessageSent` event.
+        "sendMessage(uint64,address,uint64,uint8,bytes,(address,uint64,bytes32))";
+    /// Solidity signature of the `Outbox.MessageSent` event. The `uint8`
+    /// after `gasLimit` is the hop budget (audit H6).
     pub const MESSAGE_SENT_SIGNATURE: &str = "MessageSent(uint64,uint64,address,address,uint256,\
-         uint64,bytes,bytes32,(address,uint64,bytes32))";
+         uint64,uint8,bytes,bytes32,(address,uint64,bytes32))";
 
     /// 4-byte function selector of [`Self::SEND_MESSAGE_SIGNATURE`].
     #[must_use]

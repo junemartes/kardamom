@@ -123,7 +123,7 @@ impl LocalStack {
         let mut spawned = services::spawn_sequencer_with(spec, index, opts)?;
         spawned
             .proc
-            .wait_for_log_line("tx_ordering via Aeron Cluster", Duration::from_secs(60))?;
+            .wait_for_log_line("tx_ordering via Aeron Cluster", Duration::from_mins(1))?;
         Ok(spawned)
     }
 
@@ -159,7 +159,7 @@ impl LocalStack {
         )?;
         respawned
             .proc
-            .wait_for_log_line("JSON-RPC listening", Duration::from_secs(60))?;
+            .wait_for_log_line("JSON-RPC listening", Duration::from_mins(1))?;
         self.ingress = respawned;
         Ok(())
     }

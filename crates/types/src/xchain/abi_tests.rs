@@ -17,6 +17,7 @@ sol! {
         address target,
         uint256 value,
         uint64 gasLimit,
+        uint8 hops,
         bytes data,
         SolCb cb
     );
@@ -32,6 +33,7 @@ fn wire_msg(data: &[u8], callback: Option<Callback>) -> XChainMessage {
         target: Address::repeat_byte(0xB9),
         value: 0,
         gas_limit: 250_000,
+        hops: 2,
         input: Bytes::copy_from_slice(data),
         callback,
     }
@@ -48,6 +50,7 @@ fn reference(origin_chain_id: u64, m: &XChainMessage) -> alloc::vec::Vec<u8> {
         target: m.target,
         value: U256::from(m.value),
         gasLimit: m.gas_limit,
+        hops: m.hops,
         data: AlloyBytes::copy_from_slice(m.input.as_ref()),
         cb: SolCb {
             target: cb.target,

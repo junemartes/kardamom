@@ -381,6 +381,13 @@ class RemoteOriginRecordTest {
      * cursor from its next record (trust-on-first-sight). The v4 bytes are
      * built explicitly, because a v5 entry is 9 bytes wider than a v4 one.
      */
+    /**
+     * The bytes after the version-3 origin trio in a snapshot with no peers
+     * and a disabled void ledger: the peer count (4), then the version-6
+     * void entry count (4) and vote count (4).
+     */
+    private static final int PEER_AND_VOID_TAIL = 3 * Integer.BYTES;
+
     @Test
     void a_v4_snapshot_loads_with_unknown_cursors() {
         CanonicalSealerState pre = state(8);
@@ -389,7 +396,7 @@ class RemoteOriginRecordTest {
         byte[] v5 = pre.takeSnapshot(); // no peers yet: remoteCount = 0
         // Append one v4 peer entry (origin 8 + anchor 8) and re-tag as v4.
         ByteBuffer v4 = ByteBuffer.allocate(v5.length + 16).order(ByteOrder.BIG_ENDIAN);
-        v4.put(v5, 0, v5.length - Integer.BYTES); // everything before remoteCount
+        v4.put(v5, 0, v5.length - PEER_AND_VOID_TAIL); // everything before remoteCount
         v4.putInt(1);
         v4.putLong(CHAIN_X);
         v4.putLong(700L);
@@ -424,8 +431,8 @@ class RemoteOriginRecordTest {
         pre.onRecord(id(1), payload("tx"));
         pre.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_000L);
         byte[] v5 = pre.takeSnapshot();
-        // Re-tag as v3 and drop the 4-byte peer-map count the tail added.
-        byte[] v3 = java.util.Arrays.copyOf(v5, v5.length - Integer.BYTES);
+        // Re-tag as v3 and drop what the later versions added after the trio.
+        byte[] v3 = java.util.Arrays.copyOf(v5, v5.length - PEER_AND_VOID_TAIL);
         ByteBuffer.wrap(v3).order(ByteOrder.BIG_ENDIAN).putInt(4, 3);
 
         CanonicalSealerState fromV3 = CanonicalSealerState.load(v3, 8, ALLOW);

@@ -11,12 +11,13 @@
 //! block on a remote-epoch origin advance, so a record's messages always
 //! execute at the head of the next block — are carried before that block's
 //! transactions, messages by VALUE including calldata, exactly as they
-//! travel the canonical stream. Only version 2 is accepted.
+//! travel the canonical stream. Versions 4 and 5 are accepted: a version 5
+//! block carries its cursor after the timestamp.
 //!
 //! ```text
 //! Header:
 //!   magic       4 bytes  'K' 'A' 'R' '1'
-//!   version     u8       currently 2
+//!   version     u8       4 (no block cursor) or 5 (block cursor)
 //!   flags       u8       bit 0 = zstd-compressed
 //!   block_count u32 LE
 //!   reserved    u16      zero
@@ -24,6 +25,7 @@
 //! For each block:
 //!   block_number       u64 LE
 //!   l2_timestamp       u64 LE
+//!   [version 5: end_tx_idx u64 LE, l1_origin u64 LE]
 //!   remote_epoch_count u32 LE
 //!   For each remote epoch (in canonical-stream order):
 //!     origin_chain_id  u64 LE
@@ -38,6 +40,7 @@
 //!       target         20 bytes
 //!       value          u128 LE
 //!       gas_limit      u64 LE
+//!       hops           u8
 //!       input_len      u32 LE
 //!       input          input_len bytes
 //!       has_callback   u8 (0 | 1)
@@ -78,11 +81,16 @@ use kardamom_types::xchain::{Callback, NonEmptyVec, RemoteEpochRecord, XChainMes
 use crate::error::BatcherError;
 
 pub const MAGIC: [u8; 4] = *b"KAR1";
-/// The current version. A block carries its [`BlockCursor`].
-pub const VERSION: u8 = 3;
-/// The version before the cursor. Old blobs on L1 stay readable; a
-/// state rebuilt through such a block has no resume cursor.
-pub const VERSION_NO_CURSOR: u8 = 2;
+/// The current version. A block carries its [`BlockCursor`], and every
+/// cross-chain message carries its `hops` byte (audit H6, #264).
+pub const VERSION: u8 = 5;
+/// The layout without a block cursor, with the `hops` byte. A state rebuilt
+/// through such a block has no resume cursor.
+///
+/// The `hops` byte changed every message, so both layouts got new numbers.
+/// Versions 2 and 3 (no `hops` byte) are not accepted: the contract change
+/// that added the hop budget also resets the chain.
+pub const VERSION_NO_CURSOR: u8 = 4;
 pub const FLAG_ZSTD: u8 = 0x01;
 
 const HEADER_LEN: usize = 4 + 1 + 1 + 4 + 2;
@@ -269,6 +277,7 @@ impl FrameWriter {
         self.0.extend_from_slice(msg.target.as_slice());
         self.0.extend_from_slice(&msg.value.to_le_bytes());
         self.0.extend_from_slice(&msg.gas_limit.to_le_bytes());
+        self.0.push(msg.hops);
         self.0.extend_from_slice(&input_len.to_le_bytes());
         self.0.extend_from_slice(msg.input.as_ref());
         match &msg.callback {
@@ -290,8 +299,8 @@ impl FrameWriter {
 
 /// Min `XChainMessage` size: `source_hash`(32) + `seq`(8) +
 /// `origin_sender`(20) + `target`(20) + `value`(16) + `gas_limit`(8) +
-/// `input_len`(4) + callback flag(1).
-const MIN_XCHAIN_MSG_BYTES: NonZeroUsize = NonZeroUsize::new(109).unwrap();
+/// `hops`(1) + `input_len`(4) + callback flag(1).
+const MIN_XCHAIN_MSG_BYTES: NonZeroUsize = NonZeroUsize::new(110).unwrap();
 
 /// Min `BlockFrame` size: `block_number`(8) + `l2_timestamp`(8) +
 /// `remote_epoch_count`(4) + `tx_count`(4).
@@ -334,9 +343,9 @@ pub fn decode(bytes: &[u8]) -> Result<Kar1Payload, BatcherError> {
 /// What a block header holds, by payload version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockLayout {
-    /// Version 2: block number and timestamp.
+    /// Version 4: block number and timestamp.
     NoCursor,
-    /// Version 3: the cursor follows the timestamp.
+    /// Version 5: the cursor follows the timestamp.
     WithCursor,
 }
 
@@ -497,6 +506,7 @@ impl<'a> Reader<'a> {
         let target = Address::from_slice(self.read_bytes(20)?);
         let value = self.read_u128_le()?;
         let gas_limit = self.read_u64_le()?;
+        let hops = self.read_u8()?;
         let input_len = self.read_u32_le()?;
         let input = Bytes::copy_from_slice(self.read_bytes(input_len as usize)?);
         let callback = match self.read_u8()? {
@@ -519,6 +529,7 @@ impl<'a> Reader<'a> {
             target,
             value,
             gas_limit,
+            hops,
             input,
             callback,
         })

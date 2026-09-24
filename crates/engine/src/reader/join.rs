@@ -1,7 +1,5 @@
-//! The join buffer, its config, and the dedup window and join wait that use
-//! it.
+//! The join buffer, its config, and the join wait that uses it.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +9,7 @@ use tracing::warn;
 
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
-use super::ports::JoinRecovery;
+use super::ports::{JoinRecovery, JoinRecoveryError};
 
 /// A `tx_data` join key: `(sequencer_id, session_id, tx_data_position)`.
 /// Here `sequencer_id` is the `tx_data` lane index (`TxRef::shard_id`),
@@ -95,7 +93,7 @@ impl JoinBuffer {
 pub struct ReaderConfig {
     /// Upper bound on how long the `tx_ordering` reader waits for a `TxRef`'s
     /// envelope to land on its `tx_data`. 100 ms matches the rule: a few µs of
-    /// A-publisher lag is fine, anything more is an upstream failure.
+    /// `tx_data` publisher lag is fine, anything more is an upstream failure.
     pub join_timeout: Duration,
     /// How long a join waits in-band before the first archive-refetch attempt,
     /// when a [`JoinRecovery`] is wired. Long enough that ordinary publisher lag
@@ -110,22 +108,15 @@ pub struct ReaderConfig {
     /// Soft warn threshold on the join buffer's size. Emits a `warn!` log when
     /// crossed. This applies no back-pressure; that is the publisher's job.
     pub buffer_warn_threshold: usize,
-    /// Capacity of the canonical-id dedup window on the `tx_ordering` reader.
-    /// Duplicates of one canonical id come from the P racing sequencers'
-    /// republications, which land close together, within the sequencers'
-    /// publish spread. So the window only has to outlast that spread, not the
-    /// whole stream. 2^20 ids (~32 MiB of hashes) gives ~10 s of headroom, even
-    /// at 100k tx/s.
-    ///
-    /// Zero would make [`DedupWindow::first_seen`] evict the id it just
-    /// inserted, turning dedup silently off: a duplicate `TxRef` would then
-    /// miss the join, execute twice, or misalign the next boundary. The type
-    /// makes that state unrepresentable.
-    pub dedup_window: NonZeroUsize,
+    /// This consumer's voter id at the sealer, or `None` for a consumer that
+    /// never votes. A voter asks the sealer to void an entry when every
+    /// archive refuses the entry's `tx_data` range. The sealer counts only
+    /// the ids in its voter list, so each executing consumer has its own id.
+    pub voter_id: Option<u8>,
+    /// How long a voter waits for the void record after its first vote. The
+    /// sealer keeps the vote, so a restart after this wait loses nothing.
+    pub void_wait: Duration,
 }
-
-/// Default [`ReaderConfig::dedup_window`] capacity: 2^20 ids.
-const DEFAULT_DEDUP_WINDOW: NonZeroUsize = NonZeroUsize::new(1 << 20).expect("1 << 20 is nonzero");
 
 impl Default for ReaderConfig {
     fn default() -> Self {
@@ -134,44 +125,47 @@ impl Default for ReaderConfig {
             join_refetch_after: Duration::from_secs(10),
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
-            dedup_window: DEFAULT_DEDUP_WINDOW,
+            voter_id: None,
+            void_wait: Duration::from_secs(120),
         }
     }
 }
 
-/// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
+/// How a join ended.
+pub(super) enum JoinOutcome {
+    /// The envelope arrived, live or from an archive.
+    Joined(TxEnvelope),
+    /// The budget ended, and every `tx_data` archive answered that it does
+    /// not hold the range. No retry and no restart can recover the entry.
+    Unjoinable,
+    /// The budget ended, and one archive or more gave no definite answer.
+    /// The data can still exist, so a restart can still recover the entry.
+    TimedOut,
+}
+
+/// The archives that answered "not here" during one join.
 ///
-/// `first_seen` returns `false` for an id already in the window. Once more
-/// than `capacity` ids are held, the oldest is evicted. This is safe,
-/// because duplicates of one canonical id (the racing sequencers'
-/// republications) arrive close together, well inside the window.
-pub(super) struct DedupWindow {
-    pub(super) seen: std::collections::HashSet<alloy_primitives::B256>,
-    pub(super) fifo: std::collections::VecDeque<alloy_primitives::B256>,
-    capacity: NonZeroUsize,
-}
+/// Only [`kardamom_log::error::LogError::RangeAbsent`] counts. An archive
+/// that is down, slow, or corrupt gives another error and stays outside the
+/// set, so [`Self::covers`] stays false while any copy is still unknown.
+#[derive(Default)]
+pub(super) struct RefusedArchives(std::collections::BTreeSet<String>);
 
-impl DedupWindow {
-    pub(super) fn new(capacity: NonZeroUsize) -> Self {
-        Self {
-            seen: std::collections::HashSet::new(),
-            fifo: std::collections::VecDeque::new(),
-            capacity,
+impl RefusedArchives {
+    pub(super) fn note(&mut self, error: &JoinRecoveryError) {
+        if let JoinRecoveryError::Archive(kardamom_log::error::LogError::RangeAbsent {
+            archive,
+            ..
+        }) = error
+        {
+            self.0.insert(archive.clone());
         }
     }
 
-    /// Record `id`. Return `false` if it is already in the window.
-    pub(super) fn first_seen(&mut self, id: alloy_primitives::B256) -> bool {
-        if !self.seen.insert(id) {
-            return false;
-        }
-        self.fifo.push_back(id);
-        if self.fifo.len() > self.capacity.get()
-            && let Some(evicted) = self.fifo.pop_front()
-        {
-            self.seen.remove(&evicted);
-        }
-        true
+    /// True when `archives` is not empty and each of them refused. An empty
+    /// list means discovery knows no archive, which is no answer at all.
+    pub(super) fn covers(&self, archives: &[String]) -> bool {
+        !archives.is_empty() && archives.iter().all(|a| self.0.contains(a))
     }
 }
 
@@ -190,6 +184,7 @@ pub(super) struct JoinWait<'a> {
     key: TxDataKey,
     deadline: Instant,
     recovery: &'a mut Option<JoinRecovery>,
+    refused: RefusedArchives,
 }
 
 impl<'a> JoinWait<'a> {
@@ -218,23 +213,40 @@ impl<'a> JoinWait<'a> {
             key: TxDataKey::from_ref(tx_ref),
             deadline,
             recovery,
+            refused: RefusedArchives::default(),
         })
     }
 
-    pub(super) fn run(mut self) -> Option<TxEnvelope> {
+    pub(super) fn run(mut self) -> JoinOutcome {
         let first_slice = match self.recovery {
             Some(_) => self.cfg.join_refetch_after.min(self.cfg.join_timeout),
             None => self.cfg.join_timeout,
         };
         if let Some(env) = self.wait_for(first_slice) {
-            return Some(env);
+            return JoinOutcome::Joined(env);
         }
         loop {
             match self.poll_once() {
-                JoinStep::GiveUp => return None,
-                JoinStep::Take(env) => return Some(env),
+                JoinStep::GiveUp => return self.give_up(),
+                JoinStep::Take(env) => return JoinOutcome::Joined(env),
                 JoinStep::Retry => (),
             }
+        }
+    }
+
+    /// The budget ended. The join always uses the whole budget first: a
+    /// refusal from every archive does not end it early, because the live
+    /// stream can still deliver the envelope.
+    fn give_up(&self) -> JoinOutcome {
+        let archives = self
+            .recovery
+            .as_ref()
+            .map(JoinRecovery::tx_data_archives)
+            .unwrap_or_default();
+        if self.refused.covers(&archives) {
+            JoinOutcome::Unjoinable
+        } else {
+            JoinOutcome::TimedOut
         }
     }
 
@@ -297,12 +309,15 @@ impl<'a> JoinWait<'a> {
                 recovered,
                 "archive refetch complete"
             ),
-            Err(e) => warn!(
-                target: "kardamom_executor::reader",
-                sequencer_id = key.shard,
-                error = %e,
-                "archive refetch failed; will retry within the join budget"
-            ),
+            Err(e) => {
+                warn!(
+                    target: "kardamom_executor::reader",
+                    sequencer_id = key.shard,
+                    error = %e,
+                    "archive refetch failed; will retry within the join budget"
+                );
+                self.refused.note(&e);
+            }
         }
     }
 

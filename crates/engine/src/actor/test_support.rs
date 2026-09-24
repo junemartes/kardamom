@@ -18,7 +18,6 @@ use kardamom_types::{
 use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 use crate::reader::{NoEpochCheck, NoRemoteEpochCheck, ReaderToExec, RemoteEpochObserver};
 use crate::state::MockStateDatabase;
 
@@ -60,10 +59,9 @@ pub(super) fn boundary_msg(block_number: u64, end_count: i32, l2_timestamp: u64)
     })
 }
 
-/// Build a `ReaderToExec::Tx` message: canonical index `idx` (used for
-/// both `tx_idx` and `position` — the common case where a tx's wire
-/// position matches its canonical count), a `legacy` transfer of `value`
-/// to `to` at nonce `nonce`.
+/// Build a `ReaderToExec::Tx` message at wire position `idx` (the common
+/// case where a tx's wire position matches its canonical count), a
+/// `legacy` transfer of `value` to `to` at nonce `nonce`.
 pub(super) fn tx_msg(
     signer: &PrivateKeySigner,
     to: Address,
@@ -72,7 +70,6 @@ pub(super) fn tx_msg(
     value: u64,
 ) -> ReaderToExec {
     ReaderToExec::Tx {
-        tx_idx: TxIndex(idx),
         envelope: legacy(signer, to, nonce, value),
         position: pos(i32::try_from(idx).expect("test fixture: idx fits in i32")),
     }
@@ -199,6 +196,7 @@ pub(super) fn remote_epoch_fixture(origin: u64, n: NonZeroU64) -> RemoteEpochRec
         target: Address::repeat_byte(0xB6),
         value: 0,
         gas_limit: 100_000,
+        hops: 0,
         input: bytes::Bytes::default(),
         callback: None,
     };
@@ -216,22 +214,11 @@ pub(super) fn remote_epoch_fixture(origin: u64, n: NonZeroU64) -> RemoteEpochRec
 pub(super) fn remote_epoch_records(record: RemoteEpochRecord) -> Vec<ReaderToExec> {
     let origin = record.origin_chain_id;
     let messages: Vec<XChainMessage> = record.messages.iter().cloned().collect();
-    let mut out = vec![ReaderToExec::RemoteEpoch {
-        tx_idx: TxIndex(0),
-        record: Box::new(record),
-        position: pos(0),
-    }];
-    out.extend(
-        messages
-            .into_iter()
-            .enumerate()
-            .map(|(i, message)| ReaderToExec::XChain {
-                tx_idx: TxIndex(1 + i as u64),
-                origin_chain_id: origin,
-                message: Box::new(message),
-                position: pos(1 + i32::try_from(i).expect("small test fixture")),
-            }),
-    );
+    let mut out = vec![ReaderToExec::RemoteEpoch(Box::new(record))];
+    out.extend(messages.into_iter().map(|message| ReaderToExec::XChain {
+        origin_chain_id: origin,
+        message: Box::new(message),
+    }));
     out
 }
 

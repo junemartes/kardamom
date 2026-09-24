@@ -29,7 +29,7 @@ const MAX_LANES: u32 = 8;
 const CONVERGE_SECS: u64 = 300;
 const METRIC_INTERVAL: Duration = Duration::from_secs(2);
 /// The metric waits get one TTL plus this margin.
-const WAIT_MARGIN: Duration = Duration::from_secs(60);
+const WAIT_MARGIN: Duration = Duration::from_mins(1);
 const RESYNC: &str = "kardamom_sequencer_resync_mode";
 const PENDING: &str = "kardamom_sequencer_pending_depth";
 const SHADOW: &str = "kardamom_sequencer_shadow_vslots";

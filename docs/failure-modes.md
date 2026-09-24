@@ -98,13 +98,53 @@ is left, or when the roles fail together:
   node stays, with the orchestrator and the L1. All nodes start in one call,
   with no arranged order. Every job must return to its count, the sealers
   must elect a leader within 180 s, both ingresses must be live, and the
-  pipeline must progress. **The case exists and is not in the shard yet: it
-  fails on an open product defect.** After the blackout every job returns and
-  a leader is elected, and then all three executors crash-loop on one
-  canonical entry whose transaction data no archive can serve (`join
-  timeout: TxRef ... not found within 30000 ms`, the archive refetch failing):
-  the sealer had ordered a reference to data that was lost with the nodes.
-  The chain is wedged for good. It joins the shard with that fix.
+  pipeline must progress. The blackout can lose the transaction data of an
+  entry that the sealer already ordered. Before the void rule below, all
+  three executors then crash-looped on that entry (`join timeout: TxRef ...
+  not found within 30000 ms`) and the chain was wedged for good. Now every
+  consumer votes, the sealer voids the entry, and the chain moves again. The
+  case prints the number of void decisions as evidence.
+
+**Removal of an entry that no consumer can execute (void).** The sealer
+orders a transaction reference before the archives make its data durable, so
+a failure such as the blackout above can leave an entry with no data. The
+sealer can remove such an entry with a canonical *void record*. The rule has
+no clock in it:
+
+- A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and
+  every archive refuses the range. A consumer that has the data never votes.
+- The sealer appends the void record only when **every** configured voter has
+  voted for the same `(index, tx_hash)`. One voter that is down blocks the
+  void, and the chain waits for it. This is the safe side: that voter can be
+  the one that executed the entry.
+- On a void the sealer removes the hash from its dedup window and sets the
+  sender's expected nonce back, so the sender can submit the same bytes again.
+
+Three constants bound the rule. Every member must run the same values.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `kardamom.cluster.voidVoters` | empty | The voter ids. Empty refuses every vote, which is the behavior before this rule. |
+| `kardamom.cluster.voidWindow` | 65536 (the egress retention) | The newest indices that a void can name. An older entry cannot be removed. |
+| `MAX_OPEN_VOTES` | 1024 | The most indices with open votes. More are refused. |
+
+The order path pays one 52-byte copy for each reference and no allocation.
+The votes and the window are in the snapshot (version 6). With voters
+configured, a full window adds 65536 x 68 bytes (about 4.4 MB) to each
+snapshot. A void needs the last vote before `voidWindow` more records are
+ordered after the entry: with live ingress at more than about 1000 records
+per second and a 60 s join budget, the entry leaves the window first, and the
+chain stops as it did before this rule.
+
+The voter list must equal the set of consumers that execute. The deploy
+builds both sides from the executor count: executor `i` votes with id `i`
+(`--void-voter-id`, its allocation index), the validator with the next id,
+the batcher with the one after, and `cluster.nomad.hcl` gives the sealer the
+same range. A consumer outside the list cannot stop a void. If it executed
+the entry, it stops with `VoidOfExecutedEntry` when it reads the void record.
+A consumer waits 120 s for the void record and then restarts; the sealer
+keeps its vote. A sender gets no notice of a void yet: the receipt never
+comes, and the sender submits again.
 
 **Durability of the Raft log.** The kill-based cases above prove the
 restart logic, not the durability against a power loss: a process kill or a
@@ -125,7 +165,8 @@ a test that cuts the power of a VM can prove this end to end.
   `last_committed_end_tx_position`) and replays the canonical stream from the
   Aeron archives via a replay-merge, skip-counting past the durable cursor.
   State is committed durably per block, so there is no double-apply and no
-  genesis re-sync; the `DedupWindow` absorbs any reconnect overlap.
+  genesis re-sync; the cluster subscription's canonical-index cursor drops
+  any reconnect overlap.
 - **Whole-node loss** (`node-failure-executor`) — with `distinct_hosts` there
   is no spare node to reschedule onto: the fleet degrades 3/3 → 2/3 and must
   keep progressing; the returned node rejoins to 3/3. Replicas are

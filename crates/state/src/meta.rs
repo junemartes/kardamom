@@ -9,7 +9,7 @@
 //! |--------------------------------------|--------------------------------|
 //! | `last_committed_block`               | `u64 BE`                       |
 //! | `last_committed_end_tx_position`     | `BPosition` (8 B, i32 BE + i32 BE) |
-//! | `last_fsynced_b_position`            | `BPosition` (8 B)              |
+//! | `last_fsynced_reader_position`       | `BPosition` (8 B)              |
 //! | `schema_version`                     | `u32 BE`                       |
 
 use kardamom_types::BPosition;
@@ -21,7 +21,7 @@ use crate::error::StateError;
 
 pub(crate) const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
 pub(crate) const KEY_LAST_COMMITTED_END_TX_POSITION: &[u8] = b"last_committed_end_tx_position";
-pub(crate) const KEY_LAST_FSYNCED_B_POSITION: &[u8] = b"last_fsynced_b_position";
+pub(crate) const KEY_LAST_FSYNCED_READER_POSITION: &[u8] = b"last_fsynced_reader_position";
 pub(crate) const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 /// A presence-only flag. It is written once, when genesis allocations are
 /// seeded into a fresh env (see `crate::genesis::seed_genesis`).
@@ -50,7 +50,7 @@ pub(crate) const KEY_STATE_ROOT: &[u8] = b"state_root";
 
 // The database refuses a version other than `SCHEMA_VERSION`; only
 // fresh-from-genesis is supported.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------- typed meta readers ----------
 //

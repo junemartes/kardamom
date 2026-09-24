@@ -2,7 +2,9 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 
@@ -91,6 +93,17 @@ final class ClusterNodeTest {
     }
 
     @Test
+    void parseVoidConfigMakesAVoterMaskAndRefusesATypo() {
+        assertEquals(0L, ClusterNode.parseVoidConfig(null, 16).voterMask);
+        assertEquals(0, ClusterNode.parseVoidConfig(" ", 16).capacity, "no voters keeps no window");
+        assertEquals(0b1_0111L, ClusterNode.parseVoidConfig("0, 1,2,4,", 16).voterMask);
+        assertEquals(16, ClusterNode.parseVoidConfig("0", 16).capacity);
+        // A typo is fatal, never a silently smaller voter set.
+        assertThrows(IllegalStateException.class, () -> ClusterNode.parseVoidConfig("0,x", 16));
+        assertThrows(IllegalStateException.class, () -> ClusterNode.parseVoidConfig("64", 16));
+    }
+
+    @Test
     void fileSyncLevelDefaultsToZeroAndRefusesAValueOutsideZeroToTwo() {
         final String key = "kardamom.cluster.fileSyncLevel";
         final String before = System.getProperty(key);
@@ -108,5 +121,16 @@ final class ClusterNodeTest {
                 System.setProperty(key, before);
             }
         }
+    }
+
+    @Test
+    void tornLastFragmentIsRecognisedThroughTheCauseChain() {
+        final RuntimeException torn = new RuntimeException("launch failed",
+            new io.aeron.archive.client.ArchiveException(
+                "ERROR - Found potentially incomplete last fragment straddling page boundary in file: /x/0-0.rec"
+                + "\nRun `ArchiveTool verify` for corrective action!"));
+        assertTrue(ClusterNode.isTornLastFragment(torn));
+        assertFalse(ClusterNode.isTornLastFragment(new IllegalStateException("active Mark file detected")));
+        assertFalse(ClusterNode.isTornLastFragment(new RuntimeException((String) null)));
     }
 }

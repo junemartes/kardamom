@@ -110,6 +110,7 @@ pub(crate) fn feed_msg(
         target,
         value: 0,
         gas_limit: 150_000,
+        hops: 0,
         data: AlloyBytes::copy_from_slice(data),
         callback,
     }
@@ -230,7 +231,7 @@ impl<'a> DeliveryRun<'a> {
         let last_seq = std::cell::Cell::new(U256::ZERO);
         metrics::poll_until(
             "executor state to settle on Inbox.nextSeq == 3",
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(300),
             async || self.nudge_once_if_unsettled(&last_seq).await,
         )
@@ -299,19 +300,28 @@ impl<'a> DeliveryRun<'a> {
             lane_nonce == U256::from(1),
             "Outbox.nonces[origin] = {lane_nonce}, expected 1 (the callback response)"
         );
-        let mut response_data = keccak256("onXChainResult(bool,bytes32,bytes32)")[..4].to_vec();
+        // `onXChainResult(requester, requestSeq, ok, retHash, truncated,
+        // context)` (audit H5): the requester is the origin sender of seq 2,
+        // the request seq is 2.
+        let mut response_data =
+            keccak256("onXChainResult(address,uint64,bool,bytes32,bool,bytes32)")[..4].to_vec();
+        response_data.extend_from_slice(address_word(Address::repeat_byte(0xA1)).as_slice());
+        response_data.extend_from_slice(u64_word(2).as_slice());
         let mut word = [0u8; 32];
         word[31] = 1; // success = true (an EOA call cannot revert)
         response_data.extend_from_slice(&word);
         response_data.extend_from_slice(keccak256([0u8; 0]).as_slice()); // empty return data
+        response_data.extend_from_slice(&[0u8; 32]); // truncated = false
         response_data.extend_from_slice(cb.context.as_slice());
-        // Responses never carry a callback — depth is capped at 1.
+        // Responses never carry a callback — depth is capped at 1 — and
+        // carry a zero hop budget.
         let response_leaf = XChainMessage {
             seq: 0,
             origin_sender: INBOX,
             target: cb.target,
             value: 0,
             gas_limit: cb.gas_limit,
+            hops: 0,
             input: bytes::Bytes::from(response_data),
             callback: None,
             ..Default::default()

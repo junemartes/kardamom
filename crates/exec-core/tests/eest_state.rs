@@ -12,7 +12,7 @@
 //! Latest-fork-only policy: only `post.Osaka` entries run; every other
 //! fork key is ignored. A fork bump changes [`FORK`] here, alongside
 //! `block_env::SPEC_ID` and the fixture tag in
-//! `scripts/fetch-eest-fixtures.sh`.
+//! `just eest-fixtures`.
 //!
 //! Expected failures live in `tests/eest_expected_failures.json`. This
 //! is the precise, versioned statement of where kardamom's execution

@@ -49,12 +49,13 @@ fn mapping_slots_match_cast_index() {
 
 #[test]
 fn send_message_selector_and_topic_match_forge_inspect() {
+    // Both moved with the `uint8 hops` parameter (audit H6, #264).
     // forge inspect Outbox methodIdentifiers
-    assert_eq!(Outbox::send_message_selector(), [0xbd, 0x1b, 0x0f, 0xd9]);
+    assert_eq!(Outbox::send_message_selector(), [0xf6, 0xc9, 0x3f, 0x27]);
     // forge inspect Outbox events
     assert_eq!(
         Outbox::message_sent_topic0(),
-        b256!("a00ff5f6f9bf2c30c7cd578b6a82c98b08f2d33a5677222b9d8b925c62a48082")
+        b256!("7694e56ef67389e1cc3c1007e8453316be24d66249432418367acfe4caa9d125")
     );
 }
 

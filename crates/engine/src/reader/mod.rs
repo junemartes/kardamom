@@ -34,7 +34,7 @@
 //!
 //! - `TxRef`: look up `(sequencer_id, tx_data_position)` in the join buffer.
 //!   If present, send `(b_position, TxEnvelope)` to the exec thread. If
-//!   absent (a few µs of A-publisher lag), spin with a bounded backoff up to
+//!   absent (a few µs of `tx_data` publisher lag), spin with a bounded backoff up to
 //!   [`ReaderConfig::join_timeout`]. Beyond that, return
 //!   [`ExecutorError::JoinTimeout`]: something is wrong upstream.
 //! - `BoundaryStart`: forward as-is.
@@ -47,6 +47,7 @@ pub mod cluster;
 mod join;
 mod ports;
 mod threads;
+mod void;
 
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{
@@ -60,3 +61,5 @@ pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader
 mod tests;
 #[cfg(test)]
 mod tests_remote;
+#[cfg(test)]
+mod tests_void;

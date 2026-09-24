@@ -7,7 +7,9 @@
 use alloy_primitives::{Address, B256};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef, VoidRecord,
+};
 use rkyv::Archive;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
@@ -15,8 +17,8 @@ use rkyv::rancor;
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
-    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, RemoteOriginRejectReason, SENDER_LEN,
-    WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, RT_VOID, RemoteOriginRejectReason,
+    SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -164,6 +166,7 @@ impl<'a> RelayedPayload<'a> {
             RT_DEPOSITREF => self.decode_depositref(),
             RT_EPOCH => self.decode_epoch(),
             RT_REMOTE_EPOCH => self.decode_remote_epoch(),
+            RT_VOID => self.decode_void(),
             other => Err(WireError::BadRecordType(other)),
         }
     }
@@ -234,6 +237,15 @@ impl<'a> RelayedPayload<'a> {
             )));
         }
         Ok(TxOrderingMessage::RemoteEpoch(rec))
+    }
+
+    /// The canonical-id field of a void record holds the hash of the removed
+    /// transaction, so the record needs one field of its own: the index.
+    fn decode_void(&self) -> Result<TxOrderingMessage, WireError> {
+        Ok(TxOrderingMessage::Void(VoidRecord {
+            index: rd_u64(self.fields, 0)?,
+            tx_hash: self.id,
+        }))
     }
 }
 

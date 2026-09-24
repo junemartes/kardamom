@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
+import io.aeron.archive.ArchiveTool;
+import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ClusterTool;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
@@ -9,7 +11,9 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import io.kardamom.sealer.VoidLedger;
 import java.io.File;
+import java.util.EnumSet;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
@@ -64,6 +68,16 @@ public final class ClusterNode {
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
 
+        // Void voters: the ids of the consumers whose votes remove an entry
+        // that no consumer can execute (each executor, the validator, the
+        // batcher). Unset or empty refuses every void request. Every member
+        // must run the same list and the same window.
+        final VoidLedger.Config voidConfig = parseVoidConfig(
+            System.getProperty("kardamom.cluster.voidVoters", System.getenv("KARDAMOM_VOID_VOTERS")),
+            Integer.getInteger("kardamom.cluster.voidWindow", SealerWire.DEFAULT_RETENTION));
+        System.out.println("cluster void voters memberId=" + memberId
+            + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
         // Launch with a retry past the mark-file liveness window. A member
@@ -79,6 +93,15 @@ public final class ClusterNode {
         // the double-run guard: a genuinely live sibling on the same
         // directories keeps sending heartbeats, so every retry still fails
         // and this exits with the original error.
+        //
+        // The second start error a hard kill leaves behind: the archive died
+        // in the middle of a fragment write that crosses a page, and the
+        // catalog refresh refuses the torn last fragment of the log
+        // recording ("incomplete last fragment straddling page boundary").
+        // Aeron asks for `ArchiveTool verify` here. The bytes past the last
+        // whole fragment are this member's own unacknowledged tail; the
+        // leader's log fills the gap on rejoin, as on any intact-directory
+        // restart. So the repair runs in-process, then the launch retries.
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
@@ -90,12 +113,20 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins, barrier));
+                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins,
+                        voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
                 driver = null;
-                if (!isActiveMarkFile(e) || attempt >= MAX_LAUNCH_ATTEMPTS) {
+                if (attempt >= MAX_LAUNCH_ATTEMPTS) {
+                    throw e;
+                }
+                if (isTornLastFragment(e)) {
+                    repairTornLastFragment(archiveDir, memberId, attempt);
+                    continue;
+                }
+                if (!isActiveMarkFile(e)) {
                     throw e;
                 }
                 System.out.println("cluster LAUNCH RETRY memberId=" + memberId + " attempt=" + attempt
@@ -222,6 +253,31 @@ public final class ClusterNode {
     static final long JOIN_WATCHDOG_POLL_MS = 1_000;
     /** Process exit code when the join watchdog fires. */
     static final int JOIN_WEDGE_EXIT_CODE = 3;
+
+    /** Whether the launch failure is the archive catalog's torn-last-fragment refusal. */
+    static boolean isTornLastFragment(final Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c.getMessage() != null
+                && c.getMessage().contains("incomplete last fragment straddling page boundary")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Truncate the torn last fragment of every recording in {@code archiveDir},
+     * the corrective action Aeron names in the refusal. Runs with no archive
+     * open on the directory: the failed launch closed its driver.
+     */
+    private static void repairTornLastFragment(
+            final String archiveDir, final int memberId, final int attempt) {
+        System.out.println("cluster LAUNCH REPAIR memberId=" + memberId + " attempt=" + attempt
+            + " — truncating the torn last fragment a hard kill left in the archive");
+        final boolean clean = ArchiveTool.verify(
+            System.out, new File(archiveDir), EnumSet.noneOf(VerifyOption.class), null, file -> true);
+        System.out.println("cluster LAUNCH REPAIR memberId=" + memberId + " verify clean=" + clean);
+    }
 
     /** Whether the launch failure is agrona's "active Mark file detected" guard. */
     static boolean isActiveMarkFile(final Throwable t) {
@@ -385,15 +441,48 @@ public final class ClusterNode {
         return out;
     }
 
+    /**
+     * Parse the void voter list, such as "0,1,2,3,4". The default window is
+     * the egress retention: a consumer cannot wait at an entry that the
+     * sealer can no longer replay, so a wider window is never used.
+     */
+    static VoidLedger.Config parseVoidConfig(final String raw, final int window) {
+        if (raw == null || raw.isBlank()) {
+            return VoidLedger.Config.DISABLED;
+        }
+        final long mask = java.util.Arrays.stream(raw.split(","))
+            .map(String::trim)
+            .filter(t -> !t.isEmpty())
+            .mapToInt(ClusterNode::parseVoterId)
+            .mapToLong(id -> 1L << id)
+            .reduce(0L, (a, b) -> a | b);
+        return new VoidLedger.Config(window, mask);
+    }
+
+    private static int parseVoterId(final String t) {
+        final int id;
+        try {
+            id = Integer.parseInt(t);
+        } catch (final NumberFormatException e) {
+            throw new IllegalStateException("kardamom.cluster.voidVoters: '" + t + "' is not a voter id", e);
+        }
+        if (id < 0 || id >= VoidLedger.MAX_VOTERS) {
+            throw new IllegalStateException(
+                "kardamom.cluster.voidVoters: id " + id + " outside [0, " + VoidLedger.MAX_VOTERS + ")");
+        }
+        return id;
+    }
+
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir, final String clusterDir, final int dedupCapacity,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
-            final ShutdownSignalBarrier barrier) {
+            final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
-            .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId, remoteOrigins));
+            .clusteredService(new SealerClusteredService(
+                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

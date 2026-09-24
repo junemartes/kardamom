@@ -19,6 +19,7 @@ contract CheckpointMarkerTest is Test {
     uint64 constant PEER_A = 412_346;
     uint64 constant PEER_B = 412_348;
     uint64 constant X = 600_000;
+    uint8 constant MAX_HOPS = 4;
 
     event RoundOpened(uint64 indexed round, uint64 blockNumber, uint64 indexed trigger);
     event MarkerIgnored(uint64 indexed round, uint64 indexed originChainId);
@@ -45,19 +46,31 @@ contract CheckpointMarkerTest is Test {
     /// proves the lane exists.
     function deliverUserMessage(uint64 origin, uint64 seq) internal {
         vm.prank(XChain.txSender(origin));
-        inbox.deliver(origin, seq, address(0xABCD), address(0xDEAD), 0, 100_000, hex"", noCb());
+        inbox.deliver(origin, seq, address(0xABCD), address(0xDEAD), 0, 100_000, 0, hex"", noCb());
     }
 
     /// A marker delivery from `origin`, with `originSender` as the claimed
-    /// sender on the origin chain.
+    /// sender on the origin chain, with the full hop budget.
     function deliverMarker(uint64 origin, uint64 seq, address originSender, uint64 round) internal {
+        deliverMarkerWithHops(origin, seq, originSender, round, MAX_HOPS);
+    }
+
+    function deliverMarkerWithHops(
+        uint64 origin,
+        uint64 seq,
+        address originSender,
+        uint64 round,
+        uint8 hops
+    ) internal {
         uint64 gas = marker.MARKER_GAS();
         bytes memory data = abi.encodeCall(CheckpointMarker.onMarker, (round));
         vm.prank(XChain.txSender(origin));
-        inbox.deliver(origin, seq, originSender, XChain.CHECKPOINT_MARKER, 0, gas, data, noCb());
+        inbox.deliver(
+            origin, seq, originSender, XChain.CHECKPOINT_MARKER, 0, gas, hops, data, noCb()
+        );
     }
 
-    function markerCommitment(uint64 dest, uint64 seq, uint64 round)
+    function markerCommitment(uint64 dest, uint64 seq, uint64 round, uint8 hops)
         internal
         pure
         returns (bytes32)
@@ -70,6 +83,7 @@ contract CheckpointMarkerTest is Test {
             XChain.CHECKPOINT_MARKER,
             0,
             100_000 + 80_000 * 32,
+            hops,
             keccak256(abi.encodeCall(CheckpointMarker.onMarker, (round))),
             bytes32(0)
         );
@@ -124,8 +138,9 @@ contract CheckpointMarkerTest is Test {
         // predeploy as the sender.
         assertEq(outbox.nonces(PEER_A), 1);
         assertEq(outbox.nonces(PEER_B), 1);
-        assertTrue(outbox.sentMessages(markerCommitment(PEER_A, 0, 3)));
-        assertTrue(outbox.sentMessages(markerCommitment(PEER_B, 0, 3)));
+        // The timer starts the marker chain with the full hop budget.
+        assertTrue(outbox.sentMessages(markerCommitment(PEER_A, 0, 3, MAX_HOPS)));
+        assertTrue(outbox.sentMessages(markerCommitment(PEER_B, 0, 3, MAX_HOPS)));
     }
 
     function test_startRound_onlyOncePerInterval() public {
@@ -169,12 +184,27 @@ contract CheckpointMarkerTest is Test {
         assertTrue(marker.isPeer(PEER_A));
         assertEq(outbox.nonces(PEER_B), 1);
         assertEq(outbox.nonces(PEER_A), 1);
-        assertTrue(outbox.sentMessages(markerCommitment(PEER_B, 0, 4)));
-        assertTrue(outbox.sentMessages(markerCommitment(PEER_A, 0, 4)));
+        // A forwarded marker carries one hop less than the one received.
+        assertTrue(outbox.sentMessages(markerCommitment(PEER_B, 0, 4, MAX_HOPS - 1)));
+        assertTrue(outbox.sentMessages(markerCommitment(PEER_A, 0, 4, MAX_HOPS - 1)));
 
         // The own timer for round 3 is now stale.
         vm.expectRevert("CheckpointMarker: round already open");
         marker.startRound();
+    }
+
+    function test_receivedMarkerWithNoHopBudgetOpensRoundAndSendsNothing() public {
+        deliverUserMessage(PEER_B, 0);
+        marker.registerPeer(PEER_B);
+
+        vm.expectEmit(true, true, false, true);
+        emit RoundOpened(4, 100, PEER_A);
+        deliverMarkerWithHops(PEER_A, 0, XChain.CHECKPOINT_MARKER, 4, 0);
+
+        assertEq(inbox.delivered(PEER_A, 0), 1);
+        assertEq(marker.roundBlock(4), 100);
+        assertEq(outbox.nonces(PEER_B), 0);
+        assertEq(outbox.nonces(PEER_A), 0);
     }
 
     function test_duplicateOrStaleMarkerIsIgnored() public {

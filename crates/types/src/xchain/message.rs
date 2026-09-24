@@ -31,10 +31,20 @@ pub struct Callback {
 }
 
 impl Callback {
+    /// True for the all-zero struct, the wire form of "no callback".
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.target == Address::ZERO && self.gas_limit == 0 && self.context == B256::ZERO
+    }
+
     /// `keccak256(abi.encode(target, gasLimit, context))` — the `cbHash` word
-    /// of [`super::msg_leaf`]. Must equal `Outbox.hashCallback`.
+    /// of [`MsgLeaf`]. Must equal `XChain.hashCallback`, which returns ZERO
+    /// for the zero struct (the same value as [`no_callback_hash`]).
     #[must_use]
     pub fn commitment(&self) -> B256 {
+        if self.is_zero() {
+            return B256::ZERO;
+        }
         let mut buf = [0u8; 96];
         buf[0..32].copy_from_slice(&crate::abi::word_address(self.target));
         buf[32..64].copy_from_slice(&crate::abi::word_u64(self.gas_limit));
@@ -74,6 +84,9 @@ pub struct OutboxMessage {
     pub value: u128,
     /// Gas budget for the inner call on the destination.
     pub gas_limit: u64,
+    /// Remaining hop budget: how many further derived sends a delivery of
+    /// this message may start along one chain (audit H6).
+    pub hops: u8,
     /// Inner-call calldata.
     pub data: AlloyBytes,
     /// Requested response, if any.
@@ -107,6 +120,8 @@ pub struct XChainMessage {
     pub value: u128,
     /// Gas budget for the inner call.
     pub gas_limit: u64,
+    /// Remaining hop budget (see [`OutboxMessage::hops`]).
+    pub hops: u8,
     /// Inner-call calldata.
     #[rkyv(with = wire::BytesVec)]
     pub input: Bytes,
@@ -161,6 +176,7 @@ impl XChainMessage {
             target: self.target,
             value: self.value,
             gas_limit: self.gas_limit,
+            hops: self.hops,
             data_hash: keccak256(&self.input),
             cb_hash: self
                 .callback

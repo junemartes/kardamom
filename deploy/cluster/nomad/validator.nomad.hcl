@@ -175,6 +175,9 @@ job "validator" {
           # the validator's own cluster client session: the node IP and
           # a Nomad dynamic port.
           "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+          # The void voter id: the first id after the executors'
+          # (cluster.nomad.hcl builds the sealer's voter list the same way).
+          "--void-voter-id", format("%d", var.executor_count),
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared

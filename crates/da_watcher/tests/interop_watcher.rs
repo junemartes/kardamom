@@ -34,6 +34,7 @@ fn msg(seq: u64, block: u64) -> OutboxMessage {
         target: Address::repeat_byte(0xB2),
         value: 0,
         gas_limit: 200_000,
+        hops: 0,
         data: Bytes::from_static(&[0xCA, 0xFE]),
         callback: None,
     }

@@ -24,6 +24,15 @@ const REGISTRY_PUSH_NODE: &str = "control-0";
 /// `workloads_deploy_binary` at prebuilt artifacts with it.
 const CLUSTER_VARS_ENV: &str = "KARDAMOM_CHAOS_CLUSTER_VARS";
 
+/// How many times the node apply runs before the bring-up fails. The apply
+/// builds the node image, and that build asks Docker Hub for the base
+/// image, also when the image is in the local cache. One failed request
+/// there is a transient fault of the network, not of the cluster.
+const APPLY_ATTEMPTS: u32 = 3;
+
+/// The pause between two apply attempts.
+const APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The deploy-time settings a shard passes to the workloads. Ansible
 /// reads them from the environment, and a case reads the same values
 /// from its knobs, so one setting drives both sides.
@@ -124,8 +133,7 @@ impl Lifecycle {
     /// the apply wrote is invalid.
     pub async fn up(&self, vars: &DeployVars) -> anyhow::Result<NodeContract> {
         self.tofu(&["init", "-input=false"]).await?;
-        self.tofu(&["apply", "-auto-approve", "-input=false"])
-            .await?;
+        self.apply_with_retry().await?;
         self.write_contract().await?;
         let contract = self.contract()?;
         let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
@@ -203,6 +211,28 @@ impl Lifecycle {
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
         Ok(())
+    }
+
+    /// Run the node apply, again after a failure, up to [`APPLY_ATTEMPTS`]
+    /// times. An apply is idempotent: a second run continues from the
+    /// state the first one left.
+    async fn apply_with_retry(&self) -> anyhow::Result<()> {
+        let mut attempt = 1;
+        loop {
+            let outcome = self.tofu(&["apply", "-auto-approve", "-input=false"]).await;
+            let Err(error) = outcome else {
+                return Ok(());
+            };
+            if attempt >= APPLY_ATTEMPTS {
+                return Err(error.context(format!("node apply failed {attempt} times")));
+            }
+            crate::log(format!(
+                "node apply attempt {attempt} of {APPLY_ATTEMPTS} failed ({error:#}); retrying in {}s",
+                APPLY_RETRY_DELAY.as_secs()
+            ));
+            tokio::time::sleep(APPLY_RETRY_DELAY).await;
+            attempt += 1;
+        }
     }
 
     async fn tofu(&self, args: &[&str]) -> anyhow::Result<()> {

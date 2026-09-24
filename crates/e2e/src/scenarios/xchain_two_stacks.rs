@@ -56,9 +56,12 @@ use crate::harness::metrics::poll_until;
 /// patched-genesis copy for it.
 pub const CHAIN_B_ID: u64 = 412_347;
 
-/// ABI-encode `Outbox.sendMessage(destChainId, target, gasLimit, data, cb)`.
-/// Head: 4 static params + the callback tuple inlined (3 words) = 7 words,
-/// so `data`'s offset is 0xE0; `cb = None` encodes the zeroed tuple
+/// Hop budget of every user send in this scenario (`<= Outbox.MAX_HOPS`).
+pub const USER_HOPS: u8 = 1;
+
+/// ABI-encode `Outbox.sendMessage(destChainId, target, gasLimit, hops, data,
+/// cb)`. Head: 5 static params + the callback tuple inlined (3 words) = 8
+/// words, so `data`'s offset is 0x100; `cb = None` encodes the zeroed tuple
 /// (`XChain.isNone`).
 #[must_use]
 pub fn send_message_calldata(
@@ -70,12 +73,13 @@ pub fn send_message_calldata(
 ) -> Vec<u8> {
     let selector = Outbox::send_message_selector();
     let cb = cb.unwrap_or_default();
-    let mut out = Vec::with_capacity(4 + 8 * 32 + data.len().div_ceil(32) * 32);
+    let mut out = Vec::with_capacity(4 + 9 * 32 + data.len().div_ceil(32) * 32);
     out.extend_from_slice(&selector);
     out.extend_from_slice(u64_word(dest_chain_id).as_slice());
     out.extend_from_slice(super::xchain::address_word(target).as_slice());
     out.extend_from_slice(u64_word(gas_limit).as_slice());
-    out.extend_from_slice(u64_word(7 * 32).as_slice()); // offset of `data`
+    out.extend_from_slice(u64_word(u64::from(USER_HOPS)).as_slice());
+    out.extend_from_slice(u64_word(8 * 32).as_slice()); // offset of `data`
     out.extend_from_slice(super::xchain::address_word(cb.target).as_slice());
     out.extend_from_slice(u64_word(cb.gas_limit).as_slice());
     out.extend_from_slice(cb.context.as_slice());
@@ -186,7 +190,7 @@ impl ChainSender {
         let detail = std::cell::Cell::new(String::new());
         poll_until(
             what,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(300),
             async || {
                 let Some(d) = cond()? else {

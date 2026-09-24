@@ -49,7 +49,7 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
         .context("read lastBatchIndex")?;
     let last = poll_until(
         &format!("lastBatchIndex advances past {start}+2"),
-        Duration::from_secs(120),
+        Duration::from_mins(2),
         Duration::from_secs(1),
         || async {
             let v = contract

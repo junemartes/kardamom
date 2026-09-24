@@ -60,6 +60,19 @@ variable "cluster_file_sync_level" {
 # against the deployed 412346 chain: chain B (412347, S14) and the
 # simulated origin (412399, S12/S13). Ansible deployment passes -var from
 # KARDAMOM_REMOTE_ORIGINS when set.
+# Void voters (-Dkardamom.cluster.voidVoters): the ids of the consumers
+# whose votes remove an entry that no consumer can execute. The list must
+# equal the set of consumers that execute: executor <i> has id <i> (its
+# allocation index), the validator has id executor_count, and the batcher
+# has id executor_count + 1. A consumer outside the list cannot stop a
+# void, and it stops when a void removes an entry that it executed. Every
+# member must run the same list.
+variable "executor_count" {
+  type        = number
+  description = "The executor node count (node_classes.executor.count). The void voter ids come from it."
+  default     = 3
+}
+
 variable "cluster_remote_origins" {
   type    = string
   default = "412347,412399"
@@ -98,6 +111,7 @@ variable "sealer_count" {
 # group_vars/all.yml: ingress, consensus, log, catchup, archive_control.
 locals {
   member_ports = [40200, 40201, 40202, 40203, 40204]
+  void_voters  = join(",", range(var.executor_count + 2))
   members = join("|", [
     for i in range(var.sealer_count) :
     "${i},${join(",", [for p in local.member_ports : "sealer-${i}.node.${var.datacenter}.consul:${p}"])}"
@@ -188,7 +202,7 @@ job "cluster" {
       # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters}"
       }
 
       config {

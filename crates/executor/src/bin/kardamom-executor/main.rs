@@ -209,9 +209,8 @@ fn open_transport(args: &Args) -> Result<Transport> {
 /// stream, and exposes a blocking `next()`, so no async-to-sync bridge is
 /// needed. Leader failover and reconnect, including crash-recovery replay
 /// of the canonical stream, are handled inside the cluster client, so the
-/// reader never sees an image rotation. The executor's skip-count and
-/// `DedupWindow` give idempotency across any reconnect overlap. The
-/// cluster-session guard (`LiveCluster`) must outlive the executor loop,
+/// reader never sees an image rotation. The subscription's canonical-index
+/// cursor drops any reconnect overlap. The cluster-session guard (`LiveCluster`) must outlive the executor loop,
 /// so [`bin_support::LiveStreams`] holds it. It drops only after the
 /// shutdown wait ends.
 ///
@@ -413,6 +412,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // `bounded_join_timeout` for why the fresh-start bound exceeds
     // resume's.
     cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
+    cfg.reader.voter_id = args.void_voter_id;
 
     let block_exec = wiring::build_block_exec(args);
 

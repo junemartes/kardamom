@@ -48,6 +48,7 @@ pub(crate) fn outbox_msg(dest: u64, seq: u64, block: u64) -> kardamom_types::xch
         target: alloy_primitives::Address::repeat_byte(0xB2),
         value: 0,
         gas_limit: 100_000,
+        hops: 0,
         data: alloy_primitives::Bytes::default(),
         callback: None,
     }

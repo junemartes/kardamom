@@ -2,6 +2,8 @@
 
 use alloc::string::String;
 
+use alloy_primitives::B256;
+
 use crate::exec_types::TxIndex;
 use kardamom_types::BPosition;
 
@@ -36,9 +38,6 @@ pub enum ExecutorError {
     /// the witness's own incompleteness errors.
     #[error("witness unanchored: {0}")]
     WitnessUnanchored(String),
-
-    #[error("out-of-order tx_idx: got {got:?}, expected {expected:?}")]
-    OutOfOrderTx { got: TxIndex, expected: TxIndex },
 
     #[error(
         "block boundary closes before observed end_tx_idx: end={end:?} last_seen={last_seen:?}"
@@ -88,6 +87,13 @@ pub enum ExecutorError {
         tx_data_position: BPosition,
         timeout_ms: u128,
     },
+
+    /// The canonical order removes an entry that this replica executed. A
+    /// void record is legal only while every voter still waits at the entry,
+    /// so the state of this replica is different from the state of its
+    /// peers. There is no local repair: the replica stops.
+    #[error("void record for executed entry: index={index} tx_hash={tx_hash:?}")]
+    VoidOfExecutedEntry { index: u64, tx_hash: B256 },
 }
 
 /// Role-agnostic alias for the engine error. New engine and validator code

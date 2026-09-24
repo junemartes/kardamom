@@ -46,12 +46,9 @@ test-support = [
 [dev-dependencies]
 kardamom-reconstruct = { path = ".", features = ["test-support"] }
 kardamom-deployer = { path = "../deployer" }
-alloy-consensus.workspace = true
-alloy-eips = { workspace = true, features = ["kzg"] }
 alloy-network.workspace = true
 alloy-signer-local.workspace = true
 alloy-node-bindings.workspace = true
-bytes.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 

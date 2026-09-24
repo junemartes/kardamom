@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::Receiver;
 use tracing::{info, warn};
 
+use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
     JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
 };
-use kardamom_engine::{ExecutorError, TxIndex};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
 use kardamom_log::discovery::StreamPlane;
@@ -75,6 +75,9 @@ pub struct LiveArgs {
     /// The L2 chain id. See [`BatcherConfig::chain_id`].
     pub chain_id: u64,
     pub cluster_egress_endpoint: Option<String>,
+    /// This batcher's voter id at the sealer; see
+    /// [`ReaderConfig::voter_id`]. `None` never votes.
+    pub void_voter_id: Option<u8>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
     pub blocks_per_batch: NonZeroUsize,
@@ -218,6 +221,7 @@ impl RunConfig {
         // can fire.
         let reader_cfg = ReaderConfig {
             join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
+            voter_id: args.void_voter_id,
             ..ReaderConfig::default()
         };
         let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
@@ -225,7 +229,6 @@ impl RunConfig {
             buffer: join_buffer,
             cfg: reader_cfg,
             exec_out: feed_tx,
-            start_tx_idx: TxIndex(cursor.next_index),
             recovery_factory: join_recovery,
         });
 

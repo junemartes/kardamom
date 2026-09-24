@@ -315,10 +315,11 @@ impl ArchiveRefetcher {
         let endpoints = self.cfg.tx_data_endpoints.current();
         let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let Some(rec) = FoundRecording::resolve_session(recs, session_id) else {
+            let e = self.range_absent(format!(
+                "no recording for stream {stream_id} session {session_id}"
+            ));
             self.rotate();
-            return Err(LogError::Aeron(format!(
-                "refetch: no recording for stream {stream_id} session {session_id} on this archive"
-            )));
+            return Err(e);
         };
         let Some(plan) = self.prepare_replay(&endpoints, &rec, from, stream_id, session_id)? else {
             return Ok(0);
@@ -553,6 +554,25 @@ impl ArchiveRefetcher {
         }
     }
 
+    /// The definite "not here" answer of the connected archive. Call it
+    /// before [`Self::rotate`], which drops the connection and its name.
+    fn range_absent(&self, detail: String) -> LogError {
+        LogError::RangeAbsent {
+            archive: self
+                .live
+                .as_ref()
+                .map_or_else(|| "?".to_owned(), |l| l.endpoint.clone()),
+            detail,
+        }
+    }
+
+    /// The `tx_data` archives to ask now. The join layer compares this list
+    /// with the archives that gave [`LogError::RangeAbsent`].
+    #[must_use]
+    pub fn tx_data_archives(&self) -> Vec<String> {
+        self.cfg.tx_data_endpoints.current()
+    }
+
     fn rotate(&mut self) {
         self.live = None;
         self.next_endpoint = self.next_endpoint.wrapping_add(1);
@@ -603,9 +623,8 @@ impl ArchiveRefetcher {
             // This was a silent "nothing recorded" before, and each retry
             // of the join loop asked the same copy again. Name the copy
             // and both positions, and move on to the other archive.
-            let archive = self.live.as_ref().map_or("?", |l| l.endpoint.as_str());
-            let e = LogError::Aeron(format!(
-                "refetch: recording {} of session {session_id} on archive {archive} ended at position {}, at or before the requested position {from_raw} — this copy holds no byte of the range",
+            let e = self.range_absent(format!(
+                "recording {} of session {session_id} ended at position {}, at or before the requested position {from_raw} — this copy holds no byte of the range",
                 rec.recording_id, limit.position
             ));
             warn!(error = %e, "refetch: the newest recording of the session ended before the range; rotating endpoint");

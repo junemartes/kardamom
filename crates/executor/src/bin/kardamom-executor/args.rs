@@ -75,6 +75,13 @@ pub(crate) struct Args {
     /// `${meta.node_ip}:${NOMAD_HOST_PORT_egress}`.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     pub(crate) cluster_egress_endpoint: Option<String>,
+    /// This consumer's voter id at the sealer. With an id, the consumer asks
+    /// the sealer to void an entry whose `tx_data` every archive refuses, and
+    /// drops the entry when the void record arrives. With no id, it stops at
+    /// such an entry. The id must be in the sealer's
+    /// `kardamom.cluster.voidVoters` list, and each consumer has its own id.
+    #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
+    pub(crate) void_voter_id: Option<u8>,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,

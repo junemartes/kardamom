@@ -149,7 +149,7 @@ async fn attester_posts_output_matching_rust_root() {
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
-            0,
+            21_000,
             Bytes::new(),
         )
         .value(U256::from(5_000_000_000_000_000_000u128))
@@ -196,7 +196,7 @@ async fn fund_lockbox(lockbox: &ETHLockbox::ETHLockboxInstance<impl Provider + C
     lockbox
         .depositETH(
             address!("0000000000000000000000000000000000001234"),
-            0,
+            21_000,
             Bytes::new(),
         )
         .value(U256::from(5_000_000_000_000_000_000u128))
