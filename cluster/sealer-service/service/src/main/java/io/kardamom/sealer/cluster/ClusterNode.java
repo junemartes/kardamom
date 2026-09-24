@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
+import io.aeron.archive.ArchiveTool;
+import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ClusterTool;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
@@ -11,6 +13,7 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
+import java.util.EnumSet;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
@@ -90,6 +93,15 @@ public final class ClusterNode {
         // the double-run guard: a genuinely live sibling on the same
         // directories keeps sending heartbeats, so every retry still fails
         // and this exits with the original error.
+        //
+        // The second start error a hard kill leaves behind: the archive died
+        // in the middle of a fragment write that crosses a page, and the
+        // catalog refresh refuses the torn last fragment of the log
+        // recording ("incomplete last fragment straddling page boundary").
+        // Aeron asks for `ArchiveTool verify` here. The bytes past the last
+        // whole fragment are this member's own unacknowledged tail; the
+        // leader's log fills the gap on rejoin, as on any intact-directory
+        // restart. So the repair runs in-process, then the launch retries.
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
@@ -107,7 +119,14 @@ public final class ClusterNode {
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
                 driver = null;
-                if (!isActiveMarkFile(e) || attempt >= MAX_LAUNCH_ATTEMPTS) {
+                if (attempt >= MAX_LAUNCH_ATTEMPTS) {
+                    throw e;
+                }
+                if (isTornLastFragment(e)) {
+                    repairTornLastFragment(archiveDir, memberId, attempt);
+                    continue;
+                }
+                if (!isActiveMarkFile(e)) {
                     throw e;
                 }
                 System.out.println("cluster LAUNCH RETRY memberId=" + memberId + " attempt=" + attempt
@@ -234,6 +253,31 @@ public final class ClusterNode {
     static final long JOIN_WATCHDOG_POLL_MS = 1_000;
     /** Process exit code when the join watchdog fires. */
     static final int JOIN_WEDGE_EXIT_CODE = 3;
+
+    /** Whether the launch failure is the archive catalog's torn-last-fragment refusal. */
+    static boolean isTornLastFragment(final Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c.getMessage() != null
+                && c.getMessage().contains("incomplete last fragment straddling page boundary")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Truncate the torn last fragment of every recording in {@code archiveDir},
+     * the corrective action Aeron names in the refusal. Runs with no archive
+     * open on the directory: the failed launch closed its driver.
+     */
+    private static void repairTornLastFragment(
+            final String archiveDir, final int memberId, final int attempt) {
+        System.out.println("cluster LAUNCH REPAIR memberId=" + memberId + " attempt=" + attempt
+            + " — truncating the torn last fragment a hard kill left in the archive");
+        final boolean clean = ArchiveTool.verify(
+            System.out, new File(archiveDir), EnumSet.noneOf(VerifyOption.class), null, file -> true);
+        System.out.println("cluster LAUNCH REPAIR memberId=" + memberId + " verify clean=" + clean);
+    }
 
     /** Whether the launch failure is agrona's "active Mark file detected" guard. */
     static boolean isActiveMarkFile(final Throwable t) {
