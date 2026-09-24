@@ -137,7 +137,10 @@ impl<P: Provider> FeedLoop<P> {
             // dispatches add nothing new, the same way the exec side
             // expands them again from the record.
             Ok(Some(
-                ReaderToExec::Deposit(_) | ReaderToExec::Epoch(_) | ReaderToExec::XChain { .. },
+                ReaderToExec::Deposit(_)
+                | ReaderToExec::Epoch(_)
+                | ReaderToExec::XChain { .. }
+                | ReaderToExec::Vacant { .. },
             )) => {}
             // Remote-epoch records travel in DA. Unlike deposits, they
             // are not derivable again from this chain's L1 origin. So the

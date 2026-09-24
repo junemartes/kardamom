@@ -108,6 +108,14 @@ pub struct ReaderConfig {
     /// Soft warn threshold on the join buffer's size. Emits a `warn!` log when
     /// crossed. This applies no back-pressure; that is the publisher's job.
     pub buffer_warn_threshold: usize,
+    /// This consumer's voter id at the sealer, or `None` for a consumer that
+    /// never votes. A voter asks the sealer to void an entry when every
+    /// archive refuses the entry's `tx_data` range. The sealer counts only
+    /// the ids in its voter list, so each executing consumer has its own id.
+    pub voter_id: Option<u8>,
+    /// How long a voter waits for the void record after its first vote. The
+    /// sealer keeps the vote, so a restart after this wait loses nothing.
+    pub void_wait: Duration,
 }
 
 impl Default for ReaderConfig {
@@ -117,6 +125,8 @@ impl Default for ReaderConfig {
             join_refetch_after: Duration::from_secs(10),
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
+            voter_id: None,
+            void_wait: Duration::from_secs(120),
         }
     }
 }

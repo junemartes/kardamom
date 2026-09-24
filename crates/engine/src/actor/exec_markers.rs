@@ -2,8 +2,8 @@
 //! transaction; they check the marker, then advance the origin cursor and
 //! the record's alignment count.
 
-use kardamom_types::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
+use kardamom_types::{BPosition, EpochRecord};
 
 use crate::delta::ParentState;
 use crate::error::ExecutorError;
@@ -29,6 +29,21 @@ impl<W: ExecPorts> ExecState<W> {
             l1_number = epoch.l1_number,
             deposits = epoch.deposits.len(),
             "epoch marker: L1 origin advances"
+        );
+        Ok(Flow::Continue)
+    }
+
+    /// A vacant slot: a voided entry, or the void record that removed it.
+    /// It consumes one slot and applies no tx, so the record counter stays
+    /// equal to the sealer's count at the next boundary.
+    pub(super) fn on_vacant(&mut self, position: BPosition) -> Result<Flow, ExecutorError> {
+        let tx_idx = self.next_idx()?;
+        tracing::info!(
+            target: "kardamom_executor::exec",
+            block = self.cursor.block,
+            tx_idx = tx_idx.0,
+            position = position.as_index(),
+            "vacant slot: no transaction executes here"
         );
         Ok(Flow::Continue)
     }

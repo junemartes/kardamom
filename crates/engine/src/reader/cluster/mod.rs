@@ -13,15 +13,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage, VoidRecord};
 
 use crate::ExecutorError;
 use crate::reader::TxOrderingSubscription;
 
-use kardamom_cluster_adapter::gateway::ClusterEgress;
+use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 
-use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, live};
+use kardamom_cluster_adapter::{
+    LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, live,
+};
 
 /// Shared delivery cursor: the next canonical record index and boundary
 /// block number this consumer expects. The subscription writes it on every
@@ -55,8 +57,21 @@ impl ReplayCursor {
 /// without limit.
 const MAX_PENDING: usize = 1 << 20;
 
-pub struct ClusterTxOrderingSubscription<E: ClusterEgress> {
+/// The ingress of a subscription that sends nothing to the sealer. It
+/// reports no connection, so a vote through it has no effect.
+pub struct NoIngress;
+
+impl ClusterIngress for NoIngress {
+    fn offer(&mut self, _payload: &[u8]) -> OfferOutcome {
+        OfferOutcome::NotConnected
+    }
+}
+
+pub struct ClusterTxOrderingSubscription<E: ClusterEgress, I: ClusterIngress = NoIngress> {
     egress: E,
+    /// The session's ingress side. It carries only void votes; the canonical
+    /// records come from the sequencers' own sessions.
+    ingress: I,
     cursor: ReplayCursor,
     /// Out-of-order buffers, keyed by canonical index or block number. Frames
     /// arrive out of order only around a session re-establishment, when the
@@ -85,6 +100,7 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     pub fn with_cursor(egress: E, cursor: ReplayCursor) -> Self {
         Self {
             egress,
+            ingress: NoIngress,
             cursor,
             pending_records: BTreeMap::new(),
             pending_boundaries: BTreeMap::new(),
@@ -93,6 +109,25 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
         }
     }
 
+    /// Give the subscription the session's ingress side, so the reader's
+    /// void votes reach the sealer.
+    pub fn with_ingress<I: ClusterIngress>(
+        self,
+        ingress: I,
+    ) -> ClusterTxOrderingSubscription<E, I> {
+        ClusterTxOrderingSubscription {
+            egress: self.egress,
+            ingress,
+            cursor: self.cursor,
+            pending_records: self.pending_records,
+            pending_boundaries: self.pending_boundaries,
+            catching_up: self.catching_up,
+            emit_sealer_metrics: self.emit_sealer_metrics,
+        }
+    }
+}
+
+impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// Disable the `kardamom_sealer_*` re-export (validator role).
     #[must_use]
     pub fn suppress_sealer_metrics(mut self) -> Self {
@@ -270,7 +305,7 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     }
 }
 
-impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
+impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// Receive and decode one egress frame, ingesting it into the
     /// reorder buffer. A malformed frame is dropped, and logged, not
     /// fatal: the cluster stream is authoritative, so this should never
@@ -290,7 +325,9 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     }
 }
 
-impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<E> {
+impl<E: ClusterEgress, I: ClusterIngress> TxOrderingSubscription
+    for ClusterTxOrderingSubscription<E, I>
+{
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         loop {
             let Some(out) = self.try_deliver()? else {
@@ -299,6 +336,11 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
             };
             return Ok(out);
         }
+    }
+
+    fn vote(&mut self, voter_id: u8, void: &VoidRecord) -> OfferOutcome {
+        self.ingress
+            .offer(&wire::encode_void_request(voter_id, void))
     }
 }
 
@@ -328,8 +370,14 @@ pub fn cluster_tx_ordering_subscription(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
     cursor: ReplayCursor,
-) -> Result<(LiveCluster, ClusterTxOrderingSubscription<LiveEgress>), LiveError> {
-    let (cluster, _ingress, egress) = live::connect_with(
+) -> Result<
+    (
+        LiveCluster,
+        ClusterTxOrderingSubscription<LiveEgress, LiveIngress>,
+    ),
+    LiveError,
+> {
+    let (cluster, ingress, egress) = live::connect_with(
         rt,
         cfg,
         live::ConnectOptions {
@@ -343,7 +391,7 @@ pub fn cluster_tx_ordering_subscription(
     )?;
     Ok((
         cluster,
-        ClusterTxOrderingSubscription::with_cursor(egress, cursor),
+        ClusterTxOrderingSubscription::with_cursor(egress, cursor).with_ingress(ingress),
     ))
 }
 
