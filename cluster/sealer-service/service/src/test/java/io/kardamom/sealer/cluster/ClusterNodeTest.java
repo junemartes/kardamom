@@ -2,7 +2,9 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 
@@ -119,5 +121,16 @@ final class ClusterNodeTest {
                 System.setProperty(key, before);
             }
         }
+    }
+
+    @Test
+    void tornLastFragmentIsRecognisedThroughTheCauseChain() {
+        final RuntimeException torn = new RuntimeException("launch failed",
+            new io.aeron.archive.client.ArchiveException(
+                "ERROR - Found potentially incomplete last fragment straddling page boundary in file: /x/0-0.rec"
+                + "\nRun `ArchiveTool verify` for corrective action!"));
+        assertTrue(ClusterNode.isTornLastFragment(torn));
+        assertFalse(ClusterNode.isTornLastFragment(new IllegalStateException("active Mark file detected")));
+        assertFalse(ClusterNode.isTornLastFragment(new RuntimeException((String) null)));
     }
 }
