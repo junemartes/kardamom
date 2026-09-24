@@ -8,10 +8,14 @@ The sealer orders a `TxRef` when a sequencer offers it. The ingress archives rec
 transaction data on a different path, with no link to the order. So an entry can be in the
 canonical order before its data is durable.
 
-The `pipeline-blackout-recover` chaos case shows the result. The case kills every pipeline node
-at the same time. The Raft log keeps the entry. No archive keeps the last bytes of `tx_data`.
-After the restart each consumer stops at that entry, gets a join timeout, and exits. The chain
-does not move again.
+An archive wipe shows the result (issue #376, the `archive-tx-data-wipe` case). The Raft log
+keeps the entry. No archive keeps the bytes of `tx_data`. Each consumer stops at that entry,
+gets a join timeout, and exits. The chain does not move again.
+
+Note (2026-09-23): the `pipeline-blackout-recover` case was the first example of this design.
+Its join timeouts had a different cause: a bounded replay in the refetch (#422). With that fix
+the blackout loses no data, and the case passes with zero void decisions. The void rule is for a
+real loss of data only.
 
 The owner decision (2026-09-21): do not make the order wait for the archives. The order path is
 latency sensitive. Remove the entry that no consumer can execute.
@@ -84,14 +88,13 @@ session today: the cluster network is the boundary.
   slot is the same. `kardamom-reconstruct` and the prover read the blob, so they need no change.
 - The sealer must set the expected nonce of the sender back to the nonce of the void entry. If
   it does not, the sealer refuses the new submit with a contiguity reject.
-- The sender submits the same signed bytes again, so the hash is the same. Two dedup windows
-  use the hash as the key: `dedup` in `CanonicalSealerState`, and `DedupWindow` in the engine
-  reader (`first_seen(tx_ref.tx_hash)` runs before the join). A void must remove the hash from
-  the two windows. If it does not, the sealer and each executor drop the new submit as a
-  duplicate.
+- The sender submits the same signed bytes again, so the hash is the same. One dedup window
+  uses the hash as the key: `dedup` in `CanonicalSealerState`. The sealer is the only dedup
+  point (#427 removed the engine reader's window). A void must remove the hash from the sealer
+  window. If it does not, the sealer drops the new submit as a duplicate.
 - Later entries of the same sender that are already in the order fail the nonce check at
-  execution. This is the behavior for a nonce gap today. Their hashes stay in the dedup
-  windows, so the sender cannot submit the same bytes again while the windows hold them.
+  execution. This is the behavior for a nonce gap today. Their hashes stay in the sealer
+  window, so the sender cannot submit the same bytes again while the window holds them.
   Section 6 has the question.
 - The ingress must tell the sender. Section 6 has the question.
 
@@ -116,8 +119,7 @@ and blocks in `JoinWait`. The new reader does this at a lost entry `i`:
 - It parks entry `i`. It sends no later entry to the executor. The order is total, so no entry
   of another sender can pass entry `i`.
 - It keeps reading the order stream into a bounded queue. It looks only for `Void(i)`.
-- On `Void(i)` it removes the hash from `DedupWindow`, drops entry `i`, and drains the queue in
-  order.
+- On `Void(i)` it drops entry `i` and drains the queue in order.
 - It does not look for the envelope again during the wait. The wait starts only after every
   archive refused the range, and no publisher sends an old envelope again.
 - The read-ahead cannot lose the egress position. The session thread of the client drains the
@@ -174,7 +176,7 @@ start. So a lost entry stops the chain for more than 30 s today. Section 6 asks 
 | 1 | `crates/types/src/tx_ordering.rs` | new variant `Void`; the variant macro forces each match site |
 | 2 | `crates/cluster-adapter/src/wire` | `RT_VOID = 4`, `KIND_VOID_REQUEST = 6`, encoders, decoders |
 | 3 | `SealerWire.java`, `SealerClusteredService.java`, `CanonicalSealerState.java` | request table, void table, voter set, append the record, nonce reset, dedup removal, two snapshot fields |
-| 4 | `crates/engine/src/reader` (`threads.rs`, `join.rs`, `cluster/mod.rs`) | send the request, read-ahead queue, drop on void, dedup removal, error on a void of an executed entry |
+| 4 | `crates/engine/src/reader` (`threads.rs`, `join.rs`, `cluster/mod.rs`) | send the request, read-ahead queue, drop on void, error on a void of an executed entry |
 | 5 | `crates/batcher/src` (`live/run.rs`, `multi_archive_reader.rs`) | the live batcher votes through the engine reader; the offline reader drops an entry that has a void record |
 | 6 | `crates/sequencer/src/outbound/cluster.rs` | decode the new variant (no action) |
 | 7 | `docs/failure-modes.md` | the void rule, the voter set, the two new constants |
@@ -200,15 +202,14 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
 - **One live voter has the envelope in memory, and every archive lost it.** That voter sends no
   request, so no void occurs. The other voters cannot get the bytes, so the chain waits with no
   exit. The fix is a peer envelope fetch: the voter that has the bytes serves them. It is a
-  follow-up and is not in this design. The blackout case does not need it, because there no
-  process has the bytes.
+  follow-up and is not in this design. An archive wipe does not need it, because there no
+  process has the bytes in memory after the restart.
 - **The entry leaves the void window before the last vote.** The window is the newest 65536
   indices. Sequencers keep ordering while the consumers wait. With live ingress at more than
   about 1000 records per second and a 60 s join budget, entry `i` leaves the window before the
-  last vote, the sealer refuses the vote, and the chain stops as it does today. In the blackout
-  case the ingress is dead, so the rate is near zero. A wider window is not the fix: each entry
-  is 68 bytes in every snapshot (65536 entries are about 4.4 MB). The fix is a shorter join
-  budget on this path. See question 4.
+  last vote, the sealer refuses the vote, and the chain stops as it does today. A wider window
+  is not the fix: each entry is 68 bytes in every snapshot (65536 entries are about 4.4 MB).
+  The fix is a shorter join budget on this path. See question 4.
 - **The ingress still has the transaction.** The chain drops the entry. The sender submits it
   again. A republish by the ingress is a possible later step and is not in this design.
 
@@ -230,9 +231,9 @@ Wire changes: one ingress kind, one record type. The count of the match sites of
 2. **All voters, or a quorum.** This design needs all voters. A quorum is faster when a voter
    is down, but a voter that executed the entry and is down then diverges.
 3. **Later entries of the sender.** After a void of nonce 5, the entries with nonce 6 and 7 fail
-   at execution, and their hashes stay in the dedup windows. Option A: leave it, the sender
-   signs again after the window passes. Option B: the void also removes the later hashes of
-   that sender from the windows. Option B needs a sender index in the void table. This design
+   at execution, and their hashes stay in the sealer dedup window. Option A: leave it, the
+   sender signs again after the window passes. Option B: the void also removes the later hashes
+   of that sender from the window. Option B needs a sender index in the void table. This design
    uses option A.
 4. **Stall target.** How long can the chain wait at a lost entry? The answer sets the join
    budget on this path. It also decides whether a void can occur with live ingress: the last
