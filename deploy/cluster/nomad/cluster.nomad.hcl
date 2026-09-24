@@ -40,6 +40,18 @@ variable "cluster_snapshot_interval_s" {
   default = "300"
 }
 
+# How far past the open block the sealer holds a canonical id, and the
+# deadline it assigns a marker (-Dkardamom.cluster.inclusionHorizonBlocks).
+# It must equal the ingress --inclusion-horizon-blocks: the proxy stamps a
+# deadline with it, and the sealer holds an id until that deadline passes.
+# Every member must agree, because the value decides accept-or-reject
+# inside the replicated state machine. See
+# docs/agents/offer-inclusion-deadline-spec.md.
+variable "cluster_inclusion_horizon_blocks" {
+  type    = string
+  default = "64"
+}
+
 # File sync level of the Raft log and the archive
 # (-Dkardamom.cluster.fileSyncLevel): 0 leaves a write in the page cache,
 # 1 syncs the data of every write batch, 2 syncs data and metadata. At 0
@@ -202,7 +214,7 @@ job "cluster" {
       # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks}"
       }
 
       config {

@@ -86,3 +86,31 @@
           contract_repo_dir ~ '/.github/workflows/cluster-e2e.yml'] }}
   loop_control:
     label: "{{ item | relpath(contract_repo_dir) }}"
+
+# The proxy stamps a transaction's inclusion deadline with its horizon,
+# and the sealer holds the canonical id until that deadline passes. A
+# sealer horizon below the proxy's would clamp every deadline short, and
+# one above it would hold ids longer than any offer can use. Both jobs
+# carry the number as a variable default, so the two defaults must match.
+# See docs/agents/offer-inclusion-deadline-spec.md.
+- name: Read the ingress inclusion horizon
+  ansible.builtin.set_fact:
+    contract_ingress_horizon: >-
+      {{ lookup('file', contract_cluster_dir ~ '/nomad/ingress.nomad.hcl')
+         | regex_search('variable "inclusion_horizon_blocks"[^}]*default\s*=\s*"([0-9]+)"', '\1')
+         | first }}
+
+- name: Read the sealer inclusion horizon
+  ansible.builtin.set_fact:
+    contract_sealer_horizon: >-
+      {{ lookup('file', contract_cluster_dir ~ '/nomad/cluster.nomad.hcl')
+         | regex_search('variable "cluster_inclusion_horizon_blocks"[^}]*default\s*=\s*"([0-9]+)"', '\1')
+         | first }}
+
+- name: The proxy and the sealer must agree on the inclusion horizon
+  ansible.builtin.assert:
+    that: contract_ingress_horizon | int == contract_sealer_horizon | int
+    fail_msg: >-
+      ingress inclusion_horizon_blocks ({{ contract_ingress_horizon }})
+      and cluster_inclusion_horizon_blocks ({{ contract_sealer_horizon }})
+      must be equal.
