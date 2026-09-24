@@ -11,7 +11,7 @@ use tracing::warn;
 
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
-use super::ports::JoinRecovery;
+use super::ports::{JoinRecovery, JoinRecoveryError};
 
 /// A `tx_data` join key: `(sequencer_id, session_id, tx_data_position)`.
 /// Here `sequencer_id` is the `tx_data` lane index (`TxRef::shard_id`),
@@ -175,6 +175,44 @@ impl DedupWindow {
     }
 }
 
+/// How a join ended.
+pub(super) enum JoinOutcome {
+    /// The envelope arrived, live or from an archive.
+    Joined(TxEnvelope),
+    /// The budget ended, and every `tx_data` archive answered that it does
+    /// not hold the range. No retry and no restart can recover the entry.
+    Unjoinable,
+    /// The budget ended, and one archive or more gave no definite answer.
+    /// The data can still exist, so a restart can still recover the entry.
+    TimedOut,
+}
+
+/// The archives that answered "not here" during one join.
+///
+/// Only [`kardamom_log::error::LogError::RangeAbsent`] counts. An archive
+/// that is down, slow, or corrupt gives another error and stays outside the
+/// set, so [`Self::covers`] stays false while any copy is still unknown.
+#[derive(Default)]
+pub(super) struct RefusedArchives(std::collections::BTreeSet<String>);
+
+impl RefusedArchives {
+    pub(super) fn note(&mut self, error: &JoinRecoveryError) {
+        if let JoinRecoveryError::Archive(kardamom_log::error::LogError::RangeAbsent {
+            archive,
+            ..
+        }) = error
+        {
+            self.0.insert(archive.clone());
+        }
+    }
+
+    /// True when `archives` is not empty and each of them refused. An empty
+    /// list means discovery knows no archive, which is no answer at all.
+    pub(super) fn covers(&self, archives: &[String]) -> bool {
+        !archives.is_empty() && archives.iter().all(|a| self.0.contains(a))
+    }
+}
+
 /// Joins one `TxRef` against the buffer with the full join budget, mixing
 /// in bounded archive-refetch attempts when a [`JoinRecovery`] is wired.
 ///
@@ -190,6 +228,7 @@ pub(super) struct JoinWait<'a> {
     key: TxDataKey,
     deadline: Instant,
     recovery: &'a mut Option<JoinRecovery>,
+    refused: RefusedArchives,
 }
 
 impl<'a> JoinWait<'a> {
@@ -218,23 +257,40 @@ impl<'a> JoinWait<'a> {
             key: TxDataKey::from_ref(tx_ref),
             deadline,
             recovery,
+            refused: RefusedArchives::default(),
         })
     }
 
-    pub(super) fn run(mut self) -> Option<TxEnvelope> {
+    pub(super) fn run(mut self) -> JoinOutcome {
         let first_slice = match self.recovery {
             Some(_) => self.cfg.join_refetch_after.min(self.cfg.join_timeout),
             None => self.cfg.join_timeout,
         };
         if let Some(env) = self.wait_for(first_slice) {
-            return Some(env);
+            return JoinOutcome::Joined(env);
         }
         loop {
             match self.poll_once() {
-                JoinStep::GiveUp => return None,
-                JoinStep::Take(env) => return Some(env),
+                JoinStep::GiveUp => return self.give_up(),
+                JoinStep::Take(env) => return JoinOutcome::Joined(env),
                 JoinStep::Retry => (),
             }
+        }
+    }
+
+    /// The budget ended. The join always uses the whole budget first: a
+    /// refusal from every archive does not end it early, because the live
+    /// stream can still deliver the envelope.
+    fn give_up(&self) -> JoinOutcome {
+        let archives = self
+            .recovery
+            .as_ref()
+            .map(JoinRecovery::tx_data_archives)
+            .unwrap_or_default();
+        if self.refused.covers(&archives) {
+            JoinOutcome::Unjoinable
+        } else {
+            JoinOutcome::TimedOut
         }
     }
 
@@ -297,12 +353,15 @@ impl<'a> JoinWait<'a> {
                 recovered,
                 "archive refetch complete"
             ),
-            Err(e) => warn!(
-                target: "kardamom_executor::reader",
-                sequencer_id = key.shard,
-                error = %e,
-                "archive refetch failed; will retry within the join budget"
-            ),
+            Err(e) => {
+                warn!(
+                    target: "kardamom_executor::reader",
+                    sequencer_id = key.shard,
+                    error = %e,
+                    "archive refetch failed; will retry within the join budget"
+                );
+                self.refused.note(&e);
+            }
         }
     }
 

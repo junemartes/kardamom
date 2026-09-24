@@ -543,3 +543,61 @@ fn reader_joins_two_sessions_at_same_position() {
         _ => panic!("expected Tx"),
     }
 }
+
+fn range_absent(archive: &str) -> super::ports::JoinRecoveryError {
+    kardamom_log::error::LogError::RangeAbsent {
+        archive: archive.to_owned(),
+        detail: "recording 3 ended at position 2994688".to_owned(),
+    }
+    .into()
+}
+
+#[test]
+fn an_entry_is_unjoinable_only_when_every_archive_refused() {
+    let archives = vec!["10.0.0.1:8010".to_owned(), "10.0.0.2:8010".to_owned()];
+    let mut refused = super::join::RefusedArchives::default();
+    assert!(!refused.covers(&archives));
+
+    refused.note(&range_absent("10.0.0.1:8010"));
+    assert!(
+        !refused.covers(&archives),
+        "the second archive is still unknown"
+    );
+
+    refused.note(&range_absent("10.0.0.2:8010"));
+    assert!(refused.covers(&archives));
+}
+
+#[test]
+fn an_archive_that_did_not_answer_is_not_a_refusal() {
+    let archives = vec!["10.0.0.1:8010".to_owned(), "10.0.0.2:8010".to_owned()];
+    let mut refused = super::join::RefusedArchives::default();
+    refused.note(&range_absent("10.0.0.1:8010"));
+    refused.note(
+        &kardamom_log::error::LogError::Aeron("refetch: no endpoint reachable".into()).into(),
+    );
+
+    assert!(!refused.covers(&archives));
+}
+
+#[test]
+fn no_known_archive_is_no_answer() {
+    let mut refused = super::join::RefusedArchives::default();
+    refused.note(&range_absent("10.0.0.1:8010"));
+
+    assert!(!refused.covers(&[]));
+}
+
+#[test]
+fn a_join_with_no_recovery_times_out_and_is_not_unjoinable() {
+    let buffer = JoinBuffer::new();
+    let cfg = ReaderConfig {
+        join_timeout: Duration::from_millis(5),
+        ..ReaderConfig::default()
+    };
+    let mut recovery = None;
+    let tx_ref = kardamom_types::TxRef::default();
+    let wait = super::join::JoinWait::new(&buffer, &mut recovery, &tx_ref, &cfg).unwrap();
+
+    assert!(matches!(wait.run(), super::join::JoinOutcome::TimedOut));
+}
