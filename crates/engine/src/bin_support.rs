@@ -249,7 +249,6 @@ pub fn archive_join_recovery(
     Some(JoinRecoveryFactory {
         cfg,
         tx_data_stream_base: channels.tx_data_stream_id_base,
-        tx_deposits_stream_id: channels.tx_deposits_stream_id,
     })
 }
 

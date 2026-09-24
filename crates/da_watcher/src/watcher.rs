@@ -146,11 +146,6 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         self.cursor
     }
 
-    /// The L1 source. Unit tests script the next tick through it.
-    pub fn source(&self) -> &S {
-        &self.source
-    }
-
     /// Spawn the watcher loop. Return a [`WatcherHandle`] that owns the
     /// task and a cooperative shutdown channel.
     pub fn spawn(publisher: P, source: S, config: DaWatcherConfig) -> WatcherHandle {

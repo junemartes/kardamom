@@ -86,7 +86,7 @@ pub mod fakes {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use super::{Address, B256, DepositLog, L1Source, L1SourceError, LockboxLog, async_trait};
+    use super::{Address, B256, L1Source, L1SourceError, LockboxLog, async_trait};
 
     /// In-memory `L1Source` driven by a scripted queue. Tests push expected
     /// `(tip, logs)` pairs in order. Each `process_once` call consumes one
@@ -143,11 +143,6 @@ pub mod fakes {
         /// failed.
         pub fn push_logs(&self, r: Result<Vec<LockboxLog>, L1SourceError>) {
             self.logs.lock().unwrap().push_back(r);
-        }
-
-        /// Convenience for the common case: script a round of deposit logs.
-        pub fn push_deposit_logs(&self, logs: Vec<DepositLog>) {
-            self.push_logs(Ok(logs.into_iter().map(LockboxLog::Deposit).collect()));
         }
     }
 

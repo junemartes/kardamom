@@ -122,10 +122,6 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         Self { provider, owner }
     }
 
-    pub fn owner(&self) -> Address {
-        self.owner
-    }
-
     // -----------------------------------------------------------------------
     // factory_address — pure computation
     // -----------------------------------------------------------------------

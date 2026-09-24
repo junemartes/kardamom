@@ -8,7 +8,7 @@
 /// strings; see `keys`.
 ///
 /// Returns [`APPLIED`] when the row is newer than the stored one,
-/// [`DISCARDED`] when it is older or equal with the same content, and
+/// `0` when it is older or equal with the same content, and
 /// [`DISAGREED`] when it is equal in position but differs in content. The
 /// stored value never changes on an equal position: the first row wins,
 /// and the caller counts the disagreement.
@@ -30,7 +30,5 @@ return 0
 
 /// The row was newer and is stored.
 pub const APPLIED: i64 = 1;
-/// The row was older, or equal with the same content, and is dropped.
-pub const DISCARDED: i64 = 0;
 /// The row was equal in position and different in content.
 pub const DISAGREED: i64 = -1;
