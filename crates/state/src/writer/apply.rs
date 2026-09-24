@@ -11,7 +11,7 @@ use kardamom_types::{BlockBoundary, BlockDelta};
 
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
+    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_READER_POSITION,
     KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
 };
 use crate::schema::{
@@ -216,7 +216,7 @@ impl<'a> BatchWriter<'a> {
         )?;
         self.txn.put(
             self.meta,
-            KEY_LAST_FSYNCED_B_POSITION,
+            KEY_LAST_FSYNCED_READER_POSITION,
             encode_b_position(boundary.end_tx_idx),
             WriteFlags::UPSERT,
         )?;

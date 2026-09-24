@@ -129,7 +129,7 @@ async fn wait_port_free(port: u16) {
 /// image has closed on the archive. A publication re-added before that
 /// would join the same Aeron session, which is not a restart.
 async fn wait_recording_stopped(archive: &rusteron_archive::AeronArchive, stream: i32, id: i64) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         let stopped = recordings(archive, stream)
             .iter()

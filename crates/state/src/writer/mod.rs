@@ -11,9 +11,9 @@
 //!
 //! - `last_committed_block` = `boundary.block_number`
 //! - `last_committed_end_tx_position` = `boundary.end_tx_idx`
-//! - `last_fsynced_b_position` = `boundary.end_tx_idx`. These are the
-//!   same value, because the boundary's `end_tx_idx` is the last B
-//!   position the executor committed through.
+//! - `last_fsynced_reader_position` = `boundary.end_tx_idx`. These are the
+//!   same value, because the boundary's `end_tx_idx` is the last
+//!   `tx_ordering` position the executor committed through.
 //!
 //! `BlockDelta` lives in `kardamom-types`. This crate never redefines it.
 

@@ -13,11 +13,11 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::Receiver;
 use tracing::{info, warn};
 
+use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
     JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
 };
-use kardamom_engine::{ExecutorError, TxIndex};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
 use kardamom_log::discovery::StreamPlane;
@@ -229,7 +229,6 @@ impl RunConfig {
             buffer: join_buffer,
             cfg: reader_cfg,
             exec_out: feed_tx,
-            start_tx_idx: TxIndex(cursor.next_index),
             recovery_factory: join_recovery,
         });
 

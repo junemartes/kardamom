@@ -14,16 +14,13 @@ import java.util.Set;
  *
  * <p>This is a pure POJO. It has no Aeron dependency, no wall clock, and no
  * threads. Every output is a deterministic function of the input sequence.
- * This class is a faithful Java port of the Rust sealer's canonical republish
- * logic ({@code crates/sealer/src/bin/kardamom-sealer.rs}), the boundary
- * emitter ({@code crates/sealer/src/emitter.rs}), and the executor-side
- * {@code DedupWindow} ({@code crates/executor/src/reader.rs}).</p>
+ * This is the pipeline's one dedup point: the executor trusts the relayed
+ * stream and keeps no window of its own.</p>
  *
  * <p>Responsibilities:</p>
  * <ul>
  *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[])}). This mirrors the Rust
- *       {@code DedupWindow}/{@code CanonicalDedup}.</li>
+ *       canonical ids ({@link #firstSeen(byte[])}).</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
  *       relays each first-seen record with its 0-based index and increases
  *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
@@ -97,8 +94,7 @@ public final class CanonicalSealerState {
 
     /**
      * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
-     * id is the first element. This is exactly the {@code VecDeque} front
-     * that the Rust {@code DedupWindow} pops on eviction. Keys are 32-byte
+     * id is the first element, and eviction removes it. Keys are 32-byte
      * ids, wrapped in a read-only {@link ByteBuffer} for value-based
      * equality.
      */
@@ -271,9 +267,8 @@ public final class CanonicalSealerState {
      * inserted.
      *
      * <p>On a fresh insert, if the window then exceeds its capacity, the
-     * oldest inserted id is evicted. This matches the Rust
-     * {@code DedupWindow::first_seen} exactly: an evicted id becomes "fresh"
-     * again if it is seen later.</p>
+     * oldest inserted id is evicted. An evicted id becomes "fresh" again if
+     * it is seen later.</p>
      *
      * @param id32 a 32-byte canonical id (defensively copied)
      */

@@ -12,9 +12,6 @@ edition.workspace = true
 
 [dependencies]
 kardamom-exec-core = { workspace = true }
-smallvec.workspace = true
-alloy-eip7928.workspace = true
-alloy-rlp.workspace = true
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 # Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes
@@ -24,11 +21,8 @@ kardamom-state = { path = "../state" }
 kardamom-obs = { path = "../obs" }
 # P1 footprint shadow (`crate::shadow`): the P0 classifier/grader core.
 kardamom-footprint = { path = "../footprint" }
-serde = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
-alloy-consensus.workspace = true
-alloy-eips.workspace = true
 bytes.workspace = true
 metrics = { workspace = true }
 tracing.workspace = true
@@ -61,6 +55,4 @@ kardamom-test-support = { workspace = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
-alloy-network.workspace = true
-alloy-eips.workspace = true
 tempfile = { workspace = true }

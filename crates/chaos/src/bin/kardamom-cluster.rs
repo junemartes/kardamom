@@ -12,7 +12,7 @@ use kardamom_chaos::scale::Resize;
 use kardamom_chaos::stages::GATE_ACCOUNT;
 use kardamom_chaos::{Knobs, Lifecycle};
 
-const SMOKE_BUDGET: Duration = Duration::from_secs(60);
+const SMOKE_BUDGET: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Parser)]
 #[command(

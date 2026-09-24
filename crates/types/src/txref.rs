@@ -9,12 +9,12 @@
 //! ## Why `tx_hash` is on the ref
 //!
 //! Under the MDS (multi-destination shared-publisher) model, all P
-//! sequencers per shard race to publish the same reference onto
-//! `tx_ordering` when they see a transaction on `tx_data`. So `tx_ordering`
-//! carries P duplicate references per transaction. Downstream consumers,
-//! such as the executor and batcher, dedup on `tx_hash` to drop duplicates
-//! in O(1). They use `(shard_id, tx_data_position)` to resolve a reference
-//! back to its envelope, and `tx_hash` to dedup.
+//! sequencers per shard race to offer the same reference to the sealer
+//! when they see a transaction on `tx_data`. The sealer dedups the offers
+//! on `tx_hash` in O(1), so the canonical `tx_ordering` it relays carries
+//! one reference per transaction. Consumers use
+//! `(shard_id, tx_data_position)` to resolve a reference back to its
+//! envelope.
 //!
 //! ## Why `shard_id` (not `sequencer_id`)
 //!
@@ -40,8 +40,8 @@ use crate::wire::B256Bytes;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug), compare(PartialEq))]
 pub struct TxRef {
-    /// keccak256 of the canonical RLP-encoded transaction. Used for O(1)
-    /// dedup of duplicate references from racing sequencers.
+    /// keccak256 of the canonical RLP-encoded transaction. The sealer's
+    /// dedup key for the racing sequencers' offers.
     #[rkyv(with = B256Bytes)]
     pub tx_hash: B256,
     /// Sender-shard index that identifies which `tx_data` archive holds the

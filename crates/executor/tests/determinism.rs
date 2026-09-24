@@ -15,8 +15,8 @@ use alloy_primitives::{U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use revm::primitives::KECCAK_EMPTY;
 
-use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput};
-use kardamom_engine::{CMessage, ExecutorConfig, MockStateDatabase};
+use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, HarnessSetup};
+use kardamom_engine::{CMessage, ExecutorConfig, MockStateDatabase, ResumePoint};
 
 mod common;
 use common::{Corpus, TxDataVec, TxOrderingVec};
@@ -49,12 +49,17 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
         receipt_queue_depth: QUEUE_DEPTH_128,
         ..Default::default()
     };
-    let outcome = ChannelHarness::run(HarnessInput {
-        cfg,
-        tx_data,
-        tx_ordering,
-        snap,
-    });
+    let outcome = ChannelHarness::run(
+        HarnessSetup {
+            cfg,
+            start: ResumePoint::GENESIS,
+            snap,
+        },
+        HarnessInput {
+            tx_data: vec![tx_data],
+            tx_ordering,
+        },
+    );
     outcome.result.expect("ok");
     outcome.receipts
 }

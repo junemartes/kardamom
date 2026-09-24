@@ -1,4 +1,7 @@
 target
+mise.local.toml
+.mise.local.toml
+.ansible/
 docs/superpowers
 contracts/cache/
 contracts/out/

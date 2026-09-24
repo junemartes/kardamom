@@ -41,7 +41,7 @@ class CanonicalSealerStateTest {
 
     @Test
     void dedup_window_evicts_fifo() {
-        // Capacity is 2. This matches the Rust DedupWindow::first_seen behavior.
+        // Capacity is 2.
         CanonicalSealerState state = new CanonicalSealerState(2);
 
         assertTrue(state.firstSeen(id(1)));

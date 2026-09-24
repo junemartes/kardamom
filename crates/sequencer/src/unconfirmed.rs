@@ -278,10 +278,7 @@ mod tests {
             l.record_published(a, n, n);
         }
         // Nothing is stale under a large timeout.
-        assert!(
-            l.sweep_expired(Duration::from_secs(3600), t0, 256)
-                .is_empty()
-        );
+        assert!(l.sweep_expired(Duration::from_hours(1), t0, 256).is_empty());
         assert_eq!(l.len(), 5);
         // All entries are past the timeout, but the per-call bound caps
         // the sweep at `max` (oldest first off the queue). The remainder

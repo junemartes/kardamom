@@ -186,7 +186,7 @@ impl ChainSender {
         let detail = std::cell::Cell::new(String::new());
         poll_until(
             what,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(300),
             async || {
                 let Some(d) = cond()? else {

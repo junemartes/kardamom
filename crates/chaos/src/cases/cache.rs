@@ -41,7 +41,7 @@ const REBUILD_DONE: &str = "rebuild: done";
 /// How long the sentinels get to promote the replica of a frozen
 /// primary: their `down-after-milliseconds` (5 s), the election, and
 /// slack. The freeze lasts until the promotion is observed.
-const PROMOTION_BUDGET: Duration = Duration::from_secs(60);
+const PROMOTION_BUDGET: Duration = Duration::from_mins(1);
 /// The redis job: one primary, one replica, three sentinels.
 const REDIS_ALLOCS: usize = 5;
 /// The mirror job: one mirror per executor node.

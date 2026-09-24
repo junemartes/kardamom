@@ -230,7 +230,7 @@ impl<'a> DeliveryRun<'a> {
         let last_seq = std::cell::Cell::new(U256::ZERO);
         metrics::poll_until(
             "executor state to settle on Inbox.nextSeq == 3",
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Duration::from_millis(300),
             async || self.nudge_once_if_unsettled(&last_seq).await,
         )

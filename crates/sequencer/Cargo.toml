@@ -50,9 +50,7 @@ kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
 # The nonce lookup client (`lookup`): one JSON-RPC POST per cold sender.
-reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true }

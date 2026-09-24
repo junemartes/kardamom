@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn disabling_a_drain_marks_the_node_eligible() {
-        let on = drain_request(true, Duration::from_secs(120));
+        let on = drain_request(true, Duration::from_mins(2));
         assert_eq!(on["DrainSpec"]["Deadline"], 120_000_000_000_u64);
         assert!(on.get("MarkEligible").is_none());
         let off = drain_request(false, Duration::ZERO);

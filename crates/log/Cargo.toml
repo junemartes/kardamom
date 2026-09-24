@@ -30,7 +30,6 @@ rkyv.workspace = true
 rusteron-archive.workspace = true
 rusteron-client.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 testcontainers = { workspace = true, optional = true }
 thiserror.workspace = true
 toml.workspace = true

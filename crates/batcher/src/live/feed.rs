@@ -137,8 +137,8 @@ impl<P: Provider> FeedLoop<P> {
             // dispatches add nothing new, the same way the exec side
             // expands them again from the record.
             Ok(Some(
-                ReaderToExec::Deposit { .. }
-                | ReaderToExec::Epoch { .. }
+                ReaderToExec::Deposit(_)
+                | ReaderToExec::Epoch(_)
                 | ReaderToExec::XChain { .. }
                 | ReaderToExec::Vacant { .. },
             )) => {}
@@ -147,7 +147,7 @@ impl<P: Provider> FeedLoop<P> {
             // record, with its messages and calldata by value, is
             // buffered into the block it leads. It travels in the KAR1 v2
             // payload for the reconstruction replay to run again.
-            Ok(Some(ReaderToExec::RemoteEpoch { record, .. })) => {
+            Ok(Some(ReaderToExec::RemoteEpoch(record))) => {
                 self.acc.observe_remote_epoch(*record);
             }
             Ok(Some(ReaderToExec::Boundary(b))) => {

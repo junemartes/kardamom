@@ -6,8 +6,8 @@
 //! `(BPosition, TxOrderingMessage)` records. The cluster client handles
 //! leader failover and reconnect, so the reader never sees an image
 //! rotation. The cluster has already deduped and totally ordered the
-//! stream. The executor's own `DedupWindow` still gives idempotency across
-//! any reconnect overlap.
+//! stream. The delivery cursor drops any record below the next expected
+//! canonical index, so a replay/live overlap on reconnect is idempotent.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -27,11 +27,11 @@ use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::Bytecode;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
-use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, LegacyTx};
+use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, HarnessSetup, LegacyTx};
 use kardamom_engine::executor::SnapshotRef;
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, MockStateDatabase, TxEnvelope,
-    TxOrderingMessage, TxRef,
+    BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, MockStateDatabase, ResumePoint,
+    TxEnvelope, TxOrderingMessage, TxRef,
 };
 
 const QUEUE_DEPTH_8: NonZeroUsize = NonZeroUsize::new(8).unwrap();
@@ -276,12 +276,17 @@ fn actor_receipts_match_naive_reference() {
         receipt_queue_depth: QUEUE_DEPTH_8,
         ..Default::default()
     };
-    let outcome = ChannelHarness::run(HarnessInput {
-        cfg,
-        tx_data,
-        tx_ordering,
-        snap: fixture.snap_actor,
-    });
+    let outcome = ChannelHarness::run(
+        HarnessSetup {
+            cfg,
+            start: ResumePoint::GENESIS,
+            snap: fixture.snap_actor,
+        },
+        HarnessInput {
+            tx_data: vec![tx_data],
+            tx_ordering,
+        },
+    );
     outcome.result.expect("ok");
 
     let actor: Vec<TxResult> = outcome

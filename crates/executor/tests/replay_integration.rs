@@ -13,8 +13,8 @@ use alloy_primitives::{B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use revm::primitives::KECCAK_EMPTY;
 
-use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput};
-use kardamom_engine::{BlockBoundary, CMessage, ExecutorConfig, MockStateDatabase};
+use kardamom_engine::actor::fixtures::{ChannelHarness, HarnessInput, HarnessSetup};
+use kardamom_engine::{BlockBoundary, CMessage, ExecutorConfig, MockStateDatabase, ResumePoint};
 
 mod common;
 use common::{Corpus, TxDataVec, TxOrderingVec};
@@ -102,12 +102,17 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
         receipt_queue_depth: QUEUE_DEPTH_64,
         ..Default::default()
     };
-    let outcome = ChannelHarness::run(HarnessInput {
-        cfg,
-        tx_data,
-        tx_ordering,
-        snap,
-    });
+    let outcome = ChannelHarness::run(
+        HarnessSetup {
+            cfg,
+            start: ResumePoint::GENESIS,
+            snap,
+        },
+        HarnessInput {
+            tx_data: vec![tx_data],
+            tx_ordering,
+        },
+    );
     outcome.result.expect("exec ok");
 
     let collected = drain_c_stream(outcome.receipts);

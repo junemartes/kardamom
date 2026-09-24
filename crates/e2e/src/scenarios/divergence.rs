@@ -148,7 +148,7 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
     // is refused and fails the scenario while the validator did exactly
     // the right thing. Exit code 2 is the divergence fail-stop.
     let code = stack
-        .wait_validator_exit(Duration::from_secs(60))
+        .wait_validator_exit(Duration::from_mins(1))
         .context("validator must reject an epoch L1 never produced")?;
     anyhow::ensure!(
         code == Some(2),
@@ -219,7 +219,7 @@ async fn assert_faithful_baseline(stack: &mut LocalStack, t: &Target) -> Result<
     t.wait_validator_metric_above(
         super::VALIDATOR_EPOCHS_VERIFIED,
         verified_before,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         Duration::from_millis(500),
         "epochs verifying through the interposed endpoint",
     )
