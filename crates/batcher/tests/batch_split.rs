@@ -27,6 +27,7 @@ fn capped_message(origin: u64, i: usize, n: usize) -> XChainMessage {
         target: Address::repeat_byte(0xB2),
         value: 0,
         gas_limit: 150_000,
+        hops: 0,
         input: Bytes::from(vec![u8::try_from(i).unwrap(); n]),
         callback: Some(kardamom_types::xchain::Callback {
             target: Address::repeat_byte(0xCB),

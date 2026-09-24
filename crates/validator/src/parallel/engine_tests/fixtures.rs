@@ -109,6 +109,7 @@ pub(crate) fn xchain(origin: u64, seq: u64, target: Address, i: u64) -> Buffered
             target,
             value: 0,
             gas_limit: 100_000,
+            hops: 0,
             input: bytes::Bytes::default(),
             callback: None,
         }),

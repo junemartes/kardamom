@@ -196,6 +196,7 @@ pub(super) fn remote_epoch_fixture(origin: u64, n: NonZeroU64) -> RemoteEpochRec
         target: Address::repeat_byte(0xB6),
         value: 0,
         gas_limit: 100_000,
+        hops: 0,
         input: bytes::Bytes::default(),
         callback: None,
     };

@@ -12,6 +12,7 @@ sol! {
         uint64 destChainId,
         address target,
         uint64 gasLimit,
+        uint8 hops,
         bytes data,
         SolCb cb
     );
@@ -40,6 +41,7 @@ fn send_message_calldata_is_byte_identical_to_sol_types() {
                 destChainId: CHAIN_B_ID,
                 target,
                 gasLimit: 250_000,
+                hops: USER_HOPS,
                 data: alloy_primitives::Bytes::copy_from_slice(data),
                 cb: SolCb {
                     target: c.target,

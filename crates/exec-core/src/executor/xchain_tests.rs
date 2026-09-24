@@ -21,6 +21,7 @@ fn xmsg(seq: u64, data: Bytes) -> XChainMessage {
         target: Address::from([0x88u8; 20]),
         value: 0,
         gas_limit: 200_000,
+        hops: 0,
         input: data,
         callback: None,
     }
@@ -62,6 +63,13 @@ fn predeploy_code(addr: Address) -> Vec<u8> {
     let start = rest.find("\"0x").expect("code hex") + 3;
     let end = start + rest[start..].find('"').expect("closing quote");
     alloy_primitives::hex::decode(&rest[start..end]).expect("valid hex")
+}
+
+/// The origin charges its per-block destination budget with the same
+/// overhead (`Outbox.DELIVERY_OVERHEAD`, pinned in `Outbox.t.sol`).
+#[test]
+fn delivery_overhead_matches_the_outbox_constant() {
+    assert_eq!(XCHAIN_DELIVERY_OVERHEAD, 462_000);
 }
 
 #[test]

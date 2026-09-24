@@ -196,6 +196,7 @@ pub fn derive_remote_epoch(
         target: m.target,
         value: m.value,
         gas_limit: m.gas_limit,
+        hops: m.hops,
         input: Bytes::copy_from_slice(m.data.as_ref()),
         callback: m.callback,
     };
@@ -219,12 +220,13 @@ pub fn derive_remote_epoch(
 /// `anchor_hash` (32) + `first_seq` (8) + `msg_count` (4).
 pub const REMOTE_EPOCH_FIXED_WIRE_BYTES: usize = 8 + 8 + 32 + 8 + 4;
 
-/// Fixed bytes one [`XChainMessage`] adds to the KAR1 v2 DA frame, on top
-/// of its calldata: `source_hash` (32) + `seq` (8) + `origin_sender` (20) +
-/// `target` (20) + `value` (16) + `gas_limit` (8) + `input_len` (4) +
-/// callback flag (1) + callback body (20 + 8 + 32). The callback body is
-/// always charged, so the bound holds with or without a callback.
-pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 4 + 1 + 20 + 8 + 32;
+/// Fixed bytes one [`XChainMessage`] adds to the KAR1 DA frame, on top of
+/// its calldata: `source_hash` (32) + `seq` (8) + `origin_sender` (20) +
+/// `target` (20) + `value` (16) + `gas_limit` (8) + `hops` (1) +
+/// `input_len` (4) + callback flag (1) + callback body (20 + 8 + 32). The
+/// callback body is always charged, so the bound holds with or without a
+/// callback. The sum is 170. `Outbox.MESSAGE_WIRE_OVERHEAD` mirrors it.
+pub const XCHAIN_MSG_FIXED_WIRE_BYTES: usize = 32 + 8 + 20 + 20 + 16 + 8 + 1 + 4 + 1 + 20 + 8 + 32;
 
 /// Cap on the KAR1 v2 wire size of one [`RemoteEpochRecord`]. See
 /// [`remote_epoch_wire_bytes`]. [`derive_remote_epoch`] rejects a larger

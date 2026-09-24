@@ -11,7 +11,7 @@ use super::message::XChainMessage;
 /// (`XChain.Callback`), which Solidity resolves into the signature exactly as
 /// written here.
 pub const INBOX_DELIVER_SIGNATURE: &str =
-    "deliver(uint64,uint64,address,address,uint256,uint64,bytes,(address,uint64,bytes32))";
+    "deliver(uint64,uint64,address,address,uint256,uint64,uint8,bytes,(address,uint64,bytes32))";
 
 /// 4-byte function selector of [`INBOX_DELIVER_SIGNATURE`].
 #[must_use]
@@ -21,22 +21,23 @@ pub fn inbox_deliver_selector() -> [u8; 4] {
 }
 
 /// ABI-encode `Inbox.deliver(originChainId, seq, originSender, target, value,
-/// gasLimit, data, cb)` for one message — the calldata of the derived 0x7D tx.
+/// gasLimit, hops, data, cb)` for one message — the calldata of the derived
+/// 0x7D tx.
 ///
 /// Hand-rolled: the execution edge is `no_std` and must not grow an ABI
 /// codegen dependency for one fixed call; byte-parity with `alloy-sol-types`
-/// is pinned in tests. Layout: a 10-word head — the six static params, the
-/// offset word for `data` (0x140, the tail begins right after the head), and
+/// is pinned in tests. Layout: an 11-word head — the seven static params, the
+/// offset word for `data` (0x160, the tail begins right after the head), and
 /// the static callback tuple inlined as three words — then `data`'s length
 /// word and its right-padded bytes. `callback: None` encodes as the zeroed
 /// tuple, which is exactly what `XChain.isNone` tests for.
 pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
-    const HEAD_WORDS: usize = 10;
+    const HEAD_WORDS: usize = 11;
     // `HEAD_WORDS * 32`: the byte offset where `data`'s tail begins, as the
     // `u64` word `deliver_calldata` writes into the head. Kept as its own
     // constant instead of a runtime `u64::try_from(HEAD_WORDS * 32)`, since
     // both sides are already known at compile time.
-    const HEAD_BYTES: u64 = 320;
+    const HEAD_BYTES: u64 = 352;
     const _: () = assert!(HEAD_BYTES == HEAD_WORDS as u64 * 32);
 
     let data = msg.input.as_ref();
@@ -51,6 +52,7 @@ pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
         .address(msg.target)
         .u128(msg.value)
         .u64(msg.gas_limit)
+        .u64(u64::from(msg.hops))
         .u64(HEAD_BYTES)
         .address(cb.target)
         .u64(cb.gas_limit)

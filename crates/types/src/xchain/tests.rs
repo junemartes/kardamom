@@ -22,6 +22,7 @@ fn msg_in_block(seq: u64, dest: u64, block: u64) -> OutboxMessage {
         target: Address::repeat_byte(0xB2),
         value: 0,
         gas_limit: 200_000,
+        hops: 0,
         data: AlloyBytes::from(alloc::vec![0xCA, 0xFE]),
         callback: None,
     }
@@ -316,6 +317,7 @@ fn leaf_recomputable_from_wire_record() {
         target: Address::repeat_byte(0xB2),
         value: 0,
         gas_limit: 200_000,
+        hops: 0,
         data_hash: keccak256([0xCA, 0xFE]),
         cb_hash: no_callback_hash(),
     }
@@ -341,7 +343,7 @@ fn leaf_known_vector_is_pinned() {
     // Anchored output for fixed inputs — must match Outbox.hashMessage in
     // contracts/test/Outbox.t.sol (the cross-language tie). Changing the
     // leaf layout flips this and forces a review conversation.
-    let leaf = MsgLeaf {
+    let inputs = MsgLeaf {
         origin_chain_id: 1,
         dest_chain_id: 2,
         seq: 3,
@@ -349,16 +351,45 @@ fn leaf_known_vector_is_pinned() {
         target: Address::repeat_byte(0x05),
         value: 6,
         gas_limit: 7,
+        hops: 9,
         data_hash: keccak256([0x08]),
         cb_hash: B256::ZERO,
-    }
-    .hash();
+    };
     // Same inputs, same value, asserted in contracts/test/Outbox.t.sol —
     // the cross-language tie.
     assert_eq!(
-        leaf,
-        b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
+        inputs.hash(),
+        b256!("3bffc28cda803d8ff97702a187a7218fd692b9f36b265256736d6c159f89696f")
     );
+    // The hop budget is committed: one hop more is another leaf.
+    let other = MsgLeaf { hops: 10, ..inputs };
+    assert_ne!(inputs.hash(), other.hash());
+}
+
+/// The zero struct commits to ZERO, like `XChain.hashCallback` (audit
+/// M5). Any nonzero field makes it a real callback.
+#[test]
+fn zero_callback_commits_to_zero_like_solidity() {
+    assert_eq!(Callback::default().commitment(), B256::ZERO);
+    assert_eq!(Callback::default().commitment(), no_callback_hash());
+    assert!(Callback::default().is_zero());
+    let almost = Callback {
+        gas_limit: 1,
+        ..Callback::default()
+    };
+    assert!(!almost.is_zero());
+    assert_ne!(almost.commitment(), B256::ZERO);
+}
+
+/// A message with `callback: Some(zero)` and one with `None` commit to
+/// the same leaf, so a feed that carries the zero struct verifies.
+#[test]
+fn zero_callback_and_none_share_a_leaf() {
+    let rec = derive_remote_epoch(SELF, ORIGIN, 0, &[msg(0, SELF)]).unwrap();
+    let none = rec.messages.first().clone();
+    let mut zero = none.clone();
+    zero.callback = Some(Callback::default());
+    assert_eq!(none.leaf(ORIGIN, SELF), zero.leaf(ORIGIN, SELF));
 }
 
 #[test]
