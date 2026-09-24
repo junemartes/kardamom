@@ -9,6 +9,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
@@ -64,6 +65,16 @@ public final class ClusterNode {
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
 
+        // Void voters: the ids of the consumers whose votes remove an entry
+        // that no consumer can execute (each executor, the validator, the
+        // batcher). Unset or empty refuses every void request. Every member
+        // must run the same list and the same window.
+        final VoidLedger.Config voidConfig = parseVoidConfig(
+            System.getProperty("kardamom.cluster.voidVoters", System.getenv("KARDAMOM_VOID_VOTERS")),
+            Integer.getInteger("kardamom.cluster.voidWindow", SealerWire.DEFAULT_RETENTION));
+        System.out.println("cluster void voters memberId=" + memberId
+            + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
         // Launch with a retry past the mark-file liveness window. A member
@@ -90,7 +101,8 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins, barrier));
+                        aeronDir, clusterDir, dedupCapacity, tickMs, memberId, remoteOrigins,
+                        voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
@@ -385,15 +397,48 @@ public final class ClusterNode {
         return out;
     }
 
+    /**
+     * Parse the void voter list, such as "0,1,2,3,4". The default window is
+     * the egress retention: a consumer cannot wait at an entry that the
+     * sealer can no longer replay, so a wider window is never used.
+     */
+    static VoidLedger.Config parseVoidConfig(final String raw, final int window) {
+        if (raw == null || raw.isBlank()) {
+            return VoidLedger.Config.DISABLED;
+        }
+        final long mask = java.util.Arrays.stream(raw.split(","))
+            .map(String::trim)
+            .filter(t -> !t.isEmpty())
+            .mapToInt(ClusterNode::parseVoterId)
+            .mapToLong(id -> 1L << id)
+            .reduce(0L, (a, b) -> a | b);
+        return new VoidLedger.Config(window, mask);
+    }
+
+    private static int parseVoterId(final String t) {
+        final int id;
+        try {
+            id = Integer.parseInt(t);
+        } catch (final NumberFormatException e) {
+            throw new IllegalStateException("kardamom.cluster.voidVoters: '" + t + "' is not a voter id", e);
+        }
+        if (id < 0 || id >= VoidLedger.MAX_VOTERS) {
+            throw new IllegalStateException(
+                "kardamom.cluster.voidVoters: id " + id + " outside [0, " + VoidLedger.MAX_VOTERS + ")");
+        }
+        return id;
+    }
+
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir, final String clusterDir, final int dedupCapacity,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
-            final ShutdownSignalBarrier barrier) {
+            final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
-            .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId, remoteOrigins));
+            .clusteredService(new SealerClusteredService(
+                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.
