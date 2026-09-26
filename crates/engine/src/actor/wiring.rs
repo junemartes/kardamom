@@ -142,8 +142,8 @@ pub struct RoleHooks<W: EngineWiring> {
     pub bal_capture: Option<Sender<BalHandoff>>,
     /// Footprint shadow (`crate::shadow`): per-block capture hand-off to
     /// the grader thread (executor role, `KARDAMOM_FOOTPRINT_SHADOW=1`).
-    /// `None` skips capture. Ignored on the whole-block (validator) path,
-    /// since captures ride the streaming arm.
+    /// `None` skips capture. The whole-block path drops it, since captures
+    /// ride the streaming arm.
     pub footprint_shadow: Option<Sender<crate::shadow::ShadowBlock>>,
     /// Whole-block execution strategy (validator parallel path). `None`
     /// keeps the per-transaction streaming path unchanged.

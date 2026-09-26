@@ -50,6 +50,8 @@
 //! - [`ports`]: outbound trait seams.
 //! - [`types`]: plain data types.
 //! - `exec_state`: the [`ExecState`] struct and its constructor.
+//! - `exec_block`: the per-block state, the execution mode, and the
+//!   optional captures.
 //! - `exec_thread`: the loop and [`ExecState::spawn`].
 //! - `exec_records`, `exec_markers`, `exec_boundary`: the `ReaderToExec`
 //!   arms.
@@ -67,6 +69,7 @@ use crate::error::ExecutorError;
 use crate::reader::{JoinBuffer, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 mod commit_thread;
+mod exec_block;
 mod exec_boundary;
 mod exec_markers;
 mod exec_records;
