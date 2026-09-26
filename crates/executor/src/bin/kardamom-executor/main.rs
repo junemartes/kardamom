@@ -394,11 +394,6 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         _nonce_query: nonce_query,
     } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
-    // `verify_record_identity` stays off here by decision, not omission.
-    // With the validator checking every record, a forged envelope
-    // halts verification with proof. Sequencer-side rejection would only
-    // buy defense-in-depth, at the cost of an ecrecover per tx on the hot
-    // path. See the field's doc for the full trade-off.
     let mut cfg = ExecutorConfig {
         chain_id,
         ..ExecutorConfig::default()
@@ -451,6 +446,13 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
                 // No remote-epoch check either: that seam is wired by the
                 // destination validator only.
                 remote_epoch_observer: None,
+                // No `VerifyRecordIdentity` hook, by decision, not
+                // omission. With the validator checking every record, a
+                // forged envelope halts verification with proof.
+                // Sequencer-side rejection would only buy
+                // defense-in-depth, at the cost of an ecrecover per tx on
+                // the hot path. See the hook's doc for the full trade-off.
+                tx_hook: None,
             },
         )
         .run()

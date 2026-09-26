@@ -39,6 +39,7 @@ use crate::reader::{
 };
 
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
+use super::tx_hook::TxHook;
 use super::types::{BalHandoff, BlockExecStrategy};
 
 /// The port types the exec thread itself needs, independent of the reader
@@ -68,6 +69,11 @@ pub trait ExecPorts {
     /// per-transaction path. The validator's parallel verifier and the
     /// executor's STM pool each name their own type here.
     type BlockExec: BlockExecStrategy<SnapshotDb<Self>> + 'static;
+    /// Hook around each tx record. Use [`NoTxHook`](super::NoTxHook) for
+    /// roles that wire none. The validator names
+    /// [`VerifyRecordIdentity`](super::VerifyRecordIdentity). A pair
+    /// `(A, B)` stacks two hooks.
+    type TxHook: TxHook + 'static;
 }
 
 /// The full set of port types one role plugs into [`Executor::run`]:
@@ -85,6 +91,7 @@ pub trait ExecPorts {
 ///     type Epoch = EpochVerifier;
 ///     type RemoteEpoch = RemoteEpochVerifier;
 ///     type BlockExec = ParallelBlockExec;
+///     type TxHook = VerifyRecordIdentity;
 /// }
 /// impl EngineWiring for ValidatorWiring {
 ///     type TxData = ClusterTxDataSubscription;
@@ -155,11 +162,14 @@ pub struct RoleHooks<W: EngineWiring> {
     /// messages apply. `None` trusts the pair's origin sequence as sent.
     /// Wired by the destination validator only.
     pub remote_epoch_observer: Option<W::RemoteEpoch>,
+    /// Hook around each tx record, run on the exec thread. `None` runs no
+    /// hook.
+    pub tx_hook: Option<W::TxHook>,
 }
 
 impl<W: EngineWiring> RoleHooks<W> {
-    /// No role-specific behavior: streaming execution, no BAL capture, and
-    /// no epoch check. This is the shape the executor and most tests use.
+    /// No role-specific behavior: streaming execution, no BAL capture, no
+    /// epoch check, and no tx hook. This is the shape the executor and most tests use.
     #[must_use]
     pub fn none() -> Self {
         Self {
@@ -168,6 +178,7 @@ impl<W: EngineWiring> RoleHooks<W> {
             block_exec: None,
             epoch_observer: None,
             remote_epoch_observer: None,
+            tx_hook: None,
         }
     }
 }

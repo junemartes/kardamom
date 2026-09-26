@@ -56,6 +56,7 @@ impl<D, O, R> crate::ExecPorts for TestWiring<D, O, R> {
     type Epoch = crate::NoEpochCheck;
     type RemoteEpoch = crate::NoRemoteEpochCheck;
     type BlockExec = crate::NoBlockExec;
+    type TxHook = crate::VerifyRecordIdentity;
 }
 
 impl<D, O, R> crate::EngineWiring for TestWiring<D, O, R>
@@ -128,12 +129,13 @@ const RECEIPTS_DEPTH: usize = 64;
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 
 /// What a harness run starts from: the executor config, the resume cursor,
-/// and the starting state snapshot. The snapshot is also the shared
-/// post-run state.
+/// the starting state snapshot, and the optional identity hook. The
+/// snapshot is also the shared post-run state.
 pub struct HarnessSetup {
     pub cfg: crate::ExecutorConfig,
     pub start: crate::ResumePoint,
     pub snap: crate::MockStateDatabase,
+    pub tx_hook: Option<crate::VerifyRecordIdentity>,
 }
 
 /// Input for [`ChannelHarness::run`]: one record list per `tx_data` lane
@@ -175,7 +177,12 @@ impl ChannelHarness {
     /// blocks the test thread.
     #[must_use]
     pub fn spawn(setup: HarnessSetup, lanes: u8) -> Self {
-        let HarnessSetup { cfg, start, snap } = setup;
+        let HarnessSetup {
+            cfg,
+            start,
+            snap,
+            tx_hook,
+        } = setup;
         let (tx_data, tx_data_subs): (Vec<_>, Vec<_>) = (0..lanes)
             .map(|sequencer_id| {
                 let (tx, rx) = unbounded();
@@ -198,7 +205,10 @@ impl ChannelHarness {
                 writer_queue: crate::WriterApplyingQueue::new(snap.clone()),
             },
             start,
-            crate::RoleHooks::none(),
+            crate::RoleHooks {
+                tx_hook,
+                ..crate::RoleHooks::none()
+            },
         )
         .spawn();
         Self {

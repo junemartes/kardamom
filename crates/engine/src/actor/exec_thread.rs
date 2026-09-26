@@ -71,7 +71,7 @@ impl<W: ExecPorts> ExecState<W> {
     /// The exec thread's main loop. It receives a message, or runs the idle
     /// probe, then dispatches to the matching handler. It stops cleanly when
     /// the commit channel's receiver is gone, or the reader channel closes.
-    fn run(&mut self) -> Result<(), ExecutorError> {
+    pub(super) fn run(&mut self) -> Result<(), ExecutorError> {
         while let Flow::Continue = self.recv_and_dispatch()? {}
         Ok(())
     }

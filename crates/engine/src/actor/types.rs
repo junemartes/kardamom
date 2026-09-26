@@ -92,27 +92,6 @@ pub struct ExecutorConfig {
     /// Reader-layer tunables (join buffer timeout, growth warning
     /// threshold). See [`ReaderConfig`].
     pub reader: ReaderConfig,
-    /// Re-derive every tx record's identity on arrival: check that
-    /// `tx_hash == keccak256(raw_tx)`, and that `sender` matches the
-    /// signature's recovered signer. This is the same check as
-    /// [`crate::stateless::verify_record_identity`], which the zk guest
-    /// runs. On a mismatch, abort the pipeline with
-    /// [`ExecutorError::RecordIdentity`].
-    ///
-    /// The stream carries both fields as proxy claims. A role that
-    /// leaves this off executes
-    /// whatever identity the proxy asserted.
-    ///
-    /// The validator enables this check unconditionally and treats a
-    /// mismatch as an integrity halt. The executor keeps it off: with the
-    /// validator checking, a forged envelope cannot commit unnoticed. So
-    /// sequencer-side rejection is defense-in-depth, priced at one ecrecover
-    /// per transaction on the hot path. That trade-off is a separate
-    /// decision.
-    ///
-    /// Deposit records are out of scope. Their identity (`source_hash`)
-    /// stays a trusted input until the witness is anchored on L1.
-    pub verify_record_identity: bool,
 }
 
 /// Default [`ExecutorConfig::chain_id`]: chain id 1.
@@ -127,7 +106,6 @@ impl Default for ExecutorConfig {
             chain_id: DEFAULT_CHAIN_ID,
             receipt_queue_depth: DEFAULT_RECEIPT_QUEUE_DEPTH,
             reader: ReaderConfig::default(),
-            verify_record_identity: false,
         }
     }
 }

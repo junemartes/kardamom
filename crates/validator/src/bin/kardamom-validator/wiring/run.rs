@@ -121,6 +121,7 @@ impl ExecPorts for ValidatorWiring {
     type Epoch = epoch_verify::EpochVerifier;
     type RemoteEpoch = kardamom_validator::interop::RemoteEpochVerifier;
     type BlockExec = ValidatorBlockExec;
+    type TxHook = kardamom_engine::VerifyRecordIdentity;
 }
 
 impl EngineWiring for ValidatorWiring {
@@ -153,12 +154,6 @@ impl Ready {
 
         let mut cfg = kardamom_engine::ExecutorConfig {
             chain_id,
-            // A validator always re-derives record identity. The
-            // stream's sender and tx_hash are proxy claims, and
-            // verification that trusts them re-executes the very theft
-            // it exists to catch. The resulting RecordIdentity halt is
-            // classified as integrity (exit 2) by the caller.
-            verify_record_identity: true,
             ..kardamom_engine::ExecutorConfig::default()
         };
         // Always bound the tx_data join wait. A verifier that loses an
@@ -341,6 +336,13 @@ impl Ready {
                     block_exec,
                     epoch_observer,
                     remote_epoch_observer,
+                    // A validator always re-derives record identity. The
+                    // stream's sender and tx_hash are proxy claims, and
+                    // verification that trusts them re-executes the very
+                    // theft it exists to catch. The resulting
+                    // RecordIdentity halt is classified as integrity
+                    // (exit 2) by the caller.
+                    tx_hook: Some(kardamom_engine::VerifyRecordIdentity),
                 },
             )
             .run()
