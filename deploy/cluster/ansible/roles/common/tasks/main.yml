@@ -32,6 +32,17 @@
 # (the write would either fail or leak to the host). The container-based CI
 # cluster (cluster-e2e) sets these once on the runner host and passes
 # `kardamom_in_container=true` to skip this task; VMs leave it false (default).
+#
+# A node container on a kernel before 6.11 has no `net.core.*mem_*` in its
+# network namespace at all (Ubuntu 24.04, kernel 6.8): the value of the
+# machine applies, and the machine sets it. Later kernels (Debian 13,
+# 6.12) expose the keys in the namespace, and the write lands there. So a
+# missing key means a container, never a broken machine: skip the task.
+- name: Check that the kernel exposes the socket-buffer sysctls here
+  ansible.builtin.stat:
+    path: /proc/sys/net/core/rmem_max
+  register: common_sysctl_core
+
 - name: Install and apply Aeron-friendly socket-buffer sysctls
   ansible.posix.sysctl:
     name: "{{ item.name }}"
@@ -48,7 +59,9 @@
       value: "16777216"
     - name: net.core.wmem_default
       value: "16777216"
-  when: not (kardamom_in_container | default(false) | bool)
+  when:
+    - not (kardamom_in_container | default(false) | bool)
+    - common_sysctl_core.stat.exists
 
 - name: Create on-node kardamom directories
   ansible.builtin.file:
