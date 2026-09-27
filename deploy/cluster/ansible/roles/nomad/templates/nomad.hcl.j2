@@ -5,6 +5,14 @@ data_dir   = "/opt/nomad"
 
 bind_addr = "{{ node_ip }}"
 
+# The HTTP API also listens on the loopback: the CLI on the node, the ACL
+# bootstrap of an environment and its deploy runner reach it there
+# (NOMAD_ADDR=https://127.0.0.1:4646), and the agent certificate names
+# 127.0.0.1. The RPC and serf ports stay on the node address.
+addresses {
+  http = "127.0.0.1 {{ node_ip }}"
+}
+
 advertise {
   http = "{{ node_ip }}"
   rpc  = "{{ node_ip }}"
