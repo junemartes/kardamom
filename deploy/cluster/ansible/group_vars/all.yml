@@ -52,6 +52,11 @@ consul_agent_token: ""
 consul_dns_token: ""
 nomad_acl_enabled: false
 nomad_consul_token: ""
+# The wait for the agent's own DNS name after its restart. With the ACLs
+# on, the first bootstrap of an environment runs with placeholder tokens,
+# and every read is a 403 until the ACL bootstrap: that pass turns the
+# wait off (-e consul_wait_for_dns=false) and bootstraps the ACLs next.
+consul_wait_for_dns: true
 # The directory with the agent TLS material on each host: ca.pem,
 # cert.pem, key.pem. An empty value disables TLS (local profile only).
 consul_tls_dir: ""
