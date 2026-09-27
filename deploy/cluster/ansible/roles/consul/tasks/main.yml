@@ -163,7 +163,9 @@
     unsafe_writes: true
 
 - name: Wait for the agent to answer its own name
-  when: not (image_build | default(false) | bool)
+  when:
+    - not (image_build | default(false) | bool)
+    - consul_wait_for_dns | bool
   ansible.builtin.command:
     argv: [getent, hosts, consul.service.consul]
   register: consul_dns_ready
