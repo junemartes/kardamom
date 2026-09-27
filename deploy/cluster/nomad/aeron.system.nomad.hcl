@@ -149,7 +149,12 @@ job "aeron" {
         # MB term buffers) sits off-heap in the tmpfs aeron.dir, so a
         # small heap is plenty. The JVM honors _JAVA_OPTIONS
         # regardless of the image entrypoint.
-        _JAVA_OPTIONS = "-Xmx160m"
+        # The Aeron MTU: 1344, below the 1400-byte path of a Hetzner
+        # vSwitch VLAN (1400 - 20 IP - 8 UDP = 1372, then down to a
+        # multiple of 32). The Aeron default is 1408, which fragments or
+        # drops on that path. A datagram of 1344 also fits every other
+        # path (a Docker bridge, a Cloud Network, the loopback).
+        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344"
       }
 
       # The archive record of the discovery contract
