@@ -46,6 +46,11 @@
   register: workloads_plan
   check_mode: false
 
+# The body is one expression, so JobModifyIndex stays an integer. A quoted
+# template ("{{ ... }}", with or without `| int`) reaches the module as a
+# string on ansible-core 2.17, the pin of the deploy path, and Nomad
+# answers 400 ("cannot unmarshal string into ... JobModifyIndex of type
+# uint64"). ansible-core 2.19 keeps the type either way.
 - name: Register changed job {{ workloads_job.name }}
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
@@ -53,10 +58,10 @@
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
     body_format: json
-    body:
-      Job: "{{ workloads_job_definition }}"
-      EnforceIndex: true
-      JobModifyIndex: "{{ workloads_plan.json.JobModifyIndex }}"
+    body: >-
+      {{ {'Job': workloads_job_definition,
+          'EnforceIndex': true,
+          'JobModifyIndex': workloads_plan.json.JobModifyIndex} }}
   when:
     - not ansible_check_mode
     - workloads_plan.json.Diff.Type != 'None'
