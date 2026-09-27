@@ -186,14 +186,18 @@ job "aeron" {
         }
       }
 
-      # Trimmed from 768 MB. One media driver runs on every
-      # non-control node (the sequencer and worker tiers), so the
-      # per-driver footprint is the main cluster-wide memory cost. 384
-      # MB holds the 160 MB heap plus the driver's off-heap buffers,
-      # metaspace, and threads.
+      # 768 MB. One media driver runs on every non-control node, so the
+      # per-driver footprint is the main cluster-wide memory cost, and
+      # 384 MB held the 160 MB heap plus the driver's own buffers. But
+      # the term buffers in the tmpfs aeron.dir are charged to the cgroup
+      # of the driver that creates them: on a recorder node (the ingress
+      # and aux nodes, whose archive records a topic) they reach 350 MB,
+      # and the kernel OOM-killed the driver at 384 MB on the staging
+      # launch (2026-09-27). The service containers of the node then
+      # fail on "aeron thread did not signal start".
       resources {
         cpu    = 400
-        memory = 384
+        memory = 768
       }
     }
   }
