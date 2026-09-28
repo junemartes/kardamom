@@ -463,13 +463,7 @@ impl ReceiptFloorFeed {
         if !self.vslots.contains(vslot_for(receipt.from)) {
             return ControlFlow::Continue(());
         }
-        let update = FloorUpdate {
-            sender: receipt.from,
-            executed_nonce: receipt.nonce,
-            skip_reason: receipt.skip_reason,
-            deposit: receipt.is_deposit(),
-        };
-        match self.floor_tx.try_send(update) {
+        match self.floor_tx.try_send(FloorUpdate::of_receipt(receipt)) {
             Ok(()) => ControlFlow::Continue(()),
             // The publish loop is stalled past the resync window already.
             // Dropping is safe: an unproven skip just falls through to
@@ -606,13 +600,10 @@ impl NonceLookupFeed {
         let Some(executed_nonce) = nonce.checked_sub(1) else {
             return ControlFlow::Continue(());
         };
-        let update = FloorUpdate {
-            sender,
-            executed_nonce,
-            skip_reason: None,
-            deposit: false,
-        };
-        match self.floor_tx.send(update) {
+        match self
+            .floor_tx
+            .send(FloorUpdate::executed(sender, executed_nonce))
+        {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         }
