@@ -51,69 +51,103 @@ pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
 
 /// One executed-truth observation. Two sources produce it:
 ///
-/// - The `tx_receipts` stream: `sender`'s transaction at `executed_nonce`
-///   produced a receipt, so the sender's floor is at least
-///   `executed_nonce + 1`.
+/// - The `tx_receipts` stream: one update per receipt of this replica's
+///   senders. See [`FloorUpdate::of_receipt`].
 /// - The nonce lookup (`crate::lookup`): an executor reports the committed
 ///   account nonce `c`, so every nonce below `c` executed. The task sends
-///   `executed_nonce = c - 1`, and nothing for `c == 0`. The controller
-///   treats both sources the same: the floor rises to `c`, and published
-///   refs at or below `c - 1` count as confirmed, because the committed
-///   state proves them.
+///   [`Outcome::Executed`] at `c - 1`, and nothing for `c == 0`. The
+///   controller treats both sources the same: the floor rises to `c`, and
+///   published refs at or below `c - 1` count as confirmed, because the
+///   committed state proves them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorUpdate {
     pub sender: Address,
-    pub executed_nonce: u64,
-    /// An L1-originated deposit. It consumes no L2 nonce, so it is
-    /// neither floor evidence nor a publish confirmation. This is
-    /// explicit because a deposit carries `Receipt::tx_type ==
-    /// TX_TYPE_DEPOSIT`. The nonce-0 heuristic this replaces could not
-    /// tell a deposit apart from a genuine nonce-0 transaction.
-    pub deposit: bool,
-    /// A marker receipt: the transaction was ordered (canonical-log
-    /// commitment is proven, so it confirms publishes), but it consumed
-    /// no nonce, so it is not floor evidence. `Some` carries the typed
-    /// cause. The floor logic only asks "is this a skip?" today. Reason
-    /// specific handling (drop on `NonceTooLow`, evict on `NonceTooHigh`)
-    /// is a future step.
-    pub skip_reason: Option<kardamom_types::SkipReason>,
+    pub outcome: Outcome,
+}
+
+/// What one [`FloorUpdate`] proves about its sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The tx at `nonce` executed. It confirms the publish, and it is
+    /// floor evidence: the floor rises to `nonce + 1`.
+    Executed { nonce: u64 },
+    /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
+    /// nonce. Ordering in the canonical log confirms the publish. The
+    /// floor does not rise. The floor logic does not read `reason`.
+    Skipped {
+        nonce: u64,
+        reason: kardamom_types::SkipReason,
+    },
+    /// An L1-originated deposit. It has no L2 nonce, so it is neither a
+    /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
+    /// it, so a genuine nonce-0 tx is never taken for a deposit.
+    Deposit,
+}
+
+impl Outcome {
+    /// The nonce whose publish this confirms. `None` for a deposit.
+    #[must_use]
+    pub fn confirmed(self) -> Option<u64> {
+        match self {
+            Self::Executed { nonce } | Self::Skipped { nonce, .. } => Some(nonce),
+            Self::Deposit => None,
+        }
+    }
+
+    /// The floor this proves. `Some` only for an executed tx.
+    #[must_use]
+    pub fn floor(self) -> Option<u64> {
+        match self {
+            Self::Executed { nonce } => Some(nonce.saturating_add(1)),
+            Self::Skipped { .. } | Self::Deposit => None,
+        }
+    }
 }
 
 impl FloorUpdate {
-    /// A non-skip execution receipt for `sender` at `nonce`: confirms the
-    /// publish, and is floor evidence (raises the floor to `nonce + 1`).
+    /// The update for one receipt. A deposit wins over a skip reason.
+    #[must_use]
+    pub fn of_receipt(receipt: &kardamom_types::Receipt) -> Self {
+        let outcome = match (receipt.is_deposit(), receipt.skip_reason) {
+            (true, _) => Outcome::Deposit,
+            (false, Some(reason)) => Outcome::Skipped {
+                nonce: receipt.nonce,
+                reason,
+            },
+            (false, None) => Outcome::Executed {
+                nonce: receipt.nonce,
+            },
+        };
+        Self {
+            sender: receipt.from,
+            outcome,
+        }
+    }
+
+    /// An executed tx of `sender` at `nonce`.
     #[must_use]
     pub fn executed(sender: Address, nonce: u64) -> Self {
         Self {
             sender,
-            executed_nonce: nonce,
-            deposit: false,
-            skip_reason: None,
+            outcome: Outcome::Executed { nonce },
         }
     }
 
-    /// A skip receipt for `sender` at `nonce`: confirms the publish, but
-    /// is not floor evidence (it consumed no nonce).
+    /// A skipped tx of `sender` at `nonce`.
     #[must_use]
     pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
         Self {
             sender,
-            executed_nonce: nonce,
-            deposit: false,
-            skip_reason: Some(reason),
+            outcome: Outcome::Skipped { nonce, reason },
         }
     }
 
-    /// A deposit receipt for `sender`: carries the filler nonce 0, and is
-    /// neither a confirmation nor floor evidence (see the `deposit` field
-    /// doc for why).
+    /// A deposit to `sender`.
     #[must_use]
     pub fn deposit(sender: Address) -> Self {
         Self {
             sender,
-            executed_nonce: 0,
-            deposit: true,
-            skip_reason: None,
+            outcome: Outcome::Deposit,
         }
     }
 }
@@ -500,8 +534,8 @@ impl ResyncController {
     ///   commit and only a receipt proves the ref survived into the
     ///   committed stream) and including nonce 0.
     ///
-    ///   A deposit receipt (filler nonce 0) must not confirm a genuine
-    ///   nonce-0 transaction. `Receipt::tx_type` tells the two apart at
+    ///   A deposit receipt must not confirm a genuine nonce-0
+    ///   transaction. `Receipt::tx_type` tells the two apart at
     ///   the source, so the exclusion is exactly "is this a deposit?",
     ///   not "is the nonce 0?".
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
@@ -524,25 +558,21 @@ impl ResyncController {
     }
 
     /// Fold one floor update into `raised`/`confirmations`, for
-    /// [`Self::drain_floor_updates`]'s loop.
-    ///
-    /// A deposit (filler nonce 0) consumes no L2 nonce, so it is neither
-    /// a confirmation (it never corresponds to a published `TxRef`) nor
-    /// floor evidence.
+    /// [`Self::drain_floor_updates`]'s loop. See [`Outcome`] for what each
+    /// case proves.
     fn fold_floor_update(
         &mut self,
         u: FloorUpdate,
         raised: &mut Vec<(Address, u64)>,
         confirmations: &mut Vec<(Address, u64)>,
     ) {
-        if u.deposit {
+        let Some(nonce) = u.outcome.confirmed() else {
             return;
-        }
-        confirmations.push((u.sender, u.executed_nonce));
-        if u.skip_reason.is_some() {
+        };
+        confirmations.push((u.sender, nonce));
+        let Some(floor) = u.outcome.floor() else {
             return;
-        }
-        let floor = u.executed_nonce.saturating_add(1);
+        };
         let e = self.floors.entry(u.sender).or_insert(0);
         if floor > *e {
             *e = floor;
