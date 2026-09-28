@@ -24,6 +24,7 @@ kardamom-cluster-client = { path = "../cluster-client" }
 kardamom-log.workspace = true
 alloy-primitives.workspace = true
 crossbeam-channel.workspace = true
+metrics.workspace = true
 rkyv.workspace = true
 # The shared `[cluster]` TOML section (config::ClusterConfig) lives here so the
 # sequencer/engine/ingress service configs re-export one definition.
