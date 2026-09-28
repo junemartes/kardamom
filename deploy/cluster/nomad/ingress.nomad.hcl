@@ -49,6 +49,15 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Nomad node pool of the job. An elastic pool registers its nodes in
+# a pool of its own (roles/nomad: node_pool); the workloads role passes
+# the pool id (workloads_node_pools). The default pool holds the fixed
+# servers.
+variable "node_pool" {
+  type    = string
+  default = "default"
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -78,6 +87,7 @@ variable "inclusion_horizon_blocks" {
 job "ingress" {
   datacenters = [var.datacenter]
   type        = "service"
+  node_pool   = var.node_pool
 
   constraint {
     attribute = "${meta.role}"

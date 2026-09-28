@@ -58,9 +58,11 @@ job "da-watcher" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds service (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "service"
   }
 
   group "da-watcher" {
@@ -94,6 +96,11 @@ job "da-watcher" {
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9005
+      }
     }
 
     task "da-watcher" {
@@ -143,6 +150,13 @@ job "da-watcher" {
         # there re-renders the file; the process reads it once at start
         # and follows the catalog through discovery, so never restart.
         change_mode = "noop"
+      }
+
+      service {
+        name     = "kardamom-da-watcher"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
       }
 
       resources {

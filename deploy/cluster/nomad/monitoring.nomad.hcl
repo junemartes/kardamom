@@ -1,4 +1,4 @@
-# kardamom-monitoring: Prometheus and Grafana on the aux node.
+# kardamom-monitoring: Prometheus and Grafana on the monitoring node.
 #
 # Prometheus scrapes every service's metrics endpoint by its Consul node
 # name, rendered from the node-class counts: no address in this file. It
@@ -59,7 +59,6 @@ locals {
   ingress_targets  = [for i in range(var.ingress_count) : "ingress-${i}.node.${local.dc}.consul:9006"]
   # One state mirror per executor node (nomad/state-mirror.nomad.hcl).
   state_mirror_targets = [for i in range(var.executor_count) : "executor-${i}.node.${local.dc}.consul:9007"]
-  aux                  = "aux-0.node.${local.dc}.consul"
   targets_yaml         = <<-EOT
     scrape_configs:
       - job_name: kardamom-sequencer
@@ -76,13 +75,13 @@ locals {
           - targets: ${jsonencode(local.state_mirror_targets)}
       - job_name: kardamom-validator
         static_configs:
-          - targets: ["${local.aux}:9006"]
+          - targets: [{{ range $i, $s := service "kardamom-validator" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-da-watcher
         static_configs:
-          - targets: ["${local.aux}:9005"]
+          - targets: [{{ range $i, $s := service "kardamom-da-watcher" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-batcher
         static_configs:
-          - targets: ["${local.aux}:9002"]
+          - targets: [{{ range $i, $s := service "kardamom-batcher" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
@@ -95,9 +94,11 @@ job "monitoring" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds monitoring (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "monitoring"
   }
 
   group "monitoring" {

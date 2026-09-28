@@ -70,9 +70,11 @@ job "validator" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds validator (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "validator"
   }
 
   group "validator" {
@@ -124,6 +126,11 @@ job "validator" {
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9006
+      }
       # The cluster egress (response) port, unique per allocation. A
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
@@ -251,6 +258,13 @@ job "validator" {
       template {
         destination = "local/genesis.toml"
         data        = file("config/genesis/dev.toml")
+      }
+
+      service {
+        name     = "kardamom-validator"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
       }
 
       resources {

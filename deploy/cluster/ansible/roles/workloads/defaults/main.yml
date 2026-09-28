@@ -23,6 +23,10 @@ workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default(
 workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror]
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
+# The Nomad node pool of a job, by job name: the pool id of an elastic
+# pool (the pool contract). A job without an entry stays in the default
+# pool, with the fixed servers.
+workloads_node_pools: {}
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
   partition_count: "{{ partition_count }}"
@@ -51,8 +55,8 @@ workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC'
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
 workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default('mainnet', true) }}"
-# The aux node by its Consul record; the light client listens there.
-workloads_aux_host: "{{ lookup('env', 'AUX_HOST') | default('aux-0.node.' ~ datacenter ~ '.consul', true) }}"
+# The light client by its Consul service record (nomad/l1-light-client.nomad.hcl).
+workloads_light_host: "{{ lookup('env', 'L1_LIGHT_CLIENT_HOST') | default('kardamom-l1-light-client.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80

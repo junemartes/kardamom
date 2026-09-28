@@ -76,9 +76,11 @@ job "batcher" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds batcher (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "batcher"
   }
 
   group "batcher" {
@@ -113,6 +115,11 @@ job "batcher" {
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9002
+      }
       # The cluster egress (response) port, unique per allocation. A
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
@@ -204,6 +211,13 @@ job "batcher" {
       template {
         destination = "local/batcher.toml"
         data        = file("config/executor.toml")
+      }
+
+      service {
+        name     = "kardamom-batcher"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
       }
 
       resources {

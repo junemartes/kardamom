@@ -69,7 +69,7 @@
     - name: validator
       wait: false
       vars:
-        l1_rpc_url: "{{ 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
+        l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
     # The watcher derives the epochs the validator checks. With the light
     # client deployed it reads L1 through the same client, so the epoch
@@ -78,7 +78,7 @@
       wait: false
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_rpc': 'http://' ~ workloads_aux_host ~ ':' ~ workloads_light_port}
+           | combine({'l1_rpc': 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port}
                      if workloads_light_execution_rpc | length > 0 else {}) }}
   loop_control:
     loop_var: workloads_job

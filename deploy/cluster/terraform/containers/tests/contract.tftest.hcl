@@ -33,6 +33,10 @@ run "contract" {
     condition     = output.node_contract.nodes["worker-2"].index == 2 && output.node_contract.nodes["worker-2"].role == "worker"
     error_message = "a node carries its class and index"
   }
+  assert {
+    condition     = output.node_contract.nodes["aux-0"].roles == tolist(["aux", "redis", "redis-primary", "batcher"]) && output.node_contract.nodes["worker-0"].roles == tolist(["worker"])
+    error_message = "a node carries its role set: the class, the roles of the class, the roles of the instance"
+  }
 
   assert {
     condition     = output.node_contract.nodes["control-0"].control_plane && !output.node_contract.nodes["aux-0"].control_plane
