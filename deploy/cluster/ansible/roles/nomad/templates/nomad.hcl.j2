@@ -80,6 +80,15 @@ client {
   }
 }
 
+# The agent metrics in the Prometheus format on /v1/metrics: the node
+# resources and the allocations of a client, the Raft and scheduler state
+# of a server. The monitoring job scrapes every agent through Consul.
+telemetry {
+  prometheus_metrics         = true
+  publish_allocation_metrics = true
+  publish_node_metrics       = true
+}
+
 consul {
   address = "127.0.0.1:{{ ports.consul_http }}"
   # Nomad servers and clients find each other through the local Consul

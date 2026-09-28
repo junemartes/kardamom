@@ -25,6 +25,9 @@ workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, 
 # A job receives the ones its file declares (tasks/job.yml).
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
+  cluster_id: "{{ cluster_id }}"
+  nomad_region: "{{ nomad_region }}"
+  nomad_tls_dir: "{{ nomad_tls_dir }}"
   partition_count: "{{ partition_count }}"
   tx_ttl_ms: "{{ tx_ttl_ms }}"
   executor_query_port: "{{ ports.executor_nonce_query }}"
