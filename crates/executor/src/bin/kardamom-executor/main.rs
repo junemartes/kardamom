@@ -146,17 +146,12 @@ async fn spawn_writer_and_bal(
 /// An empty or comment-only file (the current deployment shape)
 /// deserializes to a disabled cluster, so behavior stays the same
 /// unless `[cluster]` is set.
-///
-/// The cluster client's `egress_channel` is this node's reachable
-/// address (the node IP differs per replica), so the Nomad job injects
-/// it as `--cluster-egress-endpoint`, instead of baking it into the
-/// static config file.
 fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
     let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
     let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
-    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-    }
+    file_cfg
+        .cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
     Ok(file_cfg)
 }
 
