@@ -445,9 +445,6 @@ impl IngressService {
         if let Some(endpoints) = ingress_endpoints {
             live.ingress_endpoints = endpoints;
         }
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            live.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
         // This is a dedicated cluster runtime, with its own Aeron thread and
         // the same aeron dir, so the cluster session never contends with the
         // tx_data publish and receipts work.
@@ -575,7 +572,10 @@ async fn main() -> Result<()> {
     // supplies only the optional `[cluster]` section, the Aeron Cluster
     // client connection that the on-quorum watermark observer uses.
     let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
-    let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    let mut file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    file_cfg
+        .cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
 
     let running = IngressService::new(args, resolved, file_cfg).run().await?;
