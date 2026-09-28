@@ -24,6 +24,9 @@ locals {
         container     = "kardamom-${class}-${i}"
         role          = class
         tier          = spec.tier
+        # The role set: the class, the roles of every node of the class,
+        # and the roles of this instance (group_vars/all.yml, node_classes).
+        roles         = distinct(concat([class], try(spec.roles, []), try(spec.instance_roles[tostring(i)], [])))
         index         = i
         control_plane = class == "control"
       }

@@ -189,7 +189,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('l1-light-client', plans)
         self.assertTrue(all(job['Namespace'] == 'staging' for job in plans.values()))
         validator = json.dumps(plans['validator'])
-        self.assertIn('http://aux-0.node.dc1.consul:8548', validator)
+        self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))

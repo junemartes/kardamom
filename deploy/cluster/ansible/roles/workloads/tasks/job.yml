@@ -10,7 +10,8 @@
       {{ lookup('file', workloads_cluster_dir ~ '/' ~ workloads_job_file) | regex_findall('variable "(\w+)"') }}
     workloads_vars: >-
       {{ workloads_common_vars | dict2items | selectattr('key', 'in', workloads_declared) | items2dict
-         | combine(workloads_job.vars | default({})) }}
+         | combine(workloads_job.vars | default({}))
+         | combine({'node_pool': workloads_node_pools[workloads_job.name]} if workloads_job.name in workloads_node_pools else {}) }}
   ansible.builtin.command:
     argv: >-
       {{ [workloads_nomad_binary, 'job', 'run', '-output']

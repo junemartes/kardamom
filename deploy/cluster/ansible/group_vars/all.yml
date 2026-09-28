@@ -188,13 +188,27 @@ aeron_tmpfs_size: "2g"
 #   sealer      3    3-member Aeron Cluster (Raft) sealer — ordering +
 #                    durability fold into the Raft log + archive
 #   aux         1    validator + da_watcher + batcher    (tier: worker)
+#
+# Placement by a role set. A node's class is its `role` (one value: the
+# node name and the index derive from it). A node also carries a role
+# set (node_roles in an inventory): its class plus the service classes it
+# hosts. roles/nomad stamps it as meta.roles.
+# The service jobs (redis, batcher, monitoring, validator, da-watcher,
+# rpc-proxy) constrain on `roles` with set_contains; the pipeline jobs
+# (sealer, executor, ingress, sequencer, anvil) constrain on `role`. No
+# job names a node or a node index.
+#   roles          the service classes every node of the class hosts
+#   instance_roles the service classes one node of the class hosts, by index
+# Production gives each service class its own nodes (see
+# inventories/production/hosts.example.ini). The local profile packs them
+# onto aux-0 and the ingress nodes, so the container count stays.
 node_classes:
   control: { count: 1, tier: control }
   sequencer: { count: 2, tier: sequencer }
-  ingress: { count: 2, tier: worker } # active/active
+  ingress: { count: 2, tier: worker, roles: [redis], instance_roles: { "1": [redis-replica] } } # active/active
   executor: { count: 3, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, tier: worker } # 3-member Aeron Cluster (Raft) sealer
-  aux: { count: 1, tier: worker } # validator + da_watcher + batcher + redis primary
+  aux: { count: 1, tier: worker, roles: [redis, redis-primary, batcher, monitoring, validator, service] }
 
 # Aeron Cluster (Raft) sealer member ports (uniform per role; unique by node IP).
 cluster_member_count: 3

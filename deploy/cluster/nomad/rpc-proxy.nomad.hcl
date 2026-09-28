@@ -39,13 +39,20 @@ job "rpc-proxy" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds service (group_vars/all.yml,
+  # node_classes): two proxies on two nodes, so an edge has two targets.
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "service"
   }
 
   group "proxy" {
-    count = 1
+    count = 2
+    constraint {
+      operator = "distinct_hosts"
+      value    = "true"
+    }
 
     restart {
       attempts = 3

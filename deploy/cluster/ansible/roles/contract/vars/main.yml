@@ -106,7 +106,8 @@ contract_mirrors:
   - path: deploy/cluster/config/sequencer.toml.tpl
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
-      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - 'range service "redis-sentinel"'
+      - '.node.consul:{{ ports.redis_sentinel }}"'
       - master_name = "kardamom"
     forbidden: []
   - path: deploy/cluster/nomad/validator.nomad.hcl
@@ -170,6 +171,7 @@ contract_mirrors:
   - path: deploy/cluster/config/ingress.toml
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
-      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - 'range service "redis-sentinel"'
+      - '.node.consul:{{ ports.redis_sentinel }}"'
       - master_name = "kardamom"
     forbidden: []

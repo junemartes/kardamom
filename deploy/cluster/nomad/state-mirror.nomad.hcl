@@ -118,15 +118,16 @@ job "state-mirror" {
       # The [cache] section: the three sentinels by their node records.
       # The mirror asks them for the primary and asks again after a
       # failure.
+      # The sentinels come from the Consul catalog; a change of the list
+      # restarts nothing (the mirror asks again after a failure).
       template {
         destination = "local/state-mirror.toml"
+        change_mode = "noop"
         data        = <<EOF
 [cache]
 sentinels = [
-  "redis://aux-0.node.${var.datacenter}.consul:26379",
-  "redis://ingress-0.node.${var.datacenter}.consul:26379",
-  "redis://ingress-1.node.${var.datacenter}.consul:26379",
-]
+{{ range service "redis-sentinel" }}  "redis://{{ .Node }}.node.${var.datacenter}.consul:26379",
+{{ end }}]
 master_name = "kardamom"
 EOF
       }

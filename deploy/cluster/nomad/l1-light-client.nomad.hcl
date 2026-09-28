@@ -76,9 +76,12 @@ job "l1-light-client" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The node whose role set holds validator: the validator reads the
+  # light client by its Consul service (roles/workloads, workloads_light_host).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "validator"
   }
 
   group "l1-light-client" {
@@ -108,6 +111,11 @@ job "l1-light-client" {
 
     network {
       mode = "host"
+      # The RPC port, as a Consul service: the validator reads it by the
+      # service record (roles/workloads, workloads_light_host).
+      port "rpc" {
+        static = var.rpc_port
+      }
     }
 
     task "helios" {
@@ -137,6 +145,12 @@ job "l1-light-client" {
       # against receiptsRoot pulls a block's full receipt set. This is
       # sized generously rather than tightly; it is a rounding error
       # next to the validator it sits beside.
+      service {
+        name     = "kardamom-l1-light-client"
+        port     = "rpc"
+        provider = "consul"
+      }
+
       resources {
         cpu    = 500
         memory = 512
