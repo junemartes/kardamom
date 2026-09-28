@@ -6,8 +6,8 @@
 //!     lockbox address and the `DepositInitiated` and `UpgradeInitiated`
 //!     event signatures, then ABI-decode each result into a [`LockboxLog`].
 //!
-//! The contracts' bytecode-hash CI check byte-pins the event signature to
-//! the on-chain `ETHLockbox.sol` ABI.
+//! The event types come from `contracts/abi/ETHLockbox.json`, which
+//! `just abi-check` keeps equal to the Solidity source.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
@@ -19,28 +19,16 @@ use kardamom_types::epoch::UpgradeLog;
 
 use crate::source::{DepositLog, L1Source, L1SourceError, LockboxLog};
 
-sol! {
-    /// Mirror of `contracts/src/L1/ETHLockbox.sol::DepositInitiated`.
-    /// The Rust-side wire signature must stay byte-identical with the
-    /// Solidity declaration. CI's bytecode-hash pin catches drift on the
-    /// contract side.
+sol!(
     #[derive(Debug)]
-    event DepositInitiated(
-        uint64 indexed depositNonce,
-        address indexed from,
-        address indexed to,
-        uint256 mint,
-        uint64 gasLimit,
-        bytes data
-    );
+    ETHLockbox,
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/abi/ETHLockbox.json"
+    )
+);
 
-    /// Mirror of `contracts/src/L1/ETHLockbox.sol::UpgradeInitiated`, the
-    /// upgrade transaction. `activationTimestamp` is in epoch milliseconds.
-    #[derive(Debug)]
-    event UpgradeInitiated(
-        uint64 indexed upgradeNonce, uint256 indexed featureId, uint64 activationTimestamp
-    );
-}
+use ETHLockbox::{DepositInitiated, UpgradeInitiated};
 
 /// Wraps an alloy `Provider` and exposes the two L1 reads the watcher needs.
 pub struct RpcL1Source<P> {

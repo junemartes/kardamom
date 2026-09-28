@@ -601,6 +601,36 @@ cluster-doctor:
     fi
     exit "$rc"
 
+# Regenerate the committed contract ABIs in contracts/abi from a fresh forge
+# build. Rust `sol!` bindings read these files, so a Rust build needs no forge.
+# `out` redirects the files, for `abi-check`.
+abi out=(justfile_directory() / "contracts/abi"):
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd contracts
+    forge build
+    for contract in \
+        ETHLockbox \
+        IKardamomFactory \
+        Inbox \
+        KardamomFactoryV1 \
+        KardamomL2Settlement \
+        KardamomProofOracle \
+        L2ToL1MessagePasser \
+        Outbox \
+        WithdrawalOutputOracle; do
+        forge inspect "$contract" abi --json > "{{out}}/$contract.json"
+    done
+
+# Fail when the committed ABIs in contracts/abi differ from a fresh forge build.
+abi-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fresh="$(mktemp -d)"
+    trap 'rm -rf "$fresh"' EXIT
+    just abi "$fresh"
+    diff -r contracts/abi "$fresh"
+
 # Cluster recipes run through their own justfile so paths and defaults stay
 # relative to deploy/cluster, whether invoked here or from that directory.
 
