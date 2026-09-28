@@ -35,9 +35,8 @@ pub(crate) struct ExecHooks<W: ExecPorts> {
     /// marker. `None` everywhere until the destination-validator
     /// `RemoteEpochVerifier` lands.
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
-    /// Hook around each tx record. See [`crate::actor::TxHook`]. `None`
-    /// runs no hook.
-    pub(super) tx_hook: Option<W::TxHook>,
+    /// Hook around each tx record. See [`crate::actor::TxHook`].
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Every input [`ExecState::new`] and [`ExecState::spawn`] need: the config, the
@@ -67,11 +66,12 @@ pub(super) struct ExecIo<W: ExecPorts> {
 }
 
 /// The role's record hooks: the epoch checks, which the marker arms run,
-/// and the tx hook, which `on_tx` runs. `None` runs no hook.
+/// and the tx hook, which `on_tx` runs. An epoch check that is `None`
+/// does not run.
 pub(super) struct ExecObservers<W: ExecPorts> {
     pub(super) epoch_observer: Option<W::Epoch>,
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
-    pub(super) tx_hook: Option<W::TxHook>,
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Pipelined commit, at depth K. At each boundary, the code submits the

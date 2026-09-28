@@ -342,7 +342,7 @@ impl Ready {
                     // theft it exists to catch. The resulting
                     // RecordIdentity halt is classified as integrity
                     // (exit 2) by the caller.
-                    tx_hook: Some(kardamom_engine::VerifyRecordIdentity),
+                    tx_hook: kardamom_engine::VerifyRecordIdentity,
                 },
             )
             .run()

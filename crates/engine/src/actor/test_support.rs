@@ -274,7 +274,8 @@ where
     type Epoch = NoEpochCheck;
     type RemoteEpoch = R;
     type BlockExec = B;
-    type TxHook = RecordingTxHook;
+    // Off unless a test calls `ExecRig::tx_hook`.
+    type TxHook = Option<RecordingTxHook>;
 }
 
 /// [`ExecRig`]'s inputs for `ExecState`, and the exec-to-commit receiver.

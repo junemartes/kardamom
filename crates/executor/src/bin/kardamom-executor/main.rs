@@ -33,7 +33,7 @@ use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
-    MdbxWriterSignal, Outbound, RoleHooks,
+    MdbxWriterSignal, NoTxHook, Outbound, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
@@ -452,7 +452,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
                 // Sequencer-side rejection would only buy
                 // defense-in-depth, at the cost of an ecrecover per tx on
                 // the hot path. See the hook's doc for the full trade-off.
-                tx_hook: None,
+                tx_hook: NoTxHook,
             },
         )
         .run()
