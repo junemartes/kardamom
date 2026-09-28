@@ -49,6 +49,24 @@ variable "ingress_count" {
   default     = 2
 }
 
+variable "cluster_id" {
+  type        = string
+  description = "The cluster identity. The Nomad agents register <cluster_id>-nomad and <cluster_id>-nomad-client in Consul."
+  default     = "kardamom-dev"
+}
+
+variable "nomad_region" {
+  type        = string
+  description = "The Nomad region. The agent certificate of a client names client.<region>.nomad."
+  default     = "global"
+}
+
+variable "nomad_tls_dir" {
+  type        = string
+  description = "The directory with the agent TLS material on the aux node (ca.pem). Empty means the Nomad API speaks plain HTTP."
+  default     = ""
+}
+
 variable "grafana_admin_password" {
   type        = string
   description = "The Grafana admin password. The local profile keeps the development default."
@@ -93,6 +111,30 @@ locals {
       - job_name: kardamom-batcher
         static_configs:
           - targets: ["${local.aux}:9002"]
+      # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
+      # and the metrics of every Nomad agent, discovered through the local
+      # Consul agent. The node label is the Consul node name.
+      - job_name: node
+        consul_sd_configs:
+          - server: 127.0.0.1:8500
+            services: [node-exporter]
+        relabel_configs:
+          - source_labels: [__meta_consul_node]
+            target_label: node
+      - job_name: nomad
+        metrics_path: /v1/metrics
+        params:
+          format: [prometheus]
+        scheme: ${var.nomad_tls_dir != "" ? "https" : "http"}
+        tls_config:
+          ca_file: ${var.nomad_tls_dir != "" ? "/etc/kardamom/nomad-ca.pem" : ""}
+          server_name: ${var.nomad_tls_dir != "" ? "client.${var.nomad_region}.nomad" : ""}
+        consul_sd_configs:
+          - server: 127.0.0.1:8500
+            services: ["${var.cluster_id}-nomad", "${var.cluster_id}-nomad-client"]
+        relabel_configs:
+          - source_labels: [__meta_consul_node]
+            target_label: node
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
@@ -182,6 +224,9 @@ job "monitoring" {
       config {
         image        = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
         network_mode = "host"
+        # The CA of the Nomad agents, when the API speaks TLS: the scrape
+        # of the Nomad metrics verifies the agent certificate against it.
+        volumes = var.nomad_tls_dir != "" ? ["${var.nomad_tls_dir}/ca.pem:/etc/kardamom/nomad-ca.pem:ro"] : []
         args = [
           "--config.file=/local/prometheus.yml",
           "--storage.tsdb.path=/alloc/data/prometheus",

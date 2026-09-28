@@ -91,6 +91,18 @@ role passes from `node_classes` in `group_vars/all.yml`. A larger class gets
 its targets on the next deploy. Every metric is already labelled with
 `host_id`, so dashboards group by host without relabel rules.
 
+### Host and agent metrics
+
+`nomad/node-exporter.system.nomad.hcl` runs one `node_exporter` on every node
+(port 9100, the `node-exporter` Consul service): CPU, memory, disk, file
+systems and network of the host. Every Nomad agent publishes its own metrics
+on `/v1/metrics?format=prometheus` (the node resources and the allocations
+of a client, the Raft and scheduler state of a server). Prometheus discovers
+both through the local Consul agent, so an elastic node is scraped from the
+moment it joins; the `node` label is the Consul node name. On the production
+profile the Nomad API speaks TLS, and Prometheus verifies the agent
+certificate against the CA of `nomad_tls_dir`.
+
 ### Alerts
 
 `deploy/alerts.yml` holds the Prometheus alert rules. The monitoring job loads
