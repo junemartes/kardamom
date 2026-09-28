@@ -42,9 +42,11 @@ job "node-exporter" {
         image        = "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
         network_mode = "host"
         pid_mode     = "host"
-        # The host root, read-only. rslave follows the mounts the host adds
-        # after the start, so a volume mounted later is measured too.
-        volumes = ["/:/host:ro,rslave"]
+        # The host root, read-only, with the default mount propagation: a
+        # container node has a private root, and a slave propagation cannot
+        # bind it. A file system the host mounts after the start appears at
+        # the next restart of the exporter.
+        volumes = ["/:/host:ro"]
         args = [
           "--path.rootfs=/host",
           "--web.listen-address=:9100",
