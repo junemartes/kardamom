@@ -20,6 +20,7 @@
 pub mod config;
 pub mod gateway;
 pub mod live;
+pub mod metrics;
 pub mod watermark;
 pub mod wire;
 

@@ -394,6 +394,7 @@ impl SessionLoop {
             } => self.on_reconnect(leader_member_id, ingress_endpoints),
             DriverEvent::Connected { cluster_session_id } => {
                 tracing::info!(cluster_session_id, "cluster session opened");
+                crate::metrics::record_connected(self.target_member);
                 // Canonical-stream consumers request replay from their
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
@@ -404,6 +405,7 @@ impl SessionLoop {
             }
             DriverEvent::Failed(reason) => {
                 tracing::error!(%reason, "cluster session failed");
+                crate::metrics::record_failed();
             }
         }
     }
@@ -433,6 +435,7 @@ impl SessionLoop {
     /// move together with the publication, so a failed open keeps all three
     /// on the old leader.
     fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
+        crate::metrics::record_leader(leader_member_id);
         let Some(p) = open_leader_pub(
             &self.rt,
             &ingress_endpoints,
