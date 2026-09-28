@@ -50,6 +50,6 @@ keep_alive_interval_ms = 1000
 # Authentication is deferred; see the spec's section 11 (flag day).
 [cache]
 sentinels = [
-{{ range service "redis-sentinel" }}  "redis://{{ .Node }}.node.consul:26379",
-{{ end }}]
+  "redis://redis-sentinel.service.consul:26379",
+]
 master_name = "kardamom"

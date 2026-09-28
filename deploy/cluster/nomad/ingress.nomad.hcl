@@ -244,13 +244,10 @@ job "ingress" {
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
       }
 
-      # Presence-checked config. Content lives in config/ingress.toml; its
-      # sentinel list comes from the Consul catalog, and a change of the
-      # list restarts nothing (the reader asks again after a failure).
+      # Presence-checked config. Content lives in config/ingress.toml.
       template {
         destination = "local/ingress.toml"
         data        = file("config/ingress.toml")
-        change_mode = "noop"
       }
 
       # The shard map, rendered by ansible/shard-map.yml.

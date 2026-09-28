@@ -164,12 +164,9 @@ job "sequencer" {
             change_mode = "noop"
           }
 
-          # The sentinel list of the config comes from the Consul catalog;
-          # a change of the list restarts nothing.
           template {
             destination = "local/sequencer.toml"
             data        = file("config/sequencer.toml.tpl")
-            change_mode = "noop"
           }
 
           resources {
