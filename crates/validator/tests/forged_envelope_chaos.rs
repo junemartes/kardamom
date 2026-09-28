@@ -4,9 +4,9 @@
 //! proxy. A compromised proxy or sequencer can therefore attribute an
 //! attacker-signed tx to a victim: the theft shape is
 //! `envelope.sender = victim`, signed by the attacker, with value
-//! flowing to the attacker's sink. The live validator closes this:
-//! `ExecutorConfig::verify_record_identity` re-derives every
-//! tx record's identity at arrival, the same check
+//! flowing to the attacker's sink. The live validator closes this: the
+//! `VerifyRecordIdentity` tx hook re-derives every tx record's identity
+//! at arrival, the same check
 //! `exec_core::stateless::verify_record_identity` runs for the zk guest,
 //! and stops the pipeline with `ExecutorError::RecordIdentity`. The
 //! validator binary classifies this as an integrity failure (divergence
@@ -34,6 +34,7 @@ use kardamom_engine::actor::fixtures::{
 use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, ExecutorConfig, ExecutorError, MockStateDatabase,
     ResumePoint, StateDatabase, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxRef,
+    VerifyRecordIdentity,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
 use revm::primitives::KECCAK_EMPTY;
@@ -103,7 +104,6 @@ fn run_pipeline(
 
     let cfg = ExecutorConfig {
         chain_id: CHAIN_ID_NONZERO,
-        verify_record_identity,
         ..Default::default()
     };
     ChannelHarness::run(
@@ -111,6 +111,7 @@ fn run_pipeline(
             cfg,
             start: ResumePoint::GENESIS,
             snap,
+            tx_hook: verify_record_identity.then_some(VerifyRecordIdentity),
         },
         HarnessInput {
             tx_data: vec![tx_data],

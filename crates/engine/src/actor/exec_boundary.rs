@@ -1,18 +1,19 @@
 //! The `BoundaryStart` arm: alignment check, the optional whole-block
 //! strategy, block-close protocol actions, and the commit handoff.
 
-use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta};
+use revm::state::bal::Bal;
 
 use crate::error::ExecutorError;
 
-use super::exec_block::{BlockRun, BlockState};
+use super::exec_block::{BlockRun, BlockState, ExecutedBlock};
+use super::exec_records::{Finished, RecordKind, Writes};
 use super::exec_state::CommitPipeline;
 use super::exec_thread::{ExecState, Flow};
 use super::ports::StateWriterQueue;
-use super::types::ExecToCommit;
+use super::types::BufferedRecord;
 use super::wiring::ExecPorts;
 
 impl<W: ExecPorts> ExecState<W> {
@@ -100,30 +101,52 @@ impl<W: ExecPorts> ExecState<W> {
     /// block, with the validator's batches running concurrently inside this
     /// call, then feed the receipts and delta into the same boundary path
     /// the streaming executor uses. Commit ordering, durability gating, and
-    /// the write-set cross-check stay the same. The streaming mode leaves
-    /// the delta untouched: the streaming arms already built it.
+    /// the write-set cross-check stay the same. Each record then finishes
+    /// through [`Self::finish_record`], like a streaming record. The
+    /// streaming mode leaves the delta untouched: the streaming arms
+    /// already built it.
     fn run_block_exec(&mut self, block_number: u64) -> Result<Flow, ExecutorError> {
         let env = self.exec_env(block_number);
         let BlockRun::Whole(whole) = &mut self.block.run else {
             return Ok(Flow::Continue);
         };
         let apply_start = Instant::now();
-        let out = whole.execute(
+        let ExecutedBlock {
+            records,
+            delta,
+            bal,
+        } = whole.execute(
             &self.commits.snapshot,
             self.commits.parent.as_ref(),
             env,
             block_number,
         )?;
         *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-        self.block.delta = out.delta;
-        // BAL parity across strategies: a capturing strategy hands its
-        // folded per-block Bal here, so the boundary handoff below
-        // publishes it the same way the streaming capture would. If a
-        // publishing role's strategy captured nothing, it would otherwise
-        // emit an empty BAL with no warning, and every validator would
-        // degrade to the sequential fallback with no signal. So this
-        // combination logs a warning.
-        match (self.block.bal.as_mut(), out.bal) {
+        self.block.delta = delta;
+        self.adopt_strategy_bal(block_number, bal);
+        // The parallel path has no per-tx write sets. The block's merged
+        // rows ride the last receipt, so no row is tagged with a position
+        // before the writes it carries. The other receipts carry none. An
+        // empty block has no receipts, so the subtraction saturates at 0.
+        let rows = std::iter::repeat_with(Vec::new)
+            .take(records.len().saturating_sub(1))
+            .chain(std::iter::once(self.block.delta.account_rows()));
+        for ((rec, receipt), rows) in records.into_iter().zip(rows) {
+            if let Flow::Stop = self.finish_buffered(&rec, receipt, rows)? {
+                return Ok(Flow::Stop);
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// BAL parity across strategies: a capturing strategy hands its folded
+    /// per-block Bal here, so the boundary handoff publishes it the same
+    /// way the streaming capture would. If a publishing role's strategy
+    /// captured nothing, it would otherwise emit an empty BAL with no
+    /// warning, and every validator would degrade to the sequential
+    /// fallback with no signal. So this combination logs a warning.
+    fn adopt_strategy_bal(&mut self, block_number: u64, bal: Option<Bal>) {
+        match (self.block.bal.as_mut(), bal) {
             (Some(capture), Some(b)) => capture.bal = b,
             (Some(_), None) => {
                 tracing::warn!(
@@ -134,40 +157,22 @@ impl<W: ExecPorts> ExecState<W> {
             }
             (None, _) => {}
         }
-        // The parallel path has no per-tx write sets. The block's merged
-        // rows ride the last receipt, so no row is tagged with a position
-        // before the writes it carries. The other receipts carry none.
-        let mut receipts = out.receipts;
-        let last = receipts.pop();
-        let head = receipts
-            .into_iter()
-            .try_for_each(|r| self.send_receipt(r, Vec::new()));
-        let flow = match (head, last) {
-            (ControlFlow::Continue(()), Some(r)) => {
-                let rows = self.block.delta.account_rows();
-                self.send_receipt(r, rows)
-            }
-            (flow, _) => flow,
-        };
-        match flow {
-            ControlFlow::Continue(()) => Ok(Flow::Continue),
-            ControlFlow::Break(()) => Ok(Flow::Stop),
-        }
     }
 
-    /// Record one block-exec receipt and stream it, with `accounts`, to the
-    /// commit thread. `Break` means the commit thread is gone.
-    fn send_receipt(
+    /// Finish one record the whole-block strategy executed, through the
+    /// same result path as a streaming record.
+    fn finish_buffered(
         &mut self,
+        rec: &BufferedRecord,
         receipt: kardamom_types::Receipt,
-        accounts: Vec<kardamom_types::AccountRow>,
-    ) -> ControlFlow<()> {
-        self.block.receipts.push(receipt.clone());
-        let item = kardamom_types::ReceiptRows { receipt, accounts };
-        match self.io.tx.send(ExecToCommit::Receipt(Box::new(item))) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
+        rows: Vec<kardamom_types::AccountRow>,
+    ) -> Result<Flow, ExecutorError> {
+        let (kind, position) = RecordKind::of_buffered(rec, self.cursor.block);
+        self.finish_record(Finished {
+            kind,
+            position,
+            result: Ok((receipt, Writes::Rows(rows))),
+        })
     }
 
     pub(super) fn on_boundary(
