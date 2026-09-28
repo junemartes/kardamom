@@ -1,16 +1,26 @@
-# kardamom-monitoring: Prometheus and Grafana on the aux node.
+# kardamom-monitoring: Prometheus, Alertmanager and Grafana on the aux node.
 #
 # Prometheus scrapes every service's metrics endpoint by its Consul node
 # name, rendered from the node-class counts: no address in this file. It
-# evaluates the alert rules of deploy/alerts.yml. Grafana provisions the
-# Prometheus datasource by the Consul service name and the dashboards
+# evaluates the alert rules of deploy/alerts.yml and sends the firing
+# alerts to the Alertmanager of the same allocation. Grafana provisions
+# the Prometheus datasource by the Consul service name and the dashboards
 # from deploy/grafana/provisioning/dashboards-json. This job is the one
 # monitoring stack of every profile. The autoscaler's Prometheus APM
 # reads the same service.
 #
+# The operator of an environment adds rules and the Alertmanager routing
+# through the Nomad variable nomad/jobs/monitoring, with two items:
+#   rules         a Prometheus rule file (groups of alerts and limits)
+#   alertmanager  the complete Alertmanager configuration, receivers
+#                 included
+# The tasks render the two items and reload on a change (SIGHUP). Without
+# the variable, Prometheus evaluates deploy/alerts.yml only and
+# Alertmanager routes every alert to a receiver that notifies nobody.
+#
 # Placement: the aux node, next to the validator and the da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
-# Prometheus 9090, Grafana 3000.
+# Prometheus 9090, Alertmanager 9093, Grafana 3000.
 #
 # This job uses file() for its dashboards and alert rules, so submit it
 # from deploy/cluster (the workloads role does).
@@ -122,6 +132,9 @@ job "monitoring" {
       port "prometheus" {
         static = 9090
       }
+      port "alertmanager" {
+        static = 9093
+      }
       port "grafana" {
         static = 3000
       }
@@ -130,6 +143,18 @@ job "monitoring" {
     service {
       name     = "prometheus"
       port     = "prometheus"
+      provider = "consul"
+      check {
+        type     = "http"
+        path     = "/-/ready"
+        interval = "10s"
+        timeout  = "2s"
+      }
+    }
+
+    service {
+      name     = "alertmanager"
+      port     = "alertmanager"
       provider = "consul"
       check {
         type     = "http"
@@ -177,11 +202,13 @@ job "monitoring" {
           global:
             scrape_interval: 1s
             evaluation_interval: 5s
-          # Prometheus evaluates the rules and shows firing alerts on its
-          # /alerts page. No Alertmanager is wired; route the alerts there
-          # when a pager exists.
+          alerting:
+            alertmanagers:
+              - static_configs:
+                  - targets: ["127.0.0.1:9093"]
           rule_files:
             - /local/alerts.yml
+            - /local/operator-rules.yml
           ${local.targets_yaml}
         EOT
       }
@@ -195,9 +222,62 @@ job "monitoring" {
         right_delimiter = "]]]"
       }
 
+      # The rules of the operator, from the Nomad variable. The variable
+      # holds the file as one item, so its own {{ }} templates arrive as
+      # data. A change reloads Prometheus in place.
+      template {
+        destination   = "local/operator-rules.yml"
+        change_mode   = "signal"
+        change_signal = "SIGHUP"
+        data          = <<-EOT
+          {{- if nomadVarExists "nomad/jobs/monitoring" -}}
+          {{- with nomadVar "nomad/jobs/monitoring" }}{{ .rules }}{{ end -}}
+          {{- else -}}
+          groups: []
+          {{- end }}
+        EOT
+      }
+
       resources {
         cpu    = 300
         memory = 512
+      }
+    }
+
+    task "alertmanager" {
+      driver = "docker"
+
+      config {
+        image        = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+        network_mode = "host"
+        args = [
+          "--config.file=/local/alertmanager.yml",
+          "--storage.path=/alloc/data/alertmanager",
+        ]
+      }
+
+      # The routing of the operator, from the Nomad variable. Without it,
+      # the one receiver notifies nobody, and the alerts show on the
+      # Alertmanager page only. A change reloads Alertmanager in place.
+      template {
+        destination   = "local/alertmanager.yml"
+        change_mode   = "signal"
+        change_signal = "SIGHUP"
+        data          = <<-EOT
+          {{- if nomadVarExists "nomad/jobs/monitoring" -}}
+          {{- with nomadVar "nomad/jobs/monitoring" }}{{ .alertmanager }}{{ end -}}
+          {{- else -}}
+          route:
+            receiver: nobody
+          receivers:
+            - name: nobody
+          {{- end }}
+        EOT
+      }
+
+      resources {
+        cpu    = 100
+        memory = 128
       }
     }
 
