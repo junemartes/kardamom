@@ -273,7 +273,8 @@ job "ingress" {
         memory = 512
       }
 
-      # The RPC front door as a Consul service: the rpc-proxy pool is
+      # The RPC front door as a Consul service: the edge (a load balancer,
+      # or a client inside the network) reaches the replicas as
       # ingress-jsonrpc.service.consul.
       service {
         name     = "ingress-jsonrpc"
