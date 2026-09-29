@@ -39,12 +39,14 @@ job "rpc-proxy" {
   datacenters = [var.datacenter]
   type        = "service"
 
-  # The nodes whose role set holds service (group_vars/all.yml,
+  # The nodes whose role set holds rpc-proxy (group_vars/all.yml,
   # node_classes): two proxies on two nodes, so an edge has two targets.
+  # A deployment with a cloud load balancer in front of the ingress
+  # servers runs no proxy and declares no such node.
   constraint {
     attribute = "${meta.roles}"
     operator  = "set_contains"
-    value     = "service"
+    value     = "rpc-proxy"
   }
 
   group "proxy" {

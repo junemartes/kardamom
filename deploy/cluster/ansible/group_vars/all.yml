@@ -208,7 +208,7 @@ node_classes:
   ingress: { count: 2, tier: worker, roles: [redis], instance_roles: { "1": [redis-replica] } } # active/active
   executor: { count: 3, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, tier: worker } # 3-member Aeron Cluster (Raft) sealer
-  aux: { count: 1, tier: worker, roles: [redis, redis-primary, batcher, monitoring, validator, service] }
+  aux: { count: 1, tier: worker, roles: [redis, redis-primary, batcher, monitoring, validator, da-watcher, rpc-proxy] }
 
 # Aeron Cluster (Raft) sealer member ports (uniform per role; unique by node IP).
 cluster_member_count: 3

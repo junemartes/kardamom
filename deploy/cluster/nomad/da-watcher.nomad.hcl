@@ -58,11 +58,12 @@ job "da-watcher" {
   datacenters = [var.datacenter]
   type        = "service"
 
-  # The nodes whose role set holds service (group_vars/all.yml, node_classes).
+  # The nodes whose role set holds da-watcher (group_vars/all.yml,
+  # node_classes); their archive records tx_deposits.
   constraint {
     attribute = "${meta.roles}"
     operator  = "set_contains"
-    value     = "service"
+    value     = "da-watcher"
   }
 
   group "da-watcher" {
