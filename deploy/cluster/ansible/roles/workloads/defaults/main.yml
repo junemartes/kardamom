@@ -52,6 +52,9 @@ workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # for a deployment without EigenDA. The proxy signs with the batcher's key and verifies against
 # the L1 RPC.
 workloads_eigenda_network: "{{ lookup('env', 'EIGENDA_NETWORK') }}"
+# The network's EigenDACertVerifierRouter. Empty: the job's default for
+# the network.
+workloads_eigenda_cert_verifier: "{{ lookup('env', 'EIGENDA_CERT_VERIFIER') }}"
 # The proxy's API port (nomad/da-proxy.nomad.hcl), and whether the deploy
 # waits for its /health before the batcher: off only where no node
 # answers, the isolation tests.

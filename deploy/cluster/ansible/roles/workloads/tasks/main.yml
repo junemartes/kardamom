@@ -126,6 +126,7 @@
         eigenda_network: "{{ workloads_eigenda_network }}"
         eigenda_eth_rpc: "{{ workloads_l1_rpc }}"
         eigenda_signer_key: "{{ workloads_batcher_key }}"
+        eigenda_cert_verifier: "{{ workloads_eigenda_cert_verifier }}"
   when: workloads_eigenda_network | length > 0
 
 - name: Wait for the DA proxy's API
