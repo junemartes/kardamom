@@ -5,7 +5,7 @@
 //! Skips gracefully if anvil is not available (the same convention as the
 //! deployer's `deploy_e2e.rs`).
 
-use alloy_primitives::{Address, B256, address};
+use alloy_primitives::{Address, B256, Bytes, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::SolEvent;
 
@@ -21,7 +21,7 @@ const L2_CHAIN_ID: u64 = 42;
 /// call it with. Both e2e tests in this file build one, differing only in
 /// which key signs `provider` (an impersonated dev account for the
 /// calldata-path test, a real wallet signer for the live-sender test,
-/// which needs to sign blob transactions).
+/// which sends through the wallet-filled provider the sender owns).
 struct Scenario<P: Provider + Clone> {
     _anvil: alloy_node_bindings::AnvilInstance,
     provider: P,
@@ -30,19 +30,19 @@ struct Scenario<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> Scenario<P> {
-    /// Post one batch's calldata (no real blob bytes; this only checks the
-    /// calldata path) and return the receipt.
+    /// Post one batch's calldata with a stub certificate (no dispersal;
+    /// this only checks the calldata path) and return the receipt.
     async fn post_batch(
         &self,
         prev_index: u64,
-        blob_hashes: Vec<B256>,
+        da_cert: Bytes,
         l2_block_start: u64,
         l2_block_end: u64,
     ) -> alloy_rpc_types_eth::TransactionReceipt {
         self.settlement
             .postBatch(
                 prev_index,
-                blob_hashes,
+                da_cert,
                 l2_block_start,
                 l2_block_end,
                 B256::repeat_byte(0x4C),
@@ -119,13 +119,13 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     // Sanity: initializer recorded the batcher.
     let on_chain_batcher = s.settlement.l1Batcher().call().await.unwrap();
     let last_idx_before = s.settlement.lastBatchIndex().call().await.unwrap();
-    let blob_hashes = vec![B256::repeat_byte(0xA1), B256::repeat_byte(0xA2)];
-    let receipt = s.post_batch(0, blob_hashes.clone(), 100, 105).await;
+    let da_cert = Bytes::from(vec![0x02, 0xC0, 0xFF, 0xEE]);
+    let receipt = s.post_batch(0, da_cert.clone(), 100, 105).await;
     let last_idx_after = s.settlement.lastBatchIndex().call().await.unwrap();
     // Replay protection: same prev index rejected.
     let replay = s
         .settlement
-        .postBatch(0, blob_hashes, 106, 110, B256::repeat_byte(0x4C))
+        .postBatch(0, da_cert, 106, 110, B256::repeat_byte(0x4C))
         .from(BATCHER)
         .send()
         .await;
@@ -159,8 +159,8 @@ fn empty_block(block_number: u64, l2_timestamp: u64) -> kardamom_batcher::batch:
 }
 
 /// Deploy a `KardamomL2Settlement` with a real wallet-signing key (not an
-/// impersonated account) as its `l1Batcher` — blob transactions need a
-/// real signer.
+/// impersonated account) as its `l1Batcher`. The live sender signs its
+/// own `postBatch` transactions, so it needs a wallet-filled provider.
 async fn setup_wallet_and_settlement() -> Option<Scenario<impl Provider + Clone>> {
     use alloy_network::EthereumWallet;
     use alloy_signer_local::PrivateKeySigner;
@@ -188,14 +188,16 @@ async fn setup_wallet_and_settlement() -> Option<Scenario<impl Provider + Clone>
     })
 }
 
-/// The live-sender loop against real anvil: a confirmed post advances the
-/// CAS and persists the cursor. A foreign advance of `lastBatchIndex` is a
-/// fail-stop, not a silent retry.
+/// The live-sender loop against real anvil: a confirmed post disperses
+/// the payload through the DA proxy, advances the CAS, and persists the
+/// cursor. A foreign advance of `lastBatchIndex` is a fail-stop, not a
+/// silent retry.
 #[tokio::test]
 async fn live_sender_confirms_and_rejects_foreign_writer() {
     use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
-    use kardamom_batcher::da_store::FsBlobStore;
+    use kardamom_batcher::da::DaProxy;
     use kardamom_batcher::live::{BatchCursor, LiveSender};
+    use kardamom_batcher::testkit_da::FakeDaProxy;
 
     // ----- setup -----
     let Some(s) = setup_wallet_and_settlement().await else {
@@ -204,12 +206,12 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
     };
     let dir = tempfile::tempdir().unwrap();
     let cursor_path = dir.path().join("cursor.json");
-    let da_store = FsBlobStore::open(dir.path().join("da")).unwrap();
+    let fake_da = FakeDaProxy::start();
     let batch1 = pack_blocks(&BatcherConfig::default(), &[empty_block(1, 7)]).unwrap();
     let mut sender = LiveSender::new(
         s.provider.clone(),
         s.settlement_addr,
-        da_store,
+        DaProxy::new(fake_da.url()).unwrap(),
         0,
         2,
         cursor_path.clone(),
@@ -230,13 +232,14 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
     let stored_cursor = BatchCursor::load(&cursor_path)
         .unwrap()
         .expect("cursor written");
+    let dispersed = fake_da.stored();
 
     // A foreign writer advances the CAS behind the sender's back...
     let foreign_receipt = s
         .settlement
         .postBatch(
             1,
-            vec![B256::repeat_byte(0xEE)],
+            Bytes::from(vec![0x02, 0xEE]),
             2,
             9,
             B256::repeat_byte(0x4C),
@@ -264,6 +267,11 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
 
     // ----- assert -----
     assert_eq!(index_after_first_post, 1);
+    assert_eq!(
+        dispersed.get(&FakeDaProxy::cert_of(&batch1.payload)),
+        Some(&batch1.payload),
+        "the sender disperses the payload before it posts the certificate"
+    );
     assert_eq!(
         stored_cursor,
         BatchCursor {

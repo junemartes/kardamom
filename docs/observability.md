@@ -103,7 +103,7 @@ the rules with `promtool check rules deploy/alerts.yml`.
 | --- | --- |
 | `batcher.blocks_observed_total` | `kardamom_batcher_blocks_observed_total` |
 | `batcher.batches_posted_total` | `kardamom_batcher_batches_posted_total` |
-| `batcher.blobs_posted_total` | `kardamom_batcher_blobs_posted_total` |
+| `batcher.payload_bytes_posted_total` | `kardamom_batcher_payload_bytes_posted_total` |
 | `sealer_boundaries_emitted_total` | `kardamom_sealer_boundaries_emitted_total` |
 | `sealer_block_number` | `kardamom_sealer_block_number` |
 | `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
@@ -152,7 +152,7 @@ Two low-rate counters deserve standing alerts:
   investigate the source, the chain itself is fine.
 
 The live batcher (#39) adds a settlement-health group on port 9002: in live
-mode `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
+mode `kardamom_batcher_batches_posted_total` / `_payload_bytes_posted_total` count
 **confirmed L1 posts** (not packed batches), `kardamom_batcher_last_posted_block`
 vs `kardamom_executor_block_number` is the DA-freshness lag to watch,
 `_l1_post_retries_total` flags a flaky L1, and `_skipped_posted_blocks_total`

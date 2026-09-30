@@ -345,6 +345,7 @@ deploy/cluster/
     anvil.nomad.hcl         in-cluster L1 for the smoke test + da-watcher
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
+    da-proxy.nomad.hcl      the EigenDA proxy: in-memory store without a network
     l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1 only)
   config/                   *.toml(.tpl) pulled into the job specs via file();
                             channels.toml.tpl is the shared LogConfig

@@ -2,9 +2,10 @@
 //!
 //! This is the offline, archive-driven design. It reads the canonical L2
 //! stream from the on-disk Aeron archives. It groups the stream into
-//! per-block batches. It packs the batches into EIP-4844 blobs (KAR1 format
-//! with zstd framing, no state-root field). It posts the blobs to the
-//! `KardamomL2Settlement` data-availability sink contract on L1.
+//! per-block batches. It frames the batches (KAR1 format with zstd, no
+//! state-root field), disperses them to EigenDA through its proxy, and
+//! posts each certificate to the `KardamomL2Settlement` data-availability
+//! sink contract on L1.
 //!
 //! ## Split data/ordering topology
 //!
@@ -29,9 +30,8 @@
 pub mod archive_reader;
 pub mod batch;
 pub mod batcher;
-pub mod blob;
 pub mod compress;
-pub mod da_store;
+pub mod da;
 pub mod error;
 pub mod frame;
 pub mod indexer;
@@ -45,10 +45,12 @@ pub mod rereplicate;
 pub mod settlement;
 #[cfg(any(test, feature = "test-support", feature = "docker-e2e"))]
 pub mod testkit;
+#[cfg(any(test, feature = "test-support", feature = "docker-e2e"))]
+pub mod testkit_da;
 
 pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
 pub use batcher::{Batcher, MockSender, PostedBatch, Sender};
-pub use da_store::{BlobSource, FsBlobStore};
+pub use da::{DaProxy, PayloadSource};
 pub use error::BatcherError;
 pub use frame::{BlockFrame, Kar1Payload, TxFrame};
 pub use l1::{BatchDescriptor, post_batch, read_posted_batches, recover_blocks};

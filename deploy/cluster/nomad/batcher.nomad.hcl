@@ -1,9 +1,10 @@
 # kardamom-batcher is a live service. It tails the canonical ordering
 # from the Aeron Cluster egress, joining tx_data exactly like the
-# validator's front end. It packs KAR1 into zstd blob batches as
-# boundaries arrive, and posts each to the in-cluster anvil L1
-# (`KardamomL2Settlement.postBatch`, EIP-4844 blob txs), recording blob
-# bytes in the DA store for `kardamom-reconstruct`.
+# validator's front end. It packs KAR1 into zstd payloads as boundaries
+# arrive, disperses each through the EigenDA proxy
+# (nomad/da-proxy.nomad.hcl), and posts the certificate to L1
+# (`KardamomL2Settlement.postBatch`); `kardamom-reconstruct` reads the
+# payloads back by certificate.
 #
 # Durability: L1's `lastBatchIndex` and `BatchPosted` events are the
 # record of what has posted. The cursor file under
@@ -73,6 +74,14 @@ variable "indexer_url" {
   type        = string
   description = "The inbox indexer's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
   default     = ""
+}
+
+# The EigenDA proxy (nomad/da-proxy.nomad.hcl): the batcher disperses
+# every payload through it and posts the certificate on L1.
+variable "da_proxy" {
+  type        = string
+  description = "The EigenDA proxy's URL. The default is the in-cluster proxy by its Consul service record."
+  default     = "http://kardamom-da-proxy.service.consul:3100"
 }
 
 variable "l1_rpc" {
@@ -151,16 +160,15 @@ job "batcher" {
         # so the pin holds.
         force_pull = true
         # Read-only rootfs. The batcher's
-        # writable surfaces are the cursor file, the DA blob store,
-        # and the aeron directory. All are explicit bind mounts below,
+        # writable surfaces are the cursor file and the aeron
+        # directory. All are explicit bind mounts below,
         # plus Nomad's alloc, local, and secrets mounts. cluster-e2e
         # validates this.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
-          # The cursor file and DA blob store live under the persistent
-          # mount.
+          # The cursor file lives under the persistent mount.
           "/opt/kardamom/batcher:/opt/kardamom/batcher",
         ]
         args = concat(
@@ -185,7 +193,7 @@ job "batcher" {
             "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
             "--l1-rpc", var.l1_rpc,
             "--settlement", "${var.settlement_address}",
-            "--da-store", "/opt/kardamom/batcher/da",
+            "--da-proxy", var.da_proxy,
             "--cursor-file", "/opt/kardamom/batcher/cursor.json",
             # Group a few blocks per batch. The sealer emits about 1
             # boundary a second even when idle, and dense DA coverage

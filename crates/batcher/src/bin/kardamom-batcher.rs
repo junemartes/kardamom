@@ -73,7 +73,7 @@ struct Cli {
 
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
     /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, and
-    /// `--da-store`.
+    /// `--da-proxy`.
     ///
     /// This is a real boolean value flag, not `SetTrue`. With clap's
     /// default bool action, `--dry-run=false` is rejected outright
@@ -88,7 +88,7 @@ struct Cli {
     )]
     dry_run: bool,
 
-    /// L1 JSON-RPC endpoint for live blob posting.
+    /// L1 JSON-RPC endpoint for live posting.
     #[arg(long, env = "KARDAMOM_L1_RPC")]
     l1_rpc: Option<String>,
 
@@ -163,11 +163,10 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     l1_retries: u32,
 
-    /// The DA blob store directory. Each posted blob is written here, keyed
-    /// by its versioned hash, so `kardamom-reconstruct` can fetch the bytes
-    /// later.
-    #[arg(long)]
-    da_store: Option<PathBuf>,
+    /// The EigenDA proxy (`http://host:port`). Every batch's payload is
+    /// dispersed through it; the certificate it returns goes on L1.
+    #[arg(long, env = "KARDAMOM_DA_PROXY")]
+    da_proxy: Option<String>,
 
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9002")]
@@ -196,15 +195,15 @@ impl Cli {
     /// The L1 flag tuple both post paths require. `mode` names the flag
     /// that asked for it, so the error message stays exact (`--live` or
     /// `--dry-run=false`).
-    fn require_l1_flags(&self, mode: &str) -> Result<(&String, &String, Address, &PathBuf)> {
+    fn require_l1_flags(&self, mode: &str) -> Result<(&String, &String, Address, &String)> {
         match (
             self.l1_rpc.as_ref(),
             self.l1_key.as_ref(),
             self.settlement,
-            self.da_store.as_ref(),
+            self.da_proxy.as_ref(),
         ) {
             (Some(r), Some(k), Some(s), Some(d)) => Ok((r, k, s, d)),
-            _ => bail!("{mode} requires --l1-rpc, --l1-key, --settlement and --da-store"),
+            _ => bail!("{mode} requires --l1-rpc, --l1-key, --settlement and --da-proxy"),
         }
     }
 
@@ -269,10 +268,10 @@ impl Cli {
         settlement: Address,
         mut prev_index: u64,
         sent_batches: &[PostedBatch],
-        da_store: &kardamom_batcher::FsBlobStore,
+        da: &kardamom_batcher::DaProxy,
     ) -> anyhow::Result<u64> {
         for batch in sent_batches {
-            prev_index = post_batch(provider, settlement, prev_index, batch, da_store)
+            prev_index = post_batch(provider, settlement, prev_index, batch, da)
                 .await
                 .context("post batch to L1")?;
         }
@@ -284,15 +283,16 @@ impl Cli {
     async fn post_or_dry_run(&self, sent_batches: &[PostedBatch]) -> anyhow::Result<()> {
         let live = !self.dry_run;
         if live {
-            let (rpc, key, settlement, da_dir) = self.require_l1_flags("--dry-run=false")?;
-            let (provider, da_store) = live::connect_l1(rpc, key, da_dir).await?;
+            let (rpc, key, settlement, da_proxy) = self.require_l1_flags("--dry-run=false")?;
+            let provider = live::connect_l1(rpc, key).await?;
+            let da = kardamom_batcher::DaProxy::new(da_proxy)?;
 
             // Start from the contract's current index (CAS replay guard).
             let prev_index = live::read_last_batch_index(&provider, settlement).await?;
             info!(%settlement, start_index = prev_index, "live L1 posting");
 
             let head_index =
-                Self::post_all_batches(&provider, settlement, prev_index, sent_batches, &da_store)
+                Self::post_all_batches(&provider, settlement, prev_index, sent_batches, &da)
                     .await?;
             info!(
                 posted = sent_batches.len(),
@@ -321,7 +321,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
             "--live requires --dry-run=false: a live batcher that does not post is not a DA service"
         );
     }
-    let (rpc, key, settlement, da_dir) = cli.require_l1_flags("--live")?;
+    let (rpc, key, settlement, da_proxy) = cli.require_l1_flags("--live")?;
     let config = cli
         .config
         .clone()
@@ -335,7 +335,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         rpc: rpc.clone(),
         key: key.clone(),
         settlement,
-        da_store: da_dir.clone(),
+        da_proxy: da_proxy.clone(),
         config,
         cursor_file,
         log_config: cli.log_config.clone(),

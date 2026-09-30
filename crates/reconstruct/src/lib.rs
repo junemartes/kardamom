@@ -284,10 +284,10 @@ mod tests {
         let to2 = address!("00000000000000000000000000000000000C0002");
         let (block1, block2) = two_transfer_blocks(&signer, to1, to2);
 
-        // Pack into blobs, reconstruct, then re-execute.
+        // Pack, reconstruct, then re-execute.
         let cfg = BatcherConfig::default();
         let batch = pack_blocks(&cfg, &[block1.clone(), block2.clone()]).unwrap();
-        let frames = reconstruct(&batch.blobs).unwrap();
+        let frames = reconstruct(&batch.payload).unwrap();
         assert_eq!(frames.len(), 2);
 
         let recon_dir = tempfile::tempdir().unwrap();
@@ -500,13 +500,13 @@ mod tests {
     fn blob_roundtrip_executes_remote_epochs() {
         let scenario = InteropScenario::build();
 
-        // Pack → blobs → reconstruct → re-execute.
+        // Pack → payload → reconstruct → re-execute.
         let batch = pack_blocks(
             &BatcherConfig::default(),
             std::slice::from_ref(&scenario.block),
         )
         .unwrap();
-        let frames = reconstruct(&batch.blobs).unwrap();
+        let frames = reconstruct(&batch.payload).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].remote_epochs, vec![scenario.record.clone()]);
 

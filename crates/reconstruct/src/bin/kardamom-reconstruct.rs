@@ -19,7 +19,7 @@ use alloy_primitives::{Address, B256};
 use alloy_provider::ProviderBuilder;
 use anyhow::{Context, bail};
 use clap::Parser;
-use kardamom_batcher::da_store::FsBlobStore;
+use kardamom_batcher::da::DaProxy;
 use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
 use kardamom_reconstruct::Reconstruction;
@@ -37,9 +37,11 @@ struct Cli {
     #[arg(long)]
     settlement: Address,
 
-    /// DA blob store directory: the bytes behind the on-chain commitments.
-    #[arg(long)]
-    da_store: PathBuf,
+    /// The EigenDA proxy (`http://host:port`), or an inbox indexer that
+    /// serves the same payloads: the bytes behind the on-chain
+    /// certificates.
+    #[arg(long, env = "KARDAMOM_DA_PROXY")]
+    da_proxy: String,
 
     /// Kardamom genesis TOML (schema: `kardamom_types::Genesis`). Supplies
     /// the chain id and the initial allocation the reconstruction starts
@@ -131,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let store = FsBlobStore::open(&cli.da_store).context("open DA blob store")?;
-    let blocks = recover_blocks(&descriptors, &store).context("recover blocks from DA store")?;
+    let da = DaProxy::new(&cli.da_proxy).context("DA proxy client")?;
+    let blocks = recover_blocks(&descriptors, &da).context("recover blocks from the DA proxy")?;
     let blocks = truncate(blocks, cli.through_block)?;
     info!(
         blocks = blocks.len(),

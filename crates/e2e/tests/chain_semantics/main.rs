@@ -73,27 +73,25 @@ async fn launch_with_park(
     (stack, t)
 }
 
-/// Make a temp DA dir, open an `FsBlobStore` in it, post `blocks` to L1 as
-/// real blob transactions, then require the posted batch log to match.
-/// Returns the temp dir (the caller must keep it alive so
-/// `kardamom-reconstruct` can read the blobs back from disk later);
-/// `FsBlobStore` is a thin `PathBuf` wrapper with no `Drop`, so nothing
-/// needs to keep the store itself alive. `what` names the case, for the
-/// panic messages.
+/// Start a fake EigenDA proxy, post `blocks` through it to L1, then
+/// require the posted batch log to match. Returns the fake proxy: the
+/// caller keeps it alive so `kardamom-reconstruct` can read the payloads
+/// back from it later. It stops when dropped. `what` names the case, for
+/// the panic messages.
 async fn post_and_verify_da(
     l1: &e2e::harness::l1::L1,
     blocks: &[kardamom_batcher::batch::ClosedBlock],
     what: &str,
-) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("da dir");
-    let store = kardamom_batcher::da_store::FsBlobStore::open(dir.path()).expect("da store");
-    da_parity::post_to_l1(l1, l1.settlement, blocks, &store)
+) -> kardamom_batcher::testkit_da::FakeDaProxy {
+    let fake = kardamom_batcher::testkit_da::FakeDaProxy::start();
+    let da = kardamom_batcher::da::DaProxy::new(fake.url()).expect("da proxy client");
+    da_parity::post_to_l1(l1, l1.settlement, blocks, &da)
         .await
         .unwrap_or_else(|e| panic!("{what} post to L1: {e:?}"));
-    da_parity::assert_batches_on_l1(l1, l1.settlement, blocks.len(), &store)
+    da_parity::assert_batches_on_l1(l1, l1.settlement, blocks.len(), &da)
         .await
         .unwrap_or_else(|e| panic!("{what} L1 batch log: {e:?}"));
-    dir
+    fake
 }
 
 /// Launch a stack whose config sets `l1: true`. Skip the test with an

@@ -47,6 +47,11 @@ workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
 # the job's default, the anvil dev key.
 workloads_batcher_key: "{{ lookup('env', 'BATCHER_KEY') }}"
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
+# The EigenDA network the DA proxy disperses to (sepolia_testnet,
+# mainnet). Empty: the proxy's in-memory store, for a deployment without
+# EigenDA. The proxy signs with the batcher's key and verifies against
+# the L1 RPC.
+workloads_eigenda_network: "{{ lookup('env', 'EIGENDA_NETWORK') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
 workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
