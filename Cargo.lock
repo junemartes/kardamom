@@ -4107,6 +4107,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-l1-indexer"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "anyhow",
+ "async-trait",
+ "clap",
+ "jsonrpsee",
+ "kardamom-batcher",
+ "kardamom-da-watcher",
+ "kardamom-obs",
+ "kardamom-types",
+ "metrics",
+ "reqwest 0.13.4",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-log"
 version = "0.1.0"
 dependencies = [

@@ -75,6 +75,7 @@
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
     - "{{ paths.batcher_dir }}"
+    - "{{ paths.l1_indexer_dir }}"
     - "{{ paths.config_dir }}"
 
 - name: Create the Aeron tmpfs mount point
