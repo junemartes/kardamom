@@ -1,18 +1,17 @@
 # kardamom-l1-indexer follows the finalized L1 through the light client
 # and archives the inbox: every batch the settlement contract posted,
-# with its blobs, and every finalized block's epoch record. It serves
+# with its payload, and every finalized block's epoch record. It serves
 # them over JSON-RPC on the private network, for the rebuild
 # (kardamom-reconstruct), the validator, and the batcher's resume.
 #
-# Why: the execution layer keeps no blob bytes, and the consensus layer
-# drops a sidecar after about 18 days. A rebuild after that window needs
-# a copy that was taken in time. The indexer is that copy. It is not a
-# source of truth: a blob is stored only under the versioned hash L1
-# committed to, every consumer checks that commitment, and losing the
+# Why: EigenDA holds a payload for 14 days. A rebuild after that window
+# needs a copy that was taken in time. The indexer is that copy. It is
+# not a source of truth: a payload is stored under the certificate L1
+# committed to, as the proxy served and checked it, and losing the
 # archive costs a re-index from the start block, not the chain.
 #
 # Like the light client, this job deploys only against a real network:
-# anvil has no beacon API, so there is nothing to read sidecars from.
+# it follows finality, which anvil does not have.
 # CI does not exercise it. Validate a change to it against a testnet.
 # The empty defaults exist for `just validate` only; the workloads role
 # passes every value.
@@ -23,10 +22,10 @@ variable "l1_rpc" {
   default     = ""
 }
 
-variable "beacon_api" {
+variable "da_proxy" {
   type        = string
-  description = "Beacon API endpoint the blob sidecars come from. A source of bytes, not of truth: a blob is stored only when its commitment hashes to a versioned hash the settlement contract emitted."
-  default     = ""
+  description = "The EigenDA proxy's URL (nomad/da-proxy.nomad.hcl): where the payloads come from, checked against their certificates."
+  default     = "http://kardamom-da-proxy.service.consul:3100"
 }
 
 variable "settlement_address" {
@@ -131,7 +130,7 @@ job "l1-indexer" {
         args = concat(
           [
             "--l1-rpc", var.l1_rpc,
-            "--beacon-api", var.beacon_api,
+            "--da-proxy", var.da_proxy,
             "--settlement", var.settlement_address,
             "--lockbox", var.lockbox_address,
             "--data-dir", "/opt/kardamom/l1-indexer",
@@ -160,9 +159,9 @@ job "l1-indexer" {
         tags     = ["metrics"]
       }
 
-      # One HTTP round trip per block, one per batch for the sidecars,
-      # and a 128 KiB write per blob. The archive grows with the chain;
-      # the process does not.
+      # One HTTP round trip per block, one per batch for the payload,
+      # and one write per payload. The archive grows with the chain; the
+      # process does not.
       resources {
         cpu    = 300
         memory = 256

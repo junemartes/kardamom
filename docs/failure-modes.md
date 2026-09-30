@@ -186,7 +186,7 @@ a test that cuts the power of a VM can prove this end to end.
 - **Whole-fleet total loss** (`executor-fleet-total-wipe-recover`) — the
   executor job stopped, and every state DB **and every checkpoint** wiped: no
   executor holds state and no peer can serve any. The harness rebuilds an
-  executor image from L1 and the DA store on the host
+  executor image from L1 and the DA proxy on the host
   (`kardamom-reconstruct --through-block --executor-image`), installs it on
   every executor node, and starts the job. Every executor must resume from
   the image's cursor, with a replay request the sealer accepts and with no
@@ -378,13 +378,16 @@ real dependencies are cluster replay retention (an aged-out cursor is a
 fail-stop: unpostable ordering is a permanent DA gap and must be loud) and
 L1 gas/RPC health. See `docs/agents/batcher-live-l1-spec.md`.
 
-Each batch is a real EIP-4844 blob transaction to `KardamomL2Settlement`: L1
-records the ordering + KZG versioned hashes, and the blob **bytes** are
-written to the DA store keyed by versioned hash (mirroring the
-EL-holds-commitments / DA-layer-holds-bytes split, since blob sidecars are
-pruned by the consensus layer after ~18 days). The offline segment-file mode
-(`--channel-b-segment`, dry-run by default) remains for archive inspection
-and the corruption-heal tooling.
+Each batch's payload is dispersed to EigenDA through the proxy
+(`nomad/da-proxy.nomad.hcl`), and the certificate the disperser returns is
+posted to `KardamomL2Settlement`: L1 records the ordering + the
+certificates, and EigenDA holds the **bytes** (for 14 days; the inbox
+indexer archives them past that). The proxy checks a certificate against
+EigenDA's verifier contract on every put and get, and the bytes against the
+certificate's KZG commitment on every get, so a reader trusts its proxy,
+not the disperser. The offline segment-file mode (`--channel-b-segment`,
+dry-run by default) remains for archive inspection and the corruption-heal
+tooling.
 
 **A skewed resume cursor is a refusal.** A consumer resumes at a record
 index and a block number, and the two select frames on separate axes. A
@@ -402,28 +405,30 @@ the two ends; a start from genesis has no boundary to check.
 
 The bottom-of-the-stack backstop: even if **every** in-cluster durable copy is
 lost — the Raft log on a quorum of sealers *and* every node's `tx_ordering` /
-`tx_data` archive — the L2 state is still recoverable from L1 alone, because the
-posted blobs carry the full ordered `raw_tx` stream.
+`tx_data` archive — the L2 state is still recoverable from L1 and the DA
+layer alone, because the posted payloads carry the full ordered `raw_tx`
+stream.
 
 `kardamom-reconstruct` walks the `BatchPosted` event log, fetches each batch's
-blobs from the DA store by the versioned hashes L1 committed to, decodes the
-KAR1 payload back into ordered blocks, and re-executes them through the **same**
+payload from the DA proxy (or the indexer's archive) by the certificate L1
+committed to, decodes the KAR1 payload back into ordered blocks, and
+re-executes them through the **same**
 engine the live executor/validator use (`kardamom_engine::replay`) into a fresh
 trie-aware state DB. Because the state root is a pure function of genesis + the
 ordered transactions (receipts and canonical positions don't enter the trie),
 the reconstructed root is byte-identical to the canonical one. The
 `reconstruct_l1_e2e` test proves the whole loop end-to-end against a real L1
-(anvil): post → discard the originals → read L1 → fetch blobs → re-execute →
+(anvil): post → discard the originals → read L1 → fetch payloads → re-execute →
 assert root parity.
 
 **The rebuilt state is resumable.** A KAR1 version 3 block carries its
 canonical end index and its L1 origin, which the rest of the payload cannot
 give: epoch markers and deposits take canonical slots and never reach the
-blob. So the rebuilt cursor, header rows and receipt positions equal the live
+payload. So the rebuilt cursor, header rows and receipt positions equal the live
 chain's, and `--executor-image` writes the image an executor resumes on (the
 trie, the hashed mirror and the stored root removed, after the root check).
 The sealer refuses a resume whose index lies outside the block it names, so
-a wrong cursor is loud. A state rebuilt through a version 2 blob is correct
+a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
 which also gives the flag-day procedure for a wiped sealer set and the seed
 hook that would replace it.

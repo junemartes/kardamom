@@ -2,7 +2,7 @@
 //! cursor, a bounded range at a time.
 //!
 //! For a range `[from, to]` the order is fixed: the batches of the range
-//! (event logs, then each batch's blobs from the beacon API), then the
+//! (event logs, then each batch's payload from the DA proxy), then the
 //! epoch of each block, then the cursor. A crash before the cursor write
 //! re-indexes the range; every write is idempotent, so nothing is lost or
 //! doubled.
@@ -17,16 +17,16 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log};
+use alloy_rpc_types_eth::{Filter, Log};
 use alloy_sol_types::SolEvent;
+use kardamom_batcher::da::DaProxy;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_da_watcher::{L1Source, L1SourceError};
 use kardamom_types::epoch::derive_epoch;
 use metrics::{counter, gauge};
 
-use crate::beacon::BeaconApi;
 use crate::metrics::{
-    BATCHES_TOTAL, BLOBS_TOTAL, INDEXED_BLOCK, L1_FINALIZED, TICK_TOTAL, gauge_value,
+    BATCHES_TOTAL, INDEXED_BLOCK, L1_FINALIZED, PAYLOAD_BYTES_TOTAL, TICK_TOTAL, gauge_value,
 };
 use crate::store::Store;
 use crate::{BatchEntry, BlockId, Cursor, IndexerError};
@@ -50,7 +50,7 @@ pub struct FollowConfig {
 pub struct FollowerParts<S, P> {
     pub source: S,
     pub provider: P,
-    pub beacon: BeaconApi,
+    pub da: DaProxy,
     pub store: Store,
     pub cfg: FollowConfig,
 }
@@ -59,7 +59,7 @@ pub struct FollowerParts<S, P> {
 pub struct Follower<S, P> {
     source: S,
     provider: P,
-    beacon: BeaconApi,
+    da: DaProxy,
     store: Store,
     cfg: FollowConfig,
     cursor: Cursor,
@@ -86,7 +86,7 @@ impl BatchEntry {
             .ok_or_else(|| IndexerError::Provider("BatchPosted log without a tx hash".into()))?;
         Ok(Self {
             index: ev.data.batchIndex,
-            versioned_hashes: ev.data.blobHashes.clone(),
+            da_cert: ev.data.daCert.clone(),
             l2_block_start: ev.data.l2BlockStart,
             l2_block_end: ev.data.l2BlockEnd,
             records_commitment: ev.data.recordsCommitment,
@@ -106,7 +106,7 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
         Ok(Self {
             source: parts.source,
             provider: parts.provider,
-            beacon: parts.beacon,
+            da: parts.da,
             store: parts.store,
             cfg: parts.cfg,
             cursor,
@@ -146,7 +146,7 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
     /// Index the next range of finalized blocks, if any.
     ///
     /// # Errors
-    /// Returns an error when L1, the beacon API, or the store fails, or
+    /// Returns an error when L1, the DA proxy, or the store fails, or
     /// when a block does not descend from the indexed one.
     pub async fn tick(&mut self) -> Result<Tick, IndexerError> {
         let finalized = match self.source.finalized_block_number().await {
@@ -200,35 +200,18 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
     }
 
     async fn archive_batch(&self, entry: &BatchEntry) -> Result<(), IndexerError> {
-        let timestamp = self.block_timestamp(entry.l1_block).await?;
-        let slot = self.beacon.slot_of(timestamp);
-        let blobs = self.beacon.blobs_of(slot, &entry.versioned_hashes).await?;
-        blobs
-            .iter()
-            .try_for_each(|(hash, blob)| self.store.put_blob(*hash, blob))?;
+        let payload = self.da.get(&entry.da_cert).await?;
+        self.store.put_payload(&entry.da_cert, &payload)?;
         self.store.put_batch(entry)?;
         counter!(BATCHES_TOTAL).increment(1);
-        counter!(BLOBS_TOTAL).increment(blobs.len() as u64);
+        counter!(PAYLOAD_BYTES_TOTAL).increment(payload.len() as u64);
         tracing::info!(
             index = entry.index,
             l1_block = entry.l1_block,
-            slot,
-            blobs = blobs.len(),
+            payload_bytes = payload.len(),
             "batch archived"
         );
         Ok(())
-    }
-
-    async fn block_timestamp(&self, number: u64) -> Result<u64, IndexerError> {
-        let block = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
-            .await
-            .map_err(|e| IndexerError::Provider(format!("get_block_by_number {number}: {e}")))?
-            .ok_or_else(|| {
-                IndexerError::Provider(format!("finalized block {number} not served"))
-            })?;
-        Ok(block.header.timestamp)
     }
 
     async fn archive_epoch(&mut self, number: u64) -> Result<(), IndexerError> {

@@ -12,9 +12,7 @@ use kardamom_engine::reader::ReaderToExec;
 use kardamom_types::BlockBoundaryStart;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
-use crate::batcher::{
-    BatcherConfig, MAX_BLOBS_PER_BATCH, PostedBatch, metric_names, pack_block_groups,
-};
+use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_block_groups};
 use crate::error::BatcherError;
 
 use super::cursor::BatchCursor;
@@ -252,14 +250,15 @@ impl<P: Provider> FeedLoop<P> {
 fn log_pack_error(e: BatcherError) -> anyhow::Error {
     if let BatcherError::BlockTooLarge {
         block_number,
-        blobs,
+        bytes,
+        ceiling,
     } = &e
     {
         tracing::error!(
             block = block_number,
-            blobs,
-            ceiling = MAX_BLOBS_PER_BATCH,
-            "FATAL: one block alone exceeds the blob ceiling; the batcher cannot post it"
+            bytes,
+            ceiling,
+            "FATAL: one block alone exceeds the payload ceiling; the batcher cannot post it"
         );
     }
     e.into()

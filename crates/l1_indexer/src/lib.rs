@@ -5,32 +5,28 @@
 //! operator says:
 //!
 //! - every batch the settlement contract posted (`BatchPosted`): its
-//!   descriptor, and its blob bytes, fetched from the beacon API while the
-//!   sidecar is retained and checked against the versioned hashes L1
-//!   committed to before they are stored;
+//!   descriptor, and its payload, fetched from the EigenDA proxy by the
+//!   certificate L1 committed to while EigenDA retains it (14 days); the
+//!   proxy checks the certificate and the bytes against it;
 //! - every finalized L1 block's epoch record, derived through the same
 //!   [`derive_epoch`] the da-watcher and the validator use.
 //!
 //! It serves them over JSON-RPC on the private network. The consumers: the
-//! rebuild (`kardamom-reconstruct`, through [`client::HttpBlobSource`],
-//! which implements the batcher's [`BlobSource`] trait), the validator's
-//! epoch check, and the batcher's resume. Nothing here is a source of
-//! truth: everything is re-derivable from L1, and every consumer checks a
-//! commitment. Losing the archive costs a re-index from the start block,
-//! not the chain.
+//! rebuild (`kardamom-reconstruct`) and the batcher's resume, through the
+//! batcher's `IndexerClient`, and the validator's epoch check. Nothing
+//! here is a source of truth: everything is re-derivable from L1 and the
+//! DA layer within its retention. Losing the archive costs a re-index
+//! from the start block, not the chain.
 //!
 //! [`L1Source`]: kardamom_da_watcher::L1Source
 //! [`derive_epoch`]: kardamom_types::epoch::derive_epoch
-//! [`BlobSource`]: kardamom_batcher::da_store::BlobSource
 
 pub mod api;
-pub mod beacon;
-pub mod client;
 pub mod follow;
 pub mod metrics;
 pub mod store;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
 use serde::{Deserialize, Serialize};
 
 /// One posted batch, as the indexer keeps it: the `BatchPosted` event's
@@ -38,8 +34,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchEntry {
     pub index: u64,
-    /// KZG versioned hashes of the batch's blobs, in blob order.
-    pub versioned_hashes: Vec<B256>,
+    /// The EigenDA certificate of the batch's payload, as posted.
+    pub da_cert: Bytes,
     pub l2_block_start: u64,
     pub l2_block_end: u64,
     pub records_commitment: B256,
@@ -72,10 +68,6 @@ pub enum IndexerError {
     Source(#[from] kardamom_da_watcher::L1SourceError),
     #[error("L1 provider: {0}")]
     Provider(String),
-    #[error("beacon API: {0}")]
-    Beacon(String),
-    #[error("slot {slot} carries no blob with versioned hash {versioned_hash}")]
-    BlobMissing { slot: u64, versioned_hash: B256 },
     #[error(
         "L1 block {number} does not descend from the indexed block: parent {parent}, expected {expected}"
     )]

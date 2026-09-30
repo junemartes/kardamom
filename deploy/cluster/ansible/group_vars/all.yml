@@ -142,7 +142,8 @@ paths:
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
-  l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, blobs, epochs, cursor
+  l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor
+  da_store_dir: /opt/kardamom/da-store     # the DA stand-in's payloads (no EigenDA network)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
 # tmpfs size for the Aeron media-driver shared-memory dir.

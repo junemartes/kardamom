@@ -1,2 +1,4 @@
 # Rule R2 in docs/STYLE.md: a function over 100 code lines is split.
 too-many-lines-threshold = 100
+# EigenDA is a product name, not an item, in doc comments.
+doc-valid-idents = ["EigenDA", ".."]

@@ -8,8 +8,9 @@
 //! sequencer relay → sealer → 0x7D execution), recover the canonical blocks
 //! from the pipeline's own receipts — remote-epoch records attached to the
 //! blocks they LED, re-derived through the SAME shared rule
-//! ([`derive_remote_epoch`]) the watcher used — post them to anvil as real
-//! EIP-4844 blobs, throw the originals away, and rebuild from L1 data alone.
+//! ([`derive_remote_epoch`]) the watcher used — disperse them through the
+//! DA proxy, post the certificates to anvil, throw the originals away, and
+//! rebuild from L1 data alone.
 //!
 //! Parity target: S8 compared against the validator's root, but the
 //! validator's whole-block strategy does not execute 0x7D yet (it fail-stops
@@ -118,7 +119,7 @@ impl Acc {
             .txs
             .into_iter()
             .map(|(index, envelope)| RecordedTx {
-                // Positions do not reach the blob payload — the canonical
+                // Positions do not reach the DA payload — the canonical
                 // index is a faithful stand-in (the S8 idiom).
                 position: BPosition::from_index(index),
                 envelope,

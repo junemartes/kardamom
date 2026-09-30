@@ -139,6 +139,8 @@ deploy/cluster/
     executor.nomad
     sealer.nomad
     da-watcher.nomad
+    da-proxy.nomad             # the EigenDA proxy, on an EigenDA network
+    da-store.nomad             # the file-backed stand-in for it (local profile)
     batcher.nomad
     l1-indexer.nomad          # real L1 only: the inbox archive (batches, blobs, epochs)
   config/

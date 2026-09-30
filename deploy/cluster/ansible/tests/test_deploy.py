@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
-            'batcher', 'state-mirror']
+            'batcher', 'state-mirror', 'da-store']
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -94,6 +94,7 @@ class DeployTest(unittest.TestCase):
             'workloads_poll_delay': 0,
             'workloads_light_execution_rpc': '',
             'workloads_light_consensus_rpc': '',
+            'workloads_da_proxy_probe': False,
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
@@ -109,7 +110,7 @@ class DeployTest(unittest.TestCase):
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
-                    'state-mirror', 'validator', 'da-watcher', 'monitoring', 'batcher']
+                    'state-mirror', 'validator', 'da-watcher', 'monitoring', 'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
@@ -191,11 +192,11 @@ class DeployTest(unittest.TestCase):
         validator = json.dumps(plans['validator'])
         self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
-        # The indexer follows the light client and reads the same beacon
-        # endpoint; the batcher resumes from the indexer.
+        # The indexer follows the light client and reads the payloads from
+        # the DA proxy; the batcher resumes from the indexer.
         indexer = json.dumps(plans['l1-indexer'])
         self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', indexer)
-        self.assertIn('http://consensus.example', indexer)
+        self.assertIn('http://kardamom-da-proxy.service.consul:3100', indexer)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))

@@ -2,18 +2,16 @@
 //! by index, without an event scan of L1.
 //!
 //! The indexer (`kardamom-l1-indexer`) archives every `BatchPosted`
-//! batch with its blobs and serves them over JSON-RPC. This client reads
-//! two of its methods: `indexer_batch(index)` and
-//! `indexer_blob(versionedHash)`. It is transport only: a blob fetched
-//! here goes through [`crate::l1::verify_blob_against_hash`] before it
-//! is used, so the indexer's honesty is not assumed.
+//! batch with its payload and serves them over JSON-RPC. This client
+//! reads two of its methods: `indexer_batch(index)` and
+//! `indexer_payload(daCert)`. The indexer stores what its own proxy
+//! served and checked against the certificate.
 
-use alloy_eips::eip4844::Blob;
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::Bytes;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::da_store::BlobSource;
+use crate::da::PayloadSource;
 use crate::error::BatcherError;
 use crate::l1::BatchDescriptor;
 
@@ -95,22 +93,21 @@ impl IndexerClient {
         self.call("indexer_batch", serde_json::json!([index])).await
     }
 
-    async fn blob(&self, versioned_hash: B256) -> Result<Blob, BatcherError> {
+    async fn payload(&self, da_cert: &Bytes) -> Result<Vec<u8>, BatcherError> {
         let bytes: Bytes = self
-            .call("indexer_blob", serde_json::json!([versioned_hash]))
+            .call("indexer_payload", serde_json::json!([da_cert]))
             .await?;
-        Blob::try_from(bytes.as_ref())
-            .map_err(|e| BatcherError::Blob(format!("indexer blob {versioned_hash}: {e}")))
+        Ok(bytes.to_vec())
     }
 }
 
-/// [`BlobSource::fetch_blob`] is synchronous; the client blocks the
+/// [`PayloadSource::fetch_payload`] is synchronous; the client blocks the
 /// calling tokio worker in place, so the caller runs on a multi-thread
 /// runtime, as the batcher and `kardamom-reconstruct` do.
-impl BlobSource for IndexerClient {
-    fn fetch_blob(&self, versioned_hash: B256) -> Result<Blob, BatcherError> {
+impl PayloadSource for IndexerClient {
+    fn fetch_payload(&self, da_cert: &Bytes) -> Result<Vec<u8>, BatcherError> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.blob(versioned_hash))
+            tokio::runtime::Handle::current().block_on(self.payload(da_cert))
         })
     }
 }
@@ -122,22 +119,22 @@ mod tests {
     #[test]
     fn a_result_and_an_error_parse() {
         let ok: RpcResponse<Option<BatchDescriptor>> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"result":{"index":7,"versioned_hashes":["0x0101010101010101010101010101010101010101010101010101010101010101"],"l2_block_start":10,"l2_block_end":12,"records_commitment":"0x0202020202020202020202020202020202020202020202020202020202020202","l1_block":100,"l1_tx":"0x0303030303030303030303030303030303030303030303030303030303030303"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"index":7,"da_cert":"0x02aa","l2_block_start":10,"l2_block_end":12,"records_commitment":"0x0202020202020202020202020202020202020202020202020202020202020202","l1_block":100,"l1_tx":"0x0303030303030303030303030303030303030303030303030303030303030303"}}"#,
         )
         .unwrap();
         let d = ok.into_result("indexer_batch").unwrap().unwrap();
         assert_eq!((d.index, d.l2_block_start, d.l2_block_end), (7, 10, 12));
-        assert_eq!(d.versioned_hashes, vec![B256::repeat_byte(1)]);
+        assert_eq!(d.da_cert, Bytes::from(vec![0x02, 0xaa]));
 
         let none: RpcResponse<Option<BatchDescriptor>> =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap();
         assert!(none.into_result("indexer_batch").unwrap().is_none());
 
         let err: RpcResponse<Bytes> = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no such blob"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no such payload"}}"#,
         )
         .unwrap();
-        let e = err.into_result("indexer_blob").unwrap_err().to_string();
-        assert!(e.contains("no such blob") && e.contains("-32000"), "{e}");
+        let e = err.into_result("indexer_payload").unwrap_err().to_string();
+        assert!(e.contains("no such payload") && e.contains("-32000"), "{e}");
     }
 }

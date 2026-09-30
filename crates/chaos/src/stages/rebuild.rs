@@ -1,5 +1,5 @@
 //! Rebuild-from-L1 parity: the state at the validator's drained head,
-//! derived from L1 and the DA store alone, carries the validator's
+//! derived from L1 and the DA layer alone, carries the validator's
 //! committed state root. This is the bottom-of-the-stack backstop: it
 //! is what an operator runs after every in-cluster copy is gone.
 
@@ -16,9 +16,9 @@ use crate::nomad::Streams;
 use crate::poll::{self, Budget, Outcome};
 use crate::stages::first_matching_lines;
 
-/// The DA blob store on the aux node, where the batcher writes every
-/// posted blob.
-const DA_STORE: &str = "/opt/kardamom/batcher/da";
+/// The DA proxy's API port on the aux node (nomad/da-proxy.nomad.hcl):
+/// every posted payload is read back from it by certificate.
+const DA_PROXY_PORT: u16 = 3100;
 
 /// The batcher's first failures shown when the posted batches never
 /// reach the target block.
@@ -75,7 +75,8 @@ impl Rebuilt {
     }
 }
 
-/// One rebuild-from-L1 run against `target`: copy the DA store, run
+/// One rebuild-from-L1 run against `target`: read the payloads from the
+/// DA proxy, run
 /// `kardamom-reconstruct` through the target block, and require its
 /// root. The batcher posts the target block within a few seconds of
 /// the drain, so the run retries while the batches end before it.
@@ -176,16 +177,15 @@ impl Rebuild<'_> {
         ));
     }
 
-    /// One attempt: a fresh DA copy and a fresh state directory. The
-    /// inner `Err` is the tool's report of an attempt that did not
-    /// reach the target or did not match; the outer `Err` is a harness
-    /// failure.
+    /// One attempt: a fresh state directory, the payloads read from the
+    /// DA proxy. The inner `Err` is the tool's report of an attempt that
+    /// did not reach the target or did not match; the outer `Err` is a
+    /// harness failure.
     async fn attempt(
         &self,
         bin: &Path,
         settlement: &str,
     ) -> anyhow::Result<Result<Rebuilt, String>> {
-        let da = self.copy_da_store().await?;
         let state = tempfile::Builder::new()
             .prefix("rebuild-")
             .tempdir_in(&self.evidence)?
@@ -193,8 +193,7 @@ impl Rebuild<'_> {
         let out = Command::new(bin)
             .args(["--l1-rpc", &self.harness.l1_rpc()?])
             .args(["--settlement", settlement])
-            .arg("--da-store")
-            .arg(&da)
+            .args(["--da-proxy", &self.da_proxy()])
             .arg("--chain")
             .arg(self.harness.lifecycle.repo_root().join(GENESIS))
             .arg("--state-dir")
@@ -248,21 +247,11 @@ impl Rebuild<'_> {
             .collect()
     }
 
-    /// Copy the DA store off the aux node. A blob file is written once
-    /// and never changed, so a copy of the live directory is complete
-    /// for every batch posted before the copy.
-    async fn copy_da_store(&self) -> anyhow::Result<PathBuf> {
-        let destination = self.evidence.join("da");
-        std::fs::create_dir_all(&destination)?;
-        let node = &self.harness.probes.validator.container;
-        self.harness
-            .nodes
-            .docker_ok(&[
-                "cp",
-                &format!("{node}:{DA_STORE}/."),
-                destination.to_str().context("DA copy path")?,
-            ])
-            .await?;
-        Ok(destination)
+    /// The DA proxy on the aux node, beside the batcher.
+    fn da_proxy(&self) -> String {
+        format!(
+            "http://{}:{DA_PROXY_PORT}",
+            self.harness.probes.validator.ip
+        )
     }
 }

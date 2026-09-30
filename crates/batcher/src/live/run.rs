@@ -1,7 +1,7 @@
 //! Live service wiring: CLI args, the reader stack, and the feed-loop task.
 
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
 use kardamom_log::discovery::StreamPlane;
 
-use crate::da_store::FsBlobStore;
+use crate::da::DaProxy;
 
 use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
 use crate::indexer::IndexerClient;
@@ -50,19 +50,13 @@ pub(crate) struct BatcherFileConfig {
 /// # Errors
 /// Returns an error when the key does not parse, or the L1 RPC connection
 /// or the blob store fails to open.
-pub async fn connect_l1(
-    rpc: &str,
-    key: &str,
-    da_dir: &Path,
-) -> Result<(impl Provider + 'static, FsBlobStore)> {
+pub async fn connect_l1(rpc: &str, key: &str) -> Result<impl Provider + 'static> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
-    let provider = ProviderBuilder::new()
+    ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect(rpc)
         .await
-        .with_context(|| format!("connect L1 RPC {rpc}"))?;
-    let da_store = FsBlobStore::open(da_dir)?;
-    Ok((provider, da_store))
+        .with_context(|| format!("connect L1 RPC {rpc}"))
 }
 
 /// Everything [`run`] needs from the CLI, already validated. The binary
@@ -73,7 +67,8 @@ pub struct LiveArgs {
     pub rpc: String,
     pub key: String,
     pub settlement: Address,
-    pub da_store: PathBuf,
+    /// The EigenDA proxy's URL (`http://host:port`).
+    pub da_proxy: String,
     /// TOML supplying the `[cluster]` section ([`BatcherFileConfig`]).
     pub config: PathBuf,
     pub cursor_file: PathBuf,
@@ -109,7 +104,7 @@ pub struct LiveArgs {
 /// (already covered by L1).
 struct L1Side<P> {
     provider: P,
-    da_store: FsBlobStore,
+    da: DaProxy,
     l1_truth: L1Truth,
     cursor: BatchCursor,
     skip_through_block: u64,
@@ -118,7 +113,8 @@ struct L1Side<P> {
 impl LiveArgs {
     /// Connect to L1 and reconcile the durable cursor against it.
     async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
-        let (provider, da_store) = connect_l1(&self.rpc, &self.key, &self.da_store).await?;
+        let provider = connect_l1(&self.rpc, &self.key).await?;
+        let da = DaProxy::new(&self.da_proxy)?;
         let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
         let l1_truth = match &indexer {
             Some(ix) => {
@@ -151,7 +147,7 @@ impl LiveArgs {
         );
         Ok(L1Side {
             provider,
-            da_store,
+            da,
             l1_truth,
             cursor,
             skip_through_block,
@@ -365,7 +361,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     let sender = LiveSender::new(
         l1.provider,
         args.settlement,
-        l1.da_store,
+        l1.da,
         l1.l1_truth.last_batch_index,
         args.l1_retries,
         args.cursor_file,

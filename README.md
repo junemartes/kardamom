@@ -167,7 +167,7 @@ Beyond `cargo test`, two suites answer different questions.
 scenario drivers (`crates/e2e/src/scenarios/`) covers L1↔L2 bridge round-trips
 against a real anvil, nonce ordering and RPC liveness through
 `eth_sendRawTransaction`, validator↔executor state parity (down to a
-byte-level comparison of the two libmdbx databases), DA parity (blobs posted
+byte-level comparison of the two libmdbx databases), DA parity (payloads posted
 to L1, re-executed, matched against the validator's root), and state-DB
 integrity across normal operation and an unclean crash. They run on two
 targets:
