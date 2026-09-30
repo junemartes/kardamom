@@ -11,7 +11,7 @@
 # A check run must not build, push, sign, or replace a completed manifest.
 - name: Explain image check mode
   ansible.builtin.debug:
-    msg: "Would build and push {{ images_services + ['aeron', 'redis', 'cluster'] }} from prebuilt binaries, then publish {{ images_manifest }}."
+    msg: "Would build and push {{ images_services + ['aeron', 'redis', 'cluster', 'l1-light-client'] }} from prebuilt binaries, then publish {{ images_manifest }}."
   when: ansible_check_mode
 
 - name: Build a complete image release
@@ -107,6 +107,16 @@
               name: cluster
               path: "{{ images_staging.path }}/cluster"
               dockerfile: "{{ images_cluster_dir }}/docker/cluster.Dockerfile"
+
+        # helios publishes no image: this one wraps its pinned release
+        # binary (docker/helios/Dockerfile).
+        - name: Build and push the L1 light client
+          ansible.builtin.include_tasks: image.yml
+          vars:
+            images_item:
+              name: l1-light-client
+              path: "{{ images_cluster_dir }}/docker/helios"
+              dockerfile: Dockerfile
 
         - name: Publish the completed digest manifest
           ansible.builtin.include_tasks: manifest.yml

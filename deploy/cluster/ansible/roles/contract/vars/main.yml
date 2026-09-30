@@ -91,6 +91,10 @@ contract_mirrors:
       - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
     forbidden:
       - '"--shards"'
+  - path: deploy/cluster/nomad/l1-light-client.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-light-client:{{ image_tag }}'
+    forbidden: []
   - path: deploy/cluster/nomad/da-store.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-da-store:{{ image_tag }}'
