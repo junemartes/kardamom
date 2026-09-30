@@ -163,5 +163,8 @@
         {{ {'settlement_address': workloads_resolved_settlement}
            | combine({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})
            | combine({'batcher_key': workloads_batcher_key} if workloads_batcher_key | length > 0 else {})
+           | combine({'blocks_per_batch': workloads_batcher_blocks_per_batch} if workloads_batcher_blocks_per_batch | length > 0 else {})
+           | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
+           | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
                      if workloads_light_execution_rpc | length > 0 else {}) }}

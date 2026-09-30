@@ -88,6 +88,11 @@ pub struct LiveArgs {
     /// long. Nonzero at the type level: 0 makes the flush timeout expire
     /// at once, a busy loop.
     pub flush_ms: NonZeroU64,
+    /// The flush wait for a group of empty blocks. See
+    /// [`FeedConfig::idle_flush`].
+    pub idle_flush_ms: NonZeroU64,
+    /// See [`FeedConfig::target_payload_bytes`].
+    pub target_payload_bytes: NonZeroUsize,
     pub l1_retries: u32,
     /// The inbox indexer's API. With it, a batcher without a cursor file
     /// resumes just past the last posted batch, and no start reads
@@ -372,6 +377,8 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         compress: args.compress,
         chain_id: args.chain_id,
         flush: Duration::from_millis(args.flush_ms.get()),
+        idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
+        target_payload_bytes: args.target_payload_bytes,
         skip_through_block: l1.skip_through_block,
     };
     let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg).run());

@@ -84,6 +84,27 @@ variable "da_proxy" {
   default     = "http://kardamom-da-proxy.service.consul:3100"
 }
 
+# The posting cadence. The sealer closes about one block a second even
+# when idle, and every block is posted, so a real L1 pays one post per
+# blocks_per_batch seconds: 5 is right for anvil, 300 for a testnet.
+variable "blocks_per_batch" {
+  type        = string
+  description = "Blocks per post. The default suits the in-cluster anvil; a real L1 takes a larger group."
+  default     = "5"
+}
+
+variable "flush_ms" {
+  type        = string
+  description = "Post a group that holds a transaction after this wait, in milliseconds."
+  default     = "3000"
+}
+
+variable "idle_flush_ms" {
+  type        = string
+  description = "Post a group of empty blocks after this wait, in milliseconds. Empty: the same as flush_ms."
+  default     = ""
+}
+
 variable "l1_rpc" {
   type        = string
   description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
@@ -198,15 +219,17 @@ job "batcher" {
             # Group a few blocks per batch. The sealer emits about 1
             # boundary a second even when idle, and dense DA coverage
             # means empty blocks get posted too. Grouping keeps idle L1
-            # traffic to about 1 tx every 5 seconds.
-            "--blocks-per-batch", "5",
-            "--flush-ms", "3000",
+            # traffic to about 1 tx every 5 seconds on anvil; a real L1
+            # takes a larger group (the workloads role, BATCHER_BLOCKS_PER_BATCH).
+            "--blocks-per-batch", var.blocks_per_batch,
+            "--flush-ms", var.flush_ms,
             # The L2 chain id. The records commitment digests each
             # remote-epoch message leaf, which commits to this id. Same
             # value as the executor and validator jobs.
             "--chain-id", "412346",
           ],
           var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
+          var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
         )
       }
 
