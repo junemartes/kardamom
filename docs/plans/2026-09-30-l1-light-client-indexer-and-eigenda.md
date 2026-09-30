@@ -124,29 +124,27 @@ load campaigns) needs the second, not the first.
 
 How, in three parts:
 
-1. **The batcher gets a DA backend.** `DaBackend { Blobs, EigenDa }`,
-   selected by a feature flag per the L1 upgrade flags design
-   (`docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`). The
-   EigenDA backend disperses a batch through the EigenDA proxy sidecar
-   (`POST /put`, the standard rollup integration) and receives a
-   certificate; it then calls `claimBatch` with the certificate in
-   calldata in place of the blob versioned hashes. The payload framing
-   (version 3 blobs, the records commitment) does not change: what the
-   bytes are stays; where they live changes.
-2. **The contract accepts a certificate.** `KardamomProofOracle` takes a
-   DA reference of two kinds (blob hashes, EigenDA certificate). On
-   Sepolia the certificate is checked against EigenDA's cert verifier
-   contract (the disperser's signatures and quorum); the optimistic claim
-   window covers the rest as it does today. The existing challenge path
-   reads the payload through the same DA reference.
+1. **The batcher posts to EigenDA.** It disperses a batch through the
+   EigenDA proxy sidecar (`POST /put`, the standard rollup integration)
+   and receives a certificate; it then calls `claimBatch` with the
+   certificate in calldata in place of the blob versioned hashes. The
+   EIP-4844 path goes: no backend switch, no feature flag, no fallback
+   (decision of 2026-09-30). The payload framing (version 3 blobs, the
+   records commitment) does not change: what the bytes are stays; where
+   they live changes.
+2. **The contract takes a certificate.** `KardamomProofOracle`'s DA
+   reference becomes the EigenDA certificate. On Sepolia the certificate
+   is checked against EigenDA's cert verifier contract (the disperser's
+   signatures and quorum); the optimistic claim window covers the rest
+   as it does today. The existing challenge path reads the payload
+   through the certificate.
 3. **Every reader retrieves by certificate.** The indexer, the validator
    and the rebuild fetch a blob from the proxy (`GET /get/<cert>`) and
    check its commitment. The indexer archives it, so a rebuild works
    after EigenDA's own retention (about two weeks) has passed.
 
-The blob path stays as the fallback backend behind the flag; a staging
-soak runs both. Cost on the testnet: none for dispersal; one proxy
-sidecar per node that disperses or retrieves (a small container).
+Cost on the testnet: none for dispersal; one proxy sidecar per node that
+disperses or retrieves (a small container).
 
 ## 6. Order and estimate
 
@@ -155,7 +153,7 @@ sidecar per node that disperses or retrieves (a small container).
 | 1 | #163 items 1 and 4: parent-hash chaining, the unverified-epochs alert | unit tests; the alert fires in a chaos case that withholds a block | none |
 | 2 | Staging on Sepolia: skip anvil, contracts deployed once, funded key, provider values, helios with a checkpoint as the source of the validator and the da-watcher | `just launch staging` and a deploy; the smoke; epochs verified through the light client | provider free tiers; faucet ETH |
 | 3 | The indexer: crate, API, the role set of da-watcher-0, a volume; the rebuild reads it; the batcher resumes from it | a rebuild from the indexer matches the chain's state root; a batcher node loss recovers (#455) | one 50 GB volume, about 4 €/month |
-| 4 | EigenDA: the DA backend, the contract's DA reference, the proxy sidecar, retrieval by certificate | a soak on the EigenDA backend at the load campaign's rate; a rebuild from EigenDA-archived batches | none on the testnet |
+| 4 | EigenDA: the batcher disperses and claims by certificate, the contract's DA reference, the proxy sidecar, retrieval by certificate; the blob path removed | a soak at the load campaign's rate; a rebuild from EigenDA-archived batches | none on the testnet |
 | 5 | Two providers, and the decision on an own node from the alert's history | a provider outage keeps the readers on the fallback | a second free tier |
 
 Step 1 is small and lands first. Steps 2 and 3 can run in parallel; 4
