@@ -82,6 +82,8 @@ variable "da_proxy" {
   type        = string
   description = "The EigenDA proxy's URL. The default is the in-cluster proxy by its Consul service record."
   default     = "http://kardamom-da-proxy.service.consul:3100"
+}
+
 # The posting cadence. The sealer closes about one block a second even
 # when idle, and every block is posted, so a real L1 pays one post per
 # blocks_per_batch seconds: 5 is right for anvil, 300 for a testnet.
