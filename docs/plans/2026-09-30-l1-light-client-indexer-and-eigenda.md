@@ -143,8 +143,40 @@ How, in three parts:
    check its commitment. The indexer archives it, so a rebuild works
    after EigenDA's own retention (about two weeks) has passed.
 
-Cost on the testnet: none for dispersal; one proxy sidecar per node that
-disperses or retrieves (a small container).
+What the testnet is (checked 2026-09-30 against docs.eigencloud.xyz and
+the `Layr-Labs/eigenda` monorepo, where the proxy now lives under
+`api/proxy`; `eigenda-proxy` as a repository is archived):
+
+- Two testnets: `sepolia_testnet` (settles on Sepolia, disperser
+  `disperser-testnet-sepolia.eigenda.xyz:443`) is the one for a rollup
+  integration; `hoodi_testnet` is for operators. Holesky is gone.
+- The proxy image is `ghcr.io/layr-labs/eigenda-proxy` (v2.7.1 at the
+  time of writing). A minimal V2 deployment sets the network
+  (`EIGENDA_PROXY_EIGENDA_V2_NETWORK=sepolia_testnet`, which fills the
+  disperser and the contract addresses), a Sepolia RPC, the signer key,
+  the max blob length, and the cert-verifier router address. The image
+  bundles the G1 SRS points.
+- The API: `POST /put?commitment_mode=standard` with the payload as the
+  body returns the certificate bytes; `GET /get/<hex cert>` returns the
+  payload. A certificate is one version byte (`0x02` for the current
+  V2 format) and an RLP body. The proxy checks the certificate against
+  the on-chain verifier on both put and get, and the payload against the
+  certificate's KZG commitment: a reader trusts the proxy's local check,
+  not the disperser.
+- Payment: the disperser accepts blobs only from an account with a
+  reservation or an on-demand deposit in the `PaymentVault`
+  (`0x2E1BDB221E7D6bD9B7b2365208d41A5FD70b24Ed` on Sepolia;
+  `depositOnDemand(address)` with Sepolia ETH, not refundable). Cost by
+  the governance parameters: about 0.015 ETH per GB. Default per-account
+  limits exist; a reservation lifts them (a form to EigenDA).
+- Limits: 16 MiB per blob; retention 14 days; the disperser batches
+  about every 10 minutes, so a certificate takes minutes, not seconds.
+  The indexer's archive is what a rebuild reads after 14 days.
+- No maintained Rust client: the batcher calls the proxy's HTTP API.
+
+Cost on the testnet: the on-demand deposit in Sepolia ETH (the batcher
+account funds it once); one proxy sidecar per node that disperses or
+retrieves (a small container).
 
 ## 6. Order and estimate
 
@@ -167,9 +199,12 @@ da-watcher's node.
    `eth_getLogs` against `receiptsRoot`. Confirm on the pinned release
    before step 2; if it does not, the indexer fetches receipts with
    proofs itself, and the light client covers headers only.
-2. **The certificate on L1.** EigenDA's verifier contract addresses and
-   the certificate format of its current testnet release decide the
-   contract change; pin the release before step 4.
+2. **The certificate on L1.** The proxy fills the verifier addresses
+   from the network name and returns a versioned RLP certificate; the
+   contract change stores that certificate as the DA reference, and the
+   on-chain check calls the cert-verifier router. Pin the proxy release
+   (v2.7.1 or later) before step 4, and read the router address from
+   its network defaults.
 3. **Retention and rebuild.** How far back must a rebuild reach? The
    indexer's archive size follows from it (batches per day at the target
    rate, times the horizon).
