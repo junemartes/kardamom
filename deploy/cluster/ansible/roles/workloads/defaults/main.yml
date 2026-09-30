@@ -65,5 +65,12 @@ workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default(
 # The light client by its Consul service record (nomad/l1-light-client.nomad.hcl).
 workloads_light_host: "{{ lookup('env', 'L1_LIGHT_CLIENT_HOST') | default('kardamom-l1-light-client.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
+# The inbox indexer (nomad/l1-indexer.nomad.hcl): deployed with the light
+# client, read by the batcher through its Consul service record. The
+# start block is optional: empty means the finalized block at its first
+# start.
+workloads_indexer_start_block: "{{ lookup('env', 'L1_INDEXER_START_BLOCK') }}"
+workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
+workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80
