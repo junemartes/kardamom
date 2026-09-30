@@ -94,6 +94,7 @@ class DeployTest(unittest.TestCase):
             'workloads_poll_delay': 0,
             'workloads_light_execution_rpc': '',
             'workloads_light_consensus_rpc': '',
+            'workloads_da_proxy_probe': False,
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',

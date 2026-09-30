@@ -120,6 +120,12 @@
         eigenda_eth_rpc: "{{ workloads_l1_rpc if workloads_eigenda_network | length > 0 else '' }}"
         eigenda_signer_key: "{{ workloads_batcher_key if workloads_eigenda_network | length > 0 else '' }}"
 
+- name: Wait for the DA proxy's API
+  ansible.builtin.include_tasks: da_proxy.yml
+  when:
+    - workloads_da_proxy_probe | bool
+    - not ansible_check_mode
+
 # The indexer archives the posted batches and the epoch inputs; it
 # follows L1 through the light client and reads the payloads from the
 # DA proxy (the job's default, by its service record). It comes up

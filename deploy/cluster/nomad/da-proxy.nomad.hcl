@@ -107,8 +107,11 @@ job "da-proxy" {
       name     = "kardamom-da-proxy"
       port     = "api"
       provider = "consul"
+      # /health answers only once the SRS points are loaded and the API
+      # listens; the deploy waits for it (roles/workloads, da_proxy.yml).
       check {
-        type     = "tcp"
+        type     = "http"
+        path     = "/health"
         interval = "10s"
         timeout  = "2s"
       }

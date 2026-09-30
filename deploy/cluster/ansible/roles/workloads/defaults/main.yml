@@ -52,6 +52,11 @@ workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # EigenDA. The proxy signs with the batcher's key and verifies against
 # the L1 RPC.
 workloads_eigenda_network: "{{ lookup('env', 'EIGENDA_NETWORK') }}"
+# The proxy's API port (nomad/da-proxy.nomad.hcl), and whether the deploy
+# waits for its /health before the batcher: off only where no node
+# answers, the isolation tests.
+workloads_da_proxy_port: 3100
+workloads_da_proxy_probe: true
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
 workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
