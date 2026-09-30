@@ -191,6 +191,12 @@ class DeployTest(unittest.TestCase):
         validator = json.dumps(plans['validator'])
         self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
+        # The indexer follows the light client and reads the same beacon
+        # endpoint; the batcher resumes from the indexer.
+        indexer = json.dumps(plans['l1-indexer'])
+        self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', indexer)
+        self.assertIn('http://consensus.example', indexer)
+        self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
         self.assertEqual(self.api.state['writes'], [])
