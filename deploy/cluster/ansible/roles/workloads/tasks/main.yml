@@ -106,10 +106,17 @@
     loop_var: workloads_wait_job
   when: not ansible_check_mode
 
-# The DA proxy is the batcher's writer side and every reader's source.
-# Without an EigenDA network it is the in-memory store (the local
-# profile, the e2e suites); with one, the EigenDA V2 client that the
-# batcher's account pays for.
+# The DA layer is the batcher's writer side and every reader's source,
+# behind one Consul service. Without an EigenDA network it is the
+# file-backed stand-in (the local profile, the e2e suites); with one,
+# the EigenDA proxy that the batcher's account pays for.
+- name: Deploy the DA stand-in
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: da-store
+  when: workloads_eigenda_network | length == 0
+
 - name: Deploy the DA proxy
   ansible.builtin.include_tasks: job.yml
   vars:
@@ -117,8 +124,9 @@
       name: da-proxy
       vars:
         eigenda_network: "{{ workloads_eigenda_network }}"
-        eigenda_eth_rpc: "{{ workloads_l1_rpc if workloads_eigenda_network | length > 0 else '' }}"
-        eigenda_signer_key: "{{ workloads_batcher_key if workloads_eigenda_network | length > 0 else '' }}"
+        eigenda_eth_rpc: "{{ workloads_l1_rpc }}"
+        eigenda_signer_key: "{{ workloads_batcher_key }}"
+  when: workloads_eigenda_network | length > 0
 
 - name: Wait for the DA proxy's API
   ansible.builtin.include_tasks: da_proxy.yml

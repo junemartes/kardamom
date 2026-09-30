@@ -1,10 +1,11 @@
 ---
 # The DA proxy answers its API only after it loads the SRS points, tens
 # of seconds after its allocation runs. The batcher's first dispersal
-# must not race that: this waits for /health on the node that runs it.
+# must not race that: this waits for /health on the node that runs the
+# DA job (the proxy, or the stand-in).
 - name: Read the DA proxy allocations
   ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/da-proxy/allocations?namespace={{ workloads_namespace | urlencode }}"
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_da_job }}/allocations?namespace={{ workloads_namespace | urlencode }}"
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   register: workloads_da_proxy_allocations

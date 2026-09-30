@@ -32,6 +32,7 @@ pub mod batch;
 pub mod batcher;
 pub mod compress;
 pub mod da;
+pub mod da_store;
 pub mod error;
 pub mod frame;
 pub mod indexer;

@@ -7,25 +7,20 @@
 # against the certificate's KZG commitment on the read path, so a reader
 # trusts its proxy, not the disperser.
 #
-# Two backends, one deployment switch (var.eigenda_network):
-# - empty: the proxy's in-memory store. It answers the same API with no
-#   network, for the local profile and the e2e suites; anvil has no
-#   EigenDA. A payload lives until the store expires it. The proxy's
-#   client config still wants a network name, so the store runs under
-#   the testnet's name; it never contacts it.
-# - a network name (sepolia_testnet, mainnet): EigenDA V2 through the
-#   disperser of that network. The proxy fills the disperser and the
-#   contract addresses from the name. The signer pays for dispersal
-#   from its PaymentVault deposit; the batcher's account is used.
+# The proxy runs on an EigenDA network only (var.eigenda_network). It
+# fills the disperser and the contract addresses from the network name.
+# The signer pays for dispersal from its PaymentVault deposit; the
+# batcher's account is used. Without a network the workloads role
+# deploys nomad/da-store.nomad.hcl, the file-backed stand-in, under the
+# same Consul service.
 #
 # The proxy runs beside the batcher (the writer) and is one service for
-# the readers. It holds no state a deployment relies on: on a real
-# network EigenDA holds the bytes for 14 days and the indexer archives
-# them; the in-memory store is the local profile's only copy.
+# the readers. It holds no state a deployment relies on: EigenDA holds
+# the bytes for 14 days and the indexer archives them.
 
 variable "eigenda_network" {
   type        = string
-  description = "EigenDA network (sepolia_testnet, mainnet). Empty: the in-memory store, for a deployment without EigenDA."
+  description = "EigenDA network (sepolia_testnet, mainnet). The empty default exists for `just validate` only."
   default     = ""
 }
 
@@ -39,13 +34,6 @@ variable "eigenda_signer_key" {
   type        = string
   description = "The hex private key that signs dispersals and pays from its PaymentVault deposit. Empty: the proxy is read-only."
   default     = ""
-}
-
-# How long the in-memory store keeps a payload. Long enough for a full
-# e2e run, and for a rebuild within it.
-variable "memstore_expiration" {
-  type    = string
-  default = "24h"
 }
 
 variable "datacenter" {
@@ -123,20 +111,11 @@ job "da-proxy" {
       config {
         image        = "ghcr.io/layr-labs/eigenda-proxy:2.7.1"
         network_mode = "host"
-        args = concat(
-          ["--addr", "0.0.0.0", "--port", format("%d", var.port), "--apis.enabled", "standard"],
-          var.eigenda_network == "" ? [
-            "--memstore.enabled",
-            "--memstore.expiration", var.memstore_expiration,
-            "--eigenda.v2.network", "sepolia_testnet",
-          ] : [],
-        )
+        args         = ["--addr", "0.0.0.0", "--port", format("%d", var.port), "--apis.enabled", "standard"]
       }
 
-      # The EigenDA V2 client, on a real network only. The in-memory
-      # store needs none of these, so the map is empty then: an empty
-      # value would still be a set variable.
-      env = var.eigenda_network == "" ? {} : {
+      # The EigenDA V2 client.
+      env {
         EIGENDA_PROXY_STORAGE_BACKENDS_TO_ENABLE        = "V2"
         EIGENDA_PROXY_STORAGE_DISPERSAL_BACKEND         = "V2"
         EIGENDA_PROXY_EIGENDA_V2_NETWORK                = var.eigenda_network
