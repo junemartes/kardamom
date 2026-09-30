@@ -4111,7 +4111,6 @@ dependencies = [
 name = "kardamom-l1-indexer"
 version = "0.1.0"
 dependencies = [
- "alloy-eips 2.0.5",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types-eth",
@@ -4125,7 +4124,6 @@ dependencies = [
  "kardamom-obs",
  "kardamom-types",
  "metrics",
- "reqwest 0.13.4",
  "rkyv",
  "serde",
  "serde_json",
