@@ -153,11 +153,22 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_SETTLEMENT_DEPLOY_BLOCK", default_value_t = 0)]
     settlement_deploy_block: u64,
 
-    /// Post a partial group if the oldest pending block has waited this
-    /// long. Must be nonzero: 0 makes the flush timeout expire at once, a
-    /// busy loop.
+    /// Post a partial group that holds a transaction once its oldest
+    /// block has waited this long. Must be nonzero: 0 posts every block.
     #[arg(long, default_value = "2000")]
     flush_ms: NonZeroU64,
+
+    /// The same wait for a group of empty blocks. An idle chain closes a
+    /// block a second and each post costs gas, so a real L1 takes hours
+    /// here. Defaults to `--flush-ms`.
+    #[arg(long)]
+    idle_flush_ms: Option<NonZeroU64>,
+
+    /// Post a group once its raw bytes reach this, before any timer: one
+    /// full post per fee. 14 MiB stays under the 15 MiB payload ceiling
+    /// and the DA layer's 16 MiB blob after compression, so it is one post.
+    #[arg(long, default_value_t = NonZeroUsize::new(14 * 1024 * 1024).unwrap())]
+    target_payload_bytes: NonZeroUsize,
 
     /// Bounded retries per L1 post before fail-stop (live mode).
     #[arg(long, default_value_t = 5)]
@@ -347,6 +358,8 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         blocks_per_batch: cli.blocks_per_batch,
         compress: !cli.no_compress,
         flush_ms: cli.flush_ms,
+        idle_flush_ms: cli.idle_flush_ms.unwrap_or(cli.flush_ms),
+        target_payload_bytes: cli.target_payload_bytes,
         l1_retries: cli.l1_retries,
         chain_id: cli.chain_id,
         indexer_url: cli.indexer_url.clone(),

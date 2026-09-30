@@ -93,8 +93,14 @@ variable "blocks_per_batch" {
 
 variable "flush_ms" {
   type        = string
-  description = "Post a partial group after this wait, in milliseconds."
+  description = "Post a group that holds a transaction after this wait, in milliseconds."
   default     = "3000"
+}
+
+variable "idle_flush_ms" {
+  type        = string
+  description = "Post a group of empty blocks after this wait, in milliseconds. Empty: the same as flush_ms."
+  default     = ""
 }
 
 variable "l1_rpc" {
@@ -221,6 +227,7 @@ job "batcher" {
             "--chain-id", "412346",
           ],
           var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
+          var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
         )
       }
 
