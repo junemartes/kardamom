@@ -140,6 +140,7 @@ deploy/cluster/
     sealer.nomad
     da-watcher.nomad
     batcher.nomad
+    l1-indexer.nomad          # real L1 only: the inbox archive (batches, blobs, epochs)
   config/
     channels.tpl               # Aeron UDP channel template (Consul-templated)
     <svc>.toml.tpl             # per-service config templates

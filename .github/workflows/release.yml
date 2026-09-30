@@ -116,7 +116,7 @@ jobs:
           cargo build --release --locked \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
-            -p kardamom-state-mirror \
+            -p kardamom-state-mirror -p kardamom-l1-indexer \
             --bins
           # The settlement-contract deployer. A first deployment to an L1
           # with no settlement contract runs it on the deploy host.

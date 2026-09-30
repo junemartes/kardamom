@@ -91,6 +91,11 @@ contract_mirrors:
       - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
     forbidden:
       - '"--shards"'
+  - path: deploy/cluster/nomad/l1-indexer.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-indexer:{{ image_tag }}'
+      - '"{{ paths.l1_indexer_dir }}:{{ paths.l1_indexer_dir }}"'
+    forbidden: []
   - path: deploy/cluster/nomad/aeron.system.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-aeron:{{ image_tag }}'
