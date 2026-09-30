@@ -103,6 +103,9 @@ pub mod fakes {
         pub hashes: Mutex<std::collections::BTreeMap<u64, B256>>,
         /// If set, `block_hash` fails with this provider error instead.
         pub block_hash_fails: Mutex<bool>,
+        /// Blocks whose parent hash the mock reports wrong: a provider
+        /// that does not serve a chain.
+        pub parent_lies: Mutex<std::collections::BTreeSet<u64>>,
     }
 
     impl MockL1Source {
@@ -126,6 +129,7 @@ pub mod fakes {
                 logs: Mutex::new(VecDeque::new()),
                 hashes: Mutex::new(std::collections::BTreeMap::new()),
                 block_hash_fails: Mutex::new(false),
+                parent_lies: Mutex::new(std::collections::BTreeSet::new()),
             }
         }
 
@@ -178,6 +182,9 @@ pub mod fakes {
             // Filler hashes chain by construction: block N's parent is the
             // filler for N-1. So a mock chain stays self-consistent unless
             // a test deliberately breaks it.
+            if self.parent_lies.lock().unwrap().contains(&number) {
+                return Ok((at(number), Self::filler_hash(number + 1_000_000)));
+            }
             Ok((at(number), at(number.saturating_sub(1))))
         }
 
