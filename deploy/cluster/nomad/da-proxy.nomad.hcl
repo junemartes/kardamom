@@ -125,10 +125,11 @@ job "da-proxy" {
       }
 
       # The EigenDA V2 client, on a real network only. The in-memory
-      # store needs none of these.
-      env {
-        EIGENDA_PROXY_STORAGE_BACKENDS_TO_ENABLE        = var.eigenda_network == "" ? "" : "V2"
-        EIGENDA_PROXY_STORAGE_DISPERSAL_BACKEND         = var.eigenda_network == "" ? "" : "V2"
+      # store needs none of these, so the map is empty then: an empty
+      # value would still be a set variable.
+      env = var.eigenda_network == "" ? {} : {
+        EIGENDA_PROXY_STORAGE_BACKENDS_TO_ENABLE        = "V2"
+        EIGENDA_PROXY_STORAGE_DISPERSAL_BACKEND         = "V2"
         EIGENDA_PROXY_EIGENDA_V2_NETWORK                = var.eigenda_network
         EIGENDA_PROXY_EIGENDA_V2_ETH_RPC                = var.eigenda_eth_rpc
         EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX = var.eigenda_signer_key
