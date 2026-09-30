@@ -38,7 +38,14 @@ workloads_common_vars:
   ingress_count: "{{ node_classes.ingress.count }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
+# workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
+# workloads_l1_rpc with the discovered one, and the jobs that take the
+# real L1 (the batcher, the da-watcher) read the given one.
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
+workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
+# The batcher's L1 key (KARDAMOM_L1_KEY of the batcher job). Empty keeps
+# the job's default, the anvil dev key.
+workloads_batcher_key: "{{ lookup('env', 'BATCHER_KEY') }}"
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
