@@ -186,7 +186,7 @@ a test that cuts the power of a VM can prove this end to end.
 - **Whole-fleet total loss** (`executor-fleet-total-wipe-recover`) — the
   executor job stopped, and every state DB **and every checkpoint** wiped: no
   executor holds state and no peer can serve any. The harness rebuilds an
-  executor image from L1 and the DA store on the host
+  executor image from L1 and the DA proxy on the host
   (`kardamom-reconstruct --through-block --executor-image`), installs it on
   every executor node, and starts the job. Every executor must resume from
   the image's cursor, with a replay request the sealer accepts and with no
