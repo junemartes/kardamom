@@ -74,18 +74,15 @@
       vars:
         l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
-    # The watcher derives the epochs the validator checks. With the light
-    # client deployed it reads L1 through the same client, so the epoch
-    # source is verified too, not only the check against it (issue #163).
+    # The watcher derives the epochs the validator checks. It walks the
+    # followers' L1 (workloads_followers_rpc): the light client when one
+    # runs and can serve every block, else the real L1; the in-cluster
+    # anvil otherwise.
     - name: da-watcher
       wait: false
-      # Through the light client when one runs; the real L1 directly when
-      # one is given without a light client; the in-cluster anvil otherwise.
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_rpc': 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port}
-                     if workloads_light_execution_rpc | length > 0
-                     else ({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})) }}
+           | combine({'l1_rpc': workloads_followers_rpc} if workloads_l1_rpc_given | length > 0 else {}) }}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -136,21 +133,21 @@
     - not ansible_check_mode
 
 # The indexer archives the posted batches and the epoch inputs; it
-# follows L1 through the light client and reads the payloads from the
-# DA proxy (the job's default, by its service record). It comes up
-# before the batcher, which resumes from it. Like the light client, it
-# needs a real L1: it follows finality.
+# walks the followers' L1 and reads the payloads from the DA proxy (the
+# job's default, by its service record). It comes up before the
+# batcher, which resumes from it. It needs a real L1: it follows
+# finality, which anvil does not have.
 - name: Deploy the inbox indexer
   ansible.builtin.include_tasks: job.yml
   vars:
     workloads_job:
       name: l1-indexer
       vars:
-        l1_rpc: "http://{{ workloads_light_host }}:{{ workloads_light_port }}"
+        l1_rpc: "{{ workloads_followers_rpc }}"
         settlement_address: "{{ workloads_resolved_settlement }}"
         lockbox_address: "{{ workloads_lockbox_address }}"
         start_block: "{{ workloads_indexer_start_block }}"
-  when: workloads_light_execution_rpc | length > 0
+  when: workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0
 
 - name: Deploy the live batcher
   ansible.builtin.include_tasks: job.yml
@@ -168,4 +165,4 @@
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
-                     if workloads_light_execution_rpc | length > 0 else {}) }}
+                     if workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0 else {}) }}
