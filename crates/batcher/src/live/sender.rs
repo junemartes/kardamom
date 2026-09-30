@@ -27,6 +27,8 @@ pub struct LiveSender<P> {
     prev_index: u64,
     max_retries: u32,
     cursor_path: PathBuf,
+    /// Where the `BatchPosted` scan of a reconcile starts.
+    settlement_deploy_block: u64,
 }
 
 impl<P: Provider> LiveSender<P> {
@@ -37,6 +39,7 @@ impl<P: Provider> LiveSender<P> {
         prev_index: u64,
         max_retries: u32,
         cursor_path: PathBuf,
+        settlement_deploy_block: u64,
     ) -> Self {
         Self {
             provider,
@@ -45,6 +48,7 @@ impl<P: Provider> LiveSender<P> {
             prev_index,
             max_retries,
             cursor_path,
+            settlement_deploy_block,
         }
     }
 
@@ -146,7 +150,12 @@ impl<P: Provider> LiveSender<P> {
         batch: &PostedBatch,
         e: &crate::error::BatcherError,
     ) -> Result<bool> {
-        let truth = read_l1_truth(&self.provider, self.settlement).await;
+        let truth = read_l1_truth(
+            &self.provider,
+            self.settlement,
+            self.settlement_deploy_block,
+        )
+        .await;
         let next_index = self.next_index()?;
         match truth {
             Ok(t) if t.last_batch_index == next_index => {

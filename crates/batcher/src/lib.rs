@@ -34,6 +34,7 @@ pub mod compress;
 pub mod da_store;
 pub mod error;
 pub mod frame;
+pub mod indexer;
 pub mod l1;
 pub mod live;
 pub mod multi_archive_reader;

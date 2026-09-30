@@ -59,6 +59,7 @@ kardamom-obs = { path = "../obs" }
 kardamom-engine.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+reqwest.workspace = true
 
 clap.workspace = true
 # Live L1 posting is async; genesis is TOML.

@@ -24,7 +24,14 @@ use kardamom_log::discovery::StreamPlane;
 
 use crate::da_store::FsBlobStore;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile};
+use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
+use crate::indexer::IndexerClient;
+
+/// How a start waits for the indexer to reach the last posted batch: the
+/// indexer follows the finalized L1, about 13 minutes behind the head on
+/// Ethereum, and a batch posted just before the start is not there yet.
+const INDEXER_POLL: Duration = Duration::from_secs(12);
+const INDEXER_POLLS: u32 = 100;
 use super::feed::{FeedConfig, FeedLoop};
 use super::sender::LiveSender;
 
@@ -87,6 +94,14 @@ pub struct LiveArgs {
     /// at once, a busy loop.
     pub flush_ms: NonZeroU64,
     pub l1_retries: u32,
+    /// The inbox indexer's API. With it, a batcher without a cursor file
+    /// resumes just past the last posted batch, and no start reads
+    /// `BatchPosted` events from L1. Without it, a missing cursor file
+    /// replays from genesis.
+    pub indexer_url: Option<String>,
+    /// The settlement contract's deployment block: where a `BatchPosted`
+    /// scan starts when no indexer serves it.
+    pub settlement_deploy_block: u64,
 }
 
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
@@ -104,9 +119,26 @@ impl LiveArgs {
     /// Connect to L1 and reconcile the durable cursor against it.
     async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
         let (provider, da_store) = connect_l1(&self.rpc, &self.key, &self.da_store).await?;
-        let l1_truth = read_l1_truth(&provider, self.settlement).await?;
-        let (cursor, skip_through_block) =
-            reconcile(BatchCursor::load(&self.cursor_file)?, l1_truth)?;
+        let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
+        let l1_truth = match &indexer {
+            Some(ix) => {
+                L1Truth::read_via_indexer(
+                    &provider,
+                    self.settlement,
+                    ix,
+                    INDEXER_POLL,
+                    INDEXER_POLLS,
+                )
+                .await?
+            }
+            None => read_l1_truth(&provider, self.settlement, self.settlement_deploy_block).await?,
+        };
+        let (cursor, skip_through_block) = match (BatchCursor::load(&self.cursor_file)?, &indexer) {
+            (None, Some(ix)) if l1_truth.last_batch_index > 0 => {
+                resume_from_indexer(ix, l1_truth).await?
+            }
+            (loaded, _) => reconcile(loaded, l1_truth)?,
+        };
         info!(
             settlement = %self.settlement,
             last_batch_index = l1_truth.last_batch_index,
@@ -337,6 +369,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         l1.l1_truth.last_batch_index,
         args.l1_retries,
         args.cursor_file,
+        args.settlement_deploy_block,
     );
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,

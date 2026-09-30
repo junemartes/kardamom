@@ -37,8 +37,10 @@ use crate::settlement::IKardamomL2Settlement;
 /// idle chain.
 pub const DEFAULT_MAX_FEE_PER_BLOB_GAS: u128 = 1_000_000_000; // 1 gwei
 
-/// One posted batch as recovered from an on-chain `BatchPosted` event.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One posted batch as recovered from an on-chain `BatchPosted` event,
+/// or as the inbox indexer serves it (its JSON carries these fields and
+/// more).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct BatchDescriptor {
     pub index: u64,
     /// KZG versioned hashes of the batch's blobs, in blob order.

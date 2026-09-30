@@ -213,6 +213,7 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         0,
         2,
         cursor_path.clone(),
+        0,
     );
 
     // ----- act -----

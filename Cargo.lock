@@ -3781,6 +3781,7 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "proptest",
+ "reqwest 0.13.4",
  "rkyv",
  "serde",
  "serde_json",
