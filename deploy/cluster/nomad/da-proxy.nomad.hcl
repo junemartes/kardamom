@@ -40,6 +40,15 @@ variable "eigenda_cert_verifier" {
   default     = ""
 }
 
+# How the signer pays: from an on-demand deposit in the PaymentVault
+# (the default here; docs/staging-launch.md C1 makes the deposit), or
+# from a reservation EigenDA granted the account.
+variable "eigenda_ledger_mode" {
+  type        = string
+  description = "The payment mode of the signer: on-demand-only, reservation-only, reservation-and-on-demand."
+  default     = "on-demand-only"
+}
+
 variable "eigenda_signer_key" {
   type        = string
   description = "The hex private key that signs dispersals and pays from its PaymentVault deposit. Empty: the proxy is read-only."
@@ -132,6 +141,7 @@ job "da-proxy" {
         EIGENDA_PROXY_EIGENDA_V2_ETH_RPC                = var.eigenda_eth_rpc
         EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX = var.eigenda_signer_key
         EIGENDA_PROXY_EIGENDA_V2_MAX_BLOB_LENGTH        = "16MiB"
+        EIGENDA_PROXY_EIGENDA_V2_CLIENT_LEDGER_MODE     = var.eigenda_ledger_mode
         EIGENDA_PROXY_EIGENDA_V2_CERT_VERIFIER_ROUTER_OR_IMMUTABLE_VERIFIER_ADDR = (
           var.eigenda_cert_verifier != "" ? var.eigenda_cert_verifier :
           var.eigenda_network == "sepolia_testnet" ? "0x17ec4112c4BbD540E2c1fE0A49D264a280176F0D" : ""
