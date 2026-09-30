@@ -15,16 +15,34 @@
 
 use std::path::PathBuf;
 
+use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256};
 use alloy_provider::ProviderBuilder;
 use anyhow::{Context, bail};
 use clap::Parser;
-use kardamom_batcher::da::DaProxy;
+use kardamom_batcher::da::{DaProxy, PayloadSource};
+use kardamom_batcher::error::BatcherError;
 use kardamom_batcher::frame::BlockFrame;
+use kardamom_batcher::indexer::IndexerClient;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
 use kardamom_reconstruct::Reconstruction;
 use kardamom_state::Durability;
 use tracing::info;
+
+/// Where the payloads come from: the proxy, or the indexer's archive.
+enum Source {
+    Proxy(DaProxy),
+    Indexer(IndexerClient),
+}
+
+impl PayloadSource for Source {
+    fn fetch_payload(&self, da_cert: &Bytes) -> Result<Vec<u8>, BatcherError> {
+        match self {
+            Self::Proxy(p) => p.fetch_payload(da_cert),
+            Self::Indexer(i) => i.fetch_payload(da_cert),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-reconstruct", version)]
@@ -37,11 +55,19 @@ struct Cli {
     #[arg(long)]
     settlement: Address,
 
-    /// The EigenDA proxy (`http://host:port`), or an inbox indexer that
-    /// serves the same payloads: the bytes behind the on-chain
-    /// certificates.
-    #[arg(long, env = "KARDAMOM_DA_PROXY")]
-    da_proxy: String,
+    /// The EigenDA proxy (`http://host:port`): the bytes behind the
+    /// on-chain certificates, while EigenDA retains them.
+    #[arg(
+        long,
+        env = "KARDAMOM_DA_PROXY",
+        required_unless_present = "indexer_url"
+    )]
+    da_proxy: Option<String>,
+
+    /// The inbox indexer's API (`http://host:port`): the same payloads,
+    /// archived past EigenDA's retention.
+    #[arg(long, env = "KARDAMOM_INDEXER_URL", conflicts_with = "da_proxy")]
+    indexer_url: Option<String>,
 
     /// Kardamom genesis TOML (schema: `kardamom_types::Genesis`). Supplies
     /// the chain id and the initial allocation the reconstruction starts
@@ -102,6 +128,17 @@ fn truncate(blocks: Vec<BlockFrame>, through: Option<u64>) -> anyhow::Result<Vec
         .collect())
 }
 
+impl Cli {
+    /// The payload source the flags name. clap guarantees one of the two.
+    fn payload_source(&self) -> anyhow::Result<Source> {
+        match (&self.da_proxy, &self.indexer_url) {
+            (Some(url), _) => Ok(Source::Proxy(DaProxy::new(url).context("DA proxy client")?)),
+            (None, Some(url)) => Ok(Source::Indexer(IndexerClient::new(url))),
+            (None, None) => bail!("--da-proxy or --indexer-url is required"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -133,8 +170,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let da = DaProxy::new(&cli.da_proxy).context("DA proxy client")?;
-    let blocks = recover_blocks(&descriptors, &da).context("recover blocks from the DA proxy")?;
+    let source = cli.payload_source()?;
+    let blocks =
+        recover_blocks(&descriptors, &source).context("recover blocks from the DA layer")?;
     let blocks = truncate(blocks, cli.through_block)?;
     info!(
         blocks = blocks.len(),

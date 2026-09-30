@@ -3,8 +3,8 @@
 //! - `batches/<index>.json`: a [`BatchEntry`].
 //! - `epochs/<l1_block>.rkyv`: the epoch record of that block, the bytes
 //!   the epoch stream carries.
-//! - `blobs/<versioned_hash>.blob`: the blob bytes, through the batcher's
-//!   [`FsBlobStore`], so the rebuild reads them with the same code.
+//! - `payloads/<keccak(cert)>.bin`: the payload bytes, named by the
+//!   certificate's hash (a certificate is a few hundred bytes).
 //! - `cursor.json`: the [`Cursor`], written last, after the items of a
 //!   block, so a crash between the two re-indexes the block and never
 //!   skips it.
@@ -15,9 +15,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use alloy_eips::eip4844::Blob;
-use alloy_primitives::B256;
-use kardamom_batcher::da_store::{BlobSource, FsBlobStore};
+use alloy_primitives::{Bytes, keccak256};
 use kardamom_types::epoch::EpochRecord;
 
 use crate::{BatchEntry, Cursor, IndexerError};
@@ -26,7 +24,6 @@ use crate::{BatchEntry, Cursor, IndexerError};
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
-    blobs: FsBlobStore,
 }
 
 impl Store {
@@ -36,11 +33,10 @@ impl Store {
     /// Returns an error when a directory cannot be created.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, IndexerError> {
         let root = root.as_ref().to_path_buf();
-        for sub in ["batches", "epochs"] {
+        for sub in ["batches", "epochs", "payloads"] {
             fs::create_dir_all(root.join(sub))?;
         }
-        let blobs = FsBlobStore::open(root.join("blobs"))?;
-        Ok(Self { root, blobs })
+        Ok(Self { root })
     }
 
     fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), IndexerError> {
@@ -73,7 +69,7 @@ impl Store {
         Self::write_atomic(&self.root.join("cursor.json"), &bytes)
     }
 
-    /// Store a batch's descriptor. Its blobs go through [`Self::put_blob`].
+    /// Store a batch's descriptor. Its payload goes through [`Self::put_payload`].
     ///
     /// # Errors
     /// Returns an error when the write fails.
@@ -104,20 +100,30 @@ impl Store {
             .map_err(|e| IndexerError::Store(format!("batch {index}: {e}")))
     }
 
-    /// Store a blob under its versioned hash.
+    fn payload_path(&self, da_cert: &Bytes) -> PathBuf {
+        self.root
+            .join("payloads")
+            .join(format!("{:x}.bin", keccak256(da_cert)))
+    }
+
+    /// Store a payload under its certificate.
     ///
     /// # Errors
     /// Returns an error when the write fails.
-    pub fn put_blob(&self, versioned_hash: B256, blob: &Blob) -> Result<(), IndexerError> {
-        Ok(self.blobs.put(versioned_hash, blob)?)
+    pub fn put_payload(&self, da_cert: &Bytes, payload: &[u8]) -> Result<(), IndexerError> {
+        Self::write_atomic(&self.payload_path(da_cert), payload)
     }
 
-    /// A stored blob.
+    /// A stored payload, or `None`.
     ///
     /// # Errors
-    /// Returns an error when no blob is stored under the hash.
-    pub fn blob(&self, versioned_hash: B256) -> Result<Blob, IndexerError> {
-        Ok(self.blobs.fetch_blob(versioned_hash)?)
+    /// Returns an error when the read fails.
+    pub fn payload(&self, da_cert: &Bytes) -> Result<Option<Vec<u8>>, IndexerError> {
+        let path = self.payload_path(da_cert);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(path)?))
     }
 
     /// Store an epoch record as the bytes the epoch stream carries.
@@ -153,6 +159,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::BlockId;
+    use alloy_primitives::B256;
 
     #[test]
     fn cursor_batch_and_epoch_round_trip() {
@@ -161,7 +168,7 @@ mod tests {
         assert_eq!(store.cursor().unwrap(), Cursor::default());
         let entry = BatchEntry {
             index: 7,
-            versioned_hashes: vec![B256::repeat_byte(1)],
+            da_cert: Bytes::from(vec![0x03, 0xAA]),
             l2_block_start: 10,
             l2_block_end: 12,
             records_commitment: B256::repeat_byte(2),
@@ -169,8 +176,14 @@ mod tests {
             l1_tx: B256::repeat_byte(3),
         };
         store.put_batch(&entry).unwrap();
-        assert_eq!(store.batch(7).unwrap(), Some(entry));
+        assert_eq!(store.batch(7).unwrap(), Some(entry.clone()));
         assert_eq!(store.batch(8).unwrap(), None);
+        store.put_payload(&entry.da_cert, b"payload").unwrap();
+        assert_eq!(
+            store.payload(&entry.da_cert).unwrap(),
+            Some(b"payload".to_vec())
+        );
+        assert_eq!(store.payload(&Bytes::from(vec![0x03])).unwrap(), None);
         let epoch = EpochRecord {
             l1_number: 100,
             l1_hash: B256::repeat_byte(4),

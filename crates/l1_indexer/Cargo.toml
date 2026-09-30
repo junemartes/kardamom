@@ -10,7 +10,6 @@ kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-types = { workspace = true }
 kardamom-obs = { path = "../obs" }
 
-alloy-eips = { workspace = true, features = ["kzg"] }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
@@ -21,7 +20,6 @@ async-trait = "0.1"
 clap.workspace = true
 jsonrpsee = { workspace = true }
 metrics = { workspace = true }
-reqwest = { workspace = true }
 rkyv.workspace = true
 serde.workspace = true
 serde_json = { workspace = true }

@@ -3,7 +3,9 @@
 //! One process runs the follower and the API. `--l1-rpc` is the light
 //! client's endpoint on a production deployment, so every block, log,
 //! and hash the archive is built from is verified against the beacon
-//! chain's sync committee before it reaches this process.
+//! chain's sync committee before it reaches this process. The payloads
+//! come from the EigenDA proxy, which checks them against their
+//! certificates.
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -14,9 +16,9 @@ use alloy_primitives::Address;
 use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
+use kardamom_batcher::da::DaProxy;
 use kardamom_da_watcher::RpcL1Source;
 use kardamom_l1_indexer::api::Api;
-use kardamom_l1_indexer::beacon::BeaconApi;
 use kardamom_l1_indexer::follow::{FollowConfig, Follower, FollowerParts};
 use kardamom_l1_indexer::store::Store;
 use kardamom_obs::HostId;
@@ -25,15 +27,15 @@ use kardamom_obs::HostId;
 #[command(
     name = "kardamom-l1-indexer",
     version,
-    about = "archives the posted batches, their blobs, and the epoch inputs of the finalized L1"
+    about = "archives the posted batches, their payloads, and the epoch inputs of the finalized L1"
 )]
 struct Args {
     /// L1 JSON-RPC HTTP endpoint: the light client, or a full node.
     #[arg(long)]
     l1_rpc: String,
-    /// Beacon API endpoint, for the blob sidecars.
-    #[arg(long)]
-    beacon_api: String,
+    /// The EigenDA proxy (`http://host:port`), for the payloads.
+    #[arg(long, env = "KARDAMOM_DA_PROXY")]
+    da_proxy: String,
     /// L1 address of `KardamomL2Settlement`.
     #[arg(long)]
     settlement: Address,
@@ -56,9 +58,6 @@ struct Args {
     /// The most blocks one tick indexes.
     #[arg(long, default_value = "64")]
     blocks_per_tick: NonZeroU64,
-    /// The L1's seconds per slot (12 on mainnet and Sepolia).
-    #[arg(long, default_value = "12")]
-    seconds_per_slot: NonZeroU64,
     /// Prometheus exporter listen address.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9549")]
     metrics_addr: SocketAddr,
@@ -86,14 +85,12 @@ async fn main() -> anyhow::Result<()> {
         .connect(&args.l1_rpc)
         .await
         .with_context(|| format!("connect L1 {}", args.l1_rpc))?;
-    let beacon = BeaconApi::connect(&args.beacon_api, args.seconds_per_slot)
-        .await
-        .context("connect beacon API")?;
+    let da = DaProxy::new(&args.da_proxy).context("DA proxy client")?;
     let store = Store::open(&args.data_dir).context("open archive")?;
     let follower = Follower::open(FollowerParts {
         source: RpcL1Source::new(provider.clone()),
         provider,
-        beacon,
+        da,
         store: store.clone(),
         cfg: FollowConfig {
             settlement: args.settlement,

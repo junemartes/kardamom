@@ -5,12 +5,12 @@
 //!
 //! - `indexer_status() -> Cursor`
 //! - `indexer_batch(index) -> BatchEntry | null`
-//! - `indexer_blob(versionedHash) -> 0x-hex blob`
+//! - `indexer_payload(daCert) -> 0x-hex payload | null`
 //! - `indexer_epoch(l1Block) -> 0x-hex rkyv EpochRecord | null`
 
 use std::net::SocketAddr;
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::Bytes;
 use jsonrpsee::server::{RpcModule, Server, ServerHandle};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 
@@ -68,12 +68,12 @@ impl Api {
             .map_err(api_error)?;
         module
             .register_method(
-                "indexer_blob",
-                |params, store, _| -> Result<Bytes, ErrorObjectOwned> {
-                    let hash: B256 = params.one()?;
+                "indexer_payload",
+                |params, store, _| -> Result<Option<Bytes>, ErrorObjectOwned> {
+                    let da_cert: Bytes = params.one()?;
                     store
-                        .blob(hash)
-                        .map(|blob| Bytes::copy_from_slice(blob.as_slice()))
+                        .payload(&da_cert)
+                        .map(|bytes| bytes.map(Bytes::from))
                         .map_err(|e| rpc_error(&e))
                 },
             )
