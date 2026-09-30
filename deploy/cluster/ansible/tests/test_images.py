@@ -9,7 +9,8 @@ import time
 import unittest
 
 ANSIBLE = Path(__file__).resolve().parents[1]
-SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher', 'state-mirror']
+SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher', 'state-mirror',
+            'l1-indexer']
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'ansible-playbook required')
