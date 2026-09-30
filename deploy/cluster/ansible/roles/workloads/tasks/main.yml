@@ -6,14 +6,17 @@
   ansible.builtin.set_fact:
     workloads_jobs: {}
 
-- name: Deploy Aeron and the development L1
+- name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml
-  loop:
-    - {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
-    - {name: anvil}
-  loop_control:
-    loop_var: workloads_job
-    label: "{{ workloads_job.name }}"
+  vars:
+    workloads_job: {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
+
+# The development L1: anvil runs only when no real L1 is given (L1_RPC).
+- name: Deploy the development L1
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: {name: anvil}
+  when: workloads_l1_rpc | length == 0
 
 - name: Discover the in-cluster L1 through the Nomad API
   ansible.builtin.include_tasks: anvil.yml
@@ -76,10 +79,13 @@
     # source is verified too, not only the check against it (issue #163).
     - name: da-watcher
       wait: false
+      # Through the light client when one runs; the real L1 directly when
+      # one is given without a light client; the in-cluster anvil otherwise.
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
            | combine({'l1_rpc': 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port}
-                     if workloads_light_execution_rpc | length > 0 else {}) }}
+                     if workloads_light_execution_rpc | length > 0
+                     else ({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})) }}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -105,5 +111,9 @@
   vars:
     workloads_job:
       name: batcher
-      vars:
-        settlement_address: "{{ workloads_resolved_settlement }}"
+      # The real L1 and the batcher's own key when one is given; the
+      # job's defaults (the in-cluster anvil, the dev key) otherwise.
+      vars: >-
+        {{ {'settlement_address': workloads_resolved_settlement}
+           | combine({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})
+           | combine({'batcher_key': workloads_batcher_key} if workloads_batcher_key | length > 0 else {}) }}
