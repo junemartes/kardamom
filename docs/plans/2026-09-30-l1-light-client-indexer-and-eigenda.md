@@ -158,8 +158,10 @@ the `Layr-Labs/eigenda` monorepo, where the proxy now lives under
   bundles the G1 SRS points.
 - The API: `POST /put?commitment_mode=standard` with the payload as the
   body returns the certificate bytes; `GET /get/<hex cert>` returns the
-  payload. A certificate is one version byte (`0x02` for the current
-  V2 format) and an RLP body. The proxy checks the certificate against
+  payload. A certificate is one version byte (`0x03` on the current
+  release) and an RLP body of about 400 bytes. In memory mode the proxy
+  still wants `--apis.enabled standard` and a network name, and takes
+  about 20 seconds to load its SRS points before it listens. The proxy checks the certificate against
   the on-chain verifier on both put and get, and the payload against the
   certificate's KZG commitment: a reader trusts the proxy's local check,
   not the disperser.

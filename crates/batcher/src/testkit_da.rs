@@ -1,9 +1,11 @@
 //! A fake of the EigenDA proxy's API for tests: `POST /put` stores the
 //! payload under a certificate, `GET /get/<hex cert>` returns it.
 //!
-//! The certificate is `0x02` (the current version byte) followed by the
-//! payload's keccak; a real one is an RLP body the verifier contract
-//! understands. The tests exercise the batcher's side of the API, not
+//! The certificate is `0x03` (the current version byte) followed by the
+//! payload's keccak; a real one is an RLP body of about 400 bytes that the
+//! verifier contract understands. The real proxy answers an unknown
+//! certificate with 500; this fake answers 404. The client treats every
+//! non-success alike. The tests exercise the batcher's side of the API, not
 //! EigenDA: the same client code reaches the real proxy on a deployment.
 //! One thread serves one connection at a time; a test's traffic is small.
 
@@ -85,7 +87,7 @@ impl FakeDaProxy {
     /// The certificate this fake gives `payload`.
     #[must_use]
     pub fn cert_of(payload: &[u8]) -> Bytes {
-        let mut cert = vec![0x02];
+        let mut cert = vec![0x03];
         cert.extend_from_slice(keccak256(payload).as_slice());
         Bytes::from(cert)
     }

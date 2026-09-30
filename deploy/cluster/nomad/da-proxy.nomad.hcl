@@ -10,7 +10,9 @@
 # Two backends, one deployment switch (var.eigenda_network):
 # - empty: the proxy's in-memory store. It answers the same API with no
 #   network, for the local profile and the e2e suites; anvil has no
-#   EigenDA. A payload lives until the store expires it.
+#   EigenDA. A payload lives until the store expires it. The proxy's
+#   client config still wants a network name, so the store runs under
+#   the testnet's name; it never contacts it.
 # - a network name (sepolia_testnet, mainnet): EigenDA V2 through the
 #   disperser of that network. The proxy fills the disperser and the
 #   contract addresses from the name. The signer pays for dispersal
@@ -116,11 +118,15 @@ job "da-proxy" {
       driver = "docker"
 
       config {
-        image        = "ghcr.io/layr-labs/eigenda-proxy:v2.7.1"
+        image        = "ghcr.io/layr-labs/eigenda-proxy:2.7.1"
         network_mode = "host"
         args = concat(
-          ["--addr", "0.0.0.0", "--port", "${var.port}"],
-          var.eigenda_network == "" ? ["--memstore.enabled", "--memstore.expiration", var.memstore_expiration] : [],
+          ["--addr", "0.0.0.0", "--port", format("%d", var.port), "--apis.enabled", "standard"],
+          var.eigenda_network == "" ? [
+            "--memstore.enabled",
+            "--memstore.expiration", var.memstore_expiration,
+            "--eigenda.v2.network", "sepolia_testnet",
+          ] : [],
         )
       }
 
