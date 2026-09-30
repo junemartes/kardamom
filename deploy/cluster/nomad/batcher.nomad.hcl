@@ -66,6 +66,15 @@ variable "executor_count" {
   default     = 3
 }
 
+# The inbox indexer's API. With it, a batcher whose node is fresh resumes
+# just past the last posted batch (public #455). Empty: no indexer, the
+# job's replay-from-genesis behavior.
+variable "indexer_url" {
+  type        = string
+  description = "The inbox indexer's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
+  default     = ""
+}
+
 variable "l1_rpc" {
   type        = string
   description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
@@ -154,40 +163,43 @@ job "batcher" {
           # mount.
           "/opt/kardamom/batcher:/opt/kardamom/batcher",
         ]
-        args = [
-          "--live",
-          "--dry-run=false",
-          "--config", "/local/batcher.toml",
-          "--log-config", "/local/channels.toml",
-          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This allocation's cluster-egress (response) endpoint, for
-          # the batcher's own cluster client session: the node IP and a
-          # Nomad dynamic port, so it never clashes with the validator's
-          # on the same node.
-          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
-          # The void voter id: the second id after the executors'
-          # (cluster.nomad.hcl builds the sealer's voter list the same way).
-          "--void-voter-id", format("%d", var.executor_count + 1),
-          # Join-miss archive refetch (tx_data and tx_deposits). Same
-          # contract as the validator's flags, on this allocation's
-          # dynamic ports.
-          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
-          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
-          "--l1-rpc", var.l1_rpc,
-          "--settlement", "${var.settlement_address}",
-          "--da-store", "/opt/kardamom/batcher/da",
-          "--cursor-file", "/opt/kardamom/batcher/cursor.json",
-          # Group a few blocks per batch. The sealer emits about 1
-          # boundary a second even when idle, and dense DA coverage
-          # means empty blocks get posted too. Grouping keeps idle L1
-          # traffic to about 1 tx every 5 seconds.
-          "--blocks-per-batch", "5",
-          "--flush-ms", "3000",
-          # The L2 chain id. The records commitment digests each
-          # remote-epoch message leaf, which commits to this id. Same
-          # value as the executor and validator jobs.
-          "--chain-id", "412346",
-        ]
+        args = concat(
+          [
+            "--live",
+            "--dry-run=false",
+            "--config", "/local/batcher.toml",
+            "--log-config", "/local/channels.toml",
+            "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+            # This allocation's cluster-egress (response) endpoint, for
+            # the batcher's own cluster client session: the node IP and a
+            # Nomad dynamic port, so it never clashes with the validator's
+            # on the same node.
+            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+            # The void voter id: the second id after the executors'
+            # (cluster.nomad.hcl builds the sealer's voter list the same way).
+            "--void-voter-id", format("%d", var.executor_count + 1),
+            # Join-miss archive refetch (tx_data and tx_deposits). Same
+            # contract as the validator's flags, on this allocation's
+            # dynamic ports.
+            "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+            "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
+            "--l1-rpc", var.l1_rpc,
+            "--settlement", "${var.settlement_address}",
+            "--da-store", "/opt/kardamom/batcher/da",
+            "--cursor-file", "/opt/kardamom/batcher/cursor.json",
+            # Group a few blocks per batch. The sealer emits about 1
+            # boundary a second even when idle, and dense DA coverage
+            # means empty blocks get posted too. Grouping keeps idle L1
+            # traffic to about 1 tx every 5 seconds.
+            "--blocks-per-batch", "5",
+            "--flush-ms", "3000",
+            # The L2 chain id. The records commitment digests each
+            # remote-epoch message leaf, which commits to this id. Same
+            # value as the executor and validator jobs.
+            "--chain-id", "412346",
+          ],
+          var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
+        )
       }
 
       env {

@@ -142,6 +142,16 @@ struct Cli {
     /// confirmed L1 post. Live mode only; required there.
     #[arg(long, env = "KARDAMOM_BATCHER_CURSOR")]
     cursor_file: Option<PathBuf>,
+    /// The inbox indexer's API (`http://host:port`). A batcher without a
+    /// cursor file then resumes just past the last posted batch, from the
+    /// batch's own blobs, instead of replaying from genesis; and no start
+    /// scans `BatchPosted` events on L1.
+    #[arg(long, env = "KARDAMOM_INDEXER_URL")]
+    indexer_url: Option<String>,
+    /// The settlement contract's deployment block: where a `BatchPosted`
+    /// scan starts when no indexer serves it. 0 is fine on anvil.
+    #[arg(long, env = "KARDAMOM_SETTLEMENT_DEPLOY_BLOCK", default_value_t = 0)]
+    settlement_deploy_block: u64,
 
     /// Post a partial group if the oldest pending block has waited this
     /// long. Must be nonzero: 0 makes the flush timeout expire at once, a
@@ -339,6 +349,8 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         flush_ms: cli.flush_ms,
         l1_retries: cli.l1_retries,
         chain_id: cli.chain_id,
+        indexer_url: cli.indexer_url.clone(),
+        settlement_deploy_block: cli.settlement_deploy_block,
     })
     .await
 }
