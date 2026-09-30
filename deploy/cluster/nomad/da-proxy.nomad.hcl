@@ -30,6 +30,16 @@ variable "eigenda_eth_rpc" {
   default     = ""
 }
 
+# The certificate verifier the proxy checks every certificate against:
+# the network's EigenDACertVerifierRouter. The proxy does not fill it
+# from the network name. The testnet default is the one the proxy's
+# own example configuration ships (api/proxy/.env.example).
+variable "eigenda_cert_verifier" {
+  type        = string
+  description = "EigenDACertVerifierRouter address of the network. Empty: the known address for sepolia_testnet."
+  default     = ""
+}
+
 variable "eigenda_signer_key" {
   type        = string
   description = "The hex private key that signs dispersals and pays from its PaymentVault deposit. Empty: the proxy is read-only."
@@ -122,6 +132,10 @@ job "da-proxy" {
         EIGENDA_PROXY_EIGENDA_V2_ETH_RPC                = var.eigenda_eth_rpc
         EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX = var.eigenda_signer_key
         EIGENDA_PROXY_EIGENDA_V2_MAX_BLOB_LENGTH        = "16MiB"
+        EIGENDA_PROXY_EIGENDA_V2_CERT_VERIFIER_ROUTER_OR_IMMUTABLE_VERIFIER_ADDR = (
+          var.eigenda_cert_verifier != "" ? var.eigenda_cert_verifier :
+          var.eigenda_network == "sepolia_testnet" ? "0x17ec4112c4BbD540E2c1fE0A49D264a280176F0D" : ""
+        )
       }
 
       # The SRS points (32 MiB) and a few payloads in flight.
