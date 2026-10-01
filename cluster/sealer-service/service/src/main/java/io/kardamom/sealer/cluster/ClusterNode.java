@@ -66,6 +66,15 @@ public final class ClusterNode {
         final long inclusionHorizonBlocks = Long.getLong(
             "kardamom.cluster.inclusionHorizonBlocks",
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
+        // The ordering window: 20 with priority fees on, 0 for first come,
+        // first served. Replicated configuration like the two above: it
+        // decides the relay order. The deploy sets it from the same value
+        // as the sequencer's [fees] priority, and a snapshot restore halts
+        // on a mismatch.
+        final int orderingWindow = Integer.getInteger(
+            "kardamom.cluster.orderingWindow", CanonicalSealerState.DEFAULT_ORDERING_WINDOW);
+        System.out.println("cluster ordering window memberId=" + memberId
+            + " size=" + orderingWindow);
         // Remote-origin allowlist: the peer chain ids this sealer accepts
         // kind-5 records from. -Dkardamom.cluster.remoteOrigins wins over
         // the KARDAMOM_REMOTE_ORIGINS env var. Unset or empty disables
@@ -120,8 +129,8 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks, tickMs,
-                        memberId, remoteOrigins,
+                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks, orderingWindow,
+                        tickMs, memberId, remoteOrigins,
                         voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
@@ -371,6 +380,11 @@ public final class ClusterNode {
             // without approaching flow-control limits.
             .logChannel("aeron:udp?term-length=8m")
             .ingressStreamId(ingressStreamId)
+            // The ordering window's hold timer is 5 ms. Aeron's timer wheel
+            // fires a timer on the first tick at or after its deadline, and
+            // the default tick is 8 ms, which would hold a window for up to
+            // 13 ms. A 1 ms tick fires it within the millisecond.
+            .wheelTickResolutionNs(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(1))
             .appVersion(APP_VERSION)
             // Client sessions must survive a full quorum outage end to end
             // (kill 2 of 3 members, stall, node restart, member recovery,
@@ -486,6 +500,7 @@ public final class ClusterNode {
             final String clusterDir,
             final int dedupCapacity,
             final long inclusionHorizonBlocks,
+            final int orderingWindow,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
             final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
@@ -494,7 +509,7 @@ public final class ClusterNode {
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(
                 dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks));
+                inclusionHorizonBlocks, orderingWindow));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.
