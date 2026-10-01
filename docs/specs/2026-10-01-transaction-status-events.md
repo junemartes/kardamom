@@ -52,16 +52,16 @@ TxStatus {
     sender:   Address,
     nonce:    u64,
     stage:    Offered | Sealed | Executed | Rejected,
-    lane:     u16,          // Offered
-    index:    u64,          // Sealed: the canonical index
-    block:    u64,          // Sealed, Executed
     status:   u8,           // Executed: receipt status; Rejected: the TxError kind
-    at_ms:    u64,          // the publisher's clock, informational
 }
 ```
 
-About 80 bytes. The stage order is fixed per transaction; a reader that sees `Sealed` before
-`Offered` (two publishers, two streams) orders by stage, not by arrival.
+About 60 bytes: the transaction's identity and its stage, nothing else. A sender needs to
+know where its own transaction is; block numbers, canonical indices and timestamps are
+protocol values that live in blocks and receipts, for validators, bridges and the batcher.
+A client that wants them reads the receipt. The stage order is fixed per transaction; a
+reader that sees `Sealed` before `Offered` (two publishers, two streams) orders by stage,
+not by arrival.
 
 Who publishes what:
 
@@ -119,9 +119,9 @@ archive's length-prefixed rkyv record, so the tooling that reads archives reads 
 ### 3.4 What a client sees
 
 ```
-{"tx_hash":"0x…","stage":"offered","lane":3,"at":"…"}
-{"tx_hash":"0x…","stage":"sealed","index":128881,"block":4412,"at":"…"}
-{"tx_hash":"0x…","stage":"executed","block":4412,"status":1,"at":"…"}
+{"tx_hash":"0x…","sender":"0x…","nonce":17,"stage":"offered"}
+{"tx_hash":"0x…","sender":"0x…","nonce":17,"stage":"sealed"}
+{"tx_hash":"0x…","sender":"0x…","nonce":17,"stage":"executed","status":1}
 ```
 
 or `{"stage":"rejected","reason":"expired"}` in place of the last two. The stages are
@@ -139,9 +139,9 @@ monotonic per transaction; a client treats a missing earlier stage as implied.
 
 ## 5. Decided
 
-- `Sealed` carries the block number and no timestamp. The sealer sets the block's
-  timestamp when it closes the block, up to one tick after the record, and holding the
-  event for it would cost that tick. The time a client wants is on the receipt.
+- An event carries the transaction's identity and its stage, no block-level values. The
+  sealer sets a block's timestamp when it closes the block, up to one tick after the
+  record; nothing waits for it. Protocol values stay in blocks and receipts.
 
 ## 6. Open questions
 

@@ -154,8 +154,11 @@ Steps 1 and 2 remove the risk; 3 and 4 remove the stalls; 5 and 6 add the safety
    through logs. A small admin endpoint on the sealer is the cleanest.
 2. `min_healthy_time` for an executor depends on its catch-up time after a restart, which
    depends on the chain's rate. The check should express "caught up", not a fixed time.
-3. Decided: the validator records its verdict before it exits (a `verdict` file beside its
-   state, mirrored in a metric), and its readiness check refuses a start while a
-   divergence verdict stands. A stop the deploy asked for, or a node loss, carries no
-   verdict and restarts; a divergence halt fails the deploy and keeps the validator down,
-   which is what `reschedule { attempts = 0 }` is for.
+3. Decided: the validator restarts like every other service (normal `restart` and
+   `reschedule` stanzas; `attempts = 0` goes). A divergence is a state, not a dead
+   process: the validator records its verdict (a `verdict` file beside its state, mirrored
+   in a metric) and, when it finds a standing verdict at start, runs halted: it serves its
+   metrics and the verdict, makes no progress, and the alert stays loud until an operator
+   clears the verdict after the investigation. A crash, a node loss or a deploy restarts
+   it and it resumes from its cursor; the deploy's readiness check fails on a halted
+   validator, so a deploy never passes over a divergence.
