@@ -28,6 +28,7 @@ mod feed;
 pub mod poll;
 mod run;
 mod sender;
+mod spool;
 
 pub use cursor::{BatchCursor, read_last_batch_index};
 pub use run::{LiveArgs, connect_l1, run};

@@ -18,6 +18,7 @@ use crate::error::BatcherError;
 use kardamom_types::xchain::remote_epoch_wire_bytes;
 
 use super::cursor::BatchCursor;
+use super::spool::{Restored, Spool};
 
 /// How often the group's timers are checked when no record arrives.
 const TICK: Duration = Duration::from_secs(1);
@@ -126,23 +127,71 @@ pub(crate) struct FeedLoop<P> {
     pack_cfg: BatcherConfig,
     acc: BatchAccumulator,
     pending: Option<PendingGroup>,
+    /// The consumed, unposted blocks on disk (`super::spool`).
+    spool: Spool,
+}
+
+impl PendingGroup {
+    /// The group a restarted batcher continues: the spooled blocks, aged
+    /// from the oldest one's write.
+    fn restored(restored: Restored) -> Option<Self> {
+        let last = restored.blocks.last()?;
+        let age = restored
+            .oldest_written
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        let has_traffic = restored
+            .blocks
+            .iter()
+            .any(|b| !b.txs.is_empty() || !b.remote_epochs.is_empty());
+        let raw_bytes = restored.blocks.iter().map(raw_bytes_of).sum();
+        let cursor = BatchCursor {
+            next_index: last.end_tx_idx.as_index(),
+            next_block: last.block_number.saturating_add(1),
+            last_batch_index: 0,
+        };
+        Some(Self {
+            since: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+            blocks: restored.blocks,
+            has_traffic,
+            raw_bytes,
+            cursor,
+        })
+    }
 }
 
 impl<P: Provider> FeedLoop<P> {
-    pub(crate) fn new(rx: Receiver<ReaderToExec>, sender: LiveSender<P>, cfg: FeedConfig) -> Self {
+    /// A loop whose pending group starts as `restored`, the spool's
+    /// content; the reader resumes just past it (see `run`).
+    pub(crate) fn new(
+        rx: Receiver<ReaderToExec>,
+        sender: LiveSender<P>,
+        cfg: FeedConfig,
+        spool: Spool,
+        restored: Restored,
+    ) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
             compress: cfg.compress,
             chain_id: cfg.chain_id,
             ..Default::default()
         };
+        let pending = PendingGroup::restored(restored);
+        if let Some(group) = &pending {
+            tracing::info!(
+                blocks = group.blocks.len(),
+                through = group.cursor.next_block.saturating_sub(1),
+                "pending group restored from the spool"
+            );
+        }
         Self {
             rx,
             sender,
             cfg,
             pack_cfg,
             acc: BatchAccumulator::new(),
-            pending: None,
+            pending,
+            spool,
         }
     }
 
@@ -231,6 +280,7 @@ impl<P: Provider> FeedLoop<P> {
             // `LiveSender::post_confirmed` stamps `last_batch_index`.
             last_batch_index: 0,
         };
+        self.spool.append(&closed)?;
         let group = self.pending.get_or_insert_with(|| PendingGroup {
             since: Instant::now(),
             blocks: Vec::new(),
@@ -286,7 +336,8 @@ impl<P: Provider> FeedLoop<P> {
     /// own cursor.
     async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
         let cursor = group.cursor_at(batch.l2_block_end)?;
-        self.sender.post_confirmed(batch, cursor).await
+        self.sender.post_confirmed(batch, cursor).await?;
+        self.spool.clear_through(batch.l2_block_end)
     }
 }
 
