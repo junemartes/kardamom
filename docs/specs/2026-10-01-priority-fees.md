@@ -67,18 +67,27 @@ the data, not the algorithm.
 
 ### 3.2 Admission at the sequencer
 
-With the setting on, the sequencer's nonce state machine gains two checks before a
-transaction is parked or released:
+With the setting on, the sequencer's nonce state machine gains Ethereum's three fee checks
+before a transaction is parked or released, so both the gas price and the priority fee can
+be paid:
 
-- `max_fee_per_gas >= base_fee` of the latest block the sequencer has seen (it reads the
-  base fee from the block boundaries it already taps); below it the transaction cannot be
-  included at that price and is rejected on `tx_errors` with a new kind `FeeTooLow`. The
-  base fee moves by at most one eighth per block, so a view a few blocks old errs by a
-  few eighths; a transaction admitted on a stale view that cannot pay at its block becomes
-  a skip receipt at execution, as any unpayable transaction does today.
-- the sender's balance covers `gas_limit * max_fee_per_gas + value`, the same check the
-  ingress makes against a fresh balance, repeated at the sequencer with its own account
-  view (the live map and Redis). A stale balance passes; the executor is the truth.
+1. `max_priority_fee_per_gas <= max_fee_per_gas`. A bid above the cap can never be paid;
+   the transaction is invalid, not merely unpayable, and is rejected on `tx_errors` with a
+   new kind `FeeInvalid`.
+2. `max_fee_per_gas >= base_fee` of the latest block the sequencer has seen (it reads the
+   base fee from the block boundaries it already taps). The cap covers the base fee, and
+   the tip the chain collects is `min(max_priority, max_fee - base_fee)`, never more.
+   Below the base fee the transaction cannot be included at that price and is rejected
+   with `FeeTooLow`. The base fee moves by at most one eighth per block, so a view a few
+   blocks old errs by a few eighths; a transaction admitted on a stale view that cannot pay
+   at its block becomes a skip receipt at execution, as any unpayable transaction does
+   today.
+3. `balance >= gas_limit * max_fee_per_gas + value`: the worst case the sender can be
+   charged, base fee and tip together, is the cap times the gas limit. The ingress makes
+   this check against a fresh balance; the sequencer repeats it with its own account view
+   (the live map and Redis). A stale balance passes; the executor is the truth.
+
+A legacy transaction passes the same checks with `gas_price` as both cap and bid.
 
 There is no floor on the tip. A zero tip is admitted and ordered last within its window.
 
