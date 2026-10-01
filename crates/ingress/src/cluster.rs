@@ -125,7 +125,7 @@ mod tests {
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
     use kardamom_cluster_adapter::wire::{
-        encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress,
+        GuardHeader, encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress,
     };
     use kardamom_types::{BPosition, TxRef};
 
@@ -142,7 +142,7 @@ mod tests {
             },
             0,
         );
-        let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0, u64::MAX);
+        let ingress = encode_ingress_txref(&r, GuardHeader::EXEMPT);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         encode_egress_record(index, relayed).unwrap()
     }

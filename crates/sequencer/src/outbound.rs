@@ -27,7 +27,7 @@
 
 pub mod cluster;
 
-use alloy_primitives::Address;
+use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_log::aeron_live::TxErrorsPublisherHandle;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef};
@@ -41,9 +41,9 @@ use crate::error::SequencerError;
 #[derive(Clone, Copy, Debug)]
 pub struct RefOffer {
     pub tx_ref: TxRef,
-    pub sender: Address,
-    pub nonce: u64,
-    pub max_inclusion_block: u64,
+    /// The sealer's guard header: the sender and nonce for the contiguity
+    /// guard, the inclusion deadline, and the tip the record bids.
+    pub guard: GuardHeader,
 }
 
 /// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
@@ -150,6 +150,8 @@ pub mod fakes {
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
         pub refs: Arc<Mutex<Vec<TxRef>>>,
+        /// Every published offer whole, guard header included.
+        pub offers: Arc<Mutex<Vec<RefOffer>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
@@ -161,6 +163,7 @@ pub mod fakes {
                 return Err(SequencerError::Backpressure);
             }
             self.refs.lock().unwrap().push(offer.tx_ref);
+            self.offers.lock().unwrap().push(*offer);
             Ok(())
         }
 
@@ -212,9 +215,10 @@ mod tests {
                 BPosition::default(),
                 0,
             ),
-            sender: Address::ZERO,
-            nonce,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                nonce,
+                ..GuardHeader::EXEMPT
+            },
         }
     }
 

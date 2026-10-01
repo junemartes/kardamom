@@ -30,12 +30,15 @@ docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 crossbeam-channel.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 # `testkit`-only: see the `testing` feature doc above.
 alloy-network = { workspace = true, optional = true }
 alloy-rlp.workspace = true
 # `testkit`-only: see the `testing` feature doc above.
 alloy-signer-local = { workspace = true, optional = true }
 anyhow.workspace = true
+# The base fee cell the boundary feed writes and the publish loop reads.
+arc-swap.workspace = true
 bytes.workspace = true
 clap.workspace = true
 core_affinity = "0.8"
@@ -60,7 +63,6 @@ tracing.workspace = true
 [dev-dependencies]
 # alloy-network and alloy-signer-local moved to [dependencies] (optional,
 # behind the `testing` feature): see that feature's doc comment.
-alloy-eips.workspace = true
 criterion.workspace = true
 # DHAT heap profiling for the ignored-by-default allocation harness
 # (tests/alloc_profile.rs) — same setup as crates/bench/tests/alloc_profile.rs.

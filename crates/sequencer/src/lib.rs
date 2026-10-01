@@ -35,10 +35,10 @@ pub mod epoch;
 pub mod error;
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes;
+pub mod fees;
 pub mod inbound;
 pub mod lookup;
 pub mod metrics;
-mod nonce_decode;
 pub mod outbound;
 pub mod partition;
 pub(crate) mod pending;
@@ -49,6 +49,7 @@ pub(crate) mod sender;
 pub mod sequencer;
 pub mod shutdown;
 pub(crate) mod state;
+mod tx_decode;
 #[cfg(any(test, feature = "testing"))]
 pub mod testkit;
 mod unconfirmed;

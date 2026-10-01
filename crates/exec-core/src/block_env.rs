@@ -38,7 +38,7 @@ use revm::primitives::hardfork::SpecId;
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
 /// Fixed per-block gas limit. Version 0 has no dynamic adjustment.
-pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+pub use kardamom_types::limits::BLOCK_GAS_LIMIT;
 
 /// Per-block execution context, built from the sealer's `BlockBoundaryStart`.
 /// It stays the same for every tx in the block, and is rebuilt at each

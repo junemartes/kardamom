@@ -64,6 +64,7 @@ fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxE
             gas_limit: 100_000,
             calldata_len: CALLDATA_BYTES,
             real_hash: true,
+            ..Default::default()
         },
     )
 }

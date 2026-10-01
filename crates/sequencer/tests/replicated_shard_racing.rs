@@ -31,18 +31,24 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_cluster_adapter::wire;
+use kardamom_sequencer::Sequencer;
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
+use kardamom_sequencer::outbound::RefOffer;
 use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::testkit::{
-    EnvelopeSpec, drive_to_idle, envelope_with, one_partition_cfg, signer,
+    EnvelopeSpec, drive_sequencer_to_idle, drive_to_idle, envelope_with, one_partition_cfg,
+    signer,
 };
+use kardamom_types::BlockBoundary;
 
 const SENDERS: usize = 3;
 const TX_PER_SENDER: u64 = 20;
 
 /// Build a signed legacy transaction with the real keccak256 `tx_hash`.
 /// This is the racing-replica dedup key. Unlike the single-replica tests,
-/// it is not left defaulted.
+/// it is not left defaulted. The price varies per transaction, so a
+/// fees-on run bids a different tip per record.
 fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
     envelope_with(
         s,
@@ -50,6 +56,7 @@ fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxE
         correlation_id,
         EnvelopeSpec {
             real_hash: true,
+            gas_price: 1_000_000_000 + correlation_id as u128 * 1_000_000,
             ..Default::default()
         },
     )
@@ -108,24 +115,64 @@ fn first_seen_merge(interleaved: &[TxRef]) -> Vec<TxRef> {
         .collect()
 }
 
-fn encoded(refs: &[TxRef]) -> Vec<Vec<u8>> {
-    // Both replicas derive the same (sender, nonce) guard header from
-    // the same envelope, so a fixed header keeps the byte equality meaningful.
-    refs.iter()
-        .map(|r| wire::encode_ingress_txref(r, alloy_primitives::Address::ZERO, 0, u64::MAX))
+/// The offers as the cluster sees them: the guard header and the relayed
+/// payload, byte for byte.
+fn encoded(offers: &[RefOffer]) -> Vec<Vec<u8>> {
+    offers
+        .iter()
+        .map(|o| wire::encode_ingress_txref(&o.tx_ref, o.guard))
         .collect()
+}
+
+/// Run one replica with priority fees on, after it saw `boundary`.
+fn run_replica_with_fees(
+    boundary: &BlockBoundary,
+    stream: &[(TxDataLoc, TxEnvelope)],
+) -> Vec<RefOffer> {
+    let view = LatestBaseFee::new();
+    view.on_boundary(boundary);
+    let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
+    seq.enable_fees(FeeGate::on(view, None));
+    drive_sequencer_to_idle(&mut seq, stream).0
 }
 
 #[test]
 fn racing_replicas_emit_identical_ref_streams() {
     let stream = shard_stream();
-    let a = run_replica(&stream);
-    let b = run_replica(&stream);
+    let mut a = Sequencer::new(one_partition_cfg()).unwrap();
+    let mut b = Sequencer::new(one_partition_cfg()).unwrap();
+    let a = drive_sequencer_to_idle(&mut a, &stream).0;
+    let b = drive_sequencer_to_idle(&mut b, &stream).0;
 
     assert_eq!(a.len(), stream.len(), "replica A must ref every input tx");
-    // Byte-identical wire encoding. Whichever replica's copy wins the
-    // race, the relayed canonical payload is the same.
+    // Byte-identical wire encoding, guard header included. Whichever
+    // replica's copy wins the race, the sealer sees the same bytes. With
+    // the setting off every bid is zero.
     assert_eq!(encoded(&a), encoded(&b));
+    assert!(a.iter().all(|o| o.guard.tip == 0));
+}
+
+/// With priority fees on, the bid derives from the transaction bytes and
+/// the base fee view, so two replicas with the same view offer the same
+/// bytes, and a legacy price above the base fee bids its part above it.
+#[test]
+fn racing_replicas_emit_identical_bids_with_fees_on() {
+    let stream = shard_stream();
+    let boundary = BlockBoundary {
+        base_fee: 1_000_000_000,
+        gas_used: 15_000_000,
+        ..BlockBoundary::default()
+    };
+    let a = run_replica_with_fees(&boundary, &stream);
+    let b = run_replica_with_fees(&boundary, &stream);
+
+    assert_eq!(a.len(), stream.len(), "every input tx clears the fee gate");
+    assert_eq!(encoded(&a), encoded(&b));
+    // The first record is priced at the base fee and bids nothing; every
+    // later one bids its price above the base fee times its gas limit.
+    assert_eq!(a[0].guard.tip, 0);
+    assert_eq!(a[1].guard.tip, 1_000_000 * 21_000);
+    assert!(a.iter().skip(1).all(|o| o.guard.tip > 0));
 }
 
 #[test]
@@ -168,8 +215,8 @@ fn check_interleaving(seed: u64, a: &[TxRef], b: &[TxRef], stream: &[(TxDataLoc,
 
     let canonical = first_seen_merge(&interleaved);
     assert_eq!(
-        encoded(&canonical),
-        encoded(a),
+        canonical.as_slice(),
+        a,
         "seed {seed}: dedup must converge on the single-replica stream"
     );
     // Per-sender nonce order in the canonical stream is dense and
@@ -234,7 +281,7 @@ fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
     // And the canonical stream is untouched by the zombie replica.
     let mut interleaved = a.clone();
     interleaved.extend(b);
-    assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
+    assert_eq!(first_seen_merge(&interleaved), a);
 }
 
 /// A client-abandoned nonce hole must never be adopted into the canonical
