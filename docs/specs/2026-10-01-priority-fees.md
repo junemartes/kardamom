@@ -12,8 +12,10 @@ block, and the chain earns nothing from priority.
 
 Wanted:
 
-- The sequencer admits a transaction only when the sender can pay the priority fee it
-  offers, and only when that fee reaches a floor.
+- The sequencer admits a transaction only when the sender can pay the fee it offers. There
+  is no floor on the priority fee: zero is a valid tip at all times.
+- The base fee follows EIP-1559: it moves by up to one eighth per block toward a gas target,
+  computed from the previous block's gas used.
 - The sealer orders transactions by priority fee within a window of 20 entries or 5 ms,
   whichever closes first, and keeps every other rule (one nonce order per sender, the
   inclusion deadline, the dedup window).
@@ -36,15 +38,16 @@ Wanted:
 
 ## 3. Design
 
-### 3.1 The fee travels in the guard header
+### 3.1 The tip travels in the guard header
 
 The sequencer decodes, beside the nonce, the fee fields of the transaction: for a type-2
 transaction `max_priority_fee_per_gas` and `max_fee_per_gas`; for a legacy transaction
-`gas_price`. It computes the effective priority fee the chain would collect at the current
-base fee (zero today, so `min(max_priority, max_fee)` for type 2 and `gas_price` for
-legacy), in wei, and puts it in the offer: `RefOffer { …, priority_fee: u128 }`, and in the
-sealer's guard header as `[priority_fee:16]`. The field is a pure function of the
-transaction bytes, so both replicas send the same offer.
+`gas_price`. The ordering key is the tip the sender bids: `max_priority_fee_per_gas` for
+type 2, and for legacy `gas_price` (a legacy sender bids its whole price above the base
+fee, as on Ethereum). It is a pure function of the transaction bytes, so both racing
+replicas send the same offer, whatever base fee each has seen. The sequencer puts it in the
+offer, `RefOffer { …, tip: u128 }`, and in the sealer's guard header as `[tip:16]`. What
+the sender pays is settled at execution (3.4), not here.
 
 With the setting off, the sequencer writes zero. A zero fee everywhere makes the sealer's
 order equal to arrival order, so the sealer's code path is one, and the setting changes
@@ -55,13 +58,17 @@ the data, not the algorithm.
 With the setting on, the sequencer's nonce state machine gains two checks before a
 transaction is parked or released:
 
-- `priority_fee >= min_priority_fee_per_gas`, the chain's floor (3.6); below it the
-  transaction is rejected on `tx_errors` with a new kind `FeeTooLow`.
-- the sender's balance covers `gas_limit * (base_fee + priority_fee) + value`. The ingress
-  checks `gas_limit * max_fee + value` today against a fresh balance; the sequencer has the
-  same account view through the live map and Redis, and checks the effective price. A
-  stale balance passes (the executor is the truth; an unpayable transaction becomes a
-  skip receipt, as today).
+- `max_fee_per_gas >= base_fee` of the latest block the sequencer has seen (it reads the
+  base fee from the block boundaries it already taps); below it the transaction cannot be
+  included at that price and is rejected on `tx_errors` with a new kind `FeeTooLow`. The
+  base fee moves by at most one eighth per block, so a view a few blocks old errs by a
+  few eighths; a transaction admitted on a stale view that cannot pay at its block becomes
+  a skip receipt at execution, as any unpayable transaction does today.
+- the sender's balance covers `gas_limit * max_fee_per_gas + value`, the same check the
+  ingress makes against a fresh balance, repeated at the sequencer with its own account
+  view (the live map and Redis). A stale balance passes; the executor is the truth.
+
+There is no floor on the tip. A zero tip is admitted and ordered last within its window.
 
 Both are per-transaction and constant time; they add nothing to the hot path beyond the
 fee decode, which is a few fields of the already-decoded transaction.
@@ -104,38 +111,46 @@ and the window's only effect is the 5 ms hold. The sealer's own setting
 member, and a member checks it against the leader's value at join and halts on a mismatch,
 the way it checks `retention` and `inclusionHorizonBlocks`.
 
-### 3.4 Where the fee goes
+### 3.4 The base fee follows EIP-1559; the tip goes to the beneficiary
 
-The executor pays the priority fee to the block's beneficiary. The beneficiary is a config
-value of the chain (the operator's fee account), not the zero address, when the setting is
-on. The base fee stays zero in this spec; an EIP-1559 base fee that follows demand is a
-separate design, and it needs the sealer to know gas, which it does not.
+The executor computes each block's base fee as Ethereum does: from the previous block's
+gas used against the gas target, with the target at half the block gas limit
+(`BLOCK_GAS_LIMIT` is 30M, so the target is 15M) and a change of at most one eighth per
+block (`BASE_FEE_MAX_CHANGE_DENOMINATOR = 8`); the genesis sets the first base fee. The
+computation is a pure function of the chain, so every executor and the validator agree,
+and the block header carries it. The sealer needs no gas knowledge: it orders by the tip,
+and the executor settles the price.
 
-One existing inconsistency gets fixed on the way: the receipt reports `effective_gas_price`
-as `max_fee_per_gas` while revm charges `min(max_fee, priority)` at a zero base fee; the
-receipt reports what was charged.
+At execution the sender pays `gas_used * (base_fee + effective_tip)` with
+`effective_tip = min(max_priority, max_fee - base_fee)` for type 2 and
+`gas_price - base_fee` for legacy, as on Ethereum: the base fee is burned, the tip goes to
+the block's beneficiary, a chain value (the operator's fee account) in the genesis beside
+the chain id. The receipt's `effective_gas_price` reports what was charged, which fixes the
+present inconsistency where it reports `max_fee_per_gas` at a zero base fee.
+
+The ordering key (the bid) and the settlement (the charge) differ on purpose: the bid is
+knowable before the block, the charge only in it, and a window of 5 ms never spans a base
+fee change the sender could not have priced.
 
 ### 3.5 The setting
 
 | Where | Name | Effect |
 |---|---|---|
-| sequencer `sequencer.toml` | `[fees] priority = true/false` | the fee in the offer, the floor (from the chain config) and the balance check |
+| sequencer `sequencer.toml` | `[fees] priority = true/false` | the tip in the offer, the base fee check and the balance check |
 | sealer `-Dkardamom.cluster.orderingWindow` | `20` or `0` | the window hold; must match on every member |
-| executor | `--beneficiary <address>` | where the priority fee goes |
+| executor | the beneficiary and the base fee schedule from the chain config | the charge and where the tip goes |
 
 The deploy passes all three from one value (`PRIORITY_FEES=on`), so they cannot disagree.
 Turning the setting off is a rolling deploy with the fee at zero and the window at zero;
 nothing in the chain's history depends on the setting, because the order is in the log
 either way.
 
-### 3.6 The floor is a protocol value
+### 3.6 Protocol values
 
-`min_priority_fee_per_gas` is a field of the chain's genesis, beside the chain id and the
-block gas limit, in wei per gas. The sequencer reads it from the chain config it already
-loads, never from an operator setting, so two sequencers cannot disagree and the validator
-can check that every sealed transaction cleared the floor. A change is a chain upgrade: a
-new value with an activation block in the chain config, applied by every service at that
-block. Zero is a valid value and means no floor.
+Three values live in the chain's genesis, beside the chain id and the block gas limit, and
+change only by a chain upgrade with an activation block: the initial base fee, the
+beneficiary, and the gas target (half the limit). There is no priority floor: it is zero at
+all times by design, so a transaction never waits on an operator's price.
 
 ## 4. Order and estimate
 
@@ -143,8 +158,8 @@ block. Zero is a valid value and means no floor.
 |---|---|---|
 | 1 | the fee decode in the sequencer, the field in `RefOffer` and the guard header, zero when off | the racing-replica test still produces byte-identical offers |
 | 2 | the sealer window, the timer, the flush order, the sender chaining | Java unit tests: fee order within a window, nonce order of one sender across fees, flush on 20, on the timer, on a boundary; the replica-determinism test |
-| 3 | admission at the sequencer: the floor and the balance | sequencer unit tests; a chain-semantics case with a below-floor transaction rejected on the feed |
-| 4 | the beneficiary and the receipt's price | an executor test; the receipt vectors |
+| 3 | admission at the sequencer: the base fee check and the balance | sequencer unit tests; a chain-semantics case with a transaction under the base fee rejected on the feed |
+| 4 | the EIP-1559 base fee in the executor and the header; the beneficiary; the receipt's price | executor tests against Ethereum's base fee vectors; the receipt vectors |
 | 5 | the deploy value and the three settings | the deploy isolation test |
 | 6 | a load shard with fees on: latency within the window's 5 ms of the baseline | the load campaign's comparison |
 
@@ -153,7 +168,8 @@ block. Zero is a valid value and means no floor.
 1. The window's 5 ms as a cluster timer: Aeron Cluster timers are scheduled in
    milliseconds on the leader's clock and recorded in the log; the follower replays them at
    the same log position. Confirm the minimum timer resolution on the pinned version.
-2. Whether `Offered` (the status feed) should carry the fee, so a trader sees what it paid
-   for its place.
-3. The floor's unit is wei per gas at a zero base fee; when a base fee exists, the floor
-   applies to the priority part only.
+2. Whether `eth_feeHistory` and `eth_maxPriorityFeePerGas` on the ingress read the base
+   fee history and the tips of recent blocks, so wallets price transactions as they do on
+   Ethereum; the ingress has the headers and the receipts for it.
+3. The base fee at genesis and the gas target are chain values; the first values for
+   staging come with the chain upgrade that activates the schedule.
