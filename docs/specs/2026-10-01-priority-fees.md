@@ -38,16 +38,28 @@ Wanted:
 
 ## 3. Design
 
-### 3.1 The tip travels in the guard header
+### 3.1 Two prices, one ordering key
 
-The sequencer decodes, beside the nonce, the fee fields of the transaction: for a type-2
-transaction `max_priority_fee_per_gas` and `max_fee_per_gas`; for a legacy transaction
-`gas_price`. The ordering key is the tip the sender bids: `max_priority_fee_per_gas` for
-type 2, and for legacy `gas_price` (a legacy sender bids its whole price above the base
-fee, as on Ethereum). It is a pure function of the transaction bytes, so both racing
-replicas send the same offer, whatever base fee each has seen. The sequencer puts it in the
-offer, `RefOffer { …, tip: u128 }`, and in the sealer's guard header as `[tip:16]`. What
-the sender pays is settled at execution (3.4), not here.
+Two different things, kept apart everywhere in this spec:
+
+- the gas price: what the sender pays per gas, the base fee plus the tip; `max_fee_per_gas`
+  is its cap on a type-2 transaction, `gas_price` is it whole on a legacy one;
+- the priority fee, the tip: what the sender bids for its place, above the base fee;
+  `max_priority_fee_per_gas` on a type-2 transaction.
+
+The ordering key is the tip and only the tip. The base fee is the same for every
+transaction of a block, so it says nothing about order; a high `max_fee_per_gas` with a
+zero tip is a transaction that can afford any base fee and bids nothing.
+
+The sequencer decodes, beside the nonce, the fee fields of the transaction. For a type-2
+transaction the bid is `max_priority_fee_per_gas`, a pure function of the bytes, so both
+racing replicas send the same offer. A legacy transaction carries one price and no tip;
+Ethereum reads it as `max_fee = max_priority = gas_price`, so its tip at a block is
+`gas_price - base_fee`. The sequencer computes that from the base fee of the latest block
+it has seen, clamped at zero; two replicas may differ by one block's step (one eighth), and
+the sealer's first-seen dedup settles which offer defines the key. The sequencer puts the
+bid in the offer, `RefOffer { …, tip: u128 }`, and in the sealer's guard header as
+`[tip:16]`. What the sender pays is settled at execution (3.4), not here.
 
 With the setting off, the sequencer writes zero. A zero fee everywhere makes the sealer's
 order equal to arrival order, so the sealer's code path is one, and the setting changes
@@ -128,9 +140,9 @@ the block's beneficiary, a chain value (the operator's fee account) in the genes
 the chain id. The receipt's `effective_gas_price` reports what was charged, which fixes the
 present inconsistency where it reports `max_fee_per_gas` at a zero base fee.
 
-The ordering key (the bid) and the settlement (the charge) differ on purpose: the bid is
-knowable before the block, the charge only in it, and a window of 5 ms never spans a base
-fee change the sender could not have priced.
+The ordering key (the tip bid) and the settlement (the gas price charged) are two
+different numbers on purpose: the bid is knowable before the block, the charge only in it,
+and a window of 5 ms never spans a base fee change the sender could not have priced.
 
 ### 3.5 The setting
 
