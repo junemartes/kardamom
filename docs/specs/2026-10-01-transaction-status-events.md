@@ -88,10 +88,13 @@ A new service, `kardamom-notifier`, with `count = 2` behind the load balancer:
   memory (a bounded map; 10,000 events a second for 10 minutes is a few hundred megabytes
   at 80 bytes, bounded by eviction), so a client that subscribes after the submit still gets
   the steps it missed.
-- WebSocket: `kardamom_subscribeTxStatus(filter)` with `filter = { sender } | { tx_hash }`;
-  on subscribe it replays the ring for the filter, then streams. A slow client gets a
+- WebSocket: `kardamom_subscribeTxStatus(filter)` with
+  `filter = { all } | { sender } | { tx_hash }`; `all` is the full feed, every event of
+  every transaction, open to anyone, as the chain's blocks are. On subscribe the notifier
+  replays the ring for the filter, then streams. A slow client gets a
   `Lagged` marker and the stream continues from the present, as the receipt feed does.
-- Webhooks: a subscription is `{ url, filter, secret }` registered by `POST /webhooks`;
+- Webhooks: a subscription is `{ url, filter, secret }` registered by `POST /webhooks`,
+  with the same three filters;
   the notifier posts each event as JSON with an HMAC signature header and an idempotency key
   (`tx_hash` + stage). Delivery is at least once with bounded retries (exponential, one
   minute cap, ten attempts); the subscriber deduplicates by the key.
@@ -139,6 +142,8 @@ monotonic per transaction; a client treats a missing earlier stage as implied.
 
 ## 5. Decided
 
+- Anyone can subscribe to the full feed. The events are public data, the same as the
+  blocks; the filters narrow, they do not protect.
 - An event carries the transaction's identity and its stage, no block-level values. The
   sealer sets a block's timestamp when it closes the block, up to one tick after the
   record; nothing waits for it. Protocol values stay in blocks and receipts.
