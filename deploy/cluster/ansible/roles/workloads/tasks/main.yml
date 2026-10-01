@@ -164,5 +164,6 @@
            | combine({'blocks_per_batch': workloads_batcher_blocks_per_batch} if workloads_batcher_blocks_per_batch | length > 0 else {})
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
+           | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
                      if workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0 else {}) }}
