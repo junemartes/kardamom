@@ -31,7 +31,7 @@ use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscr
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
-use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::aeron_live::{AeronRuntime, TxStatusPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_log::recorder::RecorderThreads;
@@ -431,7 +431,8 @@ impl IngressService {
     /// into the proxy's on-quorum watermark bus. No standalone sealer
     /// publishes the durable watermark in the cluster-only topology, so this
     /// is the source of it: a record or boundary on egress is a
-    /// Raft-quorum-durability signal.
+    /// Raft-quorum-durability signal. The same session publishes the
+    /// `Sealed` status of every relayed transaction on `status`.
     ///
     /// Returns the running thread's handle. Dropping it stops the thread
     /// and ends the cluster session.
@@ -439,6 +440,7 @@ impl IngressService {
         &self,
         subscription: &LiveIngressSubscription,
         ingress_endpoints: Option<String>,
+        status: TxStatusPublisherHandle,
     ) -> Result<watermark::ClusterWatermark> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
@@ -462,16 +464,18 @@ impl IngressService {
         // channel, so the send never blocks. A send with no live receiver
         // is not an error here.
         let running =
-            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender())
+            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender(), status)
                 .spawn(guard)
                 .context("spawn cluster watermark thread")?;
-        tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
+        tracing::info!(
+            "kardamom-ingress: on-quorum watermark and tx_status Sealed via Aeron Cluster egress"
+        );
         Ok(running)
     }
 
-    /// Builds the config, opens Aeron, optionally starts the cluster
-    /// watermark watcher, and starts the proxy's listeners. Returns a
-    /// [`RunningIngress`] that owns everything needed to shut back down.
+    /// Builds the config, opens Aeron, starts the cluster egress tap, and
+    /// starts the proxy's listeners. Returns a [`RunningIngress`] that
+    /// owns everything needed to shut back down.
     async fn run(self) -> Result<RunningIngress> {
         let cfg = self.build_config()?;
         let map_version = cfg.shard_map.as_ref().map(ShardMap::version);
@@ -488,13 +492,18 @@ impl IngressService {
             "kardamom-ingress starting"
         );
 
-        let opened = self.open_aeron_side(&cfg.live_accounts).await?;
-        let cluster_watermark = if cfg.ack_policy.requires_quorum() {
-            let members = opened.plane.cluster_ingress_endpoints().await?;
-            Some(self.spawn_cluster_watermark(&opened.subscription, members)?)
-        } else {
-            None
-        };
+        let mut opened = self.open_aeron_side(&cfg.live_accounts).await?;
+        // The egress tap runs under every ack policy: it is the `Sealed`
+        // publisher of the status stream, and under a quorum policy also
+        // the source of the durable watermark.
+        let members = opened.plane.cluster_ingress_endpoints().await?;
+        let status = opened
+            .plane
+            .publisher::<TxStatusPublisherHandle>(&opened.rt)
+            .await
+            .context("open TxStatusPublisherHandle")?;
+        let cluster_watermark =
+            self.spawn_cluster_watermark(&opened.subscription, members, status)?;
 
         let drain_timeout = cfg.pending_receipt_timeout;
         let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
@@ -540,7 +549,7 @@ struct RunningIngress {
     /// Dropping it is the point.
     _rt: AeronRuntime,
     /// Held only for its `Drop` side effect; never read.
-    _cluster_watermark: Option<watermark::ClusterWatermark>,
+    _cluster_watermark: watermark::ClusterWatermark,
 }
 
 impl RunningIngress {

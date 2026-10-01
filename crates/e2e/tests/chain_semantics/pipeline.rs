@@ -130,3 +130,23 @@ async fn rpc_golden_vectors_hold() {
         .await
         .expect("rpc-vectors");
 }
+
+/// The transaction status feed: a client sees `offered`, `sealed` and
+/// `executed` for each of its transfers, through the replay for the
+/// ones sent before it subscribed and live for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s17_tx_status_feed_shows_every_stage() {
+    let stack = LocalStack::launch(StackConfig {
+        notifier: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = target(&stack);
+    let ws_url = stack.notifier_ws_url().expect("the stack runs a notifier");
+    if let Err(e) = tx_status::run(&t, ws_url, tx_status::Params::default()).await {
+        stack.dump_tails();
+        panic!("S17: {e:#}");
+    }
+}
