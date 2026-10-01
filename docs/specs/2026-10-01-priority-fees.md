@@ -47,19 +47,27 @@ Two different things, kept apart everywhere in this spec:
 - the priority fee, the tip: what the sender bids for its place, above the base fee;
   `max_priority_fee_per_gas` on a type-2 transaction.
 
-The ordering key is the tip and only the tip. The base fee is the same for every
-transaction of a block, so it says nothing about order; a high `max_fee_per_gas` with a
-zero tip is a transaction that can afford any base fee and bids nothing.
+The ordering key is the tip and only the tip, as an amount in wei, not a rate per gas: the
+sealer ranks what a sender pays for its place, and a transaction that uses ten times the
+gas of another at the same rate pays ten times the tip for the same place in the order.
+The base fee is the same for every transaction of a block, so it says nothing about order;
+a high `max_fee_per_gas` with a zero tip is a transaction that can afford any base fee and
+bids nothing.
 
-The sequencer decodes, beside the nonce, the fee fields of the transaction. For a type-2
-transaction the bid is `max_priority_fee_per_gas`, a pure function of the bytes, so both
-racing replicas send the same offer. A legacy transaction carries one price and no tip;
-Ethereum reads it as `max_fee = max_priority = gas_price`, so its tip at a block is
-`gas_price - base_fee`. The sequencer computes that from the base fee of the latest block
-it has seen, clamped at zero; two replicas may differ by one block's step (one eighth), and
-the sealer's first-seen dedup settles which offer defines the key. The sequencer puts the
-bid in the offer, `RefOffer { …, tip: u128 }`, and in the sealer's guard header as
-`[tip:16]`. What the sender pays is settled at execution (3.4), not here.
+A standard transaction carries the tip as a rate, so the amount is derived from it:
+
+    tip = max_priority_fee_per_gas * gas_limit
+
+the whole tip the sender committed to when it signed. It is charged in full at inclusion
+(3.4), whether or not the gas is used: a bid is what the sender pays for its place, and the
+place is given before the gas is known. The amount is a pure function of the transaction
+bytes, so both racing replicas send the same offer. A legacy transaction carries one price
+and no tip; Ethereum reads it as `max_fee = max_priority = gas_price`, so its rate above
+the base fee is `gas_price - base_fee`, and its bid is that rate times `gas_limit`. The
+sequencer computes it from the base fee of the latest block it has seen, clamped at zero;
+two replicas may differ by one block's step (one eighth), and the sealer's first-seen
+dedup settles which offer defines the key. The sequencer puts the bid in the offer,
+`RefOffer { …, tip: u128 }`, and in the sealer's guard header as `[tip:16]`.
 
 With the setting off, the sequencer writes zero. A zero fee everywhere makes the sealer's
 order equal to arrival order, so the sealer's code path is one, and the setting changes
@@ -83,7 +91,9 @@ be paid:
    at its block becomes a skip receipt at execution, as any unpayable transaction does
    today.
 3. `balance >= gas_limit * max_fee_per_gas + value`: the worst case the sender can be
-   charged, base fee and tip together, is the cap times the gas limit. The ingress makes
+   charged, base fee on every gas unit and the tip in full, is the cap times the gas
+   limit, since the tip rate is under the cap and the tip amount is that rate times the
+   gas limit. The ingress makes
    this check against a fresh balance; the sequencer repeats it with its own account view
    (the live map and Redis). A stale balance passes; the executor is the truth.
 
@@ -142,16 +152,20 @@ computation is a pure function of the chain, so every executor and the validator
 and the block header carries it. The sealer needs no gas knowledge: it orders by the tip,
 and the executor settles the price.
 
-At execution the sender pays `gas_used * (base_fee + effective_tip)` with
-`effective_tip = min(max_priority, max_fee - base_fee)` for type 2 and
-`gas_price - base_fee` for legacy, as on Ethereum: the base fee is burned, the tip goes to
-the block's beneficiary, a chain value (the operator's fee account) in the genesis beside
-the chain id. The receipt's `effective_gas_price` reports what was charged, which fixes the
-present inconsistency where it reports `max_fee_per_gas` at a zero base fee.
+At execution the sender pays two amounts: the base fee on the gas used,
+`gas_used * base_fee`, burned as on Ethereum; and the tip in full,
+`effective_tip_rate * gas_limit` with `effective_tip_rate = min(max_priority,
+max_fee - base_fee)` for type 2 and `gas_price - base_fee` for legacy, to the block's
+beneficiary, a chain value (the operator's fee account) in the genesis beside the chain id.
+The tip is not refunded for unused gas: it is the price of the place, and the place was
+given at the bid. This is the one departure from Ethereum's settlement, where the tip is
+paid on gas used. The receipt reports both: `effective_gas_price` as the base fee charged
+per gas, and a `priority_fee_paid` amount.
 
-The ordering key (the tip bid) and the settlement (the gas price charged) are two
-different numbers on purpose: the bid is knowable before the block, the charge only in it,
-and a window of 5 ms never spans a base fee change the sender could not have priced.
+The ordering key (the tip amount) and the base fee charge are two different numbers on
+purpose: the bid is knowable before the block and paid as bid, the base fee charge only in
+the block, and a window of 5 ms never spans a base fee change the sender could not have
+priced.
 
 ### 3.5 The setting
 
@@ -194,3 +208,10 @@ all times by design, so a transaction never waits on an operator's price.
    Ethereum; the ingress has the headers and the receipts for it.
 3. The base fee at genesis and the gas target are chain values; the first values for
    staging come with the chain upgrade that activates the schedule.
+
+## 6. Decided
+
+- The tip is an amount, `max_priority_fee_per_gas * gas_limit`, not a rate: the sealer
+  orders by what a sender pays for its place, and the sender pays it in full at inclusion.
+  A dedicated absolute field would need a transaction type wallets cannot sign; the
+  derived amount keeps standard transactions and gives the same order.
