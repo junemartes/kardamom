@@ -216,6 +216,7 @@ job "batcher" {
             "--settlement", "${var.settlement_address}",
             "--da-proxy", var.da_proxy,
             "--cursor-file", "/opt/kardamom/batcher/cursor.json",
+            "--spool-dir", "/opt/kardamom/batcher/spool",
             # Group a few blocks per batch. The sealer emits about 1
             # boundary a second even when idle, and dense DA coverage
             # means empty blocks get posted too. Grouping keeps idle L1

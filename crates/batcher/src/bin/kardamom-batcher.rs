@@ -142,6 +142,11 @@ struct Cli {
     /// confirmed L1 post. Live mode only; required there.
     #[arg(long, env = "KARDAMOM_BATCHER_CURSOR")]
     cursor_file: Option<PathBuf>,
+    /// The spool of consumed, unposted blocks. A restart continues its
+    /// pending group from it and asks the sealers only for what follows.
+    /// Defaults to `spool` beside the cursor file.
+    #[arg(long, env = "KARDAMOM_BATCHER_SPOOL")]
+    spool_dir: Option<PathBuf>,
     /// The inbox indexer's API (`http://host:port`). A batcher without a
     /// cursor file then resumes just past the last posted batch, from the
     /// batch's own blobs, instead of replaying from genesis; and no start
@@ -348,6 +353,10 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         settlement,
         da_proxy: da_proxy.clone(),
         config,
+        spool_dir: cli
+            .spool_dir
+            .clone()
+            .unwrap_or_else(|| cursor_file.with_file_name("spool")),
         cursor_file,
         log_config: cli.log_config.clone(),
         aeron_dir: cli.aeron_dir.clone(),
