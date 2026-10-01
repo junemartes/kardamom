@@ -55,8 +55,8 @@ the data, not the algorithm.
 With the setting on, the sequencer's nonce state machine gains two checks before a
 transaction is parked or released:
 
-- `priority_fee >= min_priority_fee` (a config value, in wei; zero disables the floor);
-  below it the transaction is rejected on `tx_errors` with a new kind `FeeTooLow`.
+- `priority_fee >= min_priority_fee_per_gas`, the chain's floor (3.6); below it the
+  transaction is rejected on `tx_errors` with a new kind `FeeTooLow`.
 - the sender's balance covers `gas_limit * (base_fee + priority_fee) + value`. The ingress
   checks `gas_limit * max_fee + value` today against a fresh balance; the sequencer has the
   same account view through the live map and Redis, and checks the effective price. A
@@ -119,7 +119,7 @@ receipt reports what was charged.
 
 | Where | Name | Effect |
 |---|---|---|
-| sequencer `sequencer.toml` | `[fees] priority = true/false`, `min_priority_fee_wei` | the fee in the offer, the floor and the balance check |
+| sequencer `sequencer.toml` | `[fees] priority = true/false` | the fee in the offer, the floor (from the chain config) and the balance check |
 | sealer `-Dkardamom.cluster.orderingWindow` | `20` or `0` | the window hold; must match on every member |
 | executor | `--beneficiary <address>` | where the priority fee goes |
 
@@ -127,6 +127,15 @@ The deploy passes all three from one value (`PRIORITY_FEES=on`), so they cannot 
 Turning the setting off is a rolling deploy with the fee at zero and the window at zero;
 nothing in the chain's history depends on the setting, because the order is in the log
 either way.
+
+### 3.6 The floor is a protocol value
+
+`min_priority_fee_per_gas` is a field of the chain's genesis, beside the chain id and the
+block gas limit, in wei per gas. The sequencer reads it from the chain config it already
+loads, never from an operator setting, so two sequencers cannot disagree and the validator
+can check that every sealed transaction cleared the floor. A change is a chain upgrade: a
+new value with an activation block in the chain config, applied by every service at that
+block. Zero is a valid value and means no floor.
 
 ## 4. Order and estimate
 
@@ -146,5 +155,5 @@ either way.
    the same log position. Confirm the minimum timer resolution on the pinned version.
 2. Whether `Offered` (the status feed) should carry the fee, so a trader sees what it paid
    for its place.
-3. A floor in wei is a chain parameter that changes with the token's price; an operator
-   knob or a governed value.
+3. The floor's unit is wei per gas at a zero base fee; when a base fee exists, the floor
+   applies to the priority part only.

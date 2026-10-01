@@ -137,12 +137,15 @@ monotonic per transaction; a client treats a missing earlier stage as implied.
 | 4 | webhooks with the outbox and retries | a case with a subscriber that is down for the ring's length and gets every event once |
 | 5 | dashboards: events per stage, dropped events, delivery lag, outbox depth | the monitoring job |
 
-## 5. Open questions
+## 5. Decided
 
-1. Whether `Sealed` should carry the block's timestamp: the boundary follows the records,
-   so the notifier would hold `Sealed` events until the boundary, which adds up to one tick
-   (2 s) of delay. First version: no timestamp, no delay.
-2. Authentication of WebSocket subscriptions by sender: today the receipt feed filters by
+- `Sealed` carries the block number and no timestamp. The sealer sets the block's
+  timestamp when it closes the block, up to one tick after the record, and holding the
+  event for it would cost that tick. The time a client wants is on the receipt.
+
+## 6. Open questions
+
+1. Authentication of WebSocket subscriptions by sender: today the receipt feed filters by
    sender without proof of ownership. The status feed inherits that; a signed challenge is
    a later step for both feeds.
-3. The ring's size and the outbox retention as deploy values.
+2. The ring's size and the outbox retention as deploy values.
