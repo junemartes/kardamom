@@ -3,8 +3,12 @@
 //! A client subscribes to the notifier's status feed for its sender,
 //! sends transfers, and sees the three stages of each one, `offered`,
 //! `sealed` and `executed`, within the receipt's latency. The replay
-//! covers a client that subscribes after the submit: the second half of
+//! covers a client that subscribes after the submit: the first half of
 //! the transfers goes out before the subscription opens.
+//!
+//! Two publishers feed the stream (the sequencer and the ingress's
+//! egress tap) and the receipt rides a third, so arrival order across
+//! stages is not fixed. A client orders by stage; this check does too.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -72,10 +76,11 @@ pub async fn run(t: &Target, ws_url: &str, p: Params) -> Result<()> {
     // that.
     let stages = collect_stages(&mut sub, &hashes, t.pending_receipt_timeout).await?;
     for hash in &hashes {
-        let seen = stages.get(hash).cloned().unwrap_or_default();
+        let mut seen = stages.get(hash).cloned().unwrap_or_default();
+        seen.sort_by_key(|s| STAGES.iter().position(|w| w == s));
         anyhow::ensure!(
             seen.iter().map(String::as_str).eq(STAGES),
-            "{hash:#x}: stages {seen:?}, expected {STAGES:?}"
+            "{hash:#x}: stages {seen:?}, expected {STAGES:?} once each"
         );
     }
     Ok(())
@@ -104,7 +109,7 @@ async fn send_transfers(
     Ok(hashes)
 }
 
-/// Drain the feed until every hash has its three stages, or `patience`
+/// Drain the feed until every hash has three stages, or `patience`
 /// passes. Returns the stage words per hash, in arrival order.
 async fn collect_stages(
     sub: &mut Subscription<serde_json::Value>,

@@ -695,11 +695,17 @@ pub fn spawn_ingress_at(
     let cfg_path = spec.write_cluster_config("ingress", "")?;
     let metrics_port = free_port().port();
     let rpc_port = fixed_rpc_port.unwrap_or_else(|| free_port().port());
+    // The cluster egress port of the `Sealed` status tap.
+    let egress_port = free_udp_port().port();
     let mut cmd = Command::new(bin("kardamom-ingress")?);
     cmd.arg("--config")
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
+        .args([
+            "--cluster-egress-endpoint",
+            &format!("127.0.0.1:{egress_port}"),
+        ])
         .args(["--jsonrpc-bind", &format!("127.0.0.1:{rpc_port}")])
         .args(["--shards", &spec.shards.get().to_string()]);
     if let Some(map) = shard_map {

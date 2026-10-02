@@ -473,8 +473,14 @@ impl IngressService {
         Ok(running)
     }
 
-    /// Builds the config, opens Aeron, starts the cluster egress tap, and
-    /// starts the proxy's listeners. Returns a [`RunningIngress`] that
+    /// Whether the CLI or the config file names a cluster egress channel.
+    fn has_egress_channel(&self) -> bool {
+        self.args.cluster_egress_endpoint.is_some()
+            || !self.file_cfg.cluster.to_live().egress_channel.is_empty()
+    }
+
+    /// Builds the config, opens Aeron, starts the cluster egress tap when
+    /// an egress channel is configured, and starts the proxy's listeners. Returns a [`RunningIngress`] that
     /// owns everything needed to shut back down.
     async fn run(self) -> Result<RunningIngress> {
         let cfg = self.build_config()?;
@@ -493,17 +499,24 @@ impl IngressService {
         );
 
         let mut opened = self.open_aeron_side(&cfg.live_accounts).await?;
-        // The egress tap runs under every ack policy: it is the `Sealed`
-        // publisher of the status stream, and under a quorum policy also
-        // the source of the durable watermark.
-        let members = opened.plane.cluster_ingress_endpoints().await?;
-        let status = opened
-            .plane
-            .publisher::<TxStatusPublisherHandle>(&opened.rt)
-            .await
-            .context("open TxStatusPublisherHandle")?;
-        let cluster_watermark =
-            self.spawn_cluster_watermark(&opened.subscription, members, status)?;
+        // The egress tap is the `Sealed` publisher of the status stream,
+        // and under a quorum policy also the source of the durable
+        // watermark. It runs whenever an egress channel is configured; a
+        // quorum policy without one fails here, as it must.
+        let cluster_watermark = if cfg.ack_policy.requires_quorum() || self.has_egress_channel() {
+            let members = opened.plane.cluster_ingress_endpoints().await?;
+            let status = opened
+                .plane
+                .publisher::<TxStatusPublisherHandle>(&opened.rt)
+                .await
+                .context("open TxStatusPublisherHandle")?;
+            Some(self.spawn_cluster_watermark(&opened.subscription, members, status)?)
+        } else {
+            tracing::warn!(
+                "kardamom-ingress: no cluster egress channel; tx_status Sealed is not published"
+            );
+            None
+        };
 
         let drain_timeout = cfg.pending_receipt_timeout;
         let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
@@ -549,7 +562,7 @@ struct RunningIngress {
     /// Dropping it is the point.
     _rt: AeronRuntime,
     /// Held only for its `Drop` side effect; never read.
-    _cluster_watermark: watermark::ClusterWatermark,
+    _cluster_watermark: Option<watermark::ClusterWatermark>,
 }
 
 impl RunningIngress {
