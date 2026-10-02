@@ -49,9 +49,9 @@ pub(crate) mod sender;
 pub mod sequencer;
 pub mod shutdown;
 pub(crate) mod state;
-mod tx_decode;
 #[cfg(any(test, feature = "testing"))]
 pub mod testkit;
+mod tx_decode;
 mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};

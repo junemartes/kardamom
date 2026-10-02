@@ -230,15 +230,6 @@ pub mod test_support {
         (block1, block2)
     }
 
-    /// Replay `blocks` directly (no DA round trip) into a fresh,
-    /// throwaway state DB, on [`CHAIN_ID`] — the oracle every
-    /// reconstruction gate compares its recovered root against.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the throwaway state env fails to open, or if replay
-    /// fails — both a test-fixture setup failure, not an assertion this
-    /// helper's callers grade.
     /// The replay chain of a test allocation on [`CHAIN_ID`], with no
     /// fee schedule.
     #[must_use]
@@ -254,6 +245,15 @@ pub mod test_support {
         }
     }
 
+    /// Replay `blocks` directly (no DA round trip) into a fresh,
+    /// throwaway state DB, on [`CHAIN_ID`] — the oracle every
+    /// reconstruction gate compares its recovered root against.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the throwaway state env fails to open, or if replay
+    /// fails — both a test-fixture setup failure, not an assertion this
+    /// helper's callers grade.
     pub fn oracle_replay(
         genesis_accounts: &[AccountChange],
         genesis_code: &[CodeEntry],
@@ -264,7 +264,12 @@ pub mod test_support {
             .durability(Durability::SafeNoSync)
             .open()
             .unwrap();
-        replay_blocks(oracle_env, &test_genesis(genesis_accounts, genesis_code), blocks).unwrap()
+        replay_blocks(
+            oracle_env,
+            &test_genesis(genesis_accounts, genesis_code),
+            blocks,
+        )
+        .unwrap()
     }
 }
 
@@ -303,8 +308,12 @@ mod tests {
         assert_eq!(frames.len(), 2);
 
         let recon_dir = tempfile::tempdir().unwrap();
-        let recovered =
-            reconstruct_state(recon_dir.path(), &test_genesis(&genesis(from), &[]), &frames).unwrap();
+        let recovered = reconstruct_state(
+            recon_dir.path(),
+            &test_genesis(&genesis(from), &[]),
+            &frames,
+        )
+        .unwrap();
 
         // Directly replay the original envelopes (no DA round trip) as the
         // oracle.

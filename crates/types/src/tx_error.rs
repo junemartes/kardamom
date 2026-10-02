@@ -68,7 +68,10 @@ pub enum TxErrorReason {
     /// The fee cap is under the base fee of the latest block the sequencer
     /// has seen, so the transaction cannot be included at that price. The
     /// client signs again with a higher cap.
-    FeeTooLow { max_fee_per_gas: u128, base_fee: u128 },
+    FeeTooLow {
+        max_fee_per_gas: u128,
+        base_fee: u128,
+    },
     /// The sender's balance, as the sequencer sees it, cannot cover the
     /// worst case the transaction can be charged: the fee cap on every
     /// gas unit plus the value.

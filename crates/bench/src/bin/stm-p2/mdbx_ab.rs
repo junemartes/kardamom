@@ -30,8 +30,7 @@ use kardamom_bench::stm::BlockAt;
 
 use super::alloc::{AllocDelta, snapshot as alloc_snapshot};
 use super::common::{
-    NO_SINK,
-    BlockOutputs, EngineOpts, MdbxHandles, RunOpts, StatsExt, Workload, assert_identical,
+    BlockOutputs, EngineOpts, MdbxHandles, NO_SINK, RunOpts, StatsExt, Workload, assert_identical,
     open_mdbx_env, records,
 };
 use super::mdbx_report::{BlockSample, MdbxAbTotals, print_block_detail};

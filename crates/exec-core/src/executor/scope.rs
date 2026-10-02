@@ -257,7 +257,8 @@ impl<S: StateDatabase> Executor<S> {
         // The chain's settlement on top of revm's: the tip in full, the
         // base fee as the receipt's price.
         let gas_used = outcome.result.gas().tx_gas_used();
-        let price = crate::settle::settle(&fees, self.env.fees, gas_used, &mut outcome.state, signer)?;
+        let price =
+            crate::settle::settle(&fees, self.env.fees, gas_used, &mut outcome.state, signer)?;
 
         // Build the write set from revm's per-tx EvmState. Only touched
         // and changed accounts and slots are emitted, which keeps the

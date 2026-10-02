@@ -171,101 +171,112 @@ pub(crate) fn encode_header_value(v: &HeaderValue) -> [u8; 48] {
 /// Returns [`StateError::BadEncoding`] if `bytes` is none of the current
 /// 48-byte row, the pre-fee 24-byte row, and the pre-origin 20-byte row.
 pub(crate) fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    // A 48-byte row is the fee pair after the origin row. Matching each
-    // fixed-size array by value, rather than slicing and `try_into`-ing
-    // sub-ranges, makes every field width a compile-time fact instead of
-    // a runtime check.
+    // Matching each fixed-size array by value, rather than slicing and
+    // `try_into`-ing sub-ranges, makes every field width a compile-time
+    // fact instead of a runtime check. A value of another width is
+    // corruption, not a format version.
     if let Ok(row) = <&[u8; 48]>::try_from(bytes) {
-        let [origin_row @ .., f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, g0, g1, g2, g3, g4, g5, g6, g7] =
-            *row;
-        let header = decode_header_value(&origin_row)?;
-        return Ok(HeaderValue {
-            base_fee: u128::from_be_bytes([
-                f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15,
-            ]),
-            gas_used: u64::from_be_bytes([g0, g1, g2, g3, g4, g5, g6, g7]),
-            ..header
-        });
+        return Ok(decode_fee_row(row));
     }
-    // A 24-byte value is the pre-fee row, a 20-byte value the pre-origin
-    // row. Anything else is corruption.
     if let Ok(row) = <&[u8; 24]>::try_from(bytes) {
-        let &[
-            t0,
-            t1,
-            t2,
-            t3,
-            o0,
-            o1,
-            o2,
-            o3,
-            l0,
-            l1,
-            l2,
-            l3,
-            l4,
-            l5,
-            l6,
-            l7,
-            r0,
-            r1,
-            r2,
-            r3,
-            r4,
-            r5,
-            r6,
-            r7,
-        ] = row;
-        return Ok(HeaderValue {
-            end_tx_idx: BPosition {
-                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
-                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
-            },
-            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
-            l1_origin: u64::from_be_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
-            base_fee: 0,
-            gas_used: 0,
-        });
+        return Ok(decode_origin_row(row));
     }
     if let Ok(row) = <&[u8; 20]>::try_from(bytes) {
-        // The last 4 bytes of the pre-origin row are a reserved field
-        // the old format never used; ignore them, same as the original
-        // decoder did.
-        let &[
-            t0,
-            t1,
-            t2,
-            t3,
-            o0,
-            o1,
-            o2,
-            o3,
-            l0,
-            l1,
-            l2,
-            l3,
-            l4,
-            l5,
-            l6,
-            l7,
-            _reserved @ ..,
-        ] = row;
-        return Ok(HeaderValue {
-            end_tx_idx: BPosition {
-                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
-                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
-            },
-            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
-            l1_origin: 0,
-            base_fee: 0,
-            gas_used: 0,
-        });
+        return Ok(decode_pre_origin_row(row));
     }
     Err(StateError::BadEncoding {
         table: TABLE_HEADERS,
         expected: 48,
         got: bytes.len(),
     })
+}
+
+/// The current row: the origin row, then the base fee and the gas used.
+fn decode_fee_row(row: &[u8; 48]) -> HeaderValue {
+    let [
+        origin_row @ ..,
+        f0,
+        f1,
+        f2,
+        f3,
+        f4,
+        f5,
+        f6,
+        f7,
+        f8,
+        f9,
+        f10,
+        f11,
+        f12,
+        f13,
+        f14,
+        f15,
+        g0,
+        g1,
+        g2,
+        g3,
+        g4,
+        g5,
+        g6,
+        g7,
+    ] = *row;
+    HeaderValue {
+        base_fee: u128::from_be_bytes([
+            f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15,
+        ]),
+        gas_used: u64::from_be_bytes([g0, g1, g2, g3, g4, g5, g6, g7]),
+        ..decode_origin_row(&origin_row)
+    }
+}
+
+/// The pre-fee row: the position and the timestamp, then the origin. The
+/// fee pair is zero, which is what those chains had.
+fn decode_origin_row(row: &[u8; 24]) -> HeaderValue {
+    let [core @ .., r0, r1, r2, r3, r4, r5, r6, r7] = *row;
+    HeaderValue {
+        l1_origin: u64::from_be_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
+        ..decode_core(&core)
+    }
+}
+
+/// The pre-origin row: the position and the timestamp, then 4 reserved
+/// bytes the old format never used. The origin and the fee pair are zero,
+/// which is what those chains had.
+fn decode_pre_origin_row(row: &[u8; 20]) -> HeaderValue {
+    let [core @ .., _reserved0, _reserved1, _reserved2, _reserved3] = *row;
+    decode_core(&core)
+}
+
+/// The fields every row width carries: the position and the timestamp.
+fn decode_core(row: &[u8; 16]) -> HeaderValue {
+    let [
+        t0,
+        t1,
+        t2,
+        t3,
+        o0,
+        o1,
+        o2,
+        o3,
+        l0,
+        l1,
+        l2,
+        l3,
+        l4,
+        l5,
+        l6,
+        l7,
+    ] = *row;
+    HeaderValue {
+        end_tx_idx: BPosition {
+            term_id: i32::from_be_bytes([t0, t1, t2, t3]),
+            term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
+        },
+        l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
+        l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
+    }
 }
 
 // ---------- receipts ----------

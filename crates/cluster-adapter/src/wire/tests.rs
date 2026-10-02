@@ -412,9 +412,7 @@ fn replay_request_roundtrip() {
     assert_eq!(b[0], KIND_REPLAY_REQUEST);
     assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
     // A record ingress message is not a replay request.
-    assert!(
-        decode_replay_request(&encode_ingress_txref(&txref(), GuardHeader::EXEMPT)).is_err()
-    );
+    assert!(decode_replay_request(&encode_ingress_txref(&txref(), GuardHeader::EXEMPT)).is_err());
 }
 
 #[test]

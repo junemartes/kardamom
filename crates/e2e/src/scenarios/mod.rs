@@ -14,6 +14,7 @@ pub mod crash_recovery;
 pub mod da_parity;
 pub mod derivation;
 pub mod divergence;
+pub mod fees;
 pub mod l1_batch;
 pub mod nonce_gap;
 pub mod nonce_unordered;

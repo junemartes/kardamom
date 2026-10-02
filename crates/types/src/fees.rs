@@ -92,9 +92,7 @@ pub struct FeeSchedule {
 /// tips go. [`Self::NONE`] is the no-schedule chain. A scheduled base fee
 /// is never zero (see [`FeeSchedule::base_fee_initial`]), so a zero base
 /// fee is the one sign of no schedule.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Archive, RkyvSerialize, RkyvDeserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Archive, RkyvSerialize, RkyvDeserialize)]
 #[rkyv(derive(Debug))]
 pub struct BlockFees {
     pub base_fee: u128,

@@ -58,9 +58,9 @@ use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
 use crate::error::SequencerError;
+use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::lookup::LookupRequester;
-use crate::fees::FeeGate;
 use crate::metrics;
 use crate::outbound::{RefOffer, TxErrorPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;

@@ -168,8 +168,12 @@ fn assert_recovered_matches_oracle(
             txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
     ];
-    let oracle =
-        replay_blocks(oracle_env, &test_genesis(&genesis(from), &[]), oracle_blocks).unwrap();
+    let oracle = replay_blocks(
+        oracle_env,
+        &test_genesis(&genesis(from), &[]),
+        oracle_blocks,
+    )
+    .unwrap();
 
     assert_eq!(recovered.head_block, 2);
     assert_eq!(recovered.txs_applied, 3);

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use kardamom_types::{BlockFees, BlockBoundary, SnapshotSource};
+use kardamom_types::{BlockBoundary, BlockFees, SnapshotSource};
 
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;

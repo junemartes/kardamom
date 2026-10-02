@@ -291,8 +291,12 @@ impl<S: StateDatabase + Sync> BlockSession<'_, '_, S> {
             .decode_ns
             .saturating_add(nanos(t_decode.elapsed()));
         let t_predict = std::time::Instant::now();
-        let (domains, domain_hashes, primary, cold) =
-            Prepared::predict(&envelope, decoded.as_ref(), self.stats, self.ctx.env.fees.beneficiary);
+        let (domains, domain_hashes, primary, cold) = Prepared::predict(
+            &envelope,
+            decoded.as_ref(),
+            self.stats,
+            self.ctx.env.fees.beneficiary,
+        );
         self.feed.predict_ns = self
             .feed
             .predict_ns

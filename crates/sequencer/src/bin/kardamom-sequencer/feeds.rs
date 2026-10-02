@@ -32,7 +32,8 @@ use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
-    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
+    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;

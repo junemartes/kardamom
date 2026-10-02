@@ -232,13 +232,8 @@ fn build_tx_result<S: StateDatabase>(
     let gas_used = outcome.result.gas().tx_gas_used();
     // The chain's settlement on top of revm's, exactly as the sequential
     // path applies it: the tip in full, the base fee as the price.
-    let price = kardamom_exec_core::settle::settle(
-        &fees,
-        env.fees,
-        gas_used,
-        &mut outcome.state,
-        signer,
-    )?;
+    let price =
+        kardamom_exec_core::settle::settle(&fees, env.fees, gas_used, &mut outcome.state, signer)?;
     let sink = env.fees.beneficiary;
     // Build wire logs straight from the borrowed result: no
     // intermediate `logs.clone()` (topic Vecs and data Bytes per log).
@@ -264,7 +259,8 @@ fn build_tx_result<S: StateDatabase>(
     mv.publish_write_set(job.local_idx, &ws, sink);
     let pub_ns = nanos(t_pub.elapsed());
     metrics.publish_ns.fetch_add(pub_ns, Ordering::Relaxed);
-    let sink_fee_delta = sink_fee_delta(&ws, sink, sink_start_balance, env.block_number, job.tx_idx)?;
+    let sink_fee_delta =
+        sink_fee_delta(&ws, sink, sink_start_balance, env.block_number, job.tx_idx)?;
     let reads = {
         // Take this transaction's read log back out of the worker's
         // view. The replacement comes from the recycle pool (cleared,

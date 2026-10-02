@@ -14,9 +14,8 @@ use kardamom_types::{AccountChange, TxEnvelope};
 use kardamom_bench::stm::BlockAt;
 
 use super::common::{
-    NO_SINK,
-    BlockOutputs, BlockRecs, EngineOpts, FeedPayload, FlowRecs, SettleJob, StatsExt, Workload,
-    assert_identical, open_mdbx_env, records,
+    BlockOutputs, BlockRecs, EngineOpts, FeedPayload, FlowRecs, NO_SINK, SettleJob, StatsExt,
+    Workload, assert_identical, open_mdbx_env, records,
 };
 use super::drive::{DriveParams, DriveState, MvChannels};
 

@@ -34,7 +34,6 @@ use kardamom_footprint::grade::grade_block;
 use kardamom_footprint::{Cell, TxObs, envelope_view};
 use kardamom_types::TxEnvelope;
 
-
 /// Pair-grading cap per block. Grading does O(n²) set intersections. CI-scale
 /// blocks have at most ~600 txs; saturated dev-host blocks have ~2,700. This
 /// cap stops a burst block from wedging the shadow thread for seconds.

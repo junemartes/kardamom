@@ -37,8 +37,7 @@ use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::outbound::RefOffer;
 use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::testkit::{
-    EnvelopeSpec, drive_sequencer_to_idle, drive_to_idle, envelope_with, one_partition_cfg,
-    signer,
+    EnvelopeSpec, drive_sequencer_to_idle, drive_to_idle, envelope_with, one_partition_cfg, signer,
 };
 use kardamom_types::BlockBoundary;
 
@@ -56,7 +55,7 @@ fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxE
         correlation_id,
         EnvelopeSpec {
             real_hash: true,
-            gas_price: 1_000_000_000 + correlation_id as u128 * 1_000_000,
+            gas_price: 1_000_000_000 + u128::from(correlation_id) * 1_000_000,
             ..Default::default()
         },
     )

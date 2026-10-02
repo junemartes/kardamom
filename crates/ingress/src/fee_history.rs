@@ -173,8 +173,12 @@ impl FeeHistory {
         percentiles: &[f64],
     ) -> Option<RpcFeeHistory> {
         let blocks = self.blocks.lock_ignore_poison();
-        let end = blocks.iter().rposition(|b| b.number == newest && b.closed)?;
-        let first = end.saturating_add(1).saturating_sub(usize::try_from(count).ok()?);
+        let end = blocks
+            .iter()
+            .rposition(|b| b.number == newest && b.closed)?;
+        let first = end
+            .saturating_add(1)
+            .saturating_sub(usize::try_from(count).ok()?);
         let window: Vec<&FeeBlock> = blocks.range(first..=end).collect();
         let newest_block = window.last()?;
         let mut base_fee_per_gas: Vec<u128> = window.iter().map(|b| b.base_fee).collect();

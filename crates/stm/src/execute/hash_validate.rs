@@ -431,7 +431,8 @@ fn lanes_hash_and_validate<S: StateDatabase>(
                 .expect("tail lane panicked");
         });
         let t_fold = std::time::Instant::now();
-        let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle, ctx.env.fees.beneficiary));
+        let delta_arc =
+            std::sync::Arc::new(fold_inline(tx_results, recycle, ctx.env.fees.beneficiary));
         fold_ns.fetch_add(nanos(t_fold.elapsed()), Ordering::Relaxed);
         if let Some(d) = &delta_out
             && d.speculative

@@ -14,7 +14,9 @@ use kardamom_stm::execute::execute_block_sequential;
 use kardamom_types::{BPosition, TxEnvelope};
 
 use super::args::Args;
-use super::common::{NO_SINK, BlockOutputs, EngineOpts, StatsExt, Workload, assert_identical, records};
+use super::common::{
+    BlockOutputs, EngineOpts, NO_SINK, StatsExt, Workload, assert_identical, records,
+};
 
 /// Pass 0 is the timed sequential baseline, plus caches. For each
 /// block: the pre-block delta (the base), the canonical outputs, and a

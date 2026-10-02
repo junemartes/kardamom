@@ -102,19 +102,16 @@ impl TipSettlement {
         debit.info.balance = debit.info.balance.checked_sub(self.extra).ok_or_else(|| {
             ExecutorError::State(alloc::format!(
                 "tip settlement: caller {caller} holds {} under the {} tip on unused gas",
-                debit.info.balance, self.extra
+                debit.info.balance,
+                self.extra
             ))
         })?;
         let credit = Self::account(state, beneficiary)?;
-        credit.info.balance = credit
-            .info
-            .balance
-            .checked_add(self.extra)
-            .ok_or_else(|| {
-                ExecutorError::State(alloc::format!(
-                    "tip settlement: beneficiary {beneficiary} balance overflows"
-                ))
-            })?;
+        credit.info.balance = credit.info.balance.checked_add(self.extra).ok_or_else(|| {
+            ExecutorError::State(alloc::format!(
+                "tip settlement: beneficiary {beneficiary} balance overflows"
+            ))
+        })?;
         Ok(())
     }
 
