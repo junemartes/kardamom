@@ -69,6 +69,8 @@ workloads_batcher_blocks_per_batch: "{{ lookup('env', 'BATCHER_BLOCKS_PER_BATCH'
 workloads_batcher_flush_ms: "{{ lookup('env', 'BATCHER_FLUSH_MS') }}"
 workloads_batcher_idle_flush_ms: "{{ lookup('env', 'BATCHER_IDLE_FLUSH_MS') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
+# The settlement's deployment block on L1: where a BatchPosted scan starts.
+workloads_settlement_deploy_block: "{{ lookup('env', 'SETTLEMENT_DEPLOY_BLOCK') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
 workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
 workloads_l1_owner_key: >-

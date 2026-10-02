@@ -70,6 +70,14 @@ variable "executor_count" {
 # The inbox indexer's API. With it, a batcher whose node is fresh resumes
 # just past the last posted batch (public #455). Empty: no indexer, the
 # job's replay-from-genesis behavior.
+# The settlement's deployment block: where a BatchPosted scan starts. A
+# public endpoint caps a log query's range; 0 suits anvil.
+variable "settlement_deploy_block" {
+  type        = string
+  description = "The settlement's deployment block on L1. Empty: 0."
+  default     = ""
+}
+
 variable "indexer_url" {
   type        = string
   description = "The inbox indexer's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
@@ -231,6 +239,7 @@ job "batcher" {
           ],
           var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
           var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
+          var.settlement_deploy_block != "" ? ["--settlement-deploy-block", var.settlement_deploy_block] : [],
         )
       }
 
