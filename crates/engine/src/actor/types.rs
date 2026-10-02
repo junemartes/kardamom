@@ -2,6 +2,7 @@
 //! the run configuration, the BAL and whole-block-execution hand-off shapes,
 //! and the internal exec-to-commit envelope.
 
+use kardamom_types::{BlockFees, FeeSchedule};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use kardamom_types::BlockBoundary;
@@ -43,6 +44,11 @@ pub struct ResumePoint {
     pub block: u64,
     pub record_count: u64,
     pub l2_timestamp: u64,
+    /// The base fee of boundary `block`, from the committed header row.
+    /// With `gas_used` it gives the next block's base fee.
+    pub base_fee: u128,
+    /// The gas boundary `block` used, from the committed header row.
+    pub gas_used: u64,
 }
 
 impl ResumePoint {
@@ -53,7 +59,24 @@ impl ResumePoint {
         block: 0,
         record_count: 0,
         l2_timestamp: 0,
+        base_fee: 0,
+        gas_used: 0,
     };
+
+    /// The fees of the block this cursor opens: the schedule's first
+    /// values at genesis, else the next step after the committed block.
+    #[must_use]
+    pub fn block_fees(&self, schedule: Option<FeeSchedule>) -> BlockFees {
+        let genesis = BlockFees::genesis(schedule);
+        if !self.is_resume() {
+            return genesis;
+        }
+        BlockFees {
+            base_fee: self.base_fee,
+            beneficiary: genesis.beneficiary,
+        }
+        .next(self.gas_used)
+    }
 
     /// True when this cursor points mid-chain (a crash-recovery restart)
     /// rather than at genesis.
@@ -79,6 +102,8 @@ impl From<&kardamom_state::RecoveryPoint> for ResumePoint {
             block: recovery.last_committed_block,
             record_count: recovery.last_fsynced_reader_position.as_index(),
             l2_timestamp: recovery.last_committed_l2_timestamp,
+            base_fee: recovery.last_committed_base_fee,
+            gas_used: recovery.last_committed_gas_used,
         }
     }
 }
@@ -113,6 +138,9 @@ pub struct ExecutorConfig {
     /// Deposit records are out of scope. Their identity (`source_hash`)
     /// stays a trusted input until the witness is anchored on L1.
     pub verify_record_identity: bool,
+    /// The chain's fee schedule, from the genesis `[fees]` section. `None`
+    /// runs no schedule: a zero base fee, and every tip burns.
+    pub fees: Option<FeeSchedule>,
 }
 
 /// Default [`ExecutorConfig::chain_id`]: chain id 1.
@@ -128,6 +156,7 @@ impl Default for ExecutorConfig {
             receipt_queue_depth: DEFAULT_RECEIPT_QUEUE_DEPTH,
             reader: ReaderConfig::default(),
             verify_record_identity: false,
+            fees: None,
         }
     }
 }

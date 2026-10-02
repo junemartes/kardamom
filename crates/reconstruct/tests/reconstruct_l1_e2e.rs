@@ -26,7 +26,7 @@ use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_engine::{ReplayBlock, replay_blocks};
 use kardamom_reconstruct::reconstruct_state;
-use kardamom_reconstruct::test_support::{CHAIN_ID as L2_CHAIN_ID, genesis, two_transfer_blocks};
+use kardamom_reconstruct::test_support::{genesis, test_genesis, two_transfer_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
@@ -145,7 +145,7 @@ fn assert_recovered_matches_oracle(
 ) {
     let recon_dir = tempfile::tempdir().unwrap();
     let recovered =
-        reconstruct_state(recon_dir.path(), L2_CHAIN_ID, &genesis(from), &[], frames).unwrap();
+        reconstruct_state(recon_dir.path(), &test_genesis(&genesis(from), &[]), frames).unwrap();
 
     let oracle_dir = tempfile::tempdir().unwrap();
     let oracle_env = StateEnvBuilder::new(oracle_dir.path())
@@ -169,7 +169,7 @@ fn assert_recovered_matches_oracle(
         },
     ];
     let oracle =
-        replay_blocks(oracle_env, L2_CHAIN_ID, &genesis(from), &[], oracle_blocks).unwrap();
+        replay_blocks(oracle_env, &test_genesis(&genesis(from), &[]), oracle_blocks).unwrap();
 
     assert_eq!(recovered.head_block, 2);
     assert_eq!(recovered.txs_applied, 3);

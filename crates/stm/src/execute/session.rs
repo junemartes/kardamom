@@ -4,7 +4,6 @@ use super::handle::PoolHandle;
 use super::metrics::{FeedTimings, StmOutcome};
 use super::prepare::{Prepared, domain_hash};
 use super::view::BlockInput;
-use crate::FEE_SINK;
 use crate::mv::MvCache;
 use alloy_primitives::U256;
 use kardamom_exec_core::delta::PendingDelta;
@@ -109,7 +108,7 @@ impl<S: StateDatabase> LayerBinder<S> {
                     mv_layers: &[],
                 };
                 let sink_start = probe
-                    .basic_ref(FEE_SINK)
+                    .basic_ref(ctx.env.fees.beneficiary)
                     .map_err(|e| ExecutorError::State(format!("fee-sink read: {e}")))?;
                 (Vec::new(), layers, sink_start)
             }
@@ -293,7 +292,7 @@ impl<S: StateDatabase + Sync> BlockSession<'_, '_, S> {
             .saturating_add(nanos(t_decode.elapsed()));
         let t_predict = std::time::Instant::now();
         let (domains, domain_hashes, primary, cold) =
-            Prepared::predict(&envelope, decoded.as_ref(), self.stats);
+            Prepared::predict(&envelope, decoded.as_ref(), self.stats, self.ctx.env.fees.beneficiary);
         self.feed.predict_ns = self
             .feed
             .predict_ns

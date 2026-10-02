@@ -271,12 +271,21 @@ impl<W: ExecPorts> ExecState<W> {
         // tx_receipts is slim; it carries no commitment. `l1_origin` passes
         // through unchanged from the sealer's marker. It identifies the L1
         // epoch this block belongs to. This is what lets a reconstructor
-        // place the epoch's deposits.
+        // place the epoch's deposits. The block's base fee and gas used
+        // ride along: the next block's base fee follows from them, on
+        // every role that reads the boundary.
+        let gas_used = self
+            .block
+            .receipts
+            .last()
+            .map_or(0, |r| r.cumulative_gas_used);
         let boundary = BlockBoundary {
             block_number,
             end_tx_idx,
             l2_timestamp,
             l1_origin,
+            base_fee: self.cursor.fees.base_fee,
+            gas_used,
         };
 
         // Drain the delta. Swap it out so the writer owns it, but keep a
@@ -323,6 +332,7 @@ impl<W: ExecPorts> ExecState<W> {
         // sealer. In v0 the sealer is single-leader, so this branch is
         // purely defensive.
         self.cursor.l2_ts = l2_timestamp;
+        self.cursor.fees = self.cursor.fees.next(gas_used);
         Ok(Flow::Continue)
     }
 }

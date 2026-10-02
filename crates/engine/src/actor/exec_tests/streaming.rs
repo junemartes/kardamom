@@ -63,6 +63,8 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         end_tx_idx: _,
         l1_origin: _,
         l2_timestamp: _,
+        base_fee: _,
+        gas_used: _,
     } = boundary;
 }
 

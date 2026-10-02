@@ -147,8 +147,8 @@ async fn main() -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&cli.chain).context("read genesis TOML")?;
     let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
     genesis.validate().context("validate genesis")?;
-    let chain_id = genesis.chain_id;
     let (accounts, code) = genesis.to_alloc();
+    let replay_genesis = kardamom_engine::ReplayGenesis::of(&genesis, &accounts, &code);
 
     let provider = ProviderBuilder::new()
         .connect(&cli.l1_rpc)
@@ -188,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
         state_dir: &cli.state_dir,
         durability,
     }
-    .run(chain_id, &accounts, &code, &blocks)
+    .run(&replay_genesis, &blocks)
     .context("re-execute reconstructed blocks")?;
 
     info!(

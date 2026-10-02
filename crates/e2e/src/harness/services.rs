@@ -110,6 +110,10 @@ pub struct ServiceSpec<'a> {
     /// The active shard count (M). The sequencers and the ingress take it.
     /// The consumers open the fixed lane plane and take no count.
     pub shards: std::num::NonZeroU32,
+    /// `--priority-fees` on every sequencer. The genesis the spec names
+    /// carries the matching fee schedule, and the sealer the matching
+    /// window: one value, as in the deploy.
+    pub priority_fees: bool,
     /// The transaction lifetime. The sequencers take it as `--tx-ttl-ms`.
     /// The ingress takes the same value as `--pending-receipt-timeout-ms`
     /// (see [`IngressOptions`]). One value drives both, as in the deploy.
@@ -414,7 +418,8 @@ pub fn spawn_sequencer_with(
             &format!("127.0.0.1:{egress_port}"),
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
-        .args(["--host-id", &format!("e2e-seq-{index}")]);
+        .args(["--host-id", &format!("e2e-seq-{index}")])
+        .args(["--priority-fees", &spec.priority_fees.to_string()]);
     with_log_config(&mut cmd, spec);
     common_service_env(&mut cmd);
     SpawnPlan {

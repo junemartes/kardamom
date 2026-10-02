@@ -613,6 +613,8 @@ mod tests {
             end_tx_idx: BPosition::from_index(receipt.tx_idx.as_index() + 1),
             l2_timestamp: 1_700_000_001,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         };
         handle
             .delta_tx

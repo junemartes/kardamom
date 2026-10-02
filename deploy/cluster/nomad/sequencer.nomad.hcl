@@ -29,6 +29,18 @@ variable "executor_query_port" {
   type    = number
   default = 9024
 }
+# Priority fees, "on" or "off" (`[fees] priority`, through KARDAMOM_PRIORITY_FEES). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
@@ -156,6 +168,7 @@ job "sequencer" {
           env {
             KARDAMOM_METRICS_ADDR = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-${group.key}"
+            KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
           }
 
           template {

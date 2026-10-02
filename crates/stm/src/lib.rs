@@ -126,7 +126,3 @@ pub use kardamom_exec_core::executor::DecodedTx;
 pub mod mv;
 pub(crate) mod schedule;
 
-/// The fee sink the accumulator marks (mirrors
-/// `kardamom_exec_core::block_env`: beneficiary = address(0), basefee = 0 —
-/// the documented V0 burn).
-pub const FEE_SINK: alloy_primitives::Address = alloy_primitives::Address::ZERO;

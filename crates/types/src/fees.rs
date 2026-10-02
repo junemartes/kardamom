@@ -17,8 +17,13 @@
 //! The executor charges that amount in full at inclusion, whether or not
 //! the gas is used.
 
+use core::num::NonZeroU128;
+
 use alloy_primitives::{Address, U256};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::Deserialize;
+
+use crate::wire;
 
 use crate::limits::BLOCK_GAS_LIMIT;
 
@@ -75,17 +80,25 @@ impl BaseFeeSchedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeeSchedule {
-    /// The base fee of the first block, in wei per gas.
-    pub base_fee_initial: u128,
+    /// The base fee of the first block, in wei per gas. Never zero: the
+    /// schedule only lowers a base fee by one eighth, so a base fee of
+    /// one wei is its floor, and a zero base fee means no schedule.
+    pub base_fee_initial: NonZeroU128,
     /// The account that collects every tip.
     pub beneficiary: Address,
 }
 
 /// The fee values one block executes under: its base fee, and where its
-/// tips go. [`Self::NONE`] is the no-schedule chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// tips go. [`Self::NONE`] is the no-schedule chain. A scheduled base fee
+/// is never zero (see [`FeeSchedule::base_fee_initial`]), so a zero base
+/// fee is the one sign of no schedule.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Archive, RkyvSerialize, RkyvDeserialize,
+)]
+#[rkyv(derive(Debug))]
 pub struct BlockFees {
     pub base_fee: u128,
+    #[rkyv(with = wire::AddressBytes)]
     pub beneficiary: Address,
 }
 
@@ -100,7 +113,7 @@ impl BlockFees {
     #[must_use]
     pub fn genesis(schedule: Option<FeeSchedule>) -> Self {
         schedule.map_or(Self::NONE, |s| Self {
-            base_fee: s.base_fee_initial,
+            base_fee: s.base_fee_initial.get(),
             beneficiary: s.beneficiary,
         })
     }
@@ -110,7 +123,7 @@ impl BlockFees {
     /// zero address, so a chain without the section never moves.
     #[must_use]
     pub fn next(self, gas_used: u64) -> Self {
-        if self == Self::NONE {
+        if !self.scheduled() {
             return self;
         }
         Self {
@@ -123,7 +136,7 @@ impl BlockFees {
     /// the receipt reports the base fee as the gas price.
     #[must_use]
     pub fn scheduled(self) -> bool {
-        self != Self::NONE
+        self.base_fee > 0
     }
 }
 
@@ -239,7 +252,7 @@ mod tests {
         assert_eq!(BlockFees::NONE.next(BLOCK_GAS_LIMIT), BlockFees::NONE);
         assert!(!BlockFees::NONE.scheduled());
         let scheduled = BlockFees::genesis(Some(FeeSchedule {
-            base_fee_initial: 800,
+            base_fee_initial: NonZeroU128::new(800).unwrap(),
             beneficiary: Address::repeat_byte(0xfe),
         }));
         assert!(scheduled.scheduled());
