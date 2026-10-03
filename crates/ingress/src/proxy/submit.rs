@@ -165,6 +165,19 @@ where
             count_reject("draining");
             return Err(IngressError::Draining);
         }
+        // The chain refuses new transactions while the sealed head is
+        // past the DA-lag budget. The sealer would refuse the record too;
+        // answering here saves the round trip and names the cause. A
+        // status one frame stale costs one resubmit, nothing more.
+        let status = self.cluster_status();
+        if status.halted {
+            count_reject("da-lag");
+            return Err(IngressError::ChainHalted {
+                sealed_head: status.sealed_head,
+                posted_head: status.posted_head,
+                budget_blocks: status.budget_blocks,
+            });
+        }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
             let _ = e; // This error carries no data.

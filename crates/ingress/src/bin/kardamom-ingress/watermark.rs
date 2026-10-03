@@ -1,12 +1,13 @@
 //! The cluster egress watermark thread: folds the cluster's egress
-//! progress into the proxy's on-quorum watermark bus.
+//! progress into the proxy's on-quorum watermark bus, and the cluster's
+//! status frames into the proxy's status channel.
 
 use std::ops::ControlFlow;
 
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
-use kardamom_ingress::cluster::ClusterWatermarkObserver;
-use kardamom_types::QuorumWatermark;
-use tokio::sync::broadcast;
+use kardamom_ingress::cluster::{ClusterWatermarkObserver, Observed};
+use kardamom_types::{ClusterStatus, QuorumWatermark};
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// The watermark thread's state: the egress observer, the watermark bus,
@@ -17,6 +18,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 pub(crate) struct ClusterWatermarkPump {
     observer: ClusterWatermarkObserver<LiveEgress>,
     tx: broadcast::Sender<QuorumWatermark>,
+    status: watch::Sender<ClusterStatus>,
     stop: CancellationToken,
 }
 
@@ -42,10 +44,12 @@ impl ClusterWatermarkPump {
     pub(crate) fn new(
         observer: ClusterWatermarkObserver<LiveEgress>,
         tx: broadcast::Sender<QuorumWatermark>,
+        status: watch::Sender<ClusterStatus>,
     ) -> Self {
         Self {
             observer,
             tx,
+            status,
             stop: CancellationToken::new(),
         }
     }
@@ -73,17 +77,22 @@ impl ClusterWatermarkPump {
         while let ControlFlow::Continue(()) = self.step() {}
     }
 
-    /// Poll one egress position and send it as the durable count.
-    /// `Break` ends the thread: the stop token fired, or the observer
-    /// ended.
+    /// Poll one egress event: send a position as the durable count, or
+    /// a status to the status channel. `Break` ends the thread: the stop
+    /// token fired, or the observer ended.
     fn step(&mut self) -> ControlFlow<()> {
         if self.stop.is_cancelled() {
             return ControlFlow::Break(());
         }
-        let Some(position) = self.observer.next_position() else {
-            return ControlFlow::Break(());
-        };
-        let _ = self.tx.send(QuorumWatermark { position });
+        match self.observer.next_event() {
+            None => return ControlFlow::Break(()),
+            Some(Observed::Durable(position)) => {
+                let _ = self.tx.send(QuorumWatermark { position });
+            }
+            Some(Observed::Status(status)) => {
+                self.status.send_replace(status);
+            }
+        }
         ControlFlow::Continue(())
     }
 }

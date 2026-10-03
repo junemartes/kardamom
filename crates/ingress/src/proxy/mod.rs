@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
-use tokio::sync::broadcast;
+use alloy_rpc_types_eth::BlockNumberOrTag;
+use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
-use kardamom_types::{Receipt, TxError};
+use kardamom_types::{ClusterStatus, Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -171,6 +172,9 @@ where
     /// and the parked ones keep waiting for their receipts. See
     /// [`Self::begin_drain`].
     pub(crate) draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The latest cluster status: the posted head behind `safe`, and the
+    /// DA-lag flag a submit is refused on.
+    pub(crate) cluster_status: watch::Receiver<ClusterStatus>,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
@@ -207,6 +211,7 @@ where
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
             draining: self.draining.clone(),
+            cluster_status: self.cluster_status.clone(),
         }
     }
 }
@@ -238,6 +243,7 @@ where
                 live.clone(),
             ))
         });
+        let cluster_status = subscription.cluster_status();
         let me = Self {
             cfg,
             partition_count_m,
@@ -256,9 +262,11 @@ where
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_status,
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
+        me.spawn_cluster_status_watcher();
         // Subscribe only to the watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
             me.spawn_quorum_watermark_watcher();
@@ -281,6 +289,36 @@ where
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
         self.latest_block_number.load(Ordering::Acquire)
+    }
+
+    /// The latest cluster status the egress fanned out.
+    #[must_use]
+    pub fn cluster_status(&self) -> ClusterStatus {
+        *self.cluster_status.borrow()
+    }
+
+    /// The block a tag names. `latest` and `pending` name the head;
+    /// `safe` names the last block posted to L1, and `finalized` the
+    /// same block, because the batcher does not observe L1 finality
+    /// today; `earliest` is genesis; a number names itself up to the
+    /// head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Decode` for a number past the head.
+    pub fn block_number_of(&self, tag: BlockNumberOrTag) -> Result<u64, IngressError> {
+        let latest = self.latest_block_number();
+        match tag {
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => Ok(latest),
+            BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized => {
+                Ok(self.cluster_status().posted_head)
+            }
+            BlockNumberOrTag::Earliest => Ok(0),
+            BlockNumberOrTag::Number(n) if n <= latest => Ok(n),
+            BlockNumberOrTag::Number(n) => Err(IngressError::Decode(format!(
+                "block {n} not served: it is past the head (block {latest})"
+            ))),
+        }
     }
 
     /// Returns the next globally unique `correlation_id` for this

@@ -6,9 +6,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::broadcast;
+use kardamom_obs::halt::{self, Halt, HaltCause};
+use tokio::sync::{broadcast, watch};
 
-use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxError};
+use kardamom_types::{
+    BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt, TxError,
+};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::pending::PendingReceipts;
@@ -70,6 +73,51 @@ where
             WatermarkWatcher::new(self.pending.clone()),
         )
         .spawn();
+    }
+
+    pub(super) fn spawn_cluster_status_watcher(&self) {
+        ClusterStatusWatcher::new(self.cluster_status.clone()).spawn();
+    }
+}
+
+/// Mirrors the cluster's status into the gauges and the `da_lag` halt:
+/// the halt is raised when the sealer says it refuses transactions, and
+/// cleared when a later status says it accepts them again. The halt is
+/// the ingress's, because the sealer has no exporter of its own; the
+/// cause is the chain's.
+struct ClusterStatusWatcher {
+    rx: watch::Receiver<ClusterStatus>,
+}
+
+impl ClusterStatusWatcher {
+    fn new(rx: watch::Receiver<ClusterStatus>) -> Self {
+        Self { rx }
+    }
+
+    fn spawn(mut self) {
+        tokio::spawn(async move {
+            while self.rx.changed().await.is_ok() {
+                Self::on_status(*self.rx.borrow_and_update());
+            }
+        });
+    }
+
+    fn on_status(status: ClusterStatus) {
+        crate::metrics::record_cluster_status(&status);
+        if status.halted {
+            halt::raise(Halt::new(
+                HaltCause::DaLag,
+                format!(
+                    "sealed head {} is {} blocks past the posted head {}; the budget is {}",
+                    status.sealed_head,
+                    status.lag(),
+                    status.posted_head,
+                    status.budget_blocks
+                ),
+            ));
+        } else {
+            halt::clear();
+        }
     }
 }
 

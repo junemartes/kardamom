@@ -461,10 +461,13 @@ impl IngressService {
         // drops, or when the observer ends. The bus is a tokio `broadcast`
         // channel, so the send never blocks. A send with no live receiver
         // is not an error here.
-        let running =
-            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender())
-                .spawn(guard)
-                .context("spawn cluster watermark thread")?;
+        let running = watermark::ClusterWatermarkPump::new(
+            observer,
+            subscription.watermark_sender(),
+            subscription.cluster_status_sender(),
+        )
+        .spawn(guard)
+        .context("spawn cluster watermark thread")?;
         tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
         Ok(running)
     }

@@ -11,7 +11,7 @@ use std::future::Future;
 use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
@@ -20,8 +20,8 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
-    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptBatch, TxEnvelope,
-    TxError,
+    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
+    ReceiptBatch, TxEnvelope, TxError,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription};
@@ -211,6 +211,9 @@ pub struct LiveIngressSubscription {
     local_fsync: broadcast::Sender<FsyncWatermark>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
     tx_errors: broadcast::Sender<TxError>,
+    /// The latest cluster status, fed by the binary's egress observer
+    /// like the watermark bus.
+    cluster_status: watch::Sender<ClusterStatus>,
 }
 
 impl LiveIngressSubscription {
@@ -237,6 +240,7 @@ impl LiveIngressSubscription {
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(BUS_CAPACITY);
         let (tx_errors_tx, _) = broadcast::channel::<TxError>(BUS_CAPACITY);
+        let (cluster_status_tx, _) = watch::channel(ClusterStatus::default());
 
         let mds = channels.tx_receipts_mds_enabled();
         if mds {
@@ -292,7 +296,15 @@ impl LiveIngressSubscription {
             local_fsync: local_fsync_tx,
             block_boundaries: block_boundaries_tx,
             tx_errors: tx_errors_tx,
+            cluster_status: cluster_status_tx,
         })
+    }
+
+    /// Producer side of the cluster status, fed by the same egress
+    /// observer as [`Self::watermark_sender`].
+    #[must_use]
+    pub fn cluster_status_sender(&self) -> watch::Sender<ClusterStatus> {
+        self.cluster_status.clone()
     }
 
     /// Producer side of the quorum and durable watermark bus. In the
@@ -324,6 +336,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn live_accounts(&self) -> Arc<LiveAccounts> {
         self.live.clone()
+    }
+    fn cluster_status(&self) -> watch::Receiver<ClusterStatus> {
+        self.cluster_status.subscribe()
     }
 }
 

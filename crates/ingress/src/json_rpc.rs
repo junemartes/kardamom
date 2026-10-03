@@ -107,6 +107,14 @@ pub trait IngressKardamomApi {
     /// streams everything.
     #[subscription(name = "subscribeReceipts", item = ReceiptEvent)]
     async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
+
+    /// The block number a tag names: `latest` and `pending` the head,
+    /// `safe` the last block posted to L1, `finalized` the last block
+    /// whose batch L1 finalized. The batcher does not observe L1
+    /// finality today, so `finalized` serves the posted head too. A
+    /// client that cannot accept a revert waits for `safe`.
+    #[method(name = "blockNumberByTag")]
+    async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256>;
 }
 
 pub(crate) struct IngressHandlers<Backend: ProxyBackend> {
@@ -172,6 +180,13 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
         self.proxy
             .submit_raw_async(client_ip(), bytes)
             .await
+            .map_err(ErrorObjectOwned::from)
+    }
+
+    async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256> {
+        self.proxy
+            .block_number_of(tag)
+            .map(U256::from)
             .map_err(ErrorObjectOwned::from)
     }
 
@@ -331,6 +346,8 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
         // The deadline names a block, not a nonce, so the nonce field of
         // this wire shape stays empty.
         kardamom_types::TxErrorReason::PastDeadline { .. } => ("past-deadline".to_string(), None),
+        // A halt names the chain's state, not a nonce.
+        kardamom_types::TxErrorReason::DaLag { .. } => ("da-lag".to_string(), None),
     }
 }
 

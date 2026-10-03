@@ -72,7 +72,25 @@ pub enum IngressError {
     /// failed.
     #[error("account state unavailable: {0}")]
     StateUnavailable(String),
+    /// The chain is halted on a DA lag: the sealed head is more than the
+    /// budget past the last block posted to L1, so the sealer refuses new
+    /// transactions until the batcher posts again. The `/halt` route on
+    /// the metrics port names the cause and the runbook.
+    #[error(
+        "chain halted: DA lag (sealed head {sealed_head}, posted head {posted_head}, budget \
+         {budget_blocks} blocks); cause and recovery at /halt — resubmit after the batcher posts"
+    )]
+    ChainHalted {
+        sealed_head: u64,
+        posted_head: u64,
+        budget_blocks: u64,
+    },
 }
+
+/// The JSON-RPC error code of a halted chain. Its own code, so a client
+/// tells a halt from the generic server error and waits instead of
+/// retrying at once.
+pub const CHAIN_HALTED_CODE: i32 = -32010;
 
 impl IngressError {
     /// Builds an `Internal` error from a context label and the
@@ -111,8 +129,19 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
+            IngressError::ChainHalted { .. } => CHAIN_HALTED_CODE,
         };
-        ErrorObjectOwned::owned::<()>(code, err.to_string(), None)
+        let data = match &err {
+            // The typed cause, so a client finds the record and the
+            // runbook without parsing the message.
+            IngressError::ChainHalted { .. } => Some(serde_json::json!({
+                "cause": "da_lag",
+                "halt": "/halt",
+                "runbook": "docs/runbooks/da_lag.md",
+            })),
+            _ => None,
+        };
+        ErrorObjectOwned::owned(code, err.to_string(), data)
     }
 }
 
@@ -155,6 +184,26 @@ mod tests {
             rpc.message()
         );
         assert!(rpc.message().contains("have 5 want 9"), "{}", rpc.message());
+    }
+
+    #[test]
+    fn chain_halted_has_its_own_code_and_names_the_halt_route() {
+        let rpc: ErrorObjectOwned = IngressError::ChainHalted {
+            sealed_head: 160,
+            posted_head: 100,
+            budget_blocks: 50,
+        }
+        .into();
+        assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
+        assert!(
+            rpc.message().starts_with("chain halted: DA lag"),
+            "{}",
+            rpc.message()
+        );
+        assert!(rpc.message().contains("/halt"), "{}", rpc.message());
+        let data = rpc.data().expect("the typed cause").get();
+        assert!(data.contains("\"cause\":\"da_lag\""), "{data}");
+        assert!(data.contains("docs/runbooks/da_lag.md"), "{data}");
     }
 
     #[test]
