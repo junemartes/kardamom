@@ -1,5 +1,5 @@
-//! The four structurally identical single-stream handle pairs: `TxErrors`,
-//! `TxDeposits`, `TxRemoteEpochs`, `FsyncWatermark`. Each is a publisher
+//! The five structurally identical single-stream handle pairs: `TxErrors`,
+//! `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
 //! publish surface. [`declare_channel_handles!`] stamps out the
@@ -12,6 +12,7 @@ use crate::config::ChannelsConfig;
 use crate::discovery::Topic;
 use crate::discovery::plane::{DiscoveredPublisher, DiscoveredSubscriber};
 use crate::error::LogError;
+use kardamom_types::service::ServiceEvent;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, TxError};
 
@@ -278,6 +279,26 @@ declare_channel_handles! {
 }
 
 declare_channel_handles! {
+    /// `events` publisher (every service → the ingress and the validator).
+    publisher ServiceEventsPublisherHandle {
+        /// Fire-and-forget publish: the Aeron thread retries a
+        /// back-pressured offer for a bounded time, then drops the
+        /// record. The next heartbeat repeats the state.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if `e` fails to encode.
+        pub fn publish_best_effort(&self, e: &ServiceEvent) -> Result<(), LogError> {
+            self.inner.publish_best_effort(crate::codec::encode(e)?);
+            Ok(())
+        }
+    }
+    /// `events` subscriber (every service → the ingress and the validator).
+    subscriber ServiceEventsSubscriberHandle(ServiceEvent);
+    open(ch) = (ch.events_channel, ch.events_stream_id);
+}
+
+declare_channel_handles! {
     /// Per-recorder fsync watermark publisher.
     publisher FsyncWatermarkPublisherHandle {
         /// # Errors
@@ -316,4 +337,11 @@ discoverable!(
     RemoteEpochRecord,
     Topic::TxRemoteEpochs,
     tx_remote_epochs_stream_id
+);
+discoverable!(
+    ServiceEventsPublisherHandle,
+    ServiceEventsSubscriberHandle,
+    ServiceEvent,
+    Topic::ServiceEvents,
+    events_stream_id
 );
