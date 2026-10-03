@@ -210,7 +210,7 @@ fn restore_newest_readable_skips_without_touching_the_directory() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with('.'))
         .collect();
-    assert_eq!(hidden.len(), 0, "nothing may be renamed: {hidden:?}");
+    assert!(hidden.is_empty(), "nothing may be renamed: {hidden:?}");
 }
 
 /// A checkpoint that the writer prunes between the listing and the read

@@ -366,7 +366,7 @@ mod tests {
         )
         .unwrap();
         let accounts = moved_accounts(dir.path()).unwrap();
-        assert_ne!(accounts.len(), 0);
+        assert!(!accounts.is_empty());
         assert!(
             accounts
                 .iter()

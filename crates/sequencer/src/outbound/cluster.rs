@@ -298,7 +298,7 @@ mod tests {
             Err(SequencerError::Backpressure)
         ));
         // Nothing was accepted by the gateway.
-        assert_eq!(ingress.accepted().len(), 0);
+        assert!(ingress.accepted().is_empty());
     }
 
     #[test]

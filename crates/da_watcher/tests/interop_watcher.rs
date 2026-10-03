@@ -258,7 +258,7 @@ async fn a_foreign_destination_halts_the_pair() {
     feed.push_message(msg(1, 101));
 
     assert_halted(handle).await;
-    assert_eq!(publisher.records().len(), 0);
+    assert!(publisher.records().is_empty());
 }
 
 /// A feed that serves its own anchor is a fault of the feed. The watcher
@@ -303,7 +303,7 @@ async fn a_multi_block_batch_is_a_fault() {
         "got {err:?}"
     );
     assert_eq!(w.cursor(), 0);
-    assert_eq!(publisher.records().len(), 0);
+    assert!(publisher.records().is_empty());
 }
 
 /// A dropped session must re-subscribe from the watcher's own cursor and
@@ -572,7 +572,7 @@ async fn a_head_event_closes_a_single_message_block() {
     feed.push_message(msg(0, 100));
     feed.push_head(100); // at the open block: not a close
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(publisher.records().len(), 0, "block 100 is still open");
+    assert!(publisher.records().is_empty(), "block 100 is still open");
     feed.push_head(101);
     wait_until(|| !publisher.records().is_empty(), "one record").await;
 

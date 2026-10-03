@@ -160,7 +160,7 @@ fn forged_sender_halts_and_latches_with_verification_on() {
         matches!(err, ExecutorError::RecordIdentity(_)),
         "expected RecordIdentity, got: {err:?}"
     );
-    assert_eq!(out.len(), 0, "no receipt/boundary may be published");
+    assert!(out.is_empty(), "no receipt/boundary may be published");
     let (_, victim_balance, _) = snap.basic(victim).unwrap().expect("victim account");
     assert_eq!(
         victim_balance,

@@ -63,7 +63,7 @@ async fn stopped_jobs_restore_their_definition_and_allocations() {
     let saved = SavedJob::capture(&nomad, "audit-test").await.unwrap();
     saved.restore().await.unwrap();
     saved.stop().await.unwrap();
-    assert_eq!(nomad.running("audit-test").await.unwrap().len(), 0);
+    assert!(nomad.running("audit-test").await.unwrap().is_empty());
     saved.restore().await.unwrap();
     assert_eq!(nomad.running("audit-test").await.unwrap().len(), 1);
     saved.stop().await.unwrap();

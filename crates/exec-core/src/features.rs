@@ -292,7 +292,7 @@ mod tests {
             .build();
         let out = apply_block_close_actions(&mut delta, 5, 1_999, None, &snap).unwrap();
         assert_eq!(out.health_beat, None);
-        assert_eq!(delta.storage.len(), 0);
+        assert!(delta.storage.is_empty());
     }
 
     #[test]

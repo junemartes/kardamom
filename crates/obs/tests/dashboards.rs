@@ -44,7 +44,7 @@ fn assert_dashboard_valid(dir: &std::path::Path, stem: &str) {
         path.display()
     );
     let panels = v["panels"].as_array().expect("panels array");
-    assert_ne!(panels.len(), 0, "{} has no panels", path.display());
+    assert!(!panels.is_empty(), "{} has no panels", path.display());
     for (i, p) in panels.iter().enumerate() {
         assert_panel_valid(&path, i, p);
     }

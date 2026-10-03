@@ -76,11 +76,11 @@ fn foreign_closed_event_ignored_while_connected() {
     // The predecessor's session (id 42) times out. Its corpse event
     // arrives on our shared egress channel.
     let evs = d.on_egress(&event(EventCode::Closed, 999, 42, "TIMEOUT"));
-    assert_eq!(evs.len(), 0, "foreign Closed must produce no events");
+    assert!(evs.is_empty(), "foreign Closed must produce no events");
     assert!(d.is_connected(), "our session must survive");
     // Keep-alives keep flowing for our session.
     let frames = d.poll_outbound(2_000);
-    assert_ne!(frames.len(), 0, "keep-alive cadence unaffected");
+    assert!(!frames.is_empty(), "keep-alive cadence unaffected");
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn own_closed_event_still_fails_session() {
 fn foreign_ok_does_not_hijack_connected_session() {
     let mut d = connected(77);
     let evs = d.on_egress(&ok_event(12345, 42, 9, 2));
-    assert_eq!(evs.len(), 0, "foreign OK must not re-connect us");
+    assert!(evs.is_empty(), "foreign OK must not re-connect us");
     match d.state() {
         SessionState::Connected {
             cluster_session_id, ..
@@ -108,7 +108,7 @@ fn foreign_ok_does_not_hijack_connected_session() {
 fn redirect_ignored_while_connected() {
     let mut d = connected(77);
     let evs = d.on_egress(&event(EventCode::Redirect, 999, 0, "1=10.0.0.2:9000"));
-    assert_eq!(evs.len(), 0, "a redirect is a connect-time response");
+    assert!(evs.is_empty(), "a redirect is a connect-time response");
     assert!(d.is_connected());
 }
 
@@ -117,7 +117,7 @@ fn stale_correlation_rejection_ignored_while_connecting() {
     let (mut d, corr) = connecting();
     // A rejection for some other correlation, from a previous process's attempt.
     let evs = d.on_egress(&event(EventCode::Error, corr + 555, 0, "nope"));
-    assert_eq!(evs.len(), 0, "stale rejection must not fail our connect");
+    assert!(evs.is_empty(), "stale rejection must not fail our connect");
     // Our own rejection still lands.
     let evs = d.on_egress(&event(EventCode::Error, corr, 0, "nope"));
     assert_eq!(evs, vec![DriverEvent::Failed("nope".into())]);
@@ -134,7 +134,7 @@ fn first_poll_emits_connect_request() {
     assert_eq!(req.response_stream_id, 101);
     assert_eq!(req.response_channel, "aeron:udp?endpoint=10.0.0.1:0");
     // The connect is not re-sent on a subsequent poll.
-    assert_eq!(d.poll_outbound(1).len(), 0);
+    assert!(d.poll_outbound(1).is_empty());
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn new_leader_event_updates_term_keeps_session() {
         other => panic!("expected SessionMessage, got {other:?}"),
     }
     // No reconnect is queued. The session is preserved across the term.
-    assert_eq!(d.poll_outbound(1).len(), 0);
+    assert!(d.poll_outbound(1).is_empty());
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn keep_alive_emitted_after_interval() {
     let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     // Before the interval: nothing.
-    assert_eq!(d.poll_outbound(500).len(), 0);
+    assert!(d.poll_outbound(500).is_empty());
     // After the interval: one keep-alive.
     let out = d.poll_outbound(1_100);
     assert_eq!(out.len(), 1);
@@ -242,7 +242,7 @@ fn session_message_for_other_session_ignored() {
     let (mut d, corr) = connecting();
     d.on_egress(&ok_event(corr, 5, 9, 0));
     let other = wrap_session_message(9, 999, 0, b"not-ours");
-    assert_eq!(d.on_egress(&other).len(), 0);
+    assert!(d.on_egress(&other).is_empty());
     let ours = wrap_session_message(9, 5, 0, b"ours");
     assert_eq!(
         d.on_egress(&ours),
@@ -292,7 +292,7 @@ fn unanswered_connect_reemits_after_timeout_with_rotate_hint() {
     assert_eq!(d.poll_outbound(0).len(), 1);
     assert!(!d.take_rotate_hint(), "first connect is not a retry");
     // Before the connect timeout: nothing.
-    assert_eq!(d.poll_outbound(CONNECT_TIMEOUT_MS - 1).len(), 0);
+    assert!(d.poll_outbound(CONNECT_TIMEOUT_MS - 1).is_empty());
     // After: the connect is re-emitted and the transport is told to rotate.
     let out = d.poll_outbound(CONNECT_TIMEOUT_MS);
     assert_eq!(out.len(), 1);

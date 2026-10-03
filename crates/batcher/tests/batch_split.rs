@@ -177,7 +177,7 @@ fn single_oversize_block_is_a_named_fatal() {
 fn batcher_posts_a_split_group_as_two_batches() {
     let mut batcher = Batcher::new(uncompressed(), MockSender::default());
     batcher.on_closed_block(block_of(10, TWO_THIRDS)).unwrap();
-    assert_eq!(batcher.sender().sent.len(), 0);
+    assert!(batcher.sender().sent.is_empty());
     batcher.on_closed_block(block_of(11, TWO_THIRDS)).unwrap();
     let sent = &batcher.sender().sent;
     assert_eq!(sent.len(), 2);

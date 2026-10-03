@@ -106,7 +106,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
     // Both envelopes buffer as future (expected = 0, cold hydration).
     rig.step(&mut seq).unwrap();
     rig.step(&mut seq).unwrap();
-    assert_eq!(rig.refs().len(), 0, "stuck behind the gap");
+    assert!(rig.refs().is_empty(), "stuck behind the gap");
 
     // Execution evidence arrives. Nonce 4 is receipted, so the floor becomes 5.
     floor_tx

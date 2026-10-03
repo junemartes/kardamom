@@ -166,7 +166,7 @@ fn stateless_replay_reproduces_recorded_execution() {
         reference.receipts.iter().all(|r| r.status),
         "setup: every record must execute successfully"
     );
-    assert_ne!(raw_bal.len(), 0, "setup: block must produce a BAL");
+    assert!(!raw_bal.is_empty(), "setup: block must produce a BAL");
 
     // Stateless replay: witness only, no state DB, with the published
     // BAL as a proof input (granularity 1 means per-tx frames).

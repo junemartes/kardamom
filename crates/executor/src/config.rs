@@ -34,14 +34,14 @@ mod tests {
     #[test]
     fn empty_toml_parses_to_default_cluster() {
         let cfg: ExecutorFileConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.cluster.ingress_endpoints.len(), 0);
+        assert!(cfg.cluster.ingress_endpoints.is_empty());
     }
 
     #[test]
     fn comment_only_toml_parses() {
         // This matches the deployed executor.toml shape: a comment-only file.
         let cfg: ExecutorFileConfig = toml::from_str("# just a comment\n").unwrap();
-        assert_eq!(cfg.cluster.ingress_endpoints.len(), 0);
+        assert!(cfg.cluster.ingress_endpoints.is_empty());
     }
 
     #[test]

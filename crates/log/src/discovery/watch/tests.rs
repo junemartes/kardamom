@@ -71,7 +71,7 @@ async fn passing_members_of_the_filtered_topic_appear_and_leave() {
     catalog.pass(&other.entry.id).unwrap();
 
     let m = wait_for(&mut rx, Membership::is_known).await;
-    assert_eq!(m.entries.len(), 0, "a critical check is not a member");
+    assert!(m.entries.is_empty(), "a critical check is not a member");
 
     catalog.pass(&a.entry.id).unwrap();
     let m = wait_for(&mut rx, |m| !m.entries.is_empty()).await;
@@ -81,7 +81,7 @@ async fn passing_members_of_the_filtered_topic_appear_and_leave() {
 
     catalog.expire(&a.entry.id);
     let m = wait_for(&mut rx, |m| m.entries.is_empty() && m.index > 3).await;
-    assert_eq!(m.entries.len(), 0);
+    assert!(m.entries.is_empty());
     cancel.cancel();
 }
 

@@ -366,12 +366,12 @@ mod tests {
         let scan = store.from_seq(7, 1);
         assert_eq!(scan.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1]);
         // A cursor past the tail scans nothing.
-        assert_eq!(store.from_seq(7, 5).msgs.len(), 0);
+        assert!(store.from_seq(7, 5).msgs.is_empty());
         let scan = store.from_seq(9, 0);
         assert_eq!(scan.msgs.len(), 1);
         // Unknown destination on a genesis-start store: empty, floor 0.
         let scan = store.from_seq(999, 0);
-        assert_eq!(scan.msgs.len(), 0);
+        assert!(scan.msgs.is_empty());
         assert_eq!(scan.floor_seq, LaneFloor::Known(0));
     }
 
@@ -402,7 +402,7 @@ mod tests {
             store.append_block(b, vec![]);
         }
         let scan = store.from_seq(7, 0);
-        assert_eq!(scan.msgs.len(), 0);
+        assert!(scan.msgs.is_empty());
         assert_eq!(scan.floor_seq, LaneFloor::Known(1));
         assert_eq!(scan.head_block, 10);
     }

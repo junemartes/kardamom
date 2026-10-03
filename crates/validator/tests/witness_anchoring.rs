@@ -168,7 +168,7 @@ fn capture_and_anchor(
     let tables = TrieTables::open(&ro).unwrap();
     let (proofs, post_root) =
         anchor_block_witness(&ro, &tables, pre_root, &mut witness, &out.delta).expect("anchor");
-    assert_ne!(proofs.nodes.len(), 0, "a real trie yields real proofs");
+    assert!(!proofs.nodes.is_empty(), "a real trie yields real proofs");
     (out, witness, bal, proofs, post_root)
 }
 

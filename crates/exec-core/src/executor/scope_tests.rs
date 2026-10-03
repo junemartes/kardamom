@@ -107,7 +107,7 @@ fn undecodable_raw_tx_skips_with_marker_receipt() {
     assert_eq!(receipt.skip_reason, Some(SkipReason::Undecodable));
     assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
     assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
-    assert_eq!(ws.accounts.len(), 0);
+    assert!(ws.accounts.is_empty());
 }
 
 #[test]
@@ -144,8 +144,8 @@ fn simple_transfer_produces_write_set_and_success_receipt() {
     assert!(ws.account(&to).is_some());
     assert_eq!(ws.account(&to).unwrap().balance, U256::from(1_000u64));
     // No storage or code writes for a plain transfer.
-    assert_eq!(ws.storage.len(), 0);
-    assert_eq!(ws.code.len(), 0);
+    assert!(ws.storage.is_empty());
+    assert!(ws.code.is_empty());
 
     // RPC enrichment populated by execute_tx.
     assert_eq!(receipt.from, from);
@@ -236,7 +236,7 @@ fn execute_tx_captures_into_the_block_bal() {
         Some((&mut bal, 1)),
         "execute",
     );
-    assert_ne!(ws.accounts.len(), 0, "the tx wrote accounts");
+    assert!(!ws.accounts.is_empty(), "the tx wrote accounts");
 
     let alloy = bal.into_alloy_bal();
     assert!(
@@ -296,11 +296,11 @@ fn execute_tx_captures_with_a_seeded_delta() {
         Some((&mut bal, 2)),
         "execute 2",
     );
-    assert_ne!(ws2.accounts.len(), 0, "tx2 wrote accounts");
+    assert!(!ws2.accounts.is_empty(), "tx2 wrote accounts");
 
     let alloy = bal.into_alloy_bal();
     assert!(after_tx1 > 0, "tx1 must be captured");
-    assert_ne!(alloy.len(), 0, "capture must survive a seeded delta");
+    assert!(!alloy.is_empty(), "capture must survive a seeded delta");
     // tx2's claims must be present: some account carries a
     // bal_index 2 change.
     let has_tx2 = alloy.iter().any(|a| {

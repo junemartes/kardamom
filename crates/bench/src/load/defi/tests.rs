@@ -51,6 +51,6 @@ fn sender_zero_queue_starts_after_deployments() {
     // Every sender's first operation is the pool seed, which funds
     // swap balances.
     for queue in &q {
-        assert_ne!(queue.len(), 0);
+        assert!(!queue.is_empty());
     }
 }

@@ -57,26 +57,26 @@ mod tests {
 
     #[test]
     fn factory_v1_creation_is_nonempty() {
-        assert_ne!(factory_v1_creation().len(), 0);
+        assert!(!factory_v1_creation().is_empty());
     }
 
     #[test]
     fn erc1967_proxy_creation_is_nonempty() {
-        assert_ne!(erc1967_proxy_creation().len(), 0);
+        assert!(!erc1967_proxy_creation().is_empty());
     }
 
     #[test]
     fn eth_lockbox_creation_is_nonempty() {
-        assert_ne!(eth_lockbox_creation().len(), 0);
+        assert!(!eth_lockbox_creation().is_empty());
     }
 
     #[test]
     fn kardamom_l2_settlement_creation_is_nonempty() {
-        assert_ne!(kardamom_l2_settlement_creation().len(), 0);
+        assert!(!kardamom_l2_settlement_creation().is_empty());
     }
 
     #[test]
     fn withdrawal_output_oracle_creation_is_nonempty() {
-        assert_ne!(withdrawal_output_oracle_creation().len(), 0);
+        assert!(!withdrawal_output_oracle_creation().is_empty());
     }
 }

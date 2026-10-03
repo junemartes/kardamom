@@ -235,7 +235,7 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
             balance: a.balance,
         })
         .collect();
-    assert_ne!(expected.len(), 0, "the block wrote at least one account");
+    assert!(!expected.is_empty(), "the block wrote at least one account");
     assert_eq!(
         rows, expected,
         "the block's merged rows ride the last receipt"

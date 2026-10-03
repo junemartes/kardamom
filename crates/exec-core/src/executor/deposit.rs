@@ -378,7 +378,7 @@ mod tests {
             assert!(!receipt.status);
             assert_eq!(receipt.gas_used, 0);
             assert_eq!(receipt.cumulative_gas_used, 90);
-            assert_eq!(receipt.logs, []);
+            assert!(receipt.logs.is_empty());
             assert_eq!(
                 receipt.skip_reason,
                 Some(kardamom_types::SkipReason::GasLimit)
@@ -396,8 +396,8 @@ mod tests {
                 }
             );
             assert!(ws.account(&to).is_none());
-            assert_eq!(ws.storage.len(), 0);
-            assert_eq!(ws.code.len(), 0);
+            assert!(ws.storage.is_empty());
+            assert!(ws.code.is_empty());
             assert_eq!(receipt.write_set_hash, ws.hash());
             // The mint is a BAL claim, like on the executed path.
             let alloy = bal.into_alloy_bal();

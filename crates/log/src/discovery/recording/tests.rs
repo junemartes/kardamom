@@ -90,7 +90,7 @@ async fn a_publisher_returning_within_grace_keeps_the_same_recording() {
     state.reconcile(&membership(false), now + Duration::from_secs(1));
     state.reconcile(&membership(true), now + Duration::from_secs(4));
     assert_eq!(state.archive.starts.borrow().len(), 1);
-    assert_eq!(state.archive.stops.borrow().len(), 0);
+    assert!(state.archive.stops.borrow().is_empty());
     assert_eq!(state.started.len(), 1);
 }
 
@@ -100,10 +100,10 @@ async fn a_confirmed_departure_stops_after_the_full_grace() {
     let now = Instant::now();
     state.reconcile(&membership(true), now);
     state.reconcile(&membership(false), now + Duration::from_secs(1));
-    assert_eq!(state.archive.stops.borrow().len(), 0);
+    assert!(state.archive.stops.borrow().is_empty());
     state.reconcile(&membership(false), now + Duration::from_secs(1) + GRACE);
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
-    assert_eq!(state.started.len(), 0);
+    assert!(state.started.is_empty());
 }
 
 #[tokio::test]
@@ -118,7 +118,7 @@ async fn a_catalog_outage_preserves_recordings_and_resets_removal_proof() {
     };
     state.reconcile(&degraded, now + GRACE * 2);
     state.reconcile(&membership(false), now + GRACE * 3);
-    assert_eq!(state.archive.stops.borrow().len(), 0);
+    assert!(state.archive.stops.borrow().is_empty());
     state.reconcile(&membership(false), now + GRACE * 4);
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
 }
@@ -134,7 +134,7 @@ async fn a_failed_start_retries_and_only_then_reports_ready() {
     state.resolve_pending();
     state.report(&mut ready);
     assert!(rx.try_recv().is_err());
-    assert_eq!(state.started.len(), 0);
+    assert!(state.started.is_empty());
     state.reconcile(&membership(true), now + POLL);
     state.resolve_pending();
     state.report(&mut ready);
@@ -170,7 +170,7 @@ async fn stopped_or_foreign_recordings_do_not_suppress_start_retries() {
         .extend([(8, 42, 1024), (9, 99, -1)]);
     let now = Instant::now();
     state.reconcile(&membership(true), now);
-    assert_eq!(state.started.len(), 0);
+    assert!(state.started.is_empty());
     state.reconcile(&membership(true), now + POLL);
     state.resolve_pending();
     assert_eq!(

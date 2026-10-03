@@ -167,7 +167,7 @@ async fn members_join_leave_and_expire_through_consul() {
     // Crash: the heartbeat stops, the TTL expires, the member is gone.
     drop(reg_a);
     let m = wait_for(&mut rx, Duration::from_secs(15), |m| m.entries.is_empty()).await;
-    assert_eq!(m.entries.len(), 0);
+    assert!(m.entries.is_empty());
 
     // The watch survived every transition without an error.
     assert_eq!(m.health, kardamom_log::discovery::CatalogHealth::Fresh);

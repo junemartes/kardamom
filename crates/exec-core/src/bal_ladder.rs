@@ -222,7 +222,7 @@ mod tests {
         let mut chunked = revm::state::bal::BalWrites::<U256>::default();
         chunked.update(1, &U256::from(5), U256::from(7));
         chunked.update(1, &U256::from(7), U256::from(7));
-        assert_eq!(chunked.writes.len(), 0, "the first write is gone");
+        assert!(chunked.writes.is_empty(), "the first write is gone");
 
         let mut per_tx = revm::state::bal::BalWrites::<U256>::default();
         per_tx.update(1, &U256::from(5), U256::from(7));

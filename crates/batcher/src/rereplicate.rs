@@ -487,7 +487,7 @@ mod tests {
             diff.diverged,
             vec!["1-0.rec".to_string(), "2-0.rec".to_string()]
         );
-        assert_eq!(diff.dest_only.len(), 0);
+        assert!(diff.dest_only.is_empty());
     }
 
     /// Recording ids are per-archive counters, so a restarted or
@@ -504,7 +504,7 @@ mod tests {
         write(dst.path(), "11-0.rec", &[7u8; 1024]);
 
         let diff = diff_mirror(src.path(), dst.path()).unwrap();
-        assert_eq!(diff.diverged.len(), 0);
+        assert!(diff.diverged.is_empty());
         assert_eq!(diff.dest_only, vec!["11-0.rec".to_string()]);
         assert!(!diff.is_clean());
         // And the mirror-equality gate refuses to call this archive clean.

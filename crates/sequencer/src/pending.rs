@@ -338,7 +338,7 @@ mod tests {
         let mut b: PendingBuffer<u32> = PendingBuffer::new(4);
         b.insert(5, 50, far());
         let drained: Vec<_> = b.drain_consecutive_from(3).collect();
-        assert_eq!(drained.len(), 0);
+        assert!(drained.is_empty());
         assert_eq!(b.len(), 1);
     }
 

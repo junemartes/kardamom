@@ -132,7 +132,7 @@ fn skip_receipts_confirm_but_never_raise_floors() {
     ))
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
-    assert_eq!(raised.len(), 0, "skip is not floor evidence");
+    assert!(raised.is_empty(), "skip is not floor evidence");
     assert_eq!(c.floor(s(1)), None);
     assert_eq!(confirmations, vec![(s(1), 7)], "skip IS a confirmation");
 }
@@ -180,7 +180,7 @@ fn nonce_zero_skip_confirms_without_raising() {
     .unwrap();
     let (raised, confirmations) = c.drain_floor_updates();
     assert_eq!(confirmations, vec![(s(1), 0)]);
-    assert_eq!(raised.len(), 0, "a skip consumed no nonce");
+    assert!(raised.is_empty(), "a skip consumed no nonce");
 }
 
 #[test]

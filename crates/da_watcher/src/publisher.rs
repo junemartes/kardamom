@@ -103,6 +103,6 @@ mod tests {
             p.publish(&epoch(1)),
             Err(PublishError::Backpressure)
         ));
-        assert_eq!(p.published.lock().unwrap().len(), 0);
+        assert!(p.published.lock().unwrap().is_empty());
     }
 }
