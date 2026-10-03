@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use kardamom_cache::{AccountCache, CacheConfig};
-use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
@@ -123,6 +123,11 @@ async fn main() -> Result<()> {
     let mut plane =
         StreamPlane::from_config(&log_cfg, "state-mirror").context("build the stream plane")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(&rt)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
     let executor_count = args
         .executor_count
         .and_then(NonZeroU32::new)

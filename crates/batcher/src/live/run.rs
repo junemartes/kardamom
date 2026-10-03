@@ -35,6 +35,7 @@ use crate::indexer::IndexerClient;
 /// Ethereum, and a batch posted just before the start is not there yet.
 const INDEXER_POLL: Duration = Duration::from_secs(12);
 const INDEXER_POLLS: u32 = 100;
+use super::events::EventsBeacon;
 use super::feed::{FeedConfig, FeedLoop};
 use super::posted_cursor::PostedCursor;
 use super::sender::{LiveSender, PostExhausted};
@@ -472,8 +473,17 @@ fn continue_from_spool(
 /// Returns an error when config parsing or the reader stack fails to
 /// start, or when the feed loop exits with a failure no halt names.
 pub async fn run(args: LiveArgs) -> Result<()> {
+    let events = EventsBeacon::open(&args).await?;
+    let ended = run_until_shutdown(&args).await;
+    events.close().await;
+    ended
+}
+
+/// Start, hold each halt, and start again, until the shutdown signal or
+/// a failure no halt names.
+async fn run_until_shutdown(args: &LiveArgs) -> Result<()> {
     loop {
-        match run_once(&args).await? {
+        match run_once(args).await? {
             RunEnd::Shutdown => return Ok(()),
             RunEnd::Halted(halt) => {
                 if hold(halt).await.is_break() {

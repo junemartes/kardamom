@@ -34,7 +34,8 @@ use kardamom_da_watcher::interop::{
     CursorFile, CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsPublisherHandle,
+    TxRemoteEpochsPublisherHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::discovery::{DiscoveredRecorder, RecorderProgress, StreamPlane, Topic};
@@ -370,6 +371,14 @@ async fn serve(
     let (tx_deposits_pub, tx_remote_epochs_pub) = service
         .open_publishers(l1.is_some(), interop.is_some())
         .await?;
+    // The watcher's lifecycle on the `events` stream: the chain status
+    // shows deposits delayed while it is halted.
+    service
+        .plane
+        .publisher::<ServiceEventsPublisherHandle>(&service.aeron_rt)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
 
     // --archive-durability records tx_deposits specifically; with no L1 path
     // there is no such publication, and starting a recording on a stream this
