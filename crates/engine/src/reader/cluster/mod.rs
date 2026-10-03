@@ -18,8 +18,11 @@ use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage, VoidRecor
 use crate::ExecutorError;
 use crate::reader::TxOrderingSubscription;
 
-use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
+use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress};
 use kardamom_cluster_adapter::wire::{self, EgressItem};
+// The outcome of an ingress offer, public for a binary that publishes the
+// posted cursor without a direct `kardamom-cluster-adapter` dependency.
+pub use kardamom_cluster_adapter::gateway::OfferOutcome;
 
 use kardamom_cluster_adapter::{
     LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, live,
@@ -127,6 +130,37 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     }
 }
 
+impl<E: ClusterEgress, I: ClusterIngress + Clone> ClusterTxOrderingSubscription<E, I> {
+    /// A publisher of the batcher's posted cursor over this subscription's
+    /// session. The clone shares the session thread, so the batcher's
+    /// feed task publishes while the reader thread polls.
+    #[must_use]
+    pub fn posted_cursor_publisher(&self) -> PostedCursorPublisher<I> {
+        PostedCursorPublisher {
+            ingress: self.ingress.clone(),
+        }
+    }
+}
+
+/// The batcher's confirmed cursor on the cluster ingress: the last L2
+/// block posted to L1, as a system record. The sealer adopts it as the
+/// floor of its DA-lag guard and of its egress retention, and the ingress
+/// serves `safe` from it.
+#[derive(Clone)]
+pub struct PostedCursorPublisher<I: ClusterIngress> {
+    ingress: I,
+}
+
+impl<I: ClusterIngress> PostedCursorPublisher<I> {
+    /// Offer `posted_head` to the sealer. A refused offer is the
+    /// caller's to retry: the next confirmed post publishes again, and
+    /// the sealer sends its status to a session that announces itself.
+    pub fn publish(&mut self, posted_head: u64) -> OfferOutcome {
+        self.ingress
+            .offer(&wire::encode_ingress_posted_cursor(posted_head))
+    }
+}
+
 impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// Disable the `kardamom_sealer_*` re-export (validator role).
     #[must_use]
@@ -205,11 +239,14 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             }
             // Every reject is offered only to the offering sequencer
             // session. An executor session cannot receive one. Ignore them
-            // defensively.
+            // defensively. The status is broadcast to every session; the
+            // ingress reads it, a consumer of the ordering does not.
             EgressItem::ContiguityReject { .. }
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::PastDeadline { .. }
-            | EgressItem::WindowFull { .. } => {}
+            | EgressItem::WindowFull { .. }
+            | EgressItem::DaLagReject { .. }
+            | EgressItem::Status(_) => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,
                 oldest_block,
