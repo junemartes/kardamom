@@ -215,6 +215,24 @@ is crash-consistent per volume, the Aeron catalogs and the state database recove
 that on start, and the same order rule applies. It is not coordinated and not tested until
 the chaos case runs it.
 
+### 3.10 Nothing is pruned below the posted head
+
+One rule for every retention and every pruning in the cluster: a block the batcher has not
+confirmed on L1 is never dropped. The posted head (the batcher's confirmed cursor, the
+system record of 3.7) is the floor of:
+
+- the sealer's egress retention: the window of `kardamom.cluster.retention` frames is a
+  minimum, not a maximum; frames past it are kept while their block is unposted, and a
+  member's restore from a snapshot does not raise the floor above the posted head;
+- the Raft log purge of `docs/specs/2026-09-12-cluster-log-purge-and-seed.md`;
+- the `tx_data` archives and the `TxRef` rows of 3.1;
+- the batcher's spool, which already keeps a block until its post is confirmed.
+
+The DA-lag guard of 3.7 bounds the cost: the sealer halts new transactions at
+`da_lag_budget` blocks past the posted head, so the unpruned range never exceeds the
+budget plus one flush. A chain that turns the guard off accepts unbounded growth while the
+batcher is down, in the open.
+
 ## 4. The chaos cases
 
 All run on the container cluster, in a new shard `chaos-l1` (the retention knobs of the
@@ -231,6 +249,7 @@ faults the incident showed: `NullReceipts`, `SwallowLogs` for an address, `RateL
 | `l1-null-receipts` | the proxy answers null receipts and empty logs for the settlement while serving blocks | same as above; in addition the batcher's resume after a restart reads `l2BlockEnd` from the contract and continues, with no wait on the indexer |
 | `batcher-outage-past-retention` | SIGSTOP the batcher; load until the sealer's floor passes its cursor and a snapshot lands; thaw. Then repeat with the spool wiped | the batcher recovers the range from the spool, then from an executor's block refs and the `tx_data` archive; L1's record is contiguous (`l2BlockStart == previous l2BlockEnd + 1` for every batch); the rebuild stage proves root parity through the recovered range |
 | `two-day-outage` | the incident's order: liar at T0; batcher restart at T1; a deploy of the same images at T2; floor passes at T3; fault cleared at T4 | no manual step; the batcher is posting again within one flush after T4; the alert fired before T1; the record is contiguous; rebuild parity holds |
+| `prune-floor` | the batcher frozen; load past the retention window and past a Raft snapshot; thaw | the sealer still replays from the batcher's cursor (no `REPLAY_UNAVAILABLE`); the batcher posts a contiguous record; the egress retention gauge shows the window stretched to the posted head and back |
 | `da-lag-halt` | the batcher frozen with SIGSTOP; load until the sealed head passes `da_lag_budget` past the posted head | the sealer halts new transactions with the typed error; deposits still land; `kardamom_halt{cause="da_lag"}` is 1 with the runbook id; the batcher thaws, posts, and the sealer resumes with no operator step |
 | `restore-from-snapshot-set` | take a set under load; then wipe every node's state, archives and cluster dirs; restore from the set | the chain continues from the cut with the same images; the executors' roots match the validator's; the batcher posts a contiguous record; the time to restore is reported |
 | `revert-to-posted-head` | the batcher frozen past the retention floor, the spool, every state database's refs and both `tx_data` archives wiped (the unrecoverable case) | the services halt with `replay_unavailable` and the runbook id; the operator procedure of 3.8 (scripted in the case) reverts the chain to the posted head; the rebuilt state matches L1; the chain seals again from there; the revoked receipts are listed |
@@ -251,7 +270,7 @@ renders and validates.
 | 4 | the `TxRef` in the state database, `kardamom_getBlockRefs`, the batcher's third resume source through the archive refetch (3.1) | `batcher-outage-past-retention` |
 | 5 | `two-day-outage` composite; failure-modes.md updated; the known gap "L1 outage" closed | the shard green on two runs |
 | 6 | the halt contract (3.6): the type, the gauge, the `/halt` route, the runbooks, the rules; every existing fail-stop (validator verdict, batcher resume, indexer chain break, da-watcher) becomes a halt | a test that every `RecoveryId` has a runbook; the chaos cases assert the halt record |
-| 7 | the DA-lag guard (3.7) and the `safe`/`finalized` tags | `da-lag-halt` |
+| 7 | the DA-lag guard (3.7), the posted head as the sealer's retention floor (3.10), and the `safe`/`finalized` tags | `da-lag-halt`, `prune-floor` |
 | 8 | the revert procedure (3.8) scripted and timed | `revert-to-posted-head` |
 | 9 | the snapshot set (3.9): the backup job with `ClusterBackup`, the archive mirror and the checkpoints; `just restore <env> <set>` | `restore-from-snapshot-set` |
 
@@ -266,6 +285,7 @@ green. Step 5 proves the combination.
 - A lie is never outvoted by public endpoints. Two sources agreeing is the bar; the light
   client is the tie-breaker inside its window.
 - The batcher never waits on the indexer. The contract is the truth for the cursor.
+- Nothing is pruned below the posted head. The DA-lag guard bounds what that keeps.
 - A halt is a state, never an exit. Every halt names its cause and its runbook, in the
   alert text.
 - The chain halts before it can lose a block it has confirmed. A fork to the posted head
@@ -273,9 +293,8 @@ green. Step 5 proves the combination.
 
 ## 7. Open questions
 
-1. The `tx_data` archives grow without bound today. A pruning rule that keeps every
-   transaction up to the L1-finalized batch plus a floor is a follow-up; until then the
-   rebuild source is complete.
+1. The `tx_data` archives grow without bound today. A pruning rule above the posted head
+   (3.10) with a floor is a follow-up; until then the rebuild source is complete.
 2. Whether the da-watcher's published epochs need the same two-source rule before
    publication. Today a wrong hash reaches the chain's L1-origin records (the staging chain
    carries such records now). The rule in 3.2 covers it when the da-watcher is a follower
