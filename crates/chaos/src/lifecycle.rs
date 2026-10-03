@@ -42,6 +42,12 @@ pub struct DeployVars {
     pub cluster_snapshot_interval_s: Option<u64>,
     /// `-Dkardamom.cluster.retention` of the sealer, in frames.
     pub cluster_retention: Option<u64>,
+    /// Deploy the L1 fault proxy in front of the in-cluster anvil, and
+    /// point the followers (the batcher, the da-watcher, the indexer) at
+    /// it. The indexer is deployed only with it on a container cluster.
+    pub l1_fault_proxy: bool,
+    /// The indexer's poll cadence, in seconds.
+    pub indexer_poll_s: Option<u64>,
 }
 
 impl DeployVars {
@@ -52,7 +58,18 @@ impl DeployVars {
         let retention = self
             .cluster_retention
             .map(|v| ("KARDAMOM_CLUSTER_RETENTION", v.to_string()));
-        snapshot.into_iter().chain(retention).collect()
+        let proxy = self
+            .l1_fault_proxy
+            .then(|| ("KARDAMOM_L1_FAULT_PROXY", "1".to_string()));
+        let poll = self
+            .indexer_poll_s
+            .map(|v| ("L1_INDEXER_POLL_S", v.to_string()));
+        snapshot
+            .into_iter()
+            .chain(retention)
+            .chain(proxy)
+            .chain(poll)
+            .collect()
     }
 }
 

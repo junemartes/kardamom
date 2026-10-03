@@ -401,6 +401,36 @@ refusal routes the consumer into its repair path. A cold start sends the
 block end exactly; a reconnect inside an open block sends an index between
 the two ends; a start from genesis has no boundary to check.
 
+**A lying or absent L1 endpoint.** The batcher's start reads the settlement
+contract: `lastBatchIndex`, and the `l2BlockEnd` the contract stores with
+that batch. Two `eth_call`s, no event scan, no wait on the inbox indexer.
+An endpoint that swallows the `BatchPosted` logs, or an indexer behind the
+head, cannot stall a start; the indexer serves only the last batch's blobs
+when no cursor file exists, and the `BatchPosted` log plus the DA proxy
+serve them when the indexer has not reached the batch. An L1 that does not
+answer at start is retried in-process with a bounded backoff: the exporter
+stays up, `kardamom_batcher_resume_failures_total` counts every failure,
+and the alert `KardamomBatcherResumeFailures` pages on the first. A
+lying endpoint's one signal that cannot hide is the age of the last post as
+L1 serves it: `kardamom_batcher_last_post_age_seconds` is read from L1 on
+every probe tick, never from the batcher's memory, and
+`KardamomBatcherLastPostStale` pages when it passes twice the idle flush
+wait. The chaos-l1 shard proves these: `l1-liar` (a wrong block hash, a
+broken parent chain, swallowed settlement logs), `l1-null-receipts` (null
+receipts and swallowed logs, with a batcher restart inside the fault),
+`two-day-outage` (the staging incident's order) and
+`batcher-outage-past-retention` (below).
+
+**An outage past the sealers' retention.** A batcher frozen or down for
+longer than the egress retention finds, on restart, that the sealers refuse
+its replay. The spool recovers the pending group it had consumed: the
+restart posts it, contiguous with the last post. The range past the spool
+needs a copy of the ordering that survived: the executors' block payload
+store (`kardamom_getBlockPayload`), the batcher's third resume source.
+Until it exists the batcher halts on the refusal, and
+`batcher-outage-past-retention` ends red at its rebuild stage: the DA gap
+is the incident, kept visible.
+
 ## Data-availability recovery (rebuild-from-L1)
 
 The bottom-of-the-stack backstop: even if **every** in-cluster durable copy is
@@ -439,6 +469,18 @@ events via the `da_watcher` path — interleaving them into the reconstruction i
 a documented follow-up, so a deposit-bearing range currently reconstructs its
 non-deposit state exactly and is flagged rather than silently diverging.
 
+**A gap in the record is loud.** Every case of the chaos-l1 shard ends with
+the persisted-state stage: the state at the validator's drained head is
+rebuilt from L1 and the DA layer alone and must carry the validator's root,
+and the harness checks that every posted batch starts at the block after
+the previous one's end. A batcher that could not post a range, for any of
+the faults the shard serves, fails the shard there. The followers of the
+rebuild (the inbox indexer, the da-watcher) read one L1 source today: a
+wrong block hash that reaches their anchor halts them until an operator
+restarts the da-watcher and re-indexes the archive, and a swallowed log is
+invisible to one source. The two-source followers remove both; the cases
+name these assertions as deferred until then.
+
 ## DA-watcher
 
 Tick-based with an in-memory cursor: any RPC or publish error leaves the
@@ -447,6 +489,18 @@ at-least-once within a run. Duplicates after a retry or restart are absorbed
 downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
 deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
 by construction.
+
+**A lying L1 endpoint.** The watcher chains consecutive blocks by their
+parent hashes. A broken parent chain halts it at the first lying block
+(`kardamom_da_watcher_tick_total{outcome="chain_break"}` moves every tick),
+and it resumes by itself when the endpoint serves the chain again. A wrong
+block hash is caught one block late: the lying hash is already its anchor,
+and already in the epoch it published, so the halt lasts until a restart
+seeds the cursor at the tip. A swallowed log is invisible to one source.
+`KardamomDaWatcherTickErrors` pages on a sustained error rate. The
+chaos-l1 cases `l1-liar` and `two-day-outage` serve each lie and check the
+halt and the resume; the inbox indexer, which chains blocks the same way
+through a persisted cursor, is checked beside it.
 
 ## L1-governed upgrades (feature flags)
 
@@ -581,8 +635,16 @@ check would pass against a feature that activated once and stopped.
 - **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.
-- **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
-  gas spikes is designed (lag + catch-up) but not chaos-tested.
+- **L1 outage** — the `chaos-l1` shard serves the followers a lying L1
+  through `kardamom-l1-fault-proxy`: `l1-liar`, `l1-null-receipts`,
+  `two-day-outage` and `batcher-outage-past-retention`. The batcher's
+  resume through the lies, the stale-post alert, the contiguous record and
+  the rebuild parity are proven. Still open: the followers' resume by
+  themselves after a wrong hash reached their anchor, the halt on a
+  swallowed log and the disagreement counter wait on the two-source
+  followers; the recovery past the sealers' retention waits on the block
+  payload store (the second half of `batcher-outage-past-retention`); gas
+  spikes on a real L1 are not served by the proxy.
 - ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
   suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
   onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)

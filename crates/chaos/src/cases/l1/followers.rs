@@ -1,0 +1,202 @@
+//! The followers' evidence: the da-watcher's and the indexer's tick
+//! outcomes and progress gauges, the resume they prove, and the operator
+//! step a poisoned single-source follower needs. The halt judgment lives
+//! in `halt`.
+
+use std::time::Duration;
+
+use crate::cases::component::wipe_dirs;
+use crate::harness::Harness;
+use crate::l1::L1;
+use crate::nomad::SavedJob;
+use crate::poll::{self, Budget};
+use crate::probes::{DA_WATCHER_PORT, INDEXER_PORT};
+
+const WATCHER_TICKS: &str = "kardamom_da_watcher_tick_total";
+const WATCHER_EPOCHS: &str = "kardamom_da_watcher_epochs_published_total";
+const INDEXER_TICKS: &str = "kardamom_l1_indexer_tick_total";
+const INDEXER_BLOCK: &str = "kardamom_l1_indexer_indexed_block_number";
+const INDEXER_LAST_BATCH: &str = "kardamom_l1_indexer_last_batch_index";
+
+const RESUME_BUDGET: Duration = Duration::from_secs(120);
+const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
+
+/// One sample of both followers. A failed scrape stays `None`: it is
+/// evidence, not zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Followers {
+    watcher_breaks: Option<i64>,
+    watcher_epochs: Option<i64>,
+    indexer_errors: Option<i64>,
+    indexer_block: Option<i64>,
+    indexer_last_batch: Option<i64>,
+}
+
+impl Followers {
+    pub(super) async fn read(h: &Harness) -> Self {
+        let p = &h.probes;
+        Self {
+            watcher_breaks: p
+                .aux_metric_where(DA_WATCHER_PORT, WATCHER_TICKS, "outcome=\"chain_break\"")
+                .await,
+            watcher_epochs: p.aux_metric(DA_WATCHER_PORT, WATCHER_EPOCHS).await,
+            indexer_errors: p
+                .aux_metric_where(INDEXER_PORT, INDEXER_TICKS, "outcome=\"error\"")
+                .await,
+            indexer_block: p.aux_metric(INDEXER_PORT, INDEXER_BLOCK).await,
+            indexer_last_batch: p.aux_metric(INDEXER_PORT, INDEXER_LAST_BATCH).await,
+        }
+    }
+
+    /// Both exporters answered with their progress gauges.
+    pub(super) fn require(self, ctx: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.watcher_breaks.is_some() && self.indexer_errors.is_some(),
+            "{}: {ctx}: a follower exporter does not answer ({})",
+            crate::FAIL_PREFIX,
+            self.show()
+        );
+        Ok(self)
+    }
+
+    /// Both followers counted a chain break since `base`.
+    pub(super) fn chain_broke_since(self, base: Self) -> bool {
+        rose(self.watcher_breaks, base.watcher_breaks)
+            && rose(self.indexer_errors, base.indexer_errors)
+    }
+
+    /// Both followers moved since `base`: the da-watcher published an
+    /// epoch, the indexer indexed a block.
+    fn advanced_since(self, base: Self) -> bool {
+        rose(self.watcher_epochs, base.watcher_epochs)
+            && rose(self.indexer_block, base.indexer_block)
+    }
+
+    pub(super) fn show(self) -> String {
+        let s = |v: Option<i64>| v.map_or("?".to_string(), |x| x.to_string());
+        format!(
+            "watcher chain_breaks={} epochs={} indexer errors={} block={} last_batch={}",
+            s(self.watcher_breaks),
+            s(self.watcher_epochs),
+            s(self.indexer_errors),
+            s(self.indexer_block),
+            s(self.indexer_last_batch)
+        )
+    }
+}
+
+fn rose(now: Option<i64>, base: Option<i64>) -> bool {
+    matches!((now, base), (Some(n), Some(b)) if n > b)
+}
+
+/// Both followers move again past `base`.
+pub(super) async fn await_resume(h: &Harness, base: Followers, ctx: &str) -> anyhow::Result<()> {
+    let last = std::cell::Cell::new(base);
+    let last_ref = &last;
+    let outcome = poll::until(
+        Budget::new(RESUME_BUDGET, Duration::from_secs(5)),
+        |_| async move {
+            let now = Followers::read(h).await;
+            last_ref.set(now);
+            Ok::<_, anyhow::Error>(now.advanced_since(base).then_some(now))
+        },
+    )
+    .await?;
+    let (now, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the followers did not resume within {}s (before: {}; last: {})",
+            t.as_secs(),
+            base.show(),
+            last.get().show()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: both followers resumed after {}s ({})",
+        elapsed.as_secs(),
+        now.show()
+    ));
+    Ok(())
+}
+
+/// The archive holds every batch L1 holds: the indexer's last batch
+/// index reaches the contract's counter.
+pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
+    let outcome = poll::until(
+        Budget::new(ARCHIVE_BUDGET, Duration::from_secs(5)),
+        |_| async move {
+            let on_l1 = i64::try_from(l1.last_batch_index().await?).unwrap_or(i64::MAX);
+            let archived = h.probes.aux_metric(INDEXER_PORT, INDEXER_LAST_BATCH).await;
+            Ok::<_, anyhow::Error>(archived.filter(|a| *a >= on_l1).map(|a| (a, on_l1)))
+        },
+    )
+    .await?;
+    let ((archived, on_l1), elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the archive did not reach L1's last batch within {}s",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: the archive is complete: batch {archived} archived, L1 at {on_l1} ({}s)",
+        elapsed.as_secs()
+    ));
+    Ok(())
+}
+
+/// The operator step a single-source follower needs after a wrong hash
+/// reached its anchor: the da-watcher's anchor is in memory, so a
+/// restart clears it; the indexer's cursor is on disk with the wrong
+/// hash, so its archive is re-indexed from the chain's first block. The
+/// two-source followers never store an unagreed hash, which removes
+/// this step.
+pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
+    crate::log(format!(
+        "{ctx}: OPERATOR STEP (removed by the two-source followers): restart the da-watcher, re-index the archive"
+    ));
+    let aux = h.probes.validator.container.clone();
+    h.inject_hard(&[&aux], "da-watcher").await?;
+    h.assert_count("da-watcher", 1, h.knobs.restart_slo).await?;
+    let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
+    indexer.stop().await?;
+    wipe_dirs(h, &aux, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;
+    indexer.restore().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_halt_and_a_resume_need_both_followers() {
+        let base = Followers {
+            watcher_breaks: Some(0),
+            watcher_epochs: Some(10),
+            indexer_errors: Some(0),
+            indexer_block: Some(20),
+            indexer_last_batch: Some(3),
+        };
+        let one = Followers {
+            watcher_breaks: Some(1),
+            ..base
+        };
+        assert!(!one.chain_broke_since(base));
+        let both = Followers {
+            indexer_errors: Some(2),
+            ..one
+        };
+        assert!(both.chain_broke_since(base));
+        assert!(!both.advanced_since(base));
+        let moved = Followers {
+            watcher_epochs: Some(11),
+            indexer_block: Some(21),
+            ..base
+        };
+        assert!(moved.advanced_since(base));
+        let dark = Followers {
+            watcher_breaks: None,
+            ..base
+        };
+        assert!(!dark.chain_broke_since(base) && dark.require("x").is_err());
+        assert!(base.require("x").is_ok());
+    }
+}

@@ -112,6 +112,7 @@ jobs:
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             -p kardamom-reconstruct -p kardamom-state-mirror -p kardamom-l1-indexer \
+            -p kardamom-l1-fault-proxy \
             --bins
           # Settlement-contract deploy for the live batcher (Ansible deployment Phase 2b).
           cargo build --release -p kardamom-deployer --bin kardamom-deploy
@@ -147,8 +148,10 @@ jobs:
     # since every case ends with a recovery probe and every shard ends with
     # the persisted-state audit and the rebuild from L1. A 60-minute limit
     # left five minutes of margin, and a slow runner cancelled a green
-    # shard in its last stage. 75 keeps a real hang bounded.
-    timeout-minutes: 75
+    # shard in its last stage. The chaos-l1 shard ends every case with
+    # that audit and holds two adaptive freezes, so it runs about 65
+    # minutes. 90 keeps a real hang bounded.
+    timeout-minutes: 90
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
@@ -164,8 +167,11 @@ jobs:
         # without their state databases, and the whole redis job.
         # chaos-coordinated crosses the redundancy of a role: both ingresses,
         # and both replicas of a sequencer lane.
+        # chaos-l1 puts a lying L1 endpoint in front of the followers: the
+        # staging incident's faults, the batcher's resume through them, and
+        # an outage past the sealer's retention.
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache, chaos-l1, semantics]
     steps:
       - uses: actions/checkout@v4
 

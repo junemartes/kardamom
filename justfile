@@ -333,7 +333,7 @@ stage-dist dist:
     # The services the images wrap (the state mirror included), the settlement
     # deployer and the semantics runner the stages spawn, the operator binary,
     # and the archive tool the archive-corruption case runs on the host.
-    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store reconstruct deploy semantics cluster archive-rereplicate; do
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy reconstruct deploy semantics cluster archive-rereplicate; do
         cp "$rel/kardamom-$bin" "$dist/$rel/"
     done
     # The shard test executable carries a build hash; the newest one is this build's.

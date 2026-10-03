@@ -151,13 +151,20 @@ Two low-rate counters deserve standing alerts:
   dedup, receipt-floor resync) let an invalid record into the canonical log:
   investigate the source, the chain itself is fine.
 
-The live batcher (#39) adds a settlement-health group on port 9002: in live
+The live batcher adds a settlement-health group on port 9002: in live
 mode `kardamom_batcher_batches_posted_total` / `_payload_bytes_posted_total` count
 **confirmed L1 posts** (not packed batches), `kardamom_batcher_last_posted_block`
 vs `kardamom_executor_block_number` is the DA-freshness lag to watch,
 `_l1_post_retries_total` flags a flaky L1, and `_skipped_posted_blocks_total`
 counts stale-cursor re-observations after a restart (bounded and expected —
 sustained growth means the cursor file is not being persisted).
+`kardamom_batcher_last_post_age_seconds` is the age of the last `BatchPosted`
+block as L1 serves it, read from L1 every ten seconds and never from the
+batcher's memory: it grows when the batcher stops posting and when its L1
+endpoint hides its posts; `KardamomBatcherLastPostStale` pages when it passes
+twice `kardamom_batcher_idle_flush_seconds`. `kardamom_batcher_resume_failures_total`
+counts starts whose L1 read failed; the start retries in-process, so the
+counter is scrapeable, and `KardamomBatcherResumeFailures` pages on the first.
 
 ## Quick start
 

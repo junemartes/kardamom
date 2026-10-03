@@ -97,6 +97,9 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     ));
     for case in &cases {
         harness.run_case(case).await?;
+        if shard.audits_each_case() {
+            harness.assert_persisted_state().await?;
+        }
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
     harness.ingress_churn().await?;
@@ -223,4 +226,10 @@ async fn chaos_retention() {
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_cache() {
     shard_test(Shard::Cache).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_l1() {
+    shard_test(Shard::L1).await;
 }
