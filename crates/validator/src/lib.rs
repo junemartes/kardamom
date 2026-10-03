@@ -58,6 +58,7 @@ pub mod epoch_verify;
 pub mod interop;
 pub mod metrics;
 pub mod prover;
+pub mod verdict;
 pub mod witness;
 
 mod block_accum;
