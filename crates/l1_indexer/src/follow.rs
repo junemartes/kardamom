@@ -9,8 +9,11 @@
 //!
 //! Each block's parent hash is checked against the indexed block's hash
 //! (through the cursor, so the check survives a restart). A break means
-//! the L1 view changed under a finalized block, which finality forbids;
-//! the follower reports it every tick until an operator looks.
+//! the L1 view changed under a finalized block, which finality forbids.
+//! The follower halts on it (`l1_chain_break`), retries the same range
+//! on every tick, and resumes by itself when the source serves a block
+//! that descends from the indexed one. An L1 source that does not
+//! answer halts it the same way (`l1_unreachable`).
 
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -22,6 +25,7 @@ use alloy_sol_types::SolEvent;
 use kardamom_batcher::da::DaProxy;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_da_watcher::{L1Source, L1SourceError};
+use kardamom_obs::halt;
 use kardamom_types::epoch::derive_epoch;
 use metrics::{counter, gauge};
 
@@ -119,8 +123,9 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
         self.cursor
     }
 
-    /// Tick forever at the poll interval. An error is logged and counted;
-    /// the next tick retries.
+    /// Tick forever at the poll interval. An error is logged and counted,
+    /// and a chain break or an unreachable L1 raises the follower's halt;
+    /// the next tick retries, and a good tick clears the halt.
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(self.cfg.poll_interval);
         loop {
@@ -131,14 +136,21 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
     async fn step(&mut self, interval: &mut tokio::time::Interval) {
         interval.tick().await;
         match self.tick().await {
-            Ok(Tick::Idle) => counter!(TICK_TOTAL, "outcome" => "idle").increment(1),
+            Ok(Tick::Idle) => {
+                counter!(TICK_TOTAL, "outcome" => "idle").increment(1);
+                halt::clear();
+            }
             Ok(Tick::Advanced { to, batches }) => {
                 tracing::info!(to, batches, "indexed");
                 counter!(TICK_TOTAL, "outcome" => "advanced").increment(1);
+                halt::clear();
             }
             Err(error) => {
                 tracing::error!(%error, "tick failed");
                 counter!(TICK_TOTAL, "outcome" => "error").increment(1);
+                if let Some(halt) = error.halt() {
+                    halt::raise(halt);
+                }
             }
         }
     }

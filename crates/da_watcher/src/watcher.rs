@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
+use kardamom_obs::halt::{self, Halt, HaltCause};
 
 use crate::source::LockboxLog;
 use tokio::sync::oneshot;
@@ -61,7 +62,9 @@ impl WatcherHandle {
 }
 
 /// Errors the watcher's tick loop reports up. A `Tip` or `Logs` error means
-/// the cursor did not advance. The next tick retries the same range.
+/// the cursor did not advance. The next tick retries the same range. A
+/// chain break and an L1 that does not answer also raise the watcher's
+/// halt (see [`MonitorError::halt`]).
 #[derive(Debug, thiserror::Error)]
 pub enum MonitorError {
     /// `L1Source::finalized_block_number` failed (transport or decode error).
@@ -103,6 +106,26 @@ pub enum MonitorError {
     /// The publisher transport is permanently closed. The watcher must exit.
     #[error("deposit publisher closed")]
     PublisherClosed,
+}
+
+impl MonitorError {
+    /// The halt this error puts the watcher in: `l1_chain_break` for a
+    /// block that does not descend from the published one,
+    /// `l1_unreachable` for an L1 source that does not answer. `None` for
+    /// every other error. Both halts clear by themselves: the watcher
+    /// retries the same range on every tick.
+    #[must_use]
+    pub fn halt(&self) -> Option<Halt> {
+        match self {
+            Self::ChainBreak { .. } => Some(Halt::new(HaltCause::L1ChainBreak, self.to_string())),
+            Self::Tip(L1SourceError::Provider(_))
+            | Self::Logs(L1SourceError::Provider(_))
+            | Self::BlockHash(L1SourceError::Provider(_)) => {
+                Some(Halt::new(HaltCause::L1Unreachable, self.to_string()))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// [`Tick::read_range`]'s result: the inclusive `from_block..=tip` range
@@ -210,19 +233,24 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     }
 
     /// Count and log one pass's outcome. Only a closed publisher stops
-    /// the loop; every other error retries on the next tick.
+    /// the loop; every other error retries on the next tick. A chain
+    /// break or an unreachable L1 raises the watcher's halt, and a good
+    /// pass clears it.
     fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
         match outcome {
             Ok(0) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
+                halt::clear();
             }
             Ok(n) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
                 info!(target: "da_watcher", published = n, "epochs published");
+                halt::clear();
             }
             Err(MonitorError::NotFinalized) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
                 debug!(target: "da_watcher", "L1 has no finalized block yet");
+                halt::clear();
             }
             Err(MonitorError::PublisherClosed) => {
                 warn!(target: "da_watcher", "publisher closed; exiting");
@@ -231,6 +259,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             Err(ref e @ MonitorError::ChainBreak { .. }) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "chain_break").increment(1);
                 warn!(target: "da_watcher", error = %e, "tick failed (the L1 view is not a chain)");
+                e.halt().map(halt::raise);
             }
             Err(
                 ref e @ (MonitorError::Tip(L1SourceError::Decode(_))
@@ -242,6 +271,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             Err(e) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
                 warn!(target: "da_watcher", error = %e, "tick failed");
+                e.halt().map(halt::raise);
             }
         }
         ControlFlow::Continue(())
