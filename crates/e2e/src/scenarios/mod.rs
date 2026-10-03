@@ -21,6 +21,7 @@ pub mod resize;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
 pub mod sequencer_restart;
+pub mod tx_status;
 pub mod upgrade;
 pub mod xchain;
 pub mod xchain_da_parity;

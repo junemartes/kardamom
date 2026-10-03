@@ -78,6 +78,9 @@ pub struct StackConfig {
     /// verifier's view is interposed, so a fault isolates to verification
     /// and does not also corrupt the epochs being produced.
     pub verified_l1: bool,
+    /// Also run `kardamom-notifier`, the transaction status feed. The
+    /// feed's WebSocket URL is [`crate::harness::LocalStack::notifier_ws_url`].
+    pub notifier: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -123,6 +126,7 @@ impl Default for StackConfig {
             l1: false,
             archive_durability: false,
             verified_l1: false,
+            notifier: false,
         }
     }
 }

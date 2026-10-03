@@ -23,7 +23,14 @@ use kardamom_types::BPosition;
 pub(super) struct PubEntry {
     pub(super) publication: Pub,
     pub(super) layout: TermLayout,
+    /// The Aeron stream id, the label of a dropped best-effort frame.
+    pub(super) stream_id: i32,
 }
+
+/// Best-effort frames the Aeron thread gave up on, by stream id. A
+/// best-effort publisher never learns of a drop: this counter is the
+/// only trace of one, so a dashboard reads it per stream.
+pub const BEST_EFFORT_DROPPED_TOTAL: &str = "kardamom_log_best_effort_dropped_total";
 
 /// Escalating idle wait. This is the Rust analogue of Aeron's
 /// `BackoffIdleStrategy`, which is what keeps the Java sealer stack's
@@ -105,6 +112,9 @@ pub(super) struct PendingPublish {
     /// Give up (ack an error, or log) once this instant passes. Bounds a
     /// publish to a never-connecting subscriber.
     pub(super) deadline: Instant,
+    /// The stream of `pub_id`, read when the frame was queued. `None` for
+    /// an unknown publication id, which fails on its first offer.
+    pub(super) stream_id: Option<i32>,
 }
 
 /// Attempt one offer for each pending publish, oldest first, preserving
@@ -180,8 +190,12 @@ enum OfferResult {
 fn fail_item(item: &mut PendingPublish, msg: String) {
     if let Some(ack) = item.ack.take() {
         let _ = ack.send(Err(LogError::Aeron(msg)));
-    } else {
-        warn!(pub_id = item.pub_id, "best-effort publish failed: {msg}");
+        return;
+    }
+    warn!(pub_id = item.pub_id, "best-effort publish failed: {msg}");
+    if let Some(stream_id) = item.stream_id {
+        metrics::counter!(BEST_EFFORT_DROPPED_TOTAL, "stream_id" => stream_id.to_string())
+            .increment(1);
     }
 }
 
@@ -333,6 +347,7 @@ mod drain_pending_tests {
         bytes.extend_from_slice(&[marker]);
         (
             PendingPublish {
+                stream_id: Some(1),
                 pub_id,
                 bytes,
                 ack: Some(tx),

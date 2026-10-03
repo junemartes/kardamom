@@ -128,6 +128,10 @@ ports:
   redis: 6379
   redis_sentinel: 26379
   state_mirror_metrics: 9007
+  # The notifier's client port (the status feed and POST /webhooks) and
+  # its Prometheus exporter, on the ingress nodes (nomad/notifier.nomad.hcl).
+  notifier_feed: 8547
+  notifier_metrics: 9008
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
   # are assigned in config/channels.toml.tpl.
@@ -141,6 +145,7 @@ paths:
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
+  notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
   l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor
   da_store_dir: /opt/kardamom/da-store     # the DA stand-in's payloads (no EigenDA network)

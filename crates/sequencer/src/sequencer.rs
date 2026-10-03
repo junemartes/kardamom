@@ -50,9 +50,10 @@
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
+use alloy_primitives::{Address, B256};
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{BPosition, TxError, TxErrorReason};
+use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
 use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
@@ -61,7 +62,7 @@ use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_decode::decode_nonce;
-use crate::outbound::{RefOffer, TxErrorPublisher, TxOrderingRefPublisher};
+use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
@@ -106,14 +107,23 @@ struct RefMetadata {
     max_inclusion_block: u64,
 }
 
+/// The identity of one observed envelope: what every report about it
+/// names. The hash is the status stream's key.
+#[derive(Clone, Copy, Debug)]
+struct Observed {
+    sender: Address,
+    nonce: u64,
+    tx_hash: B256,
+}
+
 /// One `Sequencer::run_once` iteration's port set: the `tx_data`
-/// subscription, the `tx_ordering` publisher, and the `tx_errors` publisher.
-/// Groups the three bounds behind one type parameter, instead of three
-/// separate ones on `run_once` and `run`.
+/// subscription, the `tx_ordering` publisher, and the side channels
+/// (`tx_errors`, `tx_status`). Groups the three bounds behind one type
+/// parameter, instead of three separate ones on `run_once` and `run`.
 pub trait SequencerPorts: Send {
     type In: TxDataSubscriber;
     type Refs: TxOrderingRefPublisher;
-    type Errors: TxErrorPublisher;
+    type Errors: SideChannelPublisher;
 
     /// Borrow the three ports for one iteration.
     fn split(&mut self) -> (&mut Self::In, &mut Self::Refs, &mut Self::Errors);
@@ -132,7 +142,7 @@ impl<I, B, R> SequencerPorts for Ports<'_, I, B, R>
 where
     I: TxDataSubscriber,
     B: TxOrderingRefPublisher,
-    R: TxErrorPublisher,
+    R: SideChannelPublisher,
 {
     type In = I;
     type Refs = B;
@@ -271,7 +281,7 @@ impl Sequencer {
     /// True when `sender` is in a shadow slot. Cheap outside a warm-up:
     /// no hash runs.
     #[inline]
-    fn in_shadow(&self, sender: alloy_primitives::Address) -> bool {
+    fn in_shadow(&self, sender: Address) -> bool {
         self.shadow
             .is_some_and(|s| s.vslots.contains(vslot_for(sender)))
     }
@@ -280,11 +290,25 @@ impl Sequencer {
     /// The shard that publishes the refs also owns the errors.
     fn publish_error<R>(&self, rc: &mut R, err: TxError)
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         if self.in_shadow(err.sender) {
             return;
         }
+        rc.publish_error(err);
+    }
+
+    /// Publish a rejection on both side channels: the `tx_errors` event
+    /// for the receipt feed, and the `Rejected` status for the status
+    /// feed. Silent for a sender in shadow mode, like `publish_error`.
+    fn publish_rejection<R>(&self, rc: &mut R, tx_hash: B256, err: TxError)
+    where
+        R: SideChannelPublisher,
+    {
+        if self.in_shadow(err.sender) {
+            return;
+        }
+        rc.publish_status(TxStatus::rejected(tx_hash, &err));
         rc.publish_error(err);
     }
 
@@ -346,20 +370,17 @@ impl Sequencer {
     /// are rebuffered, in reverse, so each sender's floor ends rewound to
     /// its lowest unpublished nonce. Dropping the tail would permanently
     /// lose refs whose nonces the state machine already advanced past.
-    fn flush_drained<B>(
+    fn flush_drained<P: SequencerPorts>(
         &mut self,
-        b: &mut B,
-        drained: Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+        ports: &mut P,
+        drained: Vec<(Address, u64, RefMetadata)>,
         ctx: &'static str,
-    ) -> Result<(), SequencerError>
-    where
-        B: TxOrderingRefPublisher,
-    {
+    ) -> Result<(), SequencerError> {
         // Chunked batch publish; see `flush_chunk`'s doc for the chunk
         // size and the MTU budget behind it.
         let mut rest = std::collections::VecDeque::from(self.suppress_shadow(drained, ctx));
         while !rest.is_empty() {
-            if let ControlFlow::Break(result) = self.flush_chunk(b, &mut rest, ctx) {
+            if let ControlFlow::Break(result) = self.flush_chunk(ports, &mut rest, ctx) {
                 return result;
             }
         }
@@ -374,9 +395,9 @@ impl Sequencer {
     /// refs that stay to be offered.
     fn suppress_shadow(
         &mut self,
-        drained: Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+        drained: Vec<(Address, u64, RefMetadata)>,
         ctx: &'static str,
-    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)> {
+    ) -> Vec<(Address, u64, RefMetadata)> {
         if self.shadow.is_none() {
             return drained;
         }
@@ -396,15 +417,12 @@ impl Sequencer {
     /// off the front of `rest`, and record what published. `Break` carries
     /// the flush's final error. `Continue` means the caller sends the next
     /// chunk.
-    fn flush_chunk<B>(
+    fn flush_chunk<P: SequencerPorts>(
         &mut self,
-        b: &mut B,
-        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+        ports: &mut P,
+        rest: &mut std::collections::VecDeque<(Address, u64, RefMetadata)>,
         ctx: &'static str,
-    ) -> ControlFlow<Result<(), SequencerError>>
-    where
-        B: TxOrderingRefPublisher,
-    {
+    ) -> ControlFlow<Result<(), SequencerError>> {
         // Each chunk rides one cluster app message (KIND_BATCH), which
         // amortizes the per-offer session round trip that dominated the
         // sequencer's per-transaction cost. The chunk must stay under one
@@ -427,8 +445,9 @@ impl Sequencer {
                 max_inclusion_block: m.max_inclusion_block,
             })
             .collect();
+        let (_, b, rc) = ports.split();
         let (published, err) = b.try_publish_ref_batch(&refs);
-        self.record_published_prefix(rest, published, ctx);
+        self.record_published_prefix(rc, rest, published, ctx);
         match err {
             None => ControlFlow::Continue(()),
             Some(SequencerError::Backpressure) => {
@@ -448,23 +467,26 @@ impl Sequencer {
     /// commit. The whole batch can vanish in a dead-leader window exactly
     /// like a single offer, so every ref in the accepted prefix enters
     /// the unconfirmed ledger individually.
-    fn record_published_prefix(
+    fn record_published_prefix<R: SideChannelPublisher>(
         &mut self,
-        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+        rc: &mut R,
+        rest: &mut std::collections::VecDeque<(Address, u64, RefMetadata)>,
         published: usize,
         ctx: &'static str,
     ) {
         for (sender, n, meta) in rest.drain(..published) {
-            self.record_one_published(sender, n, meta, ctx);
+            self.record_one_published(rc, sender, n, meta, ctx);
         }
     }
 
     /// One published ref, for [`Self::record_published_prefix`]'s loop:
-    /// bumps the publish metric, traces it, and (if resync is active)
-    /// records it in the unconfirmed ledger.
-    fn record_one_published(
+    /// bumps the publish metric, traces it, publishes its `Offered`
+    /// status, and (if resync is active) records it in the unconfirmed
+    /// ledger.
+    fn record_one_published<R: SideChannelPublisher>(
         &mut self,
-        sender: alloy_primitives::Address,
+        rc: &mut R,
+        sender: Address,
         n: u64,
         meta: RefMetadata,
         ctx: &'static str,
@@ -476,6 +498,7 @@ impl Sequencer {
             ctx,
             "published ref"
         );
+        rc.publish_status(TxStatus::offered(meta.tx_hash, sender, n));
         if self.resync.is_some() {
             self.unconfirmed.record_published(sender, n, meta);
         }
@@ -485,7 +508,7 @@ impl Sequencer {
     /// floor ends rewound to its lowest unpublished nonce.
     fn rebuffer_rest(
         &mut self,
-        rest: &mut std::collections::VecDeque<(alloy_primitives::Address, u64, RefMetadata)>,
+        rest: &mut std::collections::VecDeque<(Address, u64, RefMetadata)>,
     ) {
         while let Some((s, n2, m)) = rest.pop_back() {
             self.state.reinsert_for_retry(s, n2, m);
@@ -531,7 +554,7 @@ impl Sequencer {
     /// One receipt-proven floor update, for [`Self::apply_receipt_drain`]'s
     /// loop: advance the state machine's floor, and record the drops it
     /// proves, if the floor actually moved.
-    fn apply_one_floor_update(&mut self, sender: alloy_primitives::Address, floor: u64) {
+    fn apply_one_floor_update(&mut self, sender: Address, floor: u64) {
         let Some((from, dropped)) = self.state.advance_floor(sender, floor) else {
             return;
         };
@@ -582,34 +605,52 @@ impl Sequencer {
         r: &mut crate::resync::ResyncController,
         ports: &mut P,
     ) {
-        for (sender, nonce, max_inclusion_block, at_block) in r.drain_deadline_rejects() {
-            self.unconfirmed.drop_committed(sender, nonce);
-            warn!(
-                sender = ?sender,
-                nonce,
+        for reject in r.drain_deadline_rejects() {
+            self.report_past_deadline(ports, reject);
+        }
+    }
+
+    /// One past-deadline reject `(sender, nonce, max_inclusion_block,
+    /// at_block)`, for [`Self::apply_deadline_rejects`]'s loop. The
+    /// ledger entry carries the transaction's hash, so the `Rejected`
+    /// status goes out with the error. An entry a receipt or a rewind
+    /// already took gets the error only.
+    fn report_past_deadline<P: SequencerPorts>(
+        &mut self,
+        ports: &mut P,
+        reject: (Address, u64, u64, u64),
+    ) {
+        let (sender, nonce, max_inclusion_block, at_block) = reject;
+        let tx_hash = self
+            .unconfirmed
+            .drop_committed(sender, nonce)
+            .map(|meta| meta.tx_hash);
+        warn!(
+            sender = ?sender,
+            nonce,
+            max_inclusion_block,
+            at_block,
+            "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
+        );
+        let err = TxError {
+            sender,
+            nonce,
+            reason: TxErrorReason::PastDeadline {
                 max_inclusion_block,
                 at_block,
-                "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
-            );
-            let (_, _, errors) = ports.split();
-            self.publish_error(
-                errors,
-                TxError {
-                    sender,
-                    nonce,
-                    reason: TxErrorReason::PastDeadline {
-                        max_inclusion_block,
-                        at_block,
-                    },
-                },
-            );
+            },
+        };
+        let (_, _, rc) = ports.split();
+        match tx_hash {
+            Some(tx_hash) => self.publish_rejection(rc, tx_hash, err),
+            None => self.publish_error(rc, err),
         }
     }
 
     /// One committed-proof contiguity reject, for
     /// [`Self::apply_contiguity_rejects`]'s first loop.
-    fn drop_committed_and_trace(&mut self, sender: alloy_primitives::Address, n: u64) {
-        if self.unconfirmed.drop_committed(sender, n) {
+    fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
+        if self.unconfirmed.drop_committed(sender, n).is_some() {
             trace!(
                 sender = ?sender,
                 nonce = n,
@@ -622,7 +663,7 @@ impl Sequencer {
     /// [`Self::apply_contiguity_rejects`]'s second loop: rewind every
     /// unconfirmed ref the ledger holds for `sender` at or after
     /// `expected`, if any.
-    fn rewind_one_gap(&mut self, sender: alloy_primitives::Address, expected: u64) {
+    fn rewind_one_gap(&mut self, sender: Address, expected: u64) {
         let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
         if taken.is_empty() {
             return;
@@ -673,7 +714,7 @@ impl Sequencer {
     /// the order-execute-receipt round trip outran this replica's inbound
     /// processing. This is the resync mechanism absorbing a duplicate, not
     /// sequencer dirt and not a client error.
-    fn proven_executed(&self, sender: alloy_primitives::Address, nonce: u64) -> bool {
+    fn proven_executed(&self, sender: Address, nonce: u64) -> bool {
         self.resync
             .as_ref()
             .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
@@ -685,7 +726,7 @@ impl Sequencer {
     /// gap the client has not filled), and a lookup would say nothing
     /// new. The lookup task dedups senders and bounds the rate, so a
     /// request per park is cheap. See [`crate::lookup`].
-    fn request_lookup(&mut self, sender: alloy_primitives::Address) {
+    fn request_lookup(&mut self, sender: Address) {
         let floor_known = self
             .resync
             .as_ref()
@@ -706,11 +747,11 @@ impl Sequencer {
     /// `docs/specs/dynamic-sequencer-sizing.md`, section 3.3.
     fn expiry_tick<R>(&mut self, rc: &mut R)
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         let now = Instant::now();
-        for (sender, nonce) in self.state.sweep_expired(now, 256) {
-            self.report_expired(rc, sender, nonce);
+        for (sender, nonce, meta) in self.state.sweep_expired(now, 256) {
+            self.report_expired(rc, sender, nonce, meta.tx_hash);
         }
         self.shadow_tick(now);
         let depths = self.state.pending_depth_by(vslot_for);
@@ -724,9 +765,9 @@ impl Sequencer {
 
     /// One expired entry, for [`Self::expiry_tick`]'s loop: count it,
     /// trace it, and report `Expired` to the client.
-    fn report_expired<R>(&self, rc: &mut R, sender: alloy_primitives::Address, nonce: u64)
+    fn report_expired<R>(&self, rc: &mut R, sender: Address, nonce: u64, tx_hash: B256)
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         self.hot.expired.increment(1);
         trace!(
@@ -735,8 +776,9 @@ impl Sequencer {
             "pending entry expired after tx_ttl; reporting Expired"
         );
         let expected_nonce = self.state.next_nonce(sender);
-        self.publish_error(
+        self.publish_rejection(
             rc,
+            tx_hash,
             TxError {
                 sender,
                 nonce,
@@ -749,13 +791,14 @@ impl Sequencer {
     /// subscribers, that it will never be sequenced. A silent eviction
     /// would leave the client waiting forever, with its later nonces
     /// permanently gapped.
-    fn report_evicted<R>(&self, rc: &mut R, sender: alloy_primitives::Address, nonce: u64)
+    fn report_evicted<R>(&self, rc: &mut R, sender: Address, nonce: u64, tx_hash: B256)
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         let expected_nonce = self.state.next_nonce(sender);
-        self.publish_error(
+        self.publish_rejection(
             rc,
+            tx_hash,
             TxError {
                 sender,
                 nonce,
@@ -783,14 +826,15 @@ impl Sequencer {
     pub fn run_once<P: SequencerPorts>(&mut self, ports: &mut P) -> Result<bool, SequencerError> {
         // Resync bookkeeping runs first, every iteration. See `resync_tick`.
         self.resync_tick(ports);
-        let (channel_a, b, rc) = ports.split();
+        let (_, _, rc) = ports.split();
         self.expiry_tick(rc);
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
-            self.flush_drained(b, pending, "drain-pending")?;
+            self.flush_drained(ports, pending, "drain-pending")?;
             return Ok(true);
         }
+        let (channel_a, _, rc) = ports.split();
 
         // A sender with an unfillable nonce gap stalls here, recoverably.
         // A local fast-forward past the gap would adopt it into the
@@ -851,16 +895,21 @@ impl Sequencer {
             max_inclusion_block: envelope.max_inclusion_block,
         };
 
+        let observed = Observed {
+            sender,
+            nonce,
+            tx_hash: meta.tx_hash,
+        };
         let t0 = Instant::now();
         let result = self.state.process(sender, nonce, meta);
         self.hot
             .nonce_check_seconds
             .record(t0.elapsed().as_secs_f64());
 
-        let publishes = self.handle_outcome(rc, sender, nonce, result);
+        let publishes = self.handle_outcome(rc, observed, result);
         // On backpressure, the state machine rolls back. The reinsert
         // rebuffers every unpublished ref, so the retry replays them.
-        self.flush_drained(b, publishes, "ingress")?;
+        self.flush_drained(ports, publishes, "ingress")?;
         Ok(true)
     }
 
@@ -870,13 +919,17 @@ impl Sequencer {
     fn handle_outcome<R>(
         &mut self,
         rc: &mut R,
-        sender: alloy_primitives::Address,
-        nonce: u64,
+        observed: Observed,
         result: ProcessResult<RefMetadata>,
-    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)>
+    ) -> Vec<(Address, u64, RefMetadata)>
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
+        let Observed {
+            sender,
+            nonce,
+            tx_hash,
+        } = observed;
         match result.outcome {
             NonceOutcome::Matched => {}
             NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
@@ -886,11 +939,14 @@ impl Sequencer {
             NonceOutcome::BufferedDisabled => {
                 self.hot.buffered_future.increment(1);
             }
-            NonceOutcome::BufferedEvicting { evicted_nonce } => {
+            NonceOutcome::BufferedEvicting {
+                evicted_nonce,
+                evicted,
+            } => {
                 self.hot.buffered_future.increment(1);
                 self.hot.evictions.increment(1);
                 self.request_lookup(sender);
-                self.report_evicted(rc, sender, evicted_nonce);
+                self.report_evicted(rc, sender, evicted_nonce, evicted.tx_hash);
             }
             NonceOutcome::RejectedTooFar { nonce: rejected } => {
                 // The furthest-future nonce is shed to protect the
@@ -898,12 +954,12 @@ impl Sequencer {
                 // within the window. This counts as an eviction for
                 // observability (a load shed, not a wedge).
                 self.hot.evictions.increment(1);
-                self.report_evicted(rc, sender, rejected);
+                self.report_evicted(rc, sender, rejected, tx_hash);
             }
             NonceOutcome::Past => self.record_past_outcome(sender, nonce),
         }
 
-        self.collect_publishes(rc, sender, result.actions)
+        self.collect_publishes(rc, observed, result.actions)
     }
 
     /// Record bookkeeping for a `Past` outcome. Two different things
@@ -917,7 +973,7 @@ impl Sequencer {
     ///   would be spurious and could race the receipt at ingress).
     /// - An ordinary client double-submit or stale nonce: no floor proof.
     ///   Count it, and report it.
-    fn record_past_outcome(&mut self, sender: alloy_primitives::Address, nonce: u64) {
+    fn record_past_outcome(&mut self, sender: Address, nonce: u64) {
         if self.proven_executed(sender, nonce) {
             metrics::record_resync_skip(self.cfg.partition_index, 1);
         } else {
@@ -933,15 +989,15 @@ impl Sequencer {
     fn collect_publishes<R>(
         &self,
         rc: &mut R,
-        sender: alloy_primitives::Address,
+        observed: Observed,
         actions: Vec<ProcessAction<RefMetadata>>,
-    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)>
+    ) -> Vec<(Address, u64, RefMetadata)>
     where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         let mut publishes = Vec::new();
         for action in actions {
-            self.collect_one_action(rc, sender, action, &mut publishes);
+            self.collect_one_action(rc, observed, action, &mut publishes);
         }
         publishes
     }
@@ -953,40 +1009,43 @@ impl Sequencer {
     fn collect_one_action<R>(
         &self,
         rc: &mut R,
-        sender: alloy_primitives::Address,
+        observed: Observed,
         action: ProcessAction<RefMetadata>,
-        publishes: &mut Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+        publishes: &mut Vec<(Address, u64, RefMetadata)>,
     ) where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
         match action {
             ProcessAction::Publish { nonce: n, payload } => {
-                publishes.push((sender, n, payload));
+                publishes.push((observed.sender, n, payload));
             }
             ProcessAction::ReportDuplicate {
                 nonce: n,
                 expected_nonce,
-            } => self.report_duplicate_if_unproven(rc, sender, n, expected_nonce),
+            } => self.report_duplicate_if_unproven(rc, observed, n, expected_nonce),
         }
     }
 
     /// Report a duplicate submission on `rc`, unless a receipt already
     /// proves this sender and nonce executed. A proven duplicate is
-    /// routine and stays silent.
+    /// routine and stays silent. `nonce` is the duplicate's nonce, which
+    /// the state machine reports; `observed` names the transaction.
     fn report_duplicate_if_unproven<R>(
         &self,
         rc: &mut R,
-        sender: alloy_primitives::Address,
+        observed: Observed,
         nonce: u64,
         expected_nonce: u64,
     ) where
-        R: TxErrorPublisher,
+        R: SideChannelPublisher,
     {
+        let sender = observed.sender;
         if self.proven_executed(sender, nonce) {
             return;
         }
-        self.publish_error(
+        self.publish_rejection(
             rc,
+            observed.tx_hash,
             TxError {
                 sender,
                 nonce,
