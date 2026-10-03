@@ -7,6 +7,11 @@ const REBUILD_SECONDS: &str = "kardamom_state_mirror_rebuild_seconds";
 const REBUILDS_TOTAL: &str = "kardamom_state_mirror_rebuilds_total";
 const WRITE_RETRIES_TOTAL: &str = "kardamom_state_mirror_write_retries_total";
 const WAIT_REPLICA_ZERO_TOTAL: &str = "kardamom_state_mirror_wait_replica_zero_total";
+/// The unix time of the last applied batch. The readiness rule requires
+/// a recent one: the chain closes a block every second, so a mirror that
+/// applied nothing for the stale window is not attached.
+pub(crate) const LAST_ADVANCE_UNIX_SECONDS: &str =
+    "kardamom_state_mirror_last_advance_unix_seconds";
 
 /// Register the descriptions. Call once at startup.
 pub(crate) fn describe() {
@@ -28,6 +33,10 @@ pub(crate) fn describe() {
     metrics::describe_counter!(
         WAIT_REPLICA_ZERO_TOTAL,
         "batches no replica acknowledged within the wait"
+    );
+    metrics::describe_gauge!(
+        LAST_ADVANCE_UNIX_SECONDS,
+        "the unix time of the last applied batch"
     );
 }
 

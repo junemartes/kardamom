@@ -513,7 +513,18 @@ fn log_nonce_floor_sources(cfg: &SequencerConfig) {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("sequencer", args.metrics_addr, args.host_id.as_ref()).await?;
+    // Ready once the lane has left its startup resync and the cluster
+    // egress has delivered a canonical watermark: the replica publishes
+    // and its twin's dedup window is attached.
+    kardamom_obs::init_service!(
+        "sequencer",
+        args.metrics_addr,
+        args.host_id.as_ref(),
+        kardamom_obs::Readiness::up()
+            .equals(kardamom_sequencer::metrics::RESYNC_MODE, 0.0)
+            .present(kardamom_sequencer::metrics::CANONICAL_WATERMARK)
+    )
+    .await?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
     apply_cli_overrides(&args, &mut cfg)?;

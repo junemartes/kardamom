@@ -212,6 +212,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// Count and log one pass's outcome. Only a closed publisher stops
     /// the loop; every other error retries on the next tick.
     fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
+        kardamom_obs::ready::mark_now(metrics::LAST_TICK_UNIX_SECONDS);
         match outcome {
             Ok(0) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);

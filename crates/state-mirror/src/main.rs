@@ -97,6 +97,9 @@ struct Args {
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9007")]
     metrics_addr: SocketAddr,
+    /// `/ready` fails when no batch was applied for this many seconds.
+    #[arg(long, env = "KARDAMOM_MIRROR_READY_STALE_SECS", default_value_t = 30)]
+    ready_stale_secs: u64,
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
@@ -106,7 +109,16 @@ struct Args {
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("state-mirror", args.metrics_addr, args.host_id.as_str()).await?;
+    kardamom_obs::init_service!(
+        "state-mirror",
+        args.metrics_addr,
+        args.host_id.as_str(),
+        kardamom_obs::Readiness::up().fresh(
+            metrics::LAST_ADVANCE_UNIX_SECONDS,
+            std::time::Duration::from_secs(args.ready_stale_secs),
+        )
+    )
+    .await?;
     kardamom_cache::metrics::describe();
     metrics::describe();
 

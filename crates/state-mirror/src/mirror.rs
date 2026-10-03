@@ -196,6 +196,7 @@ impl Mirror {
     /// schedule the audit rebuild when it is due.
     async fn advance(&mut self, end: BPosition) -> Result<()> {
         self.applied = self.applied.max(end.as_index());
+        kardamom_obs::ready::mark_now(crate::metrics::LAST_ADVANCE_UNIX_SECONDS);
         let head = BPosition::from_index(self.applied);
         if let Err(e) = self.cache.set_head(self.id, head).await {
             warn!(error = %e, "head publish failed; the next batch retries");
