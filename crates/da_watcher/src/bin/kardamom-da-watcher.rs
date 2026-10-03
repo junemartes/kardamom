@@ -334,14 +334,14 @@ async fn main() -> anyhow::Result<()> {
     let (l1, interop) = resolve_paths(&args)?;
 
     // Ready while a watcher completed a tick within the last two periods,
-    // with one second of slack for the tick itself.
+    // with ten seconds of slack for the tick's own L1 round trips.
     let readiness = kardamom_obs::Readiness::up().fresh(
         kardamom_da_watcher::metrics::LAST_TICK_UNIX_SECONDS,
         Duration::from_secs(
             args.poll_interval_secs
                 .get()
                 .saturating_mul(2)
-                .saturating_add(1),
+                .saturating_add(10),
         ),
     );
     kardamom_obs::init_service!(

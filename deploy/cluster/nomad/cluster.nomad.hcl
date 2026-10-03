@@ -229,16 +229,11 @@ job "cluster" {
             member_id         = "${meta.node_index}"
           }
 
-          # The ingress endpoint answers connects while the member runs.
-          check {
-            type     = "tcp"
-            interval = "10s"
-            timeout  = "2s"
-          }
-
           # The member's own verdict: 200 once it is LEADER or FOLLOWER
           # with the election closed and its service caught up to the
-          # commit position; 503 while it elects or catches up.
+          # commit position; 503 while it elects or catches up. The
+          # ingress endpoint is an Aeron UDP channel, so it has no
+          # connect check of its own.
           check {
             name      = "member-ready"
             type      = "http"

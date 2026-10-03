@@ -99,6 +99,7 @@ impl Mirror {
         if self.pending_rebuild.is_none() {
             self.pending_rebuild = self.resume_or_rebuild().await;
         }
+        crate::metrics::set_serving(true);
         loop {
             let batch = tokio::select! {
                 biased;
@@ -152,11 +153,13 @@ impl Mirror {
     /// Run the rebuild, with the first live position as its floor.
     async fn run_rebuild(&mut self, reason: RebuildReason, first_live: BPosition) -> Result<()> {
         info!(reason = reason.label(), "rebuild: starting");
+        crate::metrics::set_serving(false);
         let started = Instant::now();
         self.rebuild
             .run(&self.cache, first_live, &self.shutdown)
             .await?;
         crate::metrics::record_rebuild(reason.label(), started.elapsed().as_secs_f64());
+        crate::metrics::set_serving(true);
         self.last_rebuild = Instant::now();
         Ok(())
     }
@@ -196,7 +199,6 @@ impl Mirror {
     /// schedule the audit rebuild when it is due.
     async fn advance(&mut self, end: BPosition) -> Result<()> {
         self.applied = self.applied.max(end.as_index());
-        kardamom_obs::ready::mark_now(crate::metrics::LAST_ADVANCE_UNIX_SECONDS);
         let head = BPosition::from_index(self.applied);
         if let Err(e) = self.cache.set_head(self.id, head).await {
             warn!(error = %e, "head publish failed; the next batch retries");

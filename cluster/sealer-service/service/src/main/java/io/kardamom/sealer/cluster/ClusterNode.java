@@ -166,8 +166,10 @@ public final class ClusterNode {
 
     /**
      * The member-status admin endpoint
-     * ({@code -Dkardamom.cluster.adminPort}, default 40205, 0 disables it;
-     * {@code -Dkardamom.cluster.readyLagBytes}, default 4 MiB).
+     * ({@code -Dkardamom.cluster.adminPort}; unset or 0 disables it, and
+     * the deploy passes 40205; {@code -Dkardamom.cluster.readyLagBytes},
+     * default 4 MiB). The port is off by default because two members on
+     * one host, as in the local e2e stacks, cannot share it.
      *
      * <p>{@code /ready} is the service check of the member: it passes when
      * the member holds a settled role with its election closed and the
@@ -341,8 +343,8 @@ public final class ClusterNode {
     static final long JOIN_WATCHDOG_POLL_MS = 1_000;
     /** Process exit code when the join watchdog fires. */
     static final int JOIN_WEDGE_EXIT_CODE = 3;
-    /** The admin endpoint's port; the member ports end at 40204. */
-    static final int DEFAULT_ADMIN_PORT = 40205;
+    /** The admin endpoint's port when none is given: 0, off. */
+    static final int DEFAULT_ADMIN_PORT = 0;
     /** The service lag behind the commit position that still reads as ready. */
     static final long DEFAULT_READY_LAG_BYTES = 4L * 1024 * 1024;
 

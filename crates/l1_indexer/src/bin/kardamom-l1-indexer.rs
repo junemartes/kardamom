@@ -70,15 +70,15 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    // Ready while a tick completed within the last two periods, with one
-    // second of slack for the tick itself.
+    // Ready while a tick completed within the last two periods, with ten
+    // seconds of slack for the tick's own L1 round trips.
     let readiness = kardamom_obs::Readiness::up().fresh(
         kardamom_l1_indexer::metrics::LAST_TICK_UNIX_SECONDS,
         Duration::from_secs(
             args.poll_interval_secs
                 .get()
                 .saturating_mul(2)
-                .saturating_add(1),
+                .saturating_add(10),
         ),
     );
     kardamom_obs::init_service!(
