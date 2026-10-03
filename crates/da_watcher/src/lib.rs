@@ -55,6 +55,11 @@
 //! `kardamom_types::xchain`, for the same reason the deposit rule lives in
 //! `kardamom_types::epoch`.
 
+// The `#[async_trait]` and `#[rpc]` macros expand trait methods to functions
+// that carry a bare `#[must_use]` and return a pinned boxed future, which is
+// `#[must_use]` on its own. The lint fires in the macros' output, so the crate
+// allows it here.
+#![allow(clippy::double_must_use)]
 pub mod interop;
 pub mod metrics;
 pub mod publisher;
