@@ -222,18 +222,16 @@ async fn rejects_other_methods_and_bad_input() {
     assert!(get.starts_with("HTTP/1.0 404"), "{get}");
 }
 
-/// The batcher reads a block it can no longer replay from the sealer as
-/// references: the block's boundary and, in canonical order, where the
-/// bytes of each transaction are. A deposit is not listed. A block not
-/// committed yet is `null`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serves_the_block_references_and_null_for_an_unknown_block() {
+/// A state DB with two committed blocks. Block 1: one transaction,
+/// ending at index 1. Block 2: a deposit at 1, then two transactions at
+/// 2 and 3, ending at index 4. Every transaction has an archive
+/// reference on session -9.
+fn env_with_two_blocks(dir: &std::path::Path) -> StateEnv {
     use crate::writer::{StateWriter, WriteBatch};
     use kardamom_types::receipt::TX_TYPE_DEPOSIT;
     use kardamom_types::{BPosition, BlockBoundary, BlockDelta, TxRef};
 
-    let dir = tempfile::tempdir().unwrap();
-    let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+    let env = StateEnvBuilder::new(dir).open().unwrap();
     seed_genesis(&env, &[], &[]).unwrap();
     let mut handle = StateWriter::spawn(env.clone()).unwrap();
     let receipt = |idx: u64, hash: u8, tx_type: u8| Receipt {
@@ -243,8 +241,6 @@ async fn serves_the_block_references_and_null_for_an_unknown_block() {
         block_number: 2,
         ..Receipt::default()
     };
-    // Block 1: one transaction, ends at index 1. Block 2: a deposit at 1,
-    // then two transactions at 2 and 3, ends at index 4.
     let first = BlockDelta {
         block_number: 1,
         receipts: vec![Receipt {
@@ -293,7 +289,17 @@ async fn serves_the_block_references_and_null_for_an_unknown_block() {
         ))
         .unwrap();
     handle.shutdown().unwrap();
+    env
+}
 
+/// The batcher reads a block it can no longer replay from the sealer as
+/// references: the block's boundary and, in canonical order, where the
+/// bytes of each transaction are. A deposit is not listed. A block not
+/// committed yet is `null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serves_the_block_references_and_null_for_an_unknown_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_with_two_blocks(dir.path());
     let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
     let addr = server.addr;
     let ask = move |params: &'static str| {
