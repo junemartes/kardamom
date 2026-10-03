@@ -26,11 +26,12 @@
 mod cursor;
 mod feed;
 pub mod poll;
+mod post_age;
 mod run;
 mod sender;
 mod spool;
 
-pub use cursor::{BatchCursor, read_last_batch_index};
+pub use cursor::{BatchCursor, L1Truth, read_last_batch_index};
 pub use run::{LiveArgs, connect_l1, run};
 pub use sender::LiveSender;
 
@@ -53,4 +54,15 @@ pub(crate) mod live_metric_names {
     /// Re-observed blocks dropped because L1 already covers them (stale
     /// cursor replay after a crash between post and cursor write).
     pub(crate) const SKIPPED_POSTED_BLOCKS: &str = "kardamom_batcher_skipped_posted_blocks_total";
+    /// Seconds since the block of the last `BatchPosted` log on L1, as
+    /// L1 serves it. The value comes from L1 on every probe tick, never
+    /// from this process's memory: an endpoint that swallows the logs
+    /// makes it grow, which is the alert.
+    pub(crate) const LAST_POST_AGE: &str = "kardamom_batcher_last_post_age_seconds";
+    /// The idle flush wait, in seconds. The alert rule compares the post
+    /// age with twice this value.
+    pub(crate) const IDLE_FLUSH_SECONDS: &str = "kardamom_batcher_idle_flush_seconds";
+    /// Starts whose L1 read failed. The start retries in-process, so the
+    /// counter is scrapeable while L1 stays unreachable.
+    pub(crate) const RESUME_FAILURES: &str = "kardamom_batcher_resume_failures_total";
 }

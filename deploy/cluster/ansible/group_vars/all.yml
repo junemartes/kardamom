@@ -129,6 +129,7 @@ ports:
   redis_sentinel: 26379
   state_mirror_metrics: 9007
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
+  l1_fault_proxy: 8547        # the lying L1 proxy of the chaos-l1 shard, in front of anvil
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
   # are assigned in config/channels.toml.tpl.
   aeron_channel_base: 40000

@@ -14,7 +14,7 @@ use crate::batcher::{PostedBatch, metric_names};
 use crate::da::DaProxy;
 use crate::l1::post_batch;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth};
+use super::cursor::{BatchCursor, L1Truth};
 use super::live_metric_names;
 
 /// A streaming L1 sender. It posts one packed group at a time, strictly
@@ -27,8 +27,6 @@ pub struct LiveSender<P> {
     prev_index: u64,
     max_retries: u32,
     cursor_path: PathBuf,
-    /// Where the `BatchPosted` scan of a reconcile starts.
-    settlement_deploy_block: u64,
 }
 
 impl<P: Provider> LiveSender<P> {
@@ -39,7 +37,6 @@ impl<P: Provider> LiveSender<P> {
         prev_index: u64,
         max_retries: u32,
         cursor_path: PathBuf,
-        settlement_deploy_block: u64,
     ) -> Self {
         Self {
             provider,
@@ -48,7 +45,6 @@ impl<P: Provider> LiveSender<P> {
             prev_index,
             max_retries,
             cursor_path,
-            settlement_deploy_block,
         }
     }
 
@@ -150,12 +146,7 @@ impl<P: Provider> LiveSender<P> {
         batch: &PostedBatch,
         e: &crate::error::BatcherError,
     ) -> Result<bool> {
-        let truth = read_l1_truth(
-            &self.provider,
-            self.settlement,
-            self.settlement_deploy_block,
-        )
-        .await;
+        let truth = L1Truth::read(&self.provider, self.settlement).await;
         let next_index = self.next_index()?;
         match truth {
             Ok(t) if t.last_batch_index == next_index => {

@@ -10,6 +10,7 @@ use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
+use metrics::{counter, gauge};
 use tokio::sync::mpsc::Receiver;
 use tracing::{info, warn};
 
@@ -24,17 +25,19 @@ use kardamom_log::discovery::StreamPlane;
 
 use crate::da::DaProxy;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
+use super::cursor::{BatchCursor, L1Truth, PayloadSources, reconcile};
+use super::feed::{FeedConfig, FeedLoop};
+use super::live_metric_names;
+use super::post_age::PostAge;
+use super::sender::LiveSender;
 use super::spool::{Restored, Spool};
 use crate::indexer::IndexerClient;
 
-/// How a start waits for the indexer to reach the last posted batch: the
-/// indexer follows the finalized L1, about 13 minutes behind the head on
-/// Ethereum, and a batch posted just before the start is not there yet.
-const INDEXER_POLL: Duration = Duration::from_secs(12);
-const INDEXER_POLLS: u32 = 100;
-use super::feed::{FeedConfig, FeedLoop};
-use super::sender::LiveSender;
+/// How often the post-age probe asks L1 for the last `BatchPosted` log.
+/// Its own cadence, apart from the feed loop's tick: one log query and
+/// one block read per probe, which a public endpoint tolerates at this
+/// rate and not at the feed's one-second tick.
+const POST_AGE_EVERY: Duration = Duration::from_secs(10);
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
 /// the same `[cluster]` section shape as the executor and the validator.
@@ -51,7 +54,7 @@ pub(crate) struct BatcherFileConfig {
 /// # Errors
 /// Returns an error when the key does not parse, or the L1 RPC connection
 /// or the blob store fails to open.
-pub async fn connect_l1(rpc: &str, key: &str) -> Result<impl Provider + 'static> {
+pub async fn connect_l1(rpc: &str, key: &str) -> Result<impl Provider + Clone + 'static> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
     ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
@@ -97,13 +100,13 @@ pub struct LiveArgs {
     /// See [`FeedConfig::target_payload_bytes`].
     pub target_payload_bytes: NonZeroUsize,
     pub l1_retries: u32,
-    /// The inbox indexer's API. With it, a batcher without a cursor file
-    /// resumes just past the last posted batch, and no start reads
-    /// `BatchPosted` events from L1. Without it, a missing cursor file
-    /// replays from genesis.
+    /// The inbox indexer's API. A batcher without a cursor file reads the
+    /// last posted batch's blobs from it, when it holds them; a start
+    /// never waits on it.
     pub indexer_url: Option<String>,
     /// The settlement contract's deployment block: where a `BatchPosted`
-    /// scan starts when no indexer serves it.
+    /// scan starts, for the post-age probe and for a start without a
+    /// cursor file that the indexer cannot serve.
     pub settlement_deploy_block: u64,
 }
 
@@ -118,30 +121,26 @@ struct L1Side<P> {
     skip_through_block: u64,
 }
 
+/// What a resume read from L1: its truth, and the cursor rebuilt from
+/// the last batch's payload when no cursor file exists.
+struct Resumed {
+    l1_truth: L1Truth,
+    rebuilt: Option<(BatchCursor, u64)>,
+}
+
 impl LiveArgs {
-    /// Connect to L1 and reconcile the durable cursor against it.
-    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
+    /// Connect to L1 and reconcile the durable cursor against it. The L1
+    /// reads retry until L1 answers; the reconcile of a cursor file that
+    /// is ahead of L1 is a refusal, decided once.
+    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + Clone + 'static>> {
         let provider = connect_l1(&self.rpc, &self.key).await?;
         let da = DaProxy::new(&self.da_proxy)?;
-        let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
-        let l1_truth = match &indexer {
-            Some(ix) => {
-                L1Truth::read_via_indexer(
-                    &provider,
-                    self.settlement,
-                    ix,
-                    INDEXER_POLL,
-                    INDEXER_POLLS,
-                )
-                .await?
-            }
-            None => read_l1_truth(&provider, self.settlement, self.settlement_deploy_block).await?,
-        };
-        let (cursor, skip_through_block) = match (BatchCursor::load(&self.cursor_file)?, &indexer) {
-            (None, Some(ix)) if l1_truth.last_batch_index > 0 => {
-                resume_from_indexer(ix, l1_truth).await?
-            }
-            (loaded, _) => reconcile(loaded, l1_truth)?,
+        let loaded = BatchCursor::load(&self.cursor_file)?;
+        let resumed = self.resume_until_l1_answers(&provider, &da, loaded).await;
+        let l1_truth = resumed.l1_truth;
+        let (cursor, skip_through_block) = match resumed.rebuilt {
+            Some(rebuilt) => rebuilt,
+            None => reconcile(loaded, l1_truth)?,
         };
         info!(
             settlement = %self.settlement,
@@ -160,6 +159,78 @@ impl LiveArgs {
             cursor,
             skip_through_block,
         })
+    }
+
+    /// One resume: L1's truth from the contract, and the cursor rebuilt
+    /// from the last batch's payload when there is no cursor file.
+    async fn resume_once<P: Provider>(
+        &self,
+        provider: &P,
+        da: &DaProxy,
+        loaded: Option<BatchCursor>,
+    ) -> Result<Resumed> {
+        let l1_truth = L1Truth::read(provider, self.settlement).await?;
+        let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
+        let rebuilt = match loaded {
+            None if l1_truth.last_batch_index > 0 => Some(
+                PayloadSources {
+                    indexer: indexer.as_ref(),
+                    provider,
+                    da,
+                    settlement: self.settlement,
+                    deploy_block: self.settlement_deploy_block,
+                }
+                .resume(l1_truth)
+                .await?,
+            ),
+            _ => None,
+        };
+        Ok(Resumed { l1_truth, rebuilt })
+    }
+
+    /// Resume, again after every failure, until L1 answers. A batcher
+    /// without L1 has nothing to do, and an exit would hide the failure
+    /// behind the orchestrator's restart loop: the exporter stays up, each
+    /// failure counts on the resume-failures metric, and the log names it.
+    async fn resume_until_l1_answers<P: Provider>(
+        &self,
+        provider: &P,
+        da: &DaProxy,
+        loaded: Option<BatchCursor>,
+    ) -> Resumed {
+        let mut attempt: u32 = 0;
+        loop {
+            if let Some(resumed) = self.resume_step(provider, da, loaded, &mut attempt).await {
+                return resumed;
+            }
+        }
+    }
+
+    /// One attempt; `None` after a counted failure and its backoff.
+    async fn resume_step<P: Provider>(
+        &self,
+        provider: &P,
+        da: &DaProxy,
+        loaded: Option<BatchCursor>,
+        attempt: &mut u32,
+    ) -> Option<Resumed> {
+        let error = match self.resume_once(provider, da, loaded).await {
+            Ok(resumed) => return Some(resumed),
+            Err(error) => error,
+        };
+        counter!(live_metric_names::RESUME_FAILURES).increment(1);
+        // Bounded by the shift below; saturate so a long outage keeps
+        // counting instead of wrapping to a short backoff.
+        *attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_secs(1 << (*attempt).min(5));
+        warn!(
+            attempt = *attempt,
+            backoff_s = backoff.as_secs(),
+            error = %format!("{error:#}"),
+            "resume failed; L1 did not answer; retrying"
+        );
+        tokio::time::sleep(backoff).await;
+        None
     }
 }
 
@@ -414,6 +485,17 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     run_cfg.resolve_cluster_ingress().await?;
     let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, resume)?;
 
+    gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
+        .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
+    let age_probe = tokio::spawn(
+        PostAge::new(
+            l1.provider.clone(),
+            args.settlement,
+            args.settlement_deploy_block,
+            POST_AGE_EVERY,
+        )
+        .run(),
+    );
     let sender = LiveSender::new(
         l1.provider,
         args.settlement,
@@ -421,7 +503,6 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         l1.l1_truth.last_batch_index,
         args.l1_retries,
         args.cursor_file,
-        args.settlement_deploy_block,
     );
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,
@@ -439,10 +520,12 @@ pub async fn run(args: LiveArgs) -> Result<()> {
             // Exit cleanly. The cursor is reconciled against L1 truth on
             // every restart, so tearing down mid-batch loses nothing.
             info!("shutdown signal received; stopping live batcher");
+            age_probe.abort();
             run_cfg.plane.shutdown().await;
             return Ok(());
         }
     };
+    age_probe.abort();
     match feed_result {
         Ok(()) => Ok(()),
         Err(e) => Err(handles.surface_errors(e)),

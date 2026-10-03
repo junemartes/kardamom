@@ -144,7 +144,9 @@ impl<'a> StackLaunch<'a> {
             attester_key: super::l1::ATTESTER_KEY.to_string(),
         });
         let verified_l1 = match (self.cfg.verified_l1, l1) {
-            (true, Some(l)) => Some(super::l1_verified::VerifiedL1::spawn(&l.rpc_url()).await?),
+            (true, Some(l)) => Some(
+                super::l1_verified::VerifiedL1::spawn(&l.rpc_url(), "127.0.0.1:0".parse()?).await?,
+            ),
             _ => None,
         };
         let validator = match (&da_watcher, &verified_l1) {

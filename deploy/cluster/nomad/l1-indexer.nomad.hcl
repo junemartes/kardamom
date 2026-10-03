@@ -10,11 +10,12 @@
 # committed to, as the proxy served and checked it, and losing the
 # archive costs a re-index from the start block, not the chain.
 #
-# Like the light client, this job deploys only against a real network:
-# it follows finality, which anvil does not have.
-# CI does not exercise it. Validate a change to it against a testnet.
-# The empty defaults exist for `just validate` only; the workloads role
-# passes every value.
+# Like the light client, this job deploys against a real network: it
+# follows finality. The chaos-l1 shard also deploys it against the
+# in-cluster anvil, through the L1 fault proxy, where anvil finalizes
+# two blocks behind its head; that shard is the only CI run of it. Validate a change
+# to it against a testnet too. The empty defaults exist for
+# `just validate` only; the workloads role passes every value.
 
 variable "l1_rpc" {
   type        = string
@@ -43,6 +44,12 @@ variable "lockbox_address" {
 variable "start_block" {
   type        = string
   description = "The first L1 block to index on an empty archive: the block of the contract deploy. Empty: the finalized block at first start."
+  default     = ""
+}
+
+variable "poll_interval_secs" {
+  type        = string
+  description = "The poll cadence, in seconds. Empty: the binary's default, 12."
   default     = ""
 }
 
@@ -137,6 +144,7 @@ job "l1-indexer" {
             "--listen", "0.0.0.0:${var.rpc_port}",
           ],
           var.start_block != "" ? ["--start-block", var.start_block] : [],
+          var.poll_interval_secs != "" ? ["--poll-interval-secs", var.poll_interval_secs] : [],
         )
       }
 

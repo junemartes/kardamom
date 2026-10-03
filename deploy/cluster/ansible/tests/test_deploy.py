@@ -19,6 +19,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
             'batcher', 'state-mirror', 'da-store']
+# The images the manifest pins beyond the default deployment: the jobs a
+# real L1 or the chaos-l1 shard adds.
+MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -76,7 +79,7 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.manifest = Path(self.tmp.name) / 'images.digests'
         self.manifest.write_text(''.join(
-            f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in SERVICES))
+            f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in MANIFEST))
         self.api = ThreadingHTTPServer(('127.0.0.1', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': []}
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
@@ -200,6 +203,22 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_fault_proxy_routes_the_followers_through_it(self):
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'}, check=True)
+        plans = self.api.state['plans']
+        proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
+        self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
+        anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
+        for job in ('batcher', 'da-watcher', 'l1-indexer'):
+            self.assertIn(proxy, json.dumps(plans[job]), job)
+        indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
+        self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
+        self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
+        self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertEqual(self.api.state['writes'], [])
 
     def test_resize_reuses_deployment_inputs_and_image_pins(self):

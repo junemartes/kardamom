@@ -112,6 +112,12 @@ contract_mirrors:
       - chain_id          = "{{ chain_id }}"
       - cluster_id        = "${meta.cluster_id}"
     forbidden: []
+  - path: deploy/cluster/nomad/l1-fault-proxy.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-fault-proxy:{{ image_tag }}'
+      - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
+      - default     = {{ ports.l1_fault_proxy }}
+    forbidden: []
   - path: deploy/cluster/nomad/anvil.nomad.hcl
     required:
       - '"{{ ports.anvil_l1 }}"'
