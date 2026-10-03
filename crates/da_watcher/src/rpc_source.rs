@@ -61,11 +61,11 @@ impl<P> RpcL1Source<P> {
 /// variant, so a source set rotates the endpoint out instead of
 /// reporting a generic failure.
 fn provider_error(e: RpcError<TransportErrorKind>) -> L1SourceError {
-    match &e {
+    match e {
         RpcError::Transport(TransportErrorKind::HttpError(http)) if http.is_rate_limit_err() => {
             L1SourceError::RateLimited
         }
-        _ => L1SourceError::Provider(e.to_string()),
+        other => L1SourceError::Provider(other.to_string()),
     }
 }
 

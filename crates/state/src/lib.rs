@@ -46,4 +46,6 @@ pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
 // (the validator's witness anchoring) need to name these types without
 // adding their own libmdbx dependency.
 pub use signet_libmdbx;
-pub use writer::{PayloadRetention, StateWriter, TrieMode, WriteBatch, WriterHandle, WriterOptions};
+pub use writer::{
+    PayloadRetention, StateWriter, TrieMode, WriteBatch, WriterHandle, WriterOptions,
+};

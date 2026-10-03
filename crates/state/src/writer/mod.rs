@@ -352,8 +352,8 @@ impl StateWriter {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod trie_writer_tests;
-#[cfg(test)]
 #[path = "payload_tests.rs"]
 mod payload_tests;
+#[cfg(test)]
+#[path = "tests.rs"]
+mod trie_writer_tests;

@@ -212,11 +212,8 @@ impl Kar1Payload {
 /// # Errors
 /// Returns an error when the block count overflows `u32`.
 pub fn encode(payload: &Kar1Payload) -> Result<Vec<u8>, Kar1Error> {
-    let mut enc = FrameWriter::header(
-        payload.version()?,
-        payload.compressed,
-        payload.blocks.len(),
-    )?;
+    let mut enc =
+        FrameWriter::header(payload.version()?, payload.compressed, payload.blocks.len())?;
     payload
         .blocks
         .iter()
@@ -464,9 +461,10 @@ impl<'a> Reader<'a> {
         (n as usize).min(self.buf.len() / min_elem_bytes.get())
     }
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], Kar1Error> {
-        let (s, rest) = self.buf.split_at_checked(n).ok_or_else(|| {
-            Kar1Error(format!("short read: want {n}, have {}", self.buf.len()))
-        })?;
+        let (s, rest) = self
+            .buf
+            .split_at_checked(n)
+            .ok_or_else(|| Kar1Error(format!("short read: want {n}, have {}", self.buf.len())))?;
         self.buf = rest;
         Ok(s)
     }
@@ -474,9 +472,10 @@ impl<'a> Reader<'a> {
     /// length at the type level, so there is no fallible conversion after
     /// the short-read check.
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], Kar1Error> {
-        let (chunk, rest) = self.buf.split_first_chunk::<N>().ok_or_else(|| {
-            Kar1Error(format!("short read: want {N}, have {}", self.buf.len()))
-        })?;
+        let (chunk, rest) = self
+            .buf
+            .split_first_chunk::<N>()
+            .ok_or_else(|| Kar1Error(format!("short read: want {N}, have {}", self.buf.len())))?;
         self.buf = rest;
         Ok(*chunk)
     }
@@ -601,9 +600,7 @@ impl<'a> Reader<'a> {
                 context: B256::from_slice(self.read_bytes(32)?),
             }),
             other => {
-                return Err(Kar1Error(format!(
-                    "invalid callback flag: {other}"
-                )));
+                return Err(Kar1Error(format!("invalid callback flag: {other}")));
             }
         };
         Ok(XChainMessage {

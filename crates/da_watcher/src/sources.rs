@@ -255,10 +255,10 @@ impl<S: L1Source> L1Sources<S> {
 
     /// The answers of `live`, in its order. Each trait method asks the
     /// live members concurrently, then settles the answers here.
-    fn answered<'a, R>(
-        live: Vec<&'a Member<S>>,
+    fn answered<R>(
+        live: Vec<&Member<S>>,
         results: Vec<Result<R, L1SourceError>>,
-    ) -> Vec<Answer<'a, S, R>> {
+    ) -> Vec<Answer<'_, S, R>> {
         live.into_iter()
             .zip(results)
             .map(|(member, result)| Answer { member, result })
@@ -278,7 +278,12 @@ impl<S: L1Source> L1Sources<S> {
         settled
     }
 
-    fn settle_one<'a, R>(&self, what: &str, answer: Answer<'a, S, R>, into: &mut Settled<'a, S, R>) {
+    fn settle_one<'a, R>(
+        &self,
+        what: &str,
+        answer: Answer<'a, S, R>,
+        into: &mut Settled<'a, S, R>,
+    ) {
         let member = answer.member;
         match answer.result {
             Ok(value) if member.authoritative => into.authoritative = Some(value),
@@ -334,7 +339,8 @@ impl<S: L1Source> L1Sources<S> {
         match rest.iter().find(|(_, value)| value != truth) {
             None => Ok(truth.clone()),
             Some((other, value)) => {
-                let halt = SourceHalt::disagreement(what, (&first.name, truth), (&other.name, value));
+                let halt =
+                    SourceHalt::disagreement(what, (&first.name, truth), (&other.name, value));
                 halt.report();
                 Err(L1SourceError::Halt(halt))
             }

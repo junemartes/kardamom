@@ -42,8 +42,8 @@ impl FakeStore {
                     let result = rows
                         .get(&number)
                         .map(|bytes| format!("0x{}", alloy_primitives::hex::encode(bytes)));
-                    let reply =
-                        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+                    let reply = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result})
+                        .to_string();
                     let head = format!(
                         "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         reply.len()
@@ -100,7 +100,11 @@ pub(crate) fn stored_row(block: &ClosedBlock) -> Vec<u8> {
     };
     let records = BlockRecords {
         remote_epochs: block.remote_epochs.clone(),
-        txs: block.txs.iter().map(|t| TxFrame::from(&t.envelope)).collect(),
+        txs: block
+            .txs
+            .iter()
+            .map(|t| TxFrame::from(&t.envelope))
+            .collect(),
     };
     encode_block(head, &records).unwrap()
 }
@@ -169,9 +173,12 @@ async fn a_missing_block_is_named() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_end_index_behind_the_records_is_refused() {
     let short = live_block(12, 13, 3);
-    let rows = [(11, stored_row(&live_block(11, 12, 0))), (12, stored_row(&short))]
-        .into_iter()
-        .collect();
+    let rows = [
+        (11, stored_row(&live_block(11, 12, 0))),
+        (12, stored_row(&short)),
+    ]
+    .into_iter()
+    .collect();
     let store = FakeStore::serve(rows).await;
     let client = PayloadStore::new(vec![store.url()]);
     let err = client.blocks(cursor(12, 11), 12).await.unwrap_err();
@@ -188,7 +195,11 @@ async fn a_down_endpoint_is_skipped_and_a_floor_behind_the_cursor_is_refused() {
     let store = FakeStore::serve(rows).await;
     let down = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let down_url = format!("http://{}", down.local_addr().unwrap());
-    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let unused = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
     // The port closed again when the listener dropped, so the connection
     // is refused.
     let refused_url = format!("http://{unused}");

@@ -23,10 +23,7 @@ impl StateWriterQueue for RecordsQueue {
         _delta: BlockDelta,
         records: BlockRecords,
     ) -> Result<(), ExecutorError> {
-        self.0
-            .lock()
-            .unwrap()
-            .push((block.block_number, records));
+        self.0.lock().unwrap().push((block.block_number, records));
         Ok(())
     }
 }
@@ -70,6 +67,9 @@ fn each_boundary_submits_the_frames_of_its_own_block() {
     assert_eq!(blocks, vec![1, 2, 3]);
     assert_eq!(submitted[0].1.txs, want_block_1);
     assert_eq!(submitted[1].1.txs, want_block_2);
-    assert!(submitted[2].1.txs.is_empty(), "an empty block carries no frame");
+    assert!(
+        submitted[2].1.txs.is_empty(),
+        "an empty block carries no frame"
+    );
     assert!(submitted.iter().all(|(_, r)| r.remote_epochs.is_empty()));
 }

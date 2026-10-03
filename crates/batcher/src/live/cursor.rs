@@ -10,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use kardamom_types::kar1::BlockFrame;
 use crate::indexer::IndexerClient;
 use crate::l1::{read_posted_batches, recover_blocks};
 use crate::settlement::IKardamomL2Settlement;
+use kardamom_types::kar1::BlockFrame;
 
 /// The durable cursor: the ordering-stream position matching the last
 /// confirmed L1 post. `next_index` and `next_block` seed the cluster replay

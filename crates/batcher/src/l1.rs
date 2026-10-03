@@ -23,9 +23,9 @@ use alloy_sol_types::{SolCall, SolEvent};
 use crate::batcher::PostedBatch;
 use crate::da::{DaProxy, PayloadSource};
 use crate::error::BatcherError;
-use kardamom_types::kar1::BlockFrame;
 use crate::recon::reconstruct;
 use crate::settlement::IKardamomL2Settlement;
+use kardamom_types::kar1::BlockFrame;
 
 /// One posted batch as recovered from an on-chain `BatchPosted` event,
 /// or as the inbox indexer serves it (its JSON carries these fields and

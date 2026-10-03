@@ -222,9 +222,14 @@ impl PayloadStore {
         let Some(bytes) = response.result else {
             return Ok(None);
         };
-        let payload = decode(&bytes).with_context(|| format!("decode block {number} from {endpoint}"))?;
-        let [frame] = <[BlockFrame; 1]>::try_from(payload.blocks)
-            .map_err(|blocks| anyhow::anyhow!("{endpoint} served {} blocks for block {number}", blocks.len()))?;
+        let payload =
+            decode(&bytes).with_context(|| format!("decode block {number} from {endpoint}"))?;
+        let [frame] = <[BlockFrame; 1]>::try_from(payload.blocks).map_err(|blocks| {
+            anyhow::anyhow!(
+                "{endpoint} served {} blocks for block {number}",
+                blocks.len()
+            )
+        })?;
         if frame.block_number != number {
             bail!(
                 "{endpoint} served block {} for block {number}",

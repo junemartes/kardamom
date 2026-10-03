@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types_eth::{Filter, Log};
 use kardamom_da_watcher::source::fakes::MockL1Source;
 use kardamom_da_watcher::{L1Source, L1SourceError, L1Sources, SourceHalt};
@@ -49,7 +49,12 @@ async fn two_sources_that_agree_serve_the_block_and_the_lowest_tip() {
     let (hash, parent) = set.block_ids(5).await.unwrap();
     assert_eq!(hash, MockL1Source::filler_hash(5));
     assert_eq!(parent, MockL1Source::filler_hash(4));
-    assert!(set.lockbox_logs(Default::default(), 5, 5).await.unwrap().is_empty());
+    assert!(
+        set.lockbox_logs(Address::ZERO, 5, 5)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A member with no finalized block yet is the lowest tip: the set has
@@ -77,7 +82,10 @@ async fn one_liar_halts_the_read_with_both_answers_and_the_counter() {
         .expect("init");
     let honest_source = MockL1Source::new();
     let liar = lying_at(5);
-    let set = L1Sources::new(vec![("honest".into(), honest_source), ("liar".into(), liar)]);
+    let set = L1Sources::new(vec![
+        ("honest".into(), honest_source),
+        ("liar".into(), liar),
+    ]);
 
     for _ in 0..2 {
         let err = set.block_ids(5).await.unwrap_err();
@@ -86,7 +94,10 @@ async fn one_liar_halts_the_read_with_both_answers_and_the_counter() {
         };
         assert_eq!(halt.cause(), "l1_source_disagreement");
         let SourceHalt::Disagreement {
-            what, a_name, b_name, ..
+            what,
+            a_name,
+            b_name,
+            ..
         } = halt
         else {
             panic!("a disagreement, got {halt}");
@@ -134,8 +145,11 @@ async fn a_rate_limited_source_rotates_out_and_the_rest_continue() {
 #[tokio::test]
 async fn one_live_source_of_two_is_short_of_the_quorum() {
     let limited = rate_limited();
-    let set = L1Sources::new(vec![("limited".into(), limited), ("b".into(), MockL1Source::new())])
-        .backoff(Duration::ZERO);
+    let set = L1Sources::new(vec![
+        ("limited".into(), limited),
+        ("b".into(), MockL1Source::new()),
+    ])
+    .backoff(Duration::ZERO);
     let err = set.block_ids(5).await.unwrap_err();
     assert!(
         matches!(
@@ -159,7 +173,10 @@ async fn every_source_out_halts() {
     ]);
     let err = set.finalized_block_number().await.unwrap_err();
     assert!(
-        matches!(err, L1SourceError::Halt(SourceHalt::NoQuorum { answered: 0, .. })),
+        matches!(
+            err,
+            L1SourceError::Halt(SourceHalt::NoQuorum { answered: 0, .. })
+        ),
         "{err}"
     );
     let err = set.block_ids(5).await.unwrap_err();
@@ -206,9 +223,12 @@ async fn the_light_client_settles_a_disagreement_and_rotates_the_liar_out() {
 async fn a_silent_light_client_falls_back_to_the_public_quorum() {
     let light = MockL1Source::new();
     *light.block_hash_fails.lock().unwrap() = true;
-    let set = L1Sources::new(vec![("a".into(), MockL1Source::new()), ("b".into(), MockL1Source::new())])
-        .with_light_client("light".into(), light)
-        .backoff(Duration::from_secs(3600));
+    let set = L1Sources::new(vec![
+        ("a".into(), MockL1Source::new()),
+        ("b".into(), MockL1Source::new()),
+    ])
+    .with_light_client("light".into(), light)
+    .backoff(Duration::from_secs(3600));
     assert!(set.block_ids(5).await.is_ok());
 }
 

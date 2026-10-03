@@ -63,6 +63,5 @@ pub(crate) mod live_metric_names {
     /// Blocks read from the payload store of an executor or the
     /// validator after the sealer refused the replay: the gap between
     /// the cursor and the sealer's retention floor.
-    pub(crate) const STORE_RECOVERED_BLOCKS: &str =
-        "kardamom_batcher_store_recovered_blocks_total";
+    pub(crate) const STORE_RECOVERED_BLOCKS: &str = "kardamom_batcher_store_recovered_blocks_total";
 }

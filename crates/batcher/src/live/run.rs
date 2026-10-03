@@ -512,7 +512,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
             oldest_block,
         } => {
             let resume = recover_from_store(&store, &mut feed, resume, oldest_block).await?;
-            service.serve(feed, resume).await?
+            service.serve(*feed, resume).await?
         }
     };
     if let Served::Refused { oldest_block, .. } = served {
@@ -552,8 +552,7 @@ async fn recover_from_store<P: Provider>(
     }
     warn!(
         from_block = resume.next_block,
-        oldest_block,
-        "sealer replay refused; recovering the gap from the payload store"
+        oldest_block, "sealer replay refused; recovering the gap from the payload store"
     );
     let blocks = store.blocks(resume, oldest_block).await?;
     let resumed = feed.absorb(blocks)?;
@@ -566,10 +565,14 @@ async fn recover_from_store<P: Provider>(
 }
 
 /// What one reader stack did: ran until shutdown, or ended on a refused
-/// replay with the feed loop handed back for the recovery.
+/// replay with the feed loop handed back for the recovery. The loop is
+/// boxed: it is the one large value, and `Done` carries none.
 enum Served<P> {
     Done,
-    Refused { feed: FeedLoop<P>, oldest_block: u64 },
+    Refused {
+        feed: Box<FeedLoop<P>>,
+        oldest_block: u64,
+    },
 }
 
 /// The live service's fixed parts across reader stacks: the arguments
@@ -589,7 +592,8 @@ impl Service {
         feed: FeedLoop<P>,
         resume: BatchCursor,
     ) -> Result<Served<P>> {
-        let ReaderStack { handles, feed_rx } = self.run_cfg.spawn_reader_stack(&self.args, resume)?;
+        let ReaderStack { handles, feed_rx } =
+            self.run_cfg.spawn_reader_stack(&self.args, resume)?;
         let mut task = tokio::spawn(async move {
             let mut feed = feed;
             let why = feed.run(feed_rx).await;
@@ -600,7 +604,10 @@ impl Service {
             () = bin_support::wait_for_shutdown() => return Ok(Served::Done),
         };
         match handles.end(why) {
-            ReaderEnd::ReplayRefused { oldest_block } => Ok(Served::Refused { feed, oldest_block }),
+            ReaderEnd::ReplayRefused { oldest_block } => Ok(Served::Refused {
+                feed: Box::new(feed),
+                oldest_block,
+            }),
             ReaderEnd::Failed(e) => Err(e),
         }
     }

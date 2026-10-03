@@ -65,20 +65,18 @@ async fn serves_the_committed_nonce_and_balance() {
     assert!(nonce_reply.contains(r#""result":"0x7""#), "{nonce_reply}");
     assert!(nonce_reply.contains(r#""id":5"#), "{nonce_reply}");
 
-    let balance_reply =
-        tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", known))
-            .await
-            .unwrap();
+    let balance_reply = tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", known))
+        .await
+        .unwrap();
     assert!(
         balance_reply.contains(r#""result":"0x1f4""#),
         "{balance_reply}"
     );
 
     let unknown = Address::repeat_byte(0x22);
-    let unknown_reply =
-        tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", unknown))
-            .await
-            .unwrap();
+    let unknown_reply = tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", unknown))
+        .await
+        .unwrap();
     assert!(
         unknown_reply.contains(r#""result":"0x0""#),
         "{unknown_reply}"

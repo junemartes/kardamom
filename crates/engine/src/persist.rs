@@ -207,7 +207,11 @@ mod tests {
         // (drop the adapters, then call `writer.shutdown()`) holds here too.
         with_queue(&handle.delta_tx, |queue| {
             queue
-                .submit(boundary(1), block_delta(1, addr, 999), BlockRecords::default())
+                .submit(
+                    boundary(1),
+                    block_delta(1, addr, 999),
+                    BlockRecords::default(),
+                )
                 .unwrap();
         });
 
@@ -228,10 +232,18 @@ mod tests {
         let addr = Address::from([0x07; 20]);
         with_queue(&handle.delta_tx, |queue| {
             queue
-                .submit(boundary(1), block_delta(1, addr, 1), BlockRecords::default())
+                .submit(
+                    boundary(1),
+                    block_delta(1, addr, 1),
+                    BlockRecords::default(),
+                )
                 .unwrap();
             queue
-                .submit(boundary(2), block_delta(2, addr, 2), BlockRecords::default())
+                .submit(
+                    boundary(2),
+                    block_delta(2, addr, 2),
+                    BlockRecords::default(),
+                )
                 .unwrap();
         });
 
@@ -283,7 +295,11 @@ mod tests {
         with_queue(&handle.delta_tx, |queue| {
             for b in 1..=3 {
                 queue
-                    .submit(boundary(b), block_delta(b, addr, b * 10), BlockRecords::default())
+                    .submit(
+                        boundary(b),
+                        block_delta(b, addr, b * 10),
+                        BlockRecords::default(),
+                    )
                     .unwrap();
             }
         });

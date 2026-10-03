@@ -73,8 +73,8 @@ fn a_spool_that_does_not_continue_the_cursor_is_dropped() {
 /// A feed loop over a mocked L1 provider: the recovery touches the spool
 /// and the pending group only, never the sender.
 fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
-    let provider = ProviderBuilder::new()
-        .connect_mocked_client(alloy_transport::mock::Asserter::new());
+    let provider =
+        ProviderBuilder::new().connect_mocked_client(alloy_transport::mock::Asserter::new());
     let dir = tempfile::tempdir().unwrap();
     let sender = LiveSender::new(
         provider,
@@ -106,7 +106,9 @@ async fn a_refused_replay_fills_the_gap_from_the_store_and_resumes_at_the_floor(
     let dir = tempfile::tempdir().unwrap();
     let spool = Spool::open(dir.path()).unwrap();
     for n in 11..=12 {
-        spool.append(&block(n, 100 + i32::try_from(n).unwrap())).unwrap();
+        spool
+            .append(&block(n, 100 + i32::try_from(n).unwrap()))
+            .unwrap();
     }
     let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
     assert_eq!(resume.next_block, 13);
