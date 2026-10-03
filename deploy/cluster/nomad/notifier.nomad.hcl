@@ -46,8 +46,9 @@ variable "executor_count" {
 }
 
 # The ring: the last minutes of events a late subscriber can replay, and
-# a hard cap on their count. Ten minutes at 10,000 events a second is
-# six million events; the cap bounds the memory below that.
+# a hard cap on their count. An event costs about 300 bytes with its
+# indexes, so one million events is about 300 MB; the cap, not the age,
+# bounds the memory under load.
 variable "ring_minutes" {
   type        = number
   description = "How many minutes of status events the ring keeps."
@@ -57,7 +58,7 @@ variable "ring_minutes" {
 variable "ring_max_events" {
   type        = number
   description = "The most status events the ring keeps, whatever their age."
-  default     = 4000000
+  default     = 1000000
 }
 
 # A fully delivered outbox longer than this is cut to zero.
@@ -197,7 +198,7 @@ job "notifier" {
 
       resources {
         cpu    = 500
-        memory = 1536
+        memory = 1024
       }
     }
   }

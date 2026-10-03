@@ -136,7 +136,7 @@ async fn rpc_golden_vectors_hold() {
 /// ones sent before it subscribed and live for the rest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
-async fn s17_tx_status_feed_shows_every_stage() {
+async fn s18_tx_status_feed_shows_every_stage() {
     let stack = LocalStack::launch(StackConfig {
         notifier: true,
         ..StackConfig::default()
@@ -147,6 +147,6 @@ async fn s17_tx_status_feed_shows_every_stage() {
     let ws_url = stack.notifier_ws_url().expect("the stack runs a notifier");
     if let Err(e) = tx_status::run(&t, ws_url, tx_status::Params::default()).await {
         stack.dump_tails();
-        panic!("S17: {e:#}");
+        panic!("S18: {e:#}");
     }
 }

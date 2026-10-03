@@ -473,6 +473,20 @@ impl IngressService {
         Ok(running)
     }
 
+    /// Open the status publisher and start the egress tap on `opened`.
+    async fn spawn_egress_tap(
+        &self,
+        opened: &mut OpenedAeron,
+    ) -> Result<watermark::ClusterWatermark> {
+        let members = opened.plane.cluster_ingress_endpoints().await?;
+        let status = opened
+            .plane
+            .publisher::<TxStatusPublisherHandle>(&opened.rt)
+            .await
+            .context("open TxStatusPublisherHandle")?;
+        self.spawn_cluster_watermark(&opened.subscription, members, status)
+    }
+
     /// Whether the CLI or the config file names a cluster egress channel.
     fn has_egress_channel(&self) -> bool {
         self.args.cluster_egress_endpoint.is_some()
@@ -501,16 +515,19 @@ impl IngressService {
         let mut opened = self.open_aeron_side(&cfg.live_accounts).await?;
         // The egress tap is the `Sealed` publisher of the status stream,
         // and under a quorum policy also the source of the durable
-        // watermark. It runs whenever an egress channel is configured; a
-        // quorum policy without one fails here, as it must.
-        let cluster_watermark = if cfg.ack_policy.requires_quorum() || self.has_egress_channel() {
-            let members = opened.plane.cluster_ingress_endpoints().await?;
-            let status = opened
-                .plane
-                .publisher::<TxStatusPublisherHandle>(&opened.rt)
+        // watermark. It runs whenever an egress channel is configured. A
+        // quorum policy needs it, so a failure to connect is fatal there;
+        // under any other policy the ingress serves without it, so a
+        // cluster that is down at start never keeps the front door shut.
+        let cluster_watermark = if cfg.ack_policy.requires_quorum() {
+            Some(self.spawn_egress_tap(&mut opened).await?)
+        } else if self.has_egress_channel() {
+            self.spawn_egress_tap(&mut opened)
                 .await
-                .context("open TxStatusPublisherHandle")?;
-            Some(self.spawn_cluster_watermark(&opened.subscription, members, status)?)
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "kardamom-ingress: cluster egress tap not started; tx_status Sealed is not published");
+                })
+                .ok()
         } else {
             tracing::warn!(
                 "kardamom-ingress: no cluster egress channel; tx_status Sealed is not published"

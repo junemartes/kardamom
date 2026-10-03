@@ -58,7 +58,7 @@ struct Args {
     #[arg(
         long,
         env = "KARDAMOM_NOTIFIER_RING_MAX_EVENTS",
-        default_value = "4000000"
+        default_value = "1000000"
     )]
     ring_max_events: NonZeroUsize,
     /// The live feed buffer per subscriber. A subscriber further behind
