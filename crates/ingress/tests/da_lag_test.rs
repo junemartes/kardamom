@@ -30,6 +30,39 @@ async fn wait_paused(paused: bool) {
     .unwrap();
 }
 
+/// The ingress is paused, not halted, on the sealer's `da_lag` halt, and
+/// the chain status shows the root, its detail, and the pause.
+async fn assert_paused_on_the_sealer(client: &jsonrpsee::http_client::HttpClient) {
+    let pause = process().slots().pause.unwrap();
+    let PauseReason::Upstream(root) = pause.reason else {
+        panic!("an upstream pause, not {pause:?}");
+    };
+    assert_eq!(
+        (root.service.as_str(), root.cause),
+        ("sealer", HaltCause::DaLag)
+    );
+    assert!(
+        process().slots().halt.is_none(),
+        "the ingress is paused, not halted"
+    );
+    let status: serde_json::Value = client
+        .request("kardamom_chainStatus", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(status["sealer"]["state"], "halted");
+    assert_eq!(status["sealer"]["cause"], "da_lag");
+    assert!(
+        status["sealer"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sealed head 20"),
+        "{status}"
+    );
+    assert_eq!(status["roots"][0]["service"], "sealer");
+    assert_eq!(status["ingress"]["state"], "paused");
+    assert_eq!(status["ingress"]["pause"]["root"]["cause"], "da_lag");
+}
+
 #[tokio::test]
 async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
     let server = start_test_server(IngressConfig::default()).await;
@@ -82,34 +115,7 @@ async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
         ..posted
     });
     wait_paused(true).await;
-    let pause = process().slots().pause.unwrap();
-    let PauseReason::Upstream(root) = pause.reason else {
-        panic!("an upstream pause, not {pause:?}");
-    };
-    assert_eq!(
-        (root.service.as_str(), root.cause),
-        ("sealer", HaltCause::DaLag)
-    );
-    assert!(
-        process().slots().halt.is_none(),
-        "the ingress is paused, not halted"
-    );
-    let status: serde_json::Value = client
-        .request("kardamom_chainStatus", rpc_params![])
-        .await
-        .unwrap();
-    assert_eq!(status["sealer"]["state"], "halted");
-    assert_eq!(status["sealer"]["cause"], "da_lag");
-    assert!(
-        status["sealer"]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("sealed head 20"),
-        "{status}"
-    );
-    assert_eq!(status["roots"][0]["service"], "sealer");
-    assert_eq!(status["ingress"]["state"], "paused");
-    assert_eq!(status["ingress"]["pause"]["root"]["cause"], "da_lag");
+    assert_paused_on_the_sealer(&client).await;
     let signer = PrivateKeySigner::random();
     let err = client
         .request::<alloy_primitives::B256, _>(
