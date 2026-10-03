@@ -1,6 +1,4 @@
-use kardamom_types::service::{
-    Halt, HaltCause, HaltRef, Pause, PauseReason, ServiceState,
-};
+use kardamom_types::service::{Halt, HaltCause, HaltRef, Pause, PauseReason, ServiceState};
 
 use super::Lifecycle;
 
@@ -25,7 +23,10 @@ fn a_halt_has_priority_over_a_pause() {
     life.raise(Halt::new(HaltCause::L1Unreachable, "own fault"));
     assert!(matches!(life.state(), ServiceState::Halted(_)));
     life.clear();
-    assert!(matches!(life.state(), ServiceState::Paused(_)), "the pause still stands");
+    assert!(
+        matches!(life.state(), ServiceState::Paused(_)),
+        "the pause still stands"
+    );
     life.follow(None);
     assert_eq!(life.state(), ServiceState::Running);
 }
@@ -86,6 +87,9 @@ fn the_summary_names_the_root_and_its_runbook() {
     assert_eq!(life.slots().summary(), None);
     life.follow(Some(root(HaltCause::DaLag)));
     let summary = life.slots().summary().unwrap();
-    assert!(summary.contains("upstream sealer cluster halted (da_lag)"), "{summary}");
+    assert!(
+        summary.contains("upstream sealer cluster halted (da_lag)"),
+        "{summary}"
+    );
     assert!(summary.contains("docs/runbooks/da_lag.md"), "{summary}");
 }

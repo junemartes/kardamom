@@ -218,12 +218,17 @@ mod tests {
         let rpc: ErrorObjectOwned = IngressError::da_lag(160, 100, 50).into();
         assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
         assert!(
-            rpc.message().starts_with("chain halted: da_lag at sealer (sealed head 160"),
+            rpc.message()
+                .starts_with("chain halted: da_lag at sealer (sealed head 160"),
             "{}",
             rpc.message()
         );
         assert!(rpc.message().contains("/halt"), "{}", rpc.message());
-        assert!(rpc.message().contains("docs/runbooks/da_lag.md"), "{}", rpc.message());
+        assert!(
+            rpc.message().contains("docs/runbooks/da_lag.md"),
+            "{}",
+            rpc.message()
+        );
         let data = rpc.data().expect("the typed cause").get();
         assert!(data.contains("\"cause\":\"da_lag\""), "{data}");
         assert!(data.contains("\"root_service\":\"sealer\""), "{data}");

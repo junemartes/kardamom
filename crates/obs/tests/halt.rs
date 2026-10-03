@@ -93,7 +93,10 @@ async fn the_halt_route_serves_the_record_and_readiness_fails_while_halted() {
     assert!(record.contains("\"note\":\"disk-swap\""), "{record}");
     let not_ready = common::get(addr, "/ready", budget).await;
     assert!(not_ready.contains(" 503 "), "{not_ready}");
-    assert!(not_ready.contains("paused: operator (disk-swap)"), "{not_ready}");
+    assert!(
+        not_ready.contains("paused: operator (disk-swap)"),
+        "{not_ready}"
+    );
     let metrics = common::get(addr, "/metrics", budget).await;
     assert!(
         metrics.lines().any(|l| l.starts_with("kardamom_paused{")

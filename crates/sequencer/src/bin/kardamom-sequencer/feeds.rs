@@ -35,13 +35,13 @@ use kardamom_log::aeron_live::{
     IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
     TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
+use kardamom_obs::events::SEALER_SILENCE;
+use kardamom_obs::halt::{HaltCause, HaltRef};
+use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
-use kardamom_obs::events::SEALER_SILENCE;
-use kardamom_obs::halt::{HaltCause, HaltRef};
-use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::pump::{OriginLane, Pump};

@@ -91,7 +91,10 @@ impl ChainWatch {
             () = tokio::time::sleep(TICK) => {}
         }
         self.check_silence(Instant::now());
-        process().follow(Self::submit_root(&self.sealer.slots(), &self.board.borrow()));
+        process().follow(Self::submit_root(
+            &self.sealer.slots(),
+            &self.board.borrow(),
+        ));
         ControlFlow::Continue(())
     }
 
@@ -163,7 +166,12 @@ impl ChainStatus<'_> {
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let roots: Vec<serde_json::Value> = ChainWatch::sealer_root(self.sealer)
             .into_iter()
-            .chain(self.board.roots().into_iter().filter(|r| r.service != SEALER))
+            .chain(
+                self.board
+                    .roots()
+                    .into_iter()
+                    .filter(|r| r.service != SEALER),
+            )
             .map(|root| root.to_json())
             .collect();
         serde_json::json!({

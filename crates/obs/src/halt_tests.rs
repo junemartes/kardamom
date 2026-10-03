@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::{Clears, Halt, HaltCause, RecoveryId, Record, clear, cleared, current, hold_until, raise};
+use super::{
+    Clears, Halt, HaltCause, Record, RecoveryId, clear, cleared, current, hold_until, raise,
+};
 use crate::lifecycle::Slots;
 
 /// The halt state is one per process, so the tests that write it run
@@ -162,7 +164,13 @@ fn a_pause_has_an_info_rule_muted_by_its_root() {
     assert!(rules.contains("expr: kardamom_paused == 1"));
     let inhibit =
         std::fs::read_to_string(repo_root().join("deploy/alertmanager-inhibit.yml")).unwrap();
-    assert!(inhibit.contains(r#"'alertname =~ "KardamomHalt.*"'"#), "{inhibit}");
-    assert!(inhibit.contains(r#"'alertname = "KardamomServicePaused"'"#), "{inhibit}");
+    assert!(
+        inhibit.contains(r#"'alertname =~ "KardamomHalt.*"'"#),
+        "{inhibit}"
+    );
+    assert!(
+        inhibit.contains(r#"'alertname = "KardamomServicePaused"'"#),
+        "{inhibit}"
+    );
     assert!(inhibit.contains("equal:\n      - cause"), "{inhibit}");
 }

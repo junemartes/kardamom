@@ -180,7 +180,8 @@ async fn assert_root_and_pauses(h: &Harness, ctx: &str) -> anyhow::Result<()> {
         Duration::from_secs(30),
         |v| {
             let paused = v.paused_on("ingress");
-            v.roots().contains(&("sealer".to_string(), "da_lag".to_string()))
+            v.roots()
+                .contains(&("sealer".to_string(), "da_lag".to_string()))
                 && !paused.is_empty()
                 && paused.iter().all(|cause| cause == "da_lag")
         },

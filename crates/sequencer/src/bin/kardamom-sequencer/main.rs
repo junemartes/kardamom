@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
+    TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;

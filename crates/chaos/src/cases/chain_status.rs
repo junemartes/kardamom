@@ -38,7 +38,10 @@ impl ChainView {
         })
         .await?
         .or_fail(|elapsed| {
-            crate::chaos_fail!("{what}: the chain status did not hold within {}s", elapsed.as_secs())
+            crate::chaos_fail!(
+                "{what}: the chain status did not hold within {}s",
+                elapsed.as_secs()
+            )
         })?;
         Ok(view)
     }

@@ -32,7 +32,11 @@ impl PauseGate {
 
     /// Whether the loop must offer nothing this turn.
     pub(crate) fn paused(&mut self) -> bool {
-        if let Some(rx) = self.rx.as_mut().filter(|rx| rx.has_changed().unwrap_or(false)) {
+        if let Some(rx) = self
+            .rx
+            .as_mut()
+            .filter(|rx| rx.has_changed().unwrap_or(false))
+        {
             self.paused = rx.borrow_and_update().pause.is_some();
         }
         self.paused

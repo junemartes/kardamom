@@ -111,13 +111,19 @@ impl Routes {
             .unwrap_or("operator pause")
             .to_string();
         process().pause(Pause::new(PauseReason::Operator { note }));
-        text(StatusCode::OK, format!("{}\n", process().slots().state().id()))
+        text(
+            StatusCode::OK,
+            format!("{}\n", process().slots().state().id()),
+        )
     }
 
     /// The operator's resume: ends any pause.
     fn resume() -> Response<Full<Bytes>> {
         match process().resume() {
-            Some(pause) => text(StatusCode::OK, format!("resumed from {}\n", pause.reason.id())),
+            Some(pause) => text(
+                StatusCode::OK,
+                format!("resumed from {}\n", pause.reason.id()),
+            ),
             None => text(StatusCode::OK, "no pause stands\n".to_string()),
         }
     }

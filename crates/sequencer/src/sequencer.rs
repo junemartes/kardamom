@@ -261,7 +261,10 @@ impl Sequencer {
 
     /// Offer nothing while `slots` holds a pause: the process lifecycle
     /// in the binary.
-    pub fn enable_pause(&mut self, slots: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>) {
+    pub fn enable_pause(
+        &mut self,
+        slots: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>,
+    ) {
         self.pause = crate::pause_gate::PauseGate::new(slots);
     }
 

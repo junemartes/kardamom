@@ -266,8 +266,7 @@ impl BoardView {
     /// A live halted process of `service`, any cause.
     #[must_use]
     pub fn any_halted(&self, service: &str) -> Option<HaltRef> {
-        self.live_of(service)
-            .find_map(|view| view.event.halt_ref())
+        self.live_of(service).find_map(|view| view.event.halt_ref())
     }
 
     /// The first root when every live process of `service` is halted,

@@ -14,13 +14,13 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
-use kardamom_obs::events::BoardView;
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, ServiceEventsSubscriberHandle,
     TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
     TxReceiptsReceiver,
 };
 use kardamom_log::discovery::StreamPlane;
+use kardamom_obs::events::BoardView;
 use kardamom_types::{
     BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
     ReceiptBatch, TxEnvelope, TxError,

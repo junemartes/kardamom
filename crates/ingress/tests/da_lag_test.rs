@@ -86,8 +86,14 @@ async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
     let PauseReason::Upstream(root) = pause.reason else {
         panic!("an upstream pause, not {pause:?}");
     };
-    assert_eq!((root.service.as_str(), root.cause), ("sealer", HaltCause::DaLag));
-    assert!(process().slots().halt.is_none(), "the ingress is paused, not halted");
+    assert_eq!(
+        (root.service.as_str(), root.cause),
+        ("sealer", HaltCause::DaLag)
+    );
+    assert!(
+        process().slots().halt.is_none(),
+        "the ingress is paused, not halted"
+    );
     let status: serde_json::Value = client
         .request("kardamom_chainStatus", rpc_params![])
         .await
@@ -95,7 +101,10 @@ async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
     assert_eq!(status["sealer"]["state"], "halted");
     assert_eq!(status["sealer"]["cause"], "da_lag");
     assert!(
-        status["sealer"]["detail"].as_str().unwrap().contains("sealed head 20"),
+        status["sealer"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sealed head 20"),
         "{status}"
     );
     assert_eq!(status["roots"][0]["service"], "sealer");

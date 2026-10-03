@@ -127,7 +127,10 @@ mod tests {
     #[test]
     fn its_own_validator_diverged_pauses_the_attester() {
         let own = Slots {
-            halt: Some(Halt::new(HaltCause::ValidatorDivergence, "receipt mismatch")),
+            halt: Some(Halt::new(
+                HaltCause::ValidatorDivergence,
+                "receipt mismatch",
+            )),
             pause: None,
         };
         let root = AttesterGate::root(&own, "v1", &BoardView::default()).unwrap();

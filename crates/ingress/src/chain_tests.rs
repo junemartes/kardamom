@@ -57,13 +57,23 @@ fn the_da_lag_flag_halts_the_sealer_and_the_next_status_clears_it() {
     );
     let halt = sealer.slots().halt.unwrap();
     assert_eq!(halt.cause, HaltCause::DaLag);
-    assert!(halt.detail.contains("sealed head 160 is 60 blocks"), "{}", halt.detail);
+    assert!(
+        halt.detail.contains("sealed head 160 is 60 blocks"),
+        "{}",
+        halt.detail
+    );
     let root = ChainWatch::submit_root(&sealer.slots(), &BoardView::default()).unwrap();
-    assert_eq!((root.service.as_str(), root.cause), (SEALER, HaltCause::DaLag));
+    assert_eq!(
+        (root.service.as_str(), root.cause),
+        (SEALER, HaltCause::DaLag)
+    );
 
     chain.on_status(&ClusterStatus::default(), now);
     assert_eq!(sealer.slots().halt, None);
-    assert_eq!(ChainWatch::submit_root(&sealer.slots(), &BoardView::default()), None);
+    assert_eq!(
+        ChainWatch::submit_root(&sealer.slots(), &BoardView::default()),
+        None
+    );
 }
 
 #[test]
@@ -78,7 +88,10 @@ fn a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it() {
     chain.check_silence(start + SEALER_SILENCE - Duration::from_millis(1));
     assert_eq!(sealer.slots().halt, None);
     chain.check_silence(start + SEALER_SILENCE);
-    assert_eq!(sealer.slots().halt.unwrap().cause, HaltCause::SealerNoQuorum);
+    assert_eq!(
+        sealer.slots().halt.unwrap().cause,
+        HaltCause::SealerNoQuorum
+    );
 
     chain.on_status(&ClusterStatus::default(), start + SEALER_SILENCE * 2);
     assert_eq!(sealer.slots().halt, None, "a status proves the quorum");
@@ -106,7 +119,11 @@ fn the_sealer_root_comes_before_the_executors() {
         halt: Some(Halt::new(HaltCause::SealerNoQuorum, "silent")),
         pause: None,
     };
-    let all = board(vec![event(EXECUTOR, "e1", halted(HaltCause::ReplayUnavailable))]);
+    let all = board(vec![event(
+        EXECUTOR,
+        "e1",
+        halted(HaltCause::ReplayUnavailable),
+    )]);
     assert_eq!(
         ChainWatch::submit_root(&sealer, &all).unwrap().cause,
         HaltCause::SealerNoQuorum
