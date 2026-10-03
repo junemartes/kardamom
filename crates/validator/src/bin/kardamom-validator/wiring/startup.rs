@@ -27,6 +27,9 @@ pub(crate) struct Boot {
     /// it before it starts, so a signal that lands during the repair
     /// between two revolutions ends the process instead of being lost.
     pub(crate) stop: tokio_util::sync::CancellationToken,
+    /// The `events` stream for the whole process: the beacons, the
+    /// board, and the attester's gate.
+    pub(super) events: super::events::ValidatorEvents,
 }
 
 impl Boot {
@@ -65,6 +68,13 @@ impl Boot {
 
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+        let events = super::events::ValidatorEvents::open(&super::events::EventsConfig {
+            log_cfg: &log_cfg,
+            aeron_dir: args.aeron_dir.as_deref(),
+            host_id: args.host_id.as_ref(),
+            attester_on: args.attester_key.is_some(),
+        })
+        .await?;
         let stop = tokio_util::sync::CancellationToken::new();
         let signal = stop.clone();
         tokio::spawn(async move {
@@ -76,7 +86,13 @@ impl Boot {
             file_cfg,
             log_cfg,
             stop,
+            events,
         })
+    }
+
+    /// End the events transport before the process exits.
+    pub(crate) async fn close(self) {
+        self.events.close().await;
     }
 }
 
@@ -90,6 +106,8 @@ pub(crate) struct Startup {
     pub(super) rt: AeronRuntime,
     /// The stream plane the verification subscriptions open through.
     pub(super) plane: StreamPlane,
+    /// The attester's gate: it posts nothing while a divergence stands.
+    pub(super) attester: kardamom_validator::attester::AttesterGate,
 }
 
 impl Startup {
@@ -115,6 +133,7 @@ impl Startup {
             aeron_cfg,
             rt,
             plane,
+            attester: boot.events.attester_gate(),
         })
     }
 
