@@ -22,7 +22,7 @@ mod apply;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
-use kardamom_types::{BlockBoundary, BlockDelta};
+use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 use tracing::{debug, error, info, warn};
 
 use crate::env::StateEnv;
@@ -32,22 +32,61 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 
 /// One block's worth of state changes, submitted to the writer.
 ///
-/// This pairs the boundary marker with its delta. The writer then
-/// persists, in a single atomic mdbx commit:
+/// This pairs the boundary marker with its delta and the block's
+/// transaction references. The writer then persists, in a single atomic
+/// mdbx commit:
 ///
 /// - The block-level cursors.
 /// - The per-key state mutations.
-/// - The per-transaction receipts.
+/// - The per-transaction receipts, each with where its bytes are.
 #[derive(Debug, Clone)]
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
     pub delta: BlockDelta,
+    /// Where the bytes of the block's transactions are.
+    pub refs: TxRefs,
+}
+
+/// Where the bytes of a block's transactions are, as the writer records
+/// them in the `tx_hash_index` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxRefs {
+    /// The `TxRef` of every transaction of the block, as the canonical
+    /// stream carried it: where the bytes are on a `tx_data` archive. A
+    /// deposit or a cross-chain message has none.
+    Archive(Vec<TxRef>),
+    /// The block is rebuilt from its L1 payload. A payload carries no
+    /// archive reference, so no row of the block has one. The block is on
+    /// L1, so a DA recovery never needs its references. The writer moves
+    /// the `l1_rebuilt_end_tx_position` mark to the block's end.
+    RebuiltFromL1,
 }
 
 impl WriteBatch {
+    /// A block with no transaction reference: a block of deposits and
+    /// markers only, or a synthetic block in a test.
     #[must_use]
     pub fn new(boundary: BlockBoundary, delta: BlockDelta) -> Self {
-        Self { boundary, delta }
+        Self::with_refs(boundary, delta, Vec::new())
+    }
+
+    #[must_use]
+    pub fn with_refs(boundary: BlockBoundary, delta: BlockDelta, refs: Vec<TxRef>) -> Self {
+        Self {
+            boundary,
+            delta,
+            refs: TxRefs::Archive(refs),
+        }
+    }
+
+    /// A block rebuilt from its L1 payload: see [`TxRefs::RebuiltFromL1`].
+    #[must_use]
+    pub fn rebuilt_from_l1(boundary: BlockBoundary, delta: BlockDelta) -> Self {
+        Self {
+            boundary,
+            delta,
+            refs: TxRefs::RebuiltFromL1,
+        }
     }
 
     /// The worst-case encoded size, used by the writer to budget the mdbx
@@ -58,7 +97,7 @@ impl WriteBatch {
         let stor = self.delta.storage.len() * (52 + 32);
         let code: usize = self.delta.code.iter().map(|c| 32 + c.code.len()).sum();
         let receipts: usize = self.delta.receipts.len() * (8 + 256);
-        let tx_index: usize = self.delta.receipts.len() * (32 + 8);
+        let tx_index: usize = self.delta.receipts.len() * (32 + 21);
         let header = 8 + 20;
         acct + stor + code + receipts + tx_index + header
     }

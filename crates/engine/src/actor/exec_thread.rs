@@ -94,7 +94,11 @@ impl<W: ExecPorts> ExecState<W> {
     /// Dispatch one canonical-stream message to its handler.
     fn dispatch(&mut self, msg: ReaderToExec) -> Result<Flow, ExecutorError> {
         match msg {
-            ReaderToExec::Tx { envelope, position } => self.on_tx(envelope, position),
+            ReaderToExec::Tx {
+                envelope,
+                position,
+                tx_ref,
+            } => self.on_tx(envelope, position, tx_ref),
             ReaderToExec::Epoch(epoch) => self.on_epoch(&epoch),
             ReaderToExec::Deposit(deposit) => self.on_deposit(deposit),
             ReaderToExec::RemoteEpoch(record) => self.on_remote_epoch(&record),

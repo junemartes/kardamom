@@ -37,6 +37,16 @@
 //! the `receipts` table, so the two sides share one type and no second
 //! encoding.
 //!
+//! The batcher asks for a block's references when the sealer no longer
+//! retains the block: `kardamom_getBlockRefs` with `[number]`, the number
+//! as a JSON integer or a `0x` quantity. The result is `null`, or the
+//! [`BlockRefs`] record as JSON: the block's canonical end, its L1 origin
+//! and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)`
+//! for each transaction in canonical order. A committed block whose
+//! references cannot rebuild its payload is the JSON-RPC error -32001,
+//! with the cause: this node rebuilt the block from L1, or a transaction
+//! other than a deposit has no reference.
+//!
 //! `x-state-tx-idx` is the canonical end position of the snapshot's last
 //! committed block, as an index. A cache writes the answer back tagged
 //! with it, so the answer never outranks a newer row.
@@ -60,13 +70,13 @@ use tracing::{info, warn};
 
 use crate::env::StateEnv;
 use crate::error::StateError;
-use crate::snapshot::StateSnapshot;
+use crate::snapshot::{BlockRefs, StateSnapshot};
 
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Queries served, by `outcome` (`ok`, `bad_request`, `error`).
+/// Queries served, by `outcome` (`ok`, `bad_request`, `refused`, `error`).
 pub const NONCE_QUERIES: &str = "kardamom_state_nonce_queries_total";
 
 /// The bound listener and its accept task.
@@ -198,20 +208,73 @@ pub fn committed_receipt(env: &StateEnv, tx_hash: B256) -> Result<CommittedRecei
     })
 }
 
+/// The references of one block, and where the snapshot that gave them
+/// stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedRefs {
+    /// `None` when the block is not committed yet.
+    pub refs: Option<BlockRefs>,
+    /// The snapshot's block.
+    pub block: u64,
+    /// The canonical end position of the snapshot's last block, as an
+    /// index.
+    pub tx_idx: u64,
+}
+
+/// Read the references of block `number` from a fresh snapshot.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the snapshot cannot open or the read fails,
+/// or when the block cannot be rebuilt from references.
+pub fn committed_block_refs(env: &StateEnv, number: u64) -> Result<CommittedRefs, StateError> {
+    let snapshot = StateSnapshot::open(env)?;
+    Ok(CommittedRefs {
+        refs: snapshot.block_refs(number)?,
+        block: snapshot.block_number(),
+        tx_idx: snapshot.end_tx_position()?.as_index(),
+    })
+}
+
 /// One request, parsed once at the boundary: an account method with its
-/// address, or a receipt lookup with its hash.
+/// address, a receipt lookup with its hash, or a block's references with
+/// its number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Query {
     Account(Method, Address),
     Receipt(B256),
+    Refs(u64),
 }
 
 /// The JSON-RPC name of the receipt lookup.
 const RECEIPT_METHOD: &str = "eth_getTransactionReceipt";
+/// The JSON-RPC name of the block references lookup.
+const REFS_METHOD: &str = "kardamom_getBlockRefs";
+/// The JSON-RPC error code of a committed block whose references cannot
+/// rebuild its payload. The message names the cause.
+const NO_BLOCK_REFS: i64 = -32001;
+
+/// A block number parameter: a JSON integer, or a `0x` quantity.
+fn block_number_param(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|s| s.strip_prefix("0x"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+    })
+}
 
 impl Query {
     /// The query of `request`, or the JSON-RPC error code and message.
     fn parse(request: &Request) -> Result<Self, (i64, &'static str)> {
+        if request.method == REFS_METHOD {
+            return request
+                .params
+                .first()
+                .and_then(block_number_param)
+                .map(Self::Refs)
+                .ok_or((-32602, "invalid params: expected [number]"));
+        }
         let first = request.params.first().and_then(serde_json::Value::as_str);
         if request.method == RECEIPT_METHOD {
             return first
@@ -318,6 +381,11 @@ impl Reply {
         Self::error("200 OK", "bad_request", id, code, message)
     }
 
+    /// A committed block whose references cannot rebuild its payload.
+    fn refused(id: &serde_json::Value, message: &str) -> Self {
+        Self::error("200 OK", "refused", id, NO_BLOCK_REFS, message)
+    }
+
     /// A failed state read.
     fn internal(id: &serde_json::Value, message: &str) -> Self {
         Self::error("500 Internal Server Error", "error", id, -32603, message)
@@ -334,6 +402,19 @@ impl Reply {
             )
         });
         let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+        Self {
+            status: "200 OK",
+            body,
+            state: Some((found.block, found.tx_idx)),
+        }
+    }
+
+    /// The block's references as JSON, or `null`, with the snapshot's
+    /// position.
+    fn refs(id: &serde_json::Value, found: &CommittedRefs) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "refs").increment(1);
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": found.refs}).to_string();
         Self {
             status: "200 OK",
             body,
@@ -393,6 +474,7 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
     let looked_up = tokio::task::spawn_blocking(move || query.read(&env)).await;
     match looked_up {
         Ok(Ok(found)) => found.reply(&request.id),
+        Ok(Err(e @ StateError::NoBlockRefs { .. })) => Reply::refused(&request.id, &e.to_string()),
         Ok(Err(e)) => {
             warn!(error = %e, ?query, "state query: state read failed");
             Reply::internal(&request.id, "state read failed")
@@ -408,6 +490,7 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
 enum Found {
     Account(Method, CommittedAccount),
     Receipt(CommittedReceipt),
+    Refs(CommittedRefs),
 }
 
 impl Query {
@@ -418,6 +501,7 @@ impl Query {
                 committed_account(env, address).map(|account| Found::Account(method, account))
             }
             Self::Receipt(tx_hash) => committed_receipt(env, tx_hash).map(Found::Receipt),
+            Self::Refs(number) => committed_block_refs(env, number).map(Found::Refs),
         }
     }
 }
@@ -427,6 +511,7 @@ impl Found {
         match self {
             Self::Account(method, account) => Reply::ok(id, *method, account),
             Self::Receipt(found) => Reply::receipt(id, found),
+            Self::Refs(found) => Reply::refs(id, found),
         }
     }
 }
@@ -507,228 +592,5 @@ async fn serve_one(stream: TcpStream, env: StateEnv) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::{Read, Write};
-
-    use alloy_primitives::{U256, keccak256};
-    use kardamom_types::AccountChange;
-
-    use super::*;
-    use crate::env::StateEnvBuilder;
-    use crate::genesis::seed_genesis;
-
-    /// One HTTP/1.0 POST over a plain socket. Returns the whole response.
-    fn post(addr: SocketAddr, body: &str) -> String {
-        let mut s = std::net::TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        write!(
-            s,
-            "POST / HTTP/1.0\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        let mut out = String::new();
-        s.read_to_string(&mut out).unwrap();
-        out
-    }
-
-    fn query(addr: SocketAddr, method: &str, address: Address) -> String {
-        post(
-            addr,
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":5,"method":"{method}","params":["{address}","latest"]}}"#
-            ),
-        )
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serves_the_committed_nonce_and_balance() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = StateEnvBuilder::new(dir.path()).open().unwrap();
-        let known = Address::repeat_byte(0x11);
-        seed_genesis(
-            &env,
-            &[AccountChange {
-                address: known,
-                nonce: 7,
-                balance: U256::from(0x1f4u64),
-                code_hash: keccak256([]),
-            }],
-            &[],
-        )
-        .unwrap();
-        let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
-        let addr = server.addr;
-
-        let nonce_reply =
-            tokio::task::spawn_blocking(move || query(addr, "eth_getTransactionCount", known))
-                .await
-                .unwrap();
-        assert!(nonce_reply.starts_with("HTTP/1.0 200 OK"), "{nonce_reply}");
-        assert!(nonce_reply.contains("x-state-block: "), "{nonce_reply}");
-        assert!(
-            nonce_reply.contains("x-state-tx-idx: 0\r\n"),
-            "{nonce_reply}"
-        );
-        assert!(nonce_reply.contains(r#""result":"0x7""#), "{nonce_reply}");
-        assert!(nonce_reply.contains(r#""id":5"#), "{nonce_reply}");
-
-        let balance_reply =
-            tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", known))
-                .await
-                .unwrap();
-        assert!(
-            balance_reply.contains(r#""result":"0x1f4""#),
-            "{balance_reply}"
-        );
-
-        let unknown = Address::repeat_byte(0x22);
-        let unknown_reply =
-            tokio::task::spawn_blocking(move || query(addr, "eth_getBalance", unknown))
-                .await
-                .unwrap();
-        assert!(
-            unknown_reply.contains(r#""result":"0x0""#),
-            "{unknown_reply}"
-        );
-    }
-
-    /// A state DB with one committed block that holds one receipt.
-    fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
-        use crate::writer::{StateWriter, TrieMode, WriteBatch};
-        use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
-
-        let env = StateEnvBuilder::new(dir).open().unwrap();
-        seed_genesis(&env, &[], &[]).unwrap();
-        let mut handle = StateWriter::spawn_with_trie(env.clone(), TrieMode::Off).unwrap();
-        let delta = BlockDelta {
-            block_number: 1,
-            accounts: vec![],
-            storage: vec![],
-            code: vec![],
-            receipts: vec![receipt.clone()],
-        };
-        let boundary = BlockBoundary {
-            block_number: 1,
-            end_tx_idx: BPosition::from_index(receipt.tx_idx.as_index() + 1),
-            l2_timestamp: 1_700_000_001,
-            l1_origin: 0,
-        };
-        handle
-            .delta_tx
-            .send(WriteBatch::new(boundary, delta))
-            .unwrap();
-        handle.shutdown().unwrap();
-        env
-    }
-
-    /// The ingress holds a receipt only in the memory of one process.
-    /// After a restart it asks here, and the state DB is the durable
-    /// copy: the stored bytes come back, and an unknown hash is `null`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serves_the_committed_receipt_by_hash_and_null_for_an_unknown_hash() {
-        let receipt = Receipt {
-            tx_idx: kardamom_types::BPosition::from_index(4),
-            tx_hash: B256::repeat_byte(0xBE),
-            status: true,
-            gas_used: 21_000,
-            nonce: 9,
-            from: Address::repeat_byte(0x11),
-            block_number: 1,
-            ..Receipt::default()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let env = env_with_receipt(dir.path(), &receipt);
-        let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
-        let addr = server.addr;
-        let ask = move |hash: B256| {
-            post(
-                addr,
-                &format!(
-                    r#"{{"jsonrpc":"2.0","id":5,"method":"eth_getTransactionReceipt","params":["{hash}"]}}"#
-                ),
-            )
-        };
-
-        let known = receipt.tx_hash;
-        let reply = tokio::task::spawn_blocking(move || ask(known))
-            .await
-            .unwrap();
-        assert!(reply.starts_with("HTTP/1.0 200 OK"), "{reply}");
-        assert!(reply.contains("x-state-block: 1\r\n"), "{reply}");
-        let stored = alloy_primitives::hex::encode(crate::schema::encode_receipt_value(&receipt));
-        assert!(
-            reply.contains(&format!(r#""result":"0x{stored}""#)),
-            "{reply}"
-        );
-
-        let unknown = tokio::task::spawn_blocking(move || ask(B256::repeat_byte(0x01)))
-            .await
-            .unwrap();
-        assert!(unknown.contains(r#""result":null"#), "{unknown}");
-
-        let malformed = tokio::task::spawn_blocking(move || {
-            post(
-                addr,
-                r#"{"jsonrpc":"2.0","id":5,"method":"eth_getTransactionReceipt","params":["0x12"]}"#,
-            )
-        })
-        .await
-        .unwrap();
-        assert!(malformed.contains("-32602"), "{malformed}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejects_other_methods_and_bad_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = StateEnvBuilder::new(dir.path()).open().unwrap();
-        let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
-        let addr = server.addr;
-
-        let wrong_method = tokio::task::spawn_blocking(move || {
-            post(
-                addr,
-                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":[]}"#,
-            )
-        })
-        .await
-        .unwrap();
-        assert!(wrong_method.contains(r#""code":-32601"#), "{wrong_method}");
-
-        let no_params = tokio::task::spawn_blocking(move || {
-            post(
-                addr,
-                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}"#,
-            )
-        })
-        .await
-        .unwrap();
-        assert!(no_params.contains(r#""code":-32602"#), "{no_params}");
-
-        let bad_params = tokio::task::spawn_blocking(move || {
-            post(
-                addr,
-                r#"{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionCount","params":["nope"]}"#,
-            )
-        })
-        .await
-        .unwrap();
-        assert!(bad_params.contains(r#""code":-32602"#), "{bad_params}");
-
-        let not_json = tokio::task::spawn_blocking(move || post(addr, "{{{"))
-            .await
-            .unwrap();
-        assert!(not_json.starts_with("HTTP/1.0 400"), "{not_json}");
-
-        let get = tokio::task::spawn_blocking(move || {
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            s.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
-            let mut out = String::new();
-            s.read_to_string(&mut out).unwrap();
-            out
-        })
-        .await
-        .unwrap();
-        assert!(get.starts_with("HTTP/1.0 404"), "{get}");
-    }
-}
+#[path = "nonce_query_tests.rs"]
+mod tests;

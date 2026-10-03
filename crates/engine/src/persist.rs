@@ -19,7 +19,7 @@
 
 use crossbeam_channel::Sender;
 use kardamom_state::{SnapshotReceiver, StateSnapshot, WriteBatch};
-use kardamom_types::{BlockBoundary, BlockDelta, SnapshotSource};
+use kardamom_types::{BlockBoundary, BlockDelta, SnapshotSource, TxRef};
 
 use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::error::ExecutorError;
@@ -67,17 +67,41 @@ impl MdbxWriterQueue {
     pub fn new(delta_tx: Sender<WriteBatch>) -> Self {
         Self { delta_tx }
     }
+
+    /// Send a block rebuilt from its L1 payload. The payload carries no
+    /// archive reference, so the writer marks the block as rebuilt from L1
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::State`] when the writer thread is gone.
+    pub fn submit_rebuilt(
+        &mut self,
+        block: BlockBoundary,
+        delta: BlockDelta,
+    ) -> Result<(), ExecutorError> {
+        self.send(WriteBatch::rebuilt_from_l1(block, delta))
+    }
+
+    /// The channel is bounded, `HORIZON_BLOCKS` deep. `send` blocks when the
+    /// writer falls that far behind. This is the intended fail-fast
+    /// backpressure. A send error means the writer thread is gone. This is
+    /// fatal.
+    fn send(&self, batch: WriteBatch) -> Result<(), ExecutorError> {
+        self.delta_tx
+            .send(batch)
+            .map_err(|e| ExecutorError::State(format!("state writer channel closed: {e}")))
+    }
 }
 
 impl StateWriterQueue for MdbxWriterQueue {
-    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
-        // The channel is bounded, HORIZON_BLOCKS deep. `send` blocks when the
-        // writer falls that far behind. This is the intended fail-fast
-        // backpressure. A send error means the writer thread is gone. This is
-        // fatal.
-        self.delta_tx
-            .send(WriteBatch::new(block, delta))
-            .map_err(|e| ExecutorError::State(format!("state writer channel closed: {e}")))
+    fn submit(
+        &mut self,
+        block: BlockBoundary,
+        delta: BlockDelta,
+        refs: Vec<TxRef>,
+    ) -> Result<(), ExecutorError> {
+        self.send(WriteBatch::with_refs(block, delta, refs))
     }
 }
 
@@ -201,7 +225,7 @@ mod tests {
         // (drop the adapters, then call `writer.shutdown()`) holds here too.
         with_queue(&handle.delta_tx, |queue| {
             queue
-                .submit(boundary(1), block_delta(1, addr, 999))
+                .submit(boundary(1), block_delta(1, addr, 999), Vec::new())
                 .unwrap();
         });
 
@@ -221,8 +245,12 @@ mod tests {
 
         let addr = Address::from([0x07; 20]);
         with_queue(&handle.delta_tx, |queue| {
-            queue.submit(boundary(1), block_delta(1, addr, 1)).unwrap();
-            queue.submit(boundary(2), block_delta(2, addr, 2)).unwrap();
+            queue
+                .submit(boundary(1), block_delta(1, addr, 1), Vec::new())
+                .unwrap();
+            queue
+                .submit(boundary(2), block_delta(2, addr, 2), Vec::new())
+                .unwrap();
         });
 
         // Waiting for an already-passed block must not block forever. It must
@@ -273,7 +301,7 @@ mod tests {
         with_queue(&handle.delta_tx, |queue| {
             for b in 1..=3 {
                 queue
-                    .submit(boundary(b), block_delta(b, addr, b * 10))
+                    .submit(boundary(b), block_delta(b, addr, b * 10), Vec::new())
                     .unwrap();
             }
         });

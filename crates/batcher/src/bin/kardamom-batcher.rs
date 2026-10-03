@@ -88,9 +88,12 @@ struct Cli {
     )]
     dry_run: bool,
 
-    /// L1 JSON-RPC endpoint for live posting.
-    #[arg(long, env = "KARDAMOM_L1_RPC")]
-    l1_rpc: Option<String>,
+    /// L1 JSON-RPC endpoints for live posting: repeat the flag, or
+    /// separate the endpoints with commas. A request goes to the best
+    /// endpoint first and falls back to the next on an error or a rate
+    /// limit.
+    #[arg(long, env = "KARDAMOM_L1_RPC", value_delimiter = ',', num_args = 1..)]
+    l1_rpc: Vec<String>,
 
     /// The batcher EOA private key (hex). Must equal the `settlement`'s
     /// `l1Batcher`.
@@ -157,6 +160,16 @@ struct Cli {
     /// scan starts when no indexer serves it. 0 is fine on anvil.
     #[arg(long, env = "KARDAMOM_SETTLEMENT_DEPLOY_BLOCK", default_value_t = 0)]
     settlement_deploy_block: u64,
+    /// The query endpoints of the executors and the validator
+    /// (`http://host:port`): repeat the flag, or separate them with
+    /// commas. They keep, with every receipt, where the transaction's
+    /// bytes are on the `tx_data` archives. When the sealer no longer
+    /// retains the cursor, the batcher reads each missing block's
+    /// references from the first endpoint that serves it, fetches the
+    /// bytes from the archives, and resumes at the sealer's floor.
+    /// Without them, a refused replay is a fail-stop.
+    #[arg(long, env = "KARDAMOM_BLOCK_REFS_SOURCES", value_delimiter = ',', num_args = 1..)]
+    block_refs_source: Vec<String>,
 
     /// Post a partial group that holds a transaction once its oldest
     /// block has waited this long. Must be nonzero: 0 posts every block.
@@ -211,14 +224,14 @@ impl Cli {
     /// The L1 flag tuple both post paths require. `mode` names the flag
     /// that asked for it, so the error message stays exact (`--live` or
     /// `--dry-run=false`).
-    fn require_l1_flags(&self, mode: &str) -> Result<(&String, &String, Address, &String)> {
+    fn require_l1_flags(&self, mode: &str) -> Result<(&[String], &String, Address, &String)> {
         match (
-            self.l1_rpc.as_ref(),
+            self.l1_rpc.as_slice(),
             self.l1_key.as_ref(),
             self.settlement,
             self.da_proxy.as_ref(),
         ) {
-            (Some(r), Some(k), Some(s), Some(d)) => Ok((r, k, s, d)),
+            (r @ [_, ..], Some(k), Some(s), Some(d)) => Ok((r, k, s, d)),
             _ => bail!("{mode} requires --l1-rpc, --l1-key, --settlement and --da-proxy"),
         }
     }
@@ -299,8 +312,8 @@ impl Cli {
     async fn post_or_dry_run(&self, sent_batches: &[PostedBatch]) -> anyhow::Result<()> {
         let live = !self.dry_run;
         if live {
-            let (rpc, key, settlement, da_proxy) = self.require_l1_flags("--dry-run=false")?;
-            let provider = live::connect_l1(rpc, key).await?;
+            let (rpcs, key, settlement, da_proxy) = self.require_l1_flags("--dry-run=false")?;
+            let provider = live::connect_l1(rpcs, key)?;
             let da = kardamom_batcher::DaProxy::new(da_proxy)?;
 
             // Start from the contract's current index (CAS replay guard).
@@ -315,7 +328,7 @@ impl Cli {
                 head_index, "live posting complete"
             );
         } else {
-            if self.l1_rpc.is_some() || self.settlement.is_some() {
+            if !self.l1_rpc.is_empty() || self.settlement.is_some() {
                 warn!("L1 args supplied but --dry-run is set; not broadcasting");
             }
             info!(
@@ -337,7 +350,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
             "--live requires --dry-run=false: a live batcher that does not post is not a DA service"
         );
     }
-    let (rpc, key, settlement, da_proxy) = cli.require_l1_flags("--live")?;
+    let (rpcs, key, settlement, da_proxy) = cli.require_l1_flags("--live")?;
     let config = cli
         .config
         .clone()
@@ -348,7 +361,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         .context("--live requires --cursor-file")?;
 
     live::run(live::LiveArgs {
-        rpc: rpc.clone(),
+        rpcs: rpcs.to_vec(),
         key: key.clone(),
         settlement,
         da_proxy: da_proxy.clone(),
@@ -373,6 +386,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         chain_id: cli.chain_id,
         indexer_url: cli.indexer_url.clone(),
         settlement_deploy_block: cli.settlement_deploy_block,
+        block_refs_sources: cli.block_refs_source.clone(),
     })
     .await
 }

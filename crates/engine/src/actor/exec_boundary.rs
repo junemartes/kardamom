@@ -310,7 +310,8 @@ impl<W: ExecPorts> ExecState<W> {
 
         // Submit without waiting. The commit settles at a later boundary's
         // sweep, or at the end of the stream.
-        self.io.sw_queue.submit(boundary, bd)?;
+        let refs = std::mem::take(&mut self.block.refs);
+        self.io.sw_queue.submit(boundary, bd, refs)?;
         // `block_number` comes from `BlockBoundaryStart` on the wire; a
         // corrupt value near `u64::MAX` must not wrap the next block back
         // to 0 and re-execute the chain.

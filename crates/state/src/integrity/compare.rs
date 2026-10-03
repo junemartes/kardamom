@@ -1,17 +1,18 @@
 //! Deep table-level comparison between two state DBs: [`deep_compare`]
 //! and its receipt field-diff helper.
 
+use kardamom_types::BPosition;
 use signet_libmdbx::tx::aliases::RwTxSync;
 
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    KEY_GENESIS_DIGEST, KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION,
-    KEY_SCHEMA_VERSION,
+    KEY_GENESIS_DIGEST, KEY_L1_REBUILT_END_TX_POSITION, KEY_LAST_COMMITTED_BLOCK,
+    KEY_LAST_COMMITTED_END_TX_POSITION, KEY_SCHEMA_VERSION, read_meta_b_position,
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
-    TABLE_TX_HASH_INDEX, decode_receipt_value, encode_block_key,
+    TABLE_TX_HASH_INDEX, decode_receipt_value, decode_tx_hash_value, encode_block_key,
 };
 
 /// One cursor row, or `None` at end of table.
@@ -43,6 +44,12 @@ const SHARED_TABLES: &[&str] = &[
 /// This comparison excludes trie tables and per-node meta, such as the
 /// fsync watermark and `state_root`. Only the validator maintains a
 /// trie, and [`super::sweep`] verifies it.
+///
+/// A `tx_hash_index` row has a canonical part, the position, and a
+/// per-node part, the archive reference. A node that rebuilt a block from
+/// L1 keeps no reference for it. So a row without a reference matches a
+/// row with one when the positions are equal and the row is at or below
+/// the rebuilt mark of its own node. Every other difference counts.
 ///
 /// # Errors
 ///
@@ -77,12 +84,47 @@ fn compare_bounded(
 ) -> Result<Vec<String>, StateError> {
     let ta = a.raw().begin_rw_sync()?;
     let tb = b.raw().begin_rw_sync()?;
+    let rebuilt = RebuiltMarks::read(&ta, &tb)?;
     let mut diffs = Vec::new();
     for table in SHARED_TABLES {
-        diffs.extend(TableCompare::new(&ta, &tb, table, bound).run()?);
+        diffs.extend(TableCompare::new(&ta, &tb, table, bound, rebuilt).run()?);
     }
     diffs.extend(TableCompare::meta_keys(&ta, &tb, bound)?);
     Ok(diffs)
+}
+
+/// The rebuilt mark of each side: the end of the last block that node
+/// rebuilt from L1, or `None` when it rebuilt none.
+#[derive(Clone, Copy)]
+struct RebuiltMarks {
+    a: Option<BPosition>,
+    b: Option<BPosition>,
+}
+
+impl RebuiltMarks {
+    fn read(ta: &RwTxSync, tb: &RwTxSync) -> Result<Self, StateError> {
+        let mark = |txn: &RwTxSync| -> Result<Option<BPosition>, StateError> {
+            let meta = txn.open_db(Some(TABLE_META))?;
+            read_meta_b_position(txn, meta, KEY_L1_REBUILT_END_TX_POSITION)
+        };
+        Ok(Self {
+            a: mark(ta)?,
+            b: mark(tb)?,
+        })
+    }
+
+    /// Whether two differing `tx_hash_index` rows are the same row: equal
+    /// positions, and the side without a reference rebuilt that position
+    /// from L1. A row that does not decode is a difference.
+    fn same_row(self, va: &[u8], vb: &[u8]) -> bool {
+        let (Ok(ra), Ok(rb)) = (decode_tx_hash_value(va), decode_tx_hash_value(vb)) else {
+            return false;
+        };
+        let rebuilt = |data: Option<_>, mark: Option<BPosition>| {
+            data.is_none() && mark.is_some_and(|end| ra.tx_idx <= end)
+        };
+        ra.tx_idx == rb.tx_idx && (rebuilt(ra.data, self.a) || rebuilt(rb.data, self.b))
+    }
 }
 
 /// A dual-cursor merge of one shared table between two DBs' transactions.
@@ -95,16 +137,24 @@ struct TableCompare<'a> {
     /// The last block whose `headers` row counts; rows past it are the
     /// empty tail [`deep_compare_to`] tolerates.
     bound: Option<u64>,
+    rebuilt: RebuiltMarks,
     diffs: Vec<String>,
 }
 
 impl<'a> TableCompare<'a> {
-    fn new(ta: &'a RwTxSync, tb: &'a RwTxSync, table: &'a str, bound: Option<u64>) -> Self {
+    fn new(
+        ta: &'a RwTxSync,
+        tb: &'a RwTxSync,
+        table: &'a str,
+        bound: Option<u64>,
+        rebuilt: RebuiltMarks,
+    ) -> Self {
         Self {
             ta,
             tb,
             table,
             bound,
+            rebuilt,
             diffs: Vec::new(),
         }
     }
@@ -208,7 +258,7 @@ impl<'a> TableCompare<'a> {
                 (Some((ka, va)), cb.next::<Vec<u8>, Vec<u8>>()?)
             }));
         }
-        if va != vb {
+        if va != vb && !(self.table == TABLE_TX_HASH_INDEX && self.rebuilt.same_row(&va, &vb)) {
             let message = self.value_diff_message(&ka, &va, &vb);
             self.push(message);
         }
