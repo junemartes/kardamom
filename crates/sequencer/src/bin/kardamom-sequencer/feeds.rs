@@ -43,7 +43,7 @@ use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::pump::{OriginLane, Pump};
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
+    FloorUpdate, ResyncController, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
@@ -114,10 +114,10 @@ pub(crate) struct EgressWatermarkFeed {
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    /// `(sender, nonce, max_inclusion_block, at_block)`: the refs the
-    /// sealer refused for being late. The publish loop drops each one and
-    /// tells the client.
-    deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
+    /// The refs the sealer refused for good: late ones, and ones the
+    /// DA-lag guard refused. The publish loop drops each one and tells
+    /// the client.
+    deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     /// Anchored at feed start, not `None`. The cluster emits a boundary
     /// every tick, so "never seen a boundary" past the silence window is
@@ -134,7 +134,7 @@ impl EgressWatermarkFeed {
         partition: u32,
         watermark: SharedWatermark,
         reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
-        deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
+        deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     ) -> Self {
         Self {
             silence_ms,
@@ -184,6 +184,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_deadline_frame(frame) {
+            return;
+        }
+        if self.on_da_lag_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -257,7 +260,14 @@ impl EgressWatermarkFeed {
                         at_block,
                         "sealer past-deadline reject received; dropping the ref"
                     );
-                    self.forward_past_deadline(sender, nonce, max_inclusion_block, at_block);
+                    self.forward_refusal(SealerRefusal {
+                        sender,
+                        nonce,
+                        reason: kardamom_types::TxErrorReason::PastDeadline {
+                            max_inclusion_block,
+                            at_block,
+                        },
+                    });
                 }
                 true
             }
@@ -275,6 +285,47 @@ impl EgressWatermarkFeed {
             }
             _ => false,
         }
+    }
+
+    /// Handle one DA-lag reject frame. Returns `true` when `frame` was
+    /// one, so the caller does not also check it for a boundary.
+    ///
+    /// The sealer refused the ref because the chain is halted on a DA
+    /// lag. No republish can order it until the batcher posts again, so
+    /// it takes the terminal-refusal channel: the publish loop drops the
+    /// ledger entry and tells the client to resubmit later.
+    fn on_da_lag_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_DA_LAG_REJECT) {
+            return false;
+        }
+        if let Ok(EgressItem::DaLagReject {
+            sender,
+            nonce,
+            sealed_head,
+            posted_head,
+            budget_blocks,
+        }) = EgressItem::decode(frame)
+        {
+            tracing::warn!(
+                partition = self.partition,
+                ?sender,
+                nonce,
+                sealed_head,
+                posted_head,
+                budget_blocks,
+                "sealer DA-lag reject received; dropping the ref"
+            );
+            self.forward_refusal(SealerRefusal {
+                sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::DaLag {
+                    sealed_head,
+                    posted_head,
+                    budget_blocks,
+                },
+            });
+        }
+        true
     }
 
     /// Handle one remote-origin-reject frame. Returns `true` when

@@ -573,34 +573,32 @@ impl Sequencer {
         }
     }
 
-    /// Apply the past-deadline rejects the sealer answered this shard
-    /// with. Each one is a transaction the chain will never order: drop it
-    /// from the unconfirmed ledger, so it never republishes, and tell the
-    /// client, so it can sign again instead of waiting out its timeout.
+    /// Apply the terminal refusals the sealer answered this shard with: a
+    /// ref past its inclusion deadline, or one the DA-lag guard refused.
+    /// No republish can order either now: drop it from the unconfirmed
+    /// ledger, so it never republishes, and tell the client, so it can
+    /// resubmit instead of waiting out its timeout.
     fn apply_deadline_rejects<P: SequencerPorts>(
         &mut self,
         r: &mut crate::resync::ResyncController,
         ports: &mut P,
     ) {
-        for (sender, nonce, max_inclusion_block, at_block) in r.drain_deadline_rejects() {
-            self.unconfirmed.drop_committed(sender, nonce);
+        for refusal in r.drain_deadline_rejects() {
+            self.unconfirmed
+                .drop_committed(refusal.sender, refusal.nonce);
             warn!(
-                sender = ?sender,
-                nonce,
-                max_inclusion_block,
-                at_block,
-                "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
+                sender = ?refusal.sender,
+                nonce = refusal.nonce,
+                reason = ?refusal.reason,
+                "the sealer refused the ref; reporting it to the client"
             );
             let (_, _, errors) = ports.split();
             self.publish_error(
                 errors,
                 TxError {
-                    sender,
-                    nonce,
-                    reason: TxErrorReason::PastDeadline {
-                        max_inclusion_block,
-                        at_block,
-                    },
+                    sender: refusal.sender,
+                    nonce: refusal.nonce,
+                    reason: refusal.reason,
                 },
             );
         }
