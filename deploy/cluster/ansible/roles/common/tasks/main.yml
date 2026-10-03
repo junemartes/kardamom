@@ -74,6 +74,7 @@
     - "{{ paths.state_dir }}"
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
+    - "{{ paths.notifier_dir }}"
     - "{{ paths.batcher_dir }}"
     - "{{ paths.l1_indexer_dir }}"
     - "{{ paths.da_store_dir }}"

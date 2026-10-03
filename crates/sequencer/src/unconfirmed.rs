@@ -94,9 +94,9 @@ impl<T> UnconfirmedLedger<T> {
     /// only transaction is nonce 0: nonce-0 receipts cannot be told apart
     /// from deposits, so they never confirm) would republish on every
     /// confirm timeout forever, once the dedup horizon rolls past it.
-    /// Returns whether the entry was present.
-    pub(crate) fn drop_committed(&mut self, sender: Address, nonce: u64) -> bool {
-        self.entries.remove(&(sender, nonce)).is_some()
+    /// Returns the dropped ref's metadata when the entry was present.
+    pub(crate) fn drop_committed(&mut self, sender: Address, nonce: u64) -> Option<T> {
+        self.entries.remove(&(sender, nonce)).map(|(meta, _)| meta)
     }
 
     /// A sealer contiguity gap: refs for `sender` at `expected..nonce-1`
@@ -245,8 +245,8 @@ mod tests {
         l.confirm_through(a, 5);
         assert_eq!(l.len(), 1);
         // drop_committed reports presence exactly once.
-        assert!(l.drop_committed(b, 0));
-        assert!(!l.drop_committed(b, 0));
+        assert!(l.drop_committed(b, 0).is_some());
+        assert!(l.drop_committed(b, 0).is_none());
         assert_eq!(l.len(), 0);
     }
 

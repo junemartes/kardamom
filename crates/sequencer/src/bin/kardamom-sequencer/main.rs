@@ -2,7 +2,7 @@
 //!
 //! Parses a TOML [`SequencerConfig`], opens one `tx_data` subscriber per
 //! lane it reads, the Aeron Cluster (Raft) ref publisher (`tx_ordering`),
-//! and a `tx_errors` publisher for rejection signals. Runs the sequencer
+//! and the `tx_errors` and `tx_status` publishers. Runs the sequencer
 //! main loop on a dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
 //! The lag-detection, receipt-floor, and nonce-lookup feed tasks live in
@@ -20,7 +20,7 @@ use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
@@ -254,12 +254,13 @@ struct Handles {
     deposits_sub: TxDepositsSubscriberHandle,
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
     errors_pub: TxErrorsPublisherHandle,
+    status_pub: TxStatusPublisherHandle,
 }
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    /// `tx_errors` follows the plane's transport; the rest still open on
-    /// their static channels.
+    /// `tx_errors` and `tx_status` follow the plane's transport; the rest
+    /// still open on their static channels.
     async fn open(
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
@@ -283,6 +284,10 @@ impl Handles {
                 .publisher::<TxErrorsPublisherHandle>(rt)
                 .await
                 .context("open TxErrorsPublisherHandle")?,
+            status_pub: plane
+                .publisher::<TxStatusPublisherHandle>(rt)
+                .await
+                .context("open TxStatusPublisherHandle")?,
         })
     }
 
@@ -634,7 +639,10 @@ async fn main() -> anyhow::Result<()> {
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
-        tx_errors: handles.errors_pub,
+        side: kardamom_sequencer::outbound::SideChannels {
+            errors: handles.errors_pub,
+            status: handles.status_pub,
+        },
         epochs: handles.deposits_sub,
         remote_epochs: handles.remote_epochs_sub,
         resync: Some(resync.controller),

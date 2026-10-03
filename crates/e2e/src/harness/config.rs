@@ -83,6 +83,9 @@ pub struct StackConfig {
     /// (the `[fees]` fragment appended to the genesis), as the deploy's
     /// one `PRIORITY_FEES` value sets them.
     pub priority_fees: bool,
+    /// Also run `kardamom-notifier`, the transaction status feed. The
+    /// feed's WebSocket URL is [`crate::harness::LocalStack::notifier_ws_url`].
+    pub notifier: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -135,6 +138,7 @@ impl Default for StackConfig {
             archive_durability: false,
             verified_l1: false,
             priority_fees: false,
+            notifier: false,
         }
     }
 }

@@ -123,6 +123,14 @@ fn sequencer_core_loop_allocation_profile() {
         .lock()
         .unwrap()
         .reserve(measured_total as usize + 16);
+    // The same for the fake side publisher's status vector: one `Offered`
+    // status per published ref. The real publisher encodes a frame
+    // instead, which `tx_status` costs on its own side channel.
+    rig.errors
+        .statuses
+        .lock()
+        .unwrap()
+        .reserve(measured_total as usize + 16);
 
     // This is the measured window, under DHAT. It runs the production
     // `run_once` path: poll, shard check, RLP nonce decode, nonce state

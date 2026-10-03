@@ -32,7 +32,7 @@ use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
-    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_sequencer::config::SequencerConfig;
@@ -41,7 +41,7 @@ use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
-use kardamom_sequencer::outbound::TxOrderingRefPublisher;
+use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::{OriginLane, Pump};
 use kardamom_sequencer::resync::{
     FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
@@ -718,8 +718,8 @@ impl BaseFeeFeed {
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
 /// Argument group for [`PublishLoops::spawn`]: the config, the `tx_data`
-/// lane subscriptions, the three `tx_ordering` publishers, the `tx_errors`
-/// publisher, the two origin subscriptions, the resync controller, the
+/// lane subscriptions, the three `tx_ordering` publishers, the side
+/// channels, the two origin subscriptions, the resync controller, the
 /// nonce lookup requester, and one shutdown token. Each spawned loop
 /// clones the token itself.
 pub(crate) struct PublishLoops<P> {
@@ -731,7 +731,7 @@ pub(crate) struct PublishLoops<P> {
     pub(crate) epoch_pub: P,
     /// The interop remote-epoch pump's publisher.
     pub(crate) remote_epoch_pub: P,
-    pub(crate) tx_errors: TxErrorsPublisherHandle,
+    pub(crate) side: SideChannels,
     /// The fee admission gate for the canonical loop.
     pub(crate) fees: FeeGate,
     pub(crate) epochs: TxDepositsSubscriberHandle,
@@ -763,7 +763,7 @@ where
             mut main_pub,
             epoch_pub,
             remote_epoch_pub,
-            mut tx_errors,
+            mut side,
             fees,
             epochs: epoch_subscription,
             remote_epochs: remote_epoch_subscription,
@@ -788,7 +788,7 @@ where
             let mut ports = Ports {
                 tx_data: &mut tx_data,
                 refs: &mut main_pub,
-                errors: &mut tx_errors,
+                errors: &mut side,
             };
             sequencer.run(&mut ports, &shutdown_for_main)
         });
