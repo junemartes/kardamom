@@ -11,6 +11,7 @@
 //! watcher can log at `debug` level instead of marking the tick as an error.
 
 use alloy_primitives::{Address, B256};
+use alloy_rpc_types_eth::{Filter, Log as RpcLog};
 use async_trait::async_trait;
 
 // The decoded log shapes live in `kardamom_types::epoch` alongside the
@@ -27,6 +28,29 @@ pub enum L1SourceError {
     /// Provider/transport error (HTTP failure, connection reset, etc).
     #[error("L1 provider error: {0}")]
     Provider(String),
+    /// The provider refused the request with HTTP 429. A source set
+    /// rotates the source out for its backoff; the rest keep going.
+    #[error("L1 provider rate-limited the request (HTTP 429)")]
+    RateLimited,
+    /// Two sources gave different answers for `what`, and no light client
+    /// settles it. The follower halts on this every tick: a majority of
+    /// public endpoints proves nothing, since two can share a backend.
+    #[error("L1 sources disagree on {what}: {a_name} says {a}, {b_name} says {b}")]
+    Disagreement {
+        what: String,
+        a_name: String,
+        a: String,
+        b_name: String,
+        b: String,
+    },
+    /// Fewer sources answered than the agreement rule needs: the others
+    /// are rotated out, or down.
+    #[error("{answered} of {configured} L1 sources answered; {needed} agreeing answers needed")]
+    NoQuorum {
+        answered: usize,
+        needed: usize,
+        configured: usize,
+    },
     /// Decode failure (ABI, RLP, or similar) for a log the provider returns.
     #[error("L1 log decode error: {0}")]
     Decode(String),
@@ -64,6 +88,11 @@ pub trait L1Source: Send + Sync + 'static {
         Ok(self.block_ids(number).await?.0)
     }
 
+    /// The logs that match `filter`, as the provider returns them. The
+    /// indexer reads the settlement's `BatchPosted` logs through this, so
+    /// they pass the same cross-check as the lockbox logs.
+    async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError>;
+
     /// Lockbox logs (`DepositInitiated` and `UpgradeInitiated`) that
     /// `lockbox` emits in the inclusive block range `[from_block, to_block]`.
     /// The response order is the canonical (block, `log_index`) order.
@@ -78,15 +107,57 @@ pub trait L1Source: Send + Sync + 'static {
         lockbox: Address,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<LockboxLog>, L1SourceError>;
+    ) -> Result<Vec<LockboxLog>, L1SourceError> {
+        use alloy_sol_types::SolEvent;
+        let filter = Filter::new()
+            .address(lockbox)
+            .event_signature(vec![
+                crate::rpc_source::DepositInitiated::SIGNATURE_HASH,
+                crate::rpc_source::UpgradeInitiated::SIGNATURE_HASH,
+            ])
+            .from_block(from_block)
+            .to_block(to_block);
+        self.logs(&filter)
+            .await?
+            .iter()
+            .map(crate::rpc_source::decode_lockbox_log)
+            .collect()
+    }
+}
+
+/// A shared source is a source: a test keeps its handle on a mock after
+/// the set takes it, and one provider serves two sets.
+#[async_trait]
+impl<S: L1Source> L1Source for std::sync::Arc<S> {
+    async fn finalized_block_number(&self) -> Result<u64, L1SourceError> {
+        (**self).finalized_block_number().await
+    }
+
+    async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
+        (**self).block_ids(number).await
+    }
+
+    async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {
+        (**self).logs(filter).await
+    }
+
+    async fn lockbox_logs(
+        &self,
+        lockbox: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<LockboxLog>, L1SourceError> {
+        (**self).lockbox_logs(lockbox, from_block, to_block).await
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{Address, B256, L1Source, L1SourceError, LockboxLog, async_trait};
+    use super::{Address, B256, Filter, L1Source, L1SourceError, LockboxLog, RpcLog, async_trait};
 
     /// In-memory `L1Source` driven by a scripted queue. Tests push expected
     /// `(tip, logs)` pairs in order. Each `process_once` call consumes one
@@ -106,6 +177,14 @@ pub mod fakes {
         /// Blocks whose parent hash the mock reports wrong: a provider
         /// that does not serve a chain.
         pub parent_lies: Mutex<std::collections::BTreeSet<u64>>,
+        /// If set, every read fails with `RateLimited`: a public endpoint
+        /// that answers HTTP 429.
+        pub rate_limited: Mutex<bool>,
+        /// Pre-scripted outcomes for `logs(...)` calls, in FIFO order. An
+        /// empty queue answers no log.
+        pub raw_logs: Mutex<VecDeque<Result<Vec<RpcLog>, L1SourceError>>>,
+        /// Reads served, so a test can prove which source a set asked.
+        pub calls: AtomicU64,
     }
 
     impl MockL1Source {
@@ -130,7 +209,25 @@ pub mod fakes {
                 hashes: Mutex::new(std::collections::BTreeMap::new()),
                 block_hash_fails: Mutex::new(false),
                 parent_lies: Mutex::new(std::collections::BTreeSet::new()),
+                rate_limited: Mutex::new(false),
+                raw_logs: Mutex::new(VecDeque::new()),
+                calls: AtomicU64::new(0),
             }
+        }
+
+        /// Count one read, and fail it when the mock is rate-limited.
+        fn serve(&self) -> Result<(), L1SourceError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if *self.rate_limited.lock().unwrap() {
+                return Err(L1SourceError::RateLimited);
+            }
+            Ok(())
+        }
+
+        /// Reads served so far.
+        #[must_use]
+        pub fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
         }
 
         /// # Panics
@@ -159,6 +256,7 @@ pub mod fakes {
     #[async_trait]
     impl L1Source for MockL1Source {
         async fn finalized_block_number(&self) -> Result<u64, L1SourceError> {
+            self.serve()?;
             self.tips
                 .lock()
                 .unwrap()
@@ -167,6 +265,7 @@ pub mod fakes {
         }
 
         async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
+            self.serve()?;
             if *self.block_hash_fails.lock().unwrap() {
                 return Err(L1SourceError::Provider(
                     "scripted block_hash failure".into(),
@@ -188,12 +287,22 @@ pub mod fakes {
             Ok((at(number), at(number.saturating_sub(1))))
         }
 
+        async fn logs(&self, _filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {
+            self.serve()?;
+            self.raw_logs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
+        }
+
         async fn lockbox_logs(
             &self,
             _lockbox: Address,
             _from_block: u64,
             _to_block: u64,
         ) -> Result<Vec<LockboxLog>, L1SourceError> {
+            self.serve()?;
             self.logs
                 .lock()
                 .unwrap()

@@ -1,18 +1,20 @@
 //! Alloy-provider-backed implementation of [`crate::source::L1Source`].
 //!
-//! It has only two jobs:
+//! It has three jobs:
 //!   * map `finalized_block_number()` to `eth_getBlockByNumber("finalized")`,
-//!   * map `lockbox_logs(...)` to `eth_getLogs(...)`, filtered by the
-//!     lockbox address and the `DepositInitiated` and `UpgradeInitiated`
-//!     event signatures, then ABI-decode each result into a [`LockboxLog`].
+//!   * map `block_ids(n)` to `eth_getBlockByNumber(n)`,
+//!   * map `logs(filter)` to `eth_getLogs(filter)`. The trait's
+//!     `lockbox_logs` builds the lockbox filter on it and ABI-decodes each
+//!     result into a [`LockboxLog`].
 //!
 //! The contracts' bytecode-hash CI check byte-pins the event signature to
 //! the on-chain `ETHLockbox.sol` ABI.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log as RpcLog};
 use alloy_sol_types::{SolEvent, sol};
+use alloy_transport::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
 use kardamom_types::epoch::UpgradeLog;
@@ -42,7 +44,7 @@ sol! {
     );
 }
 
-/// Wraps an alloy `Provider` and exposes the two L1 reads the watcher needs.
+/// Wraps an alloy `Provider` and exposes the L1 reads the followers need.
 pub struct RpcL1Source<P> {
     provider: P,
 }
@@ -52,6 +54,18 @@ impl<P> RpcL1Source<P> {
     #[must_use]
     pub const fn new(provider: P) -> Self {
         Self { provider }
+    }
+}
+
+/// The source error of one transport error. HTTP 429 gets its own
+/// variant, so a source set rotates the endpoint out instead of
+/// reporting a generic failure.
+fn provider_error(e: RpcError<TransportErrorKind>) -> L1SourceError {
+    match &e {
+        RpcError::Transport(TransportErrorKind::HttpError(http)) if http.is_rate_limit_err() => {
+            L1SourceError::RateLimited
+        }
+        _ => L1SourceError::Provider(e.to_string()),
     }
 }
 
@@ -65,7 +79,7 @@ where
             .provider
             .get_block_by_number(BlockNumberOrTag::Finalized)
             .await
-            .map_err(|e| L1SourceError::Provider(e.to_string()))?
+            .map_err(provider_error)?
             .ok_or(L1SourceError::NotFinalized)?;
         Ok(block.header.number)
     }
@@ -75,7 +89,7 @@ where
             .provider
             .get_block_by_number(BlockNumberOrTag::Number(number))
             .await
-            .map_err(|e| L1SourceError::Provider(e.to_string()))?
+            .map_err(provider_error)?
             .ok_or_else(|| {
                 // The caller only ever asks for blocks at or below the
                 // finalized tip. So a miss means a reorg or a lying
@@ -85,32 +99,8 @@ where
         Ok((block.header.hash, block.header.parent_hash))
     }
 
-    async fn lockbox_logs(
-        &self,
-        lockbox: Address,
-        from_block: u64,
-        to_block: u64,
-    ) -> Result<Vec<LockboxLog>, L1SourceError> {
-        // One query for both event kinds, using a topic0 set, not two round
-        // trips. Two separate queries could succeed and fail independently,
-        // which could let an epoch derive with its deposits but without its
-        // upgrade.
-        let filter = Filter::new()
-            .address(lockbox)
-            .event_signature(vec![
-                DepositInitiated::SIGNATURE_HASH,
-                UpgradeInitiated::SIGNATURE_HASH,
-            ])
-            .from_block(from_block)
-            .to_block(to_block);
-
-        let logs = self
-            .provider
-            .get_logs(&filter)
-            .await
-            .map_err(|e| L1SourceError::Provider(e.to_string()))?;
-
-        logs.iter().map(decode_lockbox_log).collect()
+    async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {
+        self.provider.get_logs(filter).await.map_err(provider_error)
     }
 }
 

@@ -3912,9 +3912,11 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
+ "alloy-transport",
  "anyhow",
  "async-trait",
  "clap",
+ "futures",
  "jsonrpsee",
  "kardamom-da-watcher",
  "kardamom-interop-feed",
@@ -4112,7 +4114,6 @@ name = "kardamom-l1-indexer"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "alloy-provider",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
  "anyhow",

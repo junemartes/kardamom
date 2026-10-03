@@ -3,9 +3,9 @@
 //! It runs up to two independent origin watchers in one process:
 //!
 //! * L1 deposits (`--l1-rpc` and `--lockbox`, plus an optional
-//!   `--poll-interval`): an `da_watcher::RpcL1Source` over an alloy HTTP
-//!   provider. Each finalized L1 block becomes one `EpochRecord` on the
-//!   `tx_deposits` Aeron channel, through
+//!   `--poll-interval`): an `da_watcher::L1Sources` set over one alloy
+//!   HTTP provider per endpoint. Each finalized L1 block becomes one
+//!   `EpochRecord` on the `tx_deposits` Aeron channel, through
 //!   [`publishers::LiveTxDepositsPublisher`].
 //! * Interop (`--interop-feed-url`, `--interop-peer-chain-id`, and
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
@@ -29,10 +29,10 @@ use alloy_primitives::Address;
 use anyhow::Context;
 use clap::Parser;
 
-use kardamom_da_watcher::DaWatcherConfig;
 use kardamom_da_watcher::interop::{
     CursorFile, CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
+use kardamom_da_watcher::{DaWatcherConfig, L1Endpoints};
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
 };
@@ -56,10 +56,18 @@ use watchers::Watchers;
     about = "origin monitor — tails finalized L1 blocks onto tx_deposits and/or a peer chain's outbox feed onto tx_remote_epochs"
 )]
 struct Args {
-    /// L1 JSON-RPC HTTP endpoint, for example `http://127.0.0.1:8545`. Enables
-    /// the L1 deposit path. It requires `--lockbox`.
+    /// L1 JSON-RPC HTTP endpoints, for example `http://127.0.0.1:8545`:
+    /// repeat the flag, or separate the endpoints with commas. Enables the
+    /// L1 deposit path. It requires `--lockbox`. With two or more, a
+    /// block is accepted when two agree; a source that fails or lies
+    /// rotates out for a backoff.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    l1_rpc: Vec<String>,
+    /// The L1 light client's endpoint. Its answer settles a read when it
+    /// serves the block; a public endpoint that disagrees with it is the
+    /// liar.
     #[arg(long)]
-    l1_rpc: Option<String>,
+    l1_light_client_rpc: Option<String>,
     /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
     #[arg(long)]
     lockbox: Option<String>,
@@ -156,7 +164,7 @@ struct Args {
 /// The L1 deposit path, resolved. Present only when both `--l1-rpc` and
 /// `--lockbox` were given.
 struct L1Path {
-    rpc: String,
+    endpoints: L1Endpoints,
     cfg: DaWatcherConfig,
 }
 
@@ -222,20 +230,25 @@ impl Args {
     /// Resolve the L1 deposit path: `Some` only when both `--l1-rpc` and
     /// `--lockbox` were given.
     fn l1_path(&self) -> anyhow::Result<Option<L1Path>> {
-        match (&self.l1_rpc, &self.lockbox) {
-            (Some(rpc), Some(lockbox)) => {
+        match (self.l1_rpc.as_slice(), &self.lockbox) {
+            ([], None) => Ok(None),
+            ([], Some(_)) | ([_, ..], None) => {
+                anyhow::bail!("--l1-rpc and --lockbox must be given together")
+            }
+            (rpcs, Some(lockbox)) => {
                 let lockbox = Address::from_str(lockbox)
                     .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
                 Ok(Some(L1Path {
-                    rpc: rpc.clone(),
+                    endpoints: L1Endpoints {
+                        rpcs: rpcs.to_vec(),
+                        light_client: self.l1_light_client_rpc.clone(),
+                    },
                     cfg: DaWatcherConfig {
                         lockbox,
                         poll_interval: Duration::from_secs(self.poll_interval_secs.get()),
                     },
                 }))
             }
-            (None, None) => Ok(None),
-            _ => anyhow::bail!("--l1-rpc and --lockbox must be given together"),
         }
     }
 

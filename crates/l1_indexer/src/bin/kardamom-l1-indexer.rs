@@ -1,11 +1,11 @@
 //! kardamom-l1-indexer: follow the finalized L1 and archive the inbox.
 //!
-//! One process runs the follower and the API. `--l1-rpc` is the light
-//! client's endpoint on a production deployment, so every block, log,
-//! and hash the archive is built from is verified against the beacon
-//! chain's sync committee before it reaches this process. The payloads
-//! come from the EigenDA proxy, which checks them against their
-//! certificates.
+//! One process runs the follower and the API. `--l1-rpc` lists the L1
+//! endpoints: a block, a log query, or a hash reaches the archive only
+//! when two endpoints agree on it, or when the light client
+//! (`--l1-light-client-rpc`) serves it, verified against the beacon
+//! chain's sync committee. The payloads come from the EigenDA proxy,
+//! which checks them against their certificates.
 
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
@@ -13,11 +13,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
 use kardamom_batcher::da::DaProxy;
-use kardamom_da_watcher::RpcL1Source;
+use kardamom_da_watcher::L1Endpoints;
 use kardamom_l1_indexer::api::Api;
 use kardamom_l1_indexer::follow::{FollowConfig, Follower, FollowerParts};
 use kardamom_l1_indexer::store::Store;
@@ -30,9 +29,16 @@ use kardamom_obs::HostId;
     about = "archives the posted batches, their payloads, and the epoch inputs of the finalized L1"
 )]
 struct Args {
-    /// L1 JSON-RPC HTTP endpoint: the light client, or a full node.
+    /// L1 JSON-RPC HTTP endpoints: repeat the flag, or separate the
+    /// endpoints with commas. With two or more, a read is accepted when
+    /// two agree; a source that fails or lies rotates out for a backoff.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    l1_rpc: Vec<String>,
+    /// The L1 light client's endpoint. Its answer settles a read when it
+    /// serves the block; a public endpoint that disagrees with it is the
+    /// liar.
     #[arg(long)]
-    l1_rpc: String,
+    l1_light_client_rpc: Option<String>,
     /// The EigenDA proxy (`http://host:port`), for the payloads.
     #[arg(long, env = "KARDAMOM_DA_PROXY")]
     da_proxy: String,
@@ -81,15 +87,17 @@ async fn main() -> anyhow::Result<()> {
     .context("init prometheus exporter")?;
     kardamom_l1_indexer::metrics::describe();
 
-    let provider = ProviderBuilder::new()
-        .connect(&args.l1_rpc)
-        .await
-        .with_context(|| format!("connect L1 {}", args.l1_rpc))?;
+    let source = L1Endpoints {
+        rpcs: args.l1_rpc.clone(),
+        light_client: args.l1_light_client_rpc.clone(),
+    }
+    .connect()
+    .await
+    .context("connect the L1 sources")?;
     let da = DaProxy::new(&args.da_proxy).context("DA proxy client")?;
     let store = Store::open(&args.data_dir).context("open archive")?;
     let follower = Follower::open(FollowerParts {
-        source: RpcL1Source::new(provider.clone()),
-        provider,
+        source,
         da,
         store: store.clone(),
         cfg: FollowConfig {

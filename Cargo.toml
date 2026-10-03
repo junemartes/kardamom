@@ -35,6 +35,9 @@ hdrhistogram = "7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 if-addrs = "0.15"
 alloy-provider = "2.0"
+alloy-transport = "2.0"
+alloy-transport-http = "2.0"
+alloy-rpc-client = "2.0"
 alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
