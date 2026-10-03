@@ -12,8 +12,8 @@
 #
 # Like the light client, this job deploys against a real network: it
 # follows finality. The chaos-l1 shard also deploys it against the
-# in-cluster anvil, through the L1 fault proxy, where every block is
-# final at once; that shard is the only CI run of it. Validate a change
+# in-cluster anvil, through the L1 fault proxy, where anvil finalizes
+# two blocks behind its head; that shard is the only CI run of it. Validate a change
 # to it against a testnet too. The empty defaults exist for
 # `just validate` only; the workloads role passes every value.
 

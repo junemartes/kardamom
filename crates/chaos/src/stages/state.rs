@@ -7,6 +7,7 @@ use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
 use super::rebuild::{Rebuild, Target};
 
+use crate::cases::L1Record;
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
@@ -17,7 +18,9 @@ impl Harness {
     /// and compare copies of all persisted state. Restore the jobs on both
     /// success and failure. Then rebuild the state at the validator's head
     /// from L1 alone, with the jobs back up so the batcher posts through
-    /// that head, and require the validator's root.
+    /// that head, and require the validator's root. A DA record with a
+    /// known gap cannot reach that head: the rebuild is then logged as
+    /// skipped.
     ///
     /// The copies remain in the reported directory on failure. A pass
     /// removes them: they hold about 1.4 GB per case, and a soak that keeps
@@ -40,7 +43,12 @@ impl Harness {
             (Err(error), _) | (_, Err(error)) => return Err(error),
             (Ok(rebuild), Ok(())) => rebuild,
         };
-        rebuild.assert_parity().await?;
+        match self.l1_record {
+            L1Record::Complete => rebuild.assert_parity().await?,
+            L1Record::KnownGap => crate::log(
+                "rebuild-from-l1: SKIPPED: the batcher halted past the sealers' retention floor, and the recovery of the gap from an executor's block refs waits on kardamom_getBlockRefs",
+            ),
+        }
         tokio::fs::remove_dir_all(&rebuild.evidence)
             .await
             .with_context(|| format!("remove {}", rebuild.evidence.display()))

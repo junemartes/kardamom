@@ -77,6 +77,16 @@ fn case_list(shard: Shard) -> Vec<String> {
     )
 }
 
+/// One case, and the persisted-state stage after it when the shard
+/// audits each case.
+async fn run_audited(harness: &mut Harness, shard: Shard, case: &str) -> anyhow::Result<()> {
+    harness.run_case(case).await?;
+    if shard.audits_each_case() {
+        harness.assert_persisted_state().await?;
+    }
+    Ok(())
+}
+
 async fn run_shard(shard: Shard) -> anyhow::Result<()> {
     let knobs = Knobs::read(shard.env())?;
     let lifecycle = Lifecycle::in_workspace();
@@ -96,10 +106,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         harness.knobs.case_window.as_secs()
     ));
     for case in &cases {
-        harness.run_case(case).await?;
-        if shard.audits_each_case() {
-            harness.assert_persisted_state().await?;
-        }
+        run_audited(&mut harness, shard, case).await?;
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
     harness.ingress_churn().await?;

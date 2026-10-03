@@ -91,7 +91,7 @@ impl Phase {
     /// One phase: arm the lie, prove the halt and the batcher's posts
     /// through it, let it run out, clear it, and prove the resume.
     async fn run(self, h: &mut Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
-        let base = Followers::read(h).await.require(ctx)?;
+        let base = Followers::ready(h, ctx).await?;
         let posted0 = require_posting(h, ctx).await?;
         let fault = self.fault(l1).await?;
         let window = h.knobs.l1_fault;

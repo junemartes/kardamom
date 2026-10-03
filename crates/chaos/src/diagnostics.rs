@@ -14,7 +14,7 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
-const JOBS: [&str; 12] = [
+const JOBS: [&str; 14] = [
     "aeron",
     "anvil",
     "cluster",
@@ -25,6 +25,8 @@ const JOBS: [&str; 12] = [
     "ingress",
     "batcher",
     "da-watcher",
+    "l1-fault-proxy",
+    "l1-indexer",
     "redis",
     "state-mirror",
 ];

@@ -210,6 +210,8 @@ class DeployTest(unittest.TestCase):
         plans = self.api.state['plans']
         proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
+        anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
         for job in ('batcher', 'da-watcher', 'l1-indexer'):
             self.assertIn(proxy, json.dumps(plans[job]), job)
         indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']

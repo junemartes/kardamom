@@ -42,7 +42,7 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "two-day-outage";
     let l1 = L1::new(h).await?;
     l1.require_rule_loaded(STALE_POST_ALERT, ctx).await?;
-    let base = Followers::read(h).await.require(ctx)?;
+    let base = Followers::ready(h, ctx).await?;
     require_posting(h, ctx).await?;
     let window = h.knobs.l1_fault;
     // T0: the lies the followers see, and the batcher's view of its own

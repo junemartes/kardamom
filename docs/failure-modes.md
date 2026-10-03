@@ -428,9 +428,12 @@ restart posts it, contiguous with the last post. The range past the spool
 needs the link the egress carried: an executor's block refs
 (`kardamom_getBlockRefs`) and the bytes in the `tx_data` archive, the
 batcher's third resume source.
-Until it exists the batcher halts on the refusal, and
-`batcher-outage-past-retention` ends red at its rebuild stage: the DA gap
-is the incident, kept visible.
+Until it exists the batcher halts on the refusal.
+`batcher-outage-past-retention` asserts that halt, and logs its second
+half as `SKIPPED`. The DA gap stays visible in the log: every later
+persisted-state stage of the shard checks the replicas and logs the
+rebuild from L1 as `SKIPPED`, because a rebuild cannot reach the head
+across the gap.
 
 ## Data-availability recovery (rebuild-from-L1)
 

@@ -12,10 +12,14 @@
     workloads_job: {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
 
 # The development L1: anvil runs only when no real L1 is given (L1_RPC).
+# Behind the fault proxy, the followers walk finalized blocks, so anvil
+# finalizes two blocks behind its head (one slot per epoch).
 - name: Deploy the development L1
   ansible.builtin.include_tasks: job.yml
   vars:
-    workloads_job: {name: anvil}
+    workloads_job:
+      name: anvil
+      vars: "{{ {'slots_in_an_epoch': '1'} if workloads_l1_fault_proxy | bool else {} }}"
   when: workloads_l1_rpc | length == 0
 
 - name: Discover the in-cluster L1 through the Nomad API
@@ -146,7 +150,7 @@
 # job's default, by its service record). It comes up before the
 # batcher, which reads a lost cursor's batch from it. It follows
 # finality: a real L1, or the in-cluster anvil behind the fault proxy,
-# where every block is final at once.
+# which finalizes two blocks behind its head.
 - name: Deploy the inbox indexer
   ansible.builtin.include_tasks: job.yml
   vars:

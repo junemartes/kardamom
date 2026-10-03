@@ -21,7 +21,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "l1-null-receipts";
     let l1 = L1::new(h).await?;
     l1.require_rule_loaded(STALE_POST_ALERT, ctx).await?;
-    let base = Followers::read(h).await.require(ctx)?;
+    let base = Followers::ready(h, ctx).await?;
     require_posting(h, ctx).await?;
     let window = h.knobs.l1_fault;
     let faults = [

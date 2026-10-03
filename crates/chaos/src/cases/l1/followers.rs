@@ -13,11 +13,16 @@ use crate::poll::{self, Budget};
 use crate::probes::{DA_WATCHER_PORT, INDEXER_PORT};
 
 const WATCHER_TICKS: &str = "kardamom_da_watcher_tick_total";
-const WATCHER_EPOCHS: &str = "kardamom_da_watcher_epochs_published_total";
+/// The L1 block of the last published epoch: a block number, so it
+/// keeps its meaning across a restart, where a counter starts at zero.
+const WATCHER_EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 const INDEXER_TICKS: &str = "kardamom_l1_indexer_tick_total";
 const INDEXER_BLOCK: &str = "kardamom_l1_indexer_indexed_block_number";
 const INDEXER_LAST_BATCH: &str = "kardamom_l1_indexer_last_batch_index";
 
+/// anvil finalizes two blocks behind its head, and the batcher's posts
+/// mine a block every few seconds: both gauges show within a minute.
+const READY_BUDGET: Duration = Duration::from_secs(120);
 const RESUME_BUDGET: Duration = Duration::from_secs(120);
 const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
 
@@ -26,7 +31,7 @@ const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Followers {
     watcher_breaks: Option<i64>,
-    watcher_epochs: Option<i64>,
+    watcher_origin: Option<i64>,
     indexer_errors: Option<i64>,
     indexer_block: Option<i64>,
     indexer_last_batch: Option<i64>,
@@ -39,7 +44,7 @@ impl Followers {
             watcher_breaks: p
                 .aux_metric_where(DA_WATCHER_PORT, WATCHER_TICKS, "outcome=\"chain_break\"")
                 .await,
-            watcher_epochs: p.aux_metric(DA_WATCHER_PORT, WATCHER_EPOCHS).await,
+            watcher_origin: p.aux_metric(DA_WATCHER_PORT, WATCHER_EPOCH_ORIGIN).await,
             indexer_errors: p
                 .aux_metric_where(INDEXER_PORT, INDEXER_TICKS, "outcome=\"error\"")
                 .await,
@@ -48,15 +53,36 @@ impl Followers {
         }
     }
 
-    /// Both exporters answered with their progress gauges.
-    pub(super) fn require(self, ctx: &str) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            self.watcher_breaks.is_some() && self.indexer_errors.is_some(),
-            "{}: {ctx}: a follower exporter does not answer ({})",
-            crate::FAIL_PREFIX,
-            self.show()
-        );
-        Ok(self)
+    /// Both exporters answered with their progress gauges. A gauge is
+    /// absent until the follower's first finalized block: a follower
+    /// without one has nothing a lie can halt.
+    fn is_ready(self) -> bool {
+        self.watcher_origin.is_some() && self.indexer_block.is_some()
+    }
+
+    /// The first sample where both followers show progress. A case
+    /// cannot start before it: its halt and resume judgments compare
+    /// against these gauges.
+    pub(super) async fn ready(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
+        let last = std::cell::Cell::new(Self::default());
+        let last_ref = &last;
+        let outcome = poll::until(
+            Budget::new(READY_BUDGET, Duration::from_secs(2)),
+            |_| async move {
+                let now = Self::read(h).await;
+                last_ref.set(now);
+                Ok::<_, anyhow::Error>(now.is_ready().then_some(now))
+            },
+        )
+        .await?;
+        let (now, _) = outcome.or_fail(|t| {
+            crate::chaos_fail!(
+                "{ctx}: a follower shows no finalized block within {}s ({})",
+                t.as_secs(),
+                last.get().show()
+            )
+        })?;
+        Ok(now)
     }
 
     /// Both followers counted a chain break since `base`.
@@ -66,18 +92,18 @@ impl Followers {
     }
 
     /// Both followers moved since `base`: the da-watcher published an
-    /// epoch, the indexer indexed a block.
+    /// epoch of a later block, the indexer indexed a later block.
     fn advanced_since(self, base: Self) -> bool {
-        rose(self.watcher_epochs, base.watcher_epochs)
+        rose(self.watcher_origin, base.watcher_origin)
             && rose(self.indexer_block, base.indexer_block)
     }
 
     pub(super) fn show(self) -> String {
         let s = |v: Option<i64>| v.map_or("?".to_string(), |x| x.to_string());
         format!(
-            "watcher chain_breaks={} epochs={} indexer errors={} block={} last_batch={}",
+            "watcher chain_breaks={} epoch_origin={} indexer errors={} block={} last_batch={}",
             s(self.watcher_breaks),
-            s(self.watcher_epochs),
+            s(self.watcher_origin),
             s(self.indexer_errors),
             s(self.indexer_block),
             s(self.indexer_last_batch)
@@ -170,7 +196,7 @@ mod tests {
     fn a_halt_and_a_resume_need_both_followers() {
         let base = Followers {
             watcher_breaks: Some(0),
-            watcher_epochs: Some(10),
+            watcher_origin: Some(10),
             indexer_errors: Some(0),
             indexer_block: Some(20),
             indexer_last_batch: Some(3),
@@ -187,16 +213,16 @@ mod tests {
         assert!(both.chain_broke_since(base));
         assert!(!both.advanced_since(base));
         let moved = Followers {
-            watcher_epochs: Some(11),
+            watcher_origin: Some(11),
             indexer_block: Some(21),
             ..base
         };
         assert!(moved.advanced_since(base));
         let dark = Followers {
-            watcher_breaks: None,
+            watcher_origin: None,
             ..base
         };
-        assert!(!dark.chain_broke_since(base) && dark.require("x").is_err());
-        assert!(base.require("x").is_ok());
+        assert!(!dark.chain_broke_since(base) && !dark.is_ready());
+        assert!(base.is_ready());
     }
 }

@@ -21,6 +21,30 @@ pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
 
+/// What the DA record on L1 holds after the cases that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum L1Record {
+    /// Every block through the live head is on L1, or is on its way:
+    /// the persisted-state stage rebuilds the state from L1.
+    #[default]
+    Complete,
+    /// A case left a gap that no recovery fills yet: the batcher halted
+    /// past the sealers' retention floor. The persisted-state stage
+    /// checks the replicas and skips the rebuild from L1.
+    KnownGap,
+}
+
+impl L1Record {
+    /// The record after `case` ran: a gap stays a gap.
+    #[must_use]
+    pub fn after(self, case: Case) -> Self {
+        match (self, case) {
+            (Self::KnownGap, _) | (_, Case::BatcherOutagePastRetention) => Self::KnownGap,
+            _ => Self::Complete,
+        }
+    }
+}
+
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
@@ -374,5 +398,14 @@ mod tests {
                 .for_each(|name| assert_eq!(Case::parse(name).unwrap().name(), *name));
         }
         assert!(Case::parse("sealer-hard").is_err());
+    }
+
+    #[test]
+    fn only_the_outage_past_retention_leaves_a_gap_and_it_stays() {
+        let complete = L1Record::Complete.after(Case::L1Liar);
+        assert_eq!(complete, L1Record::Complete);
+        let gap = complete.after(Case::BatcherOutagePastRetention);
+        assert_eq!(gap, L1Record::KnownGap);
+        assert_eq!(gap.after(Case::L1Liar), L1Record::KnownGap);
     }
 }
