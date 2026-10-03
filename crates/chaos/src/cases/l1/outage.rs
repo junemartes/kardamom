@@ -1,7 +1,7 @@
 //! `batcher-outage-past-retention`: the batcher is frozen until the
 //! sealers' egress floor passes its cursor and a snapshot lands, then
 //! thawed. Its restart recovers what its spool held; the rest of the
-//! gap waits on the executors' block payload store.
+//! gap waits on an executor's block refs and the `tx_data` archive.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -208,7 +208,7 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     await_spool_posted(&l1, covered0, ctx).await?;
     await_batcher_halted_on_replay(h, refused0, budget, ctx).await?;
     crate::log(format!(
-        "{ctx}: SKIPPED (second half): the sealers refused the replay past the spool; the recovery from an executor's payload store waits on kardamom_getBlockPayload"
+        "{ctx}: SKIPPED (second half): the sealers refused the replay past the spool; the recovery from an executor's block refs and the tx_data archive waits on kardamom_getBlockRefs"
     ));
     l1.assert_contiguous(ctx).await
 }

@@ -425,8 +425,9 @@ receipts and swallowed logs, with a batcher restart inside the fault),
 longer than the egress retention finds, on restart, that the sealers refuse
 its replay. The spool recovers the pending group it had consumed: the
 restart posts it, contiguous with the last post. The range past the spool
-needs a copy of the ordering that survived: the executors' block payload
-store (`kardamom_getBlockPayload`), the batcher's third resume source.
+needs the link the egress carried: an executor's block refs
+(`kardamom_getBlockRefs`) and the bytes in the `tx_data` archive, the
+batcher's third resume source.
 Until it exists the batcher halts on the refusal, and
 `batcher-outage-past-retention` ends red at its rebuild stage: the DA gap
 is the incident, kept visible.
@@ -643,7 +644,7 @@ check would pass against a feature that activated once and stopped.
   themselves after a wrong hash reached their anchor, the halt on a
   swallowed log and the disagreement counter wait on the two-source
   followers; the recovery past the sealers' retention waits on the block
-  payload store (the second half of `batcher-outage-past-retention`); gas
+  refs recovery (the second half of `batcher-outage-past-retention`); gas
   spikes on a real L1 are not served by the proxy.
 - ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
   suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
