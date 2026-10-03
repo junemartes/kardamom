@@ -14,8 +14,11 @@ use crate::error::ExecutorError;
 use crate::reader::ReaderToExec;
 use crate::state::StaticSnapshotSource;
 
+/// The references of each submitted block, by block number.
+type RefsLog = Arc<Mutex<Vec<(u64, Vec<TxRef>)>>>;
+
 /// A writer queue that keeps only the references of each submitted block.
-struct RefsQueue(Arc<Mutex<Vec<(u64, Vec<TxRef>)>>>);
+struct RefsQueue(RefsLog);
 
 impl StateWriterQueue for RefsQueue {
     fn submit(
