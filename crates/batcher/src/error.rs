@@ -12,6 +12,8 @@ pub enum BatcherError {
     Compress(String),
     #[error("frame: {0}")]
     Frame(String),
+    #[error(transparent)]
+    Kar1(#[from] kardamom_types::kar1::Kar1Error),
     #[error("data availability: {0}")]
     Da(String),
     #[error("payload: {0}")]

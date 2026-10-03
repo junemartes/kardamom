@@ -27,9 +27,10 @@ use crate::meta::{
 };
 use crate::schema::for_each_row;
 use crate::schema::{
-    TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
-    decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
-    encode_account_key, encode_code_key, encode_storage_key, encode_tx_hash_key,
+    TABLE_ACCOUNTS, TABLE_BLOCK_PAYLOADS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
+    TABLE_TX_HASH_INDEX, decode_account_value, decode_receipt_value, decode_storage_value,
+    decode_tx_hash_value, encode_account_key, encode_block_key, encode_code_key,
+    encode_storage_key, encode_tx_hash_key,
 };
 
 /// An MVCC snapshot of the state DB at exactly one block boundary.
@@ -53,6 +54,7 @@ struct SnapshotInner {
     code_db: Database,
     receipts_db: Database,
     tx_hash_db: Database,
+    block_payloads_db: Database,
     // Keep a strong reference to the env, so it stays alive for as long as
     // the snapshot's read-only transaction does.
     env: Arc<Environment>,
@@ -85,6 +87,7 @@ impl StateSnapshot {
         let code_db = txn.open_db(Some(TABLE_CODE))?;
         let receipts_db = txn.open_db(Some(TABLE_RECEIPTS))?;
         let tx_hash_db = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
+        let block_payloads_db = txn.open_db(Some(TABLE_BLOCK_PAYLOADS))?;
         Ok(Self {
             inner: Arc::new(SnapshotInner {
                 txn,
@@ -94,9 +97,25 @@ impl StateSnapshot {
                 code_db,
                 receipts_db,
                 tx_hash_db,
+                block_payloads_db,
                 env,
             }),
         })
+    }
+
+    /// The stored payload of block `number`: a one-block KAR1 payload, as
+    /// the writer encoded it. `None` for a block outside the retention
+    /// window, or past this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the read fails.
+    pub fn block_payload(&self, number: u64) -> Result<Option<Vec<u8>>, StateError> {
+        let key = encode_block_key(number);
+        Ok(self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.block_payloads_db.dbi(), &key)?)
     }
 
     /// The snapshot's pinned read-only transaction. This is the read view

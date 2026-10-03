@@ -19,9 +19,11 @@
 
 mod apply;
 
+use std::num::NonZeroU64;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::kar1::BlockRecords;
 use kardamom_types::{BlockBoundary, BlockDelta};
 use tracing::{debug, error, info, warn};
 
@@ -32,22 +34,37 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 
 /// One block's worth of state changes, submitted to the writer.
 ///
-/// This pairs the boundary marker with its delta. The writer then
-/// persists, in a single atomic mdbx commit:
+/// This pairs the boundary marker with its delta and the block's payload
+/// records. The writer then persists, in a single atomic mdbx commit:
 ///
 /// - The block-level cursors.
 /// - The per-key state mutations.
 /// - The per-transaction receipts.
+/// - The block's payload, in the form the batcher posts.
 #[derive(Debug, Clone)]
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
     pub delta: BlockDelta,
+    /// The records the DA payload of this block carries. The writer
+    /// encodes them off the execution thread.
+    pub records: BlockRecords,
 }
 
 impl WriteBatch {
+    /// A block whose payload carries no record: a block of deposits and
+    /// markers only, or a synthetic block in a test.
     #[must_use]
     pub fn new(boundary: BlockBoundary, delta: BlockDelta) -> Self {
-        Self { boundary, delta }
+        Self::with_records(boundary, delta, BlockRecords::default())
+    }
+
+    #[must_use]
+    pub fn with_records(boundary: BlockBoundary, delta: BlockDelta, records: BlockRecords) -> Self {
+        Self {
+            boundary,
+            delta,
+            records,
+        }
     }
 
     /// The worst-case encoded size, used by the writer to budget the mdbx
@@ -60,7 +77,8 @@ impl WriteBatch {
         let receipts: usize = self.delta.receipts.len() * (8 + 256);
         let tx_index: usize = self.delta.receipts.len() * (32 + 8);
         let header = 8 + 20;
-        acct + stor + code + receipts + tx_index + header
+        let payload: usize = self.records.txs.iter().map(|t| 64 + t.raw_tx.len()).sum();
+        acct + stor + code + receipts + tx_index + header + payload
     }
 }
 
@@ -123,6 +141,50 @@ pub enum TrieMode {
     ShadowCheck { every_n: u64 },
 }
 
+/// How many of the newest blocks keep their row in `block_payloads`.
+/// The writer deletes the row this many blocks behind each commit. The
+/// batcher reads the table only for blocks the sealer no longer retains,
+/// so the value bounds the batcher outage the store covers: at one block
+/// a second, the default of 100 000 blocks is a little over a day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayloadRetention(NonZeroU64);
+
+impl PayloadRetention {
+    pub const DEFAULT: Self = Self(NonZeroU64::new(100_000).expect("nonzero literal"));
+
+    #[must_use]
+    pub const fn new(blocks: NonZeroU64) -> Self {
+        Self(blocks)
+    }
+
+    #[must_use]
+    pub const fn blocks(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl Default for PayloadRetention {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::str::FromStr for PayloadRetention {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+/// What a writer maintains beyond the chain state: the trie mode and the
+/// payload retention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterOptions {
+    pub trie_mode: TrieMode,
+    pub payload_retention: PayloadRetention,
+}
+
 /// The single-writer state thread. It owns the only read-write mdbx
 /// transaction at a time.
 pub struct StateWriter {
@@ -134,6 +196,7 @@ pub struct StateWriter {
     /// the canonical Ethereum MPT world-state root (see [`crate::trie`])
     /// inside the same atomic transaction.
     trie_mode: TrieMode,
+    payload_retention: PayloadRetention,
 }
 
 impl StateWriter {
@@ -145,7 +208,18 @@ impl StateWriter {
     /// Returns [`StateError`] if the schema-version check fails, or if the
     /// writer thread or its initial snapshot cannot be created.
     pub fn spawn(env: StateEnv) -> Result<WriterHandle, StateError> {
-        Self::spawn_inner(env, TrieMode::Off)
+        Self::spawn_inner(env, TrieMode::Off, PayloadRetention::DEFAULT)
+    }
+
+    /// Spawn a writer with every option set: the executor and the
+    /// validator binaries pass their retention setting here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::spawn_with_trie`].
+    pub fn spawn_with(env: StateEnv, options: WriterOptions) -> Result<WriterHandle, StateError> {
+        Self::check_trie_mode(options.trie_mode)?;
+        Self::spawn_inner(env, options.trie_mode, options.payload_retention)
     }
 
     /// Spawn the trie-aware writer with the given [`TrieMode`]. Each block
@@ -158,13 +232,17 @@ impl StateWriter {
     /// `mode` is `ShadowCheck { every_n: 0 }`, or if the writer thread or
     /// its initial snapshot cannot be created.
     pub fn spawn_with_trie(env: StateEnv, mode: TrieMode) -> Result<WriterHandle, StateError> {
-        // Parsed once, at the boundary: `every_n == 0` would silently
-        // disable the shadow-check canary instead of running it every
-        // block or refusing to start. `TrieMode::ShadowCheck` keeps a
-        // plain `u64` field rather than `NonZeroU64` because the
-        // validator's CLI constructs it directly from an `Option<u64>`
-        // argument (Phase B: parse that argument into `NonZeroU64` and
-        // change this field's type to match).
+        Self::check_trie_mode(mode)?;
+        Self::spawn_inner(env, mode, PayloadRetention::DEFAULT)
+    }
+
+    /// Parsed once, at the boundary: `every_n == 0` would silently
+    /// disable the shadow-check canary instead of running it every
+    /// block or refusing to start. `TrieMode::ShadowCheck` keeps a
+    /// plain `u64` field rather than `NonZeroU64` because the
+    /// validator's CLI constructs it directly from an `Option<u64>`
+    /// argument.
+    fn check_trie_mode(mode: TrieMode) -> Result<(), StateError> {
         if let TrieMode::ShadowCheck { every_n: 0 } = mode {
             return Err(StateError::Recovery(
                 "TrieMode::ShadowCheck { every_n: 0 } disables the canary instead of running it; \
@@ -172,10 +250,14 @@ impl StateWriter {
                     .into(),
             ));
         }
-        Self::spawn_inner(env, mode)
+        Ok(())
     }
 
-    fn spawn_inner(env: StateEnv, trie_mode: TrieMode) -> Result<WriterHandle, StateError> {
+    fn spawn_inner(
+        env: StateEnv,
+        trie_mode: TrieMode,
+        payload_retention: PayloadRetention,
+    ) -> Result<WriterHandle, StateError> {
         // This channel is bounded, HORIZON_BLOCKS deep. If the writer falls
         // behind by more than the version horizon, the executor blocks
         // here. At that point, the snapshot the executor holds is about
@@ -198,6 +280,7 @@ impl StateWriter {
             delta_rx,
             snapshot_handle: snapshot_handle.clone(),
             trie_mode,
+            payload_retention,
         };
 
         let join = thread::Builder::new()
@@ -265,3 +348,6 @@ impl StateWriter {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod trie_writer_tests;
+#[cfg(test)]
+#[path = "payload_tests.rs"]
+mod payload_tests;

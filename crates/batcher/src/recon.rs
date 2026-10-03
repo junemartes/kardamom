@@ -7,7 +7,7 @@
 
 use crate::compress::decode_zstd;
 use crate::error::BatcherError;
-use crate::frame::{BlockFrame, Kar1Payload, decode as frame_decode};
+use kardamom_types::kar1::{BlockFrame, Kar1Payload, decode as frame_decode};
 
 /// Reconstruct the per-block tx stream from one posted batch's payload.
 ///
@@ -34,7 +34,7 @@ fn is_zstd(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::MAGIC;
+    use kardamom_types::kar1::MAGIC;
 
     /// The KAR1 magic must not look like a zstd stream. Its first byte is
     /// 'K' (0x4B). zstd streams start with 0x28.

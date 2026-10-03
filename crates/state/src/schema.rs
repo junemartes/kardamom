@@ -7,6 +7,7 @@
 //! | `storage`        | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
 //! | `code`           | `B256 code_hash` (32 B)          | raw bytecode                                     |
 //! | `headers`        | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp, u64 l1_origin)`, no state root |
+//! | `block_payloads` | `u64 block_number` (8 B BE)      | the block as a one-block KAR1 payload (`kardamom_types::kar1::encode_block`), the newest `PayloadRetention` blocks only |
 //! | `receipts`       | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
 //! | `tx_hash_index`  | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE `term_id` ++ i32 BE `term_offset`), for `eth_getTransactionReceipt(hash)` |
 //! | `meta`           | `&[u8]` (well-known keys, below) | varies, see `meta.rs`                            |
@@ -31,6 +32,7 @@ pub(crate) const TABLE_ACCOUNTS: &str = "accounts";
 pub(crate) const TABLE_STORAGE: &str = "storage";
 pub(crate) const TABLE_CODE: &str = "code";
 pub(crate) const TABLE_HEADERS: &str = "headers";
+pub(crate) const TABLE_BLOCK_PAYLOADS: &str = "block_payloads";
 pub(crate) const TABLE_RECEIPTS: &str = "receipts";
 pub(crate) const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub(crate) const TABLE_META: &str = "meta";
@@ -53,6 +55,7 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_STORAGE,
     TABLE_CODE,
     TABLE_HEADERS,
+    TABLE_BLOCK_PAYLOADS,
     TABLE_RECEIPTS,
     TABLE_TX_HASH_INDEX,
     TABLE_META,
@@ -242,6 +245,15 @@ pub(crate) fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateErro
         got: bytes.len(),
     })
 }
+
+// ---------- block_payloads ----------
+//
+// Key: the block number, as the `headers` key. Value: the block's records
+// as the DA payload carries them, encoded once by the state writer with
+// `kardamom_types::kar1::encode_block`. The table is a bounded cache for
+// the batcher: a block the sealer no longer retains is read back from
+// here, so the writer deletes the row `PayloadRetention` blocks behind
+// the one it commits. The rows never enter the state trie.
 
 // ---------- receipts ----------
 //

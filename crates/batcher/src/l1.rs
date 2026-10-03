@@ -23,7 +23,7 @@ use alloy_sol_types::{SolCall, SolEvent};
 use crate::batcher::PostedBatch;
 use crate::da::{DaProxy, PayloadSource};
 use crate::error::BatcherError;
-use crate::frame::BlockFrame;
+use kardamom_types::kar1::BlockFrame;
 use crate::recon::reconstruct;
 use crate::settlement::IKardamomL2Settlement;
 

@@ -7,6 +7,7 @@ use signet_libmdbx::tx::aliases::RwTxSync;
 use signet_libmdbx::{Database, WriteFlags};
 use tracing::error;
 
+use kardamom_types::kar1::{BlockCursor, BlockHead, BlockRecords, encode_block};
 use kardamom_types::{BlockBoundary, BlockDelta};
 
 use crate::error::StateError;
@@ -15,14 +16,14 @@ use crate::meta::{
     KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
 };
 use crate::schema::{
-    HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
-    TABLE_STORAGE, TABLE_TX_HASH_INDEX, encode_block_key, encode_header_value,
-    encode_receipt_value, encode_storage_key, encode_storage_value, encode_tx_hash_key,
-    encode_tx_hash_value,
+    HeaderValue, TABLE_ACCOUNTS, TABLE_BLOCK_PAYLOADS, TABLE_CODE, TABLE_HEADERS, TABLE_META,
+    TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX, del_if_present, encode_block_key,
+    encode_header_value, encode_receipt_value, encode_storage_key, encode_storage_value,
+    encode_tx_hash_key, encode_tx_hash_value,
 };
 use crate::trie;
 
-use super::{StateWriter, TrieMode, WriteBatch};
+use super::{PayloadRetention, StateWriter, TrieMode, WriteBatch};
 
 /// Per-section stopwatches for one `apply` call, reported when
 /// `KARDAMOM_WRITER_TIMING` is set.
@@ -61,22 +62,25 @@ struct BatchWriter<'a> {
     storage: Database,
     code: Database,
     headers: Database,
+    block_payloads: Database,
     receipts: Database,
     tx_hash_index: Database,
     meta: Database,
     trie_mode: TrieMode,
+    payload_retention: PayloadRetention,
     timing: ApplyTimings,
 }
 
 impl<'a> BatchWriter<'a> {
     /// Open every table this batch touches, timed as the batch's `open`
     /// section.
-    fn open(txn: &'a RwTxSync, trie_mode: TrieMode) -> Result<Self, StateError> {
+    fn open(txn: &'a RwTxSync, writer: &StateWriter) -> Result<Self, StateError> {
         let t0 = Instant::now();
         let accounts = txn.open_db(Some(TABLE_ACCOUNTS))?;
         let storage = txn.open_db(Some(TABLE_STORAGE))?;
         let code = txn.open_db(Some(TABLE_CODE))?;
         let headers = txn.open_db(Some(TABLE_HEADERS))?;
+        let block_payloads = txn.open_db(Some(TABLE_BLOCK_PAYLOADS))?;
         let receipts = txn.open_db(Some(TABLE_RECEIPTS))?;
         let tx_hash_index = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
         let meta = txn.open_db(Some(TABLE_META))?;
@@ -86,10 +90,12 @@ impl<'a> BatchWriter<'a> {
             storage,
             code,
             headers,
+            block_payloads,
             receipts,
             tx_hash_index,
             meta,
-            trie_mode,
+            trie_mode: writer.trie_mode,
+            payload_retention: writer.payload_retention,
             timing: ApplyTimings {
                 open: t0.elapsed(),
                 storage: Duration::ZERO,
@@ -165,6 +171,36 @@ impl<'a> BatchWriter<'a> {
             encode_header_value(&header),
             WriteFlags::UPSERT,
         )?;
+        Ok(self)
+    }
+
+    /// Write this block's payload row, and delete the row that falls out
+    /// of the retention window. The payload is the block as the batcher
+    /// posts it, so the batcher reads a row back as its own bytes. One
+    /// put and one delete per block keep the table at the retention
+    /// size with no sweep.
+    fn payload(self, boundary: &BlockBoundary, records: &BlockRecords) -> Result<Self, StateError> {
+        let head = BlockHead {
+            block_number: boundary.block_number,
+            l2_timestamp: boundary.l2_timestamp,
+            cursor: BlockCursor {
+                end_tx_idx: boundary.end_tx_idx.as_index(),
+                l1_origin: boundary.l1_origin,
+            },
+        };
+        let bytes = encode_block(head, records).map_err(|e| StateError::Recovery(e.to_string()))?;
+        self.txn.put(
+            self.block_payloads,
+            encode_block_key(boundary.block_number),
+            bytes,
+            WriteFlags::UPSERT,
+        )?;
+        if let Some(expired) = boundary
+            .block_number
+            .checked_sub(self.payload_retention.blocks())
+        {
+            del_if_present(self.txn, self.block_payloads, encode_block_key(expired))?;
+        }
         Ok(self)
     }
 
@@ -279,11 +315,12 @@ impl StateWriter {
         let want_timing = std::env::var_os("KARDAMOM_WRITER_TIMING").is_some();
         let txn = self.env.raw().begin_rw_sync()?;
 
-        let mut timing = BatchWriter::open(&txn, self.trie_mode)?
+        let mut timing = BatchWriter::open(&txn, self)?
             .storage(&batch.delta)?
             .accounts(&batch.delta)?
             .code(&batch.delta)?
             .header(&batch.boundary)?
+            .payload(&batch.boundary, &batch.records)?
             .receipts_and_index(&batch.delta)?
             .meta_cursors(&batch.boundary)?
             .advance_state_root(&batch.boundary, &batch.delta)?

@@ -34,7 +34,6 @@ pub mod compress;
 pub mod da;
 pub mod da_store;
 pub mod error;
-pub mod frame;
 pub mod indexer;
 pub mod l1;
 pub mod live;
@@ -53,7 +52,10 @@ pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
 pub use batcher::{Batcher, MockSender, PostedBatch, Sender};
 pub use da::{DaProxy, PayloadSource};
 pub use error::BatcherError;
-pub use frame::{BlockFrame, Kar1Payload, TxFrame};
+// The KAR1 codec lives with the shared types: the executors and the
+// validator store every block in this form, and the batcher reads it back.
+pub use kardamom_types::kar1 as frame;
+pub use kardamom_types::kar1::{BlockFrame, Kar1Payload, TxFrame};
 pub use l1::{BatchDescriptor, post_batch, read_posted_batches, recover_blocks};
 pub use multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
 pub use optimistic::{BatchClaimer, BatchWatcher, ClaimOutcome, WatchOutcome};
