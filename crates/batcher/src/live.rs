@@ -10,6 +10,12 @@
 //! deposits are absent from DA by design. A reconstructor re-derives them
 //! from L1.
 //!
+//! Resume sources, in order: the spool (the blocks consumed and not yet
+//! posted), the sealer's replay from the cursor, and, when the sealer no
+//! longer retains the cursor, the block payload store of an executor or
+//! the validator for the gap up to the sealer's floor. Retention is a
+//! latency, not a loss, while one state database survives.
+//!
 //! Durability model:
 //! - L1 (`lastBatchIndex` and the `BatchPosted` event) is the authoritative
 //!   record of what has been posted.
@@ -25,6 +31,7 @@
 
 mod cursor;
 mod feed;
+mod payload_store;
 pub mod poll;
 mod run;
 mod sender;
@@ -53,4 +60,9 @@ pub(crate) mod live_metric_names {
     /// Re-observed blocks dropped because L1 already covers them (stale
     /// cursor replay after a crash between post and cursor write).
     pub(crate) const SKIPPED_POSTED_BLOCKS: &str = "kardamom_batcher_skipped_posted_blocks_total";
+    /// Blocks read from the payload store of an executor or the
+    /// validator after the sealer refused the replay: the gap between
+    /// the cursor and the sealer's retention floor.
+    pub(crate) const STORE_RECOVERED_BLOCKS: &str =
+        "kardamom_batcher_store_recovered_blocks_total";
 }

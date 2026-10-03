@@ -38,6 +38,7 @@ alloy-provider = "2.0"
 alloy-transport = "2.0"
 alloy-transport-http = "2.0"
 alloy-rpc-client = "2.0"
+tower = "0.5"
 alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"

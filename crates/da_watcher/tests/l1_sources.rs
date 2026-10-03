@@ -7,7 +7,7 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Filter, Log};
 use kardamom_da_watcher::source::fakes::MockL1Source;
-use kardamom_da_watcher::{L1Source, L1SourceError, L1Sources};
+use kardamom_da_watcher::{L1Source, L1SourceError, L1Sources, SourceHalt};
 use kardamom_obs::testkit::{free_port, scrape};
 
 /// A set of `n` honest mocks, named `s0..`, with a one-hour backoff.
@@ -81,11 +81,15 @@ async fn one_liar_halts_the_read_with_both_answers_and_the_counter() {
 
     for _ in 0..2 {
         let err = set.block_ids(5).await.unwrap_err();
-        let L1SourceError::Disagreement {
+        let L1SourceError::Halt(halt) = err else {
+            panic!("a halt, got {err}");
+        };
+        assert_eq!(halt.cause(), "l1_source_disagreement");
+        let SourceHalt::Disagreement {
             what, a_name, b_name, ..
-        } = err
+        } = halt
         else {
-            panic!("a disagreement, got {err}");
+            panic!("a disagreement, got {halt}");
         };
         assert_eq!(what, "block 5");
         assert_eq!((a_name.as_str(), b_name.as_str()), ("honest", "liar"));
@@ -136,11 +140,11 @@ async fn one_live_source_of_two_is_short_of_the_quorum() {
     assert!(
         matches!(
             err,
-            L1SourceError::NoQuorum {
+            L1SourceError::Halt(SourceHalt::NoQuorum {
                 answered: 1,
                 needed: 2,
                 configured: 2
-            }
+            })
         ),
         "{err}"
     );
@@ -155,14 +159,14 @@ async fn every_source_out_halts() {
     ]);
     let err = set.finalized_block_number().await.unwrap_err();
     assert!(
-        matches!(err, L1SourceError::NoQuorum { answered: 0, .. }),
+        matches!(err, L1SourceError::Halt(SourceHalt::NoQuorum { answered: 0, .. })),
         "{err}"
     );
     let err = set.block_ids(5).await.unwrap_err();
-    assert!(
-        matches!(err, L1SourceError::NoQuorum { answered: 0, .. }),
-        "{err}"
-    );
+    let L1SourceError::Halt(halt) = err else {
+        panic!("a halt, got {err}");
+    };
+    assert_eq!(halt.cause(), "l1_sources_out");
 }
 
 /// A rotated source comes back after the backoff: with a zero backoff it
@@ -228,7 +232,10 @@ async fn log_queries_are_cross_checked() {
         .push_back(Ok(vec![Log::default()]));
     let set = L1Sources::new(vec![("a".into(), a), ("b".into(), b)]);
     let err = set.logs(&Filter::new()).await.unwrap_err();
-    assert!(matches!(err, L1SourceError::Disagreement { .. }), "{err}");
+    assert!(
+        matches!(err, L1SourceError::Halt(SourceHalt::Disagreement { .. })),
+        "{err}"
+    );
     // The next query: both mocks answer no log, so they agree.
     assert!(set.logs(&Filter::new()).await.unwrap().is_empty());
 }

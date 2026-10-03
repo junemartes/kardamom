@@ -36,6 +36,67 @@ use crate::source::{L1Source, L1SourceError, LockboxLog};
 /// How long a failed source stays out of the set.
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Why a source set cannot serve a read: the follower's halt cause. The
+/// error the follower reports, its log line and the disagreement counter
+/// carry this one value, so a halt record carries it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SourceHalt {
+    /// Two sources gave different answers for `what`, and no light client
+    /// settles it. A majority of public endpoints proves nothing, since
+    /// two can share a backend. The halt clears when the sources agree
+    /// again: the operator drops the lying endpoint.
+    #[error("L1 sources disagree on {what}: {a_name} says {a}, {b_name} says {b}")]
+    Disagreement {
+        what: String,
+        a_name: String,
+        a: String,
+        b_name: String,
+        b: String,
+    },
+    /// Fewer sources answered than the agreement rule needs: the others
+    /// are rotated out, or down. The halt clears when a source returns
+    /// after its backoff.
+    #[error("{answered} of {configured} L1 sources answered; {needed} agreeing answers needed")]
+    NoQuorum {
+        answered: usize,
+        needed: usize,
+        configured: usize,
+    },
+}
+
+impl SourceHalt {
+    /// The stable id of the cause.
+    #[must_use]
+    pub fn cause(&self) -> &'static str {
+        match self {
+            Self::Disagreement { .. } => "l1_source_disagreement",
+            Self::NoQuorum { .. } => "l1_sources_out",
+        }
+    }
+
+    /// Log the cause and count a disagreement. A disagreement the light
+    /// client settles is reported here too: the liar rotates out instead
+    /// of halting the follower, and the counter still says an endpoint
+    /// lied.
+    fn report(&self) {
+        if let Self::Disagreement { .. } = self {
+            ::metrics::counter!(metrics::L1_SOURCE_DISAGREEMENT_TOTAL).increment(1);
+        }
+        error!(target: "l1_sources", cause = self.cause(), detail = %self, "L1 source set cannot serve the read");
+    }
+
+    /// The disagreement of two answers to `what`.
+    fn disagreement<R: Debug>(what: &str, a: (&str, &R), b: (&str, &R)) -> Self {
+        Self::Disagreement {
+            what: what.to_string(),
+            a_name: a.0.to_string(),
+            a: format!("{:?}", a.1),
+            b_name: b.0.to_string(),
+            b: format!("{:?}", b.1),
+        }
+    }
+}
+
 /// The endpoints a follower is given: the public RPC list, and the light
 /// client when one runs. Parsed once at the CLI boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -230,14 +291,16 @@ impl<S: L1Source> L1Sources<S> {
         }
     }
 
-    /// The error of a read that `answered` public sources answered, fewer
+    /// The halt of a read that `answered` public sources answered, fewer
     /// than the rule needs.
     fn no_quorum(&self, answered: usize) -> L1SourceError {
-        L1SourceError::NoQuorum {
+        let halt = SourceHalt::NoQuorum {
             answered,
             needed: self.quorum(),
             configured: self.members.len(),
-        }
+        };
+        halt.report();
+        L1SourceError::Halt(halt)
     }
 
     /// Settle a read whose answers must be equal: the light client's
@@ -254,7 +317,8 @@ impl<S: L1Source> L1Sources<S> {
                 .iter()
                 .filter(|(_, value)| *value != truth)
                 .for_each(|(member, value)| {
-                    self.report_disagreement(what, ("light client", &truth), (&member.name, value));
+                    SourceHalt::disagreement(what, ("light client", &truth), (&member.name, value))
+                        .report();
                     self.rotate_out(member, "disagreement");
                 });
             return Ok(truth);
@@ -270,30 +334,11 @@ impl<S: L1Source> L1Sources<S> {
         match rest.iter().find(|(_, value)| value != truth) {
             None => Ok(truth.clone()),
             Some((other, value)) => {
-                self.report_disagreement(what, (&first.name, truth), (&other.name, value));
-                Err(L1SourceError::Disagreement {
-                    what: what.to_string(),
-                    a_name: first.name.clone(),
-                    a: format!("{truth:?}"),
-                    b_name: other.name.clone(),
-                    b: format!("{value:?}"),
-                })
+                let halt = SourceHalt::disagreement(what, (&first.name, truth), (&other.name, value));
+                halt.report();
+                Err(L1SourceError::Halt(halt))
             }
         }
-    }
-
-    /// Log both answers and count the disagreement.
-    fn report_disagreement<R: Debug>(&self, what: &str, a: (&str, &R), b: (&str, &R)) {
-        ::metrics::counter!(metrics::L1_SOURCE_DISAGREEMENT_TOTAL).increment(1);
-        error!(
-            target: "l1_sources",
-            what,
-            a_source = a.0,
-            a_answer = ?a.1,
-            b_source = b.0,
-            b_answer = ?b.1,
-            "L1 sources DISAGREE; one endpoint lies"
-        );
     }
 
     /// Settle the finalized-tip read: the light client's tip, or the

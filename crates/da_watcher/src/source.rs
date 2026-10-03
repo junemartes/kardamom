@@ -32,25 +32,11 @@ pub enum L1SourceError {
     /// rotates the source out for its backoff; the rest keep going.
     #[error("L1 provider rate-limited the request (HTTP 429)")]
     RateLimited,
-    /// Two sources gave different answers for `what`, and no light client
-    /// settles it. The follower halts on this every tick: a majority of
-    /// public endpoints proves nothing, since two can share a backend.
-    #[error("L1 sources disagree on {what}: {a_name} says {a}, {b_name} says {b}")]
-    Disagreement {
-        what: String,
-        a_name: String,
-        a: String,
-        b_name: String,
-        b: String,
-    },
-    /// Fewer sources answered than the agreement rule needs: the others
-    /// are rotated out, or down.
-    #[error("{answered} of {configured} L1 sources answered; {needed} agreeing answers needed")]
-    NoQuorum {
-        answered: usize,
-        needed: usize,
-        configured: usize,
-    },
+    /// The source set cannot serve the read: a disagreement no light
+    /// client settles, or too few sources in the set. The follower halts
+    /// on it every tick, with the cause.
+    #[error(transparent)]
+    Halt(#[from] crate::sources::SourceHalt),
     /// Decode failure (ABI, RLP, or similar) for a log the provider returns.
     #[error("L1 log decode error: {0}")]
     Decode(String),

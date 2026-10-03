@@ -8,9 +8,13 @@ use std::time::Duration;
 use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_client::RpcClient;
 use alloy_signer_local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use alloy_transport::layers::FallbackLayer;
+use alloy_transport_http::Http;
+use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc::Receiver;
+use tower::Layer;
 use tracing::{info, warn};
 
 use kardamom_engine::ExecutorError;
@@ -25,6 +29,7 @@ use kardamom_log::discovery::StreamPlane;
 use crate::da::DaProxy;
 
 use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
+use super::payload_store::PayloadStore;
 use super::spool::{Restored, Spool};
 use crate::indexer::IndexerClient;
 
@@ -44,20 +49,57 @@ pub(crate) struct BatcherFileConfig {
     pub cluster: kardamom_engine::reader::cluster::ClusterConfig,
 }
 
-/// Parse the batcher key. Connect the wallet-backed L1 provider and the
-/// local DA blob store. The live service and the offline `--dry-run=false`
-/// post path share this signer, provider, and blob-store setup.
+/// The methods the batcher sends, tried one endpoint at a time in score
+/// order, so a failed or rate-limited endpoint falls back to the next
+/// one inside the request. A method outside this set fans out to every
+/// endpoint and takes the first answer, which is wrong for a nonce or a
+/// send: two endpoints at different heights answer differently.
+const SEQUENTIAL_METHODS: &[&str] = &[
+    "eth_blockNumber",
+    "eth_call",
+    "eth_chainId",
+    "eth_estimateGas",
+    "eth_feeHistory",
+    "eth_gasPrice",
+    "eth_getBlockByNumber",
+    "eth_getLogs",
+    "eth_getTransactionCount",
+    "eth_getTransactionReceipt",
+    "eth_maxPriorityFeePerGas",
+    "eth_sendRawTransaction",
+    "eth_sendRawTransactionSync",
+];
+
+/// Parse the batcher key. Connect the wallet-backed L1 provider over
+/// `rpcs`, and the local DA blob store. The live service and the offline
+/// `--dry-run=false` post path share this signer, provider, and
+/// blob-store setup.
+///
+/// With more than one endpoint, every request goes to the best-scored
+/// endpoint first and falls back to the next on an error or an HTTP 429;
+/// the scores rank a failing endpoint last for the requests after it.
 ///
 /// # Errors
-/// Returns an error when the key does not parse, or the L1 RPC connection
-/// or the blob store fails to open.
-pub async fn connect_l1(rpc: &str, key: &str) -> Result<impl Provider + 'static> {
+/// Returns an error when the key does not parse, when `rpcs` is empty,
+/// or when an endpoint is not a URL.
+pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + 'static> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
-    ProviderBuilder::new()
+    let transports = rpcs
+        .iter()
+        .map(|rpc| {
+            rpc.parse::<reqwest::Url>()
+                .map(Http::new)
+                .with_context(|| format!("--l1-rpc {rpc} is not a URL"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let count = NonZeroUsize::new(transports.len()).context("--l1-rpc names no endpoint")?;
+    let service = FallbackLayer::default()
+        .with_active_transport_count(count)
+        .with_sequential_methods(SEQUENTIAL_METHODS.iter().map(ToString::to_string).collect())
+        .layer(transports);
+    Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
-        .connect(rpc)
-        .await
-        .with_context(|| format!("connect L1 RPC {rpc}"))
+        .connect_client(RpcClient::new(service, false)))
 }
 
 /// Everything [`run`] needs from the CLI, already validated. The binary
@@ -65,7 +107,8 @@ pub async fn connect_l1(rpc: &str, key: &str) -> Result<impl Provider + 'static>
 /// first, so its error messages can name the exact flag combination.
 #[derive(Debug, Clone)]
 pub struct LiveArgs {
-    pub rpc: String,
+    /// The L1 endpoints, best first. See [`connect_l1`].
+    pub rpcs: Vec<String>,
     pub key: String,
     pub settlement: Address,
     /// The EigenDA proxy's URL (`http://host:port`).
@@ -105,6 +148,11 @@ pub struct LiveArgs {
     /// The settlement contract's deployment block: where a `BatchPosted`
     /// scan starts when no indexer serves it.
     pub settlement_deploy_block: u64,
+    /// The query endpoints of the executors and the validator
+    /// (`http://host:port`), the block payload store. When the sealer
+    /// refuses the replay, the gap up to its floor is read from here.
+    /// Empty: a refused replay is a fail-stop.
+    pub payload_sources: Vec<String>,
 }
 
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
@@ -121,7 +169,7 @@ struct L1Side<P> {
 impl LiveArgs {
     /// Connect to L1 and reconcile the durable cursor against it.
     async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
-        let provider = connect_l1(&self.rpc, &self.key).await?;
+        let provider = connect_l1(&self.rpcs, &self.key)?;
         let da = DaProxy::new(&self.da_proxy)?;
         let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
         let l1_truth = match &indexer {
@@ -316,22 +364,39 @@ struct ReaderHandles<G> {
     ordering_handle: JoinHandle<Result<(), ExecutorError>>,
 }
 
+/// Why a reader stack ended, as [`ReaderHandles::end`] classifies it.
+enum ReaderEnd {
+    /// The sealer refused the replay: the cursor is below its retention
+    /// floor, and `oldest_block` is the oldest block it still holds.
+    ReplayRefused { oldest_block: u64 },
+    /// Every other failure, with the reader thread's error for context.
+    Failed(anyhow::Error),
+}
+
 impl<G> ReaderHandles<G> {
     /// The feed loop returns only on failure (channel closed, or a post
-    /// that stopped it). Surface the reader threads' errors for context
-    /// before propagating `feed_err`. The channel-closed case's root
-    /// cause lives there.
-    fn surface_errors(self, feed_err: anyhow::Error) -> anyhow::Error {
+    /// that stopped it). Classify the end from the reader threads'
+    /// errors: the channel-closed case's root cause lives there. The
+    /// handles drop here, so the cluster session and the runtime close
+    /// before a new stack opens.
+    fn end(self, feed_err: anyhow::Error) -> ReaderEnd {
         warn!(error = %format!("{feed_err:#}"), "feed loop exited");
         if self.ordering_handle.is_finished()
             && let Ok(Err(re)) = self.ordering_handle.join()
         {
-            return anyhow::anyhow!("tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})");
+            if let ExecutorError::ClusterReplayUnavailable { oldest_block, .. } = re {
+                return ReaderEnd::ReplayRefused { oldest_block };
+            }
+            return ReaderEnd::Failed(anyhow::anyhow!(
+                "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
+            ));
         }
-        self.join_handles
-            .into_iter()
-            .find_map(|h| Self::stream_reader_failure(h, &feed_err))
-            .unwrap_or(feed_err)
+        ReaderEnd::Failed(
+            self.join_handles
+                .into_iter()
+                .find_map(|h| Self::stream_reader_failure(h, &feed_err))
+                .unwrap_or(feed_err),
+        )
     }
 
     /// `h`'s error, if it already finished and failed.
@@ -403,6 +468,12 @@ fn continue_from_spool(
 
 /// Ctrl-C, or a feed-loop failure that stops it.
 ///
+/// The resume sources, in order: the spool, the sealer's replay from the
+/// cursor, and the block payload store for a gap the sealer no longer
+/// retains. A refused replay is answered once: the store fills the gap
+/// up to the sealer's floor, and the stack starts again at the floor. A
+/// second refusal is a fail-stop.
+///
 /// # Errors
 /// Returns an error when L1 setup, cursor reconcile, config parsing, or the
 /// reader stack fails to start, or when the feed loop exits with a failure.
@@ -412,7 +483,6 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
     let mut run_cfg = RunConfig::resolve(&args)?;
     run_cfg.resolve_cluster_ingress().await?;
-    let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, resume)?;
 
     let sender = LiveSender::new(
         l1.provider,
@@ -420,7 +490,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         l1.da,
         l1.l1_truth.last_batch_index,
         args.l1_retries,
-        args.cursor_file,
+        args.cursor_file.clone(),
         args.settlement_deploy_block,
     );
     let feed_cfg = FeedConfig {
@@ -432,90 +502,110 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         target_payload_bytes: args.target_payload_bytes,
         skip_through_block: resume.next_block.saturating_sub(1),
     };
-    let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg, spool, restored).run());
-    let feed_result = tokio::select! {
-        r = &mut feed => r.context("feed task panicked")?,
-        () = bin_support::wait_for_shutdown() => {
-            // Exit cleanly. The cursor is reconciled against L1 truth on
-            // every restart, so tearing down mid-batch loses nothing.
-            info!("shutdown signal received; stopping live batcher");
-            run_cfg.plane.shutdown().await;
-            return Ok(());
+    let feed = FeedLoop::new(sender, feed_cfg, spool, restored);
+    let store = PayloadStore::new(args.payload_sources.clone());
+    let mut service = Service { args, run_cfg };
+    let served = match service.serve(feed, resume).await? {
+        Served::Done => Served::Done,
+        Served::Refused {
+            mut feed,
+            oldest_block,
+        } => {
+            let resume = recover_from_store(&store, &mut feed, resume, oldest_block).await?;
+            service.serve(feed, resume).await?
         }
     };
-    match feed_result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(handles.surface_errors(e)),
+    if let Served::Refused { oldest_block, .. } = served {
+        bail!(
+            "the sealer refused the replay again after the store filled the gap: its floor \
+             moved to block {oldest_block}; a restart recovers the new gap"
+        );
+    }
+    // Exit cleanly. The cursor is reconciled against L1 truth on every
+    // restart, so tearing down mid-batch loses nothing.
+    info!("shutdown signal received; stopping live batcher");
+    service.run_cfg.plane.shutdown().await;
+    Ok(())
+}
+
+/// Read the gap between the cursor and the sealer's floor from the
+/// payload store into the feed loop, and return the cursor the reader
+/// resumes at: the end of the floor block, which the sealer holds.
+///
+/// # Errors
+/// Returns an error when no payload source is configured, when a block
+/// of the gap is not served, or when a block does not continue its
+/// predecessor.
+async fn recover_from_store<P: Provider>(
+    store: &PayloadStore,
+    feed: &mut FeedLoop<P>,
+    resume: BatchCursor,
+    oldest_block: u64,
+) -> Result<BatchCursor> {
+    if store.is_empty() {
+        bail!(
+            "the sealer refused the replay from block {} (its oldest retained block is \
+             {oldest_block}) and no --payload-source is set; the gap is not recoverable \
+             from here",
+            resume.next_block
+        );
+    }
+    warn!(
+        from_block = resume.next_block,
+        oldest_block,
+        "sealer replay refused; recovering the gap from the payload store"
+    );
+    let blocks = store.blocks(resume, oldest_block).await?;
+    let resumed = feed.absorb(blocks)?;
+    info!(
+        replay_from_index = resumed.next_index,
+        replay_from_block = resumed.next_block,
+        "gap recovered from the payload store; resuming at the sealer's floor"
+    );
+    Ok(resumed)
+}
+
+/// What one reader stack did: ran until shutdown, or ended on a refused
+/// replay with the feed loop handed back for the recovery.
+enum Served<P> {
+    Done,
+    Refused { feed: FeedLoop<P>, oldest_block: u64 },
+}
+
+/// The live service's fixed parts across reader stacks: the arguments
+/// and the resolved config.
+struct Service {
+    args: LiveArgs,
+    run_cfg: RunConfig,
+}
+
+impl Service {
+    /// Run `feed` on a reader stack that resumes at `resume`, until
+    /// shutdown or a failure. A refused replay hands the feed loop back;
+    /// every other failure is the error. The caller ends the plane after
+    /// a shutdown.
+    async fn serve<P: Provider + 'static>(
+        &mut self,
+        feed: FeedLoop<P>,
+        resume: BatchCursor,
+    ) -> Result<Served<P>> {
+        let ReaderStack { handles, feed_rx } = self.run_cfg.spawn_reader_stack(&self.args, resume)?;
+        let mut task = tokio::spawn(async move {
+            let mut feed = feed;
+            let why = feed.run(feed_rx).await;
+            (feed, why)
+        });
+        let (feed, why) = tokio::select! {
+            r = &mut task => r.context("feed task panicked")?,
+            () = bin_support::wait_for_shutdown() => return Ok(Served::Done),
+        };
+        match handles.end(why) {
+            ReaderEnd::ReplayRefused { oldest_block } => Ok(Served::Refused { feed, oldest_block }),
+            ReaderEnd::Failed(e) => Err(e),
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use kardamom_types::BPosition;
-
-    use super::*;
-    use crate::batch::ClosedBlock;
-
-    fn block(number: u64, end: i32) -> ClosedBlock {
-        ClosedBlock {
-            block_number: number,
-            l2_timestamp: 0,
-            end_tx_idx: BPosition {
-                term_id: 0,
-                term_offset: end,
-            },
-            l1_origin: 0,
-            remote_epochs: Vec::new(),
-            txs: Vec::new(),
-        }
-    }
-
-    fn cursor(next_index: u64, next_block: u64) -> BatchCursor {
-        BatchCursor {
-            next_index,
-            next_block,
-            last_batch_index: 3,
-        }
-    }
-
-    #[test]
-    fn a_spool_that_continues_the_cursor_moves_the_resume_point() {
-        let dir = tempfile::tempdir().unwrap();
-        let spool = Spool::open(dir.path()).unwrap();
-        for n in 11..=13 {
-            spool
-                .append(&block(n, 100 + i32::try_from(n).unwrap()))
-                .unwrap();
-        }
-        let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
-        assert_eq!(restored.blocks.len(), 3);
-        assert_eq!(resume.next_block, 14);
-        assert_eq!(resume.next_index, block(13, 113).end_tx_idx.as_index());
-        assert_eq!(resume.last_batch_index, 3);
-    }
-
-    #[test]
-    fn a_spool_behind_a_confirmed_post_drops_the_covered_blocks() {
-        let dir = tempfile::tempdir().unwrap();
-        let spool = Spool::open(dir.path()).unwrap();
-        for n in 11..=13 {
-            spool.append(&block(n, 0)).unwrap();
-        }
-        // L1 covers through 12 (a post confirmed after the spool write).
-        let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 12).unwrap();
-        assert_eq!(restored.blocks.len(), 1);
-        assert_eq!(restored.blocks[0].block_number, 13);
-        assert_eq!(resume.next_block, 14);
-    }
-
-    #[test]
-    fn a_spool_that_does_not_continue_the_cursor_is_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let spool = Spool::open(dir.path()).unwrap();
-        spool.append(&block(20, 0)).unwrap();
-        let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
-        assert!(restored.blocks.is_empty());
-        assert_eq!(resume, cursor(90, 11));
-        assert!(spool.load().unwrap().blocks.is_empty());
-    }
-}
+#[path = "run_tests.rs"]
+mod tests;
