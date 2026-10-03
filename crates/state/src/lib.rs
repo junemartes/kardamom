@@ -32,20 +32,19 @@ pub use error::StateError;
 pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
 pub use nonce_query::{
-    CommittedAccount, CommittedPayload, CommittedReceipt, NonceQueryServer, committed_account,
-    committed_block_payload, committed_receipt, serve_nonce_queries,
+    CommittedAccount, CommittedReceipt, CommittedRefs, NonceQueryServer, committed_account,
+    committed_block_refs, committed_receipt, serve_nonce_queries,
 };
 pub use recovery::{
     RecoveryPoint, bootstrap_trie_from_state, has_trie, read_all_headers, read_recovery_point,
     strip_trie,
 };
-pub use snapshot::StateSnapshot;
+pub use schema::{TxDataRef, TxIndexValue};
+pub use snapshot::{BlockRefs, BlockTxRef, StateSnapshot};
 pub use swap::{SnapshotHandle, SnapshotReceiver};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
 // The proof-generation API works with any libmdbx transaction kind. Callers
 // (the validator's witness anchoring) need to name these types without
 // adding their own libmdbx dependency.
 pub use signet_libmdbx;
-pub use writer::{
-    PayloadRetention, StateWriter, TrieMode, WriteBatch, WriterHandle, WriterOptions,
-};
+pub use writer::{StateWriter, TrieMode, WriteBatch, WriterHandle};

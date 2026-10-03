@@ -123,9 +123,9 @@ ports:
   # sequencer.nomad.hcl --executor-query-endpoints (both groups).
   executor_nonce_query: 9024
   # The validator's query endpoint, the same methods as the executor's:
-  # the batcher reads a block's payload from it when the sealer no longer
-  # retains the block. Mirrors: validator.nomad.hcl --nonce-query-addr,
-  # batcher.nomad.hcl --payload-source.
+  # the batcher reads a block's transaction references from it when the
+  # sealer no longer retains the block. Mirrors: validator.nomad.hcl
+  # --nonce-query-addr, batcher.nomad.hcl --block-refs-source.
   validator_query: 9025
   # The account-state projection cache (nomad/redis.nomad.hcl): the primary
   # and the replica on `redis`, the three sentinels on `redis_sentinel`. The

@@ -55,8 +55,9 @@ variable "lockbox_address" {
 }
 
 # The query endpoint (group_vars/all.yml, ports.validator_query): the
-# committed nonce, balance and receipt, and the stored block payload the
-# batcher reads when the sealer no longer retains a block.
+# committed nonce, balance and receipt, and a block's transaction
+# references, which the batcher reads when the sealer no longer retains
+# the block.
 variable "query_port" {
   type    = number
   default = 9025
@@ -140,7 +141,7 @@ job "validator" {
         static = 9006
       }
       # The query endpoint, as a Consul service: the batcher reads block
-      # payloads from it by the service record.
+      # references from it by the service record.
       port "query" {
         static = var.query_port
       }
@@ -204,9 +205,9 @@ job "validator" {
           # persistent mount, never the executor's /opt/kardamom/state
           # root. This is a separate mdbx environment.
           "--state-dir", "/opt/kardamom/state/validator",
-          # The query endpoint: the batcher's payload store, next to
-          # the executors'. The validator keeps every block it executes
-          # in the form the batcher posts.
+          # The query endpoint: a block's transaction references, next
+          # to the executors'. The validator keeps, with every receipt,
+          # where the transaction's bytes are on the tx_data archives.
           "--nonce-query-addr", "${meta.node_ip}:${var.query_port}",
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope, it

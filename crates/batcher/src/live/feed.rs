@@ -219,8 +219,8 @@ impl<P: Provider> FeedLoop<P> {
         self.pending.as_ref().map_or(0, |g| g.blocks.len())
     }
 
-    /// Add blocks the payload store recovered, in order, as if the sealer
-    /// had served them: into the spool and the pending group. The reader
+    /// Add rebuilt blocks, in order, as if the sealer had served them:
+    /// into the spool and the pending group. The reader
     /// then resumes just past them, and re-observed blocks up to the last
     /// one drop. Returns the cursor the reader resumes at.
     ///
@@ -237,7 +237,7 @@ impl<P: Provider> FeedLoop<P> {
             resume = self.push_closed(closed)?;
         }
         self.cfg.skip_through_block = resume.next_block.saturating_sub(1);
-        counter!(live_metric_names::STORE_RECOVERED_BLOCKS).increment(count as u64);
+        counter!(live_metric_names::REBUILT_BLOCKS).increment(count as u64);
         Ok(resume)
     }
 

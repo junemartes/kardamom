@@ -18,7 +18,7 @@ use metrics::counter;
 use crate::batch::{BatchAccumulator, ClosedBlock};
 use crate::compress::{DEFAULT_LEVEL, encode_zstd};
 use crate::error::BatcherError;
-use kardamom_types::kar1::{BlockCursor, BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
+use crate::frame::{BlockCursor, BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
 
 /// Metric names. Use `metrics::Recorder` to scrape them. The runtime sets up
 /// a Prometheus exporter with `metrics-exporter-prometheus`.

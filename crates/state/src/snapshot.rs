@@ -25,13 +25,42 @@ use crate::meta::{
     KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_STATE_ROOT,
     encode_b_position, get_decoded, read_meta_b_position, read_meta_b256, read_meta_u64,
 };
-use crate::schema::for_each_row;
 use crate::schema::{
-    TABLE_ACCOUNTS, TABLE_BLOCK_PAYLOADS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
-    TABLE_TX_HASH_INDEX, decode_account_value, decode_receipt_value, decode_storage_value,
-    decode_tx_hash_value, encode_account_key, encode_block_key, encode_code_key,
-    encode_storage_key, encode_tx_hash_key,
+    TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
+    TABLE_TX_HASH_INDEX, decode_account_value, decode_header_value, decode_receipt_value,
+    decode_storage_value, decode_tx_hash_value, encode_account_key, encode_block_key,
+    encode_code_key, encode_storage_key, encode_tx_hash_key,
 };
+use crate::schema::{for_each_range, for_each_row};
+use kardamom_types::receipt::TX_TYPE_DEPOSIT;
+
+/// The references of one block: its boundary, and where the bytes of
+/// each of its transactions are, in canonical order. The batcher rebuilds
+/// the block's payload from them when the sealer no longer retains it.
+/// This is the JSON of `kardamom_getBlockRefs`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockRefs {
+    pub block_number: u64,
+    /// The block's canonical end, as an index.
+    pub end_tx_idx: u64,
+    pub l1_origin: u64,
+    pub l2_timestamp: u64,
+    pub refs: Vec<BlockTxRef>,
+}
+
+/// One transaction of a block: its hash, its canonical position, and its
+/// `TxRef` on the `tx_data` archive. Deposits are not listed; a payload
+/// never carries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockTxRef {
+    pub tx_hash: B256,
+    /// The canonical position, as an index.
+    pub tx_idx: u64,
+    pub shard_id: u8,
+    pub session_id: i32,
+    /// The archive position, as [`BPosition::as_index`] packs it.
+    pub position: u64,
+}
 
 /// An MVCC snapshot of the state DB at exactly one block boundary.
 ///
@@ -54,7 +83,6 @@ struct SnapshotInner {
     code_db: Database,
     receipts_db: Database,
     tx_hash_db: Database,
-    block_payloads_db: Database,
     // Keep a strong reference to the env, so it stays alive for as long as
     // the snapshot's read-only transaction does.
     env: Arc<Environment>,
@@ -87,7 +115,6 @@ impl StateSnapshot {
         let code_db = txn.open_db(Some(TABLE_CODE))?;
         let receipts_db = txn.open_db(Some(TABLE_RECEIPTS))?;
         let tx_hash_db = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
-        let block_payloads_db = txn.open_db(Some(TABLE_BLOCK_PAYLOADS))?;
         Ok(Self {
             inner: Arc::new(SnapshotInner {
                 txn,
@@ -97,25 +124,93 @@ impl StateSnapshot {
                 code_db,
                 receipts_db,
                 tx_hash_db,
-                block_payloads_db,
                 env,
             }),
         })
     }
 
-    /// The stored payload of block `number`: a one-block KAR1 payload, as
-    /// the writer encoded it. `None` for a block outside the retention
-    /// window, or past this snapshot.
+    /// The references of block `number`, or `None` for a block this
+    /// snapshot has not committed.
     ///
     /// # Errors
     ///
-    /// Returns [`StateError`] if the read fails.
-    pub fn block_payload(&self, number: u64) -> Result<Option<Vec<u8>>, StateError> {
-        let key = encode_block_key(number);
-        Ok(self
-            .inner
-            .txn
-            .get::<Vec<u8>>(self.inner.block_payloads_db.dbi(), &key)?)
+    /// Returns [`StateError`] if a read fails, or [`StateError::Recovery`]
+    /// when the block cannot be rebuilt from references: a transaction
+    /// without one (a row written before the reference existed), or a
+    /// cross-chain message, whose remote-epoch record is in no archive.
+    pub fn block_refs(&self, number: u64) -> Result<Option<BlockRefs>, StateError> {
+        let txn = &self.inner.txn;
+        let headers = txn.open_db(Some(TABLE_HEADERS))?;
+        let Some(header) =
+            get_decoded(txn, headers, &encode_block_key(number), decode_header_value)?
+        else {
+            return Ok(None);
+        };
+        // The block's records sit between the previous block's end and its
+        // own. The chain's first block starts at position zero.
+        let start = match number.checked_sub(1).filter(|n| *n > 0) {
+            Some(previous) => {
+                get_decoded(
+                    txn,
+                    headers,
+                    &encode_block_key(previous),
+                    decode_header_value,
+                )?
+                .ok_or_else(|| {
+                    StateError::Recovery(format!(
+                        "block {number} has no predecessor header; its start is unknown"
+                    ))
+                })?
+                .end_tx_idx
+            }
+            None => BPosition::ZERO,
+        };
+        let mut refs = Vec::new();
+        for_each_range(
+            txn,
+            self.inner.receipts_db,
+            &encode_b_position(start),
+            &encode_b_position(header.end_tx_idx),
+            |_, v| {
+                let receipt = decode_receipt_value(&v)?;
+                refs.extend(self.tx_ref_of(&receipt)?);
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(Some(BlockRefs {
+            block_number: number,
+            end_tx_idx: header.end_tx_idx.as_index(),
+            l1_origin: header.l1_origin,
+            l2_timestamp: header.l2_timestamp,
+            refs,
+        }))
+    }
+
+    /// The reference of `receipt`'s transaction: `None` for a deposit,
+    /// which no payload carries; an error for any other transaction
+    /// without one.
+    fn tx_ref_of(&self, receipt: &Receipt) -> Result<Option<BlockTxRef>, StateError> {
+        let row = get_decoded(
+            &self.inner.txn,
+            self.inner.tx_hash_db,
+            &encode_tx_hash_key(receipt.tx_hash),
+            decode_tx_hash_value,
+        )?;
+        match (row.and_then(|r| r.data), receipt.tx_type) {
+            (Some(data), _) => Ok(Some(BlockTxRef {
+                tx_hash: receipt.tx_hash,
+                tx_idx: receipt.tx_idx.as_index(),
+                shard_id: data.shard_id,
+                session_id: data.session_id,
+                position: data.position.as_index(),
+            })),
+            (None, TX_TYPE_DEPOSIT) => Ok(None),
+            (None, tx_type) => Err(StateError::Recovery(format!(
+                "transaction {} (type {tx_type:#x}) in block {} has no archive reference; the \
+                 block cannot be rebuilt from references",
+                receipt.tx_hash, receipt.block_number
+            ))),
+        }
     }
 
     /// The snapshot's pinned read-only transaction. This is the read view
@@ -253,11 +348,12 @@ impl StateDatabase for StateSnapshot {
     /// `eth_getTransactionReceipt`.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
         let key = encode_tx_hash_key(tx_hash);
-        get_decoded(
+        Ok(get_decoded(
             &self.inner.txn,
             self.inner.tx_hash_db,
             &key,
             decode_tx_hash_value,
-        )
+        )?
+        .map(|v| v.tx_idx))
     }
 }

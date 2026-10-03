@@ -92,6 +92,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
             input: bytes::Bytes::default(),
         }),
         ReaderToExec::Tx {
+            tx_ref: kardamom_types::TxRef::default(),
             envelope: legacy(&signer, to, 1, 1_000),
             position: pos(64),
         },

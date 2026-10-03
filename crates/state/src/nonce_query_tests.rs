@@ -223,39 +223,73 @@ async fn rejects_other_methods_and_bad_input() {
 }
 
 /// The batcher reads a block it can no longer replay from the sealer as
-/// the bytes it would have posted: the stored one-block KAR1 payload
-/// comes back as hex, and a block outside the window is `null`.
+/// references: the block's boundary and, in canonical order, where the
+/// bytes of each transaction are. A deposit is not listed. A block not
+/// committed yet is `null`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serves_the_stored_block_payload_and_null_for_an_unknown_block() {
+async fn serves_the_block_references_and_null_for_an_unknown_block() {
     use crate::writer::{StateWriter, WriteBatch};
-    use kardamom_types::kar1::{BlockRecords, TxFrame, decode};
-    use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
+    use kardamom_types::receipt::TX_TYPE_DEPOSIT;
+    use kardamom_types::{BPosition, BlockBoundary, BlockDelta, TxRef};
 
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path()).open().unwrap();
     seed_genesis(&env, &[], &[]).unwrap();
     let mut handle = StateWriter::spawn(env.clone()).unwrap();
-    let records = BlockRecords {
-        remote_epochs: Vec::new(),
-        txs: vec![TxFrame {
-            correlation_id: 9,
-            sender: Address::repeat_byte(0x11),
-            tx_hash: B256::repeat_byte(0xBE),
-            raw_tx: bytes::Bytes::from_static(b"raw"),
-        }],
+    let receipt = |idx: u64, hash: u8, tx_type: u8| Receipt {
+        tx_idx: BPosition::from_index(idx),
+        tx_hash: B256::repeat_byte(hash),
+        tx_type,
+        block_number: 2,
+        ..Receipt::default()
     };
-    let boundary = BlockBoundary {
+    // Block 1: one transaction, ends at index 1. Block 2: a deposit at 1,
+    // then two transactions at 2 and 3, ends at index 4.
+    let first = BlockDelta {
         block_number: 1,
-        end_tx_idx: BPosition::from_index(2),
-        l2_timestamp: 1_700_000_001,
-        l1_origin: 4,
+        receipts: vec![Receipt {
+            block_number: 1,
+            ..receipt(0, 0xA0, 0)
+        }],
+        ..BlockDelta::default()
+    };
+    let second = BlockDelta {
+        block_number: 2,
+        receipts: vec![
+            receipt(1, 0xD1, TX_TYPE_DEPOSIT),
+            receipt(2, 0xB2, 0),
+            receipt(3, 0xB3, 0),
+        ],
+        ..BlockDelta::default()
+    };
+    let boundary = |number: u64, end: u64| BlockBoundary {
+        block_number: number,
+        end_tx_idx: BPosition::from_index(end),
+        l2_timestamp: 1_700_000_000 + number,
+        l1_origin: 40 + number,
+    };
+    let tx_ref = |hash: u8, shard: u8, position: u64| {
+        TxRef::new(
+            B256::repeat_byte(hash),
+            shard,
+            BPosition::from_index(position),
+            -9,
+        )
     };
     handle
         .delta_tx
-        .send(WriteBatch::with_records(
-            boundary,
-            BlockDelta::default(),
-            records.clone(),
+        .send(WriteBatch::with_refs(
+            boundary(1, 1),
+            first,
+            vec![tx_ref(0xA0, 0, 100)],
+        ))
+        .unwrap();
+    handle
+        .delta_tx
+        .send(WriteBatch::with_refs(
+            boundary(2, 4),
+            second,
+            vec![tx_ref(0xB2, 1, 200), tx_ref(0xB3, 0, 300)],
         ))
         .unwrap();
     handle.shutdown().unwrap();
@@ -266,28 +300,48 @@ async fn serves_the_stored_block_payload_and_null_for_an_unknown_block() {
         post(
             addr,
             &format!(
-                r#"{{"jsonrpc":"2.0","id":5,"method":"kardamom_getBlockPayload","params":[{params}]}}"#
+                r#"{{"jsonrpc":"2.0","id":5,"method":"kardamom_getBlockRefs","params":[{params}]}}"#
             ),
         )
     };
 
-    let reply = tokio::task::spawn_blocking(move || ask("1")).await.unwrap();
+    let reply = tokio::task::spawn_blocking(move || ask("2")).await.unwrap();
     assert!(reply.starts_with("HTTP/1.0 200 OK"), "{reply}");
-    assert!(reply.contains("x-state-block: 1\r\n"), "{reply}");
+    assert!(reply.contains("x-state-block: 2\r\n"), "{reply}");
     let body = reply.rsplit("\r\n\r\n").next().unwrap();
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
-    let hex = json["result"].as_str().unwrap().strip_prefix("0x").unwrap();
-    let payload = decode(&alloy_primitives::hex::decode(hex).unwrap()).unwrap();
-    assert_eq!(payload.blocks.len(), 1);
-    assert_eq!(payload.blocks[0].block_number, 1);
-    assert_eq!(payload.blocks[0].txs, records.txs);
-    assert_eq!(payload.blocks[0].cursor.unwrap().end_tx_idx, 2);
-    assert_eq!(payload.blocks[0].cursor.unwrap().l1_origin, 4);
+    let refs: crate::BlockRefs = serde_json::from_value(json["result"].clone()).unwrap();
+    assert_eq!(
+        refs,
+        crate::BlockRefs {
+            block_number: 2,
+            end_tx_idx: 4,
+            l1_origin: 42,
+            l2_timestamp: 1_700_000_002,
+            refs: vec![
+                crate::BlockTxRef {
+                    tx_hash: B256::repeat_byte(0xB2),
+                    tx_idx: 2,
+                    shard_id: 1,
+                    session_id: -9,
+                    position: 200,
+                },
+                crate::BlockTxRef {
+                    tx_hash: B256::repeat_byte(0xB3),
+                    tx_idx: 3,
+                    shard_id: 0,
+                    session_id: -9,
+                    position: 300,
+                },
+            ],
+        }
+    );
 
-    let as_hex = tokio::task::spawn_blocking(move || ask(r#""0x1""#))
+    let first = tokio::task::spawn_blocking(move || ask(r#""0x1""#))
         .await
         .unwrap();
-    assert!(as_hex.contains(r#""result":"0x"#), "{as_hex}");
+    assert!(first.contains(r#""end_tx_idx":1"#), "{first}");
+    assert!(first.contains(r#""position":100"#), "{first}");
 
     let unknown = tokio::task::spawn_blocking(move || ask("7")).await.unwrap();
     assert!(unknown.contains(r#""result":null"#), "{unknown}");
@@ -296,4 +350,42 @@ async fn serves_the_stored_block_payload_and_null_for_an_unknown_block() {
         .await
         .unwrap();
     assert!(malformed.contains("-32602"), "{malformed}");
+}
+
+/// A block whose transaction has no archive reference (a row written
+/// before the reference existed, or a cross-chain message) cannot be
+/// rebuilt from references, and the query says so instead of answering a
+/// shorter list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_without_references_is_refused_not_shortened() {
+    use crate::writer::{StateWriter, WriteBatch};
+    use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+    seed_genesis(&env, &[], &[]).unwrap();
+    let mut handle = StateWriter::spawn(env.clone()).unwrap();
+    let delta = BlockDelta {
+        block_number: 1,
+        receipts: vec![Receipt {
+            tx_idx: BPosition::from_index(0),
+            tx_hash: B256::repeat_byte(0xA0),
+            block_number: 1,
+            ..Receipt::default()
+        }],
+        ..BlockDelta::default()
+    };
+    let boundary = BlockBoundary {
+        block_number: 1,
+        end_tx_idx: BPosition::from_index(1),
+        l2_timestamp: 1,
+        l1_origin: 0,
+    };
+    handle
+        .delta_tx
+        .send(WriteBatch::new(boundary, delta))
+        .unwrap();
+    handle.shutdown().unwrap();
+    let err = crate::committed_block_refs(&env, 1).unwrap_err();
+    assert!(err.to_string().contains("no archive reference"), "{err}");
 }

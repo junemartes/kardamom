@@ -19,8 +19,7 @@
 
 use crossbeam_channel::Sender;
 use kardamom_state::{SnapshotReceiver, StateSnapshot, WriteBatch};
-use kardamom_types::kar1::BlockRecords;
-use kardamom_types::{BlockBoundary, BlockDelta, SnapshotSource};
+use kardamom_types::{BlockBoundary, BlockDelta, SnapshotSource, TxRef};
 
 use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::error::ExecutorError;
@@ -75,14 +74,14 @@ impl StateWriterQueue for MdbxWriterQueue {
         &mut self,
         block: BlockBoundary,
         delta: BlockDelta,
-        records: BlockRecords,
+        refs: Vec<TxRef>,
     ) -> Result<(), ExecutorError> {
         // The channel is bounded, HORIZON_BLOCKS deep. `send` blocks when the
         // writer falls that far behind. This is the intended fail-fast
         // backpressure. A send error means the writer thread is gone. This is
         // fatal.
         self.delta_tx
-            .send(WriteBatch::with_records(block, delta, records))
+            .send(WriteBatch::with_refs(block, delta, refs))
             .map_err(|e| ExecutorError::State(format!("state writer channel closed: {e}")))
     }
 }
@@ -207,11 +206,7 @@ mod tests {
         // (drop the adapters, then call `writer.shutdown()`) holds here too.
         with_queue(&handle.delta_tx, |queue| {
             queue
-                .submit(
-                    boundary(1),
-                    block_delta(1, addr, 999),
-                    BlockRecords::default(),
-                )
+                .submit(boundary(1), block_delta(1, addr, 999), Vec::new())
                 .unwrap();
         });
 
@@ -232,18 +227,10 @@ mod tests {
         let addr = Address::from([0x07; 20]);
         with_queue(&handle.delta_tx, |queue| {
             queue
-                .submit(
-                    boundary(1),
-                    block_delta(1, addr, 1),
-                    BlockRecords::default(),
-                )
+                .submit(boundary(1), block_delta(1, addr, 1), Vec::new())
                 .unwrap();
             queue
-                .submit(
-                    boundary(2),
-                    block_delta(2, addr, 2),
-                    BlockRecords::default(),
-                )
+                .submit(boundary(2), block_delta(2, addr, 2), Vec::new())
                 .unwrap();
         });
 
@@ -295,11 +282,7 @@ mod tests {
         with_queue(&handle.delta_tx, |queue| {
             for b in 1..=3 {
                 queue
-                    .submit(
-                        boundary(b),
-                        block_delta(b, addr, b * 10),
-                        BlockRecords::default(),
-                    )
+                    .submit(boundary(b), block_delta(b, addr, b * 10), Vec::new())
                     .unwrap();
             }
         });

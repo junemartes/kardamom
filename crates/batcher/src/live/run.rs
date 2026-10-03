@@ -20,7 +20,8 @@ use tracing::{info, warn};
 use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
+    JoinBuffer, JoinRecoveryFactory, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs,
+    TxOrderingReader,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
@@ -29,7 +30,8 @@ use kardamom_log::discovery::StreamPlane;
 use crate::da::DaProxy;
 
 use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
-use super::payload_store::PayloadStore;
+use super::rebuild::{ArchiveRebuilder, Rebuilder};
+use super::refs_store::RefsStore;
 use super::spool::{Restored, Spool};
 use crate::indexer::IndexerClient;
 
@@ -149,10 +151,11 @@ pub struct LiveArgs {
     /// scan starts when no indexer serves it.
     pub settlement_deploy_block: u64,
     /// The query endpoints of the executors and the validator
-    /// (`http://host:port`), the block payload store. When the sealer
-    /// refuses the replay, the gap up to its floor is read from here.
-    /// Empty: a refused replay is a fail-stop.
-    pub payload_sources: Vec<String>,
+    /// (`http://host:port`). When the sealer refuses the replay, the
+    /// references of the gap up to its floor are read from here, and the
+    /// bytes from the `tx_data` archives. Empty: a refused replay is a
+    /// fail-stop.
+    pub block_refs_sources: Vec<String>,
 }
 
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
@@ -257,6 +260,19 @@ impl RunConfig {
         Ok(())
     }
 
+    /// The join-miss refetch factory: the `tx_data` archives, reached
+    /// from this node's refetch endpoints. `None` when the deployment
+    /// configures no archive or no local endpoint.
+    fn join_recovery(&mut self, args: &LiveArgs) -> Option<JoinRecoveryFactory> {
+        bin_support::archive_join_recovery(
+            &mut self.plane,
+            &self.aeron_cfg,
+            args.aeron_dir.as_deref(),
+            args.archive_control_response_endpoint.as_deref(),
+            args.replay_destination_endpoint.as_deref(),
+        )
+    }
+
     fn spawn_reader_stack(
         &mut self,
         args: &LiveArgs,
@@ -264,13 +280,7 @@ impl RunConfig {
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
         let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
-        let join_recovery = bin_support::archive_join_recovery(
-            &mut self.plane,
-            &self.aeron_cfg,
-            args.aeron_dir.as_deref(),
-            args.archive_control_response_endpoint.as_deref(),
-            args.replay_destination_endpoint.as_deref(),
-        );
+        let join_recovery = self.join_recovery(args);
 
         // A dedicated cluster runtime, exactly as in the executor and
         // validator. The cluster session must never contend with the
@@ -469,10 +479,11 @@ fn continue_from_spool(
 /// Ctrl-C, or a feed-loop failure that stops it.
 ///
 /// The resume sources, in order: the spool, the sealer's replay from the
-/// cursor, and the block payload store for a gap the sealer no longer
-/// retains. A refused replay is answered once: the store fills the gap
-/// up to the sealer's floor, and the stack starts again at the floor. A
-/// second refusal is a fail-stop.
+/// cursor, and a rebuild from the state databases' references and the
+/// `tx_data` archives for a gap the sealer no longer retains. A refused
+/// replay is answered once: the rebuild fills the gap up to the sealer's
+/// floor, and the stack starts again at the floor. A second refusal is a
+/// fail-stop.
 ///
 /// # Errors
 /// Returns an error when L1 setup, cursor reconcile, config parsing, or the
@@ -503,7 +514,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         skip_through_block: resume.next_block.saturating_sub(1),
     };
     let feed = FeedLoop::new(sender, feed_cfg, spool, restored);
-    let store = PayloadStore::new(args.payload_sources.clone());
+    let store = RefsStore::new(args.block_refs_sources.clone());
     let mut service = Service { args, run_cfg };
     let served = match service.serve(feed, resume).await? {
         Served::Done => Served::Done,
@@ -511,14 +522,21 @@ pub async fn run(args: LiveArgs) -> Result<()> {
             mut feed,
             oldest_block,
         } => {
-            let resume = recover_from_store(&store, &mut feed, resume, oldest_block).await?;
+            let factory = service.run_cfg.join_recovery(&service.args).context(
+                "the sealer refused the replay, and the rebuild from references needs the \
+                 tx_data archives: --replay-destination-endpoint, \
+                 --archive-control-response-endpoint and the archive endpoints of channels.toml",
+            )?;
+            let rebuilder = ArchiveRebuilder { factory };
+            let resume =
+                recover_from_refs(&store, rebuilder, &mut feed, resume, oldest_block).await?;
             service.serve(*feed, resume).await?
         }
     };
     if let Served::Refused { oldest_block, .. } = served {
         bail!(
-            "the sealer refused the replay again after the store filled the gap: its floor \
-             moved to block {oldest_block}; a restart recovers the new gap"
+            "the sealer refused the replay again after the rebuild filled the gap: its floor \
+             moved to block {oldest_block}; a restart rebuilds the new gap"
         );
     }
     // Exit cleanly. The cursor is reconciled against L1 truth on every
@@ -528,16 +546,18 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read the gap between the cursor and the sealer's floor from the
-/// payload store into the feed loop, and return the cursor the reader
-/// resumes at: the end of the floor block, which the sealer holds.
+/// Rebuild the gap between the cursor and the sealer's floor into the
+/// feed loop: the references from the state databases, the bytes from the
+/// archives through `rebuilder`. Returns the cursor the reader resumes
+/// at: the end of the floor block, which the sealer holds.
 ///
 /// # Errors
-/// Returns an error when no payload source is configured, when a block
-/// of the gap is not served, or when a block does not continue its
-/// predecessor.
-async fn recover_from_store<P: Provider>(
-    store: &PayloadStore,
+/// Returns an error when no query endpoint is configured, when a block
+/// of the gap is not served, when a block does not continue its
+/// predecessor, or when the rebuild fails.
+async fn recover_from_refs<P: Provider, R: Rebuilder>(
+    store: &RefsStore,
+    rebuilder: R,
     feed: &mut FeedLoop<P>,
     resume: BatchCursor,
     oldest_block: u64,
@@ -545,21 +565,25 @@ async fn recover_from_store<P: Provider>(
     if store.is_empty() {
         bail!(
             "the sealer refused the replay from block {} (its oldest retained block is \
-             {oldest_block}) and no --payload-source is set; the gap is not recoverable \
+             {oldest_block}) and no --block-refs-source is set; the gap is not recoverable \
              from here",
             resume.next_block
         );
     }
     warn!(
         from_block = resume.next_block,
-        oldest_block, "sealer replay refused; recovering the gap from the payload store"
+        oldest_block,
+        "sealer replay refused; rebuilding the gap from the state databases and the archives"
     );
-    let blocks = store.blocks(resume, oldest_block).await?;
+    let refs = store.blocks(resume, oldest_block).await?;
+    // The archive client is thread-bound and blocks on each replay; the
+    // runtime's other tasks keep running on their own workers.
+    let blocks = tokio::task::block_in_place(|| rebuilder.rebuild(refs))?;
     let resumed = feed.absorb(blocks)?;
     info!(
         replay_from_index = resumed.next_index,
         replay_from_block = resumed.next_block,
-        "gap recovered from the payload store; resuming at the sealer's floor"
+        "gap rebuilt; resuming at the sealer's floor"
     );
     Ok(resumed)
 }

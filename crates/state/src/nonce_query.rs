@@ -37,11 +37,12 @@
 //! the `receipts` table, so the two sides share one type and no second
 //! encoding.
 //!
-//! The batcher asks for a block's payload when the sealer no longer
-//! retains the block: `kardamom_getBlockPayload` with `[number]`, the
-//! number as a JSON integer or a `0x` quantity. The result is `null`, or
-//! the stored one-block KAR1 payload as `0x` hex, the bytes the batcher
-//! would post.
+//! The batcher asks for a block's references when the sealer no longer
+//! retains the block: `kardamom_getBlockRefs` with `[number]`, the number
+//! as a JSON integer or a `0x` quantity. The result is `null`, or the
+//! [`BlockRefs`] record as JSON: the block's canonical end, its L1 origin
+//! and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)`
+//! for each transaction in canonical order.
 //!
 //! `x-state-tx-idx` is the canonical end position of the snapshot's last
 //! committed block, as an index. A cache writes the answer back tagged
@@ -66,7 +67,7 @@ use tracing::{info, warn};
 
 use crate::env::StateEnv;
 use crate::error::StateError;
-use crate::snapshot::StateSnapshot;
+use crate::snapshot::{BlockRefs, StateSnapshot};
 
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 8 * 1024;
@@ -204,13 +205,12 @@ pub fn committed_receipt(env: &StateEnv, tx_hash: B256) -> Result<CommittedRecei
     })
 }
 
-/// The stored payload of one block, and where the snapshot that gave it
+/// The references of one block, and where the snapshot that gave them
 /// stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedPayload {
-    /// `None` when the block is outside the retention window, or not
-    /// committed yet.
-    pub payload: Option<Vec<u8>>,
+pub struct CommittedRefs {
+    /// `None` when the block is not committed yet.
+    pub refs: Option<BlockRefs>,
     /// The snapshot's block.
     pub block: u64,
     /// The canonical end position of the snapshot's last block, as an
@@ -218,37 +218,35 @@ pub struct CommittedPayload {
     pub tx_idx: u64,
 }
 
-/// Read the stored payload of block `number` from a fresh snapshot.
+/// Read the references of block `number` from a fresh snapshot.
 ///
 /// # Errors
 ///
-/// Returns [`StateError`] if the snapshot cannot open or the read fails.
-pub fn committed_block_payload(
-    env: &StateEnv,
-    number: u64,
-) -> Result<CommittedPayload, StateError> {
+/// Returns [`StateError`] if the snapshot cannot open or the read fails,
+/// or when the block cannot be rebuilt from references.
+pub fn committed_block_refs(env: &StateEnv, number: u64) -> Result<CommittedRefs, StateError> {
     let snapshot = StateSnapshot::open(env)?;
-    Ok(CommittedPayload {
-        payload: snapshot.block_payload(number)?,
+    Ok(CommittedRefs {
+        refs: snapshot.block_refs(number)?,
         block: snapshot.block_number(),
         tx_idx: snapshot.end_tx_position()?.as_index(),
     })
 }
 
 /// One request, parsed once at the boundary: an account method with its
-/// address, a receipt lookup with its hash, or a block payload with its
-/// number.
+/// address, a receipt lookup with its hash, or a block's references with
+/// its number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Query {
     Account(Method, Address),
     Receipt(B256),
-    Payload(u64),
+    Refs(u64),
 }
 
 /// The JSON-RPC name of the receipt lookup.
 const RECEIPT_METHOD: &str = "eth_getTransactionReceipt";
-/// The JSON-RPC name of the block payload lookup.
-const PAYLOAD_METHOD: &str = "kardamom_getBlockPayload";
+/// The JSON-RPC name of the block references lookup.
+const REFS_METHOD: &str = "kardamom_getBlockRefs";
 
 /// A block number parameter: a JSON integer, or a `0x` quantity.
 fn block_number_param(value: &serde_json::Value) -> Option<u64> {
@@ -263,12 +261,12 @@ fn block_number_param(value: &serde_json::Value) -> Option<u64> {
 impl Query {
     /// The query of `request`, or the JSON-RPC error code and message.
     fn parse(request: &Request) -> Result<Self, (i64, &'static str)> {
-        if request.method == PAYLOAD_METHOD {
+        if request.method == REFS_METHOD {
             return request
                 .params
                 .first()
                 .and_then(block_number_param)
-                .map(Self::Payload)
+                .map(Self::Refs)
                 .ok_or((-32602, "invalid params: expected [number]"));
         }
         let first = request.params.first().and_then(serde_json::Value::as_str);
@@ -400,15 +398,12 @@ impl Reply {
         }
     }
 
-    /// The stored block payload as the hex of its bytes, or `null`, with
-    /// the snapshot's position.
-    fn payload(id: &serde_json::Value, found: &CommittedPayload) -> Self {
-        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "payload").increment(1);
-        let result = found
-            .payload
-            .as_ref()
-            .map(|bytes| format!("0x{}", alloy_primitives::hex::encode(bytes)));
-        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+    /// The block's references as JSON, or `null`, with the snapshot's
+    /// position.
+    fn refs(id: &serde_json::Value, found: &CommittedRefs) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "refs").increment(1);
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": found.refs}).to_string();
         Self {
             status: "200 OK",
             body,
@@ -483,7 +478,7 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
 enum Found {
     Account(Method, CommittedAccount),
     Receipt(CommittedReceipt),
-    Payload(CommittedPayload),
+    Refs(CommittedRefs),
 }
 
 impl Query {
@@ -494,7 +489,7 @@ impl Query {
                 committed_account(env, address).map(|account| Found::Account(method, account))
             }
             Self::Receipt(tx_hash) => committed_receipt(env, tx_hash).map(Found::Receipt),
-            Self::Payload(number) => committed_block_payload(env, number).map(Found::Payload),
+            Self::Refs(number) => committed_block_refs(env, number).map(Found::Refs),
         }
     }
 }
@@ -504,7 +499,7 @@ impl Found {
         match self {
             Self::Account(method, account) => Reply::ok(id, *method, account),
             Self::Receipt(found) => Reply::receipt(id, found),
-            Self::Payload(found) => Reply::payload(id, found),
+            Self::Refs(found) => Reply::refs(id, found),
         }
     }
 }

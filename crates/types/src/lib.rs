@@ -31,7 +31,6 @@ pub mod deposit;
 pub mod envelope;
 pub mod epoch;
 pub mod genesis;
-pub mod kar1;
 pub mod limits;
 pub mod num;
 pub mod position;

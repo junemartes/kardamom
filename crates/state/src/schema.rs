@@ -7,9 +7,8 @@
 //! | `storage`        | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
 //! | `code`           | `B256 code_hash` (32 B)          | raw bytecode                                     |
 //! | `headers`        | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp, u64 l1_origin)`, no state root |
-//! | `block_payloads` | `u64 block_number` (8 B BE)      | the block as a one-block KAR1 payload (`kardamom_types::kar1::encode_block`), the newest `PayloadRetention` blocks only |
 //! | `receipts`       | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
-//! | `tx_hash_index`  | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE `term_id` ++ i32 BE `term_offset`), for `eth_getTransactionReceipt(hash)` |
+//! | `tx_hash_index`  | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE `term_id` ++ i32 BE `term_offset`), for `eth_getTransactionReceipt(hash)`; a transaction with bytes on a `tx_data` archive adds its `TxRef` (13 B: `u8 shard_id`, `i32 BE session_id`, `BPosition` archive position) |
 //! | `meta`           | `&[u8]` (well-known keys, below) | varies, see `meta.rs`                            |
 //! | `account_trie`   | trie path (raw nibbles)          | branch node, see `trie/node.rs`                  |
 //! | `storage_trie`   | account hash ++ trie path        | branch node, see `trie/node.rs`                  |
@@ -24,7 +23,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Receipt};
+use kardamom_types::{AccountChange, BPosition, CodeEntry, Receipt, TxRef};
 
 use crate::error::StateError;
 
@@ -32,7 +31,6 @@ pub(crate) const TABLE_ACCOUNTS: &str = "accounts";
 pub(crate) const TABLE_STORAGE: &str = "storage";
 pub(crate) const TABLE_CODE: &str = "code";
 pub(crate) const TABLE_HEADERS: &str = "headers";
-pub(crate) const TABLE_BLOCK_PAYLOADS: &str = "block_payloads";
 pub(crate) const TABLE_RECEIPTS: &str = "receipts";
 pub(crate) const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub(crate) const TABLE_META: &str = "meta";
@@ -55,7 +53,6 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_STORAGE,
     TABLE_CODE,
     TABLE_HEADERS,
-    TABLE_BLOCK_PAYLOADS,
     TABLE_RECEIPTS,
     TABLE_TX_HASH_INDEX,
     TABLE_META,
@@ -246,15 +243,6 @@ pub(crate) fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateErro
     })
 }
 
-// ---------- block_payloads ----------
-//
-// Key: the block number, as the `headers` key. Value: the block's records
-// as the DA payload carries them, encoded once by the state writer with
-// `kardamom_types::kar1::encode_block`. The table is a bounded cache for
-// the batcher: a block the sealer no longer retains is read back from
-// here, so the writer deletes the row `PayloadRetention` blocks behind
-// the one it commits. The rows never enter the state trie.
-
 // ---------- receipts ----------
 //
 // Key: `BPosition` (8 bytes: i32 BE term_id, then i32 BE term_offset). The
@@ -291,11 +279,53 @@ pub(crate) fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> 
 // ---------- tx_hash_index ----------
 //
 // Key: `B256 tx_hash` (32 bytes). Value: `BPosition` (8 bytes, the same
-// layout as the receipts-table key; see [`crate::meta::encode_b_position`]).
+// layout as the receipts-table key; see [`crate::meta::encode_b_position`]),
+// then, for a transaction whose bytes a `tx_data` archive holds, its
+// `TxRef` without the hash: `shard_id` (1 byte), `session_id` (i32 BE),
+// and the archive position (8 bytes). A deposit or a cross-chain message
+// has no bytes on an archive, and its row stops at the position. An 8-byte
+// row written before the reference existed decodes the same way.
 //
 // Block commit populates one entry per receipt. On the read path,
 // `eth_getTransactionReceipt(hash)` calls
 // `StateDatabase::get_tx_position(hash)`, then `StateDatabase::get_receipt(pos)`.
+// The batcher reads the references of a block the sealer no longer
+// retains, and fetches the bytes from the archive by them.
+
+/// Where a transaction's bytes are on a `tx_data` archive: the
+/// [`TxRef`] without the hash, which is the row's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxDataRef {
+    pub shard_id: u8,
+    pub session_id: i32,
+    pub position: BPosition,
+}
+
+impl TxDataRef {
+    /// The reference of `tx_ref`, less its hash.
+    #[must_use]
+    pub const fn of(tx_ref: &TxRef) -> Self {
+        Self {
+            shard_id: tx_ref.shard_id,
+            session_id: tx_ref.tx_data_session_id,
+            position: tx_ref.tx_data_position,
+        }
+    }
+
+    /// The full reference, with `tx_hash` as its key.
+    #[must_use]
+    pub const fn tx_ref(self, tx_hash: B256) -> TxRef {
+        TxRef::new(tx_hash, self.shard_id, self.position, self.session_id)
+    }
+}
+
+/// One `tx_hash_index` row: the canonical position of the transaction,
+/// and where its bytes are when an archive holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxIndexValue {
+    pub tx_idx: BPosition,
+    pub data: Option<TxDataRef>,
+}
 
 #[must_use]
 pub(crate) fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
@@ -303,22 +333,41 @@ pub(crate) fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
 }
 
 #[must_use]
-pub(crate) fn encode_tx_hash_value(pos: BPosition) -> [u8; 8] {
-    crate::meta::encode_b_position(pos)
+pub(crate) fn encode_tx_hash_value(v: &TxIndexValue) -> Vec<u8> {
+    let mut out = Vec::with_capacity(21);
+    out.extend_from_slice(&crate::meta::encode_b_position(v.tx_idx));
+    if let Some(data) = v.data {
+        out.push(data.shard_id);
+        out.extend_from_slice(&data.session_id.to_be_bytes());
+        out.extend_from_slice(&crate::meta::encode_b_position(data.position));
+    }
+    out
 }
 
 /// # Errors
 ///
-/// Returns [`StateError::BadEncoding`] if `bytes` is not 8 bytes.
-pub(crate) fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
-    crate::meta::decode_b_position(bytes).map_err(|e| match e {
-        StateError::BadEncoding { expected, got, .. } => StateError::BadEncoding {
-            table: TABLE_TX_HASH_INDEX,
-            expected,
-            got,
-        },
-        other => other,
-    })
+/// Returns [`StateError::BadEncoding`] if `bytes` is neither the 8-byte
+/// position row nor the 21-byte row with the archive reference.
+pub(crate) fn decode_tx_hash_value(bytes: &[u8]) -> Result<TxIndexValue, StateError> {
+    let bad = |got: usize| StateError::BadEncoding {
+        table: TABLE_TX_HASH_INDEX,
+        expected: 21,
+        got,
+    };
+    let (position, rest) = bytes
+        .split_first_chunk::<8>()
+        .ok_or_else(|| bad(bytes.len()))?;
+    let tx_idx = crate::meta::decode_b_position(position)?;
+    let data = match rest {
+        [] => None,
+        [shard_id, s0, s1, s2, s3, p @ ..] => Some(TxDataRef {
+            shard_id: *shard_id,
+            session_id: i32::from_be_bytes([*s0, *s1, *s2, *s3]),
+            position: crate::meta::decode_b_position(p).map_err(|_| bad(bytes.len()))?,
+        }),
+        _ => return Err(bad(bytes.len())),
+    };
+    Ok(TxIndexValue { tx_idx, data })
 }
 
 // ---------- table iteration ----------
@@ -447,6 +496,29 @@ pub(crate) fn for_each_prefix<K: signet_libmdbx::TransactionKind>(
     let mut cur = txn.cursor(db)?;
     let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(prefix)?;
     while let Some((k, v)) = item.take_if(|(k, _)| k.starts_with(prefix)) {
+        let std::ops::ControlFlow::Continue(()) = f(k, v)? else {
+            return Ok(());
+        };
+        item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(())
+}
+
+/// Walk every row of `db` whose key is in `[from, to)`, ascending, and
+/// stop at the first key at or past `to`, or earlier if `f` returns
+/// [`ControlFlow::Break`]. The receipts of one block are such a range of
+/// the `receipts` table: its keys are canonical positions, and the
+/// headers give the block's two ends.
+pub(crate) fn for_each_range<K: signet_libmdbx::TransactionKind>(
+    txn: &signet_libmdbx::tx::Tx<K>,
+    db: signet_libmdbx::Database,
+    from: &[u8],
+    to: &[u8],
+    mut f: impl FnMut(Vec<u8>, Vec<u8>) -> Result<std::ops::ControlFlow<()>, StateError>,
+) -> Result<(), StateError> {
+    let mut cur = txn.cursor(db)?;
+    let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(from)?;
+    while let Some((k, v)) = item.take_if(|(k, _)| k.as_slice() < to) {
         let std::ops::ControlFlow::Continue(()) = f(k, v)? else {
             return Ok(());
         };
@@ -586,18 +658,48 @@ mod tests {
         assert!(b < c);
     }
 
+    /// Both row widths decode: the 8-byte row of a block written before
+    /// the archive reference existed, or of a deposit, and the 21-byte row
+    /// of a transaction with bytes on an archive.
     #[test]
-    fn tx_hash_index_roundtrip() {
+    fn tx_hash_index_roundtrip_in_both_widths() {
         let hash = b256!("0x000000000000000000000000000000000000000000000000000000000000dead");
         let pos = BPosition {
             term_id: 7,
             term_offset: 12345,
         };
         let k = encode_tx_hash_key(hash);
-        let v = encode_tx_hash_value(pos);
         assert_eq!(k.len(), 32);
+
+        let bare = TxIndexValue {
+            tx_idx: pos,
+            data: None,
+        };
+        let v = encode_tx_hash_value(&bare);
         assert_eq!(v.len(), 8);
-        assert_eq!(decode_tx_hash_value(&v).unwrap(), pos);
+        assert_eq!(decode_tx_hash_value(&v).unwrap(), bare);
+
+        let with_ref = TxIndexValue {
+            tx_idx: pos,
+            data: Some(TxDataRef {
+                shard_id: 3,
+                session_id: -7,
+                position: BPosition {
+                    term_id: 2,
+                    term_offset: 4096,
+                },
+            }),
+        };
+        let v = encode_tx_hash_value(&with_ref);
+        assert_eq!(v.len(), 21);
+        assert_eq!(decode_tx_hash_value(&v).unwrap(), with_ref);
+        let full = with_ref.data.unwrap().tx_ref(hash);
+        assert_eq!(TxDataRef::of(&full), with_ref.data.unwrap());
+        assert_eq!(full.tx_hash, hash);
+
+        for width in [0usize, 7, 9, 20, 22] {
+            assert!(decode_tx_hash_value(&vec![0u8; width]).is_err(), "{width}");
+        }
     }
 
     #[test]

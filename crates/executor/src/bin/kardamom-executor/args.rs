@@ -8,7 +8,6 @@ use std::str::FromStr;
 
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
-use kardamom_state::PayloadRetention;
 
 /// Default `--checkpoint-keep`.
 const DEFAULT_CHECKPOINT_KEEP: NonZeroU64 = NonZeroU64::new(3).unwrap();
@@ -111,13 +110,6 @@ pub(crate) struct Args {
     /// it only for tests or short-lived runs. It is unsafe on real hosts.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     pub(crate) state_durability: StateDurabilityArg,
-    /// How many of the newest blocks keep their payload row in the state
-    /// database. The batcher reads a block from here when the sealer no
-    /// longer retains it, so this bounds the batcher outage the store
-    /// covers: at one block a second, 100 000 blocks is a little over a
-    /// day. The row costs the block's raw transaction bytes.
-    #[arg(long, env = "KARDAMOM_PAYLOAD_RETENTION_BLOCKS", default_value_t = PayloadRetention::DEFAULT)]
-    pub(crate) payload_retention_blocks: PayloadRetention,
     /// UDP endpoint (`host:port`) on this node for refetched `tx_data` and
     /// `tx_deposits` fragments. A canonical reference whose envelope never
     /// arrived on the live multicast (image lapse, blackout, or a restart

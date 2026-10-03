@@ -377,27 +377,40 @@ loss and never a double post (the contract CAS rejects those loudly). Its
 real dependencies are one surviving state database and L1 gas/RPC health.
 See `docs/agents/batcher-live-l1-spec.md`.
 
-**Retention is a latency, not a loss, while one state database survives.**
-The resume has three sources, in order:
+**Retention is a latency, not a loss, while one state database and one
+archive survive.** The resume has three sources, in order:
 
 1. The spool: every block the batcher consumed and did not post yet, on
    its own disk. A restart continues the pending group from it.
 2. The sealer's replay from the cursor, inside its egress retention.
-3. The block payload store. Every executor and the validator keep each
-   block they execute as the one-block KAR1 payload the batcher posts
-   (the `block_payloads` table, written by the state writer with the
-   block's header row, pruned `--payload-retention-blocks` behind the
-   head, 100 000 by default). When the sealer answers `REPLAY_UNAVAILABLE`
-   past the cursor, the batcher reads the gap up to the sealer's floor
-   from the query endpoints it names with `--payload-source`
-   (`kardamom_getBlockPayload`), checks each block's number and canonical
-   end index against its predecessor, fills the spool and the pending
-   group, and resumes at the floor. The recovered bytes are the posted
-   bytes: one encoder serves the store and the batcher.
+3. A rebuild from what the nodes already keep. The state database of every
+   executor and of the validator holds the ordering: the `headers` table
+   maps a block to its canonical end and its L1 origin, and the `receipts`
+   table holds one row per canonical position with the transaction's hash.
+   The `tx_data` archives hold every raw transaction the ingress accepted,
+   on both ingress nodes. The link between them is the `TxRef` the egress
+   record carried; the state writer now keeps it with the receipt (the
+   `tx_hash_index` row gains the shard id, the publisher session and the
+   archive position, 13 bytes; an 8-byte row written before still
+   decodes). When the sealer answers `REPLAY_UNAVAILABLE` past the cursor,
+   the batcher reads each missing block's references from the query
+   endpoints it names with `--block-refs-source`
+   (`kardamom_getBlockRefs`: the block's canonical end, its L1 origin and
+   timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)` per
+   transaction in canonical order, deposits excluded), fetches the bytes
+   from the archives through the join-miss refetch the engine uses, checks
+   each hash against its bytes and each block's end against its
+   predecessor's, closes the blocks as the live feed closes them, fills the
+   spool and the pending group, and resumes at the sealer's floor. The
+   rebuilt range packs to the bytes the live path posts.
 
-A batcher outage longer than the store's retention is still a loss, and a
-second refusal after the recovery is a fail-stop. Without a payload source
-the refusal is the fail-stop it was before.
+A second refusal after the rebuild is a fail-stop, and so is a refusal
+without a query endpoint or without the refetch endpoints. A block that
+carried a cross-chain message cannot be rebuilt this way: its remote-epoch
+record is in no archive, and the query endpoint refuses the block instead
+of answering a shorter list. Nothing is pruned below the posted head: the
+reference rows live with the receipts, which nothing deletes, and the
+rebuild never touches the archives' retention.
 
 **L1 endpoints.** `--l1-rpc` takes a list. A request goes to the best
 endpoint first and falls back to the next on an error or an HTTP 429; a
@@ -437,11 +450,10 @@ layer alone, because the posted payloads carry the full ordered `raw_tx`
 stream.
 
 The backstop covers what L1 holds. A range the batcher never posted is on
-no L1 and in no DA store; its only copies are the sealer's egress retention
-and the block payload store of the executors and the validator (the
-batcher section above). The rebuild writes the payload rows too, so an
-executor that resumes on a rebuilt image serves the batcher the same rows
-a live one does.
+no L1 and in no DA store; its copies are the sealer's egress retention, the
+ordering in every state database and the bytes on the `tx_data` archives
+(the batcher section above). A block rebuilt from L1 carries no archive
+reference: its bytes are on L1 already, and the batcher never asks for it.
 
 `kardamom-reconstruct` walks the `BatchPosted` event log, fetches each batch's
 payload from the DA proxy (or the indexer's archive) by the certificate L1
@@ -632,8 +644,8 @@ check would pass against a feature that activated once and stopped.
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.
 - **L1 outage** — the followers cross-check two L1 sources and the
-  batcher recovers a range the sealer no longer retains from the block
-  payload store (the batcher section). The chaos cases that reproduce the
+  batcher rebuilds a range the sealer no longer retains from the state
+  databases' references and the `tx_data` archives (the batcher section). The chaos cases that reproduce the
   staging incident (`l1-liar`, `batcher-outage-past-retention`,
   `two-day-outage`) are the proof that closes this gap.
 - ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics

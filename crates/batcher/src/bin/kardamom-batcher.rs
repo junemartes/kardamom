@@ -162,12 +162,14 @@ struct Cli {
     settlement_deploy_block: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`): repeat the flag, or separate them with
-    /// commas. They hold every block in the form the batcher posts. When
-    /// the sealer no longer retains the cursor, the batcher reads the
-    /// gap from the first endpoint that serves each block and resumes at
-    /// the sealer's floor. Without them, a refused replay is a fail-stop.
-    #[arg(long, env = "KARDAMOM_PAYLOAD_SOURCES", value_delimiter = ',', num_args = 1..)]
-    payload_source: Vec<String>,
+    /// commas. They keep, with every receipt, where the transaction's
+    /// bytes are on the `tx_data` archives. When the sealer no longer
+    /// retains the cursor, the batcher reads each missing block's
+    /// references from the first endpoint that serves it, fetches the
+    /// bytes from the archives, and resumes at the sealer's floor.
+    /// Without them, a refused replay is a fail-stop.
+    #[arg(long, env = "KARDAMOM_BLOCK_REFS_SOURCES", value_delimiter = ',', num_args = 1..)]
+    block_refs_source: Vec<String>,
 
     /// Post a partial group that holds a transaction once its oldest
     /// block has waited this long. Must be nonzero: 0 posts every block.
@@ -384,7 +386,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         chain_id: cli.chain_id,
         indexer_url: cli.indexer_url.clone(),
         settlement_deploy_block: cli.settlement_deploy_block,
-        payload_sources: cli.payload_source.clone(),
+        block_refs_sources: cli.block_refs_source.clone(),
     })
     .await
 }

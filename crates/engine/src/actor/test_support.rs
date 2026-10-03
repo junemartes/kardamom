@@ -10,11 +10,10 @@ use std::thread::JoinHandle;
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender};
-use kardamom_types::kar1::BlockRecords;
 use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
-    TxEnvelope as KtTxEnvelope,
+    TxEnvelope as KtTxEnvelope, TxRef,
 };
 use revm::primitives::KECCAK_EMPTY;
 
@@ -70,9 +69,12 @@ pub(super) fn tx_msg(
     nonce: u64,
     value: u64,
 ) -> ReaderToExec {
+    let envelope = legacy(signer, to, nonce, value);
+    let position = pos(i32::try_from(idx).expect("test fixture: idx fits in i32"));
     ReaderToExec::Tx {
-        envelope: legacy(signer, to, nonce, value),
-        position: pos(i32::try_from(idx).expect("test fixture: idx fits in i32")),
+        tx_ref: TxRef::new(envelope.tx_hash, 0, position, 0),
+        envelope,
+        position,
     }
 }
 
@@ -138,7 +140,7 @@ impl StateWriterQueue for RecordingQueue {
         &mut self,
         b: BlockBoundary,
         d: BlockDelta,
-        _records: BlockRecords,
+        _refs: Vec<TxRef>,
     ) -> Result<(), ExecutorError> {
         self.0.lock().unwrap().push((b, d));
         Ok(())
@@ -186,7 +188,7 @@ impl StateWriterQueue for ApplyingRecordingQueue {
         &mut self,
         b: BlockBoundary,
         d: BlockDelta,
-        _records: BlockRecords,
+        _refs: Vec<TxRef>,
     ) -> Result<(), ExecutorError> {
         self.db.apply_block_delta(&d);
         self.log.lock().unwrap().push((b, d));

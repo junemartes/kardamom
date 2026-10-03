@@ -1,55 +1,55 @@
-//! The block payload records the exec thread hands the state writer: the
-//! frames the DA payload of the block carries, in arrival order.
+//! The transaction references the exec thread hands the state writer
+//! with each block: one per transaction, in arrival order, none for a
+//! deposit.
 
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::address;
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_types::kar1::{BlockRecords, TxFrame};
-use kardamom_types::{BlockBoundary, BlockDelta};
+use kardamom_types::{BlockBoundary, BlockDelta, TxRef};
 
 use super::StateWriterQueue;
 use super::test_support::{ExecRig, ImmediateCommit, boundary_msg, feed, funded, tx_msg};
 use crate::error::ExecutorError;
+use crate::reader::ReaderToExec;
 use crate::state::StaticSnapshotSource;
 
-/// A writer queue that keeps only the records of each submitted block.
-struct RecordsQueue(Arc<Mutex<Vec<(u64, BlockRecords)>>>);
+/// A writer queue that keeps only the references of each submitted block.
+struct RefsQueue(Arc<Mutex<Vec<(u64, Vec<TxRef>)>>>);
 
-impl StateWriterQueue for RecordsQueue {
+impl StateWriterQueue for RefsQueue {
     fn submit(
         &mut self,
         block: BlockBoundary,
         _delta: BlockDelta,
-        records: BlockRecords,
+        refs: Vec<TxRef>,
     ) -> Result<(), ExecutorError> {
-        self.0.lock().unwrap().push((block.block_number, records));
+        self.0.lock().unwrap().push((block.block_number, refs));
         Ok(())
     }
 }
 
-/// Each boundary submits the frames of its own block, and only those: the
-/// batcher packs the same frames, so the stored bytes are the posted
-/// bytes.
+/// Each boundary submits the references of its own block, and only
+/// those, in the order the stream carried them.
 #[test]
-fn each_boundary_submits_the_frames_of_its_own_block() {
+fn each_boundary_submits_the_references_of_its_own_block() {
     let signer = PrivateKeySigner::random();
     let to = address!("00000000000000000000000000000000000ABCDE");
     let log = Arc::new(Mutex::new(Vec::new()));
     let rig = ExecRig::new(
         StaticSnapshotSource(funded(&signer, 0)),
         ImmediateCommit,
-        RecordsQueue(log.clone()),
+        RefsQueue(log.clone()),
     );
     let first = tx_msg(&signer, to, 0, 0, 10);
     let second = tx_msg(&signer, to, 1, 1, 20);
     let third = tx_msg(&signer, to, 2, 2, 30);
-    let frame_of = |msg: &crate::reader::ReaderToExec| match msg {
-        crate::reader::ReaderToExec::Tx { envelope, .. } => TxFrame::from(envelope),
+    let ref_of = |msg: &ReaderToExec| match msg {
+        ReaderToExec::Tx { tx_ref, .. } => *tx_ref,
         other => panic!("a tx fixture, got {other:?}"),
     };
-    let want_block_1 = vec![frame_of(&first), frame_of(&second)];
-    let want_block_2 = vec![frame_of(&third)];
+    let want_block_1 = vec![ref_of(&first), ref_of(&second)];
+    let want_block_2 = vec![ref_of(&third)];
 
     let rx = feed(vec![
         first,
@@ -65,11 +65,10 @@ fn each_boundary_submits_the_frames_of_its_own_block() {
     let submitted = log.lock().unwrap();
     let blocks: Vec<u64> = submitted.iter().map(|(n, _)| *n).collect();
     assert_eq!(blocks, vec![1, 2, 3]);
-    assert_eq!(submitted[0].1.txs, want_block_1);
-    assert_eq!(submitted[1].1.txs, want_block_2);
+    assert_eq!(submitted[0].1, want_block_1);
+    assert_eq!(submitted[1].1, want_block_2);
     assert!(
-        submitted[2].1.txs.is_empty(),
-        "an empty block carries no frame"
+        submitted[2].1.is_empty(),
+        "an empty block carries no reference"
     );
-    assert!(submitted.iter().all(|(_, r)| r.remote_epochs.is_empty()));
 }

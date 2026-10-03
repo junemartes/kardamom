@@ -10,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::frame::BlockFrame;
 use crate::indexer::IndexerClient;
 use crate::l1::{read_posted_batches, recover_blocks};
 use crate::settlement::IKardamomL2Settlement;
-use kardamom_types::kar1::BlockFrame;
 
 /// The durable cursor: the ordering-stream position matching the last
 /// confirmed L1 post. `next_index` and `next_block` seed the cluster replay
@@ -278,7 +278,7 @@ fn genesis_reconcile(l1: L1Truth) -> (BatchCursor, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kardamom_types::kar1::BlockCursor;
+    use crate::frame::BlockCursor;
 
     fn truth(last_batch_index: u64, covered_through_block: u64) -> L1Truth {
         L1Truth {

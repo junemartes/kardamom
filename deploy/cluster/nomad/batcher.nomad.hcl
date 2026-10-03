@@ -13,10 +13,11 @@
 # from the cursor, and skips blocks L1 already covers. See
 # docs/agents/batcher-live-l1-spec.md.
 #
-# A restart past the sealer's retention reads the gap from the block
-# payload store: the query endpoints of the executors and the validator
-# (--payload-source), which keep every block in the form the batcher
-# posts. Retention is a latency while one state database survives.
+# A restart past the sealer's retention rebuilds the gap: the query
+# endpoints of the executors and the validator (--block-refs-source)
+# serve each block's transaction references, and the tx_data archives
+# serve the bytes through the join-miss refetch. Retention is a latency
+# while one state database and one archive survive.
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
@@ -124,7 +125,7 @@ variable "l1_rpc" {
   default     = "http://anvil.service.consul:8546"
 }
 
-# The query endpoints that serve block payloads: every executor's
+# The query endpoints that serve block references: every executor's
 # (group_vars/all.yml, ports.executor_nonce_query) and the validator's
 # (ports.validator_query), by the records the jobs register.
 variable "executor_query_port" {
@@ -243,9 +244,9 @@ job "batcher" {
             "--da-proxy", var.da_proxy,
             "--cursor-file", "/opt/kardamom/batcher/cursor.json",
             "--spool-dir", "/opt/kardamom/batcher/spool",
-            # The block payload store: the executors' query endpoints by
+            # The block references: the executors' query endpoints by
             # node name, then the validator's by its service record.
-            "--payload-source", join(",", concat(
+            "--block-refs-source", join(",", concat(
               [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
               ["http://kardamom-validator-query.service.${var.datacenter}.consul:${var.validator_query_port}"],
             )),

@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
 use kardamom_engine::reader::cluster::ClusterConfig;
-use kardamom_state::PayloadRetention;
 use kardamom_validator::interop::{
     DEFAULT_FEED_MAX_SUBSCRIPTIONS, DEFAULT_FEED_MAX_SUBSCRIPTIONS_PER_DEST, RetentionBlocks,
 };
@@ -76,17 +75,10 @@ pub(crate) struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     pub(crate) state_durability: StateDurabilityArg,
-    /// How many of the newest blocks keep their payload row in the state
-    /// database. The batcher reads a block from here when the sealer no
-    /// longer retains it, so this bounds the batcher outage the store
-    /// covers: at one block a second, 100 000 blocks is a little over a
-    /// day. The row costs the block's raw transaction bytes.
-    #[arg(long, env = "KARDAMOM_PAYLOAD_RETENTION_BLOCKS", default_value_t = PayloadRetention::DEFAULT)]
-    pub(crate) payload_retention_blocks: PayloadRetention,
     /// Serve read-only state queries on this address: the committed
-    /// nonce, balance and receipt, and the stored block payload
-    /// (`kardamom_getBlockPayload`) the batcher reads when the sealer no
-    /// longer retains a block. The same endpoint as the executor's flag
+    /// nonce, balance and receipt, and a block's transaction references
+    /// (`kardamom_getBlockRefs`) the batcher reads when the sealer no
+    /// longer retains the block. The same endpoint as the executor's flag
     /// of this name. Off when unset.
     #[arg(long, env = "KARDAMOM_NONCE_QUERY_ADDR")]
     pub(crate) nonce_query_addr: Option<std::net::SocketAddr>,

@@ -1,11 +1,18 @@
 //! The spool continuation at start, and the recovery of a gap the sealer
-//! no longer retains from the payload store.
+//! no longer retains, from the references and the archives.
 
 use kardamom_types::BPosition;
 
 use super::*;
 use crate::batch::ClosedBlock;
-use crate::live::payload_store::tests::{FakeStore, stored_row};
+use std::collections::HashMap;
+
+use kardamom_types::TxEnvelope;
+
+use crate::live::rebuild::tests::{archive_of, live_block, refs_of};
+use crate::live::rebuild::{ArchiveLoc, rebuild};
+use crate::live::refs_store::BlockRefs;
+use crate::live::refs_store::tests::FakeStore;
 
 fn block(number: u64, end: i32) -> ClosedBlock {
     ClosedBlock {
@@ -97,12 +104,39 @@ fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
     FeedLoop::new(sender, cfg, spool, restored)
 }
 
+/// A rebuilder over a map of envelopes: the test's archive.
+struct MapRebuilder(HashMap<ArchiveLoc, TxEnvelope>);
+
+impl Rebuilder for MapRebuilder {
+    fn rebuild(mut self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
+        rebuild(blocks, &mut self.0)
+    }
+}
+
+/// The JSON the query endpoint serves for `block`.
+fn block_json(block: &ClosedBlock) -> serde_json::Value {
+    let refs = refs_of(block);
+    serde_json::json!({
+        "block_number": refs.block_number,
+        "end_tx_idx": refs.end_tx_idx,
+        "l1_origin": refs.l1_origin,
+        "l2_timestamp": refs.l2_timestamp,
+        "refs": refs.refs.iter().map(|r| serde_json::json!({
+            "tx_hash": r.tx_hash,
+            "tx_idx": r.tx_idx,
+            "shard_id": r.shard_id,
+            "session_id": r.session_id,
+            "position": r.position,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// The sealer refuses the replay from block 13 and holds block 15 and
-/// after: the store serves 13..=15 into the spool and the group, and
-/// the reader resumes at the end of block 15, a boundary the sealer
-/// holds.
+/// after: the gap 13..=15 is rebuilt from the references and the
+/// archive into the spool and the group, and the reader resumes at the
+/// end of block 15, a boundary the sealer holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_replay_fills_the_gap_from_the_store_and_resumes_at_the_floor() {
+async fn a_refused_replay_rebuilds_the_gap_and_resumes_at_the_floor() {
     let dir = tempfile::tempdir().unwrap();
     let spool = Spool::open(dir.path()).unwrap();
     for n in 11..=12 {
@@ -112,39 +146,57 @@ async fn a_refused_replay_fills_the_gap_from_the_store_and_resumes_at_the_floor(
     }
     let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
     assert_eq!(resume.next_block, 13);
-    let rows = (13..=15)
-        .map(|n| (n, stored_row(&block(n, 100 + i32::try_from(n).unwrap()))))
+    // Blocks 13..=15: two transactions, none, three, ending at 114, 114
+    // and 117.
+    let gap = vec![
+        live_block(13, 114, 2),
+        live_block(14, 114, 0),
+        live_block(15, 117, 3),
+    ];
+    let rows = gap
+        .iter()
+        .map(|b| (b.block_number, block_json(b)))
         .collect();
     let store = FakeStore::serve(rows).await;
     let mut feed = feed_over(spool.clone(), restored);
 
-    let resumed = recover_from_store(&PayloadStore::new(vec![store.url()]), &mut feed, resume, 15)
-        .await
-        .unwrap();
+    let resumed = recover_from_refs(
+        &RefsStore::new(vec![store.url()]),
+        MapRebuilder(archive_of(&gap)),
+        &mut feed,
+        cursor(112, 13),
+        15,
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed.next_block, 16);
-    assert_eq!(resumed.next_index, block(15, 115).end_tx_idx.as_index());
+    assert_eq!(resumed.next_index, 117);
     assert_eq!(feed.skip_through_block(), 15);
     assert_eq!(feed.pending_blocks(), 5);
-    let spooled: Vec<u64> = spool
-        .load()
-        .unwrap()
-        .blocks
-        .iter()
-        .map(|b| b.block_number)
-        .collect();
-    assert_eq!(spooled, vec![11, 12, 13, 14, 15]);
+    let spooled = spool.load().unwrap().blocks;
+    assert_eq!(
+        spooled.iter().map(|b| b.block_number).collect::<Vec<_>>(),
+        vec![11, 12, 13, 14, 15]
+    );
+    assert_eq!(spooled[2..], gap[..]);
 }
 
-/// Without a payload source, a refused replay stays the fail-stop it is
+/// Without a query endpoint, a refused replay stays the fail-stop it is
 /// today, and the error says which setting is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_replay_without_a_store_is_a_fail_stop_that_names_the_setting() {
+async fn a_refused_replay_without_a_source_is_a_fail_stop_that_names_the_setting() {
     let dir = tempfile::tempdir().unwrap();
     let spool = Spool::open(dir.path()).unwrap();
     let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
     let mut feed = feed_over(spool, restored);
-    let err = recover_from_store(&PayloadStore::new(Vec::new()), &mut feed, resume, 15)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("--payload-source"), "{err:#}");
+    let err = recover_from_refs(
+        &RefsStore::new(Vec::new()),
+        MapRebuilder(HashMap::new()),
+        &mut feed,
+        resume,
+        15,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("--block-refs-source"), "{err:#}");
 }
