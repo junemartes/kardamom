@@ -259,7 +259,9 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             Err(ref e @ MonitorError::ChainBreak { .. }) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "chain_break").increment(1);
                 warn!(target: "da_watcher", error = %e, "tick failed (the L1 view is not a chain)");
-                e.halt().map(halt::raise);
+                if let Some(halt) = e.halt() {
+                    halt::raise(halt);
+                }
             }
             Err(
                 ref e @ (MonitorError::Tip(L1SourceError::Decode(_))
@@ -271,7 +273,9 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             Err(e) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
                 warn!(target: "da_watcher", error = %e, "tick failed");
-                e.halt().map(halt::raise);
+                if let Some(halt) = e.halt() {
+                    halt::raise(halt);
+                }
             }
         }
         ControlFlow::Continue(())

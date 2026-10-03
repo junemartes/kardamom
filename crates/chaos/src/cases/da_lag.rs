@@ -17,7 +17,7 @@ use crate::probes::{CLUSTER_TASK, EXECUTOR_BLOCK_METRIC};
 use crate::rpc::{CHAIN_HALTED_CODE, Rpc};
 
 /// The batcher's exporter: on the aux node, bound to every interface.
-pub const BATCHER_PORT: u16 = 9002;
+const BATCHER_PORT: u16 = 9002;
 /// The halt gauge every exporter serves; the ingress raises `da_lag`.
 const HALT_METRIC: &str = "kardamom_halt";
 const DA_LAG_LABEL: &str = "cause=\"da_lag\"";
