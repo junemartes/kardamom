@@ -321,6 +321,7 @@ impl EgressWatermarkFeed {
             let now = Instant::now();
             self.flag(now);
             self.last_boundary_at = Some(now);
+            kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
             self.watermark.store(b.end_tx_idx.as_index());
         }
     }

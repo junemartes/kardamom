@@ -513,22 +513,24 @@ fn log_nonce_floor_sources(cfg: &SequencerConfig) {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    // Ready once the lane has left its startup resync and the cluster
-    // egress has delivered a canonical watermark: the replica publishes
-    // and its twin's dedup window is attached.
-    kardamom_obs::init_service!(
-        "sequencer",
-        args.metrics_addr,
-        args.host_id.as_ref(),
-        kardamom_obs::Readiness::up()
-            .equals(kardamom_sequencer::metrics::RESYNC_MODE, 0.0)
-            .present(kardamom_sequencer::metrics::CANONICAL_WATERMARK)
-    )
-    .await?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
     apply_cli_overrides(&args, &mut cfg)?;
     cfg.validate().context("validate config")?;
+    // Ready while the cluster egress delivered a boundary within the
+    // boundary-silence window: the session is open and the twin's dedup
+    // window is attached. The sealer ticks a boundary on an idle chain
+    // too, so this holds before the first transaction.
+    kardamom_obs::init_service!(
+        "sequencer",
+        args.metrics_addr,
+        args.host_id.as_ref(),
+        kardamom_obs::Readiness::up().fresh(
+            kardamom_sequencer::metrics::LAST_BOUNDARY_UNIX_SECONDS,
+            std::time::Duration::from_millis(cfg.resync.boundary_silence_ms),
+        )
+    )
+    .await?;
     // Contract line for the CI drift check: this must match the cluster
     // JVM's -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
     kardamom_sequencer::metrics::record_start_time();
