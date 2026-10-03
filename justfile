@@ -171,8 +171,10 @@ style:
         fi
     }
     # R11, R2 (too_many_lines at the threshold in clippy.toml), R8 (unreachable_pub).
+    # `assert_is_empty` (pedantic since Rust 1.99) wants `assert_eq!(x, [] as [T; 0])`
+    # in place of `assert!(x.is_empty())`; the typed empty array hides the intent.
     step "clippy pedantic" cargo clippy --workspace --all-targets --all-features --locked -- \
-        -D warnings -W clippy::pedantic -D unreachable_pub
+        -D warnings -W clippy::pedantic -D unreachable_pub -A clippy::assert_is_empty
     step "rustfmt" cargo fmt --all -- --check
     # R9, R13, R6, R11: patterns that a lint cannot express. Test files are exempt.
     forbidden() {
