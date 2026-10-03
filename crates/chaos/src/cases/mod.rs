@@ -10,6 +10,7 @@ use crate::knobs::Knobs;
 
 pub(crate) mod archive;
 pub(crate) mod cache;
+pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod coordinated;

@@ -6,9 +6,15 @@
 //! the budget but runs past the sealer's retention window and a Raft
 //! snapshot, and asserts the sealer still replays from the batcher's
 //! cursor: nothing is pruned below the posted head.
+//!
+//! Both read the chain status of the service events: `da-lag-halt` sees
+//! the sealer halted on `da_lag` as the root and the ingresses paused on
+//! it; `prune-floor` sees the frozen batcher gone and no root. Both end
+//! with every service running again.
 
 use std::time::Duration;
 
+use super::chain_status::ChainView;
 use crate::harness::Harness;
 use crate::metrics::{self, Target};
 use crate::nomad::Streams;
@@ -143,8 +149,10 @@ pub(crate) async fn da_lag_halt(h: &mut Harness) -> anyhow::Result<()> {
         halted.sealed, halted.posted
     ));
     let verdict = assert_halted_chain(h, ctx, &halted).await;
+    let roots = assert_root_and_pauses(h, ctx).await;
     frozen.thaw(h, ctx).await;
     verdict?;
+    roots?;
 
     let resumed = await_halt(h, ctx, budget, false).await?;
     let posted = frozen.posted(h).await.unwrap_or(0);
@@ -158,7 +166,59 @@ pub(crate) async fn da_lag_halt(h: &mut Harness) -> anyhow::Result<()> {
     rpc.transfer_at(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: a transfer after the resume failed: {e:#}"))?;
+    await_all_running(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(2)).await
+}
+
+/// While halted, the chain status names the sealer halted on `da_lag` as
+/// the root, and the ingresses paused on it: one root, its dependents
+/// paused, not halted.
+async fn assert_root_and_pauses(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    let view = ChainView::await_until(
+        h,
+        &format!("{ctx}: the sealer as the da_lag root, the ingresses paused on it"),
+        Duration::from_secs(30),
+        |v| {
+            let paused = v.paused_on("ingress");
+            v.roots().contains(&("sealer".to_string(), "da_lag".to_string()))
+                && !paused.is_empty()
+                && paused.iter().all(|cause| cause == "da_lag")
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        view.states_of("ingress").iter().all(|s| s != "halted"),
+        "{ctx}: an ingress is halted, not paused: {view}"
+    );
+    crate::log(format!(
+        "{ctx}: chain status: roots {:?}, ingresses paused on {:?}",
+        view.roots(),
+        view.paused_on("ingress")
+    ));
+    Ok(())
+}
+
+/// After the thaw, no root stands, nothing is paused, and the main
+/// services run again.
+async fn await_all_running(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    let view = ChainView::await_until(
+        h,
+        &format!("{ctx}: every service running again"),
+        Duration::from_mins(2),
+        |v| {
+            v.settled()
+                && ["ingress", "sequencer", "executor", "batcher"]
+                    .iter()
+                    .all(|service| v.all_running(service))
+        },
+    )
+    .await?;
+    crate::log(format!(
+        "{ctx}: chain status settled: ingress {:?}, batcher {:?}",
+        view.states_of("ingress"),
+        view.states_of("batcher")
+    ));
+    Ok(())
 }
 
 /// Wait until the ingress reports the halt flag `halted`, within the
@@ -253,8 +313,18 @@ pub(crate) async fn prune_floor(h: &mut Harness) -> anyhow::Result<()> {
     let frozen = FrozenBatcher::freeze(h, ctx).await?;
 
     let stretched = await_stretched(h, ctx, retention, snapshots_before).await;
+    let frozen_view = ChainView::read(h).await;
     frozen.thaw(h, ctx).await;
     let stretched = stretched?;
+    let frozen_view = frozen_view?;
+    anyhow::ensure!(
+        frozen_view.states_of("batcher").iter().any(|s| s == "gone"),
+        "{ctx}: the frozen batcher is not gone in the chain status: {frozen_view}"
+    );
+    anyhow::ensure!(
+        frozen_view.roots().is_empty(),
+        "{ctx}: a root stands under the budget: {frozen_view}"
+    );
     anyhow::ensure!(
         stretched.floor <= before.posted.saturating_add(1),
         "{ctx}: the replay floor {} passed the posted head {}",
@@ -299,6 +369,7 @@ pub(crate) async fn prune_floor(h: &mut Harness) -> anyhow::Result<()> {
         refusals - refusals_before
     );
     assert_contiguous_posts(h, ctx).await?;
+    await_all_running(h, ctx).await?;
     h.assert_executor_progress(Duration::from_mins(2)).await
 }
 

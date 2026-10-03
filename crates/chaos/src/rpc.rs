@@ -139,6 +139,16 @@ impl Rpc {
         .map(|_| ())
     }
 
+    /// The ingress's chain status: the heads, the roots, and every
+    /// service's latest state on the `events` stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub async fn chain_status(&self) -> anyhow::Result<serde_json::Value> {
+        self.call("kardamom_chainStatus", serde_json::json!([])).await
+    }
+
     /// The next nonce of genesis account `account`, from the latest
     /// block the ingress serves.
     ///
