@@ -182,7 +182,7 @@ impl Rig {
     /// Panics if the refs mutex is poisoned.
     #[must_use]
     pub fn refs(&self) -> Vec<TxRef> {
-        self.refs.refs.lock().unwrap().clone()
+        self.refs.refs()
     }
 
     /// A cloned snapshot of every offer published so far, guard header

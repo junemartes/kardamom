@@ -993,7 +993,10 @@ impl Sequencer {
     where
         R: TxErrorPublisher,
     {
-        let mut publishes = Vec::new();
+        // Sized exactly: every action is a publish on the in-order path,
+        // and a vector that starts at four slots would allocate four
+        // records per transaction.
+        let mut publishes = Vec::with_capacity(actions.len());
         for action in actions {
             self.collect_one_action(rc, sender, action, &mut publishes);
         }

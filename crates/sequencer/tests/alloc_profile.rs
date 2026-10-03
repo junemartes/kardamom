@@ -115,11 +115,11 @@ fn sequencer_core_loop_allocation_profile() {
         warmup_total,
         "warmup must publish exactly one ref per envelope"
     );
-    // Pre-reserve the fake publisher's ref vector. This stops its growth
+    // Pre-reserve the fake publisher's offer vector. This stops its growth
     // doubling from affecting the measured counts. The real publisher holds
     // no such vector.
     rig.refs
-        .refs
+        .offers
         .lock()
         .unwrap()
         .reserve(measured_total as usize + 16);

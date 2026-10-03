@@ -144,13 +144,14 @@ pub mod fakes {
 
     use super::{RefOffer, SequencerError, TxError, TxErrorPublisher, TxOrderingRefPublisher};
 
-    /// In-memory `tx_ordering` publisher. Records every published `TxRef`,
+    /// In-memory `tx_ordering` publisher. Records every published offer,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
     /// can check the canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
-        pub refs: Arc<Mutex<Vec<TxRef>>>,
-        /// Every published offer whole, guard header included.
+        /// Every published offer whole, guard header included. One vector
+        /// holds the whole record: the allocation harness reserves it,
+        /// so the fake costs the measured loop nothing.
         pub offers: Arc<Mutex<Vec<RefOffer>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
@@ -162,7 +163,6 @@ pub mod fakes {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.refs.lock().unwrap().push(offer.tx_ref);
             self.offers.lock().unwrap().push(*offer);
             Ok(())
         }
@@ -184,6 +184,23 @@ pub mod fakes {
             }
             self.remote_epochs.lock().unwrap().push(r.clone());
             Ok(())
+        }
+    }
+
+    impl InMemoryTxOrderingRefPublisher {
+        /// The `TxRef` of every published offer, in arrival order.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the offers mutex is poisoned.
+        #[must_use]
+        pub fn refs(&self) -> Vec<TxRef> {
+            self.offers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|o| o.tx_ref)
+                .collect()
         }
     }
 
@@ -227,7 +244,7 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         p.try_publish_ref(&offer(0)).unwrap();
         p.try_publish_ref(&offer(1)).unwrap();
-        assert_eq!(p.refs.lock().unwrap().len(), 2);
+        assert_eq!(p.refs().len(), 2);
     }
 
     #[test]
