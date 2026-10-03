@@ -63,6 +63,13 @@ runs on a dedicated thread inside every service (`kardamom_obs::init`), so
 "wedged but alive" reads as `kardamom_service_up == 1` with stale gauges,
 not as node loss.
 
+Beside `/metrics`, the exporter serves `/ready` (the service's readiness
+rule over its own gauges) and `/halt` (the service's standing halt as JSON:
+the cause, the detail, the runbook, and whether it clears by itself). A
+halted service exports `kardamom_halt{cause, recovery} == 1`, and
+`POST /halt/clear` from the service's own node ends an operator halt. See
+the "Halts" section of `docs/failure-modes.md` and `docs/runbooks/`.
+
 Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
 `local`). It's
 stamped on every emitted metric as the `host_id` label, alongside an automatic
