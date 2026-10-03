@@ -245,7 +245,7 @@ mod tests {
         assert!(div.is_halted());
         assert!(div.reason().unwrap().contains("outbox extraction failed"));
         let msgs = store.from_seq(412_347, 0).msgs;
-        assert!(msgs.is_empty(), "a diverging block must never be served");
+        assert_eq!(msgs.len(), 0, "a diverging block must never be served");
     }
 
     #[test]
@@ -287,7 +287,7 @@ mod tests {
         }
         // Retention 2, head 8: the block-1 message aged out.
         let scan = store.from_seq(412_347, 0);
-        assert!(scan.msgs.is_empty());
+        assert_eq!(scan.msgs.len(), 0);
         assert_eq!(scan.floor_seq, LaneFloor::Known(1));
     }
 }

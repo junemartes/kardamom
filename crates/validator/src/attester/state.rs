@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(st.leaves_through(8), vec![l(1), l(2), l(3), l(4)]);
         st.mark_attested(8);
         assert_eq!(st.last_attested(), 8);
-        assert!(st.leaves_through(8).is_empty());
+        assert_eq!(st.leaves_through(8).len(), 0);
         assert!(!st.due(11));
         assert!(st.due(12));
 
@@ -235,7 +235,7 @@ mod tests {
         let mut st = AttestState::new(0, nz(1));
 
         // Root for block 4 arrives first: posted with nothing.
-        assert!(st.leaves_through(4).is_empty());
+        assert_eq!(st.leaves_through(4).len(), 0);
         st.mark_attested(4);
 
         // Block 4's leaves show up late. They belong to an output already
@@ -243,7 +243,7 @@ mod tests {
         st.on_leaves(4, vec![l(1)]);
         assert_eq!(st.leaves_through(5), vec![l(1)]);
         st.mark_attested(5);
-        assert!(st.leaves_through(9).is_empty());
+        assert_eq!(st.leaves_through(9).len(), 0);
     }
 
     /// This is the invariant the whole design rests on: a block's root is
@@ -320,14 +320,14 @@ mod tests {
         // Resuming: the oracle says blocks through 10 are already attested.
         let mut st = AttestState::new(10, nz(1));
         st.on_leaves(6, vec![l(1)]);
-        assert!(st.leaves_through(20).is_empty(), "no own floor yet ⇒ drop");
+        assert_eq!(st.leaves_through(20).len(), 0, "no own floor yet ⇒ drop");
 
         // Attest block 12; our own coverage starts at 11.
         st.on_leaves(12, vec![l(2)]);
         st.mark_attested(12);
         // Still below our floor, so still dropped.
         st.on_leaves(9, vec![l(3)]);
-        assert!(st.leaves_through(20).is_empty());
+        assert_eq!(st.leaves_through(20).len(), 0);
         // At or above our floor, so carried.
         st.on_leaves(11, vec![l(4)]);
         assert_eq!(st.leaves_through(20), vec![l(4)]);

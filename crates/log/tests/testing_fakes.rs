@@ -54,7 +54,7 @@ fn fake_fsync_watermark_stream_per_recorder() {
 
     assert_eq!(stream.drain(0).len(), 2);
     assert_eq!(stream.drain(1).len(), 1);
-    assert!(stream.drain(2).is_empty());
+    assert_eq!(stream.drain(2).len(), 0);
 }
 
 // ---------------------------------------------------------------------------

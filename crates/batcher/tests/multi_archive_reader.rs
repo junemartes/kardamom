@@ -351,7 +351,7 @@ fn parse_a_spec_rejects_missing_separator() {
 #[test]
 fn parse_a_spec_empty_returns_empty() {
     let parsed = MultiArchiveConfig::parse_a_spec("").unwrap();
-    assert!(parsed.is_empty());
+    assert_eq!(parsed.len(), 0);
     let parsed = MultiArchiveConfig::parse_a_spec("  , ,  ").unwrap();
-    assert!(parsed.is_empty());
+    assert_eq!(parsed.len(), 0);
 }

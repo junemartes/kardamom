@@ -209,9 +209,9 @@ mod tests {
         assert_eq!(l.len(), 0);
         // Confirmed entries' queue slots were lazily deleted along the
         // way. A second sweep finds nothing.
-        assert!(
-            l.sweep_expired(Duration::ZERO, Instant::now(), 256)
-                .is_empty()
+        assert_eq!(
+            l.sweep_expired(Duration::ZERO, Instant::now(), 256).len(),
+            0
         );
     }
 
@@ -266,7 +266,7 @@ mod tests {
         // so the caller's reinsert loop leaves the rewind floor there.
         assert_eq!(taken, vec![((a, 8), 8), ((a, 7), 7), ((a, 6), 6)]);
         assert_eq!(l.len(), 2);
-        assert!(l.take_gap_rewinds(a, 6).is_empty());
+        assert_eq!(l.take_gap_rewinds(a, 6).len(), 0);
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
             l.record_published(a, n, n);
         }
         // Nothing is stale under a large timeout.
-        assert!(l.sweep_expired(Duration::from_hours(1), t0, 256).is_empty());
+        assert_eq!(l.sweep_expired(Duration::from_hours(1), t0, 256).len(), 0);
         assert_eq!(l.len(), 5);
         // All entries are past the timeout, but the per-call bound caps
         // the sweep at `max` (oldest first off the queue). The remainder

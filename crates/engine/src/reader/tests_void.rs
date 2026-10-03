@@ -177,7 +177,7 @@ fn a_consumer_that_is_no_voter_stops_as_before() {
     let (mut reader, _rx) = reader(sub, JoinBuffer::new(), ReaderConfig::default());
     let err = reader.on_unjoinable(&tx_ref(LOST, 10), pos(0)).err();
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
-    assert!(votes.lock().unwrap().is_empty());
+    assert_eq!(votes.lock().unwrap().len(), 0);
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn a_wait_that_ends_with_no_void_record_stops_the_reader() {
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
     // The vote went out before the wait ended: the sealer keeps it.
     assert_eq!(votes.lock().unwrap().len(), 1);
-    assert!(slots(&rx).is_empty());
+    assert_eq!(slots(&rx).len(), 0);
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn a_void_record_for_another_entry_does_not_end_the_wait() {
         .on_unjoinable(&tx_ref(LOST, 10), pos(0))
         .expect("closed");
     assert!(matches!(flow, Flow::Stop));
-    assert!(slots(&rx).is_empty());
+    assert_eq!(slots(&rx).len(), 0);
 }
 
 #[test]

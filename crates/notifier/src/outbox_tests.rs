@@ -62,7 +62,7 @@ fn truncate_only_when_nothing_was_appended_since() {
     w.append(&OutboxRecord::new(2, 20, &event(2))).unwrap();
     assert!(!w.truncate_if_len(len).unwrap());
     assert!(w.truncate_if_len(w.len()).unwrap());
-    assert!(w.is_empty());
+    assert_eq!(w.len(), 0);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 }
 

@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(tx.value, 0);
         assert_eq!(tx.gas_limit, 21_000);
         assert_eq!(tx.gas_price, 0);
-        assert!(tx.input.is_empty());
+        assert_eq!(tx.input.len(), 0);
         assert_eq!(tx.correlation_id, 0);
     }
 

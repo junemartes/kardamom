@@ -514,8 +514,8 @@ mod tests {
         let spool = Spool::open(dir.path()).unwrap();
         spool.append(&block(20, 0)).unwrap();
         let (restored, resume) = continue_from_spool(&spool, cursor(90, 11), 10).unwrap();
-        assert!(restored.blocks.is_empty());
+        assert_eq!(restored.blocks.len(), 0);
         assert_eq!(resume, cursor(90, 11));
-        assert!(spool.load().unwrap().blocks.is_empty());
+        assert_eq!(spool.load().unwrap().blocks.len(), 0);
     }
 }

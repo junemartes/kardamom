@@ -127,7 +127,7 @@ fn xchain_nonzero_value_is_a_failed_receipt_not_an_error() {
     assert!(!receipt.status);
     assert_eq!(receipt.gas_used, 0);
     assert_eq!(receipt.cumulative_gas_used, 40);
-    assert!(receipt.logs.is_empty());
+    assert_eq!(receipt.logs, []);
     assert_eq!(receipt.skip_reason, Some(SkipReason::OtherTransaction));
     assert_eq!(receipt.tx_hash, m.source_hash);
     assert_eq!(ws, WriteSet::default(), "no state change");
@@ -256,7 +256,7 @@ fn xchain_validation_failure_is_a_failed_receipt_on_both_paths() {
     assert_eq!(receipt.gas_used, 0);
     assert_eq!(receipt.cumulative_gas_used, 55);
     assert_eq!(receipt.skip_reason, Some(SkipReason::GasLimit));
-    assert!(receipt.logs.is_empty());
+    assert_eq!(receipt.logs, []);
     assert_eq!(ws, WriteSet::default());
 
     let env = ExecEnv::new(1, &boundary(1));
@@ -274,8 +274,8 @@ fn xchain_validation_failure_is_a_failed_receipt_on_both_paths() {
         .expect("failed receipt");
     assert_eq!(new_r, receipt);
     assert_eq!(new_ws, ws);
-    assert!(old_bal.into_alloy_bal().is_empty());
-    assert!(new_bal.into_alloy_bal().is_empty());
+    assert_eq!(old_bal.into_alloy_bal().len(), 0);
+    assert_eq!(new_bal.into_alloy_bal().len(), 0);
 }
 
 /// Run one `old_and_new_xchain_paths_agree` case: both delivery paths

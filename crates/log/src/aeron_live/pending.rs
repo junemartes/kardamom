@@ -364,7 +364,7 @@ mod drain_pending_tests {
         let mut q = VecDeque::from([p]);
         // Offer always succeeds with a stream position.
         drain_pending_inner(&mut q, now, |_| delivered(64));
-        assert!(q.is_empty(), "delivered frame must be removed");
+        assert_eq!(q.len(), 0, "delivered frame must be removed");
         match rx.try_recv() {
             Ok(Ok(_pos)) => {}
             other => panic!("expected an Ok position ack, got {other:?}"),
@@ -387,7 +387,7 @@ mod drain_pending_tests {
 
         // Next iteration the subscriber has drained — now it delivers.
         drain_pending_inner(&mut q, now, |_| delivered(0));
-        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
         assert!(matches!(rx.try_recv(), Ok(Ok(_))));
     }
 
@@ -454,7 +454,7 @@ mod drain_pending_tests {
         drain_pending_inner(&mut q, now, |_| {
             OfferResult::Status(-1 /* NOT_CONNECTED */)
         });
-        assert!(q.is_empty(), "expired frame must be dropped");
+        assert_eq!(q.len(), 0, "expired frame must be dropped");
         match rx.try_recv() {
             Ok(Err(LogError::Aeron(m))) => {
                 assert!(
@@ -521,7 +521,7 @@ mod drain_pending_tests {
         let (p, rx) = pending(9, 0xAA, now, 5_000);
         let mut q = VecDeque::from([p]);
         drain_pending_inner(&mut q, now, |_| OfferResult::UnknownPub);
-        assert!(q.is_empty(), "unknown-pub frame must not be retried");
+        assert_eq!(q.len(), 0, "unknown-pub frame must not be retried");
         match rx.try_recv() {
             Ok(Err(LogError::Aeron(m))) => assert!(m.contains("unknown pub_id")),
             other => panic!("expected unknown-pub error, got {other:?}"),

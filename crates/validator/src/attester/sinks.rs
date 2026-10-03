@@ -198,6 +198,6 @@ mod tests {
         let mut foreign = message_passed_log(0, Address::ZERO, Address::ZERO, 1);
         foreign.address = Address::from([0xff; 20]); // This is not the predeploy.
         let receipt = receipt_with_logs(vec![foreign]);
-        assert!(receipt_withdrawal_leaves(&receipt).is_empty());
+        assert_eq!(receipt_withdrawal_leaves(&receipt).len(), 0);
     }
 }

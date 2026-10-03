@@ -316,7 +316,7 @@ fn rebuffered_entry_does_not_expire() {
     let t0 = Instant::now();
     st.process_at(t0, s(1), 0, 100);
     st.reinsert_for_retry(s(1), 0, 100);
-    assert!(st.sweep_expired(t0 + TTL * 10, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL * 10, 256).len(), 0);
     assert_eq!(st.drain_pending(), vec![(s(1), 0, 100)]);
 }
 
@@ -334,7 +334,7 @@ fn a_parked_run_that_was_rebuffered_keeps_no_stale_deadline() {
     for (n, p) in [(2u64, 2u32), (1, 1), (0, 0)] {
         st.reinsert_for_retry(s(1), n, p);
     }
-    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL, 256).len(), 0);
     let drained: Vec<u64> = st.drain_pending().into_iter().map(|(_, n, _)| n).collect();
     assert_eq!(drained, vec![0, 1, 2]);
 }
@@ -347,7 +347,7 @@ fn an_entry_at_the_expected_nonce_never_expires() {
     let t0 = Instant::now();
     st.process_at(t0, s(1), 5, 55);
     assert_eq!(st.advance_floor(s(1), 5), Some((0, 0)));
-    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL, 256).len(), 0);
     assert_eq!(st.drain_pending(), vec![(s(1), 5, 55)]);
 }
 
@@ -361,7 +361,7 @@ fn a_replaced_entry_takes_the_new_deadline() {
         st.process_at(t0 + later, s(1), 5, 56).outcome,
         NonceOutcome::BufferedReplaced
     );
-    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL, 256).len(), 0);
     assert_eq!(st.sweep_expired(t0 + TTL + later, 256), vec![(s(1), 5, 56)]);
 }
 
@@ -373,7 +373,7 @@ fn a_floor_dropped_entry_leaves_only_a_stale_deadline() {
     let t0 = Instant::now();
     st.process_at(t0, s(1), 5, 55);
     assert_eq!(st.advance_floor(s(1), 8), Some((0, 1)));
-    assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL, 256).len(), 0);
 }
 
 #[test]
@@ -386,5 +386,5 @@ fn sweep_is_bounded_per_call() {
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 2);
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 1);
-    assert!(st.sweep_expired(t0 + TTL, 2).is_empty());
+    assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 0);
 }

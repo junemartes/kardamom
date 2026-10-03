@@ -141,7 +141,7 @@ mod tests {
     fn blocks_round_trip_in_order_and_clear_through_a_post() {
         let dir = tempfile::tempdir().unwrap();
         let spool = Spool::open(dir.path()).unwrap();
-        assert!(spool.load().unwrap().blocks.is_empty());
+        assert_eq!(spool.load().unwrap().blocks.len(), 0);
         for n in [12, 10, 11] {
             spool.append(&block(n)).unwrap();
         }

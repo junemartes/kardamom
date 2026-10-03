@@ -70,7 +70,7 @@ fn defi_workload_executes_on_the_engine() {
     for d in &dep.txs {
         let (r, ws) = assert_one_ok(run(d, addr0, &mut delta), "deploy failed");
         assert!(r.contract_address.is_some());
-        assert!(!ws.code.is_empty(), "deploy must write code");
+        assert_ne!(ws.code.len(), 0, "deploy must write code");
         deploy_gas += r.gas_used;
     }
     assert!(
@@ -89,7 +89,7 @@ fn defi_workload_executes_on_the_engine() {
             run(tx, sender, &mut delta),
             format!("op reverted (sender {si} nonce {})", tx.nonce),
         );
-        assert!(!ws.accounts.is_empty());
+        assert_ne!(ws.accounts.len(), 0);
         op_gas.push(r.gas_used);
     }
 

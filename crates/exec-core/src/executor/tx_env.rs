@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(te.gas_price, 42);
         assert_eq!(te.gas_priority_fee, None);
         assert!(te.access_list.iter().next().is_none());
-        assert!(te.authorization_list.is_empty());
+        assert_eq!(te.authorization_list, []);
     }
 
     #[test]

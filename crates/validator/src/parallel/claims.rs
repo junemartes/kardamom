@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(s.storage.get(&(addr(1), slot(9))), Some(&U256::from(70)));
         // A range with no writes claims nothing for that slot.
         let s = idx.claims_in_range(2, 3);
-        assert!(s.storage.is_empty());
+        assert_eq!(s.storage.len(), 0);
     }
 
     #[test]

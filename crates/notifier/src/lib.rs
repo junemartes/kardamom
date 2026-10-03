@@ -27,6 +27,11 @@
 //!   outbox, and the instance sharding.
 //! - [`server`]: the one listener for both client surfaces.
 
+// The `#[rpc]` subscription methods expand to functions that carry a bare
+// `#[must_use]` and return a pinned boxed future, which is `#[must_use]` on
+// its own. The lint fires in the macro's output, so it is allowed here.
+#![allow(clippy::double_must_use)]
+
 pub mod delivery;
 pub mod dto;
 pub mod feed;

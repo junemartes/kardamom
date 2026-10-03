@@ -69,7 +69,7 @@ async fn seed_call_returns_zero_and_advances_cursor() {
     let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
     assert_eq!(w.cursor(), Some(100));
-    assert!(pub_.published.lock().unwrap().is_empty());
+    assert_eq!(pub_.published.lock().unwrap().len(), 0);
 }
 
 /// The upgrade transaction rides the deposit path end to end: the same
@@ -157,7 +157,7 @@ async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
         "epochs are emitted in L1 order with no gaps"
     );
     assert_eq!(v[0].deposits.len(), 2);
-    assert!(v[1].deposits.is_empty(), "block 152 had no deposits");
+    assert_eq!(v[1].deposits.len(), 0, "block 152 had no deposits");
     assert_eq!(v[2].deposits.len(), 1);
 
     // Deposit content is derived, not passed through: the sender is
@@ -297,7 +297,7 @@ async fn log_disagreeing_with_the_block_hash_is_rejected() {
 
     assert!(matches!(err, MonitorError::Derive(_)));
     assert_eq!(w.cursor(), Some(150), "cursor must not pass a bad epoch");
-    assert!(pub_.published.lock().unwrap().is_empty());
+    assert_eq!(pub_.published.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]

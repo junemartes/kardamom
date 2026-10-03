@@ -358,7 +358,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
     };
     let dep = deployment_txs(&signers, plan_params).unwrap();
     let queues = pregenerate_defi(&signers, &dep.contracts, 120, plan_params).unwrap();
-    assert!(!queues.is_empty(), "SENDERS must be at least 1");
+    assert_ne!(queues.len(), 0, "SENDERS must be at least 1");
 
     // Block 1 is setup. The accumulated write sets become the parent
     // layer for the repro blocks.

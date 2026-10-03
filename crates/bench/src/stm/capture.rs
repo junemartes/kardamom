@@ -203,7 +203,7 @@ mod tests {
         let mut all = blocks.setup;
         all.extend(blocks.flows);
         let obs = run_capture(&snap, &all, CHAIN_ID).expect("capture run succeeds");
-        assert!(!obs.is_empty(), "capture produced no observations");
+        assert_ne!(obs.len(), 0, "capture produced no observations");
         assert!(
             obs.iter().all(|o| o.gas > 0),
             "every transaction must execute against the state the prior block left, not revert"

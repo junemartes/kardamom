@@ -135,7 +135,7 @@ fn deep_compare_identical_dbs_is_empty_and_divergent_is_not() {
     build_db(b.path());
     let ea = open(a.path());
     let eb = open(b.path());
-    assert!(deep_compare(&ea, &eb).unwrap().is_empty());
+    assert_eq!(deep_compare(&ea, &eb).unwrap().len(), 0);
     drop(eb);
     // Change one account balance in b.
     {
@@ -227,8 +227,8 @@ fn a_bounded_compare_tolerates_one_empty_tail_block_only() {
     append_block_3(b.path(), false);
     let ea = open(a.path());
     let eb = open(b.path());
-    assert!(!deep_compare(&ea, &eb).unwrap().is_empty());
-    assert!(deep_compare_to(&ea, &eb, 2).unwrap().is_empty());
+    assert_ne!(deep_compare(&ea, &eb).unwrap().len(), 0);
+    assert_eq!(deep_compare_to(&ea, &eb, 2).unwrap().len(), 0);
     drop(eb);
     let c = tempfile::tempdir().unwrap();
     build_db(c.path());

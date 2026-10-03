@@ -56,7 +56,7 @@ fn back_to_back_boundaries_emit_empty_blocks() {
         l1_origin: 0,
     });
     assert_eq!(next.block_number, 2);
-    assert!(next.txs.is_empty());
+    assert_eq!(next.txs.len(), 0);
 }
 
 #[test]

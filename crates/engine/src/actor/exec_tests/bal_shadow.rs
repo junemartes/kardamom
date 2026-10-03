@@ -107,7 +107,7 @@ fn exec_hands_off_shadow_captures_at_boundary() {
             c.write_cells
                 .contains(&kardamom_footprint::Cell::Account(to))
         );
-        assert!(c.touches.slot_reads.is_empty(), "transfers read no slots");
+        assert_eq!(c.touches.slot_reads.len(), 0, "transfers read no slots");
         assert!(c.gas_used > 0, "capture {i} carries gas");
     }
     assert!(srx.try_recv().is_err(), "exactly one block");

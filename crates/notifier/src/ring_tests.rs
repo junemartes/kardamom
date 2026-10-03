@@ -79,7 +79,10 @@ fn a_sealed_before_an_offered_joins_the_sender_later() {
         panic!("sealed stored");
     };
     assert_eq!(sealed.event.sender, None);
-    assert!(stages(&r, &StatusFilter::Sender { sender: sender(3) }).is_empty());
+    assert_eq!(
+        stages(&r, &StatusFilter::Sender { sender: sender(3) }).len(),
+        0
+    );
     r.insert(&TxStatus::offered(h, sender(3), 0), now);
     // The sender index now covers the earlier sealed event too.
     assert_eq!(
@@ -104,9 +107,10 @@ fn replay_pages_by_sequence_number() {
     assert_eq!(second.first().unwrap().seq, last + 1);
     let rest = r.replay(&StatusFilter::all(), second.last().unwrap().seq, 4);
     assert_eq!(rest.len(), 2, "a short page is the last one");
-    assert!(
+    assert_eq!(
         r.replay(&StatusFilter::all(), rest.last().unwrap().seq, 4)
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -120,7 +124,10 @@ fn eviction_by_count_drops_the_oldest_and_its_indexes() {
     assert_eq!(r.evict(now), 2);
     assert_eq!(r.len(), 3);
     assert_eq!(r.transactions(), 3);
-    assert!(stages(&r, &StatusFilter::TxHash { tx_hash: hash(0) }).is_empty());
+    assert_eq!(
+        stages(&r, &StatusFilter::TxHash { tx_hash: hash(0) }).len(),
+        0
+    );
     assert_eq!(r.resolve(sender(0), 0), None);
     assert_eq!(r.resolve(sender(4), 0), Some(hash(4)));
     // A replay from before the ring starts at its oldest event.

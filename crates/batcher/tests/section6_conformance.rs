@@ -73,7 +73,7 @@ fn drive_batcher_pipeline(archives: &MPlusOneArchives, cfg: &BatcherConfig) -> P
     let posted = batcher.sender().sent[0].clone();
     assert_eq!(posted.l2_block_start, 42);
     assert_eq!(posted.l2_block_end, 42);
-    assert!(!posted.payload.is_empty(), "batch must carry a payload");
+    assert_ne!(posted.payload.len(), 0, "batch must carry a payload");
     posted
 }
 

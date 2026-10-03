@@ -164,8 +164,8 @@ fn roundtrip_remote_epochs_multi_message_record() {
     let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
     assert_eq!(reconstructed[1].remote_epochs, blocks[1].remote_epochs);
-    assert!(reconstructed[0].remote_epochs.is_empty());
-    assert!(reconstructed[2].remote_epochs.is_empty());
+    assert_eq!(reconstructed[0].remote_epochs.len(), 0);
+    assert_eq!(reconstructed[2].remote_epochs.len(), 0);
 }
 
 /// A record whose messages carry the Outbox's `MAX_DATA_BYTES` calldata
@@ -281,7 +281,7 @@ fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
 
     // Block 1 closes with no interop traffic.
     let b1 = acc.observe_boundary(&boundary(1));
-    assert!(b1.remote_epochs.is_empty());
+    assert_eq!(b1.remote_epochs.len(), 0);
 
     // A record leads block 2: observed right after boundary 1, before the
     // block's txs.
@@ -295,7 +295,7 @@ fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
 
     // Drained: block 3 carries none.
     let b3 = acc.observe_boundary(&boundary(3));
-    assert!(b3.remote_epochs.is_empty());
+    assert_eq!(b3.remote_epochs.len(), 0);
 }
 
 /// The recovery path reads a batch's payload by its certificate from the

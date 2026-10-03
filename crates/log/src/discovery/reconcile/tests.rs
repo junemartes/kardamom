@@ -72,7 +72,7 @@ fn new_members_attach_and_a_second_snapshot_is_idempotent() {
     let now = Instant::now();
     let plan = r.plan(&m, now);
     assert_eq!(plan.attach, vec![uri(41000), uri(41001)]);
-    assert!(plan.detach.is_empty());
+    assert_eq!(plan.detach.len(), 0);
     r.apply(&plan, &port, &m);
     assert_eq!(r.attached(), vec![uri(41000), uri(41001)]);
 
@@ -95,7 +95,7 @@ fn a_missing_member_detaches_only_after_the_grace() {
 
     let only_a = membership(6, vec![publisher("a", 41000)]);
     let early = r.plan(&only_a, t0 + Duration::from_secs(1));
-    assert!(early.detach.is_empty(), "inside the grace nothing detaches");
+    assert_eq!(early.detach.len(), 0, "inside the grace nothing detaches");
 
     let late = r.plan(&only_a, t0 + GRACE + Duration::from_secs(1));
     assert_eq!(late.detach, vec![uri(41001)]);
@@ -158,7 +158,7 @@ fn a_failed_attach_is_retried_on_the_next_snapshot() {
     let now = Instant::now();
     let plan = r.plan(&m, now);
     r.apply(&plan, &port, &m);
-    assert!(r.attached().is_empty(), "a failed attach is not recorded");
+    assert_eq!(r.attached().len(), 0, "a failed attach is not recorded");
     let retry = r.plan(&m, now);
     assert_eq!(retry.attach, vec![uri(41000)]);
 }
@@ -197,10 +197,9 @@ fn an_outage_during_removal_grace_requires_fresh_confirmation() {
     let initial = r.plan(&present, t0);
     r.apply(&initial, &port, &present);
     let missing = membership(6, vec![]);
-    assert!(
-        r.plan(&missing, t0 + Duration::from_secs(1))
-            .detach
-            .is_empty()
+    assert_eq!(
+        r.plan(&missing, t0 + Duration::from_secs(1)).detach.len(),
+        0
     );
     let mut degraded = missing.clone();
     degraded.health = CatalogHealth::Degraded {
@@ -208,7 +207,7 @@ fn an_outage_during_removal_grace_requires_fresh_confirmation() {
     };
     assert_eq!(r.plan(&degraded, t0 + GRACE * 2), Plan::default());
     assert_eq!(r.attached(), vec![uri(41000)]);
-    assert!(r.plan(&missing, t0 + GRACE * 3).detach.is_empty());
+    assert_eq!(r.plan(&missing, t0 + GRACE * 3).detach.len(), 0);
     assert_eq!(r.plan(&missing, t0 + GRACE * 4).detach, vec![uri(41000)]);
 }
 

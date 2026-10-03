@@ -577,7 +577,7 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async { tokio::time::sleep(Duration::from_millis(50)).await });
         join_submit_tasks(&mut tasks, Instant::now() + Duration::from_secs(5)).await;
-        assert!(tasks.is_empty());
+        assert_eq!(tasks.len(), 0);
     }
 
     #[tokio::test]

@@ -79,7 +79,7 @@ fn empty_epoch_is_valid_and_must_still_exist() {
     // emitted. So deriving one is explicitly not an error.
     let block = B256::repeat_byte(0x33);
     let e = derive_epoch(12, block, &[]).unwrap();
-    assert!(e.deposits.is_empty());
+    assert_eq!(e.deposits, []);
     assert_eq!(e.l1_number, 12);
     assert_eq!(e.l1_hash, block);
 }

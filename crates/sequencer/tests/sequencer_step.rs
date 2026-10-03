@@ -23,7 +23,7 @@ fn match_publishes_ref() {
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].shard_id, 0);
     assert_eq!(refs[0].tx_data_position, pos(0));
-    assert!(rig.errors().is_empty());
+    assert_eq!(rig.errors().len(), 0);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn parked_future_nonce_expires_with_an_explicit_error() {
     let mut seq = Sequencer::new(cfg).unwrap();
 
     rig.step(&mut seq).unwrap();
-    assert!(rig.errors().is_empty(), "no error before tx_ttl");
+    assert_eq!(rig.errors().len(), 0, "no error before tx_ttl");
 
     std::thread::sleep(std::time::Duration::from_millis(40));
     rig.step(&mut seq).unwrap();
@@ -99,7 +99,7 @@ fn parked_future_nonce_expires_with_an_explicit_error() {
         errors[0].reason,
         kardamom_sequencer::TxErrorReason::Expired { expected_nonce: 0 }
     );
-    assert!(rig.refs().is_empty(), "an expired entry never publishes");
+    assert_eq!(rig.refs().len(), 0, "an expired entry never publishes");
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
             matches!(r, Err(kardamom_sequencer::SequencerError::Backpressure)),
             "backpressured pass must surface Backpressure, got {r:?}"
         );
-        assert!(rig.refs().is_empty(), "nothing accepted yet");
+        assert_eq!(rig.refs().len(), 0, "nothing accepted yet");
     }
 
     // The publisher recovers. The ref publishes from drain-pending, with

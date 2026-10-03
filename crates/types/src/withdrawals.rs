@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(withdrawals_root(&[]), B256::ZERO);
         let l = leaf(0);
         assert_eq!(withdrawals_root(&[l]), hash_leaf(l));
-        assert!(withdrawal_proof(&[l], 0).is_empty());
+        assert_eq!(withdrawal_proof(&[l], 0), Vec::<B256>::new());
     }
 
     #[test]
