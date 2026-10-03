@@ -91,7 +91,7 @@ fn a_rebuilt_range_packs_to_the_live_bytes() {
         live_block(13, 15, 3),
     ];
     let mut archive = archive_of(&live);
-    let rebuilt = rebuild(live.iter().map(refs_of).collect(), &mut archive).unwrap();
+    let rebuilt = rebuild(&live.iter().map(refs_of).collect::<Vec<_>>(), &mut archive).unwrap();
     assert_eq!(rebuilt, live);
     let cfg = BatcherConfig {
         compress: false,
@@ -114,7 +114,7 @@ fn an_envelope_not_served_is_named() {
     let mut archive = archive_of(&live);
     let lost = live[0].txs[1].envelope.tx_hash;
     archive.retain(|_, env| env.tx_hash != lost);
-    let err = rebuild(live.iter().map(refs_of).collect(), &mut archive).unwrap_err();
+    let err = rebuild(&live.iter().map(refs_of).collect::<Vec<_>>(), &mut archive).unwrap_err();
     let text = format!("{err:#}");
     assert!(
         text.contains(&format!("{lost}")) && text.contains("block 11"),
@@ -133,7 +133,7 @@ fn an_envelope_that_does_not_hash_to_its_reference_is_refused() {
         .values_mut()
         .filter(|env| env.tx_hash == forged)
         .for_each(|env| env.raw_tx = Bytes::from_static(b"not those bytes"));
-    let err = rebuild(live.iter().map(refs_of).collect(), &mut archive).unwrap_err();
+    let err = rebuild(&live.iter().map(refs_of).collect::<Vec<_>>(), &mut archive).unwrap_err();
     assert!(
         format!("{err:#}").contains("whose bytes hash to"),
         "{err:#}"
@@ -144,6 +144,6 @@ fn an_envelope_that_does_not_hash_to_its_reference_is_refused() {
         .values_mut()
         .filter(|env| env.tx_hash == forged)
         .for_each(|env| env.tx_hash = B256::repeat_byte(0xEE));
-    let err = rebuild(live.iter().map(refs_of).collect(), &mut archive).unwrap_err();
+    let err = rebuild(&live.iter().map(refs_of).collect::<Vec<_>>(), &mut archive).unwrap_err();
     assert!(format!("{err:#}").contains("with hash"), "{err:#}");
 }

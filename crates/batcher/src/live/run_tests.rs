@@ -109,7 +109,7 @@ struct MapRebuilder(HashMap<ArchiveLoc, TxEnvelope>);
 
 impl Rebuilder for MapRebuilder {
     fn rebuild(mut self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
-        rebuild(blocks, &mut self.0)
+        rebuild(&blocks, &mut self.0)
     }
 }
 

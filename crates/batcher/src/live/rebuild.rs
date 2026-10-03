@@ -91,12 +91,16 @@ impl ArchiveEnvelopes {
         }
     }
 
-    /// Fetch one session's wanted locations, replay by replay.
-    fn fetch_session(&mut self, fetch: &mut SessionFetch<'_>) -> Result<()> {
+    /// Fetch one session's wanted locations, replay by replay: the
+    /// envelopes found.
+    fn fetch_session(
+        &mut self,
+        mut fetch: SessionFetch<'_>,
+    ) -> Result<HashMap<ArchiveLoc, TxEnvelope>> {
         while let Some(from) = fetch.lowest_missing() {
-            self.replay_from(fetch, from)?;
+            self.replay_from(&mut fetch, from)?;
         }
-        Ok(())
+        Ok(fetch.found)
     }
 
     /// One replay from `from`: the wanted locations it delivers land in
@@ -152,9 +156,8 @@ impl EnvelopeSource for ArchiveEnvelopes {
             Self::group(&mut sessions, loc);
         }
         let mut all = HashMap::new();
-        for mut fetch in sessions {
-            self.fetch_session(&mut fetch)?;
-            all.extend(fetch.found);
+        for fetch in sessions {
+            all.extend(self.fetch_session(fetch)?);
         }
         Ok(all)
     }
@@ -200,7 +203,7 @@ pub(crate) struct ArchiveRebuilder {
 
 impl Rebuilder for ArchiveRebuilder {
     fn rebuild(self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
-        rebuild(blocks, &mut ArchiveEnvelopes::new(self.factory))
+        rebuild(&blocks, &mut ArchiveEnvelopes::new(self.factory))
     }
 }
 
@@ -214,7 +217,7 @@ impl Rebuilder for ArchiveRebuilder {
 /// Returns an error when the source does not serve a reference, or when
 /// an envelope does not hash to its reference.
 pub(crate) fn rebuild<E: EnvelopeSource>(
-    blocks: Vec<BlockRefs>,
+    blocks: &[BlockRefs],
     source: &mut E,
 ) -> Result<Vec<ClosedBlock>> {
     let wanted: BTreeSet<ArchiveLoc> = blocks
@@ -223,7 +226,7 @@ pub(crate) fn rebuild<E: EnvelopeSource>(
         .collect();
     let found = source.fetch(&wanted)?;
     let closed = blocks
-        .into_iter()
+        .iter()
         .map(|block| close(block, &found))
         .collect::<Result<Vec<_>>>()?;
     info!(
@@ -237,7 +240,7 @@ pub(crate) fn rebuild<E: EnvelopeSource>(
 /// Close one block: its boundary from the references, its transactions
 /// from the envelopes. A block rebuilt this way carries no remote-epoch
 /// record; the query endpoint refuses a block that had one.
-fn close(block: BlockRefs, found: &HashMap<ArchiveLoc, TxEnvelope>) -> Result<ClosedBlock> {
+fn close(block: &BlockRefs, found: &HashMap<ArchiveLoc, TxEnvelope>) -> Result<ClosedBlock> {
     let txs = block
         .refs
         .iter()
