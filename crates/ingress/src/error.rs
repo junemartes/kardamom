@@ -72,19 +72,24 @@ pub enum IngressError {
     /// failed.
     #[error("account state unavailable: {0}")]
     StateUnavailable(String),
-    /// The chain is halted on a DA lag: the sealed head is more than the
-    /// budget past the last block posted to L1, so the sealer refuses new
-    /// transactions until the batcher posts again. The `/halt` route on
-    /// the metrics port names the cause and the runbook.
+    /// The ingress pauses submits on a root halt upstream: the sealer
+    /// (a DA lag or a lost quorum), or every executor. The message and
+    /// the data name the root's service, its cause, and its runbook; the
+    /// pause ends by itself when the root clears.
     #[error(
-        "chain halted: DA lag (sealed head {sealed_head}, posted head {posted_head}, budget \
-         {budget_blocks} blocks); cause and recovery at /halt — resubmit after the batcher posts"
+        "chain halted: {} at {} ({detail}); the ingress pauses submits until it clears; \
+         cause and recovery at /halt and kardamom_chainStatus, runbook {}",
+        .root.cause.id(),
+        .root.service,
+        .root.cause.recovery().runbook()
     )]
     ChainHalted {
-        sealed_head: u64,
-        posted_head: u64,
-        budget_blocks: u64,
+        root: kardamom_types::service::HaltRef,
+        detail: String,
     },
+    /// An operator paused this ingress, for example for maintenance.
+    #[error("ingress paused by an operator ({note}); resubmit after the operator resumes it")]
+    OperatorPaused { note: String },
 }
 
 /// The JSON-RPC error code of a halted chain. Its own code, so a client
@@ -93,6 +98,22 @@ pub enum IngressError {
 pub const CHAIN_HALTED_CODE: i32 = -32010;
 
 impl IngressError {
+    /// The sealer refused a record on its DA-lag guard: the chain is
+    /// halted on `da_lag`, and the sealer is the root.
+    #[must_use]
+    pub fn da_lag(sealed_head: u64, posted_head: u64, budget_blocks: u64) -> Self {
+        Self::ChainHalted {
+            root: kardamom_types::service::HaltRef {
+                service: crate::chain::SEALER.to_string(),
+                instance: crate::chain::SEALER_INSTANCE.to_string(),
+                cause: kardamom_types::service::HaltCause::DaLag,
+            },
+            detail: format!(
+                "sealed head {sealed_head}, posted head {posted_head}, budget {budget_blocks} blocks"
+            ),
+        }
+    }
+
     /// Builds an `Internal` error from a context label and the
     /// underlying error's `Display`. The many `.map_err(|e|
     /// IngressError::Internal(format!("...: {e}")))` call sites across
@@ -129,15 +150,23 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
-            IngressError::ChainHalted { .. } => CHAIN_HALTED_CODE,
+            IngressError::ChainHalted { .. } | IngressError::OperatorPaused { .. } => {
+                CHAIN_HALTED_CODE
+            }
         };
         let data = match &err {
             // The typed cause, so a client finds the record and the
             // runbook without parsing the message.
-            IngressError::ChainHalted { .. } => Some(serde_json::json!({
-                "cause": "da_lag",
+            IngressError::ChainHalted { root, .. } => Some(serde_json::json!({
+                "cause": root.cause.id(),
+                "root_service": root.service,
+                "root_instance": root.instance,
                 "halt": "/halt",
-                "runbook": "docs/runbooks/da_lag.md",
+                "runbook": root.cause.recovery().runbook(),
+            })),
+            IngressError::OperatorPaused { .. } => Some(serde_json::json!({
+                "cause": "operator",
+                "halt": "/halt",
             })),
             _ => None,
         };
@@ -187,23 +216,27 @@ mod tests {
     }
 
     #[test]
-    fn chain_halted_has_its_own_code_and_names_the_halt_route() {
-        let rpc: ErrorObjectOwned = IngressError::ChainHalted {
-            sealed_head: 160,
-            posted_head: 100,
-            budget_blocks: 50,
-        }
-        .into();
+    fn chain_halted_has_its_own_code_and_names_the_root() {
+        let rpc: ErrorObjectOwned = IngressError::da_lag(160, 100, 50).into();
         assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
         assert!(
-            rpc.message().starts_with("chain halted: DA lag"),
+            rpc.message().starts_with("chain halted: da_lag at sealer (sealed head 160"),
             "{}",
             rpc.message()
         );
         assert!(rpc.message().contains("/halt"), "{}", rpc.message());
+        assert!(rpc.message().contains("docs/runbooks/da_lag.md"), "{}", rpc.message());
         let data = rpc.data().expect("the typed cause").get();
         assert!(data.contains("\"cause\":\"da_lag\""), "{data}");
+        assert!(data.contains("\"root_service\":\"sealer\""), "{data}");
         assert!(data.contains("docs/runbooks/da_lag.md"), "{data}");
+
+        let rpc: ErrorObjectOwned = IngressError::OperatorPaused {
+            note: "disk swap".into(),
+        }
+        .into();
+        assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
+        assert!(rpc.message().contains("disk swap"), "{}", rpc.message());
     }
 
     #[test]

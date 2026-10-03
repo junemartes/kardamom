@@ -1,7 +1,9 @@
 //! The DA-lag guard at the ingress: the `safe` and `finalized` tags
-//! follow the posted head of the cluster's status, a halted status refuses
-//! a submit with the typed error and raises the `da_lag` halt, and a
-//! status that says the sealer accepts again clears it.
+//! follow the posted head of the cluster's status. A halted status halts
+//! the sealer (as the ingress observes it) on `da_lag`, pauses the
+//! ingress on that root, and refuses a submit with the typed error; the
+//! chain status shows the root and the pause. A status that says the
+//! sealer accepts again clears the halt and resumes the ingress.
 
 use std::time::Duration;
 
@@ -12,16 +14,17 @@ use jsonrpsee::rpc_params;
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::CHAIN_HALTED_CODE;
 use kardamom_ingress::test_support::{http_client, sign_legacy, start_test_server};
-use kardamom_obs::halt::{self, HaltCause};
+use kardamom_obs::halt::{HaltCause, PauseReason};
+use kardamom_obs::lifecycle::process;
 use kardamom_types::ClusterStatus;
 
-/// Wait until the halt watcher mirrored the last status.
-async fn wait_halted(halted: bool) {
+/// Wait until the chain watch paused (or resumed) the ingress.
+async fn wait_paused(paused: bool) {
     kardamom_obs::testkit::poll_until(
-        "the ingress halt mirrors the cluster status",
+        "the ingress pause follows the cluster status",
         Duration::from_secs(5),
         Duration::from_millis(20),
-        async || Ok((halt::current().is_some() == halted).then_some(())),
+        async || Ok((process().slots().pause.is_some() == paused).then_some(())),
     )
     .await
     .unwrap();
@@ -70,21 +73,34 @@ async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
         .unwrap_err();
     assert!(err.to_string().contains("not served"), "{err}");
 
-    // The sealer refuses new transactions: the submit is refused here
-    // with the typed error, and the ingress halts on `da_lag`.
+    // The sealer refuses new transactions: the sealer halts on `da_lag`,
+    // the ingress pauses on it, and the submit is refused with the typed
+    // error that names the root.
     server.mock.cluster_status_bus.send_replace(ClusterStatus {
         sealed_head: 20,
         halted: true,
         ..posted
     });
-    wait_halted(true).await;
-    let standing = halt::current().unwrap();
-    assert_eq!(standing.cause, HaltCause::DaLag);
+    wait_paused(true).await;
+    let pause = process().slots().pause.unwrap();
+    let PauseReason::Upstream(root) = pause.reason else {
+        panic!("an upstream pause, not {pause:?}");
+    };
+    assert_eq!((root.service.as_str(), root.cause), ("sealer", HaltCause::DaLag));
+    assert!(process().slots().halt.is_none(), "the ingress is paused, not halted");
+    let status: serde_json::Value = client
+        .request("kardamom_chainStatus", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(status["sealer"]["state"], "halted");
+    assert_eq!(status["sealer"]["cause"], "da_lag");
     assert!(
-        standing.detail.contains("sealed head 20"),
-        "{}",
-        standing.detail
+        status["sealer"]["detail"].as_str().unwrap().contains("sealed head 20"),
+        "{status}"
     );
+    assert_eq!(status["roots"][0]["service"], "sealer");
+    assert_eq!(status["ingress"]["state"], "paused");
+    assert_eq!(status["ingress"]["pause"]["root"]["cause"], "da_lag");
     let signer = PrivateKeySigner::random();
     let err = client
         .request::<alloy_primitives::B256, _>(
@@ -94,19 +110,26 @@ async fn the_tags_follow_the_posted_head_and_a_halt_refuses_submits() {
         .await
         .unwrap_err();
     let text = err.to_string();
-    assert!(text.contains("chain halted: DA lag"), "{text}");
+    assert!(text.contains("chain halted: da_lag at sealer"), "{text}");
+    assert!(text.contains("docs/runbooks/da_lag.md"), "{text}");
     assert!(text.contains("/halt"), "{text}");
     assert!(text.contains(&CHAIN_HALTED_CODE.to_string()), "{text}");
 
-    // The batcher posted: the sealer accepts again, the halt clears, and
-    // a submit is published.
+    // The batcher posted: the sealer accepts again, the halt clears, the
+    // ingress resumes, and a submit is published.
     server.mock.cluster_status_bus.send_replace(ClusterStatus {
         posted_head: 19,
         sealed_head: 20,
         halted: false,
         ..posted
     });
-    wait_halted(false).await;
+    wait_paused(false).await;
+    let status: serde_json::Value = client
+        .request("kardamom_chainStatus", rpc_params![])
+        .await
+        .unwrap();
+    assert_eq!(status["sealer"]["state"], "running");
+    assert_eq!(status["roots"].as_array().unwrap().len(), 0);
     let hash: alloy_primitives::B256 = client
         .request(
             "kardamom_sendRawTransactionAsync",

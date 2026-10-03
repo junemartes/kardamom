@@ -115,6 +115,13 @@ pub trait IngressKardamomApi {
     /// client that cannot accept a revert waits for `safe`.
     #[method(name = "blockNumberByTag")]
     async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256>;
+
+    /// The chain status: the posted and sealed heads, the DA-lag budget,
+    /// the roots (the live halts every pause waits on), the sealer as
+    /// this ingress observes it, this ingress's own state, and the latest
+    /// state of every service on the `events` stream.
+    #[method(name = "chainStatus")]
+    async fn chain_status(&self) -> RpcResult<serde_json::Value>;
 }
 
 pub(crate) struct IngressHandlers<Backend: ProxyBackend> {
@@ -181,6 +188,10 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
             .submit_raw_async(client_ip(), bytes)
             .await
             .map_err(ErrorObjectOwned::from)
+    }
+
+    async fn chain_status(&self) -> RpcResult<serde_json::Value> {
+        Ok(self.proxy.chain_status())
     }
 
     async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256> {

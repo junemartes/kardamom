@@ -422,11 +422,7 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             sealed_head,
             posted_head,
             budget_blocks,
-        } => IngressError::ChainHalted {
-            sealed_head: *sealed_head,
-            posted_head: *posted_head,
-            budget_blocks: *budget_blocks,
-        },
+        } => IngressError::da_lag(*sealed_head, *posted_head, *budget_blocks),
     }
 }
 

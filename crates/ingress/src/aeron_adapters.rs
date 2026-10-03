@@ -14,9 +14,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
+use kardamom_obs::events::BoardView;
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, ServiceEventsSubscriberHandle,
+    TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsReceiver,
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_types::{
@@ -214,16 +216,19 @@ pub struct LiveIngressSubscription {
     /// The latest cluster status, fed by the binary's egress observer
     /// like the watermark bus.
     cluster_status: watch::Sender<ClusterStatus>,
+    /// The board of every service's latest state, fed by the `events`
+    /// subscription.
+    service_board: watch::Receiver<BoardView>,
 }
 
 impl LiveIngressSubscription {
-    /// Open the four subscriber handles through `plane`: `tx_errors`,
-    /// receipts, and boundaries follow the plane's transport; the fsync
-    /// watermark still opens on its static channel.
+    /// Open the five subscriber handles through `plane`: `tx_errors`,
+    /// receipts, boundaries, and `events` follow the plane's transport;
+    /// the fsync watermark still opens on its static channel.
     ///
     /// # Errors
     ///
-    /// Returns `IngressError::Internal` if any of the four subscriber
+    /// Returns `IngressError::Internal` if any of the five subscriber
     /// handles fails to open.
     pub fn open(
         rt: &AeronRuntime,
@@ -289,6 +294,12 @@ impl LiveIngressSubscription {
             .map_err(|e| IngressError::internal("open tx_errors", e))?;
         Pump::new(errors_sub, tx_errors_tx.clone()).spawn();
 
+        // This is the events stream to the board of service states.
+        let service_board = plane
+            .subscriber::<ServiceEventsSubscriberHandle>(rt)
+            .map_err(|e| IngressError::internal("open events", e))?
+            .spawn_board();
+
         Ok(Self {
             receipts: receipts_tx,
             live,
@@ -297,6 +308,7 @@ impl LiveIngressSubscription {
             block_boundaries: block_boundaries_tx,
             tx_errors: tx_errors_tx,
             cluster_status: cluster_status_tx,
+            service_board,
         })
     }
 
@@ -339,6 +351,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn cluster_status(&self) -> watch::Receiver<ClusterStatus> {
         self.cluster_status.subscribe()
+    }
+    fn service_board(&self) -> watch::Receiver<BoardView> {
+        self.service_board.clone()
     }
 }
 
