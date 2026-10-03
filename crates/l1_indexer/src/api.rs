@@ -7,12 +7,18 @@
 //! - `indexer_batch(index) -> BatchEntry | null`
 //! - `indexer_payload(daCert) -> 0x-hex payload | null`
 //! - `indexer_epoch(l1Block) -> 0x-hex rkyv EpochRecord | null`
+//! - `indexer_halt() -> the process's lifecycle record`: its state, its
+//!   halt, its pause. The indexer has no Aeron runtime on the `events`
+//!   stream, so a tool that reads from it asks here, and refuses a
+//!   halted indexer.
 
 use std::net::SocketAddr;
 
 use alloy_primitives::Bytes;
 use jsonrpsee::server::{RpcModule, Server, ServerHandle};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
+
+use kardamom_obs::lifecycle::process;
 
 use crate::store::Store;
 use crate::{BatchEntry, Cursor, IndexerError};
@@ -90,6 +96,35 @@ impl Api {
                 },
             )
             .map_err(api_error)?;
+        module
+            .register_method("indexer_halt", |_, _, _| -> serde_json::Value {
+                kardamom_obs::halt::to_json("l1-indexer", &process().slots())
+            })
+            .map_err(api_error)?;
         Ok(module)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kardamom_obs::halt::{Halt, HaltCause};
+
+    use super::{Api, process};
+    use crate::store::Store;
+
+    /// The rebuild tool reads this record and refuses a halted indexer.
+    #[tokio::test]
+    async fn the_halt_method_serves_the_lifecycle_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = Api::new(Store::open(dir.path()).unwrap()).module().unwrap();
+        let running: serde_json::Value = module.call("indexer_halt", [(); 0]).await.unwrap();
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["service"], "l1-indexer");
+
+        process().raise(Halt::new(HaltCause::L1ChainBreak, "block 7"));
+        let halted: serde_json::Value = module.call("indexer_halt", [(); 0]).await.unwrap();
+        assert_eq!(halted["state"], "halted");
+        assert_eq!(halted["runbook"], "docs/runbooks/l1_chain_break.md");
+        process().clear();
     }
 }
