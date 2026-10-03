@@ -102,6 +102,73 @@ The rolling-deploys spec's `/ready` routes fail on a halted follower and on a ba
 has not posted within its budget, so a deploy stops at the first halted service instead of
 restarting the rest against the same fault.
 
+### 3.6 Every halt is a state with a cause and a recovery
+
+A service that cannot continue safely halts: it stops making progress, keeps its state
+intact, keeps serving its metrics and its query endpoints, fails its readiness check, and
+says why and what to do. It does not exit, because an exit loses the cause and invites a
+restart against the same fault. The halt is one shared type in `kardamom_obs`:
+
+```
+Halt {
+    cause:    HaltCause,      // a stable id: l1_source_disagreement, l1_chain_break,
+                              // replay_unavailable, da_lag, validator_divergence, ...
+    detail:   String,         // the numbers: the block, the two hashes, the cursor and the floor
+    recovery: RecoveryId,     // names docs/runbooks/<id>.md: the steps, in order
+    since:    Timestamp,
+    clears:   Auto | Operator // whether the service resumes by itself when the cause goes
+}
+```
+
+What it drives:
+
+- the gauge `kardamom_halt{service, cause, recovery}` = 1 while halted, and a `/halt`
+  route beside `/metrics` and `/ready` that serves the whole record as JSON;
+- one Alertmanager rule per cause, whose annotation carries the cause, the detail and the
+  runbook link; the alert text is the recovery procedure, not a metric name;
+- `clears = Auto` halts resume on their own when the cause clears (an L1 source comes
+  back, the floor is reachable again); `Operator` halts resume on `kardamom-admin clear
+  <service>` after the runbook's steps, as the validator's verdict does.
+
+The runbooks live in `docs/runbooks/`, one per `RecoveryId`, and a test asserts every
+`RecoveryId` has one. The chaos cases assert the halt record, not only the log line.
+
+### 3.7 The sealer halts before the chain becomes unrecoverable
+
+The two-day loss happened because the sealer kept sealing while nothing posted. The
+sealer gains a DA-lag guard: the batcher publishes its confirmed cursor (the last L2 block
+on L1) on the cluster's ingress as a system record; the sealer refuses new transactions
+when the sealed head is more than `da_lag_budget` blocks past that cursor, and the ingress
+answers them with a typed error (`chain halted: DA lag; cause and recovery at /halt`).
+Deposits and boundaries continue, so the chain's L1 view stays current. The budget sits
+well inside what the payload store and the retention keep, so a halt of this kind is
+always inside the recoverable set. When the batcher posts again, the sealer resumes by
+itself (`clears = Auto`).
+
+The budget is a chain value with a deploy default (`DA_LAG_BUDGET_BLOCKS`, 10,000: about
+three hours at one block a second). A chain that would rather stay live and risk the loss
+sets it to zero to turn the guard off; that is a choice, made in the open.
+
+### 3.8 The fork: revert to the posted head as the last resort
+
+The rollup answer to lost unposted blocks is a fork: the canonical chain is what L1
+derives, everything past the last posted block is unsafe, and on loss the chain reverts to
+the posted head. Kardamom has the pieces: the recovery lines of
+`docs/specs/2026-09-07-recovery-lines-and-l1-rollback.md` define a consistent cut and the
+L1 rollback; a rebuild from L1 gives the state at the posted head; the sealer's resume
+checks refuse a cursor that does not name a point of the stream.
+
+It is the last resort and not the first, because it revokes receipts: every transaction in
+the reverted range was confirmed to its sender and is undone. On the staging incident
+that is 38,000 blocks. So the order is: 3.7 halts the chain while everything is still
+recoverable; 3.1 recovers the range from a surviving copy; the revert runs only when no
+copy survives, with the operator's word, through the recovery-line procedure, and it is a
+chaos case so the procedure is proven and timed.
+
+Clients see the distinction today only through receipts. The ingress gains the `safe` and
+`finalized` block tags: `safe` is the last block posted to L1, `finalized` the last block
+whose batch L1 finalized. A client that cannot accept a revert waits for `safe`.
+
 ## 4. The chaos cases
 
 All run on the container cluster, in a new shard `chaos-l1` (the retention knobs of the
@@ -118,6 +185,8 @@ faults the incident showed: `NullReceipts`, `SwallowLogs` for an address, `RateL
 | `l1-null-receipts` | the proxy answers null receipts and empty logs for the settlement while serving blocks | same as above; in addition the batcher's resume after a restart reads `l2BlockEnd` from the contract and continues, with no wait on the indexer |
 | `batcher-outage-past-retention` | SIGSTOP the batcher; load until the sealer's floor passes its cursor and a snapshot lands; thaw. Then repeat with the spool wiped | the batcher recovers the range from the spool, then from an executor's payload store; L1's record is contiguous (`l2BlockStart == previous l2BlockEnd + 1` for every batch); the rebuild stage proves root parity through the recovered range |
 | `two-day-outage` | the incident's order: liar at T0; batcher restart at T1; a deploy of the same images at T2; floor passes at T3; fault cleared at T4 | no manual step; the batcher is posting again within one flush after T4; the alert fired before T1; the record is contiguous; rebuild parity holds |
+| `da-lag-halt` | the batcher frozen with SIGSTOP; load until the sealed head passes `da_lag_budget` past the posted head | the sealer halts new transactions with the typed error; deposits still land; `kardamom_halt{cause="da_lag"}` is 1 with the runbook id; the batcher thaws, posts, and the sealer resumes with no operator step |
+| `revert-to-posted-head` | the batcher frozen past the retention floor, the spool and every payload store wiped (the unrecoverable case) | the services halt with `replay_unavailable` and the runbook id; the operator procedure of 3.8 (scripted in the case) reverts the chain to the posted head; the rebuilt state matches L1; the chain seals again from there; the revoked receipts are listed |
 
 Each case ends with the shard's persisted-state stage (rebuild-from-L1 against the
 validator's root), so a silent gap in the record fails the shard.
@@ -134,6 +203,9 @@ renders and validates.
 | 3 | two L1 sources with cross-check and rotation (3.2) in the follower crates | `l1-liar`'s "keeps posting" assertion |
 | 4 | the block payload store, the query method, the batcher's third resume source (3.1) | `batcher-outage-past-retention` |
 | 5 | `two-day-outage` composite; failure-modes.md updated; the known gap "L1 outage" closed | the shard green on two runs |
+| 6 | the halt contract (3.6): the type, the gauge, the `/halt` route, the runbooks, the rules; every existing fail-stop (validator verdict, batcher resume, indexer chain break, da-watcher) becomes a halt | a test that every `RecoveryId` has a runbook; the chaos cases assert the halt record |
+| 7 | the DA-lag guard (3.7) and the `safe`/`finalized` tags | `da-lag-halt` |
+| 8 | the revert procedure (3.8) scripted and timed | `revert-to-posted-head` |
 
 Steps 1 and 2 land first: they turn the incident into a red test. Steps 3 and 4 make it
 green. Step 5 proves the combination.
@@ -147,6 +219,10 @@ green. Step 5 proves the combination.
 - A lie is never outvoted by public endpoints. Two sources agreeing is the bar; the light
   client is the tie-breaker inside its window.
 - The batcher never waits on the indexer. The contract is the truth for the cursor.
+- A halt is a state, never an exit. Every halt names its cause and its runbook, in the
+  alert text.
+- The chain halts before it can lose a block it has confirmed. A fork to the posted head
+  is the last resort, gated by the operator, and proven by a chaos case.
 
 ## 7. Open questions
 
