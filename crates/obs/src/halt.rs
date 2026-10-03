@@ -272,10 +272,15 @@ pub fn raise(halt: Halt) {
     });
 }
 
-/// Clear the standing halt, and return it. `None` when none stood.
+/// Clear the standing halt, and return it. `None` when none stood, and
+/// then the watchers are not woken: a follower calls this on every good
+/// tick.
 pub fn clear() -> Option<Halt> {
     let mut cleared = None;
-    STATE.send_modify(|standing| cleared = standing.take());
+    STATE.send_if_modified(|standing| {
+        cleared = standing.take();
+        cleared.is_some()
+    });
     if let Some(halt) = &cleared {
         halt.set_gauge(0.0);
         tracing::info!(cause = halt.cause.id(), "halt cleared; the service resumes");
