@@ -218,6 +218,8 @@ pub struct Sequencer {
     /// The resize warm-up, while one is in progress.
     shadow: Option<ShadowWindow>,
     depth: DepthReport,
+    /// While closed, the loop offers nothing. See [`crate::pause_gate`].
+    pause: crate::pause_gate::PauseGate,
 }
 
 impl Sequencer {
@@ -253,7 +255,14 @@ impl Sequencer {
             vslots,
             shadow,
             depth,
+            pause: crate::pause_gate::PauseGate::default(),
         })
+    }
+
+    /// Offer nothing while `slots` holds a pause: the process lifecycle
+    /// in the binary.
+    pub fn enable_pause(&mut self, slots: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>) {
+        self.pause = crate::pause_gate::PauseGate::new(slots);
     }
 
     /// The virtual slots this replica serves.
@@ -783,6 +792,9 @@ impl Sequencer {
         self.resync_tick(ports);
         let (channel_a, b, rc) = ports.split();
         self.expiry_tick(rc);
+        if self.pause.paused() {
+            return Ok(false);
+        }
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {

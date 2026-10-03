@@ -34,6 +34,12 @@ pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// How long a record stays live without a heartbeat: three heartbeats.
 pub const EXPIRY: Duration = Duration::from_secs(15);
 
+/// How long a cluster session may see no boundary before its holder
+/// calls the sealer halted on a lost quorum. The sealer emits a boundary
+/// on every tick (2 s in the deploy), so this is five ticks: longer than
+/// a leader election.
+pub const SEALER_SILENCE: Duration = Duration::from_secs(10);
+
 /// How long the board keeps a gone record, so the chain status shows
 /// what died.
 const FORGET: Duration = Duration::from_mins(5);

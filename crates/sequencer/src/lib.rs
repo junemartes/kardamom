@@ -41,6 +41,7 @@ pub mod metrics;
 mod nonce_decode;
 pub mod outbound;
 pub mod partition;
+mod pause_gate;
 pub(crate) mod pending;
 pub mod pump;
 pub mod remote_epoch;

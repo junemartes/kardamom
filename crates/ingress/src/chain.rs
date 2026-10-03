@@ -23,9 +23,9 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 /// The service name the ingress publishes the sealer's state under.
-pub const SEALER: &str = "sealer";
+pub const SEALER: &str = HaltRef::SEALER;
 /// The instance name of the sealer's state: the cluster as a whole.
-pub const SEALER_INSTANCE: &str = "cluster";
+pub const SEALER_INSTANCE: &str = HaltRef::SEALER_INSTANCE;
 /// The service name of the executors on the stream.
 pub const EXECUTOR: &str = "executor";
 /// The service name of the da-watcher on the stream.
@@ -35,8 +35,8 @@ pub const BATCHER: &str = "batcher";
 
 /// How long the cluster may send no status frame before the ingress
 /// calls the sealer halted on a lost quorum. The sealer sends one on
-/// every boundary tick (2 s in the deploy), so this is five ticks.
-pub const SEALER_SILENCE: Duration = Duration::from_secs(10);
+/// every boundary tick.
+pub use kardamom_obs::events::SEALER_SILENCE;
 
 /// How often the watch checks the silence and the board when nothing
 /// arrives.
@@ -145,11 +145,7 @@ impl ChainWatch {
 
     /// The sealer's halt as a root.
     pub(crate) fn sealer_root(sealer: &Slots) -> Option<HaltRef> {
-        sealer.halt.as_ref().map(|halt| HaltRef {
-            service: SEALER.to_string(),
-            instance: SEALER_INSTANCE.to_string(),
-            cause: halt.cause,
-        })
+        sealer.halt.as_ref().map(|halt| HaltRef::sealer(halt.cause))
     }
 }
 

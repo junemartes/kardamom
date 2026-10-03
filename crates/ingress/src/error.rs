@@ -103,11 +103,9 @@ impl IngressError {
     #[must_use]
     pub fn da_lag(sealed_head: u64, posted_head: u64, budget_blocks: u64) -> Self {
         Self::ChainHalted {
-            root: kardamom_types::service::HaltRef {
-                service: crate::chain::SEALER.to_string(),
-                instance: crate::chain::SEALER_INSTANCE.to_string(),
-                cause: kardamom_types::service::HaltCause::DaLag,
-            },
+            root: kardamom_types::service::HaltRef::sealer(
+                kardamom_types::service::HaltCause::DaLag,
+            ),
             detail: format!(
                 "sealed head {sealed_head}, posted head {posted_head}, budget {budget_blocks} blocks"
             ),

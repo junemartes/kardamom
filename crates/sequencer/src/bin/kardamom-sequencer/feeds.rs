@@ -39,6 +39,9 @@ use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
+use kardamom_obs::events::SEALER_SILENCE;
+use kardamom_obs::halt::{HaltCause, HaltRef};
+use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::pump::{OriginLane, Pump};
@@ -126,6 +129,10 @@ pub(crate) struct EgressWatermarkFeed {
     /// condition persists, `flag`'s re-arm repeats the flag once per
     /// silence window: a bounded, genuinely alarming heartbeat.
     last_boundary_at: Option<Instant>,
+    /// When the last boundary arrived, never re-armed. Past
+    /// [`SEALER_SILENCE`] the replica pauses on the sealer's lost quorum;
+    /// the next boundary resumes it.
+    last_boundary_seen: Instant,
 }
 
 impl EgressWatermarkFeed {
@@ -143,6 +150,7 @@ impl EgressWatermarkFeed {
             deadline_tx,
             reject_tx,
             last_boundary_at: Some(Instant::now()),
+            last_boundary_seen: Instant::now(),
         }
     }
 
@@ -173,7 +181,18 @@ impl EgressWatermarkFeed {
     /// could be a partition from egress, or a dead cluster boundary
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
-        self.flag(Instant::now());
+        let now = Instant::now();
+        self.flag(now);
+        self.pause_on_silence(now);
+    }
+
+    /// Pause the replica on the sealer's lost quorum once no boundary
+    /// arrived for [`SEALER_SILENCE`]. A frame that is not a boundary
+    /// does not end the silence.
+    fn pause_on_silence(&self, now: Instant) {
+        if now.saturating_duration_since(self.last_boundary_seen) >= SEALER_SILENCE {
+            process().follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
+        }
     }
 
     fn on_frame(&mut self, frame: &[u8]) {
@@ -372,6 +391,8 @@ impl EgressWatermarkFeed {
             let now = Instant::now();
             self.flag(now);
             self.last_boundary_at = Some(now);
+            self.last_boundary_seen = now;
+            process().follow(None);
             self.watermark.store(b.end_tx_idx.as_index());
         }
     }
@@ -797,6 +818,7 @@ where
             if let Some(requester) = lookup {
                 sequencer.enable_nonce_lookup(requester);
             }
+            sequencer.enable_pause(process().subscribe());
             let mut ports = Ports {
                 tx_data: &mut tx_data,
                 refs: &mut main_pub,

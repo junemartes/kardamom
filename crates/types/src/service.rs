@@ -220,6 +220,30 @@ pub struct HaltRef {
     pub cause: HaltCause,
 }
 
+impl HaltRef {
+    /// The service name of the sealer's state. The sealer has no Rust
+    /// runtime on the stream; the ingress observes it and publishes it.
+    pub const SEALER: &'static str = "sealer";
+    /// The instance name of the sealer's state: the cluster as a whole.
+    pub const SEALER_INSTANCE: &'static str = "cluster";
+
+    /// The sealer halted on `cause`.
+    #[must_use]
+    pub fn sealer(cause: HaltCause) -> Self {
+        Self {
+            service: Self::SEALER.into(),
+            instance: Self::SEALER_INSTANCE.into(),
+            cause,
+        }
+    }
+
+    /// Whether this root is the sealer.
+    #[must_use]
+    pub fn is_sealer(&self) -> bool {
+        self.service == Self::SEALER
+    }
+}
+
 /// Why a service waits.
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
