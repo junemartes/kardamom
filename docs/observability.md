@@ -67,8 +67,13 @@ Beside `/metrics`, the exporter serves `/ready` (the service's readiness
 rule over its own gauges) and `/halt` (the service's standing halt as JSON:
 the cause, the detail, the runbook, and whether it clears by itself). A
 halted service exports `kardamom_halt{cause, recovery} == 1`, and
-`POST /halt/clear` from the service's own node ends an operator halt. See
-the "Halts" section of `docs/failure-modes.md` and `docs/runbooks/`.
+`POST /halt/clear` from the service's own node ends an operator halt. A
+paused service exports `kardamom_paused{reason, root_service, cause} == 1`;
+`POST /pause?note=<text>` and `POST /resume` from the service's own node
+pause and resume it. Every service also publishes its lifecycle on the
+`events` Aeron stream, and `kardamom_chainStatus` on an ingress returns all of
+them with their roots. See the "Halts" section of `docs/failure-modes.md` and
+`docs/runbooks/`.
 
 Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
 `local`). It's

@@ -25,3 +25,15 @@ curl -s -X POST http://127.0.0.1:<port>/halt/clear
 An `auto` halt needs no clear: the service retries its cause and resumes when the
 cause goes. A clear of an `auto` halt is harmless; the service raises it again
 on the next failed retry.
+
+A service that waits on another service's halt is `paused`, not halted. It
+names the root in its `/halt` record and in `kardamom_paused{root_service,
+cause}`, and it resumes by itself when the root clears: follow the root's
+runbook, not the paused service's. `kardamom_chainStatus` on an ingress lists
+every root and every pause. An operator pauses a service for maintenance and
+resumes it on the service's node:
+
+```sh
+curl -s -X POST 'http://127.0.0.1:<port>/pause?note=disk-swap'
+curl -s -X POST http://127.0.0.1:<port>/resume
+```

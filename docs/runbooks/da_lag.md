@@ -7,13 +7,15 @@ to L1, so the sealer refuses new transactions until the batcher posts again.
 
 ## Confirm
 
-1. Read `/halt` on an ingress. The detail names the sealed head, the posted
-   head, and the budget.
+1. Call `kardamom_chainStatus` on an ingress. The root is `sealer` (instance
+   `cluster`) halted on `da_lag`; its detail names the sealed head, the posted
+   head, and the budget. The ingresses are `paused` on it, not halted.
 2. Read `kardamom_batcher_last_posted_block` on the batcher, and `/halt` on
    the batcher. The batcher is the cause: it is halted, frozen, or cannot
    reach L1.
-3. A client sees the JSON-RPC error `chain halted: DA lag` (code -32010) on
-   `eth_sendRawTransaction`. Deposits and block boundaries continue.
+3. A client sees the JSON-RPC error `chain halted: da_lag at sealer` (code
+   -32010) on `eth_sendRawTransaction`. Deposits and block boundaries
+   continue.
 
 ## Steps
 
@@ -30,5 +32,6 @@ to L1, so the sealer refuses new transactions until the batcher posts again.
 
 This halt clears by itself (`auto`). The batcher publishes its confirmed cursor
 on every post. When the cursor comes within the budget of the sealed head, the
-sealer accepts transactions again, and the ingress clears the halt on the next
-status it reads from the cluster.
+sealer accepts transactions again, the ingress clears the sealer's halt on the
+next status it reads from the cluster, and the ingresses resume submits with
+it. No pause needs an operator.

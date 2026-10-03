@@ -17,7 +17,9 @@ receipts, block access list, or state root.
 ## Steps
 
 1. Treat the chain as suspect until the cause is known. The executors keep
-   serving, so nothing stops on its own.
+   serving. The output attester pauses on this halt (`kardamom_chainStatus`
+   shows `attester` paused on `validator_divergence`): no output root reaches
+   L1 until the halt clears.
 2. Compare the validator's view with the executors': the receipts of the
    block, the block access list on `tx_bal`, and the state root. One of the
    three sides is wrong: an executor, the validator's binary, or the stream.

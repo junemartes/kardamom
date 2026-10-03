@@ -57,7 +57,8 @@ rule.
 | `l1_chain_break` | indexer, da-watcher | auto | `docs/runbooks/l1_chain_break.md` |
 | `l1_unreachable` | batcher, indexer, da-watcher | auto | `docs/runbooks/l1_unreachable.md` |
 | `replay_unavailable` | batcher | operator | `docs/runbooks/replay_unavailable.md` |
-| `da_lag` | ingress (the chain's state; the sealer has no exporter) | auto | `docs/runbooks/da_lag.md` |
+| `da_lag` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/da_lag.md` |
+| `sealer_no_quorum` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/sealer_no_quorum.md` |
 | `validator_divergence` | validator | operator | `docs/runbooks/validator_divergence.md` |
 
 `docs/runbooks/revert_to_posted_head.md` is the last resort the
@@ -66,6 +67,39 @@ The metrics ports of the deploy: batcher 9002, da-watcher 9005, ingress and
 validator 9006, l1-indexer 9009. The chaos cases assert the halt record, not
 only the log line (`da-lag-halt`, and the chain-semantics divergence drills).
 
+**Service events: halted, paused, resumed.** The services share their
+lifecycle state on the `events` Aeron stream (id 1019, best effort, RAM only;
+`kardamom_types::service::ServiceEvent`). `Halted` is the service's own fault
+and pages. `Paused` means the service waits on something outside itself: a
+root halt upstream, or an operator's pause (`POST /pause?note=...` and
+`POST /resume` on its exporter, loopback only). A paused service makes no
+progress, keeps its state, serves its metrics and queries, fails `/ready`, and
+resumes by itself when the root clears; it never pages. `Resumed` is published
+once on the way back. Every service publishes its state at once on a change
+and every 5 s; a record with no heartbeat for 15 s is `gone`. The sealer has
+no Rust runtime on the stream, so the ingress observes it on its cluster
+session and publishes it as `sealer/cluster`: `da_lag` from the status frame,
+`sealer_no_quorum` after 10 s without one.
+
+| root | reaction |
+|---|---|
+| the sealer has no quorum | the ingresses pause submits (typed error naming the root); the sequencers pause offering, from their own egress silence |
+| the sealer's DA-lag guard | the ingresses pause submits; the guard itself stays in the cluster log |
+| every executor halted | the ingresses pause submits; one executor halted changes nothing |
+| a validator divergence | the output attester pauses: no output root reaches L1 |
+| the batcher halted | the chain status shows it; the DA-lag guard enforces |
+| the da-watcher halted | the chain status shows deposits delayed |
+| the l1-indexer halted | `kardamom-reconstruct` refuses it (`indexer_halt` on its API; the indexer is not on the stream) |
+
+Nothing that changes the canonical order reads the stream: a lost event can
+delay a pause or a resume, never change the order. `kardamom_chainStatus` on an
+ingress returns the posted and sealed heads, the roots, the sealer, the
+ingress, and every service's latest state. A pause exports
+`kardamom_paused{reason, root_service, cause}` and fires the info alert
+`KardamomServicePaused`; the inhibit rule in `deploy/alertmanager-inhibit.yml`
+mutes it while the root's halt alert fires, so one incident pages once, with
+the root's runbook.
+
 **The DA-lag guard and the posted head.** The batcher publishes its confirmed
 cursor (the last L2 block on L1) on the cluster ingress as a system record
 (`KIND_POSTED_CURSOR`) at start and after every confirmed post. The sealer
@@ -73,12 +107,14 @@ keeps it in its replicated state and refuses user records while
 `sealed_head - posted_head > DA_LAG_BUDGET_BLOCKS` (default 10,000; zero turns
 the guard off, in the open). Deposits and boundaries still enter. Every member
 takes the same decision: the cursor is in the log and the budget is shared
-configuration. The ingress answers a refused submit with the typed JSON-RPC
-error `chain halted: DA lag` (code -32010, `data.cause = "da_lag"`), serves
-`safe` and `finalized` from the posted head (`kardamom_blockNumberByTag`; the
-batcher does not observe L1 finality today, so `finalized` is the posted head
-too), and raises `kardamom_halt{cause="da_lag"}` from the status frame the
-sealer fans out on every tick. The same posted head is the floor of the
+configuration. The ingress halts the sealer's observed lifecycle on `da_lag`
+from the status frame the sealer fans out on every tick
+(`kardamom_halt{service="sealer", cause="da_lag"}`), pauses its own submits on
+that root, answers a refused submit with the typed JSON-RPC error
+`chain halted: da_lag at sealer (...)` (code -32010, `data.cause = "da_lag"`,
+`data.runbook`), and serves `safe` and `finalized` from the posted head
+(`kardamom_blockNumberByTag`; the batcher does not observe L1 finality today,
+so `finalized` is the posted head too). The same posted head is the floor of the
 sealer's egress retention: the window of `kardamom.cluster.retention` frames is
 a minimum, and a frame past it leaves only when its block is posted, so the
 batcher always replays from its cursor. The frames above the posted head ride
