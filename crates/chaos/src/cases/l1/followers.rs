@@ -85,6 +85,15 @@ impl Followers {
         Ok(now)
     }
 
+    /// The followers at the moment the lie stops, then the lie cleared.
+    /// A resume must pass this sample: a halted follower holds its
+    /// gauges here, and the sample before the lie is already behind it.
+    pub(super) async fn at_clear(h: &Harness, l1: &L1) -> anyhow::Result<Self> {
+        let now = Self::read(h).await;
+        l1.clear_faults().await?;
+        Ok(now)
+    }
+
     /// Both followers counted a chain break since `base`.
     pub(super) fn chain_broke_since(self, base: Self) -> bool {
         rose(self.watcher_breaks, base.watcher_breaks)
@@ -144,13 +153,16 @@ pub(super) async fn await_resume(h: &Harness, base: Followers, ctx: &str) -> any
     Ok(())
 }
 
-/// The archive holds every batch L1 holds: the indexer's last batch
-/// index reaches the contract's counter.
+/// The archive holds every batch L1 held at the call: the indexer's
+/// last batch index reaches the contract's counter as read then.
 pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
+    // The target is read once: the batcher keeps posting, and the
+    // indexer walks finalized blocks only, so it always trails L1's
+    // newest batch by the finality depth.
+    let on_l1 = i64::try_from(l1.last_batch_index().await?).unwrap_or(i64::MAX);
     let outcome = poll::until(
         Budget::new(ARCHIVE_BUDGET, Duration::from_secs(5)),
         |_| async move {
-            let on_l1 = i64::try_from(l1.last_batch_index().await?).unwrap_or(i64::MAX);
             let archived = h.probes.aux_metric(INDEXER_PORT, INDEXER_LAST_BATCH).await;
             Ok::<_, anyhow::Error>(archived.filter(|a| *a >= on_l1).map(|a| (a, on_l1)))
         },

@@ -117,8 +117,8 @@ impl Phase {
         self.assert_alert(l1, window, ctx).await?;
         tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
         assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await?;
-        l1.clear_faults().await?;
-        self.assert_resume(h, base, ctx).await
+        let stuck = Followers::at_clear(h, l1).await?;
+        self.assert_resume(h, stuck, ctx).await
     }
 
     /// The stale-post alert fires on the swallowed logs: the batcher's
@@ -145,18 +145,18 @@ impl Phase {
     async fn assert_resume(
         self,
         h: &mut Harness,
-        base: Followers,
+        stuck: Followers,
         ctx: &str,
     ) -> anyhow::Result<()> {
         match self.recovery() {
-            Recovery::SelfResume | Recovery::NeverHalted => await_resume(h, base, ctx).await,
+            Recovery::SelfResume | Recovery::NeverHalted => await_resume(h, stuck, ctx).await,
             Recovery::PoisonedAnchor => {
                 deferred(
                     ctx,
                     "the resume by itself after a wrong hash: the single-source follower kept the wrong hash as its anchor",
                 );
                 heal_single_source_followers(h, ctx).await?;
-                await_resume(h, base, ctx).await
+                await_resume(h, stuck, ctx).await
             }
         }
     }

@@ -101,14 +101,14 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     );
     // T4: the fault clears. The batcher posts within one flush.
     crate::log(format!("{ctx}: T4: the fault clears"));
-    l1.clear_faults().await?;
+    let stuck = Followers::at_clear(h, &l1).await?;
     await_posting(h, at_t3, Duration::from_secs(30), ctx).await?;
     deferred(
         ctx,
         "the followers' resume by themselves after T4: the single-source followers kept the wrong hash as their anchor",
     );
     heal_single_source_followers(h, ctx).await?;
-    await_resume(h, base, ctx).await?;
+    await_resume(h, stuck, ctx).await?;
     await_archive_complete(h, &l1, ctx).await?;
     l1.assert_contiguous(ctx).await
 }
