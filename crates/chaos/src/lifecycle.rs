@@ -42,6 +42,8 @@ pub struct DeployVars {
     pub cluster_snapshot_interval_s: Option<u64>,
     /// `-Dkardamom.cluster.retention` of the sealer, in frames.
     pub cluster_retention: Option<u64>,
+    /// `-Dkardamom.cluster.daLagBudgetBlocks` of the sealer, in blocks.
+    pub da_lag_budget_blocks: Option<u64>,
 }
 
 impl DeployVars {
@@ -52,7 +54,14 @@ impl DeployVars {
         let retention = self
             .cluster_retention
             .map(|v| ("KARDAMOM_CLUSTER_RETENTION", v.to_string()));
-        snapshot.into_iter().chain(retention).collect()
+        let budget = self
+            .da_lag_budget_blocks
+            .map(|v| ("KARDAMOM_DA_LAG_BUDGET_BLOCKS", v.to_string()));
+        snapshot
+            .into_iter()
+            .chain(retention)
+            .chain(budget)
+            .collect()
     }
 }
 

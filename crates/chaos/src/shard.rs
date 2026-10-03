@@ -115,10 +115,12 @@ impl Shard {
             Self::Cluster => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
                 cluster_retention: None,
+                da_lag_budget_blocks: None,
             },
             Self::Retention => DeployVars {
                 cluster_snapshot_interval_s: None,
                 cluster_retention: Some(6144),
+                da_lag_budget_blocks: None,
             },
             Self::Executor
             | Self::Ingress

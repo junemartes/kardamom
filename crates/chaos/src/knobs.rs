@@ -102,6 +102,9 @@ pub struct Knobs {
     /// The cluster egress retention the cluster was deployed with, in
     /// frames. The retention cases need it; other cases ignore it.
     pub cluster_retention: Option<NonZeroU64>,
+    /// The sealer's DA-lag budget in blocks, when the shard deploys one
+    /// (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`). The DA cases need it small.
+    pub da_lag_budget_blocks: Option<NonZeroU64>,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     pub squeeze: Squeeze,
@@ -130,6 +133,18 @@ impl Source<'_> {
 
     fn or(&self, name: &str, default: &str) -> String {
         self.get(name).unwrap_or_else(|| default.to_string())
+    }
+
+    /// A positive number, or `None` when the variable is unset or empty.
+    fn optional_nonzero_u64(&self, name: &str) -> anyhow::Result<Option<NonZeroU64>> {
+        match self.get(name) {
+            Some(raw) if !raw.is_empty() => {
+                Ok(Some(raw.parse::<NonZeroU64>().with_context(|| {
+                    format!("{name} is not a positive number")
+                })?))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn u64(&self, name: &str, default: u64) -> anyhow::Result<u64> {
@@ -204,13 +219,8 @@ impl Knobs {
     /// Returns an error if a set variable does not parse.
     pub fn read(shard: &[(&str, &str)]) -> anyhow::Result<Self> {
         let env = Source { shard };
-        let retention = match env.get("KARDAMOM_CLUSTER_RETENTION") {
-            Some(raw) if !raw.is_empty() => Some(
-                raw.parse::<NonZeroU64>()
-                    .context("KARDAMOM_CLUSTER_RETENTION is not a positive number")?,
-            ),
-            _ => None,
-        };
+        let retention = env.optional_nonzero_u64("KARDAMOM_CLUSTER_RETENTION")?;
+        let da_lag_budget = env.optional_nonzero_u64("KARDAMOM_DA_LAG_BUDGET_BLOCKS")?;
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
             tps: env.nonzero_u32("CHAOS_TPS", 200)?,
@@ -232,6 +242,7 @@ impl Knobs {
             seq_lapse: env.secs("SEQ_LAPSE_S", 30)?,
             validator_lapse: env.secs("LAPSE_S", 30)?,
             cluster_retention: retention,
+            da_lag_budget_blocks: da_lag_budget,
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             squeeze: Squeeze {
                 window: env.secs("SQUEEZE_S", 120)?,
