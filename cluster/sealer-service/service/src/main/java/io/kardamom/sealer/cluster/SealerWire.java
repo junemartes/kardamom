@@ -128,6 +128,20 @@ public final class SealerWire {
      * Rust {@code KIND_VOID_REQUEST}.
      */
     public static final byte KIND_VOID_REQUEST = 6;
+    /**
+     * Posted cursor, the batcher's system record:
+     * {@code [kind:7][posted_head:u64 LE]}. The last L2 block the batcher
+     * confirmed on L1. The sealer adopts it as the floor of the DA-lag
+     * guard and of its egress retention, and fans the resulting
+     * {@link #EGRESS_KIND_STATUS} out to every session. Matches Rust
+     * {@code KIND_POSTED_CURSOR}.
+     */
+    public static final byte KIND_POSTED_CURSOR = 7;
+
+    /** Offset of the u64 LE posted head within a {@link #KIND_POSTED_CURSOR} frame. */
+    static final int POSTED_HEAD_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Exact length of a {@link #KIND_POSTED_CURSOR} frame. */
+    static final int MIN_POSTED_CURSOR_LEN = POSTED_HEAD_OFFSET + Long.BYTES;
 
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
@@ -219,6 +233,24 @@ public final class SealerWire {
      * republishes the record after the window prunes.
      */
     public static final byte EGRESS_KIND_WINDOW_FULL = 8;
+    /**
+     * The chain's data-availability status, broadcast to every session on
+     * every boundary tick, on every posted cursor, and to a session that
+     * announces itself:
+     * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}.
+     * The ingress serves {@code safe} from the posted head and raises its
+     * {@code da_lag} halt from the flag. Not retained: a session learns the
+     * current status when it announces itself.
+     */
+    public static final byte EGRESS_KIND_STATUS = 9;
+    /**
+     * The DA-lag guard refused a user record:
+     * {@code [kind:10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]}.
+     * Offered only to the offering session. The record is not ordered; the
+     * sequencer drops it and tells the client, which resubmits after the
+     * batcher posts again.
+     */
+    public static final byte EGRESS_KIND_DA_LAG_REJECT = 10;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

@@ -130,6 +130,22 @@ final class IngressFrames {
         return new byte[] {SealerWire.KIND_SUBSCRIBE};
     }
 
+    /** A {@code KIND_POSTED_CURSOR} frame: {@code [kind:7][posted_head:u64 LE]}. */
+    static byte[] postedCursorFrame(final long postedHead) {
+        return java.nio.ByteBuffer.allocate(SealerWire.MIN_POSTED_CURSOR_LEN)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(SealerWire.KIND_POSTED_CURSOR)
+            .putLong(postedHead)
+            .array();
+    }
+
+    /** Offer the batcher's posted cursor to the cluster. */
+    static void offerPostedCursor(final AeronCluster client, final long postedHead) {
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        buf.putBytes(0, postedCursorFrame(postedHead));
+        offerFully(client, buf, SealerWire.MIN_POSTED_CURSOR_LEN);
+    }
+
     /**
      * A complete single-record ingress frame that a batch can embed: a guard
      * header ({@code sender20}, {@code nonce} and a deadline no block
