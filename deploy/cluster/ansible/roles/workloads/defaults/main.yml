@@ -36,6 +36,10 @@ workloads_common_vars:
   sealer_count: "{{ node_classes.sealer.count }}"
   sequencer_count: "{{ node_classes.sequencer.count }}"
   ingress_count: "{{ node_classes.ingress.count }}"
+  # One value for the sequencer's tip, the sealer's ordering window, and
+  # the executor's and validator's fee schedule: "on" or "off". Empty
+  # leaves every job at its "off" default.
+  priority_fees: "{{ workloads_priority_fees }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -81,6 +85,7 @@ workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
 workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
+workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"

@@ -32,11 +32,12 @@ use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
-    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsSubscriberHandle,
-    TxRemoteEpochsSubscriberHandle,
+    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
+use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
@@ -680,6 +681,40 @@ async fn redis_nonce(redis: Option<&CacheReader>, sender: Address) -> Option<u64
     redis?.account(sender).await.map(|view| view.nonce)
 }
 
+/// The executor-boundary feed into the base fee view: every closed
+/// block's base fee and gas used imply the next block's base fee, which
+/// the fee gate checks caps against. A plain async task, like the
+/// receipts feed: the handle fans in over a tokio channel.
+pub(crate) struct BaseFeeFeed {
+    view: Arc<LatestBaseFee>,
+}
+
+impl BaseFeeFeed {
+    pub(crate) fn new(view: Arc<LatestBaseFee>) -> Self {
+        Self { view }
+    }
+
+    pub(crate) fn spawn(
+        self,
+        mut sub: TxReceiptsBoundarySubscriberHandle,
+        shutdown: Shutdown,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let boundary = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return,
+                    msg = sub.recv() => match msg {
+                        Some((_pos, boundary)) => boundary,
+                        None => return,
+                    },
+                };
+                self.view.on_boundary(&boundary);
+            }
+        })
+    }
+}
+
 pub(crate) type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
 /// Argument group for [`PublishLoops::spawn`]: the config, the `tx_data`
@@ -697,6 +732,8 @@ pub(crate) struct PublishLoops<P> {
     /// The interop remote-epoch pump's publisher.
     pub(crate) remote_epoch_pub: P,
     pub(crate) side: SideChannels,
+    /// The fee admission gate for the canonical loop.
+    pub(crate) fees: FeeGate,
     pub(crate) epochs: TxDepositsSubscriberHandle,
     pub(crate) remote_epochs: TxRemoteEpochsSubscriberHandle,
     pub(crate) resync: Option<ResyncController>,
@@ -727,6 +764,7 @@ where
             epoch_pub,
             remote_epoch_pub,
             mut side,
+            fees,
             epochs: epoch_subscription,
             remote_epochs: remote_epoch_subscription,
             resync,
@@ -746,6 +784,7 @@ where
             if let Some(requester) = lookup {
                 sequencer.enable_nonce_lookup(requester);
             }
+            sequencer.enable_fees(fees);
             let mut ports = Ports {
                 tx_data: &mut tx_data,
                 refs: &mut main_pub,

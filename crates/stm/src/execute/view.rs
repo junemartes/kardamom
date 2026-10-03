@@ -1,6 +1,5 @@
 use super::config::{account_info, nanos};
 use super::metrics::Metrics;
-use crate::FEE_SINK;
 use crate::FastMap;
 use crate::mv::MvCache;
 use crate::mv::ReadRecord;
@@ -207,6 +206,9 @@ pub(super) struct MvView<'a, S: StateDatabase> {
     pub(super) base: &'a BlockInput<'a, S>,
     pub(super) idx: u32,
     pub(super) reads: Vec<ReadRecord>,
+    /// The fee sink: the block's beneficiary. Every worker reads it at
+    /// its block-start value; the commit pass computes the prefixes.
+    pub(super) sink: alloy_primitives::Address,
     pub(super) sink_start: Option<AccountInfo>,
     /// Shared across workers. See [`BaseCache`].
     pub(super) base_cache: &'a BaseCache,
@@ -229,6 +231,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
     pub(super) fn new(
         mv: &'a MvCache,
         base: &'a BlockInput<'a, S>,
+        sink: alloy_primitives::Address,
         sink_start: Option<AccountInfo>,
         base_cache: &'a BaseCache,
         metrics: &'a Metrics,
@@ -238,6 +241,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             base,
             idx: 0,
             reads: Vec::new(),
+            sink,
             sink_start,
             base_cache,
             metrics,
@@ -280,7 +284,7 @@ impl<S: StateDatabase> MvView<'_, S> {
         &mut self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, kardamom_exec_core::executor::StateRefError> {
-        if address == FEE_SINK {
+        if address == self.sink {
             return Ok(self.sink_start.clone());
         }
         self.n_reads += 1;

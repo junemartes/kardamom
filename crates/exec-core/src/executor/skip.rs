@@ -260,6 +260,8 @@ impl<S: StateDatabase> Executor<S> {
             to: identity.to,
             contract_address: None,
             effective_gas_price: 0,
+            priority_fee_per_gas: 0,
+            priority_fee_paid: 0,
             block_number: ctx.block_number,
             transaction_index: ctx.tx_index_in_block,
             cumulative_gas_used: ctx.cumulative_gas_used_before,

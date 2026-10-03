@@ -16,33 +16,58 @@ use kardamom_types::xchain::RemoteEpochRecord;
 use super::RT_DEPOSITREF;
 use super::{
     CANONICAL_ID_LEN, INGRESS_CANONICAL_ID_OFFSET, INGRESS_DEADLINE_OFFSET, INGRESS_NONCE_OFFSET,
-    INGRESS_SENDER_OFFSET, KIND_BATCH, KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD,
+    INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD,
     KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH,
     RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, epoch_slots, rd_slice,
-    rd_u64, remote_epoch_slots, too_short,
+    rd_u64, rd_u128, remote_epoch_slots, too_short,
 };
+
+/// The guard header of a kind-0 ingress frame: the fields the service
+/// checks and orders by, and never relays. Executors never see them.
+///
+/// Every field derives from the transaction bytes or the `tx_data`
+/// envelope, so every racing replica of a shard encodes the same bytes
+/// for the same record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardHeader {
+    /// Feeds the service's per-sender contiguity guard, with `nonce`.
+    pub sender: Address,
+    pub nonce: u64,
+    /// The last block the sealer may order the record into.
+    pub max_inclusion_block: u64,
+    /// The amount in wei the sender bids for its place. The service
+    /// orders a window of records by it, highest first. Zero when the
+    /// sequencer's fee setting is off.
+    pub tip: u128,
+}
+
+impl GuardHeader {
+    /// The guard-exempt header: an all-zero sender, no deadline, no bid.
+    /// Deposits and test records that need no guard carry it.
+    pub const EXEMPT: Self = Self {
+        sender: Address::ZERO,
+        nonce: 0,
+        max_inclusion_block: u64::MAX,
+        tip: 0,
+    };
+
+    fn write(&self, b: &mut Vec<u8>) {
+        b.extend_from_slice(self.sender.as_slice()); // sender (20)
+        b.extend_from_slice(&self.nonce.to_le_bytes());
+        b.extend_from_slice(&self.max_inclusion_block.to_le_bytes());
+        b.extend_from_slice(&self.tip.to_le_bytes());
+    }
+}
 
 // ── encode (ingress: Rust to cluster) ───────────────────────────────────────
 
-/// Encode a `TxRef` as an ingress app message. `sender` and `nonce` feed
-/// the service's per-sender contiguity guard, and `max_inclusion_block`
-/// its inclusion check. None of the three is part of the relayed payload;
-/// executors never see them.
-///
-/// `max_inclusion_block` comes from the `tx_data` envelope, so every
-/// racing replica of a shard encodes the same bytes for the same record.
+/// Encode a `TxRef` as an ingress app message: the [`GuardHeader`], then
+/// the relayed payload.
 #[must_use]
-pub fn encode_ingress_txref(
-    r: &TxRef,
-    sender: Address,
-    nonce: u64,
-    max_inclusion_block: u64,
-) -> Vec<u8> {
+pub fn encode_ingress_txref(r: &TxRef, guard: GuardHeader) -> Vec<u8> {
     let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
     b.push(KIND_INGRESS_RECORD);
-    b.extend_from_slice(sender.as_slice()); // sender (20)
-    b.extend_from_slice(&nonce.to_le_bytes());
-    b.extend_from_slice(&max_inclusion_block.to_le_bytes());
+    guard.write(&mut b);
     b.extend_from_slice(r.tx_hash.as_slice()); // canonical_id (32)
     b.push(RT_TXREF);
     b.push(r.shard_id);
@@ -65,10 +90,8 @@ pub fn encode_ingress_txref(
 pub fn encode_ingress_depositref(r: &DepositRef) -> Vec<u8> {
     let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 8);
     b.push(KIND_INGRESS_RECORD);
-    b.extend_from_slice(Address::ZERO.as_slice()); // guard-exempt sender
-    b.extend_from_slice(&0u64.to_le_bytes());
-    // A deposit derives from L1 and must never expire.
-    b.extend_from_slice(&u64::MAX.to_le_bytes());
+    // A deposit derives from L1, never expires, and bids nothing.
+    GuardHeader::EXEMPT.write(&mut b);
     b.extend_from_slice(r.source_hash.as_slice()); // canonical_id (32)
     b.push(RT_DEPOSITREF);
     b.extend_from_slice(&r.deposit_position.term_id.to_le_bytes());
@@ -254,4 +277,13 @@ pub fn ingress_sender_nonce(buf: &[u8]) -> Result<(Address, u64), WireError> {
 /// Returns [`WireError::TooShort`] if `buf` ends before the field.
 pub fn ingress_deadline(buf: &[u8]) -> Result<u64, WireError> {
     rd_u64(buf, INGRESS_DEADLINE_OFFSET)
+}
+
+/// The tip in the guard header of a kind-0 ingress frame.
+///
+/// # Errors
+///
+/// Returns [`WireError::TooShort`] if `buf` ends before the field.
+pub fn ingress_tip(buf: &[u8]) -> Result<u128, WireError> {
+    rd_u128(buf, INGRESS_TIP_OFFSET)
 }

@@ -60,6 +60,18 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# Priority fees, "on" or "off" (the genesis `[fees]` section). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -255,9 +267,11 @@ job "validator" {
       }
 
       # The chain genesis comes from one source: config/genesis/dev.toml.
+      # With priority fees on, the fee schedule fragment follows it, as
+      # on the executor: both roles compute the same roots.
       template {
         destination = "local/genesis.toml"
-        data        = file("config/genesis/dev.toml")
+        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
       }
 
       service {

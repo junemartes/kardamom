@@ -10,7 +10,6 @@ use super::metrics::{Metrics, StmOutcome, TxResult};
 use super::recycle::{RecyclePools, SpentBlock};
 use super::session::DeltaOut;
 use super::tail::Tail;
-use crate::FEE_SINK;
 use alloy_primitives::B256;
 use alloy_primitives::U256;
 use kardamom_exec_core::delta::WriteSet;
@@ -196,8 +195,12 @@ impl Chunk<'_> {
 /// commit pass's `WriteSet` sink rewrite. Workers execute against the
 /// block-start sink, so their captured value is `start + own_fee`, not
 /// the running sum the sequential capture records.
-pub(super) fn rewrite_frag_sink(frag: &mut revm::state::bal::Bal, value: U256) {
-    let Some(acct) = frag.accounts.get_mut(&FEE_SINK) else {
+pub(super) fn rewrite_frag_sink(
+    frag: &mut revm::state::bal::Bal,
+    sink: alloy_primitives::Address,
+    value: U256,
+) {
+    let Some(acct) = frag.accounts.get_mut(&sink) else {
         return;
     };
     for w in &mut acct.account_info.balance.writes {
@@ -219,6 +222,8 @@ pub(super) fn rewrite_frag_sink(frag: &mut revm::state::bal::Bal, value: U256) {
 struct Fold {
     delta: PendingDelta,
     sink_final: Option<AccountFields>,
+    /// The fee sink: the block's beneficiary.
+    sink: alloy_primitives::Address,
 }
 
 impl Fold {
@@ -241,7 +246,7 @@ impl Fold {
     /// sink, merged into the delta (last-writer-wins) otherwise. The
     /// `for` loop in [`Self::absorb`] stays free of a branch.
     fn absorb_account(&mut self, a: alloy_primitives::Address, v: AccountFields) {
-        if a == FEE_SINK {
+        if a == self.sink {
             self.sink_final = Some(v);
         } else {
             self.delta.accounts.insert(a, v);
@@ -252,7 +257,7 @@ impl Fold {
     /// touched), and hand the delta over.
     fn finish(mut self) -> PendingDelta {
         if let Some(v) = self.sink_final {
-            self.delta.accounts.insert(FEE_SINK, v);
+            self.delta.accounts.insert(self.sink, v);
         }
         self.delta
     }
@@ -263,7 +268,11 @@ impl Fold {
 /// into the delta directly; the commit pass computes its prefix
 /// separately). The delta's tables come from the recycle pool when one
 /// is free, so a steady-state block allocates none.
-fn fold_inline(results: Results<'_>, recycle: &RecyclePools) -> PendingDelta {
+fn fold_inline(
+    results: Results<'_>,
+    recycle: &RecyclePools,
+    sink: alloy_primitives::Address,
+) -> PendingDelta {
     let delta = recycle
         .deltas
         .lock()
@@ -273,6 +282,7 @@ fn fold_inline(results: Results<'_>, recycle: &RecyclePools) -> PendingDelta {
     let mut fold = Fold {
         delta,
         sink_final: None,
+        sink,
     };
     fold.delta.accounts.reserve(results.len() * 2);
     fold.delta.storage.reserve(results.len());
@@ -326,7 +336,7 @@ fn serial_hash_and_validate<S: StateDatabase>(
         return (std::sync::Arc::new(PendingDelta::new()), wounded);
     }
     let t_fold = std::time::Instant::now();
-    let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle));
+    let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle, ctx.env.fees.beneficiary));
     fold_ns.fetch_add(nanos(t_fold.elapsed()), Ordering::Relaxed);
     if let Some(d) = delta_out
         && d.speculative
@@ -421,7 +431,8 @@ fn lanes_hash_and_validate<S: StateDatabase>(
                 .expect("tail lane panicked");
         });
         let t_fold = std::time::Instant::now();
-        let delta_arc = std::sync::Arc::new(fold_inline(tx_results, recycle));
+        let delta_arc =
+            std::sync::Arc::new(fold_inline(tx_results, recycle, ctx.env.fees.beneficiary));
         fold_ns.fetch_add(nanos(t_fold.elapsed()), Ordering::Relaxed);
         if let Some(d) = &delta_out
             && d.speculative

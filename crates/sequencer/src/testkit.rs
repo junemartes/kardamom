@@ -21,6 +21,7 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope, TxError, TxRef, TxStatus}
 use crate::config::SequencerConfig;
 use crate::error::SequencerError;
 use crate::inbound::fakes::ScriptedTxData;
+use crate::outbound::RefOffer;
 use crate::outbound::fakes::{InMemorySidePublisher, InMemoryTxOrderingRefPublisher};
 use crate::partition::PartitionCount;
 use crate::sequencer::{Ports, Sequencer};
@@ -44,6 +45,9 @@ pub fn signer(seed: u64) -> PrivateKeySigner {
 #[derive(Clone, Copy)]
 pub struct EnvelopeSpec {
     pub gas_limit: u64,
+    /// The legacy price, in wei per gas. A fee test varies it to vary
+    /// the bid; every other test leaves it at one gwei.
+    pub gas_price: u128,
     /// Length of a filler calldata payload (`0xAB` repeated). Most tests
     /// want zero; the allocation-profile harness wants a realistic size
     /// to exercise RLP decode cost.
@@ -59,6 +63,7 @@ impl Default for EnvelopeSpec {
     fn default() -> Self {
         Self {
             gas_limit: 21_000,
+            gas_price: 1_000_000_000,
             calldata_len: 0,
             real_hash: false,
         }
@@ -84,7 +89,7 @@ pub fn envelope_with(
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
-        gas_price: 1_000_000_000,
+        gas_price: spec.gas_price,
         gas_limit: spec.gas_limit,
         to: Address::ZERO.into(),
         value: U256::ZERO,
@@ -177,7 +182,18 @@ impl Rig {
     /// Panics if the refs mutex is poisoned.
     #[must_use]
     pub fn refs(&self) -> Vec<TxRef> {
-        self.refs.refs.lock().unwrap().clone()
+        self.refs.refs()
+    }
+
+    /// A cloned snapshot of every offer published so far, guard header
+    /// included, in arrival order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the offers mutex is poisoned.
+    #[must_use]
+    pub fn offers(&self) -> Vec<RefOffer> {
+        self.refs.offers.lock().unwrap().clone()
     }
 
     /// A cloned snapshot of every error emitted so far, in arrival order.
@@ -220,12 +236,28 @@ pub fn drive_to_idle(
     stream: &[(TxDataLoc, TxEnvelope)],
 ) -> (Vec<TxRef>, Vec<TxError>) {
     let mut seq = Sequencer::new(cfg).unwrap();
+    let (offers, errors) = drive_sequencer_to_idle(&mut seq, stream);
+    (offers.iter().map(|o| o.tx_ref).collect(), errors)
+}
+
+/// [`drive_to_idle`] over a caller-built [`Sequencer`], for a test that
+/// enables a seam first (the fee gate, the lookup). Returns every
+/// published offer whole, guard header included.
+///
+/// # Panics
+///
+/// Panics if [`Rig::step`] returns an error.
+#[must_use]
+pub fn drive_sequencer_to_idle(
+    seq: &mut Sequencer,
+    stream: &[(TxDataLoc, TxEnvelope)],
+) -> (Vec<RefOffer>, Vec<TxError>) {
     let mut rig = Rig::default();
     for (loc, env) in stream {
         rig.push(*loc, env.clone());
     }
-    while rig.step(&mut seq).unwrap() {}
-    (rig.refs(), rig.errors())
+    while rig.step(seq).unwrap() {}
+    (rig.offers(), rig.errors())
 }
 
 /// A `SequencerConfig` for a single-partition deployment (`M = 1`):
