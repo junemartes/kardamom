@@ -79,8 +79,14 @@ impl Streamed {
         // `StateEnv` is `Arc`-backed and clones cheaply; cloning it out
         // here, instead of moving the field, keeps `self.opened` whole so
         // it can nest into `Written` as one field below.
-        let writer = StateWriter::spawn_with_trie(self.opened.state.env.clone(), trie_mode)
-            .context("spawn trie-aware state writer")?;
+        let writer = StateWriter::spawn_with(
+            self.opened.state.env.clone(),
+            kardamom_state::WriterOptions {
+                trie_mode,
+                payload_retention: args.payload_retention_blocks,
+            },
+        )
+        .context("spawn trie-aware state writer")?;
         let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
         let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
         let writer_queue = ValidatorWriterQueue::new(

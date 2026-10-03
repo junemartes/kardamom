@@ -80,6 +80,8 @@ mod wiring;
 #[cfg(test)]
 mod commit_tests;
 #[cfg(test)]
+mod exec_payload_tests;
+#[cfg(test)]
 mod exec_pipeline_tests;
 #[cfg(test)]
 mod exec_resume_tests;

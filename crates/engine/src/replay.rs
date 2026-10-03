@@ -28,6 +28,7 @@
 
 use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
+use kardamom_types::kar1::{BlockRecords, TxFrame};
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, CodeEntry, Receipt, SnapshotSource, TxEnvelope,
@@ -413,7 +414,14 @@ impl<'a> Replay<'a> {
             l2_timestamp: block.l2_timestamp,
             l1_origin: block.canonical_end.map_or(0, |end| end.l1_origin),
         };
-        self.queue.submit(boundary, block_delta)?;
+        // The rebuilt image keeps each block's payload too, so an executor
+        // that resumes on it serves the batcher the same rows a live one
+        // does.
+        let records = BlockRecords {
+            remote_epochs: block.remote_epochs.clone(),
+            txs: block.txs.iter().map(TxFrame::from).collect(),
+        };
+        self.queue.submit(boundary, block_delta, records)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
         self.counters.head_end_tx_idx = block.canonical_end.map(|end| end.end_tx_idx);

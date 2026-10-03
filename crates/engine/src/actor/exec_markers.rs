@@ -70,6 +70,9 @@ impl<W: ExecPorts> ExecState<W> {
             );
             obs.observe(record, &parent_state)?;
         }
+        // The record travels in the DA payload by value, before the
+        // block's transactions, as the batcher packs it.
+        self.block.records.remote_epochs.push(record.clone());
         tracing::debug!(
             target: "kardamom_executor::exec",
             block = self.cursor.block,

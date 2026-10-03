@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::kar1::BlockRecords;
 use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
@@ -133,7 +134,12 @@ pub(super) type WriterLog = Arc<Mutex<Vec<(BlockBoundary, BlockDelta)>>>;
 
 pub(super) struct RecordingQueue(pub(super) WriterLog);
 impl StateWriterQueue for RecordingQueue {
-    fn submit(&mut self, b: BlockBoundary, d: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(
+        &mut self,
+        b: BlockBoundary,
+        d: BlockDelta,
+        _records: BlockRecords,
+    ) -> Result<(), ExecutorError> {
         self.0.lock().unwrap().push((b, d));
         Ok(())
     }
@@ -176,7 +182,12 @@ pub(super) struct ApplyingRecordingQueue {
 }
 
 impl StateWriterQueue for ApplyingRecordingQueue {
-    fn submit(&mut self, b: BlockBoundary, d: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(
+        &mut self,
+        b: BlockBoundary,
+        d: BlockDelta,
+        _records: BlockRecords,
+    ) -> Result<(), ExecutorError> {
         self.db.apply_block_delta(&d);
         self.log.lock().unwrap().push((b, d));
         Ok(())

@@ -245,16 +245,27 @@ impl Ready {
             args,
             chain_id.get(),
             interop_serve,
-            state_env_for_rpc,
+            state_env_for_rpc.clone(),
             feed_resume_block,
         )
         .await?;
+        // The query endpoint holds a clone of the state env too, so it
+        // ends, and its end is awaited, before a revolution parks the env.
+        let query_server = args
+            .nonce_query_addr
+            .map(|addr| kardamom_state::serve_nonce_queries(addr, state_env_for_rpc))
+            .transpose()
+            .context("bind nonce query address")?;
 
         let ports = self.run_ports();
         let outcome = self.execute(ports).await;
         if let Some(server) = feed_server {
             let _ = server.stop();
             server.stopped().await;
+        }
+        if let Some(mut server) = query_server {
+            server.task.abort();
+            let _ = (&mut server.task).await;
         }
         Ok(RunEnd {
             outcome,

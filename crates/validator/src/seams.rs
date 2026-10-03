@@ -12,6 +12,7 @@ use alloy_primitives::Address;
 use kardamom_engine::{
     CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication, publish_each,
 };
+use kardamom_types::kar1::BlockRecords;
 use kardamom_types::{AccountRow, BPosition, BlockBoundary, BlockDelta, Receipt, ReceiptRows};
 
 use crate::buffers::{BalBuffer, ReceiptBuffer};
@@ -133,7 +134,12 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
 }
 
 impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
-    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(
+        &mut self,
+        block: BlockBoundary,
+        delta: BlockDelta,
+        records: BlockRecords,
+    ) -> Result<(), ExecutorError> {
         if block.block_number <= self.verify_floor || block.block_number <= self.high_water {
             tracing::debug!(
                 block = block.block_number,
@@ -141,7 +147,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
                 high_water = self.high_water,
                 "replay overlap; BAL verification skipped (already verified)"
             );
-            return self.inner.submit(block, delta);
+            return self.inner.submit(block, delta, records);
         }
         self.high_water = block.block_number;
         if let Some(bal) = self.bals.take(block.block_number, self.wait) {
@@ -163,7 +169,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
             metrics::counter_bal_missing();
         }
         // Send the delta to the trie-aware writer; this advances the MPT state root.
-        self.inner.submit(block, delta)
+        self.inner.submit(block, delta, records)
     }
 }
 
@@ -511,6 +517,7 @@ mod tests {
             &mut self,
             block: BlockBoundary,
             _delta: BlockDelta,
+            _records: BlockRecords,
         ) -> Result<(), ExecutorError> {
             self.submitted.lock().unwrap().push(block.block_number);
             Ok(())
@@ -528,7 +535,8 @@ mod tests {
         let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
 
         bals.insert(delta(1, 100));
-        q.submit(boundary(1), delta(1, 100)).unwrap();
+        q.submit(boundary(1), delta(1, 100), BlockRecords::default())
+            .unwrap();
 
         assert!(!div.is_halted());
         assert_eq!(*submitted.lock().unwrap(), vec![1]);
@@ -542,7 +550,10 @@ mod tests {
         let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
 
         bals.insert(delta(1, 100)); // The BAL has balance 100.
-        let err = q.submit(boundary(1), delta(1, 999)).unwrap_err(); // The local delta has 999.
+        // The local delta has 999.
+        let err = q
+            .submit(boundary(1), delta(1, 999), BlockRecords::default())
+            .unwrap_err();
 
         assert!(matches!(err, ExecutorError::Divergence(_)));
         assert!(div.is_halted());
@@ -561,7 +572,8 @@ mod tests {
             .with_wait(Duration::from_millis(50));
 
         // No BAL is inserted: submit must still forward, and must not flag a divergence.
-        q.submit(boundary(1), delta(1, 100)).unwrap();
+        q.submit(boundary(1), delta(1, 100), BlockRecords::default())
+            .unwrap();
         assert!(!div.is_halted());
         assert_eq!(*submitted.lock().unwrap(), vec![1]);
     }

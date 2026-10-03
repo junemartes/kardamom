@@ -11,6 +11,7 @@
 pub use kardamom_exec_core::state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
 };
+use kardamom_types::kar1::BlockRecords;
 use kardamom_types::{BlockBoundary, BlockDelta};
 
 use crate::actor::StateWriterQueue;
@@ -33,7 +34,12 @@ impl WriterApplyingQueue {
 }
 
 impl StateWriterQueue for WriterApplyingQueue {
-    fn submit(&mut self, _block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(
+        &mut self,
+        _block: BlockBoundary,
+        delta: BlockDelta,
+        _records: BlockRecords,
+    ) -> Result<(), ExecutorError> {
         self.db.apply_block_delta(&delta);
         Ok(())
     }
@@ -73,7 +79,7 @@ mod tests {
             l2_timestamp: 0,
             l1_origin: 0,
         };
-        q.submit(boundary, delta).unwrap();
+        q.submit(boundary, delta, BlockRecords::default()).unwrap();
 
         let snap = src.snapshot_after(1);
         let (nonce, balance, _) = snap.basic(addr).unwrap().unwrap();

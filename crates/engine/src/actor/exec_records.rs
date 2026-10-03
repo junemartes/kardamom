@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use kardamom_types::kar1::TxFrame;
 use kardamom_types::xchain::XChainMessage;
 use kardamom_types::{BPosition, Deposit, SnapshotSource, TxEnvelope};
 
@@ -138,6 +139,7 @@ impl<W: ExecPorts> ExecState<W> {
             tracing::error!(block = self.cursor.block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
             return Err(e);
         }
+        self.block.records.txs.push(TxFrame::from(&envelope));
         if self.hooks.block_exec.is_some() {
             // Whole-block strategy: defer to the boundary, so batches can
             // execute concurrently.

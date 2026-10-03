@@ -169,6 +169,12 @@ impl Default for PayloadRetention {
     }
 }
 
+impl std::fmt::Display for PayloadRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl std::str::FromStr for PayloadRetention {
     type Err = std::num::ParseIntError;
 
