@@ -1,12 +1,15 @@
 //! The exporter's HTTP listener: `/metrics` renders the registry,
 //! `/ready` answers the service's readiness rule, and `/halt` serves the
-//! standing halt as JSON. One listener serves them all, so a Consul
-//! check, a Prometheus scrape, and an operator share a port.
+//! process's lifecycle record (its halt and its pause) as JSON. One
+//! listener serves them all, so a Consul check, a Prometheus scrape, and
+//! an operator share a port.
 //!
-//! `POST /halt/clear` ends an operator halt. The repository guards no
-//! route with a credential: an admin action is guarded by where it comes
-//! from. The route accepts a loopback peer only, so the operator runs
-//! the clear from the service's own node, as the runbooks say.
+//! Three admin routes change the lifecycle: `POST /halt/clear` ends an
+//! operator halt, `POST /pause?note=<text>` pauses the service, and
+//! `POST /resume` ends a pause. The repository guards no route with a
+//! credential: an admin action is guarded by where it comes from. These
+//! routes accept a loopback peer only, so the operator runs them from the
+//! service's own node, as the runbooks say.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -23,7 +26,8 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use crate::halt::{self, Halt};
+use crate::halt::{self, Pause, PauseReason};
+use crate::lifecycle::{Slots, process};
 use crate::ready::Readiness;
 
 /// The registry's histogram buckets drain on this period, the same
@@ -35,12 +39,12 @@ const UPKEEP: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// What every connection task reads: the registry handle, the rule, the
-/// service name, and the standing halt.
+/// service name, and the process's lifecycle.
 struct Routes {
     handle: PrometheusHandle,
     readiness: Readiness,
     service: &'static str,
-    halts: watch::Receiver<Option<Halt>>,
+    slots: watch::Receiver<Slots>,
 }
 
 impl Routes {
@@ -51,18 +55,20 @@ impl Routes {
             "/metrics" => text(StatusCode::OK, self.handle.render()),
             "/ready" => self.ready(),
             "/halt" => self.halt(),
-            "/halt/clear" if req.method() == Method::POST => Self::clear_halt(local),
+            "/halt/clear" if req.method() == Method::POST => admin(local, Self::clear_halt),
+            "/pause" if req.method() == Method::POST => admin(local, || Self::pause(req)),
+            "/resume" if req.method() == Method::POST => admin(local, Self::resume),
             _ => text(StatusCode::NOT_FOUND, "not found\n".to_string()),
         }
     }
 
-    /// 503 with the halt while one stands, 200 `ready` when the rule
-    /// holds, 503 with the failed conditions when it does not.
+    /// 503 with the halt or the pause while one stands, 200 `ready` when
+    /// the rule holds, 503 with the failed conditions when it does not.
     fn ready(&self) -> Response<Full<Bytes>> {
-        if let Some(halt) = self.halts.borrow().as_ref() {
+        if let Some(summary) = self.slots.borrow().summary() {
             return text(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("not ready:\n{}\n", halt.summary()),
+                format!("not ready:\n{summary}\n"),
             );
         }
         match self
@@ -77,9 +83,9 @@ impl Routes {
         }
     }
 
-    /// The standing halt as JSON, or `{"halted": false}`.
+    /// The lifecycle record as JSON: the state, the halt, the pause.
     fn halt(&self) -> Response<Full<Bytes>> {
-        let body = halt::to_json(self.service, self.halts.borrow().as_ref());
+        let body = halt::to_json(self.service, &self.slots.borrow());
         Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -87,19 +93,45 @@ impl Routes {
             .expect("a status and one header form a valid response")
     }
 
-    /// The operator's clear. A peer off the loopback is refused.
-    fn clear_halt(local: bool) -> Response<Full<Bytes>> {
-        if !local {
-            return text(
-                StatusCode::FORBIDDEN,
-                "a halt clears from the service's own node only\n".to_string(),
-            );
-        }
+    /// The operator's clear of the halt.
+    fn clear_halt() -> Response<Full<Bytes>> {
         match halt::clear() {
             Some(halt) => text(StatusCode::OK, format!("cleared {}\n", halt.cause.id())),
             None => text(StatusCode::OK, "no halt stands\n".to_string()),
         }
     }
+
+    /// The operator's pause. The `note` query parameter says why; it is
+    /// the rest of the query after `note=`, as sent.
+    fn pause(req: &Request<Incoming>) -> Response<Full<Bytes>> {
+        let note = req
+            .uri()
+            .query()
+            .and_then(|q| q.strip_prefix("note="))
+            .unwrap_or("operator pause")
+            .to_string();
+        process().pause(Pause::new(PauseReason::Operator { note }));
+        text(StatusCode::OK, format!("{}\n", process().slots().state().id()))
+    }
+
+    /// The operator's resume: ends any pause.
+    fn resume() -> Response<Full<Bytes>> {
+        match process().resume() {
+            Some(pause) => text(StatusCode::OK, format!("resumed from {}\n", pause.reason.id())),
+            None => text(StatusCode::OK, "no pause stands\n".to_string()),
+        }
+    }
+}
+
+/// Run an admin action for a loopback peer; refuse any other peer.
+fn admin(local: bool, action: impl FnOnce() -> Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    if local {
+        return action();
+    }
+    text(
+        StatusCode::FORBIDDEN,
+        "an admin route answers from the service's own node only\n".to_string(),
+    )
 }
 
 /// A plain-text response.
@@ -130,7 +162,7 @@ impl Server {
                 handle,
                 readiness,
                 service,
-                halts: halt::subscribe(),
+                slots: process().subscribe(),
             }),
         }
     }

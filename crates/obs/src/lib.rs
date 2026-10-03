@@ -5,8 +5,10 @@
 //! shared histogram bucket layout, a build-info gauge, and a liveness
 //! gauge. The exporter serves `/metrics` and, beside it, `/ready`: the
 //! service's readiness rule ([`Readiness`]) over the gauges it exports.
-//! It also serves `/halt`: the service's standing [`halt::Halt`], the
-//! state a service enters when it cannot continue safely.
+//! It also serves `/halt`: the service's lifecycle record, with its
+//! standing [`halt::Halt`] (the state a service enters when it cannot
+//! continue safely) and its pause (the state it enters while it waits on
+//! something outside itself). See [`lifecycle`] and [`events`].
 //! See `docs/specs/2026-05-29-prometheus-grafana-design.md` for the
 //! dashboard layout that reads these metrics.
 
@@ -17,7 +19,9 @@ use anyhow::{Context, Result, anyhow};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 
 pub mod bin;
+pub mod events;
 pub mod halt;
+pub mod lifecycle;
 pub mod ready;
 mod serve;
 #[cfg(feature = "test-support")]
@@ -234,6 +238,10 @@ impl Exporter {
             halt::HALT,
             "1 while the service is halted; cause and recovery name the runbook."
         );
+        metrics::describe_gauge!(
+            halt::PAUSED,
+            "1 while the service is paused; root_service and cause name the root it waits on."
+        );
     }
 
     /// Bind with retry, install the recorder, and spawn the listener.
@@ -247,6 +255,10 @@ impl Exporter {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("register the metrics listener with the runtime")?;
         serve::Server::new(listener, handle, self.readiness, self.service).spawn();
+        events::set_identity(events::Identity {
+            service: self.service.to_string(),
+            instance: self.host_id.clone(),
+        });
 
         Self::register_build_gauges(version, git_sha);
 

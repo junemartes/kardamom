@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::{Clears, Halt, HaltCause, RecoveryId, clear, cleared, current, hold_until, raise};
+use super::{Clears, Halt, HaltCause, RecoveryId, Record, clear, cleared, current, hold_until, raise};
+use crate::lifecycle::Slots;
 
 /// The halt state is one per process, so the tests that write it run
 /// one at a time.
@@ -59,16 +60,24 @@ fn ids_are_stable_and_distinct() {
 
 #[test]
 fn the_json_record_names_the_runbook() {
-    let halt = Halt::new(HaltCause::L1ChainBreak, "block 7");
-    let json = halt.to_json("indexer");
+    let slots = Slots {
+        halt: Some(Halt::new(HaltCause::L1ChainBreak, "block 7")),
+        pause: None,
+    };
+    let json = super::to_json("indexer", &slots);
     assert_eq!(json["service"], "indexer");
+    assert_eq!(json["state"], "halted");
     assert_eq!(json["halted"], true);
     assert_eq!(json["cause"], "l1_chain_break");
     assert_eq!(json["detail"], "block 7");
     assert_eq!(json["runbook"], "docs/runbooks/l1_chain_break.md");
     assert_eq!(json["clears"], "auto");
-    assert!(json["since_unix_secs"].as_f64().unwrap() > 0.0);
-    assert_eq!(super::to_json("indexer", None)["halted"], false);
+    assert!(json["since_unix_ms"].as_u64().unwrap() > 0);
+    assert_eq!(json["pause"], serde_json::Value::Null);
+    let running = super::to_json("indexer", &Slots::default());
+    assert_eq!(running["halted"], false);
+    assert_eq!(running["state"], "running");
+    assert_eq!(slots.halt.unwrap().to_json()["recovery"], "l1_chain_break");
 }
 
 #[tokio::test]
@@ -79,7 +88,7 @@ async fn a_raise_of_the_same_cause_keeps_since_and_a_clear_returns_the_halt() {
     let first = current().unwrap();
     raise(Halt::new(HaltCause::L1Unreachable, "second"));
     let second = current().unwrap();
-    assert_eq!(second.since, first.since);
+    assert_eq!(second.since_unix_ms, first.since_unix_ms);
     assert_eq!(second.detail, "second");
     raise(Halt::new(HaltCause::DaLag, "other"));
     assert_eq!(current().unwrap().cause, HaltCause::DaLag);
@@ -144,4 +153,16 @@ fn every_cause_has_an_alert_rule() {
             cause.id()
         );
     }
+}
+
+#[test]
+fn a_pause_has_an_info_rule_muted_by_its_root() {
+    let rules = std::fs::read_to_string(repo_root().join("deploy/alerts.yml")).unwrap();
+    assert!(rules.contains("alert: KardamomServicePaused"));
+    assert!(rules.contains("expr: kardamom_paused == 1"));
+    let inhibit =
+        std::fs::read_to_string(repo_root().join("deploy/alertmanager-inhibit.yml")).unwrap();
+    assert!(inhibit.contains(r#"'alertname =~ "KardamomHalt.*"'"#), "{inhibit}");
+    assert!(inhibit.contains(r#"'alertname = "KardamomServicePaused"'"#), "{inhibit}");
+    assert!(inhibit.contains("equal:\n      - cause"), "{inhibit}");
 }

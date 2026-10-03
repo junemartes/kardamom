@@ -37,6 +37,7 @@ pub mod num;
 pub mod position;
 pub mod prover;
 pub mod receipt;
+pub mod service;
 pub mod shard_map;
 pub mod state;
 pub mod time;

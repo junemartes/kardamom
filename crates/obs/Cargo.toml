@@ -17,6 +17,8 @@ path = "src/lib.rs"
 test-support = ["dep:reqwest"]
 
 [dependencies]
+# The halt, pause, and event records, shared on the `events` stream.
+kardamom-types = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 anyhow = { workspace = true }
@@ -35,4 +37,4 @@ bytes = { workspace = true }
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

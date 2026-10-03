@@ -1,6 +1,6 @@
 //! The `/halt` route beside `/metrics` and `/ready`: the record as JSON,
-//! the gauge, readiness failing while a halt stands, and the operator's
-//! clear from the loopback.
+//! the gauges, readiness failing while a halt or a pause stands, and the
+//! operator's clear, pause, and resume from the loopback.
 
 mod common;
 
@@ -84,4 +84,29 @@ async fn the_halt_route_serves_the_record_and_readiness_fails_while_halted() {
         get_clear.contains(" 404 "),
         "a clear is a POST: {get_clear}"
     );
+
+    let paused = common::post(addr, "/pause?note=disk-swap", budget).await;
+    assert!(paused.contains(" 200 "), "{paused}");
+    assert!(paused.contains("paused"), "{paused}");
+    let record = common::get(addr, "/halt", budget).await;
+    assert!(record.contains("\"state\":\"paused\""), "{record}");
+    assert!(record.contains("\"note\":\"disk-swap\""), "{record}");
+    let not_ready = common::get(addr, "/ready", budget).await;
+    assert!(not_ready.contains(" 503 "), "{not_ready}");
+    assert!(not_ready.contains("paused: operator (disk-swap)"), "{not_ready}");
+    let metrics = common::get(addr, "/metrics", budget).await;
+    assert!(
+        metrics.lines().any(|l| l.starts_with("kardamom_paused{")
+            && l.contains("reason=\"operator\"")
+            && l.ends_with(" 1")),
+        "{metrics}"
+    );
+    let resumed = common::post(addr, "/resume", budget).await;
+    assert!(resumed.contains("resumed from operator"), "{resumed}");
+    let ready = common::get(addr, "/ready", budget).await;
+    assert!(ready.contains(" 200 "), "{ready}");
+
+    let identity = kardamom_obs::events::identity().expect("the install records it");
+    assert_eq!(identity.service, "halt-test");
+    assert_eq!(identity.instance, "host");
 }
