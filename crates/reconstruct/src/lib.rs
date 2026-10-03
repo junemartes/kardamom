@@ -320,6 +320,21 @@ mod tests {
             recovered.state_root, oracle.state_root,
             "DA-reconstructed root must equal the directly-executed root"
         );
+
+        // A payload carries no archive reference: the rebuilt blocks are
+        // marked as rebuilt from L1, and the query says so.
+        let env = StateEnvBuilder::new(recon_dir.path()).open().unwrap();
+        let refused = kardamom_state::committed_block_refs(&env, 2).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                kardamom_state::StateError::NoBlockRefs {
+                    block: 2,
+                    cause: kardamom_state::NoRefsCause::RebuiltFromL1,
+                }
+            ),
+            "{refused}"
+        );
     }
 
     /// One interop scenario: real interop genesis (Outbox/Inbox predeploy

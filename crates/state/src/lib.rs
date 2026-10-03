@@ -28,7 +28,7 @@ pub use checkpoint::{
 pub use checkpoint_transfer::{CheckpointServer, fetch_best_checkpoint, serve_checkpoints};
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
-pub use error::StateError;
+pub use error::{NoRefsCause, StateError};
 pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
 pub use nonce_query::{
@@ -47,4 +47,4 @@ pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
 // (the validator's witness anchoring) need to name these types without
 // adding their own libmdbx dependency.
 pub use signet_libmdbx;
-pub use writer::{StateWriter, TrieMode, WriteBatch, WriterHandle};
+pub use writer::{StateWriter, TrieMode, TxRefs, WriteBatch, WriterHandle};

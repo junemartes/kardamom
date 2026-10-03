@@ -42,7 +42,10 @@
 //! as a JSON integer or a `0x` quantity. The result is `null`, or the
 //! [`BlockRefs`] record as JSON: the block's canonical end, its L1 origin
 //! and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)`
-//! for each transaction in canonical order.
+//! for each transaction in canonical order. A committed block whose
+//! references cannot rebuild its payload is the JSON-RPC error -32001,
+//! with the cause: this node rebuilt the block from L1, or a transaction
+//! other than a deposit has no reference.
 //!
 //! `x-state-tx-idx` is the canonical end position of the snapshot's last
 //! committed block, as an index. A cache writes the answer back tagged
@@ -73,7 +76,7 @@ const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY: usize = 8 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Queries served, by `outcome` (`ok`, `bad_request`, `error`).
+/// Queries served, by `outcome` (`ok`, `bad_request`, `refused`, `error`).
 pub const NONCE_QUERIES: &str = "kardamom_state_nonce_queries_total";
 
 /// The bound listener and its accept task.
@@ -247,6 +250,9 @@ enum Query {
 const RECEIPT_METHOD: &str = "eth_getTransactionReceipt";
 /// The JSON-RPC name of the block references lookup.
 const REFS_METHOD: &str = "kardamom_getBlockRefs";
+/// The JSON-RPC error code of a committed block whose references cannot
+/// rebuild its payload. The message names the cause.
+const NO_BLOCK_REFS: i64 = -32001;
 
 /// A block number parameter: a JSON integer, or a `0x` quantity.
 fn block_number_param(value: &serde_json::Value) -> Option<u64> {
@@ -375,6 +381,11 @@ impl Reply {
         Self::error("200 OK", "bad_request", id, code, message)
     }
 
+    /// A committed block whose references cannot rebuild its payload.
+    fn refused(id: &serde_json::Value, message: &str) -> Self {
+        Self::error("200 OK", "refused", id, NO_BLOCK_REFS, message)
+    }
+
     /// A failed state read.
     fn internal(id: &serde_json::Value, message: &str) -> Self {
         Self::error("500 Internal Server Error", "error", id, -32603, message)
@@ -463,6 +474,7 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
     let looked_up = tokio::task::spawn_blocking(move || query.read(&env)).await;
     match looked_up {
         Ok(Ok(found)) => found.reply(&request.id),
+        Ok(Err(e @ StateError::NoBlockRefs { .. })) => Reply::refused(&request.id, &e.to_string()),
         Ok(Err(e)) => {
             warn!(error = %e, ?query, "state query: state read failed");
             Reply::internal(&request.id, "state read failed")

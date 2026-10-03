@@ -454,6 +454,14 @@ no L1 and in no DA store; its copies are the sealer's egress retention, the
 ordering in every state database and the bytes on the `tx_data` archives
 (the batcher section above). A block rebuilt from L1 carries no archive
 reference: its bytes are on L1 already, and the batcher never asks for it.
+The rebuild sets the `l1_rebuilt_end_tx_position` meta mark to the end of
+the last rebuilt block. A `tx_hash_index` row at or below the mark stops
+at the position. `kardamom_getBlockRefs` answers such a block with the
+JSON-RPC error -32001 and the cause, and the batcher asks the next query
+endpoint. The deep compare of two state databases compares the position
+of every row. It accepts a row without a reference against a row with one
+only at or below the mark of the node that keeps the shorter row. The
+reference is not in the trie, so the roots of every consumer stay equal.
 
 `kardamom-reconstruct` walks the `BatchPosted` event log, fetches each batch's
 payload from the DA proxy (or the indexer's archive) by the certificate L1

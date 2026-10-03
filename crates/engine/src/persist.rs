@@ -67,6 +67,31 @@ impl MdbxWriterQueue {
     pub fn new(delta_tx: Sender<WriteBatch>) -> Self {
         Self { delta_tx }
     }
+
+    /// Send a block rebuilt from its L1 payload. The payload carries no
+    /// archive reference, so the writer marks the block as rebuilt from L1
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::State`] when the writer thread is gone.
+    pub fn submit_rebuilt(
+        &mut self,
+        block: BlockBoundary,
+        delta: BlockDelta,
+    ) -> Result<(), ExecutorError> {
+        self.send(WriteBatch::rebuilt_from_l1(block, delta))
+    }
+
+    /// The channel is bounded, `HORIZON_BLOCKS` deep. `send` blocks when the
+    /// writer falls that far behind. This is the intended fail-fast
+    /// backpressure. A send error means the writer thread is gone. This is
+    /// fatal.
+    fn send(&self, batch: WriteBatch) -> Result<(), ExecutorError> {
+        self.delta_tx
+            .send(batch)
+            .map_err(|e| ExecutorError::State(format!("state writer channel closed: {e}")))
+    }
 }
 
 impl StateWriterQueue for MdbxWriterQueue {
@@ -76,13 +101,7 @@ impl StateWriterQueue for MdbxWriterQueue {
         delta: BlockDelta,
         refs: Vec<TxRef>,
     ) -> Result<(), ExecutorError> {
-        // The channel is bounded, HORIZON_BLOCKS deep. `send` blocks when the
-        // writer falls that far behind. This is the intended fail-fast
-        // backpressure. A send error means the writer thread is gone. This is
-        // fatal.
-        self.delta_tx
-            .send(WriteBatch::with_refs(block, delta, refs))
-            .map_err(|e| ExecutorError::State(format!("state writer channel closed: {e}")))
+        self.send(WriteBatch::with_refs(block, delta, refs))
     }
 }
 

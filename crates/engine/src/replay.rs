@@ -33,7 +33,7 @@ use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, CodeEntry, Receipt, SnapshotSource, TxEnvelope,
 };
 
-use crate::actor::{StateWriterQueue, StateWriterSignal};
+use crate::actor::StateWriterSignal;
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
@@ -413,9 +413,7 @@ impl<'a> Replay<'a> {
             l2_timestamp: block.l2_timestamp,
             l1_origin: block.canonical_end.map_or(0, |end| end.l1_origin),
         };
-        // A payload carries no archive reference, so a rebuilt block has
-        // none: its bytes are on L1 already.
-        self.queue.submit(boundary, block_delta, Vec::new())?;
+        self.queue.submit_rebuilt(boundary, block_delta)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
         self.counters.head_end_tx_idx = block.canonical_end.map(|end| end.end_tx_idx);

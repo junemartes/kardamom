@@ -12,8 +12,8 @@ use kardamom_types::{BlockBoundary, BlockDelta};
 
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_READER_POSITION,
-    KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
+    KEY_L1_REBUILT_END_TX_POSITION, KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION,
+    KEY_LAST_FSYNCED_READER_POSITION, KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
 };
 use crate::schema::{
     HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
@@ -23,7 +23,7 @@ use crate::schema::{
 };
 use crate::trie;
 
-use super::{StateWriter, TrieMode, WriteBatch};
+use super::{StateWriter, TrieMode, TxRefs, WriteBatch};
 
 /// Per-section stopwatches for one `apply` call, reported when
 /// `KARDAMOM_WRITER_TIMING` is set.
@@ -181,11 +181,11 @@ impl<'a> BatchWriter<'a> {
         let delta = &batch.delta;
         // The references by hash: a lookup per receipt, not a walk per
         // receipt. The map's order never reaches the table.
-        let data: HashMap<_, _> = batch
-            .refs
-            .iter()
-            .map(|r| (r.tx_hash, TxDataRef::of(r)))
-            .collect();
+        let refs: &[_] = match &batch.refs {
+            TxRefs::Archive(refs) => refs,
+            TxRefs::RebuiltFromL1 => &[],
+        };
+        let data: HashMap<_, _> = refs.iter().map(|r| (r.tx_hash, TxDataRef::of(r))).collect();
         // Receipts arrive in ascending BPosition order, so use a cursor.
         // One pass writes each receipt and collects its hash-index entry,
         // instead of a second walk over `delta.receipts` just to build `hk`.
@@ -213,7 +213,17 @@ impl<'a> BatchWriter<'a> {
 
     /// Write the block-level durable cursors, last so a reader never sees a
     /// cursor advance past data the same transaction has not yet committed.
-    fn meta_cursors(self, boundary: &BlockBoundary) -> Result<Self, StateError> {
+    /// A block rebuilt from L1 also moves the rebuilt mark to its end.
+    fn meta_cursors(self, batch: &WriteBatch) -> Result<Self, StateError> {
+        let boundary = &batch.boundary;
+        if matches!(batch.refs, TxRefs::RebuiltFromL1) {
+            self.txn.put(
+                self.meta,
+                KEY_L1_REBUILT_END_TX_POSITION,
+                encode_b_position(boundary.end_tx_idx),
+                WriteFlags::UPSERT,
+            )?;
+        }
         self.txn.put(
             self.meta,
             KEY_LAST_COMMITTED_BLOCK,
@@ -297,7 +307,7 @@ impl StateWriter {
             .code(&batch.delta)?
             .header(&batch.boundary)?
             .receipts_and_index(batch)?
-            .meta_cursors(&batch.boundary)?
+            .meta_cursors(batch)?
             .advance_state_root(&batch.boundary, &batch.delta)?
             .finish();
 

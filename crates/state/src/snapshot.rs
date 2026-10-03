@@ -20,10 +20,11 @@ use signet_libmdbx::tx::aliases::RoTxSync;
 use signet_libmdbx::{Database, Environment};
 
 use crate::env::StateEnv;
-use crate::error::StateError;
+use crate::error::{NoRefsCause, StateError};
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_STATE_ROOT,
-    encode_b_position, get_decoded, read_meta_b_position, read_meta_b256, read_meta_u64,
+    KEY_L1_REBUILT_END_TX_POSITION, KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION,
+    KEY_STATE_ROOT, encode_b_position, get_decoded, read_meta_b_position, read_meta_b256,
+    read_meta_u64,
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
@@ -134,10 +135,10 @@ impl StateSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`StateError`] if a read fails, or [`StateError::Recovery`]
-    /// when the block cannot be rebuilt from references: a transaction
-    /// without one (a row written before the reference existed), or a
-    /// cross-chain message, whose remote-epoch record is in no archive.
+    /// Returns [`StateError`] if a read fails, or
+    /// [`StateError::NoBlockRefs`] when the block cannot be rebuilt from
+    /// references: this node rebuilt the block from L1, or a transaction
+    /// other than a deposit has no reference.
     pub fn block_refs(&self, number: u64) -> Result<Option<BlockRefs>, StateError> {
         let txn = &self.inner.txn;
         let headers = txn.open_db(Some(TABLE_HEADERS))?;
@@ -146,6 +147,15 @@ impl StateSnapshot {
         else {
             return Ok(None);
         };
+        if self
+            .l1_rebuilt_end()?
+            .is_some_and(|end| header.end_tx_idx <= end)
+        {
+            return Err(StateError::NoBlockRefs {
+                block: number,
+                cause: NoRefsCause::RebuiltFromL1,
+            });
+        }
         // The block's records sit between the previous block's end and its
         // own. The chain's first block starts at position zero.
         let start = match number.checked_sub(1).filter(|n| *n > 0) {
@@ -205,11 +215,13 @@ impl StateSnapshot {
                 position: data.position.as_index(),
             })),
             (None, TX_TYPE_DEPOSIT) => Ok(None),
-            (None, tx_type) => Err(StateError::Recovery(format!(
-                "transaction {} (type {tx_type:#x}) in block {} has no archive reference; the \
-                 block cannot be rebuilt from references",
-                receipt.tx_hash, receipt.block_number
-            ))),
+            (None, tx_type) => Err(StateError::NoBlockRefs {
+                block: receipt.block_number,
+                cause: NoRefsCause::Unreferenced {
+                    tx_hash: receipt.tx_hash,
+                    tx_type,
+                },
+            }),
         }
     }
 
@@ -254,6 +266,13 @@ impl StateSnapshot {
             read_meta_b_position(&self.inner.txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?
                 .unwrap_or(BPosition::ZERO),
         )
+    }
+
+    /// The end of the last block this node rebuilt from L1, or `None` when
+    /// it rebuilt none. See `meta::KEY_L1_REBUILT_END_TX_POSITION`.
+    fn l1_rebuilt_end(&self) -> Result<Option<BPosition>, StateError> {
+        let meta = self.inner.txn.open_db(Some(TABLE_META))?;
+        read_meta_b_position(&self.inner.txn, meta, KEY_L1_REBUILT_END_TX_POSITION)
     }
 
     /// Walk every account in address order and call `f(address, nonce,

@@ -43,15 +43,28 @@ use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
 pub struct WriteBatch {
     pub boundary: BlockBoundary,
     pub delta: BlockDelta,
+    /// Where the bytes of the block's transactions are.
+    pub refs: TxRefs,
+}
+
+/// Where the bytes of a block's transactions are, as the writer records
+/// them in the `tx_hash_index` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxRefs {
     /// The `TxRef` of every transaction of the block, as the canonical
     /// stream carried it: where the bytes are on a `tx_data` archive. A
     /// deposit or a cross-chain message has none.
-    pub refs: Vec<TxRef>,
+    Archive(Vec<TxRef>),
+    /// The block is rebuilt from its L1 payload. A payload carries no
+    /// archive reference, so no row of the block has one. The block is on
+    /// L1, so a DA recovery never needs its references. The writer moves
+    /// the `l1_rebuilt_end_tx_position` mark to the block's end.
+    RebuiltFromL1,
 }
 
 impl WriteBatch {
     /// A block with no transaction reference: a block of deposits and
-    /// markers only, a replayed block, or a synthetic block in a test.
+    /// markers only, or a synthetic block in a test.
     #[must_use]
     pub fn new(boundary: BlockBoundary, delta: BlockDelta) -> Self {
         Self::with_refs(boundary, delta, Vec::new())
@@ -62,7 +75,17 @@ impl WriteBatch {
         Self {
             boundary,
             delta,
-            refs,
+            refs: TxRefs::Archive(refs),
+        }
+    }
+
+    /// A block rebuilt from its L1 payload: see [`TxRefs::RebuiltFromL1`].
+    #[must_use]
+    pub fn rebuilt_from_l1(boundary: BlockBoundary, delta: BlockDelta) -> Self {
+        Self {
+            boundary,
+            delta,
+            refs: TxRefs::RebuiltFromL1,
         }
     }
 

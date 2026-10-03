@@ -283,8 +283,11 @@ pub(crate) fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> 
 // then, for a transaction whose bytes a `tx_data` archive holds, its
 // `TxRef` without the hash: `shard_id` (1 byte), `session_id` (i32 BE),
 // and the archive position (8 bytes). A deposit or a cross-chain message
-// has no bytes on an archive, and its row stops at the position. An 8-byte
-// row written before the reference existed decodes the same way.
+// has no bytes on an archive, and its row stops at the position. A block
+// rebuilt from its L1 payload has no reference either: the payload carries
+// none. Its rows stop at the position, and the `l1_rebuilt_end_tx_position`
+// meta mark covers them. An 8-byte row written before the reference
+// existed decodes the same way.
 //
 // Block commit populates one entry per receipt. On the read path,
 // `eth_getTransactionReceipt(hash)` calls

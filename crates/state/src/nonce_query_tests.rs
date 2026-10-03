@@ -222,11 +222,24 @@ async fn rejects_other_methods_and_bad_input() {
     assert!(get.starts_with("HTTP/1.0 404"), "{get}");
 }
 
+/// How a fixture writes block 1: with its references, or as a block
+/// rebuilt from L1.
+type FirstBlock = fn(
+    kardamom_types::BlockBoundary,
+    kardamom_types::BlockDelta,
+    Vec<kardamom_types::TxRef>,
+) -> crate::writer::WriteBatch;
+
 /// A state DB with two committed blocks. Block 1: one transaction,
 /// ending at index 1. Block 2: a deposit at 1, then two transactions at
 /// 2 and 3, ending at index 4. Every transaction has an archive
 /// reference on session -9.
 fn env_with_two_blocks(dir: &std::path::Path) -> StateEnv {
+    env_with_two_blocks_and(dir, crate::writer::WriteBatch::with_refs)
+}
+
+/// [`env_with_two_blocks`] with block 1 written by `first`.
+fn env_with_two_blocks_and(dir: &std::path::Path, first_block: FirstBlock) -> StateEnv {
     use crate::writer::{StateWriter, WriteBatch};
     use kardamom_types::receipt::TX_TYPE_DEPOSIT;
     use kardamom_types::{BPosition, BlockBoundary, BlockDelta, TxRef};
@@ -274,7 +287,7 @@ fn env_with_two_blocks(dir: &std::path::Path) -> StateEnv {
     };
     handle
         .delta_tx
-        .send(WriteBatch::with_refs(
+        .send(first_block(
             boundary(1, 1),
             first,
             vec![tx_ref(0xA0, 0, 100)],
@@ -394,4 +407,33 @@ async fn a_block_without_references_is_refused_not_shortened() {
     handle.shutdown().unwrap();
     let err = crate::committed_block_refs(&env, 1).unwrap_err();
     assert!(err.to_string().contains("no archive reference"), "{err}");
+}
+
+/// A node that rebuilt a block from L1 keeps no reference for it. The
+/// query refuses the block with the cause as a JSON-RPC error, and still
+/// serves a later block that has its references.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_rebuilt_from_l1_is_refused_with_the_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_with_two_blocks_and(dir.path(), |boundary, delta, _| {
+        crate::writer::WriteBatch::rebuilt_from_l1(boundary, delta)
+    });
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let addr = server.addr;
+    let ask = move |number: u64| {
+        post(
+            addr,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"kardamom_getBlockRefs","params":[{number}]}}"#
+            ),
+        )
+    };
+
+    let rebuilt = tokio::task::spawn_blocking(move || ask(1)).await.unwrap();
+    assert!(rebuilt.starts_with("HTTP/1.0 200 OK"), "{rebuilt}");
+    assert!(rebuilt.contains("-32001"), "{rebuilt}");
+    assert!(rebuilt.contains("rebuilt the block from L1"), "{rebuilt}");
+
+    let live = tokio::task::spawn_blocking(move || ask(2)).await.unwrap();
+    assert!(live.contains(r#""position":300"#), "{live}");
 }
