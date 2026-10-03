@@ -12,10 +12,11 @@
   ansible.builtin.set_fact:
     workloads_jobs: {}
 
+# The submission waits for its deployment: a canary needs the role's
+# promotion, and the next phase of the resize needs this one whole.
 - name: Plan and submit the resize job
   ansible.builtin.include_tasks: job.yml
   vars:
     workloads_job:
       name: "{{ workloads_resize_job }}"
-      wait: false
       vars: "{{ workloads_resize_vars | default({}) }}"

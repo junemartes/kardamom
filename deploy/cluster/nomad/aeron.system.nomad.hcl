@@ -82,6 +82,18 @@ job "aeron" {
   }
 
   group "aeron" {
+    # A system job rolls node by node: every pipeline process on a node
+    # shares its driver, so two drivers must never restart together. The
+    # driver's control channel is UDP, so no port check applies; the
+    # task state plus the stagger is the gate.
+    update {
+      max_parallel     = 1
+      stagger          = "30s"
+      health_check     = "task_states"
+      min_healthy_time = "15s"
+      healthy_deadline = "3m"
+    }
+
     network {
       mode = "host"
       # The archive control endpoint, registered below. Consumers

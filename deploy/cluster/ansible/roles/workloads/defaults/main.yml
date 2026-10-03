@@ -36,6 +36,7 @@ workloads_common_vars:
   sealer_count: "{{ node_classes.sealer.count }}"
   sequencer_count: "{{ node_classes.sequencer.count }}"
   ingress_count: "{{ node_classes.ingress.count }}"
+  canary: "{{ workloads_canary }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -107,3 +108,23 @@ workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80
+# The poll budget of one Nomad deployment, in polls of workloads_poll_delay
+# seconds. It covers a job's progress_deadline (10 minutes), so a
+# deployment that Nomad has not decided yet is never read as a failure.
+workloads_deployment_retries: 220
+# Canary allocations for the ingress and the sequencer: 0 or 1. A canary
+# is one allocation more than the count, so it needs a spare node of its
+# class; the container profile has none.
+workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
+# The sealer members' admin port (cluster_ports.admin): the role reads
+# the leader from it for the staged roll.
+workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The operator binary that runs the smoke against a canary.
+workloads_cluster_binary: >-
+  {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
+     | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
+# The record of the deployed manifests, by environment: deployed/<env>/
+# images.digests is the last successful deploy, .previous the one before.
+# `just rollback <env>` deploys the previous one.
+workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
+workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"

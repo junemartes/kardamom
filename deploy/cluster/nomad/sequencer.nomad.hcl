@@ -33,6 +33,12 @@ variable "metrics_base" {
   type    = number
   default = 9001
 }
+# Canary allocations per lane deployment: 0 or 1. A canary needs a spare
+# sequencer-class node; a profile without one keeps 0.
+variable "canary" {
+  type    = number
+  default = 0
+}
 variable "shard_table" {
   type        = list(number)
   description = "The target map's 256 lane assignments. Empty uses the two-lane development identity map."
@@ -108,17 +114,41 @@ job "sequencer" {
         unlimited      = true
       }
 
+      # One replica of a lane at a time, healthy by its /ready check:
+      # the lane left its startup resync and the cluster egress is
+      # attached. The twin keeps the lane publishing meanwhile. A
+      # failed instance reverts the job: a sequencer holds no state.
       update {
-        max_parallel     = 1
-        health_check     = "task_states"
-        min_healthy_time = "10s"
-        healthy_deadline = "2m"
-        auto_revert      = false
+        max_parallel      = 1
+        canary            = var.canary
+        auto_promote      = false
+        auto_revert       = true
+        health_check      = "checks"
+        min_healthy_time  = "15s"
+        healthy_deadline  = "3m"
+        progress_deadline = "10m"
       }
 
       network {
         mode = "host"
         port "egress" {}
+        # The exporter, one port per lane, so two lanes share a node.
+        port "metrics" {
+          static = var.metrics_base + 10 * parseint(group.key, 10)
+        }
+      }
+
+      service {
+        name     = "kardamom-sequencer"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics", "lane-${group.key}"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       dynamic "task" {

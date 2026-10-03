@@ -1,12 +1,17 @@
 # kardamom-cluster is the 3-member Aeron Cluster (Raft) sealer. Each
 # alloc is one Raft member. Members run on the sealer node class
-# (sealer-0, sealer-1, sealer-2; constraint ${meta.role} == sealer), with
-# distinct_hosts so one member lands on each sealer node. memberId
-# comes from the node's own IP (${meta.node_ip}), not
-# ${NOMAD_ALLOC_INDEX}. distinct_hosts spreads allocs across the 3
-# nodes, but the alloc index is not guaranteed to match node-IP order.
-# A static index-to-IP mapping could advertise the wrong endpoints and
-# fail to form quorum.
+# (sealer-0, sealer-1, sealer-2; constraint ${meta.role} == sealer).
+# Member i is one task group, cluster-<i>, pinned to the node with
+# node_index i: the static membership list names sealer-<i> as member
+# i, so the group and the node agree by construction. memberId comes
+# from the node (${meta.node_index}), not ${NOMAD_ALLOC_INDEX}.
+#
+# One group per member lets the deploy roll the members in its own
+# order: the role submits one group's change at a time (the followers
+# first, the leader last), and each group's update stanza holds the
+# next member until this one rejoined and caught up. A plain
+# `nomad job run` of a changed file rolls every group at once, so
+# submit the job through the workloads role.
 #
 # This replaces the single sealer (sealer.nomad.hcl) in cluster mode.
 # Ordering and durability now fold into the Raft log and the
@@ -121,8 +126,11 @@ variable "sealer_count" {
 # The member id is the node index (meta.node_index), so a member never
 # has to find itself by address. The port list mirrors cluster_ports in
 # group_vars/all.yml: ingress, consensus, log, catchup, archive_control.
+# The admin port (cluster_ports.admin) serves the member status and the
+# readiness check; it is not part of the membership list.
 locals {
   member_ports = [40200, 40201, 40202, 40203, 40204]
+  admin_port   = 40205
   void_voters  = join(",", range(var.executor_count + 2))
   members = join("|", [
     for i in range(var.sealer_count) :
@@ -139,116 +147,155 @@ job "cluster" {
     value     = "sealer"
   }
 
-  group "cluster" {
-    # Run one Raft member per sealer node, a 3-member quorum.
-    # distinct_hosts spreads the members across the 3 sealer nodes.
-    # memberId comes from the node IP, since the alloc index is not
-    # guaranteed to match node-IP order.
-    count = 3
-    constraint {
-      operator = "distinct_hosts"
-      value    = "true"
-    }
-
-    # Never give up restarting a Raft member. mode=delay retries past
-    # exhausted attempts, instead of leaving the task dead. Nomad's
-    # service defaults (attempts=2/30m, mode=fail) can silently strand
-    # a member. A member restarted into the survivors' election window
-    # (about a 10s leader-heartbeat timeout, plus the election itself)
-    # self-terminates through Aeron's termination hook: cleanly, exit
-    # 0, nothing in the error log. Reproduced locally: a kill -9'd
-    # leader relaunched at +2s dies about 1s in, but relaunched after
-    # the election it rejoins fine every time. Each such death burned a
-    # default attempt. Once exhausted, the member stayed down, and the
-    # cluster wedged at 2/3 (or 1/3 after the quorum-loss case). This
-    # was the chaos suite's most common flake. The 15s delay also
-    # spaces retries past the election window, so the second attempt
-    # lands in the always-works rejoin path.
-    restart {
-      attempts = 5
-      interval = "5m"
-      delay    = "15s"
-      mode     = "delay"
-    }
-
-    network {
-      mode = "host"
-      # The client-facing ingress endpoint, registered below.
-      port "ingress" {
-        static = 40200
+  dynamic "group" {
+    for_each = range(var.sealer_count)
+    labels   = ["cluster-${group.value}"]
+    content {
+      # Member i runs on sealer-<i>: the node whose index is i.
+      count = 1
+      constraint {
+        attribute = "${meta.node_index}"
+        value     = format("%d", group.value)
       }
-    }
 
-    task "cluster" {
-      driver = "docker"
+      # Never give up restarting a Raft member. mode=delay retries past
+      # exhausted attempts, instead of leaving the task dead. Nomad's
+      # service defaults (attempts=2/30m, mode=fail) can silently strand
+      # a member. A member restarted into the survivors' election window
+      # (about a 10s leader-heartbeat timeout, plus the election itself)
+      # self-terminates through Aeron's termination hook: cleanly, exit
+      # 0, nothing in the error log. Reproduced locally: a kill -9'd
+      # leader relaunched at +2s dies about 1s in, but relaunched after
+      # the election it rejoins fine every time. Each such death burned a
+      # default attempt. Once exhausted, the member stayed down, and the
+      # cluster wedged at 2/3 (or 1/3 after the quorum-loss case). This
+      # was the chaos suite's most common flake. The 15s delay also
+      # spaces retries past the election window, so the second attempt
+      # lands in the always-works rejoin path.
+      restart {
+        attempts = 5
+        interval = "5m"
+        delay    = "15s"
+        mode     = "delay"
+      }
 
-      # The cluster member record of the discovery contract
-      # (docs/aeron-discovery.md): every cluster client resolves the
-      # member ingress endpoints from these records at startup. The
-      # member id equals the node index of the sealer class, which is
-      # the order ClusterNode derives its member id from the node IP.
-      # Nomad owns this record. Discovering a member never changes the
-      # voting set: the membership stays the static list in
-      # JAVA_TOOL_OPTIONS below.
-      service {
-        name     = "kardamom-cluster-member"
-        port     = "ingress"
-        address  = "${meta.node_ip}"
-        provider = "consul"
-        meta {
-          discovery_version = "1"
-          cluster_id        = "${meta.cluster_id}"
-          chain_id          = "412346"
-          member_id         = "${meta.node_index}"
+      # One member at a time, and only after the member's own check
+      # passes for a minute: it reports LEADER or FOLLOWER with the
+      # election closed and its applied position at the commit position,
+      # so it has rejoined and caught up before the next member stops.
+      # Two members never restart together. No revert: a member carries
+      # the Raft log, and the role's rollback is the path.
+      update {
+        max_parallel      = 1
+        health_check      = "checks"
+        min_healthy_time  = "60s"
+        healthy_deadline  = "5m"
+        progress_deadline = "10m"
+        auto_revert       = false
+      }
+
+      network {
+        mode = "host"
+        # The client-facing ingress endpoint, registered below.
+        port "ingress" {
+          static = 40200
+        }
+        # The member-status admin endpoint: GET /status and GET /ready.
+        port "admin" {
+          static = local.admin_port
         }
       }
 
-      # These are JVM options for the image ENTRYPOINT
-      # (java -Xmx384m -cp ... ClusterNode). They must go through env,
-      # not docker `args`. docker `args` land after the main class, so
-      # they would become program arguments instead of -D system
-      # properties. ClusterNode reads System.getProperty(...), so the
-      # members and nodeIp properties would be null, and every member
-      # would crash-loop on startup ("kardamom.cluster.members not
-      # set"). JAVA_TOOL_OPTIONS is read by the JVM as VM options, the
-      # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
-      # interpolates in env exactly as it would in args.
-      # aeron.mtu.length=1344 applies to the embedded ClusteredMediaDriver:
-      # the same value as the shared driver (aeron.system.nomad.hcl),
-      # below the 1400-byte path of a Hetzner vSwitch VLAN.
-      env {
-        JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks}"
-      }
+      task "cluster" {
+        driver = "docker"
 
-      config {
-        image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-cluster:dev"
-        # force_pull stays on for both paths; see the ingress job's
-        # comment. The :dev fallback needs it. On the pinned path, the
-        # 1.9.5 driver pulls the tag but resolves the image by digest,
-        # so the pin holds.
-        force_pull = true
-        # This skips readonly_rootfs on
-        # purpose. This is a JVM task, and the JVM writes into the
-        # rootfs outside the bind mounts, at least /tmp (hsperfdata,
-        # JVM temp files). Turning this on needs a tmpfs mount for
-        # /tmp, validated by a full cluster-e2e pass first. A wrong
-        # guess here would wedge the Raft sealer, which is the whole
-        # pipeline.
-        network_mode = "host"
-        volumes = [
-          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
-          "/opt/kardamom/cluster:/opt/kardamom/cluster",
-          "/opt/kardamom/archive:/opt/kardamom/archive",
-        ]
-        # The JVM -D system properties pass through the
-        # JAVA_TOOL_OPTIONS env stanza above, not here as docker
-        # `args`. args land after the main class, and would be parsed
-        # as program arguments, leaving System.getProperty null.
-      }
+        # The cluster member record of the discovery contract
+        # (docs/aeron-discovery.md): every cluster client resolves the
+        # member ingress endpoints from these records at startup. The
+        # member id equals the node index of the sealer class, which is
+        # the order ClusterNode derives its member id from the node IP.
+        # Nomad owns this record. Discovering a member never changes the
+        # voting set: the membership stays the static list in
+        # JAVA_TOOL_OPTIONS below.
+        service {
+          name     = "kardamom-cluster-member"
+          port     = "ingress"
+          address  = "${meta.node_ip}"
+          provider = "consul"
+          meta {
+            discovery_version = "1"
+            cluster_id        = "${meta.cluster_id}"
+            chain_id          = "412346"
+            member_id         = "${meta.node_index}"
+          }
 
-      resources {
-        cpu    = 1000
-        memory = 1024
+          # The ingress endpoint answers connects while the member runs.
+          check {
+            type     = "tcp"
+            interval = "10s"
+            timeout  = "2s"
+          }
+
+          # The member's own verdict: 200 once it is LEADER or FOLLOWER
+          # with the election closed and its service caught up to the
+          # commit position; 503 while it elects or catches up.
+          check {
+            name      = "member-ready"
+            type      = "http"
+            port      = "admin"
+            path      = "/ready"
+            interval  = "10s"
+            timeout   = "2s"
+          }
+        }
+
+        # These are JVM options for the image ENTRYPOINT
+        # (java -Xmx384m -cp ... ClusterNode). They must go through env,
+        # not docker `args`. docker `args` land after the main class, so
+        # they would become program arguments instead of -D system
+        # properties. ClusterNode reads System.getProperty(...), so the
+        # members and nodeIp properties would be null, and every member
+        # would crash-loop on startup ("kardamom.cluster.members not
+        # set"). JAVA_TOOL_OPTIONS is read by the JVM as VM options, the
+        # same mechanism as the aeron job's _JAVA_OPTIONS. ${meta.node_ip}
+        # interpolates in env exactly as it would in args.
+        # aeron.mtu.length=1344 applies to the embedded ClusteredMediaDriver:
+        # the same value as the shared driver (aeron.system.nomad.hcl),
+        # below the 1400-byte path of a Hetzner vSwitch VLAN.
+        env {
+          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.adminPort=${local.admin_port}"
+        }
+
+        config {
+          image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-cluster:dev"
+          # force_pull stays on for both paths; see the ingress job's
+          # comment. The :dev fallback needs it. On the pinned path, the
+          # 1.9.5 driver pulls the tag but resolves the image by digest,
+          # so the pin holds.
+          force_pull = true
+          # This skips readonly_rootfs on
+          # purpose. This is a JVM task, and the JVM writes into the
+          # rootfs outside the bind mounts, at least /tmp (hsperfdata,
+          # JVM temp files). Turning this on needs a tmpfs mount for
+          # /tmp, validated by a full cluster-e2e pass first. A wrong
+          # guess here would wedge the Raft sealer, which is the whole
+          # pipeline.
+          network_mode = "host"
+          volumes = [
+            "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+            "/opt/kardamom/cluster:/opt/kardamom/cluster",
+            "/opt/kardamom/archive:/opt/kardamom/archive",
+          ]
+          # The JVM -D system properties pass through the
+          # JAVA_TOOL_OPTIONS env stanza above, not here as docker
+          # `args`. args land after the main class, and would be parsed
+          # as program arguments, leaving System.getProperty null.
+        }
+
+        resources {
+          cpu    = 1000
+          memory = 1024
+        }
       }
     }
   }
