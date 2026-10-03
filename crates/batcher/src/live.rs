@@ -24,8 +24,10 @@
 //! [`BatchAccumulator`]: crate::batch::BatchAccumulator
 
 mod cursor;
+mod events;
 mod feed;
 pub mod poll;
+mod posted_cursor;
 mod run;
 mod sender;
 mod spool;

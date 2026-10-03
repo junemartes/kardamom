@@ -66,6 +66,15 @@ public final class ClusterNode {
         final long inclusionHorizonBlocks = Long.getLong(
             "kardamom.cluster.inclusionHorizonBlocks",
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
+        // The DA-lag budget: how far the sealed head may run past the last
+        // block posted to L1 before the sealer refuses new transactions.
+        // Replicated configuration like the horizon. Zero turns the guard
+        // off. -Dkardamom.cluster.daLagBudgetBlocks wins over the
+        // DA_LAG_BUDGET_BLOCKS env var.
+        final long daLagBudgetBlocks = parseDaLagBudget(
+            System.getProperty("kardamom.cluster.daLagBudgetBlocks", System.getenv("DA_LAG_BUDGET_BLOCKS")));
+        System.out.println("cluster da-lag budget memberId=" + memberId
+            + " blocks=" + (daLagBudgetBlocks == 0 ? "0 <guard off>" : Long.toString(daLagBudgetBlocks)));
         // Remote-origin allowlist: the peer chain ids this sealer accepts
         // kind-5 records from. -Dkardamom.cluster.remoteOrigins wins over
         // the KARDAMOM_REMOTE_ORIGINS env var. Unset or empty disables
@@ -120,8 +129,8 @@ public final class ClusterNode {
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 container = ClusteredServiceContainer.launch(
                     serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks, tickMs,
-                        memberId, remoteOrigins,
+                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks,
+                        daLagBudgetBlocks, tickMs, memberId, remoteOrigins,
                         voidConfig, barrier));
                 break;
             } catch (final RuntimeException e) {
@@ -481,11 +490,31 @@ public final class ClusterNode {
         return id;
     }
 
+    /** The DA-lag budget from its property or env value; unset means the default. */
+    static long parseDaLagBudget(final String raw) {
+        if (raw == null || raw.isBlank()) {
+            return CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS;
+        }
+        final long blocks;
+        try {
+            blocks = Long.parseLong(raw.trim());
+        } catch (final NumberFormatException e) {
+            throw new IllegalStateException(
+                "kardamom.cluster.daLagBudgetBlocks: '" + raw + "' is not a block count", e);
+        }
+        if (blocks < 0) {
+            throw new IllegalStateException(
+                "kardamom.cluster.daLagBudgetBlocks: " + blocks + " is negative");
+        }
+        return blocks;
+    }
+
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir,
             final String clusterDir,
             final int dedupCapacity,
             final long inclusionHorizonBlocks,
+            final long daLagBudgetBlocks,
             final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
             final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
@@ -494,7 +523,7 @@ public final class ClusterNode {
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(
                 dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks));
+                inclusionHorizonBlocks, daLagBudgetBlocks));
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

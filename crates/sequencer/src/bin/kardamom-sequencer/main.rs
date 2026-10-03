@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
+    TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
@@ -546,6 +546,13 @@ async fn main() -> anyhow::Result<()> {
         .context("build the stream plane")?;
 
     let handles = Handles::open(&rt, &mut plane, &cfg).await?;
+    // This replica's lifecycle on the `events` stream: it pauses while the
+    // sealer emits no boundary.
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(&rt)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
 
     let shutdown = Shutdown::new();
 

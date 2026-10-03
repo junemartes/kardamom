@@ -52,6 +52,18 @@ variable "cluster_inclusion_horizon_blocks" {
   default = "64"
 }
 
+# The DA-lag budget (-Dkardamom.cluster.daLagBudgetBlocks): how far the
+# sealed head may run past the last block the batcher posted to L1 before
+# the sealer refuses new transactions, and the bound of the egress
+# retention above the posted head. Every member must agree. Zero turns
+# the guard off: a chain that would rather stay live and risk the loss of
+# the unposted blocks sets it here, in the open. Ansible deployment
+# passes -var from KARDAMOM_DA_LAG_BUDGET_BLOCKS.
+variable "cluster_da_lag_budget_blocks" {
+  type    = string
+  default = "10000"
+}
+
 # File sync level of the Raft log and the archive
 # (-Dkardamom.cluster.fileSyncLevel): 0 leaves a write in the page cache,
 # 1 syncs the data of every write batch, 2 syncs data and metadata. At 0
@@ -217,7 +229,7 @@ job "cluster" {
       # the same value as the shared driver (aeron.system.nomad.hcl),
       # below the 1400-byte path of a Hetzner vSwitch VLAN.
       env {
-        JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks}"
+        JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks}"
       }
 
       config {

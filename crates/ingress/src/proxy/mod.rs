@@ -19,10 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
-use tokio::sync::broadcast;
+use alloy_rpc_types_eth::BlockNumberOrTag;
+use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{AccountView, CacheReader, ExecutorQuery, LiveAccounts};
-use kardamom_types::{Receipt, TxError};
+use kardamom_obs::halt::{HaltRef, Pause, PauseReason};
+use kardamom_obs::lifecycle::{Lifecycle, process};
+use kardamom_types::{ClusterStatus, Receipt, TxError};
+
+use crate::chain::SealerLifecycle;
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -171,6 +176,12 @@ where
     /// and the parked ones keep waiting for their receipts. See
     /// [`Self::begin_drain`].
     pub(crate) draining: Arc<std::sync::atomic::AtomicBool>,
+    /// The latest cluster status: the posted head behind `safe`, and the
+    /// DA-lag flag the sealer's lifecycle follows.
+    pub(crate) cluster_status: watch::Receiver<ClusterStatus>,
+    /// The sealer's lifecycle as this ingress observes it. The binary
+    /// publishes it on the `events` stream.
+    pub(crate) sealer: SealerLifecycle,
 }
 
 /// Capacity of the deduped receipt and error re-broadcast feeds. A
@@ -207,6 +218,8 @@ where
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
             draining: self.draining.clone(),
+            cluster_status: self.cluster_status.clone(),
+            sealer: self.sealer.clone(),
         }
     }
 }
@@ -238,6 +251,7 @@ where
                 live.clone(),
             ))
         });
+        let cluster_status = subscription.cluster_status();
         let me = Self {
             cfg,
             partition_count_m,
@@ -256,9 +270,12 @@ where
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_status,
+            sealer: Arc::new(Lifecycle::new(Some(crate::chain::SEALER))),
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
+        me.spawn_chain_watch();
         // Subscribe only to the watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
             me.spawn_quorum_watermark_watcher();
@@ -281,6 +298,90 @@ where
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
         self.latest_block_number.load(Ordering::Acquire)
+    }
+
+    /// The latest cluster status the egress fanned out.
+    #[must_use]
+    pub fn cluster_status(&self) -> ClusterStatus {
+        *self.cluster_status.borrow()
+    }
+
+    /// The sealer's lifecycle as this ingress observes it.
+    #[must_use]
+    pub fn sealer(&self) -> &SealerLifecycle {
+        &self.sealer
+    }
+
+    /// The chain status: the heads, the roots, and every service's latest
+    /// state. `kardamom_chainStatus` serves it.
+    #[must_use]
+    pub fn chain_status(&self) -> serde_json::Value {
+        crate::chain::ChainStatus {
+            cluster: self.cluster_status(),
+            sealer: &self.sealer.slots(),
+            ingress: &process().slots(),
+            board: &self.subscription.service_board().borrow(),
+        }
+        .to_json()
+    }
+
+    /// The error of a submit refused while the ingress is paused: the
+    /// root and its detail, or the operator's note.
+    pub(crate) fn paused_error(&self, pause: Pause) -> IngressError {
+        match pause.reason {
+            PauseReason::Upstream(root) => IngressError::ChainHalted {
+                detail: self.root_detail(&root),
+                root,
+            },
+            PauseReason::Operator { note } => IngressError::OperatorPaused { note },
+        }
+    }
+
+    /// The detail of `root`'s halt: the sealer's from its lifecycle, any
+    /// other from the board. Empty when the record is gone.
+    fn root_detail(&self, root: &HaltRef) -> String {
+        if root.is_sealer() {
+            return self
+                .sealer
+                .slots()
+                .halt
+                .map(|h| h.detail)
+                .unwrap_or_default();
+        }
+        self.subscription
+            .service_board()
+            .borrow()
+            .services
+            .iter()
+            .filter(|view| {
+                view.event.service == root.service && view.event.instance == root.instance
+            })
+            .find_map(|view| view.event.state.halt().map(|h| h.detail.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The block a tag names. `latest` and `pending` name the head;
+    /// `safe` names the last block posted to L1, and `finalized` the
+    /// same block, because the batcher does not observe L1 finality
+    /// today; `earliest` is genesis; a number names itself up to the
+    /// head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Decode` for a number past the head.
+    pub fn block_number_of(&self, tag: BlockNumberOrTag) -> Result<u64, IngressError> {
+        let latest = self.latest_block_number();
+        match tag {
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Pending => Ok(latest),
+            BlockNumberOrTag::Safe | BlockNumberOrTag::Finalized => {
+                Ok(self.cluster_status().posted_head)
+            }
+            BlockNumberOrTag::Earliest => Ok(0),
+            BlockNumberOrTag::Number(n) if n <= latest => Ok(n),
+            BlockNumberOrTag::Number(n) => Err(IngressError::Decode(format!(
+                "block {n} not served: it is past the head (block {latest})"
+            ))),
+        }
     }
 
     /// Returns the next globally unique `correlation_id` for this

@@ -418,6 +418,11 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             max_inclusion_block: *max_inclusion_block,
             at_block: *at_block,
         },
+        TxErrorReason::DaLag {
+            sealed_head,
+            posted_head,
+            budget_blocks,
+        } => IngressError::da_lag(*sealed_head, *posted_head, *budget_blocks),
     }
 }
 

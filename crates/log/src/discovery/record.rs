@@ -28,6 +28,7 @@ pub enum Topic {
     TxDeposits,
     TxRemoteEpochs,
     TxBal,
+    ServiceEvents,
 }
 
 impl Topic {
@@ -41,6 +42,7 @@ impl Topic {
             Self::TxDeposits => "tx_deposits",
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
+            Self::ServiceEvents => "events",
         }
     }
 
@@ -53,6 +55,7 @@ impl Topic {
             "tx_deposits" => Some(Self::TxDeposits),
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),
+            "events" => Some(Self::ServiceEvents),
             _ => None,
         }
     }

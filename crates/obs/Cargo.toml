@@ -17,16 +17,24 @@ path = "src/lib.rs"
 test-support = ["dep:reqwest"]
 
 [dependencies]
+# The halt, pause, and event records, shared on the `events` stream.
+kardamom-types = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# The exporter is spawned onto the caller's runtime (see `init`).
-tokio = { workspace = true, features = ["rt", "net", "time"] }
+# The listener is spawned onto the caller's runtime (see `init`).
+tokio = { workspace = true, features = ["rt", "net", "time", "sync"] }
+# The `/halt` record.
+serde_json = { workspace = true }
+# The listener that serves `/metrics` and `/ready` on one port.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = { workspace = true }
 # Only for `testkit::scrape`, behind `test-support`.
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

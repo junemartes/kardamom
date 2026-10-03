@@ -26,6 +26,7 @@ mod rlp;
 
 pub mod ack_policy;
 pub mod boundary;
+pub mod cluster_status;
 pub mod delta;
 pub mod deposit;
 pub mod envelope;
@@ -36,6 +37,7 @@ pub mod num;
 pub mod position;
 pub mod prover;
 pub mod receipt;
+pub mod service;
 pub mod shard_map;
 pub mod state;
 pub mod time;
@@ -52,6 +54,7 @@ pub mod xchain;
 
 pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
+pub use cluster_status::ClusterStatus;
 pub use delta::{AccountChange, BalFrame, BlockDelta, CodeEntry, StorageChange};
 pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;

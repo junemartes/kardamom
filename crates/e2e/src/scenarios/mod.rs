@@ -69,6 +69,11 @@ pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
 pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";
 pub const VALIDATOR_EPOCHS_VERIFIED: &str = "validator_epochs_verified_total";
 pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
+/// The gauge a halted service exports (`kardamom_obs::halt::HALT`): 1
+/// while the halt stands, with the cause as a label.
+pub const HALT: &str = "kardamom_halt";
+/// The label block of a validator halted on a proven divergence.
+pub const HALT_DIVERGENCE_LABEL: &str = "cause=\"validator_divergence\"";
 pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
 
@@ -193,10 +198,43 @@ impl Target {
     /// Returns an error when the target has no validator, or when the
     /// scrape fails.
     pub async fn validator_metric_opt(&self, name: &str) -> Result<Option<f64>> {
+        self.validator_metric_where(name, "").await
+    }
+
+    /// The validator's `name`, summed over the samples whose label block
+    /// contains `label`. `Ok(None)` when no sample matches.
+    ///
+    /// # Errors
+    /// Returns an error when the target has no validator, or when the
+    /// scrape fails.
+    pub async fn validator_metric_where(&self, name: &str, label: &str) -> Result<Option<f64>> {
         let addr = self
             .validator_metrics
             .context("target has no validator (StackConfig::validator)")?;
-        Self::metric_opt(addr, name).await
+        Ok(metrics::scrape(addr).await?.value_where(name, label))
+    }
+
+    /// Poll the validator until it halts on a proven divergence: the halt
+    /// gauge with the divergence cause reads 1. The validator stays up
+    /// and keeps serving its metrics while halted, so a scrape failure
+    /// is an error here, not a sign of the halt.
+    ///
+    /// # Errors
+    /// Returns an error when the target has no validator, when a scrape
+    /// fails, or when the validator does not halt within `timeout`.
+    pub async fn wait_validator_halted(&self, timeout: Duration, what: &str) -> Result<()> {
+        metrics::poll_until(what, timeout, Duration::from_millis(500), || async {
+            let halted = self
+                .validator_metric_where(HALT, HALT_DIVERGENCE_LABEL)
+                .await?
+                .unwrap_or(0.0);
+            #[allow(
+                clippy::float_cmp,
+                reason = "the gauge holds exactly 0 or 1; exact equality is the meaning"
+            )]
+            Ok((halted == 1.0).then_some(()))
+        })
+        .await
     }
 
     /// # Errors

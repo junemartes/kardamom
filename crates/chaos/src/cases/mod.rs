@@ -10,9 +10,11 @@ use crate::knobs::Knobs;
 
 pub(crate) mod archive;
 pub(crate) mod cache;
+pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod coordinated;
+pub(crate) mod da_lag;
 pub(crate) mod fleet;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -61,9 +63,11 @@ pub enum Case {
     RedisPartitionIngress,
     RedisTotalLossRecover,
     MirrorKillRebuild,
+    DaLagHalt,
+    PruneFloor,
 }
 
-const ALL: [Case; 39] = [
+const ALL: [Case; 41] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -103,6 +107,8 @@ const ALL: [Case; 39] = [
     Case::RedisPartitionIngress,
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
+    Case::DaLagHalt,
+    Case::PruneFloor,
 ];
 
 impl Case {
@@ -161,6 +167,8 @@ impl Case {
             Self::RedisPartitionIngress => "redis-partition-ingress",
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
+            Self::DaLagHalt => "da-lag-halt",
+            Self::PruneFloor => "prune-floor",
         }
     }
 
@@ -188,9 +196,10 @@ impl Case {
         let floor = match self {
             Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
-            Self::RetentionOverrun | Self::RetentionOverrunValidator => {
-                inject + k.retention_freeze_cap + Duration::from_mins(2)
-            }
+            Self::RetentionOverrun
+            | Self::RetentionOverrunValidator
+            | Self::DaLagHalt
+            | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
@@ -233,6 +242,10 @@ impl Case {
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
+            // The chain refuses every submit while it is halted, at once,
+            // and the load's retry delay grows with the attempt: 120
+            // attempts cover a halt of about 24 minutes.
+            Self::DaLagHalt => 120,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -299,6 +312,8 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
+            Self::DaLagHalt => da_lag::da_lag_halt(h).await,
+            Self::PruneFloor => da_lag::prune_floor(h).await,
         }
     }
 }

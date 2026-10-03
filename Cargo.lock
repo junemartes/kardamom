@@ -4127,6 +4127,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4142,6 +4143,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "if-addrs",
+ "kardamom-obs",
  "kardamom-types",
  "reqwest 0.13.4",
  "rkyv",
@@ -4162,6 +4164,11 @@ name = "kardamom-obs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kardamom-types",
  "metrics",
  "metrics-exporter-prometheus",
  "reqwest 0.13.4",

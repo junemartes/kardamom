@@ -9,9 +9,11 @@ import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import io.kardamom.sealer.VoidLedger;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Optional;
 import java.util.Set;
@@ -94,6 +96,14 @@ public final class SealerClusteredService implements ClusteredService {
      * deadline the sealer assigns a marker.
      */
     private final long inclusionHorizonBlocks;
+    /**
+     * The DA-lag budget, in blocks. Replicated configuration: it decides
+     * accept-or-reject inside the replicated state machine. Zero turns the
+     * guard off.
+     */
+    private final long daLagBudgetBlocks;
+    /** DA-lag rejects emitted (logged at power-of-two counts). */
+    private long daLagRejectCount = 0;
 
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
@@ -108,7 +118,7 @@ public final class SealerClusteredService implements ClusteredService {
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
     }
 
-    /** The full constructor, with this member's inclusion horizon. */
+    /** The constructor with this member's inclusion horizon and the default DA-lag budget. */
     public SealerClusteredService(
             int dedupCapacity,
             long tickIntervalMs,
@@ -116,7 +126,21 @@ public final class SealerClusteredService implements ClusteredService {
             Set<Long> remoteOrigins,
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks) {
+        this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, voidConfig,
+            inclusionHorizonBlocks, CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS);
+    }
+
+    /** The full constructor, with this member's inclusion horizon and DA-lag budget. */
+    public SealerClusteredService(
+            int dedupCapacity,
+            long tickIntervalMs,
+            int memberId,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            long daLagBudgetBlocks) {
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
+        this.daLagBudgetBlocks = daLagBudgetBlocks;
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
         this.memberId = memberId;
@@ -151,27 +175,17 @@ public final class SealerClusteredService implements ClusteredService {
             // or empty snapshot image is fatal. Restarting silently at genesis
             // would diverge from the rest of the cluster, which assumes the
             // snapshotted state (and the log replayed after it) is correct.
-            final byte[] snapshot = SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy());
-            this.state = CanonicalSealerState.load(
-                snapshot, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks);
-            // The retained deque is not snapshotted (v1). Nothing before the
-            // restore point can ever be served, so the retention floors start
-            // at the first frame this member can retain: record index
-            // canonicalCount and boundary block blockNumber (the next ones to
-            // emit). Floors left at genesis would answer a pre-snapshot replay
-            // request with a false REPLAY_DONE (a silent canonical gap)
-            // instead of the correct REPLAY_UNAVAILABLE.
-            this.egress = new SealerEgress(
-                cluster, memberId, state.canonicalCount(), state.blockNumber());
+            restore(SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy()));
             // Log to stdout so the cluster-member-rejoin chaos case can check
             // that a wiped member came back through a snapshot restore, not
             // silently at genesis.
             System.out.println("sealer snapshot RESTORED memberId=" + memberId
-                + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
+                + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount()
+                + " retained=" + egress.retainedCount() + " postedHead=" + state.postedHead());
         } else {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks);
+                inclusionHorizonBlocks, daLagBudgetBlocks);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -179,6 +193,51 @@ public final class SealerClusteredService implements ClusteredService {
         // Do not call scheduleTimer here: Aeron rejects timer scheduling from
         // onStart. The boundary timer is armed from onNewLeadershipTermEvent,
         // which is log-driven.
+    }
+
+    /**
+     * The snapshot: the state section, then the egress retention above the
+     * posted head. Every member writes the same bytes at the same log
+     * position.
+     */
+    byte[] snapshot() {
+        final byte[] stateBytes = state.takeSnapshot();
+        final byte[] retention = egress.writeSnapshot();
+        final byte[] out = new byte[stateBytes.length + retention.length];
+        System.arraycopy(stateBytes, 0, out, 0, stateBytes.length);
+        System.arraycopy(retention, 0, out, stateBytes.length, retention.length);
+        return out;
+    }
+
+    /**
+     * Restore the state and the retention from {@code snapshot}. The floors
+     * start at the restore point (record index canonicalCount and boundary
+     * block blockNumber, the next ones to emit) and move down to the oldest
+     * retained frame, so a member restored from a snapshot still serves a
+     * replay from the posted head. Floors left at genesis would answer a
+     * pre-retention replay request with a false REPLAY_DONE (a silent
+     * canonical gap) instead of the correct REPLAY_UNAVAILABLE.
+     */
+    void restore(final byte[] snapshot) {
+        final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
+        this.state = CanonicalSealerState.load(
+            buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, daLagBudgetBlocks);
+        this.egress = new SealerEgress(
+            cluster, memberId, state.canonicalCount(), state.blockNumber());
+        egress.readSnapshot(buf);
+        egress.setPostedHead(state.postedHead());
+    }
+
+    /** The chain's status: the posted and sealed heads, the guard, and the retention floors. */
+    private ClusterStatus status() {
+        return new ClusterStatus(
+            state.postedHead(),
+            state.sealedHead(),
+            state.daLagBudgetBlocks(),
+            state.daLagHalted(),
+            egress.retainedCount(),
+            egress.firstRetainedIndex(),
+            egress.firstRetainedBlock());
     }
 
     @Override
@@ -254,6 +313,12 @@ public final class SealerClusteredService implements ClusteredService {
         switch (kind) {
             case SealerWire.KIND_SUBSCRIBE:
                 egress.addConsumer(session.id());
+                // A consumer that announces itself learns the current
+                // status at once, instead of at the next tick.
+                egress.offerStatus(session, status());
+                return;
+            case SealerWire.KIND_POSTED_CURSOR:
+                onPostedCursor(buffer, offset, length);
                 return;
             case SealerWire.KIND_REPLAY_REQUEST: {
                 if (length < SealerWire.MIN_REPLAY_REQUEST_LEN) {
@@ -267,6 +332,7 @@ public final class SealerClusteredService implements ClusteredService {
                 // A replay request announces a consumer just as a SUBSCRIBE
                 // frame does.
                 egress.addConsumer(session.id());
+                egress.offerStatus(session, status());
                 egress.handleReplayRequest(
                     session, fromIndex, fromBlock, state.canonicalCount(), state.blockNumber());
                 // A consumer sends a replay request when it sees no egress.
@@ -513,9 +579,59 @@ public final class SealerClusteredService implements ClusteredService {
             case CONTIGUITY_REJECT -> onContiguityReject(session, nonce, outcome.expectedNonce);
             case PAST_DEADLINE -> onPastDeadline(session, nonce, outcome.maxInclusionBlock);
             case WINDOW_FULL -> onWindowFull(session, nonce);
+            case DA_LAG_REJECT -> onDaLagReject(session, nonce);
             case RELAYED -> outcome.relayed.ifPresent(egress::offerRelayed);
             case DUPLICATE -> { }
         }
+    }
+
+    /**
+     * Handle a {@link SealerWire#KIND_POSTED_CURSOR} frame: the batcher's
+     * confirmed cursor. The state adopts it as the DA-lag floor, the egress
+     * as the retention floor, and every session learns the new status. A
+     * cursor past the sealed head is a batcher bug; every member drops it
+     * the same way, because the check reads only replicated state.
+     */
+    private void onPostedCursor(final DirectBuffer buffer, final int offset, final int length) {
+        if (length < SealerWire.MIN_POSTED_CURSOR_LEN) {
+            onMalformedFrame("posted-cursor", length);
+            return;
+        }
+        final long postedHead =
+            buffer.getLong(offset + SealerWire.POSTED_HEAD_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final boolean advanced;
+        try {
+            advanced = state.onPostedCursor(postedHead);
+        } catch (final IllegalArgumentException ex) {
+            onMalformedFrame("posted-cursor-ahead", length);
+            return;
+        }
+        if (!advanced) {
+            return;
+        }
+        egress.setPostedHead(postedHead);
+        System.out.println("cluster POSTED-CURSOR memberId=" + memberId
+            + " postedHead=" + postedHead + " sealedHead=" + state.sealedHead()
+            + " retained=" + egress.retainedCount()
+            + " halted=" + state.daLagHalted());
+        egress.offerStatus(status());
+    }
+
+    /**
+     * Answer one offer the DA-lag guard refused. The record is not ordered
+     * until the batcher posts again, so the sequencer reports it to the
+     * client instead of republishing.
+     */
+    private void onDaLagReject(final ClientSession session, final long nonce) {
+        daLagRejectCount++;
+        if (Long.bitCount(daLagRejectCount) == 1) {
+            System.out.println("cluster DA-LAG-REJECT memberId=" + memberId
+                + " nonce=" + nonce + " sealedHead=" + state.sealedHead()
+                + " postedHead=" + state.postedHead()
+                + " budget=" + state.daLagBudgetBlocks()
+                + " totalDaLagRejected=" + daLagRejectCount);
+        }
+        egress.offerDaLagReject(session, senderScratch, nonce, status());
     }
 
     /**
@@ -605,6 +721,9 @@ public final class SealerClusteredService implements ClusteredService {
         }
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
+        // The status rides every tick, so an observer sees the guard flip
+        // and the retention stretch without waiting for a cursor record.
+        egress.offerStatus(status());
         boundaryTicks++;
         if (boundaryTicks % BOUNDARY_TICK_LOG_EVERY == 0) {
             // The proof that the boundary clock runs. A stall with a leader
@@ -620,7 +739,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
-        SnapshotIo.writeSnapshot(snapshotPublication, state.takeSnapshot(), cluster.idleStrategy());
+        SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
         // Log to stdout, like the role line below. The block= value is the
         // proof of catch-up. The SNAPSHOT action is itself a replicated-log
         // entry, so a blank member re-executes historical snapshots (and logs

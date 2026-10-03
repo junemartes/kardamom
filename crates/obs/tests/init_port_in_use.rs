@@ -30,7 +30,7 @@ async fn init_retries_addr_in_use_then_fails_or_recovers() {
         .expect_err("held squatter must still surface a bind failure");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("PrometheusBuilder::build"),
+        msg.contains("bind the metrics listener"),
         "bind failure surfaces through the build/ready hand-off: {msg}"
     );
     assert!(

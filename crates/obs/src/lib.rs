@@ -3,18 +3,31 @@
 //! Every service binary calls [`init`] (or the [`init_service!`] macro)
 //! once, inside its Tokio runtime, to install a Prometheus exporter with a
 //! shared histogram bucket layout, a build-info gauge, and a liveness
-//! gauge. See `docs/specs/2026-05-29-prometheus-grafana-design.md` for the
+//! gauge. The exporter serves `/metrics` and, beside it, `/ready`: the
+//! service's readiness rule ([`Readiness`]) over the gauges it exports.
+//! It also serves `/halt`: the service's lifecycle record, with its
+//! standing [`halt::Halt`] (the state a service enters when it cannot
+//! continue safely) and its pause (the state it enters while it waits on
+//! something outside itself). See [`lifecycle`] and [`events`].
+//! See `docs/specs/2026-05-29-prometheus-grafana-design.md` for the
 //! dashboard layout that reads these metrics.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use metrics_exporter_prometheus::{ExporterFuture, PrometheusBuilder, PrometheusRecorder};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 
 pub mod bin;
+pub mod events;
+pub mod halt;
+pub mod lifecycle;
+pub mod ready;
+mod serve;
 #[cfg(feature = "test-support")]
 pub mod testkit;
+
+pub use ready::Readiness;
 
 /// A non-empty host identifier, stamped on every metric this service
 /// exports. Parses once at a binary's CLI boundary (`impl FromStr`), so a
@@ -60,20 +73,27 @@ impl std::error::Error for HostIdEmpty {}
 
 /// [`init`] with the version and git-sha values filled in at the call
 /// site, so each binary stamps its own crate version. A plain helper
-/// function would bake in kardamom-obs's version instead.
+/// function would bake in kardamom-obs's version instead. The fourth
+/// argument is the service's readiness rule; without it the rule is
+/// [`Readiness::up`].
 ///
 /// ```ignore
 /// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id).await?;
+/// kardamom_obs::init_service!("executor", addr, &host_id, rule).await?;
 /// ```
 #[macro_export]
 macro_rules! init_service {
     ($service:expr, $metrics_addr:expr, $host_id:expr $(,)?) => {
-        $crate::init(
+        $crate::init_service!($service, $metrics_addr, $host_id, $crate::Readiness::up())
+    };
+    ($service:expr, $metrics_addr:expr, $host_id:expr, $readiness:expr $(,)?) => {
+        $crate::init_with_readiness(
             $service,
             $metrics_addr,
             $host_id,
             env!("CARGO_PKG_VERSION"),
             option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+            $readiness,
         )
     };
 }
@@ -100,25 +120,35 @@ const DURATION_BUCKETS: &[f64] = &[
 const BUILD_INFO: &str = "kardamom_build_info";
 
 /// Heartbeat gauge: set to 1 once init succeeds. Used by the overview
-/// dashboard's "services up" panel.
-const SERVICE_UP: &str = "kardamom_service_up";
+/// dashboard's "services up" panel, and by the default readiness rule.
+use ready::SERVICE_UP;
 
 /// This service's Prometheus exporter, before it is installed. Building it
 /// (binding the TCP listener, setting bucket layout and global labels) is
 /// separate from installing it (making it the global recorder, spawning
-/// its future), so [`Exporter::build_with_retry`] can retry the bind alone.
+/// its listener), so [`Exporter::build_with_retry`] can retry the bind alone.
 struct Exporter {
     service: &'static str,
     metrics_addr: SocketAddr,
     host_id: String,
+    readiness: Readiness,
 }
 
+/// The recorder and the bound listener one build attempt produces.
+type Built = (PrometheusRecorder, std::net::TcpListener);
+
 impl Exporter {
-    fn new(service: &'static str, metrics_addr: SocketAddr, host_id: &str) -> Self {
+    fn new(
+        service: &'static str,
+        metrics_addr: SocketAddr,
+        host_id: &str,
+        readiness: Readiness,
+    ) -> Self {
         Self {
             service,
             metrics_addr,
             host_id: host_id.to_string(),
+            readiness,
         }
     }
 
@@ -140,36 +170,31 @@ impl Exporter {
         (attempts, delay)
     }
 
-    /// Build the exporter once. `metrics-exporter-prometheus` (0.18) binds
-    /// the TCP listener synchronously inside `build()`, so a port
-    /// collision surfaces as an init error here, rather than as a
-    /// healthy-looking service with no `/metrics`. The `init_port_in_use`
-    /// integration test pins this eager bind: if a dependency upgrade
-    /// moves the bind into the exporter future's first poll, that test
-    /// fails, and the bind must be made eager again (for example, by
-    /// pre-binding a std `TcpListener`).
-    fn build(&self) -> Result<(PrometheusRecorder, ExporterFuture)> {
-        PrometheusBuilder::new()
-            .with_http_listener(self.metrics_addr)
+    /// Build the exporter once: the recorder, and the listener bound
+    /// synchronously, so a port collision surfaces as an init error
+    /// here, rather than as a healthy-looking service with no
+    /// `/metrics`. The `init_port_in_use` integration test pins this
+    /// eager bind.
+    fn build(&self) -> Result<Built> {
+        let recorder = PrometheusBuilder::new()
             .set_buckets(DURATION_BUCKETS)
-            .context("set_buckets")
-            .and_then(|b| {
-                b.add_global_label("service", self.service)
-                    .add_global_label("host_id", self.host_id.as_str())
-                    .build()
-                    .context("PrometheusBuilder::build")
-            })
+            .context("set_buckets")?
+            .add_global_label("service", self.service)
+            .add_global_label("host_id", self.host_id.as_str())
+            .build_recorder();
+        let listener = std::net::TcpListener::bind(self.metrics_addr)
+            .with_context(|| format!("bind the metrics listener on {}", self.metrics_addr))?;
+        Ok((recorder, listener))
     }
 
     /// Retry [`Exporter::build`] on `AddrInUse`, up to the env-configured
     /// budget. A port squatter is usually a wedged or frozen predecessor
     /// seconds away from being reaped by its supervisor. Failing
     /// instantly would burn one restart attempt per squat, and under a
-    /// `mode = "fail"` restart policy (the validator allows 5 attempts,
-    /// then stays down), that would turn a transient squat into a
-    /// permanent outage. Every other bind or build error stays fail-fast
-    /// (no retry).
-    async fn build_with_retry(&self) -> Result<(PrometheusRecorder, ExporterFuture)> {
+    /// `mode = "fail"` restart policy that would turn a transient squat
+    /// into a permanent outage. Every other bind or build error stays
+    /// fail-fast (no retry).
+    async fn build_with_retry(&self) -> Result<Built> {
         let (bind_retries, bind_retry_delay) = Self::retry_settings();
         let mut built = self.build();
         for attempt in 1..=bind_retries {
@@ -186,12 +211,7 @@ impl Exporter {
     /// One retry for [`Self::build_with_retry`]'s loop, once it has
     /// decided (via the `AddrInUse` check) that this attempt should
     /// retry: log, wait `delay`, then rebuild.
-    async fn retry_bind(
-        &self,
-        attempt: u32,
-        max: u32,
-        delay: Duration,
-    ) -> Result<(PrometheusRecorder, ExporterFuture)> {
+    async fn retry_bind(&self, attempt: u32, max: u32, delay: Duration) -> Result<Built> {
         tracing::warn!(
             metrics_addr = %self.metrics_addr,
             attempt,
@@ -214,15 +234,51 @@ impl Exporter {
 
         metrics::describe_gauge!(SERVICE_UP, "1 while the service's exporter is live.");
         metrics::gauge!(SERVICE_UP).set(1.0);
+        metrics::describe_gauge!(
+            halt::HALT,
+            "1 while the service is halted; cause and recovery name the runbook."
+        );
+        metrics::describe_gauge!(
+            halt::PAUSED,
+            "1 while the service is paused; root_service and cause name the root it waits on."
+        );
+    }
+
+    /// Bind with retry, install the recorder, and spawn the listener.
+    async fn install(self, version: &'static str, git_sha: &'static str) -> Result<()> {
+        let (recorder, listener) = self.build_with_retry().await?;
+        let handle = recorder.handle();
+        metrics::set_global_recorder(recorder).map_err(|e| anyhow!("set_global_recorder: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .context("set the metrics listener non-blocking")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("register the metrics listener with the runtime")?;
+        serve::Server::new(listener, handle, self.readiness, self.service).spawn();
+        events::set_identity(events::Identity {
+            service: self.service.to_string(),
+            instance: self.host_id.clone(),
+        });
+
+        Self::register_build_gauges(version, git_sha);
+
+        tracing::info!(
+            service = self.service,
+            host_id = %self.host_id,
+            addr = %self.metrics_addr,
+            "kardamom_obs: prometheus exporter installed"
+        );
+        Ok(())
     }
 }
 
-/// Install the Prometheus exporter for this service.
+/// Install the Prometheus exporter for this service, with the default
+/// readiness rule ([`Readiness::up`]).
 ///
-/// Must run inside a Tokio runtime: the exporter future is spawned onto the
+/// Must run inside a Tokio runtime: the listener is spawned onto the
 /// ambient runtime (`tokio::spawn`). Every service binary is a
 /// `#[tokio::main]`, so the call site is `init(...).await?` (or the
-/// [`init_service!`] macro followed by `.await?`). The exporter runs as a
+/// [`init_service!`] macro followed by `.await?`). The listener runs as a
 /// task on that same runtime; this crate does not start a dedicated thread
 /// or a private runtime for it.
 ///
@@ -238,6 +294,30 @@ pub async fn init(
     version: &'static str,
     git_sha: &'static str,
 ) -> Result<()> {
+    init_with_readiness(
+        service,
+        metrics_addr,
+        host_id,
+        version,
+        git_sha,
+        Readiness::up(),
+    )
+    .await
+}
+
+/// [`init`] with the service's own readiness rule behind `/ready`.
+///
+/// # Errors
+///
+/// The same errors as [`init`].
+pub async fn init_with_readiness(
+    service: &'static str,
+    metrics_addr: SocketAddr,
+    host_id: &str,
+    version: &'static str,
+    git_sha: &'static str,
+    readiness: Readiness,
+) -> Result<()> {
     if host_id.is_empty() {
         return Err(anyhow!("host_id must be non-empty"));
     }
@@ -245,25 +325,9 @@ pub async fn init(
     // panic) when a caller forgets the runtime.
     tokio::runtime::Handle::try_current()
         .context("kardamom_obs::init requires an ambient tokio runtime")?;
-
-    let exporter = Exporter::new(service, metrics_addr, host_id);
-    let (recorder, fut) = exporter.build_with_retry().await?;
-    metrics::set_global_recorder(recorder).map_err(|e| anyhow!("set_global_recorder: {e}"))?;
-    tokio::spawn(async move {
-        if let Err(e) = fut.await {
-            tracing::error!(error = ?e, "obs-exporter: exporter terminated");
-        }
-    });
-
-    Exporter::register_build_gauges(version, git_sha);
-
-    tracing::info!(
-        service = service,
-        host_id = host_id,
-        addr = %metrics_addr,
-        "kardamom_obs: prometheus exporter installed"
-    );
-    Ok(())
+    Exporter::new(service, metrics_addr, host_id, readiness)
+        .install(version, git_sha)
+        .await
 }
 
 #[cfg(test)]

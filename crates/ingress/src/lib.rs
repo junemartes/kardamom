@@ -24,6 +24,7 @@
 #![allow(clippy::double_must_use)]
 pub mod aeron_adapters;
 pub(crate) mod binary;
+pub mod chain;
 pub mod channels;
 pub mod cluster;
 pub mod config;

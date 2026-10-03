@@ -53,3 +53,104 @@ groups:
         annotations:
           summary: "validator scrape target down"
           description: "Prometheus cannot scrape the validator. A halted validator (epoch fault or divergence) looks like this too."
+
+  # One rule per halt cause. A halted service exports kardamom_halt = 1
+  # with the cause and the runbook id as labels, and serves the whole
+  # record (the detail: the block, the hashes, the cursor and the floor)
+  # as JSON on /halt beside /metrics. The alert text is the recovery
+  # procedure, not a metric name: it names the cause, where the detail
+  # is, and the runbook that holds the steps in order.
+  - name: kardamom-halts
+    rules:
+      - alert: KardamomHaltL1SourceDisagreement
+        expr: kardamom_halt{cause="l1_source_disagreement"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_source_disagreement
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_source_disagreement ({{ $labels.host_id }})"
+          description: "Two L1 sources answered differently for one block or one log query, and no light client settled it. One source lies; the follower retries every tick and resumes when two sources agree. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_source_disagreement.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_source_disagreement.md"
+
+      - alert: KardamomHaltL1ChainBreak
+        expr: kardamom_halt{cause="l1_chain_break"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_chain_break
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_chain_break ({{ $labels.host_id }})"
+          description: "A finalized L1 block does not descend from the block the follower holds. Finality forbids that, so a source lies or the follower's cursor holds a lie. The follower retries every tick. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_chain_break.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_chain_break.md"
+
+      - alert: KardamomHaltL1Unreachable
+        expr: kardamom_halt{cause="l1_unreachable"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_unreachable
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_unreachable ({{ $labels.host_id }})"
+          description: "No L1 source answers. The service retries on a backoff and resumes when a source answers. While the batcher cannot post, the DA-lag guard halts new transactions before the chain loses its recoverable range. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_unreachable.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_unreachable.md"
+
+      - alert: KardamomHaltReplayUnavailable
+        expr: kardamom_halt{cause="replay_unavailable"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: replay_unavailable
+        annotations:
+          summary: "{{ $labels.service }} halted: replay_unavailable ({{ $labels.host_id }})"
+          description: "The sealer refused the batcher's replay: the cursor is below the retention floor and no copy of the range is at hand. The batcher waits for an operator. Do not restart it. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/replay_unavailable.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/replay_unavailable.md"
+
+      - alert: KardamomHaltDaLag
+        expr: kardamom_halt{cause="da_lag"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: da_lag
+        annotations:
+          summary: "{{ $labels.service }} halted: da_lag ({{ $labels.host_id }})"
+          description: "The sealed head is more than the DA-lag budget past the last block posted to L1. The sealer refuses new transactions until the batcher posts again; the ingresses pause submits on it. The ingress observes the sealer and exports this halt. Find why the batcher does not post. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/da_lag.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/da_lag.md"
+
+      - alert: KardamomHaltSealerNoQuorum
+        expr: kardamom_halt{cause="sealer_no_quorum"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: sealer_no_quorum
+        annotations:
+          summary: "{{ $labels.service }} halted: sealer_no_quorum (seen by {{ $labels.host_id }})"
+          description: "The sealer emits no block boundary: the cluster has no leader or no quorum. Nothing is ordered; the ingresses and the sequencers pause on it. The ingress observes the sealer and exports this halt. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/sealer_no_quorum.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/sealer_no_quorum.md"
+
+      - alert: KardamomHaltValidatorDivergence
+        expr: kardamom_halt{cause="validator_divergence"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: validator_divergence
+        annotations:
+          summary: "{{ $labels.service }} halted: validator_divergence ({{ $labels.host_id }})"
+          description: "The validator's re-execution disagreed with the executor's published result. The validator holds, serves its metrics, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/validator_divergence.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/validator_divergence.md"
+
+  # A pause is not a fault of the paused service: it waits on a root halt
+  # upstream, or on an operator. It never pages. The root's halt rule
+  # above pages once, with the root's runbook; the inhibit rule in
+  # deploy/alertmanager-inhibit.yml mutes this alert while the root's
+  # alert fires, keyed on the cause label both carry.
+  - name: kardamom-pauses
+    rules:
+      - alert: KardamomServicePaused
+        expr: kardamom_paused == 1
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.service }} paused: {{ $labels.reason }} on {{ $labels.root_service }} ({{ $labels.cause }}, {{ $labels.host_id }})"
+          description: "The service makes no progress and waits. reason=upstream: it waits on the halt of {{ $labels.root_service }} (cause {{ $labels.cause }}) and resumes by itself when that clears; follow the root's runbook, docs/runbooks/{{ $labels.cause }}.md. reason=operator: an operator paused it; POST /resume on its node ends the pause. Detail: http://{{ $labels.instance }}/halt."

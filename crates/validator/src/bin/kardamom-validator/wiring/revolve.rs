@@ -18,6 +18,7 @@
 use std::ops::ControlFlow;
 
 use anyhow::Result;
+use kardamom_obs::halt::{self, Halt, HaltCause};
 
 use super::run::{EngineOutcome, RunEnd};
 use super::startup::{Boot, Startup};
@@ -30,8 +31,12 @@ pub(crate) enum Verdict {
     /// A peer checkpoint is staged and the stale state parked: run the
     /// pipeline again, which adopts it.
     Revolve,
-    /// Leave the process with this status: 2 for a proven divergence, 1
-    /// for every other failure the process cannot repair.
+    /// A proven divergence, with its reason: the process holds, halted,
+    /// until an operator clears it, then runs the pipeline again from
+    /// its cursor.
+    Halt(String),
+    /// Leave the process with this status: 1, an availability failure
+    /// the process cannot repair, for the orchestrator to restart.
     Exit(i32),
 }
 
@@ -41,10 +46,12 @@ pub(crate) enum Verdict {
 pub(crate) fn verdict(outcome: &EngineOutcome, repaired: Option<&str>) -> Verdict {
     match outcome {
         EngineOutcome::Clean => Verdict::Done,
-        // Exit 2 is reserved for a proven divergence, the page-the-humans
-        // signal. Any other engine failure is an availability problem,
+        // A proven divergence is a state of the chain, not a property of
+        // one process, so it halts the process instead of ending it: an
+        // exit loses the reason and invites a restart against the same
+        // fault. Any other engine failure is an availability problem,
         // not an integrity one, and must not look like one.
-        EngineOutcome::Diverged => Verdict::Exit(2),
+        EngineOutcome::Diverged(reason) => Verdict::Halt(reason.clone()),
         EngineOutcome::Failed(_) | EngineOutcome::Panicked => match repaired {
             Some("peer-checkpoint") => Verdict::Revolve,
             _ => Verdict::Exit(1),
@@ -82,7 +89,7 @@ fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
     let cause = match &end.outcome {
         EngineOutcome::Failed(e) => Some(e),
         EngineOutcome::Panicked => None,
-        EngineOutcome::Clean | EngineOutcome::Diverged => return Ok(None),
+        EngineOutcome::Clean | EngineOutcome::Diverged(_) => return Ok(None),
     };
     let args = &boot.args;
     crate::adoption::resync_after_engine_error(
@@ -104,7 +111,18 @@ fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
 pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFlow<()>> {
     match revolution(boot).await? {
         Verdict::Done => return Ok(ControlFlow::Break(())),
-        Verdict::Exit(status) => halt(status),
+        Verdict::Exit(status) => exit(status),
+        Verdict::Halt(reason) => {
+            if hold_divergence(boot, reason).await.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            *revolutions += 1;
+            tracing::info!(
+                revolutions,
+                "divergence halt cleared; the pipeline starts again from its cursor"
+            );
+            return Ok(ControlFlow::Continue(()));
+        }
         Verdict::Revolve => (),
     }
     if boot.stop.is_cancelled() {
@@ -119,16 +137,27 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
     Ok(ControlFlow::Continue(()))
 }
 
-/// Leave the process. Status 1 is an availability problem, for the
-/// orchestrator to restart; status 2 is a proven divergence.
-fn halt(status: i32) -> ! {
-    if status == 1 {
-        tracing::error!(
-            "validator halted on an engine error (NOT a proven divergence); if the \
-             cluster refused replay and no peer checkpoint qualified, rebuild state \
-             via kardamom-reconstruct or restore a checkpoint"
-        );
+/// Hold the process on a proven divergence: raise the halt, keep serving
+/// the metrics and the `/halt` record, make no progress, and wait for
+/// the operator's clear or the shutdown signal. `Continue` means the
+/// operator cleared the halt after the runbook's steps, so the pipeline
+/// runs again from its cursor and verifies the block again.
+async fn hold_divergence(boot: &Boot, reason: String) -> ControlFlow<()> {
+    halt::raise(Halt::new(HaltCause::ValidatorDivergence, reason));
+    tokio::select! {
+        () = boot.stop.cancelled() => ControlFlow::Break(()),
+        () = halt::cleared() => ControlFlow::Continue(()),
     }
+}
+
+/// Leave the process with status 1: an availability problem, for the
+/// orchestrator to restart.
+fn exit(status: i32) -> ! {
+    tracing::error!(
+        "validator halted on an engine error (NOT a proven divergence); if the \
+         cluster refused replay and no peer checkpoint qualified, rebuild state \
+         via kardamom-reconstruct or restore a checkpoint"
+    );
     std::process::exit(status);
 }
 
@@ -153,8 +182,11 @@ mod tests {
         );
         assert_eq!(verdict(&EngineOutcome::Panicked, None), Verdict::Exit(1));
         assert_eq!(
-            verdict(&EngineOutcome::Diverged, Some("peer-checkpoint")),
-            Verdict::Exit(2)
+            verdict(
+                &EngineOutcome::Diverged("mismatch".into()),
+                Some("peer-checkpoint")
+            ),
+            Verdict::Halt("mismatch".into())
         );
         assert_eq!(verdict(&EngineOutcome::Clean, None), Verdict::Done);
     }

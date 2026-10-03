@@ -71,6 +71,15 @@ where
         )
         .spawn();
     }
+
+    pub(super) fn spawn_chain_watch(&self) {
+        crate::chain::ChainWatch::new(
+            self.cluster_status.clone(),
+            self.subscription.service_board(),
+            self.sealer.clone(),
+        )
+        .spawn();
+    }
 }
 
 /// Folds block boundaries into the proxy's latest-block counter.

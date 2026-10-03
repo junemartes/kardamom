@@ -218,6 +218,8 @@ pub struct Sequencer {
     /// The resize warm-up, while one is in progress.
     shadow: Option<ShadowWindow>,
     depth: DepthReport,
+    /// While closed, the loop offers nothing. See [`crate::pause_gate`].
+    pause: crate::pause_gate::PauseGate,
 }
 
 impl Sequencer {
@@ -253,7 +255,17 @@ impl Sequencer {
             vslots,
             shadow,
             depth,
+            pause: crate::pause_gate::PauseGate::default(),
         })
+    }
+
+    /// Offer nothing while `slots` holds a pause: the process lifecycle
+    /// in the binary.
+    pub fn enable_pause(
+        &mut self,
+        slots: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>,
+    ) {
+        self.pause = crate::pause_gate::PauseGate::new(slots);
     }
 
     /// The virtual slots this replica serves.
@@ -573,34 +585,32 @@ impl Sequencer {
         }
     }
 
-    /// Apply the past-deadline rejects the sealer answered this shard
-    /// with. Each one is a transaction the chain will never order: drop it
-    /// from the unconfirmed ledger, so it never republishes, and tell the
-    /// client, so it can sign again instead of waiting out its timeout.
+    /// Apply the terminal refusals the sealer answered this shard with: a
+    /// ref past its inclusion deadline, or one the DA-lag guard refused.
+    /// No republish can order either now: drop it from the unconfirmed
+    /// ledger, so it never republishes, and tell the client, so it can
+    /// resubmit instead of waiting out its timeout.
     fn apply_deadline_rejects<P: SequencerPorts>(
         &mut self,
         r: &mut crate::resync::ResyncController,
         ports: &mut P,
     ) {
-        for (sender, nonce, max_inclusion_block, at_block) in r.drain_deadline_rejects() {
-            self.unconfirmed.drop_committed(sender, nonce);
+        for refusal in r.drain_deadline_rejects() {
+            self.unconfirmed
+                .drop_committed(refusal.sender, refusal.nonce);
             warn!(
-                sender = ?sender,
-                nonce,
-                max_inclusion_block,
-                at_block,
-                "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
+                sender = ?refusal.sender,
+                nonce = refusal.nonce,
+                reason = ?refusal.reason,
+                "the sealer refused the ref; reporting it to the client"
             );
             let (_, _, errors) = ports.split();
             self.publish_error(
                 errors,
                 TxError {
-                    sender,
-                    nonce,
-                    reason: TxErrorReason::PastDeadline {
-                        max_inclusion_block,
-                        at_block,
-                    },
+                    sender: refusal.sender,
+                    nonce: refusal.nonce,
+                    reason: refusal.reason,
                 },
             );
         }
@@ -785,6 +795,9 @@ impl Sequencer {
         self.resync_tick(ports);
         let (channel_a, b, rc) = ports.split();
         self.expiry_tick(rc);
+        if self.pause.paused() {
+            return Ok(false);
+        }
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {

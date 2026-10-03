@@ -10,9 +10,11 @@
 //! boundary observed is the durable canonical count that the `on-quorum`
 //! gate releases parked submits against.
 //!
-//! The bin runs [`ClusterWatermarkObserver::next_position`] on a dedicated
+//! The bin runs [`ClusterWatermarkObserver::next_event`] on a dedicated
 //! OS thread, because egress `recv()` blocks. It forwards each returned
-//! count into the proxy's watermark broadcast bus as a `QuorumWatermark`.
+//! count into the proxy's watermark broadcast bus as a `QuorumWatermark`,
+//! and each cluster status (the posted head, the DA-lag flag, the
+//! retention floors) into the proxy's status channel.
 
 use std::ops::ControlFlow;
 
@@ -21,7 +23,16 @@ use kardamom_cluster_adapter::watermark::ClusterWatermark;
 use kardamom_cluster_adapter::wire::EgressItem;
 use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, live};
 use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_types::BPosition;
+use kardamom_types::{BPosition, ClusterStatus};
+
+/// What one egress poll observed: durable progress, or the chain's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observed {
+    /// The highest durable canonical position.
+    Durable(BPosition),
+    /// The sealer's data-availability status.
+    Status(ClusterStatus),
+}
 
 /// Folds cluster egress progress into a monotonic durable count.
 pub struct ClusterWatermarkObserver<E: ClusterEgress> {
@@ -37,34 +48,38 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
         }
     }
 
-    /// Blocks for the next egress item, folds it into the watermark, and
-    /// returns the highest durable canonical position:
+    /// Blocks for the next egress item and folds it into the watermark.
+    /// Returns the highest durable canonical position,
     /// `from_index(count - 1)`, where `count` is the increasing durable
-    /// record count. This value compares directly to a receipt's `tx_idx`
-    /// in the proxy's on-quorum gate (`watermark >= receipt_position`).
-    /// Returns `None` on a clean egress EOF. An item that does not move
-    /// the count past 0, such as an empty-block boundary before any
-    /// record, has no durable position yet, so this method keeps polling.
-    /// It skips malformed frames and logs them.
-    pub fn next_position(&mut self) -> Option<BPosition> {
+    /// record count, or the cluster status a status frame carries. The
+    /// position compares directly to a receipt's `tx_idx` in the proxy's
+    /// on-quorum gate (`watermark >= receipt_position`). Returns `None`
+    /// on a clean egress EOF. An item that does not move the count past
+    /// 0, such as an empty-block boundary before any record, has no
+    /// durable position yet, so this method keeps polling. It skips
+    /// malformed frames and logs them.
+    pub fn next_event(&mut self) -> Option<Observed> {
         loop {
-            if let ControlFlow::Break(result) = self.poll_position() {
+            if let ControlFlow::Break(result) = self.poll_event() {
                 return result;
             }
         }
     }
 
-    /// One [`Self::next_position`] poll. `Break(None)` means the egress
-    /// ended. `Break(Some(pos))` carries the next durable position.
-    /// `Continue` means the frame moved nothing durable yet, or was
-    /// skipped, so the caller polls again.
-    fn poll_position(&mut self) -> ControlFlow<Option<BPosition>> {
+    /// One [`Self::next_event`] poll. `Break(None)` means the egress
+    /// ended. `Break(Some(observed))` carries the next durable position
+    /// or the status. `Continue` means the frame moved nothing durable
+    /// yet, or was skipped, so the caller polls again.
+    fn poll_event(&mut self) -> ControlFlow<Option<Observed>> {
         let Some(bytes) = self.egress.recv() else {
             return ControlFlow::Break(None);
         };
         let count = match EgressItem::decode(&bytes) {
             Ok(EgressItem::Record { index, .. }) => self.watermark.observe_record(index),
             Ok(EgressItem::Boundary(b)) => self.watermark.observe_boundary(b.end_tx_idx.as_index()),
+            Ok(EgressItem::Status(status)) => {
+                return ControlFlow::Break(Some(Observed::Status(status)));
+            }
             // Replay control frames are per-session responses to a
             // REPLAY_FROM request. The ingress never sends one; it
             // derives a watermark only from live progress. Every reject
@@ -76,7 +91,8 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::ContiguityReject { .. }
                 | EgressItem::RemoteOriginReject { .. }
                 | EgressItem::PastDeadline { .. }
-                | EgressItem::WindowFull { .. },
+                | EgressItem::WindowFull { .. }
+                | EgressItem::DaLagReject { .. },
             ) => return ControlFlow::Continue(()),
             Err(e) => {
                 // The cluster stream is authoritative, so this should
@@ -93,7 +109,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
         let Some(last) = count.checked_sub(1) else {
             return ControlFlow::Continue(());
         };
-        ControlFlow::Break(Some(BPosition::from_index(last)))
+        ControlFlow::Break(Some(Observed::Durable(BPosition::from_index(last))))
     }
 }
 
@@ -157,9 +173,46 @@ mod tests {
         egress.push(record(1, 20));
         egress.close();
         let mut obs = ClusterWatermarkObserver::new(egress);
-        assert_eq!(obs.next_position(), Some(BPosition::from_index(0)));
-        assert_eq!(obs.next_position(), Some(BPosition::from_index(1)));
-        assert_eq!(obs.next_position(), None); // Clean EOF.
+        assert_eq!(
+            obs.next_event(),
+            Some(Observed::Durable(BPosition::from_index(0)))
+        );
+        assert_eq!(
+            obs.next_event(),
+            Some(Observed::Durable(BPosition::from_index(1)))
+        );
+        assert_eq!(obs.next_event(), None); // Clean EOF.
+    }
+
+    /// A status frame is its own event: it moves no durable position, and
+    /// a reject to another session is skipped.
+    #[test]
+    fn a_status_frame_is_observed_and_a_reject_is_skipped() {
+        let egress = FakeEgress::new();
+        let status = ClusterStatus {
+            posted_head: 5,
+            sealed_head: 9,
+            budget_blocks: 10,
+            halted: false,
+            retained_frames: 40,
+            floor_index: 3,
+            floor_block: 2,
+        };
+        egress.push(kardamom_cluster_adapter::wire::encode_status(&status));
+        egress.push(kardamom_cluster_adapter::wire::encode_da_lag_reject(
+            alloy_primitives::Address::ZERO,
+            0,
+            &status,
+        ));
+        egress.push(record(0, 10));
+        egress.close();
+        let mut obs = ClusterWatermarkObserver::new(egress);
+        assert_eq!(obs.next_event(), Some(Observed::Status(status)));
+        assert_eq!(
+            obs.next_event(),
+            Some(Observed::Durable(BPosition::from_index(0)))
+        );
+        assert_eq!(obs.next_event(), None);
     }
 
     #[test]
@@ -173,7 +226,13 @@ mod tests {
         egress.push(record(5, 99));
         egress.close();
         let mut obs = ClusterWatermarkObserver::new(egress);
-        assert_eq!(obs.next_position(), Some(BPosition::from_index(41)));
-        assert_eq!(obs.next_position(), Some(BPosition::from_index(41)));
+        assert_eq!(
+            obs.next_event(),
+            Some(Observed::Durable(BPosition::from_index(41)))
+        );
+        assert_eq!(
+            obs.next_event(),
+            Some(Observed::Durable(BPosition::from_index(41)))
+        );
     }
 }

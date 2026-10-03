@@ -125,6 +125,14 @@ tx_deposits_stream_id = 1016
 tx_remote_epochs_channel = "aeron:udp?endpoint=239.192.56.27:40080|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_remote_epochs_stream_id = 1017
 
+# --- events: every service's lifecycle state (running, halted, paused,
+# resumed), at once on a change and on a 5 s heartbeat. Every service
+# publishes, best effort; the ingress and the validator subscribe. RAM
+# only. Nothing that changes the canonical order reads it. Own group
+# .31:40100, stream 1019 (1018 is the transaction status stream).
+events_channel = "aeron:udp?endpoint=239.192.56.31:40100|interface={{ env "meta.node_ip" }}/32|ttl=1"
+events_stream_id = 1019
+
 # --- TxBal: per-block BAL (the executor's BlockDelta). The executor publishes
 # one BlockDelta per sealed block; validators subscribe and cross-check their
 # independent re-execution against it. Multicast (many validator subscribers).
