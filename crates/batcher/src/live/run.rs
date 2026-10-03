@@ -1,6 +1,7 @@
 //! Live service wiring: CLI args, the reader stack, and the feed-loop task.
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
+use kardamom_obs::halt::{self, Clears, Halt, HaltCause};
 use tokio::sync::mpsc::Receiver;
 use tracing::{info, warn};
 
@@ -34,7 +36,13 @@ use crate::indexer::IndexerClient;
 const INDEXER_POLL: Duration = Duration::from_secs(12);
 const INDEXER_POLLS: u32 = 100;
 use super::feed::{FeedConfig, FeedLoop};
-use super::sender::LiveSender;
+use super::posted_cursor::PostedCursor;
+use super::sender::{LiveSender, PostExhausted};
+
+/// How long an `l1_unreachable` halt waits before the batcher starts
+/// again: long enough for a rate limit to lift, short enough that a post
+/// follows an L1 recovery within a flush.
+const HALT_RETRY: Duration = Duration::from_secs(30);
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
 /// the same `[cluster]` section shape as the executor and the validator.
@@ -107,6 +115,25 @@ pub struct LiveArgs {
     pub settlement_deploy_block: u64,
 }
 
+/// Why a start did not reach a running feed: L1 (or the indexer in front
+/// of it) did not answer, or the resume was refused. The first clears by
+/// itself when L1 answers; the second waits for an operator, who recovers
+/// the range or reverts the chain.
+enum StartError {
+    L1(anyhow::Error),
+    Resume(anyhow::Error),
+}
+
+impl StartError {
+    /// The halt this start failure puts the batcher in.
+    fn halt(&self) -> Halt {
+        match self {
+            Self::L1(e) => Halt::new(HaltCause::L1Unreachable, format!("{e:#}")),
+            Self::Resume(e) => Halt::new(HaltCause::ReplayUnavailable, format!("{e:#}")),
+        }
+    }
+}
+
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
 /// truth, the cursor to replay from, and the block to skip through
 /// (already covered by L1).
@@ -119,10 +146,14 @@ struct L1Side<P> {
 }
 
 impl LiveArgs {
-    /// Connect to L1 and reconcile the durable cursor against it.
-    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
-        let provider = connect_l1(&self.rpc, &self.key).await?;
-        let da = DaProxy::new(&self.da_proxy)?;
+    /// Connect to L1 and reconcile the durable cursor against it. The two
+    /// failure classes are typed at this boundary, so the service holds
+    /// the right halt for each.
+    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>, StartError> {
+        let provider = connect_l1(&self.rpc, &self.key)
+            .await
+            .map_err(StartError::L1)?;
+        let da = DaProxy::new(&self.da_proxy).map_err(|e| StartError::Resume(e.into()))?;
         let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
         let l1_truth = match &indexer {
             Some(ix) => {
@@ -133,15 +164,17 @@ impl LiveArgs {
                     INDEXER_POLL,
                     INDEXER_POLLS,
                 )
-                .await?
+                .await
             }
-            None => read_l1_truth(&provider, self.settlement, self.settlement_deploy_block).await?,
-        };
-        let (cursor, skip_through_block) = match (BatchCursor::load(&self.cursor_file)?, &indexer) {
-            (None, Some(ix)) if l1_truth.last_batch_index > 0 => {
-                resume_from_indexer(ix, l1_truth).await?
-            }
-            (loaded, _) => reconcile(loaded, l1_truth)?,
+            None => read_l1_truth(&provider, self.settlement, self.settlement_deploy_block).await,
+        }
+        .map_err(StartError::L1)?;
+        let loaded = BatchCursor::load(&self.cursor_file).map_err(StartError::Resume)?;
+        let (cursor, skip_through_block) = match (loaded, &indexer) {
+            (None, Some(ix)) if l1_truth.last_batch_index > 0 => resume_from_indexer(ix, l1_truth)
+                .await
+                .map_err(StartError::Resume)?,
+            (loaded, _) => reconcile(loaded, l1_truth).map_err(StartError::Resume)?,
         };
         info!(
             settlement = %self.settlement,
@@ -237,6 +270,7 @@ impl RunConfig {
         )?;
         // The kardamom_sealer_* re-export is the executor's job.
         let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
+        let posted_cursor = PostedCursor::new(tx_ordering_sub.posted_cursor_publisher());
         info!("kardamom-batcher: tx_ordering via Aeron Cluster");
 
         let join_buffer = JoinBuffer::new();
@@ -276,15 +310,25 @@ impl RunConfig {
                 ordering_handle,
             },
             feed_rx,
+            posted_cursor,
         })
     }
 }
 
 /// The engine reader stack: the `tx_data` join-buffer readers, the cluster
-/// ordering subscription, and the channel the feed loop reads from.
+/// ordering subscription, the channel the feed loop reads from, and the
+/// posted-cursor publisher over the same cluster session.
 struct ReaderStack<G> {
     handles: ReaderHandles<G>,
     feed_rx: Receiver<ReaderToExec>,
+    posted_cursor: PostedCursor,
+}
+
+/// How a run ended short of a shutdown: the halt to hold before the
+/// next start, or the error that ends the process.
+struct RunFailure {
+    halt: Option<Halt>,
+    error: anyhow::Error,
 }
 
 /// The reader-thread handles, kept for post-failure diagnosis. The cluster
@@ -320,18 +364,33 @@ impl<G> ReaderHandles<G> {
     /// The feed loop returns only on failure (channel closed, or a post
     /// that stopped it). Surface the reader threads' errors for context
     /// before propagating `feed_err`. The channel-closed case's root
-    /// cause lives there.
-    fn surface_errors(self, feed_err: anyhow::Error) -> anyhow::Error {
+    /// cause lives there. Two failures are halts, not ends: a refused
+    /// replay from the cursor (`replay_unavailable`), and a post that
+    /// failed on every attempt (`l1_unreachable`).
+    fn surface_errors(self, feed_err: anyhow::Error) -> RunFailure {
         warn!(error = %format!("{feed_err:#}"), "feed loop exited");
         if self.ordering_handle.is_finished()
             && let Ok(Err(re)) = self.ordering_handle.join()
         {
-            return anyhow::anyhow!("tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})");
+            let halt = matches!(re, ExecutorError::ClusterReplayUnavailable { .. })
+                .then(|| Halt::new(HaltCause::ReplayUnavailable, re.to_string()));
+            return RunFailure {
+                halt,
+                error: anyhow::anyhow!(
+                    "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
+                ),
+            };
         }
-        self.join_handles
+        let halt = feed_err
+            .chain()
+            .any(|c| c.downcast_ref::<PostExhausted>().is_some())
+            .then(|| Halt::new(HaltCause::L1Unreachable, format!("{feed_err:#}")));
+        let error = self
+            .join_handles
             .into_iter()
             .find_map(|h| Self::stream_reader_failure(h, &feed_err))
-            .unwrap_or(feed_err)
+            .unwrap_or(feed_err);
+        RunFailure { halt, error }
     }
 
     /// `h`'s error, if it already finished and failed.
@@ -403,16 +462,79 @@ fn continue_from_spool(
 
 /// Ctrl-C, or a feed-loop failure that stops it.
 ///
+/// A failure the batcher can wait out is a halt, not an end: the process
+/// stays up, serves its metrics and the `/halt` record, and starts again
+/// when the halt clears. An `l1_unreachable` halt retries on a backoff;
+/// a `replay_unavailable` halt waits for the operator's clear, after the
+/// range is recovered or the chain reverted.
+///
 /// # Errors
-/// Returns an error when L1 setup, cursor reconcile, config parsing, or the
-/// reader stack fails to start, or when the feed loop exits with a failure.
+/// Returns an error when config parsing or the reader stack fails to
+/// start, or when the feed loop exits with a failure no halt names.
 pub async fn run(args: LiveArgs) -> Result<()> {
-    let l1 = args.start_l1_side().await?;
+    loop {
+        match run_once(&args).await? {
+            RunEnd::Shutdown => return Ok(()),
+            RunEnd::Halted(halt) => {
+                if hold(halt).await.is_break() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// How one run ended: the shutdown signal, or a halt to hold.
+enum RunEnd {
+    Shutdown,
+    Halted(Halt),
+}
+
+/// Hold `halt` until the batcher may start again: one backoff for a halt
+/// that clears by itself, the operator's clear for the other. `Break` is
+/// the shutdown signal during the hold.
+async fn hold(halt: Halt) -> ControlFlow<()> {
+    let clears = halt.clears;
+    halt::raise(halt);
+    tokio::select! {
+        () = bin_support::wait_for_shutdown() => {
+            info!("shutdown signal received while halted; stopping live batcher");
+            ControlFlow::Break(())
+        }
+        () = wait_to_retry(clears) => ControlFlow::Continue(()),
+    }
+}
+
+/// When a held halt is tried again.
+async fn wait_to_retry(clears: Clears) {
+    match clears {
+        Clears::Auto => tokio::time::sleep(HALT_RETRY).await,
+        Clears::Operator => halt::cleared().await,
+    }
+}
+
+/// One start of the service: L1, the spool, the reader stack, and the
+/// feed loop, until the shutdown signal or a failure.
+async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
+    let l1 = match args.start_l1_side().await {
+        Ok(l1) => l1,
+        Err(e) => return Ok(RunEnd::Halted(e.halt())),
+    };
     let spool = Spool::open(&args.spool_dir)?;
     let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
-    let mut run_cfg = RunConfig::resolve(&args)?;
+    let mut run_cfg = RunConfig::resolve(args)?;
     run_cfg.resolve_cluster_ingress().await?;
-    let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, resume)?;
+    let ReaderStack {
+        handles,
+        feed_rx,
+        posted_cursor,
+    } = run_cfg.spawn_reader_stack(args, resume)?;
+    // The start reached the stream: a held halt is over. The sealer and
+    // the ingress learn the confirmed cursor before the first post.
+    halt::clear();
+    posted_cursor
+        .publish(l1.l1_truth.covered_through_block)
+        .await?;
 
     let sender = LiveSender::new(
         l1.provider,
@@ -420,7 +542,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         l1.da,
         l1.l1_truth.last_batch_index,
         args.l1_retries,
-        args.cursor_file,
+        args.cursor_file.clone(),
         args.settlement_deploy_block,
     );
     let feed_cfg = FeedConfig {
@@ -432,7 +554,9 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         target_payload_bytes: args.target_payload_bytes,
         skip_through_block: resume.next_block.saturating_sub(1),
     };
-    let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg, spool, restored).run());
+    let mut feed = tokio::spawn(
+        FeedLoop::new(feed_rx, sender, feed_cfg, spool, restored, posted_cursor).run(),
+    );
     let feed_result = tokio::select! {
         r = &mut feed => r.context("feed task panicked")?,
         () = bin_support::wait_for_shutdown() => {
@@ -440,18 +564,38 @@ pub async fn run(args: LiveArgs) -> Result<()> {
             // every restart, so tearing down mid-batch loses nothing.
             info!("shutdown signal received; stopping live batcher");
             run_cfg.plane.shutdown().await;
-            return Ok(());
+            return Ok(RunEnd::Shutdown);
         }
     };
-    match feed_result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(handles.surface_errors(e)),
+    let Err(e) = feed_result else {
+        return Ok(RunEnd::Shutdown);
+    };
+    let RunFailure { halt, error } = handles.surface_errors(e);
+    run_cfg.plane.shutdown().await;
+    match halt {
+        Some(halt) => Ok(RunEnd::Halted(halt)),
+        None => Err(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use kardamom_types::BPosition;
+
+    /// L1 silence clears by itself; a refused resume waits for an operator.
+    #[test]
+    fn a_start_failure_names_its_halt() {
+        let l1 = StartError::L1(anyhow::anyhow!("connect L1 RPC http://l1: refused"));
+        let halt = l1.halt();
+        assert_eq!(halt.cause, HaltCause::L1Unreachable);
+        assert!(halt.detail.contains("connect L1 RPC"), "{}", halt.detail);
+        assert_eq!(halt.clears, kardamom_obs::halt::Clears::Auto);
+
+        let resume = StartError::Resume(anyhow::anyhow!("spool does not continue the cursor"));
+        let halt = resume.halt();
+        assert_eq!(halt.cause, HaltCause::ReplayUnavailable);
+        assert_eq!(halt.clears, kardamom_obs::halt::Clears::Operator);
+    }
 
     use super::*;
     use crate::batch::ClosedBlock;

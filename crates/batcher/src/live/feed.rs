@@ -18,6 +18,7 @@ use crate::error::BatcherError;
 use kardamom_types::xchain::remote_epoch_wire_bytes;
 
 use super::cursor::BatchCursor;
+use super::posted_cursor::PostedCursor;
 use super::spool::{Restored, Spool};
 
 /// How often the group's timers are checked when no record arrives.
@@ -129,6 +130,8 @@ pub(crate) struct FeedLoop<P> {
     pending: Option<PendingGroup>,
     /// The consumed, unposted blocks on disk (`super::spool`).
     spool: Spool,
+    /// The cursor the sealer and the ingress learn after every post.
+    cursor: PostedCursor,
 }
 
 impl PendingGroup {
@@ -169,6 +172,7 @@ impl<P: Provider> FeedLoop<P> {
         cfg: FeedConfig,
         spool: Spool,
         restored: Restored,
+        cursor: PostedCursor,
     ) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
@@ -192,6 +196,7 @@ impl<P: Provider> FeedLoop<P> {
             acc: BatchAccumulator::new(),
             pending,
             spool,
+            cursor,
         }
     }
 
@@ -337,7 +342,8 @@ impl<P: Provider> FeedLoop<P> {
     async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
         let cursor = group.cursor_at(batch.l2_block_end)?;
         self.sender.post_confirmed(batch, cursor).await?;
-        self.spool.clear_through(batch.l2_block_end)
+        self.spool.clear_through(batch.l2_block_end)?;
+        self.cursor.publish(batch.l2_block_end).await
     }
 }
 

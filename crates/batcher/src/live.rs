@@ -26,6 +26,7 @@
 mod cursor;
 mod feed;
 pub mod poll;
+mod posted_cursor;
 mod run;
 mod sender;
 mod spool;
