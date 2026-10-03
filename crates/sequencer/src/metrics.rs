@@ -51,6 +51,11 @@ pub(crate) const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skip
 pub(crate) const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub(crate) const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
 pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
+/// The unix time of the last boundary frame the cluster egress delivered.
+/// The readiness rule requires one within the boundary-silence window:
+/// the sealer emits a boundary every tick, so a recent one proves the
+/// session is open and the egress attached, on an idle chain too.
+pub const LAST_BOUNDARY_UNIX_SECONDS: &str = "kardamom_sequencer_last_boundary_unix_seconds";
 /// A gauge for refs that are published but not yet receipt-confirmed as
 /// committed. A counter for refs that are rewound and republished after
 /// the confirm timeout. A steady nonzero republish rate means offers land

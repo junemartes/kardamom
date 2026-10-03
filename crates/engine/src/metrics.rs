@@ -18,6 +18,12 @@ pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 // each replica re-exports its own view.
 pub const SEALER_BLOCK_NUMBER: &str = "kardamom_sealer_block_number";
 pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_total";
+/// The sealer's block number as the validator's reader sees it. The name
+/// differs from `SEALER_BLOCK_NUMBER` on purpose: the executor's series is
+/// the documented observation point, and a second copy under that name
+/// breaks every `sum()` query over it. The validator's readiness rule
+/// compares this head with `validator_committed_block`.
+pub const VALIDATOR_SEALER_BLOCK_NUMBER: &str = "validator_sealer_block_number";
 
 /// EIP-7928 BAL publication.
 pub const BAL_FRAME_BYTES: &str = "kardamom_executor_bal_frame_bytes";
@@ -95,6 +101,10 @@ pub fn describe() {
     metrics::describe_counter!(
         SEALER_BOUNDARIES_TOTAL,
         "sealer block boundaries observed at cluster egress"
+    );
+    metrics::describe_gauge!(
+        VALIDATOR_SEALER_BLOCK_NUMBER,
+        "sealer's block number per its latest boundary, as the validator's reader sees it"
     );
     metrics::describe_counter!(
         INVALID_TX_SKIPPED_TOTAL,

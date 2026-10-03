@@ -32,12 +32,23 @@ pub(crate) fn free_port() -> SocketAddr {
 /// Panics if the connect never succeeds within `budget`, or if the
 /// blocking task itself panics.
 pub(crate) async fn scrape(addr: SocketAddr, budget: Duration) -> String {
+    get(addr, "/metrics", budget).await
+}
+
+/// GET `path` at `addr` and return the whole raw response (status line,
+/// headers, body), retrying the connect until `budget` elapses.
+///
+/// # Panics
+///
+/// Panics if the connect never succeeds within `budget`, or if the
+/// blocking task itself panics.
+pub(crate) async fn get(addr: SocketAddr, path: &'static str, budget: Duration) -> String {
     tokio::task::spawn_blocking(move || {
         kardamom_obs::testkit::poll_sync(
             &format!("exporter on {addr}"),
             budget,
             Duration::from_millis(100),
-            || Ok(scrape_once(addr)),
+            || Ok(get_once(addr, path)),
         )
         .unwrap()
     })
@@ -45,15 +56,14 @@ pub(crate) async fn scrape(addr: SocketAddr, budget: Duration) -> String {
     .expect("scrape task panicked")
 }
 
-/// One scrape attempt: connect and read the whole response body, or
-/// `None` if the connect itself fails (the exporter has not started
-/// listening yet).
-fn scrape_once(addr: SocketAddr) -> Option<String> {
+/// One attempt: connect and read the whole response, or `None` if the
+/// connect itself fails (the exporter has not started listening yet).
+fn get_once(addr: SocketAddr, path: &str) -> Option<String> {
     let Ok(mut s) = TcpStream::connect(addr) else {
         return None;
     };
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    write!(s, "GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+    write!(s, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
     let mut out = String::new();
     s.read_to_string(&mut out).unwrap();
     Some(out)

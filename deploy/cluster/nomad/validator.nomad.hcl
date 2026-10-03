@@ -119,9 +119,28 @@ job "validator" {
       mode     = "delay"
     }
 
+    # A node loss reschedules the validator like every other service.
+    # A divergence is a state, not a dead process: the verdict file
+    # beside its state survives the move, and the validator comes up
+    # halted on the new node until an operator clears it.
     reschedule {
-      attempts  = 0
-      unlimited = false
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    # In place: a singleton with a static port restarts on its node.
+    # Healthy by its /ready check: no divergence verdict stands and the
+    # committed block is within the lag budget of the sealer's head, so
+    # a deploy never passes over a divergence.
+    update {
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
@@ -265,6 +284,12 @@ job "validator" {
         port     = "metrics"
         provider = "consul"
         tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {
