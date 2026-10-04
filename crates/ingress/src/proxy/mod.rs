@@ -397,6 +397,7 @@ where
     pub fn begin_drain(&self) {
         self.draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        metrics::gauge!(crate::metrics::DRAINING).set(1.0);
         tracing::info!(
             pending = self.pending.len(),
             "ingress: draining; new submits refused"
@@ -441,6 +442,7 @@ where
     {
         let (jsonrpc_addr, jsonrpc_handle) =
             crate::json_rpc::start_jsonrpc_server(self.clone(), self.cfg.jsonrpc_bind).await?;
+        metrics::gauge!(crate::metrics::DRAINING).set(0.0);
         #[cfg(feature = "binary-protocol")]
         {
             if let Some(addr) = self.cfg.binary_tcp_bind {

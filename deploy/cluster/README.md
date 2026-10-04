@@ -194,10 +194,31 @@ ansible-playbook -i localhost, deploy/cluster/ansible/deploy.yml
 The controller runs the playbook locally and connects to the Nomad HTTP API.
 It verifies the image manifest before changing jobs, compiles the existing HCL
 with `nomad job run -output`, plans changes, and registers only changed jobs.
-Registration uses Nomad's job modify index to reject concurrent edits. Readiness
-requires the current job version's running allocations for **every task group**,
-including every Aeron node and both racing sequencer groups. Allocation readiness
-is followed by the smoke, load and chaos gates of `crates/chaos` in CI.
+Registration uses Nomad's job modify index to reject concurrent edits.
+
+The deploy is a rolling deploy. Every service job carries a Consul check that
+means "this instance does its job" (the `/ready` route beside `/metrics` on the
+Rust services, `/health` on the ingress RPC port, `/ready` on the sealer's admin
+port), and its `update` stanza rolls one instance at a time under that check.
+The role waits for each job's Nomad deployment and requires `successful`; a
+deployment Nomad marks `failed` fails the play at that job, before the next job
+is touched. A system job (the Aeron drivers) has no deployment, so the role
+waits for its allocations instead. The sealer rolls one member at a time in
+the role's order, the followers first and the leader last: one task group per
+Raft member, and one registration per member. The ingress and the sequencer
+can deploy a canary (`KARDAMOM_CANARY=1`, one spare node of the class): the
+role smokes the ingress canary by its node address, promotes it, and only then
+replaces the old instances. `auto_revert` is on for those two stateless
+classes only.
+
+A successful deploy records its manifest under `deployed/<env>/` (`KARDAMOM_ENV`,
+default `local`): `images.digests` is what runs, `images.digests.previous` is
+what it replaced. `just rollback <env>` deploys the previous one; it is a
+normal rolling deploy of older images under the same checks. The validator's
+divergence verdict is a file beside its state; it survives restarts and
+deploys, keeps `/ready` failing, and an operator clears it with
+`kardamom-validator --state-dir <dir> --clear-verdict` inside the allocation.
+The smoke, load and chaos gates of `crates/chaos` follow in CI.
 
 Configuration lives in `ansible/roles/workloads/defaults/main.yml`. Existing
 `NOMAD_ADDR`, `DIGEST_MANIFEST`, `KARDAMOM_REQUIRE_SIGNED`, settlement, light-client,

@@ -1,0 +1,24 @@
+---
+# One step of the staged roll: the groups rolled so far carry the new
+# definition, the others keep the registered one, so the plan touches
+# one member.
+- name: Build the sealer roll step of {{ workloads_sealer_group }}
+  ansible.builtin.set_fact:
+    workloads_job_definition: >-
+      {{ workloads_sealer_new | combine({'TaskGroups':
+           (workloads_sealer_new.TaskGroups | selectattr('Name', 'in', workloads_sealer_rolled) | list)
+           + (workloads_sealer_current.json.TaskGroups | rejectattr('Name', 'in', workloads_sealer_rolled) | list)}) }}
+  vars:
+    workloads_sealer_rolled: "{{ workloads_sealer_order[: workloads_sealer_index + 1] }}"
+
+- name: Register the sealer roll step of {{ workloads_sealer_group }}
+  ansible.builtin.include_tasks: register.yml
+  vars:
+    workloads_register_job: cluster
+    workloads_register_submit: true
+
+- name: Wait for member {{ workloads_sealer_group }}
+  ansible.builtin.include_tasks: wait.yml
+  vars:
+    workloads_wait_job: cluster
+    workloads_job: "{{ workloads_sealer_job }}"

@@ -85,6 +85,13 @@ public final class SealerClusteredService implements ClusteredService {
     private CanonicalSealerState state;
     private SealerEgress egress;
 
+    /**
+     * The log position of the last entry this service applied. The admin
+     * endpoint reads it from another thread and compares it with the
+     * commit position: the gap is the service's lag behind the log.
+     */
+    private volatile long servicePosition;
+
     /** Malformed ingress frames dropped (logged at power-of-two counts). */
     private long droppedFrameCount = 0;
 
@@ -271,6 +278,7 @@ public final class SealerClusteredService implements ClusteredService {
             + " logPosition=" + logPosition
             + " role=" + cluster.role()
             + " block=" + state.blockNumber());
+        recordServicePosition();
     }
 
     @Override
@@ -303,6 +311,16 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        dispatchSessionMessage(session, buffer, offset, length);
+        recordServicePosition();
+    }
+
+    /** Decode the kind tag and dispatch one ingress frame. */
+    private void dispatchSessionMessage(
+            final ClientSession session,
+            final DirectBuffer buffer,
+            final int offset,
+            final int length) {
         if (length <= SealerWire.KIND_OFFSET) {
             // Malformed or too-short envelope: it cannot carry the kind tag.
             onMalformedFrame("ingress-envelope", length);
@@ -701,6 +719,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        recordServicePosition();
         if (correlationId == WINDOW_TIMER_CORRELATION_ID) {
             flushWindow();
             return;
@@ -761,7 +780,16 @@ public final class SealerClusteredService implements ClusteredService {
         // No external resources to release.
     }
 
+    /** The log position of the last applied entry; 0 before the first. */
+    long servicePosition() {
+        return servicePosition;
+    }
+
     // --- helpers ------------------------------------------------------------
+
+    private void recordServicePosition() {
+        servicePosition = cluster.logPosition();
+    }
 
     /**
      * Arm the ordering window's hold timer. Only the leader's call takes

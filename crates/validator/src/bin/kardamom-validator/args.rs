@@ -44,8 +44,16 @@ pub(crate) struct ValidatorFileConfig {
 )]
 pub(crate) struct Args {
     /// Path to the TOML config file. Its presence is checked; tuning uses flags.
-    #[arg(long)]
-    pub(crate) config: PathBuf,
+    /// Only `--clear-verdict` runs without it.
+    #[arg(long, required_unless_present = "clear_verdict")]
+    pub(crate) config: Option<PathBuf>,
+    /// Clear the divergence verdict beside `--state-dir` and exit. A
+    /// validator that runs halted on that verdict sees the removal within
+    /// its poll interval and resumes from its cursor. Nothing else starts:
+    /// no exporter, no Aeron. Run it from the validator's allocation, so
+    /// the state directory is the same one.
+    #[arg(long, default_value_t = false)]
+    pub(crate) clear_verdict: bool,
     /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
     #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
     pub(crate) log_config: Option<PathBuf>,
@@ -125,6 +133,11 @@ pub(crate) struct Args {
     /// must not compete for one socket. See docs/observability.md.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9007")]
     pub(crate) metrics_addr: std::net::SocketAddr,
+    /// `/ready` passes while no divergence verdict stands and the
+    /// committed block is at most this many blocks behind the sealer's
+    /// head.
+    #[arg(long, env = "KARDAMOM_READY_LAG_BLOCKS", default_value_t = 8)]
+    pub(crate) ready_lag_blocks: u32,
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     pub(crate) host_id: String,

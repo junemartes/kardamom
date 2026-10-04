@@ -261,7 +261,17 @@ struct Boot {
 impl Boot {
     async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
-        kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
+        kardamom_obs::init_service!(
+            "executor",
+            args.metrics_addr,
+            &args.host_id,
+            kardamom_obs::Readiness::up().within(
+                kardamom_engine::metrics::BLOCK_NUMBER,
+                kardamom_engine::metrics::SEALER_BLOCK_NUMBER,
+                f64::from(args.ready_lag_blocks),
+            )
+        )
+        .await?;
         kardamom_engine::metrics::describe();
         let file_cfg = load_file_config(&args)?;
         tracing::info!(

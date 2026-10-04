@@ -34,54 +34,19 @@
     workloads_job_definition: >-
       {{ (workloads_compiled.stdout | from_json).Job | combine({'Namespace': workloads_namespace}) }}
 
-- name: Plan {{ workloads_job.name }}
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_job.name }}/plan?namespace={{ workloads_namespace | urlencode }}"
-    method: POST
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    body_format: json
-    body:
-      Job: "{{ workloads_job_definition }}"
-      Diff: true
-  register: workloads_plan
-  check_mode: false
-
-# The body is one expression, so JobModifyIndex stays an integer. A quoted
-# template ("{{ ... }}", with or without `| int`) reaches the module as a
-# string on ansible-core 2.17, the pin of the deploy path, and Nomad
-# answers 400 ("cannot unmarshal string into ... JobModifyIndex of type
-# uint64"). ansible-core 2.19 keeps the type either way.
-- name: Register changed job {{ workloads_job.name }}
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
-    method: POST
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    body_format: json
-    body: >-
-      {{ {'Job': workloads_job_definition,
-          'EnforceIndex': true,
-          'JobModifyIndex': workloads_plan.json.JobModifyIndex} }}
-  when:
-    - not ansible_check_mode
-    - workloads_plan.json.Diff.Type != 'None'
-  changed_when: true
-
-- name: Report planned change for {{ workloads_job.name }}
-  ansible.builtin.debug:
-    msg: "{{ workloads_plan.json.Diff.Type }}"
-  changed_when: workloads_plan.json.Diff.Type != 'None'
-  when: ansible_check_mode
-
-- name: Remember desired groups for readiness checks
-  ansible.builtin.set_fact:
-    workloads_jobs: "{{ workloads_jobs | combine({workloads_job.name: workloads_job_definition}) }}"
+# A job with submit: false stops here, planned but not registered: the
+# sealer roll reads the plan and registers the groups one at a time.
+- name: Plan and register {{ workloads_job.name }}
+  ansible.builtin.include_tasks: register.yml
+  vars:
+    workloads_register_job: "{{ workloads_job.name }}"
+    workloads_register_submit: "{{ workloads_job.submit | default(true) }}"
 
 - name: Wait for startup dependency {{ workloads_job.name }}
   ansible.builtin.include_tasks: wait.yml
   vars:
     workloads_wait_job: "{{ workloads_job.name }}"
   when:
+    - workloads_job.submit | default(true)
     - workloads_job.wait | default(true)
     - not ansible_check_mode

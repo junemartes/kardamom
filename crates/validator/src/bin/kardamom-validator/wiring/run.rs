@@ -401,13 +401,11 @@ impl Running {
         }
         .wait()
         .await;
-        if !divergence.is_halted() {
+        let Some(reason) = divergence.halt_reason("divergence (no reason recorded)") else {
             return outcome;
-        }
-        if let Some(reason) = divergence.reason() {
-            tracing::error!(reason = %reason, "validator halted on divergence");
-        }
-        EngineOutcome::Diverged
+        };
+        tracing::error!(reason = %reason, "validator halted on divergence");
+        EngineOutcome::Diverged(reason)
     }
 }
 
@@ -612,12 +610,12 @@ pub(crate) struct RunEnd {
 
 /// The joined engine loop's outcome: a clean return, an engine-level
 /// failure (not necessarily a divergence), a task panic (no error value
-/// survives a panic), or a proven divergence.
+/// survives a panic), or a proven divergence with its reason.
 pub(crate) enum EngineOutcome {
     Clean,
     Failed(ExecutorError),
     Panicked,
-    Diverged,
+    Diverged(String),
 }
 
 /// Classify the joined engine loop's outcome. Latches a forged record

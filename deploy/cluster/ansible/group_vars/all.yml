@@ -225,5 +225,6 @@ cluster_ports:
   log: 40202              # log replication
   catchup: 40203          # replay / catch-up (log replication uses an OS-assigned port)
   archive_control: 40204
+  admin: 40205            # member status (GET /status) and the readiness check (GET /ready)
 cluster_ingress_stream_id: 101
 cluster_egress_stream_id: 102
