@@ -101,7 +101,7 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     );
     // T4: the fault clears. The batcher posts within one flush.
     crate::log(format!("{ctx}: T4: the fault clears"));
-    let stuck = Followers::at_clear(h, &l1).await?;
+    let stuck = Followers::at_clear(h, &l1, base).await?;
     await_posting(h, at_t3, Duration::from_secs(30), ctx).await?;
     deferred(
         ctx,

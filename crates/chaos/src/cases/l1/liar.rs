@@ -117,7 +117,7 @@ impl Phase {
         self.assert_alert(l1, window, ctx).await?;
         tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
         assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await?;
-        let stuck = Followers::at_clear(h, l1).await?;
+        let stuck = Followers::at_clear(h, l1, base).await?;
         self.assert_resume(h, stuck, ctx).await
     }
 

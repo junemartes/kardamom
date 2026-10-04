@@ -21,7 +21,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "l1-null-receipts";
     let l1 = L1::new(h).await?;
     l1.require_rule_loaded(STALE_POST_ALERT, ctx).await?;
-    Followers::ready(h, ctx).await?;
+    let base = Followers::ready(h, ctx).await?;
     require_posting(h, ctx).await?;
     let window = h.knobs.l1_fault;
     let faults = [
@@ -48,7 +48,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     assert_resumed_from_contract(h, &l1, before, ctx).await?;
     tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
     let stalled = posted(h).await.unwrap_or(0);
-    let stuck = Followers::at_clear(h, &l1).await?;
+    let stuck = Followers::at_clear(h, &l1, base).await?;
     // The receipt of the post in flight arrives; the batcher continues.
     await_posting(
         h,

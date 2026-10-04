@@ -87,11 +87,24 @@ impl Followers {
 
     /// The followers at the moment the lie stops, then the lie cleared.
     /// A resume must pass this sample: a halted follower holds its
-    /// gauges here, and the sample before the lie is already behind it.
-    pub(super) async fn at_clear(h: &Harness, l1: &L1) -> anyhow::Result<Self> {
-        let now = Self::read(h).await;
+    /// gauges here, and `before` (the sample before the lie) is already
+    /// behind it. A follower restarted under the lie has no gauge yet;
+    /// its value from `before` stands in.
+    pub(super) async fn at_clear(h: &Harness, l1: &L1, before: Self) -> anyhow::Result<Self> {
+        let now = Self::read(h).await.or(before);
         l1.clear_faults().await?;
         Ok(now)
+    }
+
+    /// Each absent field of `self` taken from `earlier`.
+    fn or(self, earlier: Self) -> Self {
+        Self {
+            watcher_breaks: self.watcher_breaks.or(earlier.watcher_breaks),
+            watcher_origin: self.watcher_origin.or(earlier.watcher_origin),
+            indexer_errors: self.indexer_errors.or(earlier.indexer_errors),
+            indexer_block: self.indexer_block.or(earlier.indexer_block),
+            indexer_last_batch: self.indexer_last_batch.or(earlier.indexer_last_batch),
+        }
     }
 
     /// Both followers counted a chain break since `base`.
@@ -236,5 +249,11 @@ mod tests {
         };
         assert!(!dark.chain_broke_since(base) && !dark.is_ready());
         assert!(base.is_ready());
+        let restarted = Followers {
+            indexer_block: None,
+            ..moved
+        };
+        assert_eq!(restarted.or(base).indexer_block, Some(20));
+        assert_eq!(restarted.or(base).watcher_origin, Some(11));
     }
 }
