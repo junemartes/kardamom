@@ -135,7 +135,11 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
         Verdict::Done => return Ok(ControlFlow::Break(())),
         Verdict::Exit(status) => exit(status),
         Verdict::Halt(reason) => {
-            if super::halted::Halted::of(boot).hold_on(boot, reason).await.is_break() {
+            if super::halted::Halted::of(boot)
+                .hold_on(boot, reason)
+                .await
+                .is_break()
+            {
                 return Ok(ControlFlow::Break(()));
             }
             *revolutions += 1;

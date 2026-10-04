@@ -31,7 +31,9 @@ use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscr
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
-use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle};
+use kardamom_log::aeron_live::{
+    AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
+};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_log::recorder::RecorderThreads;

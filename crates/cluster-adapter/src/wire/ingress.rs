@@ -17,10 +17,9 @@ use super::RT_DEPOSITREF;
 use super::{
     CANONICAL_ID_LEN, INGRESS_CANONICAL_ID_OFFSET, INGRESS_DEADLINE_OFFSET, INGRESS_NONCE_OFFSET,
     INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD,
-    KIND_POSTED_CURSOR,
-    KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH,
-    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, epoch_slots, rd_slice,
-    rd_u64, rd_u128, remote_epoch_slots, too_short,
+    KIND_POSTED_CURSOR, KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE,
+    KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError,
+    encode_kind_2u64, epoch_slots, rd_slice, rd_u64, rd_u128, remote_epoch_slots, too_short,
 };
 
 /// The guard header of a kind-0 ingress frame: the fields the service

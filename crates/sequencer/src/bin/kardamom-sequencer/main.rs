@@ -548,6 +548,17 @@ fn log_nonce_floor_sources(cfg: &SequencerConfig) {
     }
 }
 
+/// Publish this replica's lifecycle on the `events` stream: it pauses
+/// while the sealer emits no boundary.
+async fn spawn_events_beacon(plane: &mut StreamPlane, rt: &AeronRuntime) -> Result<()> {
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(rt)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -598,13 +609,7 @@ async fn main() -> anyhow::Result<()> {
         .context("build the stream plane")?;
 
     let handles = Handles::open(&rt, &mut plane, &cfg).await?;
-    // This replica's lifecycle on the `events` stream: it pauses while the
-    // sealer emits no boundary.
-    plane
-        .publisher::<ServiceEventsPublisherHandle>(&rt)
-        .await
-        .context("open events")?
-        .spawn_process_beacon();
+    spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();
 
