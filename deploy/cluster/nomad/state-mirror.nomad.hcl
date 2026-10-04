@@ -59,16 +59,23 @@ job "state-mirror" {
       unlimited      = true
     }
 
+    # One mirror at a time, healthy by its /ready check: it applied a
+    # batch within the stale window, so it is attached to tx_receipts.
     update {
-      max_parallel     = 1
-      health_check     = "task_states"
-      min_healthy_time = "10s"
-      healthy_deadline = "2m"
-      auto_revert      = false
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
       mode = "host"
+      # The exporter, as a Consul service: the /ready check reads it.
+      port "metrics" {
+        static = 9007
+      }
     }
 
     task "state-mirror" {
@@ -130,6 +137,19 @@ sentinels = [
 ]
 master_name = "kardamom"
 EOF
+      }
+
+      service {
+        name     = "kardamom-state-mirror"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

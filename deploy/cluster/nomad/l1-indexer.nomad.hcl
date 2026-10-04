@@ -165,6 +165,12 @@ job "l1-indexer" {
         port     = "metrics"
         provider = "consul"
         tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       # One HTTP round trip per block, one per batch for the payload,

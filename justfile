@@ -614,6 +614,10 @@ images:
 deploy:
     @just --justfile deploy/cluster/justfile deploy
 
+# Deploy the manifest the last successful deploy of <env> replaced.
+rollback env:
+    @just --justfile deploy/cluster/justfile rollback {{ env }}
+
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:
     @just --justfile deploy/cluster/justfile smoke

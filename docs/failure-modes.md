@@ -314,6 +314,15 @@ an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
 
+A divergence is a state, not a dead process. The validator writes its verdict
+to a `verdict` file beside its state before it exits, and mirrors it in the
+`validator_verdict_standing` gauge. A restart (a crash, a node loss, a deploy)
+that finds a standing verdict runs halted: the exporter serves, the gauge
+stays at 1, `/ready` fails, and the pipeline does not start. So a deploy never
+passes over a divergence, and the alert stays loud until an operator clears
+the file (`kardamom-validator --state-dir <dir> --clear-verdict`); the halted
+validator notices within seconds and resumes from its cursor.
+
 Exit codes keep the two halt classes distinguishable: **exit 2 is reserved
 for a proven divergence** (the latch records the reason before the engine
 surfaces it) — the page-the-humans signal. Every other engine failure — a

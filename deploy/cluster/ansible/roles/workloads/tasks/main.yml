@@ -42,16 +42,21 @@
 
 # Submit sequencers without waiting: they may need downstream subscribers.
 # Ingress must subscribe to receipts before executors start publishing them.
-- name: Deploy pipeline dependencies
-  ansible.builtin.include_tasks: job.yml
-  loop:
-    - name: cluster
+- name: Deploy the sealer
+  ansible.builtin.include_tasks: sealer.yml
+  vars:
+    workloads_sealer_job:
+      name: cluster
       retries: 100
       vars:
         cluster_retention: "{{ workloads_cluster_retention }}"
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
         cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
+
+- name: Deploy pipeline dependencies
+  ansible.builtin.include_tasks: job.yml
+  loop:
     - name: sequencer
       wait: false
       vars:
@@ -188,3 +193,7 @@
            | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
                      if workloads_indexer_deployed | bool else {}) }}
+
+- name: Record the deployed manifest
+  ansible.builtin.import_tasks: record.yml
+  when: not ansible_check_mode

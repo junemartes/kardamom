@@ -606,7 +606,13 @@ impl RunningIngress {
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("ingress", args.metrics_addr, args.host_id.as_ref()).await?;
+    kardamom_obs::init_service!(
+        "ingress",
+        args.metrics_addr,
+        args.host_id.as_ref(),
+        kardamom_obs::Readiness::up().equals(kardamom_ingress::metrics::DRAINING, 0.0)
+    )
+    .await?;
     kardamom_ingress::metrics::describe();
     kardamom_cache::metrics::describe();
 

@@ -523,7 +523,11 @@ where
         .build();
     let server = Server::builder()
         .set_config(server_cfg)
-        .set_http_middleware(tower::ServiceBuilder::new().layer(peer_addr_layer::PeerAddrLayer))
+        .set_http_middleware(
+            tower::ServiceBuilder::new()
+                .layer(health_layer::HealthLayer::new(proxy.draining.clone()))
+                .layer(peer_addr_layer::PeerAddrLayer),
+        )
         .build(addr)
         .await
         .map_err(|e| IngressError::internal("jsonrpsee bind", e))?;
@@ -537,6 +541,78 @@ where
         ))
         .map_err(|e| IngressError::internal("rpc module merge", e))?;
     Ok((local, server.start(module)))
+}
+
+/// The health route on the JSON-RPC port: `GET /health` answers 200
+/// while the proxy serves and 503 from the first moment of the shutdown
+/// drain. A load balancer or a Consul check reads it to take a draining
+/// replica out of rotation before its in-flight submits finish. Every
+/// other request goes to the RPC server.
+mod health_layer {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use futures::future::{Either, Ready, ready};
+    use jsonrpsee::server::HttpBody;
+    use tower::{Layer, Service};
+
+    #[derive(Clone)]
+    pub(super) struct HealthLayer {
+        draining: Arc<AtomicBool>,
+    }
+
+    impl HealthLayer {
+        pub(super) fn new(draining: Arc<AtomicBool>) -> Self {
+            Self { draining }
+        }
+    }
+
+    impl<S> Layer<S> for HealthLayer {
+        type Service = HealthService<S>;
+        fn layer(&self, inner: S) -> Self::Service {
+            HealthService {
+                inner,
+                draining: self.draining.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct HealthService<S> {
+        inner: S,
+        draining: Arc<AtomicBool>,
+    }
+
+    impl<S, Body> Service<hyper::Request<Body>> for HealthService<S>
+    where
+        S: Service<hyper::Request<Body>, Response = hyper::Response<HttpBody>>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = Either<Ready<Result<S::Response, S::Error>>, S::Future>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
+            if req.method() != hyper::Method::GET || req.uri().path() != "/health" {
+                return Either::Right(self.inner.call(req));
+            }
+            let (status, body) = if self.draining.load(Ordering::SeqCst) {
+                (hyper::StatusCode::SERVICE_UNAVAILABLE, "draining\n")
+            } else {
+                (hyper::StatusCode::OK, "ok\n")
+            };
+            let response = hyper::Response::builder()
+                .status(status)
+                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                .body(HttpBody::from(body))
+                .expect("a status and one header form a valid response");
+            Either::Left(ready(Ok(response)))
+        }
+    }
 }
 
 /// Tiny tower layer. It pulls the peer's `SocketAddr`, set on the
@@ -621,6 +697,41 @@ mod tests {
     use crate::test_support::{TestServer, http_client, start_test_server};
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::rpc_params;
+
+    /// One raw `GET path` on the server, with the whole response text.
+    async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn health_fails_from_the_first_moment_of_the_drain() {
+        let cfg = IngressConfig::default();
+        let shards = std::num::NonZeroUsize::try_from(cfg.partition_count_m).unwrap();
+        let (mock, _shard_rx) = crate::channels::MockChannels::new(shards);
+        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let (addr, handle) = start_jsonrpc_server(proxy.clone(), bind).await.unwrap();
+
+        let serving = get(addr, "/health").await;
+        assert!(serving.contains(" 200 "), "{serving}");
+        assert!(serving.ends_with("ok\n"), "{serving}");
+
+        proxy.begin_drain();
+        let draining = get(addr, "/health").await;
+        assert!(draining.contains(" 503 "), "{draining}");
+        assert!(draining.ends_with("draining\n"), "{draining}");
+
+        let other = get(addr, "/other").await;
+        assert!(!other.contains(" 200 "), "{other}");
+        handle.stop().unwrap();
+    }
 
     #[tokio::test]
     async fn chain_id_round_trips() {
