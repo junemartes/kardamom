@@ -186,6 +186,7 @@ class DeployTest(unittest.TestCase):
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_file_sync_level': '2',
             'workloads_remote_origins': '412399',
+            'workloads_priority_fees': 'on',
         }, check=True)
         plans = self.api.state['plans']
         self.assertIn('l1-light-client', plans)
@@ -201,7 +202,30 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        # One value turns priority fees on for every role that has a say.
+        self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
+        self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')
+        for name in ('executor', 'validator'):
+            self.assertIn('base_fee_initial', self.genesis_template(plans[name]), name)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_priority_fees_default_off_on_every_role(self):
+        self.run_deploy(check=True)
+        plans = self.api.state['plans']
+        self.assertIn('-Dkardamom.cluster.orderingWindow=0', json.dumps(plans['cluster']))
+        self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
+        for name in ('executor', 'validator'):
+            self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    @staticmethod
+    def sequencer_env(plans):
+        return plans['sequencer']['TaskGroups'][0]['Tasks'][0]['Env']
+
+    @staticmethod
+    def genesis_template(job):
+        templates = [t for g in job['TaskGroups'] for t in g['Tasks'][0]['Templates']
+                     if t['DestPath'] == 'local/genesis.toml']
+        return templates[0]['EmbeddedTmpl']
 
     def test_resize_reuses_deployment_inputs_and_image_pins(self):
         settings = {

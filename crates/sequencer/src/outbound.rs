@@ -29,7 +29,7 @@
 
 pub mod cluster;
 
-use alloy_primitives::Address;
+use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
@@ -43,9 +43,9 @@ use crate::error::SequencerError;
 #[derive(Clone, Copy, Debug)]
 pub struct RefOffer {
     pub tx_ref: TxRef,
-    pub sender: Address,
-    pub nonce: u64,
-    pub max_inclusion_block: u64,
+    /// The sealer's guard header: the sender and nonce for the contiguity
+    /// guard, the inclusion deadline, and the tip the record bids.
+    pub guard: GuardHeader,
 }
 
 /// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
@@ -159,12 +159,15 @@ pub mod fakes {
 
     use super::{RefOffer, SequencerError, SideChannelPublisher, TxError, TxOrderingRefPublisher};
 
-    /// In-memory `tx_ordering` publisher. Records every published `TxRef`,
+    /// In-memory `tx_ordering` publisher. Records every published offer,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
     /// can check the canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
-        pub refs: Arc<Mutex<Vec<TxRef>>>,
+        /// Every published offer whole, guard header included. One vector
+        /// holds the whole record: the allocation harness reserves it,
+        /// so the fake costs the measured loop nothing.
+        pub offers: Arc<Mutex<Vec<RefOffer>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
@@ -175,7 +178,7 @@ pub mod fakes {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.refs.lock().unwrap().push(offer.tx_ref);
+            self.offers.lock().unwrap().push(*offer);
             Ok(())
         }
 
@@ -196,6 +199,23 @@ pub mod fakes {
             }
             self.remote_epochs.lock().unwrap().push(r.clone());
             Ok(())
+        }
+    }
+
+    impl InMemoryTxOrderingRefPublisher {
+        /// The `TxRef` of every published offer, in arrival order.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the offers mutex is poisoned.
+        #[must_use]
+        pub fn refs(&self) -> Vec<TxRef> {
+            self.offers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|o| o.tx_ref)
+                .collect()
         }
     }
 
@@ -234,9 +254,10 @@ mod tests {
                 BPosition::default(),
                 0,
             ),
-            sender: Address::ZERO,
-            nonce,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                nonce,
+                ..GuardHeader::EXEMPT
+            },
         }
     }
 
@@ -245,7 +266,7 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         p.try_publish_ref(&offer(0)).unwrap();
         p.try_publish_ref(&offer(1)).unwrap();
-        assert_eq!(p.refs.lock().unwrap().len(), 2);
+        assert_eq!(p.refs().len(), 2);
     }
 
     #[test]

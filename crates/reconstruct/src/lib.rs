@@ -25,9 +25,9 @@
 use std::path::Path;
 
 use kardamom_batcher::BlockFrame;
-use kardamom_engine::{CanonicalEnd, ReplayBlock, ReplayOutcome, replay_blocks};
+use kardamom_engine::{CanonicalEnd, ReplayBlock, ReplayGenesis, ReplayOutcome, replay_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
-use kardamom_types::{AccountChange, CodeEntry, TxEnvelope};
+use kardamom_types::TxEnvelope;
 
 /// Error from the rebuild-from-L1 reconstruction path: opening the state
 /// env, or replaying blocks through the engine.
@@ -94,16 +94,14 @@ pub fn strip_to_executor_image(state_dir: &Path) -> Result<(), ReconstructError>
 /// replaying the blocks through the engine fails.
 pub fn reconstruct_state(
     state_dir: &Path,
-    chain_id: u64,
-    genesis_accounts: &[AccountChange],
-    genesis_code: &[CodeEntry],
+    genesis: &ReplayGenesis<'_>,
     blocks: &[BlockFrame],
 ) -> Result<ReplayOutcome, ReconstructError> {
     Reconstruction {
         state_dir,
         durability: Durability::Durable,
     }
-    .run(chain_id, genesis_accounts, genesis_code, blocks)
+    .run(genesis, blocks)
 }
 
 /// Where a reconstruction writes, and how hard each block commit syncs.
@@ -124,9 +122,7 @@ impl Reconstruction<'_> {
     /// Returns an error if the state env cannot open or the replay fails.
     pub fn run(
         &self,
-        chain_id: u64,
-        genesis_accounts: &[AccountChange],
-        genesis_code: &[CodeEntry],
+        genesis: &ReplayGenesis<'_>,
         blocks: &[BlockFrame],
     ) -> Result<ReplayOutcome, ReconstructError> {
         let env = StateEnvBuilder::new(self.state_dir)
@@ -135,8 +131,7 @@ impl Reconstruction<'_> {
             .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
 
         let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
-        replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
-            .map_err(|e| ReconstructError(e.to_string()))
+        replay_blocks(env, genesis, replay).map_err(|e| ReconstructError(e.to_string()))
     }
 }
 
@@ -157,7 +152,7 @@ pub mod test_support {
     use alloy_primitives::{Address, U256, keccak256};
     use alloy_signer_local::PrivateKeySigner;
     use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
-    use kardamom_engine::{ReplayBlock, ReplayOutcome, replay_blocks};
+    use kardamom_engine::{ReplayBlock, ReplayGenesis, ReplayOutcome, replay_blocks};
     use kardamom_state::{Durability, StateEnvBuilder};
     use kardamom_test_support::LegacyTx;
     use kardamom_types::{AccountChange, BPosition, CodeEntry, TxEnvelope};
@@ -235,6 +230,21 @@ pub mod test_support {
         (block1, block2)
     }
 
+    /// The replay chain of a test allocation on [`CHAIN_ID`], with no
+    /// fee schedule.
+    #[must_use]
+    pub fn test_genesis<'a>(
+        accounts: &'a [AccountChange],
+        code: &'a [CodeEntry],
+    ) -> ReplayGenesis<'a> {
+        ReplayGenesis {
+            chain_id: CHAIN_ID,
+            accounts,
+            code,
+            fees: None,
+        }
+    }
+
     /// Replay `blocks` directly (no DA round trip) into a fresh,
     /// throwaway state DB, on [`CHAIN_ID`] — the oracle every
     /// reconstruction gate compares its recovered root against.
@@ -254,20 +264,27 @@ pub mod test_support {
             .durability(Durability::SafeNoSync)
             .open()
             .unwrap();
-        replay_blocks(oracle_env, CHAIN_ID, genesis_accounts, genesis_code, blocks).unwrap()
+        replay_blocks(
+            oracle_env,
+            &test_genesis(genesis_accounts, genesis_code),
+            blocks,
+        )
+        .unwrap()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{CHAIN_ID, genesis, oracle_replay, transfer, two_transfer_blocks};
+    use crate::test_support::{
+        CHAIN_ID, genesis, oracle_replay, test_genesis, transfer, two_transfer_blocks,
+    };
     use alloy_primitives::{Address, B256, U256, address};
     use alloy_signer_local::PrivateKeySigner;
     use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
     use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
     use kardamom_batcher::recon::reconstruct;
-    use kardamom_types::BPosition;
+    use kardamom_types::{AccountChange, BPosition, CodeEntry};
 
     /// The interop scenario's remote origin chain id.
     const REMOTE_ORIGIN: u64 = 412_399;
@@ -291,8 +308,12 @@ mod tests {
         assert_eq!(frames.len(), 2);
 
         let recon_dir = tempfile::tempdir().unwrap();
-        let recovered =
-            reconstruct_state(recon_dir.path(), CHAIN_ID, &genesis(from), &[], &frames).unwrap();
+        let recovered = reconstruct_state(
+            recon_dir.path(),
+            &test_genesis(&genesis(from), &[]),
+            &frames,
+        )
+        .unwrap();
 
         // Directly replay the original envelopes (no DA round trip) as the
         // oracle.
@@ -513,9 +534,7 @@ mod tests {
         let recon_dir = tempfile::tempdir().unwrap();
         let recovered = reconstruct_state(
             recon_dir.path(),
-            CHAIN_ID,
-            &scenario.accounts,
-            &scenario.code,
+            &test_genesis(&scenario.accounts, &scenario.code),
             &frames,
         )
         .unwrap();

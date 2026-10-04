@@ -55,7 +55,9 @@ std = [
 [dependencies]
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 kardamom-types = { path = "../types", default-features = false }
-revm = { version = "38", default-features = false }
+# `optional_no_base_fee`: a derived transaction (a deposit, a cross-chain
+# message) carries no price and must run under any base fee.
+revm = { version = "38", default-features = false, features = ["optional_no_base_fee"] }
 alloy-primitives = { version = "1.6", default-features = false }
 # `k256` (pure-Rust secp256k1) powers the stateless driver's in-guest sender
 # recovery — NOT the C `secp256k1` backend the workspace enables elsewhere,

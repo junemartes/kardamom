@@ -30,7 +30,8 @@ use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, CodeEntry, Receipt, SnapshotSource, TxEnvelope,
+    AccountChange, BPosition, BlockBoundary, BlockFees, CodeEntry, FeeSchedule, Receipt,
+    SnapshotSource, TxEnvelope,
 };
 
 use crate::actor::{StateWriterQueue, StateWriterSignal};
@@ -180,8 +181,36 @@ impl Counters {
     }
 }
 
+/// The chain a replay rebuilds: its id, its genesis allocation, and its
+/// fee schedule. Every value feeds the state roots, so a replay with the
+/// wrong one silently produces a different, wrong, root.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayGenesis<'a> {
+    pub chain_id: u64,
+    pub accounts: &'a [AccountChange],
+    pub code: &'a [CodeEntry],
+    pub fees: Option<FeeSchedule>,
+}
+
+impl<'a> ReplayGenesis<'a> {
+    /// The replay chain of a parsed genesis file and its allocation.
+    #[must_use]
+    pub fn of(
+        genesis: &kardamom_types::Genesis,
+        accounts: &'a [AccountChange],
+        code: &'a [CodeEntry],
+    ) -> Self {
+        Self {
+            chain_id: genesis.chain_id,
+            accounts,
+            code,
+            fees: genesis.fees,
+        }
+    }
+}
+
 /// Re-execute `blocks`, in canonical order, into the state DB at `env`.
-/// This seeds `genesis_accounts` and `genesis_code` first.
+/// This seeds the genesis allocation first.
 ///
 /// `env` should be a fresh state DB, for a from-scratch reconstruction.
 /// Seeding is idempotent: an already-seeded env is left untouched. So
@@ -199,9 +228,7 @@ impl Counters {
 /// no state root (an internal invariant break: see [`ReplayError::NoStateRoot`]).
 pub fn replay_blocks<I>(
     env: StateEnv,
-    chain_id: u64,
-    genesis_accounts: &[AccountChange],
-    genesis_code: &[CodeEntry],
+    genesis: &ReplayGenesis<'_>,
     blocks: I,
 ) -> Result<ReplayOutcome, ReplayError>
 where
@@ -209,7 +236,7 @@ where
 {
     // Genesis must be in place before the writer publishes its initial
     // snapshot. Then block 1 already has accounts to debit.
-    seed_genesis(&env, genesis_accounts, genesis_code)?;
+    seed_genesis(&env, genesis.accounts, genesis.code)?;
 
     let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental)?;
 
@@ -221,7 +248,7 @@ where
         let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
         let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
         let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
-        let mut replay = Replay::new(&mut queue, &mut signal, &source, chain_id);
+        let mut replay = Replay::new(&mut queue, &mut signal, &source, genesis);
 
         blocks
             .into_iter()
@@ -357,6 +384,10 @@ struct Replay<'a> {
     signal: &'a mut MdbxWriterSignal,
     source: &'a MdbxSnapshotSource,
     chain_id: u64,
+    /// The fees of the next block to replay. A replay starts at genesis,
+    /// so this starts at the schedule's first values and advances with
+    /// each block's gas used, as the live exec thread's cursor does.
+    fees: BlockFees,
     counters: Counters,
 }
 
@@ -365,13 +396,14 @@ impl<'a> Replay<'a> {
         queue: &'a mut MdbxWriterQueue,
         signal: &'a mut MdbxWriterSignal,
         source: &'a MdbxSnapshotSource,
-        chain_id: u64,
+        genesis: &ReplayGenesis<'_>,
     ) -> Self {
         Self {
             queue,
             signal,
             source,
-            chain_id,
+            chain_id: genesis.chain_id,
+            fees: BlockFees::genesis(genesis.fees),
             counters: Counters::default(),
         }
     }
@@ -402,6 +434,7 @@ impl<'a> Replay<'a> {
             snapshot,
         )?;
 
+        let gas_used = acc.receipts.last().map_or(0, |r| r.cumulative_gas_used);
         let block_delta = acc.delta.finalize(block.block_number, acc.receipts);
         let boundary = BlockBoundary {
             block_number: block.block_number,
@@ -412,7 +445,10 @@ impl<'a> Replay<'a> {
             end_tx_idx: BPosition::from_index(self.counters.global_pos),
             l2_timestamp: block.l2_timestamp,
             l1_origin: block.canonical_end.map_or(0, |end| end.l1_origin),
+            base_fee: self.fees.base_fee,
+            gas_used,
         };
+        self.fees = self.fees.next(gas_used);
         self.queue.submit(boundary, block_delta)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
@@ -436,6 +472,7 @@ impl<'a> Replay<'a> {
             chain_id: self.chain_id,
             block_number: block.block_number,
             l2_timestamp: block.l2_timestamp,
+            fees: self.fees,
         };
 
         // Remote-epoch messages lead the block: the sealer closed the
@@ -494,6 +531,17 @@ mod tests {
     }
 
     /// A genesis funding `from` with 1 ETH and the two recipients we assert on.
+    /// The replay chain of a test allocation: chain id 1, no code, no
+    /// fee schedule.
+    fn test_genesis(accounts: &[AccountChange]) -> ReplayGenesis<'_> {
+        ReplayGenesis {
+            chain_id: CHAIN_ID,
+            accounts,
+            code: &[],
+            fees: None,
+        }
+    }
+
     fn genesis_for(from: Address) -> Vec<AccountChange> {
         vec![AccountChange {
             address: from,
@@ -565,9 +613,7 @@ mod tests {
         let (_plain_dir, plain_env) = fresh_env();
         let plain = replay_blocks(
             plain_env,
-            CHAIN_ID,
-            &genesis,
-            &[],
+            &test_genesis(&genesis),
             two_blocks(&signer, to1, to2),
         )
         .unwrap();
@@ -576,7 +622,7 @@ mod tests {
         let (_dir, env) = fresh_env();
         let blocks = two_blocks_after_epochs(&signer, to1, to2);
         let last_tx = blocks[1].txs[0].tx_hash;
-        let outcome = replay_blocks(env.clone(), CHAIN_ID, &genesis, &[], blocks).unwrap();
+        let outcome = replay_blocks(env.clone(), &test_genesis(&genesis), blocks).unwrap();
 
         assert_eq!(outcome.state_root, plain.state_root);
         assert_eq!(outcome.head_end_tx_idx, Some(7));
@@ -603,7 +649,7 @@ mod tests {
         });
         let (_dir, env) = fresh_env();
         let err =
-            replay_blocks(env, CHAIN_ID, &genesis_for(signer.address()), &[], blocks).unwrap_err();
+            replay_blocks(env, &test_genesis(&genesis_for(signer.address())), blocks).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -626,9 +672,7 @@ mod tests {
         let (_dir, env) = fresh_env();
         let outcome = replay_blocks(
             env.clone(),
-            CHAIN_ID,
-            &genesis_for(from),
-            &[],
+            &test_genesis(&genesis_for(from)),
             two_blocks(&signer, to1, to2),
         )
         .unwrap();
@@ -664,17 +708,13 @@ mod tests {
         let (_d2, env2) = fresh_env();
         let r1 = replay_blocks(
             env1,
-            CHAIN_ID,
-            &genesis_for(from),
-            &[],
+            &test_genesis(&genesis_for(from)),
             two_blocks(&signer, to1, to2),
         )
         .unwrap();
         let r2 = replay_blocks(
             env2,
-            CHAIN_ID,
-            &genesis_for(from),
-            &[],
+            &test_genesis(&genesis_for(from)),
             two_blocks(&signer, to1, to2),
         )
         .unwrap();
@@ -691,7 +731,7 @@ mod tests {
         let from = signer.address();
         let (_dir, env) = fresh_env();
         let outcome =
-            replay_blocks(env.clone(), CHAIN_ID, &genesis_for(from), &[], Vec::new()).unwrap();
+            replay_blocks(env.clone(), &test_genesis(&genesis_for(from)), Vec::new()).unwrap();
         assert_eq!(outcome.head_block, 0);
         assert_eq!(outcome.blocks_applied, 0);
         // With no blocks, the root is the seeded genesis root.

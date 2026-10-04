@@ -4239,6 +4239,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-signer-local",
  "anyhow",
+ "arc-swap",
  "bytes",
  "clap",
  "core_affinity",

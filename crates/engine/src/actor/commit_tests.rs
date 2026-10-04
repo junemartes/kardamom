@@ -52,6 +52,8 @@ fn commit_thread_preserves_order() {
             end_tx_idx: pos0,
             l2_timestamp: 100,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         }),
     ]);
 
@@ -155,6 +157,8 @@ fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
         end_tx_idx: pos(4 * 64),
         l2_timestamp: 100,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     }));
     let rx = feed_commits(messages);
 

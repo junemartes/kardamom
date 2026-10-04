@@ -10,8 +10,8 @@
 //! is `#[non_exhaustive]`, so the `cfg_pinning` tests pin its effective
 //! values instead.
 
-use alloy_primitives::{Address, B256, U256};
-use kardamom_types::BlockBoundaryStart;
+use alloy_primitives::{B256, U256};
+use kardamom_types::{BlockBoundaryStart, BlockFees};
 use revm::context::{BlockEnv, CfgEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
 use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
@@ -38,26 +38,39 @@ use revm::primitives::hardfork::SpecId;
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
 /// Fixed per-block gas limit. Version 0 has no dynamic adjustment.
-pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+pub use kardamom_types::limits::BLOCK_GAS_LIMIT;
 
-/// Per-block execution context, built from the sealer's `BlockBoundaryStart`.
-/// It stays the same for every tx in the block, and is rebuilt at each
-/// boundary.
+/// Per-block execution context, built from the sealer's `BlockBoundaryStart`
+/// and the block's fees. It stays the same for every tx in the block, and
+/// is rebuilt at each boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecEnv {
     pub chain_id: u64,
     pub block_number: u64,
     pub l2_timestamp: u64,
+    /// The block's base fee and beneficiary. The driver derives them from
+    /// the previous block and the genesis schedule (see
+    /// `kardamom_types::fees`); [`BlockFees::NONE`] is the no-schedule
+    /// chain.
+    pub fees: BlockFees,
 }
 
 impl ExecEnv {
+    /// The env of a chain without a fee schedule. [`Self::with_fees`]
+    /// sets the block's fees.
     #[must_use]
     pub fn new(chain_id: u64, boundary: &BlockBoundaryStart) -> Self {
         Self {
             chain_id,
             block_number: boundary.block_number,
             l2_timestamp: boundary.l2_timestamp,
+            fees: BlockFees::NONE,
         }
+    }
+
+    #[must_use]
+    pub fn with_fees(self, fees: BlockFees) -> Self {
+        Self { fees, ..self }
     }
 
     #[must_use]
@@ -68,15 +81,19 @@ impl ExecEnv {
         // Osaka spec, with no one deciding either value.
         BlockEnv {
             number: U256::from(self.block_number),
-            // Version 0 fee sink. With `basefee = 0`, the full
-            // `gas_price * gas_used` of every tx is a priority fee paid to
-            // the beneficiary. The zero address means a documented burn.
-            // Revisit this with a fee-vault predeploy if fees become real.
-            // Do not change it silently.
-            beneficiary: Address::ZERO,
+            // The fee sink. Without a schedule the beneficiary is the zero
+            // address and the base fee is zero: the full
+            // `gas_price * gas_used` of every tx is a priority fee, and
+            // the zero address means a documented burn. With a schedule
+            // the beneficiary is the genesis fee account and the base fee
+            // follows EIP-1559 from block to block; `crate::settle` then
+            // charges the tip in full on top of revm's settlement.
+            beneficiary: self.fees.beneficiary,
             timestamp: U256::from(self.l2_timestamp),
             gas_limit: BLOCK_GAS_LIMIT,
-            basefee: 0,
+            // `u64::MAX` wei per gas is beyond any schedule; the
+            // saturation only shortens an impossible number.
+            basefee: self.fees.base_fee.try_into().unwrap_or(u64::MAX),
             // Unused after the merge. DIFFICULTY (0x44) resolves to
             // `prevrandao`.
             difficulty: U256::ZERO,
@@ -166,5 +183,18 @@ mod tests {
     #[test]
     fn cfg_env_carries_chain_id() {
         assert_eq!(env().cfg_env().chain_id, 412_346);
+    }
+
+    #[test]
+    fn block_env_carries_the_block_fees() {
+        let beneficiary = alloy_primitives::Address::repeat_byte(0xfe);
+        let env = env()
+            .with_fees(BlockFees {
+                base_fee: 7,
+                beneficiary,
+            })
+            .block_env();
+        assert_eq!(env.basefee, 7);
+        assert_eq!(env.beneficiary, beneficiary);
     }
 }

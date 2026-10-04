@@ -51,6 +51,7 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
+use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
@@ -58,13 +59,14 @@ use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
 use crate::error::SequencerError;
+use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::lookup::LookupRequester;
 use crate::metrics;
-use crate::nonce_decode::decode_nonce;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
+use crate::tx_decode::decode_fields;
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
 
 // Re-export: the bin (and external callers) import
@@ -105,6 +107,12 @@ struct RefMetadata {
     /// racing replica reads the same envelope, so every replica offers the
     /// same deadline for the same record.
     max_inclusion_block: u64,
+    /// The tip the sender bids for its place, in wei. It rides the guard
+    /// header too. It derives from the transaction bytes and the base fee
+    /// view, so every replica offers the same bid, up to one block's step
+    /// of the base fee for a legacy price; the sealer's first-seen dedup
+    /// settles which offer defines the key.
+    tip: u128,
 }
 
 /// The identity of one observed envelope: what every report about it
@@ -228,6 +236,9 @@ pub struct Sequencer {
     /// The resize warm-up, while one is in progress.
     shadow: Option<ShadowWindow>,
     depth: DepthReport,
+    /// The fee admission gate. Off unless the binary wired the base fee
+    /// view and the setting is on.
+    fees: FeeGate,
 }
 
 impl Sequencer {
@@ -263,7 +274,14 @@ impl Sequencer {
             vslots,
             shadow,
             depth,
+            fees: FeeGate::off(),
         })
+    }
+
+    /// Enable the fee admission gate: the three fee checks run on every
+    /// envelope, and the admitted bid rides the offer.
+    pub fn enable_fees(&mut self, gate: FeeGate) {
+        self.fees = gate;
     }
 
     /// The virtual slots this replica serves.
@@ -428,21 +446,24 @@ impl Sequencer {
         // sequencer's per-transaction cost. The chunk must stay under one
         // Aeron MTU (about 1408 bytes): the hand-rolled cluster ingress
         // path does not survive fragmented session messages. With the
-        // guard header (sender 20 bytes, nonce 8 bytes, deadline 8 bytes),
-        // each entry is 83 bytes plus a 4 byte length prefix. 15 x 87 + 3
-        // is about 1.31 KB, which stays under the MTU with margin (16 x 87
-        // + 3 leaves only 13 bytes). A 15:1 ratio still amortizes away the
-        // dominant per-offer cost.
-        const BATCH_MAX: usize = 15;
+        // guard header (sender 20 bytes, nonce 8 bytes, deadline 8 bytes,
+        // tip 16 bytes), each entry is 99 bytes plus a 4 byte length
+        // prefix. 13 x 103 + 3 is about 1.31 KB, which stays under the
+        // MTU with margin (14 x 103 + 3 is over it). A 13:1 ratio still
+        // amortizes away the dominant per-offer cost.
+        const BATCH_MAX: usize = 13;
         let chunk = BATCH_MAX.min(rest.len());
         let refs: Vec<RefOffer> = rest
             .iter()
             .take(chunk)
             .map(|(s, n, m)| RefOffer {
                 tx_ref: Self::make_txref(m),
-                sender: *s,
-                nonce: *n,
-                max_inclusion_block: m.max_inclusion_block,
+                guard: GuardHeader {
+                    sender: *s,
+                    nonce: *n,
+                    max_inclusion_block: m.max_inclusion_block,
+                    tip: m.tip,
+                },
             })
             .collect();
         let (_, b, rc) = ports.split();
@@ -787,6 +808,31 @@ impl Sequencer {
         );
     }
 
+    /// Tell a client its transaction failed a fee check, on both side
+    /// channels. The transaction never enters the state machine, so it
+    /// holds no nonce slot and the client signs again at once.
+    fn report_fee_reject<R>(&self, rc: &mut R, observed: Observed, reason: TxErrorReason)
+    where
+        R: SideChannelPublisher,
+    {
+        let Observed {
+            sender,
+            nonce,
+            tx_hash,
+        } = observed;
+        self.hot.fee_rejected.increment(1);
+        trace!(sender = ?sender, nonce, ?reason, "fee check failed; reporting it");
+        self.publish_rejection(
+            rc,
+            tx_hash,
+            TxError {
+                sender,
+                nonce,
+                reason,
+            },
+        );
+    }
+
     /// Tell an evicted transaction's parked submit call, and any receipt
     /// subscribers, that it will never be sequenced. A silent eviction
     /// would leave the client waiting forever, with its later nonces
@@ -869,11 +915,24 @@ impl Sequencer {
             return Ok(true);
         }
 
-        // Decode the alloy `TxEnvelope` from `raw_tx` to extract `nonce`.
+        // Decode the nonce, the fee fields, and the value from `raw_tx`.
         // This decode is the only per-transaction work the sequencer does
-        // beyond the state-machine arithmetic. The result is discarded
-        // after the nonce is read. This never calls `recover_signer()`.
-        let nonce = decode_nonce(&envelope.raw_tx)?;
+        // beyond the state-machine arithmetic and the fee gate. This never
+        // calls `recover_signer()`.
+        let fields = decode_fields(&envelope.raw_tx)?;
+        let nonce = fields.nonce;
+        let observed = Observed {
+            sender,
+            nonce,
+            tx_hash: envelope.tx_hash,
+        };
+        let tip = match self.fees.admit(sender, &fields.fees) {
+            Ok(tip) => tip,
+            Err(reason) => {
+                self.report_fee_reject(rc, observed, reason);
+                return Ok(true);
+            }
+        };
 
         // A cold sender seeds at nonce 0. The sequencer holds no
         // committed-state reader; it is a pure reorderer. Committed-nonce
@@ -893,13 +952,9 @@ impl Sequencer {
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
             max_inclusion_block: envelope.max_inclusion_block,
+            tip,
         };
 
-        let observed = Observed {
-            sender,
-            nonce,
-            tx_hash: meta.tx_hash,
-        };
         let t0 = Instant::now();
         let result = self.state.process(sender, nonce, meta);
         self.hot
@@ -995,7 +1050,10 @@ impl Sequencer {
     where
         R: SideChannelPublisher,
     {
-        let mut publishes = Vec::new();
+        // Sized exactly: every action is a publish on the in-order path,
+        // and a vector that starts at four slots would allocate four
+        // records per transaction.
+        let mut publishes = Vec::with_capacity(actions.len());
         for action in actions {
             self.collect_one_action(rc, observed, action, &mut publishes);
         }

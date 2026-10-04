@@ -30,6 +30,7 @@ pub mod delta;
 pub mod deposit;
 pub mod envelope;
 pub mod epoch;
+pub mod fees;
 pub mod genesis;
 pub mod limits;
 pub mod num;
@@ -57,6 +58,7 @@ pub use delta::{AccountChange, BalFrame, BlockDelta, CodeEntry, StorageChange};
 pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
+pub use fees::{BlockFees, FeeSchedule, TxFees};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};
 pub use prover::{

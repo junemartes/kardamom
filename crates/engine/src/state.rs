@@ -72,6 +72,8 @@ mod tests {
             end_tx_idx: BPosition::ZERO,
             l2_timestamp: 0,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         };
         q.submit(boundary, delta).unwrap();
 
