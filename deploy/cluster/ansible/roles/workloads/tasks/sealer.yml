@@ -1,0 +1,56 @@
+---
+# The sealer roll. One group per Raft member lets the role order the
+# members: the followers first, the leader last. Each step registers the
+# new definition of one group and keeps the current definition of the
+# others, so Nomad replaces one member and the group's update stanza
+# holds the next step until that member rejoined and caught up. A fresh
+# job, or a job that still has the one shared group, registers in one
+# step: there is no member to order.
+- name: Plan the sealer
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: "{{ workloads_sealer_job | combine({'submit': false}) }}"
+
+- name: Keep the planned sealer definition
+  ansible.builtin.set_fact:
+    workloads_sealer_new: "{{ workloads_job_definition }}"
+    workloads_sealer_diff: "{{ workloads_plan.json.Diff.Type }}"
+
+- name: Read the registered sealer
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/cluster?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_sealer_current
+  when: workloads_sealer_diff == 'Edited'
+
+- name: Decide the sealer roll
+  ansible.builtin.set_fact:
+    workloads_sealer_staged: >-
+      {{ workloads_sealer_diff == 'Edited'
+         and (workloads_sealer_current.json.TaskGroups | map(attribute='Name')
+              | select('match', '^cluster-') | list | length > 0) }}
+
+- name: Register the sealer in one step
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: "{{ workloads_sealer_job }}"
+  when:
+    - workloads_sealer_diff != 'None'
+    - not workloads_sealer_staged | bool
+
+- name: Order the members for the staged roll
+  ansible.builtin.include_tasks: sealer_order.yml
+  when:
+    - workloads_sealer_staged | bool
+    - not ansible_check_mode
+
+- name: Roll the sealer one member at a time
+  ansible.builtin.include_tasks: sealer_step.yml
+  loop: "{{ workloads_sealer_order | default([]) }}"
+  loop_control:
+    loop_var: workloads_sealer_group
+    index_var: workloads_sealer_index
+  when:
+    - workloads_sealer_staged | bool
+    - not ansible_check_mode

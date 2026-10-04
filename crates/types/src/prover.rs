@@ -21,7 +21,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::witness::{ExecutionWitness, WitnessProofs};
 use crate::xchain::RemoteEpochRecord;
-use crate::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope, wire};
+use crate::{BPosition, BlockBoundaryStart, BlockFees, Deposit, TxEnvelope, wire};
 
 /// One canonical record on the prover wire. This mirrors the exec core's
 /// `BufferedRecord`. That type is not itself a wire type; the guest
@@ -48,6 +48,9 @@ pub struct ProverInput {
     /// under boundary N-1's timestamp. The guest rebuilds `ExecEnv` exactly
     /// as the live exec thread does.
     pub boundary: BlockBoundaryStart,
+    /// The fees the block ran under. The guest rebuilds `ExecEnv` with
+    /// them; the validator captured them from its own cursor.
+    pub fees: BlockFees,
     pub witness: ExecutionWitness,
     pub proofs: WitnessProofs,
     pub records: Vec<ProverRecord>,

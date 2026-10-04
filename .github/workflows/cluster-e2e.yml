@@ -112,6 +112,7 @@ jobs:
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             -p kardamom-reconstruct -p kardamom-state-mirror -p kardamom-l1-indexer \
+            -p kardamom-notifier \
             --bins
           # Settlement-contract deploy for the live batcher (Ansible deployment Phase 2b).
           cargo build --release -p kardamom-deployer --bin kardamom-deploy

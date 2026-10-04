@@ -76,12 +76,22 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init(
+    // Ready while a tick completed within the last two periods, with ten
+    // seconds of slack for the tick's own L1 round trips.
+    let readiness = kardamom_obs::Readiness::up().fresh(
+        kardamom_l1_indexer::metrics::LAST_TICK_UNIX_SECONDS,
+        Duration::from_secs(
+            args.poll_interval_secs
+                .get()
+                .saturating_mul(2)
+                .saturating_add(10),
+        ),
+    );
+    kardamom_obs::init_service!(
         "l1-indexer",
         args.metrics_addr,
         args.host_id.as_ref(),
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+        readiness
     )
     .await
     .context("init prometheus exporter")?;

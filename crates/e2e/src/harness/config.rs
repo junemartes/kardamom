@@ -78,6 +78,14 @@ pub struct StackConfig {
     /// verifier's view is interposed, so a fault isolates to verification
     /// and does not also corrupt the epochs being produced.
     pub verified_l1: bool,
+    /// Priority fees on every role: the sequencer's tip and fee checks,
+    /// the sealer's ordering window, and the executor's fee schedule
+    /// (the `[fees]` fragment appended to the genesis), as the deploy's
+    /// one `PRIORITY_FEES` value sets them.
+    pub priority_fees: bool,
+    /// Also run `kardamom-notifier`, the transaction status feed. The
+    /// feed's WebSocket URL is [`crate::harness::LocalStack::notifier_ws_url`].
+    pub notifier: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -104,6 +112,12 @@ impl Genesis {
             Genesis::DevInterop => repo.join("chains/dev-interop.toml"),
         }
     }
+
+    /// The fee schedule fragment the deploy appends with priority fees
+    /// on: the same file the executor and validator jobs render.
+    pub(super) fn fees_fragment(repo: &std::path::Path) -> PathBuf {
+        repo.join("deploy/cluster/config/genesis/fees.toml")
+    }
 }
 
 impl Default for StackConfig {
@@ -123,6 +137,8 @@ impl Default for StackConfig {
             l1: false,
             archive_durability: false,
             verified_l1: false,
+            priority_fees: false,
+            notifier: false,
         }
     }
 }

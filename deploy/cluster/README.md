@@ -34,7 +34,7 @@ no file in the tree names its address:
 |-------|-------|------|
 | `control` | 1 | Nomad/Consul **server**, Docker registry, anvil (L1) |
 | `sequencer` | 2 | 2 lanes × 2 racing replicas (one job group per lane, `seq-<lane>`, expanded by Nomad HCL; ports `9001 + 10 * lane`) |
-| `ingress` | 2 | active/active JSON-RPC front door (:8545) |
+| `ingress` | 2 | active/active JSON-RPC front door (:8545); the notifier's status feed (:8547) |
 | `executor` | 3 | state-machine replica appliers (libmdbx state) |
 | `sealer` | 3 | **3-member Aeron Cluster (Raft)** — the Java `cluster` job: canonical ordering + archive-at-the-sealer durability folded into the Raft log |
 | `aux` | 1 | validator, da_watcher, batcher, monitoring (off the chaos blast radius) |
@@ -194,10 +194,31 @@ ansible-playbook -i localhost, deploy/cluster/ansible/deploy.yml
 The controller runs the playbook locally and connects to the Nomad HTTP API.
 It verifies the image manifest before changing jobs, compiles the existing HCL
 with `nomad job run -output`, plans changes, and registers only changed jobs.
-Registration uses Nomad's job modify index to reject concurrent edits. Readiness
-requires the current job version's running allocations for **every task group**,
-including every Aeron node and both racing sequencer groups. Allocation readiness
-is followed by the smoke, load and chaos gates of `crates/chaos` in CI.
+Registration uses Nomad's job modify index to reject concurrent edits.
+
+The deploy is a rolling deploy. Every service job carries a Consul check that
+means "this instance does its job" (the `/ready` route beside `/metrics` on the
+Rust services, `/health` on the ingress RPC port, `/ready` on the sealer's admin
+port), and its `update` stanza rolls one instance at a time under that check.
+The role waits for each job's Nomad deployment and requires `successful`; a
+deployment Nomad marks `failed` fails the play at that job, before the next job
+is touched. A system job (the Aeron drivers) has no deployment, so the role
+waits for its allocations instead. The sealer rolls one member at a time in
+the role's order, the followers first and the leader last: one task group per
+Raft member, and one registration per member. The ingress and the sequencer
+can deploy a canary (`KARDAMOM_CANARY=1`, one spare node of the class): the
+role smokes the ingress canary by its node address, promotes it, and only then
+replaces the old instances. `auto_revert` is on for those two stateless
+classes only.
+
+A successful deploy records its manifest under `deployed/<env>/` (`KARDAMOM_ENV`,
+default `local`): `images.digests` is what runs, `images.digests.previous` is
+what it replaced. `just rollback <env>` deploys the previous one; it is a
+normal rolling deploy of older images under the same checks. The validator's
+divergence verdict is a file beside its state; it survives restarts and
+deploys, keeps `/ready` failing, and an operator clears it with
+`kardamom-validator --state-dir <dir> --clear-verdict` inside the allocation.
+The smoke, load and chaos gates of `crates/chaos` follow in CI.
 
 Configuration lives in `ansible/roles/workloads/defaults/main.yml`. Existing
 `NOMAD_ADDR`, `DIGEST_MANIFEST`, `KARDAMOM_REQUIRE_SIGNED`, settlement, light-client,
@@ -345,6 +366,7 @@ deploy/cluster/
     anvil.nomad.hcl         in-cluster L1 for the smoke test + da-watcher
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
+    notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one
     l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1 only)

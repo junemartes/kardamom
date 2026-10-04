@@ -314,6 +314,15 @@ an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
 
+A divergence is a state, not a dead process. The validator writes its verdict
+to a `verdict` file beside its state before it exits, and mirrors it in the
+`validator_verdict_standing` gauge. A restart (a crash, a node loss, a deploy)
+that finds a standing verdict runs halted: the exporter serves, the gauge
+stays at 1, `/ready` fails, and the pipeline does not start. So a deploy never
+passes over a divergence, and the alert stays loud until an operator clears
+the file (`kardamom-validator --state-dir <dir> --clear-verdict`); the halted
+validator notices within seconds and resumes from its cursor.
+
 Exit codes keep the two halt classes distinguishable: **exit 2 is reserved
 for a proven divergence** (the latch records the reason before the engine
 surfaces it) — the page-the-humans signal. Every other engine failure — a
@@ -517,6 +526,23 @@ of public endpoints, since two can share a backend. With a light client the
 source that disagrees with it is the liar, and rotates out. The halt cause
 is one typed value (`SourceHalt`: `l1_source_disagreement`,
 `l1_sources_out`) that the error, the log line and the counter carry.
+
+## Notifier
+
+Off the hot path by construction: it reads `tx_status`, `tx_receipts` and
+`tx_errors` as one more multi-destination-cast subscriber, so a dead or slow
+notifier costs its own clients and nothing else. The `tx_status` publishers
+(sequencer, ingress) offer best effort and never block; a back-pressured
+frame is dropped after a bounded retry and counted
+(`kardamom_log_best_effort_dropped_total{stream_id="1018"}`). The receipt
+stream stays the truth: a client that misses a status reads the receipt.
+
+A restart loses the in-memory ring; a WebSocket client that reconnects
+replays what the new ring holds. Webhook subscriptions and their outboxes
+live on disk, so a restart resumes delivery from the persisted cursor,
+at least once. The two instances shard subscriptions by a rendezvous hash
+of the id and both store every registration; a lost instance's shard moves
+to the twin when the instance count changes.
 
 ## L1-governed upgrades (feature flags)
 

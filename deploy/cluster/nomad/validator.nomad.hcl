@@ -69,6 +69,18 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# Priority fees, "on" or "off" (the genesis `[fees]` section). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -128,9 +140,28 @@ job "validator" {
       mode     = "delay"
     }
 
+    # A node loss reschedules the validator like every other service.
+    # A divergence is a state, not a dead process: the verdict file
+    # beside its state survives the move, and the validator comes up
+    # halted on the new node until an operator clears it.
     reschedule {
-      attempts  = 0
-      unlimited = false
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    # In place: a singleton with a static port restarts on its node.
+    # Healthy by its /ready check: no divergence verdict stands and the
+    # committed block is within the lag budget of the sealer's head, so
+    # a deploy never passes over a divergence.
+    update {
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
@@ -273,9 +304,11 @@ job "validator" {
       }
 
       # The chain genesis comes from one source: config/genesis/dev.toml.
+      # With priority fees on, the fee schedule fragment follows it, as
+      # on the executor: both roles compute the same roots.
       template {
         destination = "local/genesis.toml"
-        data        = file("config/genesis/dev.toml")
+        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
       }
 
       service {
@@ -283,6 +316,12 @@ job "validator" {
         port     = "metrics"
         provider = "consul"
         tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       service {

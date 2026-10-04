@@ -26,11 +26,23 @@ adapters over a Rust-native cluster client) — see
 ## App envelope (kept in lockstep with the Rust `cluster-adapter::wire`)
 
 ```
-ingress  [kind:u8=0][canonical_id:32][record_type:u8][fields…]   (id parsed for dedup;
-                                                                   payload from offset 1 relayed)
+ingress  [kind:u8=0][sender:20][nonce:u64][deadline:u64][tip:u128][canonical_id:32][record_type:u8][fields…]
+         (the guard header feeds the contiguity guard, the deadline check, and the
+          ordering window; the payload from the canonical id on is relayed)
 egress   relayed:  [kind:u8=1][index:u64-LE][payload_len:u32-LE][relayed payload]
          boundary: [kind:u8=2][block_number:u64-LE][end_tx_idx:u64-LE][l2_timestamp:u64-LE]
 ```
+
+## Ordering window (`-Dkardamom.cluster.orderingWindow`)
+
+With priority fees on (`20`), a window of records in front of the record path
+flushes in `(tip descending, arrival ascending)` order, one sender's records in
+nonce order. It closes on log events only: the entry count, a 5 ms cluster
+timer, a boundary tick, an origin record, or a snapshot, so every member relays
+the same order. `0` passes every record through at once. Every member must use
+the SAME value: the snapshot carries it, and a member that restores a snapshot
+taken with another value halts. The deploy sets it with the sequencer's
+`[fees] priority` from one value, `PRIORITY_FEES`.
 
 ## Dedup window sizing (`-Dkardamom.cluster.dedupCapacity`)
 

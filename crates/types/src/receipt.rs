@@ -235,10 +235,18 @@ pub struct Receipt {
     /// is `None`.
     #[rkyv(with = Map<wire::AddressBytes>)]
     pub contract_address: Option<Address>,
-    /// Effective gas price the transaction paid. In v0 this comes from
-    /// `TxEnv.gas_price`: the legacy or 1559-derived value chosen when the
-    /// env is built.
+    /// The gas price the transaction paid per gas used. With a fee
+    /// schedule this is the block's base fee: the tip is charged on the
+    /// gas limit, not on the gas used, and is reported apart. Without a
+    /// schedule it is the transaction's own price, as revm charged it.
     pub effective_gas_price: u128,
+    /// The tip rate the chain collected, in wei per gas: the committed
+    /// rate, bounded by the cap above the base fee. Zero without a
+    /// schedule.
+    pub priority_fee_per_gas: u128,
+    /// The tip paid to the beneficiary, in wei: the tip rate times the gas
+    /// limit, unused gas included. Zero without a schedule.
+    pub priority_fee_paid: u128,
     /// Block that included this transaction.
     pub block_number: u64,
     /// Zero-based index within the block. This differs from `tx_idx`'s `BPosition`.

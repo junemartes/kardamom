@@ -435,6 +435,8 @@ mod tests {
             end_tx_idx: BPosition::from_index(block),
             l2_timestamp: 1_700_000_000 + block,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         }
     }
 
@@ -628,6 +630,7 @@ mod tests {
                 chain_id: 1,
                 block_number: 7,
                 l2_timestamp: 1_700_000_000,
+                fees: kardamom_types::BlockFees::NONE,
             },
             &[BufferedRecord::Tx {
                 tx_idx: TxIndex(0),

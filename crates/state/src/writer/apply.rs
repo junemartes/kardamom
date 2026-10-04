@@ -159,6 +159,8 @@ impl<'a> BatchWriter<'a> {
             end_tx_idx: boundary.end_tx_idx,
             l2_timestamp: boundary.l2_timestamp,
             l1_origin: boundary.l1_origin,
+            base_fee: boundary.base_fee,
+            gas_used: boundary.gas_used,
         };
         self.txn.put(
             self.headers,

@@ -333,7 +333,7 @@ stage-dist dist:
     # The services the images wrap (the state mirror included), the settlement
     # deployer and the semantics runner the stages spawn, the operator binary,
     # and the archive tool the archive-corruption case runs on the host.
-    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store reconstruct deploy semantics cluster archive-rereplicate; do
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store notifier reconstruct deploy semantics cluster archive-rereplicate; do
         cp "$rel/kardamom-$bin" "$dist/$rel/"
     done
     # The shard test executable carries a build hash; the newest one is this build's.
@@ -474,7 +474,7 @@ test-e2e-local: aeron-jar cluster-jar
     cargo build --bins --locked \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
-        -p kardamom-reconstruct
+        -p kardamom-reconstruct -p kardamom-notifier
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2 --skip s14_
     # S14 runs TWO full stacks (4 JVMs + 10 service processes) — the
@@ -613,6 +613,10 @@ images:
 # Converge workload jobs and settlement through Ansible.
 deploy:
     @just --justfile deploy/cluster/justfile deploy
+
+# Deploy the manifest the last successful deploy of <env> replaced.
+rollback env:
+    @just --justfile deploy/cluster/justfile rollback {{ env }}
 
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:

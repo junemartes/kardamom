@@ -623,6 +623,7 @@ impl Service {
             let why = feed.run(feed_rx).await;
             (feed, why)
         });
+        metrics::gauge!(super::live_metric_names::FEED_RUNNING).set(1.0);
         let (feed, why) = tokio::select! {
             r = &mut task => r.context("feed task panicked")?,
             () = bin_support::wait_for_shutdown() => return Ok(Served::Done),

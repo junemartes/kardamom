@@ -169,6 +169,12 @@ job "da-watcher" {
         port     = "metrics"
         provider = "consul"
         tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

@@ -103,6 +103,8 @@ fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
         end_tx_idx: BPosition::from_index(receipt.tx_idx.as_index() + 1),
         l2_timestamp: 1_700_000_001,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     };
     handle
         .delta_tx
@@ -276,6 +278,8 @@ fn env_with_two_blocks_and(dir: &std::path::Path, first_block: FirstBlock) -> St
         end_tx_idx: BPosition::from_index(end),
         l2_timestamp: 1_700_000_000 + number,
         l1_origin: 40 + number,
+        base_fee: 0,
+        gas_used: 0,
     };
     let tx_ref = |hash: u8, shard: u8, position: u64| {
         TxRef::new(
@@ -399,6 +403,8 @@ async fn a_block_without_references_is_refused_not_shortened() {
         end_tx_idx: BPosition::from_index(1),
         l2_timestamp: 1,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     };
     handle
         .delta_tx

@@ -33,6 +33,9 @@ pub const REMOTE_WATCHER_TICK_TOTAL: &str = "kardamom_da_watcher_remote_tick_tot
 /// exactly the one whose gauge is flat while the peer keeps sending — the
 /// interop analogue of the L1 origin lag.
 pub const REMOTE_CURSOR_SEQ: &str = "kardamom_da_watcher_remote_cursor_seq";
+/// The unix time of the last completed tick of any watcher. The
+/// readiness rule requires one within two poll periods.
+pub const LAST_TICK_UNIX_SECONDS: &str = "kardamom_da_watcher_last_tick_unix_seconds";
 /// Failed durable-cursor writes. Non-fatal by design (a stale cursor resumes
 /// harmlessly through dedup), but a GROWING count means the next restart
 /// replays further and further back — an operator alarm, not an error path.

@@ -129,7 +129,9 @@ impl<S: L1Source> Follower<S> {
 
     async fn step(&mut self, interval: &mut tokio::time::Interval) {
         interval.tick().await;
-        match self.tick().await {
+        let outcome = self.tick().await;
+        kardamom_obs::ready::mark_now(crate::metrics::LAST_TICK_UNIX_SECONDS);
+        match outcome {
             Ok(Tick::Idle) => counter!(TICK_TOTAL, "outcome" => "idle").increment(1),
             Ok(Tick::Advanced { to, batches }) => {
                 tracing::info!(to, batches, "indexed");

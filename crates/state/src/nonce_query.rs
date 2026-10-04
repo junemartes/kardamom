@@ -486,10 +486,11 @@ async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
     }
 }
 
-/// What a [`Query`] read from the state.
+/// What a [`Query`] read from the state. The receipt is boxed: it is
+/// several times the account's size, and one query reads one of them.
 enum Found {
     Account(Method, CommittedAccount),
-    Receipt(CommittedReceipt),
+    Receipt(Box<CommittedReceipt>),
     Refs(CommittedRefs),
 }
 
@@ -500,7 +501,9 @@ impl Query {
             Self::Account(method, address) => {
                 committed_account(env, address).map(|account| Found::Account(method, account))
             }
-            Self::Receipt(tx_hash) => committed_receipt(env, tx_hash).map(Found::Receipt),
+            Self::Receipt(tx_hash) => {
+                committed_receipt(env, tx_hash).map(|found| Found::Receipt(Box::new(found)))
+            }
             Self::Refs(number) => committed_block_refs(env, number).map(Found::Refs),
         }
     }

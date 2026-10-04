@@ -67,6 +67,8 @@ fn build_db_with(dir: &std::path::Path, writes: [BlockWrite; 2]) {
             end_tx_idx: BPosition::from_index(block),
             l2_timestamp: 1_700_000_000 + block,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         };
         handle.delta_tx.send(write(boundary, delta)).unwrap();
     }
@@ -226,6 +228,8 @@ fn append_block_3(dir: &std::path::Path, receipts: bool) {
         end_tx_idx: end,
         l2_timestamp: 1_700_000_003,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     };
     handle
         .delta_tx
