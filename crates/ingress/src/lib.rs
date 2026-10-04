@@ -29,6 +29,7 @@ pub mod channels;
 pub mod cluster;
 pub mod config;
 pub mod error;
+pub(crate) mod fee_history;
 pub mod json_rpc;
 pub mod metrics;
 pub(crate) mod pending;

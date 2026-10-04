@@ -9,7 +9,6 @@ use super::hash_validate::{Results, reap_and_learn, result_mut, rewrite_frag_sin
 use super::metrics::{FeedTimings, Metrics, StmOutcome, TxResult};
 use super::recycle::{RecyclePools, SpentBlock};
 use super::session::{DeltaOut, MvRelease};
-use crate::FEE_SINK;
 use alloy_primitives::B256;
 use alloy_primitives::U256;
 use kardamom_exec_core::delta::PendingDelta;
@@ -30,6 +29,8 @@ struct Prefix {
     cumulative: u64,
     sink_running: U256,
     block_number: u64,
+    /// The fee sink: the block's beneficiary.
+    sink: alloy_primitives::Address,
 }
 
 impl Prefix {
@@ -63,13 +64,13 @@ impl Prefix {
             ))
         })?;
         if r.sink_fee_delta.is_some() {
-            if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
+            if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == self.sink) {
                 entry.1.balance = self.sink_running;
             }
             // Same computation for the capture fragment (see
             // `rewrite_frag_sink`); a wound rebuilds both from scratch.
             if let Some(frag) = r.bal_frag.as_mut() {
-                rewrite_frag_sink(frag, self.sink_running);
+                rewrite_frag_sink(frag, self.sink, self.sink_running);
             }
         }
         Ok(())
@@ -175,6 +176,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
         let t_extract = t_extract0.elapsed();
         let sink_running = ctx.bound().sink_start_balance;
         let block_number = ctx.env.block_number;
+        let sink = ctx.env.fees.beneficiary;
         Ok(Self {
             ctx,
             n,
@@ -187,6 +189,7 @@ impl<S: StateDatabase + Sync> Tail<S> {
                 cumulative: 0,
                 sink_running,
                 block_number,
+                sink,
             },
             receipts: Vec::with_capacity(n),
             delta: PendingDelta::new(),

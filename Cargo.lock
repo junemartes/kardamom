@@ -4145,6 +4145,7 @@ dependencies = [
  "if-addrs",
  "kardamom-obs",
  "kardamom-types",
+ "metrics",
  "reqwest 0.13.4",
  "rkyv",
  "rusteron-archive",
@@ -4156,6 +4157,35 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-notifier"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "async-trait",
+ "clap",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "jsonrpsee",
+ "kardamom-log",
+ "kardamom-obs",
+ "kardamom-types",
+ "metrics",
+ "reqwest 0.13.4",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
 ]
 
@@ -4216,6 +4246,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-signer-local",
  "anyhow",
+ "arc-swap",
  "bytes",
  "clap",
  "core_affinity",

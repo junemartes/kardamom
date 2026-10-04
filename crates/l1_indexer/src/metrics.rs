@@ -6,6 +6,9 @@ pub const LAST_BATCH: &str = "kardamom_l1_indexer_last_batch_index";
 pub const BATCHES_TOTAL: &str = "kardamom_l1_indexer_batches_total";
 pub const PAYLOAD_BYTES_TOTAL: &str = "kardamom_l1_indexer_payload_bytes_total";
 pub const TICK_TOTAL: &str = "kardamom_l1_indexer_tick_total";
+/// The unix time of the last completed tick. The readiness rule requires
+/// one within two poll periods.
+pub const LAST_TICK_UNIX_SECONDS: &str = "kardamom_l1_indexer_last_tick_unix_seconds";
 
 /// Describe every metric once.
 pub fn describe() {

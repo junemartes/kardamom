@@ -12,8 +12,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
-use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt};
+use alloy_primitives::{Address, B256, Bytes, Log, LogData, U64, U256};
+use alloy_rpc_types_eth::{BlockNumberOrTag, FeeHistory, TransactionReceipt};
 use jsonrpsee::core::{RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle, SubscriptionSink};
@@ -60,7 +60,40 @@ pub trait IngressEthApi {
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
 
     #[method(name = "getTransactionReceipt")]
-    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>>;
+    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<KardamomReceipt>>;
+
+    /// The base fee of each of the newest `block_count` closed blocks up
+    /// to `newest_block`, plus the next block's, the gas used ratio per
+    /// block, and the tip rate rewards at `reward_percentiles`.
+    #[method(name = "feeHistory")]
+    async fn fee_history(
+        &self,
+        block_count: U64,
+        newest_block: BlockNumberOrTag,
+        reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory>;
+
+    /// A tip rate a wallet can bid: the median of recent blocks' tips.
+    /// Zero is a valid bid at all times; there is no floor.
+    #[method(name = "maxPriorityFeePerGas")]
+    async fn max_priority_fee_per_gas(&self) -> RpcResult<U256>;
+
+    /// The next block's base fee plus the suggested tip rate.
+    #[method(name = "gasPrice")]
+    async fn gas_price(&self) -> RpcResult<U256>;
+}
+
+/// Ethereum's receipt, plus the chain's two tip fields: the tip rate the
+/// transaction paid, and the tip amount it paid on its whole gas limit.
+/// The extra fields serialize beside the standard ones, so an Ethereum
+/// client that ignores unknown fields reads the receipt as usual.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KardamomReceipt {
+    #[serde(flatten)]
+    pub receipt: TransactionReceipt,
+    pub priority_fee_per_gas: U256,
+    pub priority_fee_paid: U256,
 }
 
 /// Event stream payload for `kardamom_subscribeReceipts`. One subscription
@@ -74,7 +107,7 @@ pub trait IngressEthApi {
 pub enum ReceiptEvent {
     /// A tx executed, and its enriched receipt was observed on `tx_receipts`.
     #[serde(rename_all = "camelCase")]
-    Receipt { receipt: Box<TransactionReceipt> },
+    Receipt { receipt: Box<KardamomReceipt> },
     /// The sequencer rejected the tx.
     #[serde(rename_all = "camelCase")]
     TxError {
@@ -168,7 +201,7 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
         Ok(res.receipt.tx_hash)
     }
 
-    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
+    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<KardamomReceipt>> {
         // The in-memory `ReceiptCache` first, populated off the
         // tx_receipts stream; on a miss, one query to an executor's state
         // DB, the durable copy. Returns `null`, by JSON-RPC convention,
@@ -178,6 +211,43 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
             .receipt_by_hash(client_ip(), hash)
             .await
             .map(|r| RpcReceipt::from(&r).0))
+    }
+
+    async fn fee_history(
+        &self,
+        block_count: U64,
+        newest_block: BlockNumberOrTag,
+        reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory> {
+        let history = self.proxy.fee_history();
+        let newest = match newest_block {
+            BlockNumberOrTag::Number(n) => n,
+            // Every other tag names the newest closed block: the chain
+            // has no finality distinction the ingress can see.
+            _ => history.latest(),
+        };
+        history
+            .query(
+                block_count.to::<u64>(),
+                newest,
+                reward_percentiles.as_deref().unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned::<()>(
+                    -32000,
+                    format!("block {newest} is not in the fee history"),
+                    None,
+                )
+            })
+    }
+
+    async fn max_priority_fee_per_gas(&self) -> RpcResult<U256> {
+        Ok(U256::from(self.proxy.fee_history().suggested_tip()))
+    }
+
+    async fn gas_price(&self) -> RpcResult<U256> {
+        let history = self.proxy.fee_history();
+        Ok(U256::from(history.next_base_fee()) + U256::from(history.suggested_tip()))
     }
 }
 
@@ -355,8 +425,14 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
             ("expired".to_string(), Some(*expected_nonce))
         }
         // The deadline names a block, not a nonce, so the nonce field of
-        // this wire shape stays empty.
+        // this wire shape stays empty. The fee reasons name amounts, not
+        // a nonce, so it stays empty for them too.
         kardamom_types::TxErrorReason::PastDeadline { .. } => ("past-deadline".to_string(), None),
+        kardamom_types::TxErrorReason::FeeInvalid { .. } => ("fee-invalid".to_string(), None),
+        kardamom_types::TxErrorReason::FeeTooLow { .. } => ("fee-too-low".to_string(), None),
+        kardamom_types::TxErrorReason::InsufficientFunds { .. } => {
+            ("insufficient-funds".to_string(), None)
+        }
         // A halt names the chain's state, not a nonce.
         kardamom_types::TxErrorReason::DaLag { .. } => ("da-lag".to_string(), None),
     }
@@ -376,7 +452,7 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
 /// are both foreign to this crate: the orphan rule blocks `impl
 /// From<&Receipt> for TransactionReceipt` directly, but allows it for a
 /// local wrapper type.
-struct RpcReceipt(TransactionReceipt);
+struct RpcReceipt(KardamomReceipt);
 
 impl From<&kardamom_types::Receipt> for RpcReceipt {
     fn from(r: &kardamom_types::Receipt) -> Self {
@@ -426,19 +502,23 @@ impl From<&kardamom_types::Receipt> for RpcReceipt {
             // consumers is `Receipt::is_deposit()` on the native stream.
             _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
         };
-        Self(TransactionReceipt {
-            inner,
-            transaction_hash: r.tx_hash,
-            transaction_index: Some(r.transaction_index),
-            block_hash: None,
-            block_number: Some(r.block_number),
-            gas_used: r.gas_used,
-            effective_gas_price: r.effective_gas_price,
-            blob_gas_used: None,
-            blob_gas_price: None,
-            from: r.from,
-            to: r.to,
-            contract_address: r.contract_address,
+        Self(KardamomReceipt {
+            receipt: TransactionReceipt {
+                inner,
+                transaction_hash: r.tx_hash,
+                transaction_index: Some(r.transaction_index),
+                block_hash: None,
+                block_number: Some(r.block_number),
+                gas_used: r.gas_used,
+                effective_gas_price: r.effective_gas_price,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: r.from,
+                to: r.to,
+                contract_address: r.contract_address,
+            },
+            priority_fee_per_gas: U256::from(r.priority_fee_per_gas),
+            priority_fee_paid: U256::from(r.priority_fee_paid),
         })
     }
 }
@@ -471,7 +551,11 @@ where
         .build();
     let server = Server::builder()
         .set_config(server_cfg)
-        .set_http_middleware(tower::ServiceBuilder::new().layer(peer_addr_layer::PeerAddrLayer))
+        .set_http_middleware(
+            tower::ServiceBuilder::new()
+                .layer(health_layer::HealthLayer::new(proxy.draining.clone()))
+                .layer(peer_addr_layer::PeerAddrLayer),
+        )
         .build(addr)
         .await
         .map_err(|e| IngressError::internal("jsonrpsee bind", e))?;
@@ -485,6 +569,78 @@ where
         ))
         .map_err(|e| IngressError::internal("rpc module merge", e))?;
     Ok((local, server.start(module)))
+}
+
+/// The health route on the JSON-RPC port: `GET /health` answers 200
+/// while the proxy serves and 503 from the first moment of the shutdown
+/// drain. A load balancer or a Consul check reads it to take a draining
+/// replica out of rotation before its in-flight submits finish. Every
+/// other request goes to the RPC server.
+mod health_layer {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use futures::future::{Either, Ready, ready};
+    use jsonrpsee::server::HttpBody;
+    use tower::{Layer, Service};
+
+    #[derive(Clone)]
+    pub(super) struct HealthLayer {
+        draining: Arc<AtomicBool>,
+    }
+
+    impl HealthLayer {
+        pub(super) fn new(draining: Arc<AtomicBool>) -> Self {
+            Self { draining }
+        }
+    }
+
+    impl<S> Layer<S> for HealthLayer {
+        type Service = HealthService<S>;
+        fn layer(&self, inner: S) -> Self::Service {
+            HealthService {
+                inner,
+                draining: self.draining.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct HealthService<S> {
+        inner: S,
+        draining: Arc<AtomicBool>,
+    }
+
+    impl<S, Body> Service<hyper::Request<Body>> for HealthService<S>
+    where
+        S: Service<hyper::Request<Body>, Response = hyper::Response<HttpBody>>,
+    {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = Either<Ready<Result<S::Response, S::Error>>, S::Future>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
+            if req.method() != hyper::Method::GET || req.uri().path() != "/health" {
+                return Either::Right(self.inner.call(req));
+            }
+            let (status, body) = if self.draining.load(Ordering::SeqCst) {
+                (hyper::StatusCode::SERVICE_UNAVAILABLE, "draining\n")
+            } else {
+                (hyper::StatusCode::OK, "ok\n")
+            };
+            let response = hyper::Response::builder()
+                .status(status)
+                .header(hyper::header::CONTENT_TYPE, "text/plain")
+                .body(HttpBody::from(body))
+                .expect("a status and one header form a valid response");
+            Either::Left(ready(Ok(response)))
+        }
+    }
 }
 
 /// Tiny tower layer. It pulls the peer's `SocketAddr`, set on the
@@ -569,6 +725,41 @@ mod tests {
     use crate::test_support::{TestServer, http_client, start_test_server};
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::rpc_params;
+
+    /// One raw `GET path` on the server, with the whole response text.
+    async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn health_fails_from_the_first_moment_of_the_drain() {
+        let cfg = IngressConfig::default();
+        let shards = std::num::NonZeroUsize::try_from(cfg.partition_count_m).unwrap();
+        let (mock, _shard_rx) = crate::channels::MockChannels::new(shards);
+        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let (addr, handle) = start_jsonrpc_server(proxy.clone(), bind).await.unwrap();
+
+        let serving = get(addr, "/health").await;
+        assert!(serving.contains(" 200 "), "{serving}");
+        assert!(serving.ends_with("ok\n"), "{serving}");
+
+        proxy.begin_drain();
+        let draining = get(addr, "/health").await;
+        assert!(draining.contains(" 503 "), "{draining}");
+        assert!(draining.ends_with("draining\n"), "{draining}");
+
+        let other = get(addr, "/other").await;
+        assert!(!other.contains(" 200 "), "{other}");
+        handle.stop().unwrap();
+    }
 
     #[tokio::test]
     async fn chain_id_round_trips() {

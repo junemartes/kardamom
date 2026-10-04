@@ -170,6 +170,10 @@ pub(crate) struct Args {
     /// Host identifier. It is stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     pub(crate) host_id: String,
+    /// `/ready` passes while the applied block is at most this many
+    /// blocks behind the sealer's head.
+    #[arg(long, env = "KARDAMOM_READY_LAG_BLOCKS", default_value_t = 8)]
+    pub(crate) ready_lag_blocks: u32,
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ import io.aeron.cluster.ClusterTool;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
+import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
@@ -16,6 +17,7 @@ import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import java.util.EnumSet;
 import org.agrona.SemanticVersion;
+import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
 /**
@@ -75,6 +77,15 @@ public final class ClusterNode {
             System.getProperty("kardamom.cluster.daLagBudgetBlocks", System.getenv("DA_LAG_BUDGET_BLOCKS")));
         System.out.println("cluster da-lag budget memberId=" + memberId
             + " blocks=" + (daLagBudgetBlocks == 0 ? "0 <guard off>" : Long.toString(daLagBudgetBlocks)));
+        // The ordering window: 20 with priority fees on, 0 for first come,
+        // first served. Replicated configuration like the two above: it
+        // decides the relay order. The deploy sets it from the same value
+        // as the sequencer's [fees] priority, and a snapshot restore halts
+        // on a mismatch.
+        final int orderingWindow = Integer.getInteger(
+            "kardamom.cluster.orderingWindow", CanonicalSealerState.DEFAULT_ORDERING_WINDOW);
+        System.out.println("cluster ordering window memberId=" + memberId
+            + " size=" + orderingWindow);
         // Remote-origin allowlist: the peer chain ids this sealer accepts
         // kind-5 records from. -Dkardamom.cluster.remoteOrigins wins over
         // the KARDAMOM_REMOTE_ORIGINS env var. Unset or empty disables
@@ -121,17 +132,20 @@ public final class ClusterNode {
         final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
+        SealerClusteredService service = null;
         for (int attempt = 1; ; attempt++) {
             try {
                 driver = ClusteredMediaDriver.launch(
                     driverContext(aeronDir),
                     archiveContext(aeronDir, archiveDir, me),
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
+                // Aeron contexts are single-use, and so is the service they
+                // launch: a retry gets a fresh instance.
+                service = new SealerClusteredService(
+                    dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
+                    inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
                 container = ClusteredServiceContainer.launch(
-                    serviceContext(
-                        aeronDir, clusterDir, dedupCapacity, inclusionHorizonBlocks,
-                        daLagBudgetBlocks, tickMs, memberId, remoteOrigins,
-                        voidConfig, barrier));
+                    serviceContext(aeronDir, clusterDir, memberId, service, barrier));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
@@ -157,12 +171,89 @@ public final class ClusterNode {
             }
         }
 
+        final ConsensusModule.Context consensus = driver.consensusModule().context();
         try (ClusteredMediaDriver ignored = driver;
-             ClusteredServiceContainer ignored2 = container) {
+             ClusteredServiceContainer ignored2 = container;
+             AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
-            startJoinWatchdog(driver.consensusModule().context().electionStateCounter(), memberId);
+            startJoinWatchdog(consensus.electionStateCounter(), memberId);
             barrier.await();
+        }
+    }
+
+    /**
+     * The member-status admin endpoint
+     * ({@code -Dkardamom.cluster.adminPort}; unset or 0 disables it, and
+     * the deploy passes 40205; {@code -Dkardamom.cluster.readyLagBytes},
+     * default 4 MiB). The port is off by default because two members on
+     * one host, as in the local e2e stacks, cannot share it.
+     *
+     * <p>{@code /ready} is the service check of the member: it passes when
+     * the member holds a settled role with its election closed and the
+     * service has applied the committed log within the lag budget. A
+     * follower that still catches up, or a member inside an election, is
+     * not ready, so a rolling deploy waits for it before it stops the next
+     * member. Returns {@code null} when the port is 0; try-with-resources
+     * accepts a null resource.</p>
+     */
+    private static AdminServer startAdminServer(
+            final ConsensusModule.Context consensus,
+            final SealerClusteredService service,
+            final int memberId) {
+        final int port = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
+        if (port == 0) {
+            System.out.println("cluster admin endpoint DISABLED memberId=" + memberId);
+            return null;
+        }
+        final long lagBytes = Long.getLong("kardamom.cluster.readyLagBytes", DEFAULT_READY_LAG_BYTES);
+        final MemberStatusSource source = new MemberStatusSource(
+            memberId,
+            consensus.clusterNodeRoleCounter(),
+            consensus.electionStateCounter(),
+            consensus.commitPositionCounter(),
+            service);
+        final AdminServer admin;
+        try {
+            admin = AdminServer.start(port, source::sample, lagBytes);
+        } catch (final java.io.IOException e) {
+            throw new IllegalStateException("cluster admin endpoint bind failed on port " + port, e);
+        }
+        System.out.println("cluster admin endpoint up memberId=" + memberId + " port=" + admin.port());
+        return admin;
+    }
+
+    /**
+     * Reads one {@link MemberStatus} from the live counters. A closed
+     * counter reads as {@code CLOSED}: the member is shutting down.
+     */
+    private static final class MemberStatusSource {
+        private final int memberId;
+        private final AtomicCounter role;
+        private final AtomicCounter election;
+        private final AtomicCounter commitPosition;
+        private final SealerClusteredService service;
+
+        MemberStatusSource(
+                final int memberId,
+                final AtomicCounter role,
+                final AtomicCounter election,
+                final AtomicCounter commitPosition,
+                final SealerClusteredService service) {
+            this.memberId = memberId;
+            this.role = role;
+            this.election = election;
+            this.commitPosition = commitPosition;
+            this.service = service;
+        }
+
+        MemberStatus sample() {
+            final String roleName = role.isClosed()
+                ? MemberStatus.ELECTION_CLOSED : String.valueOf(Cluster.Role.get(role));
+            final String electionName = election.isClosed()
+                ? MemberStatus.ELECTION_CLOSED : String.valueOf(ElectionState.get(election));
+            final long commit = commitPosition.isClosed() ? 0L : commitPosition.get();
+            return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition());
         }
     }
 
@@ -270,6 +361,10 @@ public final class ClusterNode {
     static final long JOIN_WATCHDOG_POLL_MS = 1_000;
     /** Process exit code when the join watchdog fires. */
     static final int JOIN_WEDGE_EXIT_CODE = 3;
+    /** The admin endpoint's port when none is given: 0, off. */
+    static final int DEFAULT_ADMIN_PORT = 0;
+    /** The service lag behind the commit position that still reads as ready. */
+    static final long DEFAULT_READY_LAG_BYTES = 4L * 1024 * 1024;
 
     /** Whether the launch failure is the archive catalog's torn-last-fragment refusal. */
     static boolean isTornLastFragment(final Throwable t) {
@@ -380,6 +475,11 @@ public final class ClusterNode {
             // without approaching flow-control limits.
             .logChannel("aeron:udp?term-length=8m")
             .ingressStreamId(ingressStreamId)
+            // The ordering window's hold timer is 5 ms. Aeron's timer wheel
+            // fires a timer on the first tick at or after its deadline, and
+            // the default tick is 8 ms, which would hold a window for up to
+            // 13 ms. A 1 ms tick fires it within the millisecond.
+            .wheelTickResolutionNs(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(1))
             .appVersion(APP_VERSION)
             // Client sessions must survive a full quorum outage end to end
             // (kill 2 of 3 members, stall, node restart, member recovery,
@@ -512,18 +612,14 @@ public final class ClusterNode {
     private static ClusteredServiceContainer.Context serviceContext(
             final String aeronDir,
             final String clusterDir,
-            final int dedupCapacity,
-            final long inclusionHorizonBlocks,
-            final long daLagBudgetBlocks,
-            final long tickMs, final int memberId, final java.util.Set<Long> remoteOrigins,
-            final VoidLedger.Config voidConfig, final ShutdownSignalBarrier barrier) {
+            final int memberId,
+            final SealerClusteredService service,
+            final ShutdownSignalBarrier barrier) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
-            .clusteredService(new SealerClusteredService(
-                dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks, daLagBudgetBlocks));
+            .clusteredService(service);
         // The clustered-service container has its own termination hook.
         // Instrumenting only the consensus module would still exit silently
         // when the container is the one that terminates.

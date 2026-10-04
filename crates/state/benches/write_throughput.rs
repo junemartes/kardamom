@@ -41,6 +41,8 @@ fn big_batch(block: u64) -> WriteBatch {
             end_tx_idx: pos,
             l2_timestamp: 1_700_000_000 + block,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         },
         BlockDelta {
             block_number: block,

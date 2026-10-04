@@ -27,6 +27,23 @@ images:
 deploy:
     ansible-playbook -i localhost, ansible/deploy.yml
 
+# Deploy the previous manifest of an environment: the one the last
+# successful deploy replaced (deployed/<env>/images.digests.previous,
+# written by the deploy). It is a normal rolling deploy of older images,
+# under the same checks. The environment's NOMAD_ADDR and the other
+# deploy settings come from the caller's environment, as for `deploy`.
+rollback env:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    previous="deployed/{{ env }}/images.digests.previous"
+    if [[ ! -f "$previous" ]]; then
+        echo "no previous manifest for {{ env }}: $previous is missing" >&2
+        exit 1
+    fi
+    echo ">> rolling {{ env }} back to:"
+    cat "$previous"
+    KARDAMOM_ENV="{{ env }}" DIGEST_MANIFEST="$previous" ansible-playbook -i localhost, ansible/deploy.yml
+
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:
     #!/usr/bin/env bash
@@ -59,7 +76,7 @@ clean:
     -docker image rm "$REGISTRY/kardamom-aeron:$TAG"
     -docker image rm "$REGISTRY/kardamom-cluster:$TAG"
     rm -f docker/kardamom-cluster-node.jar
-    for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
+    for svc in ingress sequencer executor validator da-watcher batcher state-mirror notifier l1-indexer da-store; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
 
 # Create nodes, provision them, publish prebuilt images and deploy workloads.
 # CLUSTER_VARS is a JSON object passed as a single Ansible extra-vars argument.

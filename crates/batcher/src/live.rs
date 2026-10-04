@@ -40,6 +40,8 @@ pub use sender::LiveSender;
 /// live mode, `kardamom_batcher_batches_posted_total` and
 /// `_blobs_posted_total` count confirmed L1 posts (receipt observed or
 /// reconciled on-chain), not packed batches.
+pub use live_metric_names::FEED_RUNNING;
+
 pub(crate) mod live_metric_names {
     /// L1 post attempts that failed and were retried. This includes
     /// transient transport errors and CAS races that reconciled as not
@@ -55,4 +57,7 @@ pub(crate) mod live_metric_names {
     /// Re-observed blocks dropped because L1 already covers them (stale
     /// cursor replay after a crash between post and cursor write).
     pub(crate) const SKIPPED_POSTED_BLOCKS: &str = "kardamom_batcher_skipped_posted_blocks_total";
+    /// 1 once the feed loop runs over the spool it restored. The
+    /// readiness rule of the live batcher requires it.
+    pub const FEED_RUNNING: &str = "kardamom_batcher_feed_running";
 }

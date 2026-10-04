@@ -160,6 +160,34 @@ impl Lifecycle {
         Ok(contract)
     }
 
+    /// Deploy the workloads of the cluster at `nomad_addr` from the image
+    /// manifest at `manifest`, a path relative to `deploy/cluster`, and
+    /// report whether the deploy succeeded. The output streams to this
+    /// process's stdout and stderr. A failed deploy is a result here, not
+    /// an error: the broken-image case expects one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the playbook cannot be spawned.
+    pub async fn deploy(&self, nomad_addr: &str, manifest: &str) -> anyhow::Result<bool> {
+        let env = vec![
+            ("NOMAD_ADDR", nomad_addr.to_string()),
+            ("DIGEST_MANIFEST", manifest.to_string()),
+            ("KARDAMOM_ENV", "chaos".to_string()),
+        ];
+        let mut cmd = self.command("ansible-playbook", &env);
+        cmd.args(["-i", "localhost,", "ansible/deploy.yml"]);
+        if let Ok(extra) = std::env::var(CLUSTER_VARS_ENV) {
+            cmd.args(["--extra-vars", &extra]);
+        }
+        let status = cmd
+            .stdin(Stdio::null())
+            .status()
+            .await
+            .context("spawn ansible-playbook ansible/deploy.yml")?;
+        Ok(status.success())
+    }
+
     /// Replace one node the way a cloud provider replaces a machine: the
     /// container comes back with generation `generation`, on another
     /// address and with empty volumes, and the contract file follows.

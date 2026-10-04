@@ -77,7 +77,8 @@ pub fn bin(name: &str) -> Result<ExistingFile> {
         bin_dir()?.join(name),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher -p kardamom-reconstruct` (or just `just test-e2e-local`)",
+         -p kardamom-da-watcher -p kardamom-reconstruct -p kardamom-notifier` (or just \
+         `just test-e2e-local`)",
     )
 }
 
@@ -110,6 +111,10 @@ pub struct ServiceSpec<'a> {
     /// The active shard count (M). The sequencers and the ingress take it.
     /// The consumers open the fixed lane plane and take no count.
     pub shards: std::num::NonZeroU32,
+    /// `--priority-fees` on every sequencer. The genesis the spec names
+    /// carries the matching fee schedule, and the sealer the matching
+    /// window: one value, as in the deploy.
+    pub priority_fees: bool,
     /// The transaction lifetime. The sequencers take it as `--tx-ttl-ms`.
     /// The ingress takes the same value as `--pending-receipt-timeout-ms`
     /// (see [`IngressOptions`]). One value drives both, as in the deploy.
@@ -232,6 +237,45 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned
         state_dir: None,
     }
     .spawn()
+}
+
+/// A running notifier: the process, and the WebSocket URL of its feed.
+pub struct SpawnedNotifier {
+    pub service: Spawned,
+    pub ws_url: String,
+}
+
+/// Spawn `kardamom-notifier`: the status feed over the stack's Aeron
+/// dir, with its webhook directory under the stack root.
+///
+/// # Errors
+/// Returns an error when the binary is not built or the process fails to
+/// spawn.
+pub fn spawn_notifier(spec: &ServiceSpec<'_>) -> Result<SpawnedNotifier> {
+    let metrics_port = free_port().port();
+    let feed_port = free_port().port();
+    let mut cmd = Command::new(bin("kardamom-notifier")?);
+    cmd.arg("--aeron-dir")
+        .arg(spec.aeron_dir)
+        .args(["--bind", &format!("127.0.0.1:{feed_port}")])
+        .arg("--dir")
+        .arg(spec.root.join("notifier"));
+    with_log_config(&mut cmd, spec);
+    cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-notifier"]);
+    common_service_env(&mut cmd);
+    let service = SpawnPlan {
+        name: "notifier".to_string(),
+        cmd,
+        log: spec.root.join("notifier.log"),
+        metrics_port,
+        state_dir: None,
+    }
+    .spawn()?;
+    Ok(SpawnedNotifier {
+        service,
+        ws_url: format!("ws://127.0.0.1:{feed_port}"),
+    })
 }
 
 /// Spawn `kardamom-da-watcher` in INTEROP mode: no L1 flags, one peer pair
@@ -414,7 +458,8 @@ pub fn spawn_sequencer_with(
             &format!("127.0.0.1:{egress_port}"),
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
-        .args(["--host-id", &format!("e2e-seq-{index}")]);
+        .args(["--host-id", &format!("e2e-seq-{index}")])
+        .args(["--priority-fees", &spec.priority_fees.to_string()]);
     with_log_config(&mut cmd, spec);
     common_service_env(&mut cmd);
     SpawnPlan {
@@ -655,11 +700,17 @@ pub fn spawn_ingress_at(
     let cfg_path = spec.write_cluster_config("ingress", "")?;
     let metrics_port = free_port().port();
     let rpc_port = fixed_rpc_port.unwrap_or_else(|| free_port().port());
+    // The cluster egress port of the `Sealed` status tap.
+    let egress_port = free_udp_port().port();
     let mut cmd = Command::new(bin("kardamom-ingress")?);
     cmd.arg("--config")
         .arg(&cfg_path)
         .arg("--aeron-dir")
         .arg(spec.aeron_dir)
+        .args([
+            "--cluster-egress-endpoint",
+            &format!("127.0.0.1:{egress_port}"),
+        ])
         .args(["--jsonrpc-bind", &format!("127.0.0.1:{rpc_port}")])
         .args(["--shards", &spec.shards.get().to_string()]);
     if let Some(map) = shard_map {

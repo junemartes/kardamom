@@ -45,6 +45,12 @@ pub struct RecoveryPoint {
     /// This is 0 when nothing is committed yet, on a fresh DB or a
     /// genesis-only DB.
     pub last_committed_l2_timestamp: u64,
+    /// The committed block's base fee, from its `headers` row. With
+    /// `last_committed_gas_used` it gives the next block's base fee on a
+    /// resume. Zero when nothing is committed yet.
+    pub last_committed_base_fee: u128,
+    /// The committed block's gas used, from its `headers` row.
+    pub last_committed_gas_used: u64,
 }
 
 /// # Errors
@@ -66,21 +72,29 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
     let last_fsynced_reader_position =
         read_meta_b_position(&txn, meta, KEY_LAST_FSYNCED_READER_POSITION)?
             .unwrap_or(BPosition::ZERO);
-    let last_committed_l2_timestamp = if last_committed_block > 0 {
-        read_committed_l2_timestamp(&txn, last_committed_block)?
+    let header = if last_committed_block > 0 {
+        read_committed_header(&txn, last_committed_block)?
     } else {
-        0
+        HeaderValue {
+            end_tx_idx: BPosition::ZERO,
+            l2_timestamp: 0,
+            l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
+        }
     };
 
     Ok(RecoveryPoint {
         last_committed_block,
         last_committed_end_tx_position,
         last_fsynced_reader_position,
-        last_committed_l2_timestamp,
+        last_committed_l2_timestamp: header.l2_timestamp,
+        last_committed_base_fee: header.base_fee,
+        last_committed_gas_used: header.gas_used,
     })
 }
 
-/// The L2 timestamp of block `block`, read from its header row.
+/// The header row of block `block`.
 ///
 /// The committed block's header row is written in the same transaction as
 /// the meta cursors. So a present cursor with an absent header means a
@@ -91,17 +105,17 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
 ///
 /// Returns [`StateError::Recovery`] if the header row is missing, and
 /// [`StateError`] if the table read or the decode fails.
-fn read_committed_l2_timestamp<K: signet_libmdbx::TransactionKind>(
+fn read_committed_header<K: signet_libmdbx::TransactionKind>(
     txn: &signet_libmdbx::tx::Tx<K>,
     block: u64,
-) -> Result<u64, StateError> {
+) -> Result<HeaderValue, StateError> {
     let headers = txn.open_db(Some(TABLE_HEADERS))?;
     let Some(b) = txn.get::<Vec<u8>>(headers.dbi(), &encode_block_key(block))? else {
         return Err(StateError::Recovery(format!(
             "meta cursor says block {block} committed but its headers row is missing"
         )));
     };
-    Ok(decode_header_value(&b)?.l2_timestamp)
+    decode_header_value(&b)
 }
 
 /// Whether the env carries a populated trie: a hashed mirror plus stored

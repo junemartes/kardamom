@@ -128,13 +128,14 @@ pub(crate) fn encode_code_key(hash: B256) -> [u8; 32] {
 // ---------- headers ----------
 //
 // Headers do not carry a state-root commitment. The encoded value is
-// `(end_tx_idx: BPosition, l2_timestamp: u64, l1_origin: u64)`. This uses a
-// hand-rolled, fixed-width encoding (8 + 8 + 8 = 24 bytes) instead of RLP.
-// The row has a fixed size, and `BPosition` is not an RLP-native type.
+// `(end_tx_idx: BPosition, l2_timestamp: u64, l1_origin: u64, base_fee:
+// u128, gas_used: u64)`. This uses a hand-rolled, fixed-width encoding
+// (8 + 8 + 8 + 16 + 8 = 48 bytes) instead of RLP. The row has a fixed
+// size, and `BPosition` is not an RLP-native type.
 //
-// A 24-byte row carries `l1_origin`; a 20-byte row decodes as
-// `l1_origin = 0`, so an existing state DB keeps reading without a
-// migration.
+// A 48-byte row carries the fee pair; a 24-byte row decodes with a zero
+// base fee and gas used, and a 20-byte row with `l1_origin = 0` too, so an
+// existing state DB keeps reading without a migration.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderValue {
@@ -142,6 +143,10 @@ pub struct HeaderValue {
     pub l2_timestamp: u64,
     /// The L1 block number for the epoch this block belongs to.
     pub l1_origin: u64,
+    /// The base fee the block's transactions paid, in wei per gas.
+    pub base_fee: u128,
+    /// The gas the block's transactions used.
+    pub gas_used: u64,
 }
 
 #[must_use]
@@ -150,97 +155,128 @@ pub(crate) fn encode_block_key(block_number: u64) -> [u8; 8] {
 }
 
 #[must_use]
-pub(crate) fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
-    let mut out = [0u8; 24];
+pub(crate) fn encode_header_value(v: &HeaderValue) -> [u8; 48] {
+    let mut out = [0u8; 48];
     out[..4].copy_from_slice(&v.end_tx_idx.term_id.to_be_bytes());
     out[4..8].copy_from_slice(&v.end_tx_idx.term_offset.to_be_bytes());
     out[8..16].copy_from_slice(&v.l2_timestamp.to_be_bytes());
     out[16..24].copy_from_slice(&v.l1_origin.to_be_bytes());
+    out[24..40].copy_from_slice(&v.base_fee.to_be_bytes());
+    out[40..48].copy_from_slice(&v.gas_used.to_be_bytes());
     out
 }
 
 /// # Errors
 ///
-/// Returns [`StateError::BadEncoding`] if `bytes` is neither the
-/// current 24-byte row nor the pre-origin 20-byte row.
+/// Returns [`StateError::BadEncoding`] if `bytes` is none of the current
+/// 48-byte row, the pre-fee 24-byte row, and the pre-origin 20-byte row.
 pub(crate) fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    // A 20-byte value is the pre-origin row. Anything else is corruption.
     // Matching each fixed-size array by value, rather than slicing and
     // `try_into`-ing sub-ranges, makes every field width a compile-time
-    // fact instead of a runtime check.
+    // fact instead of a runtime check. A value of another width is
+    // corruption, not a format version.
+    if let Ok(row) = <&[u8; 48]>::try_from(bytes) {
+        return Ok(decode_fee_row(row));
+    }
     if let Ok(row) = <&[u8; 24]>::try_from(bytes) {
-        let &[
-            t0,
-            t1,
-            t2,
-            t3,
-            o0,
-            o1,
-            o2,
-            o3,
-            l0,
-            l1,
-            l2,
-            l3,
-            l4,
-            l5,
-            l6,
-            l7,
-            r0,
-            r1,
-            r2,
-            r3,
-            r4,
-            r5,
-            r6,
-            r7,
-        ] = row;
-        return Ok(HeaderValue {
-            end_tx_idx: BPosition {
-                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
-                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
-            },
-            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
-            l1_origin: u64::from_be_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
-        });
+        return Ok(decode_origin_row(row));
     }
     if let Ok(row) = <&[u8; 20]>::try_from(bytes) {
-        // The last 4 bytes of the pre-origin row are a reserved field
-        // the old format never used; ignore them, same as the original
-        // decoder did.
-        let &[
-            t0,
-            t1,
-            t2,
-            t3,
-            o0,
-            o1,
-            o2,
-            o3,
-            l0,
-            l1,
-            l2,
-            l3,
-            l4,
-            l5,
-            l6,
-            l7,
-            _reserved @ ..,
-        ] = row;
-        return Ok(HeaderValue {
-            end_tx_idx: BPosition {
-                term_id: i32::from_be_bytes([t0, t1, t2, t3]),
-                term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
-            },
-            l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
-            l1_origin: 0,
-        });
+        return Ok(decode_pre_origin_row(row));
     }
     Err(StateError::BadEncoding {
         table: TABLE_HEADERS,
-        expected: 24,
+        expected: 48,
         got: bytes.len(),
     })
+}
+
+/// The current row: the origin row, then the base fee and the gas used.
+fn decode_fee_row(row: &[u8; 48]) -> HeaderValue {
+    let [
+        origin_row @ ..,
+        f0,
+        f1,
+        f2,
+        f3,
+        f4,
+        f5,
+        f6,
+        f7,
+        f8,
+        f9,
+        f10,
+        f11,
+        f12,
+        f13,
+        f14,
+        f15,
+        g0,
+        g1,
+        g2,
+        g3,
+        g4,
+        g5,
+        g6,
+        g7,
+    ] = *row;
+    HeaderValue {
+        base_fee: u128::from_be_bytes([
+            f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15,
+        ]),
+        gas_used: u64::from_be_bytes([g0, g1, g2, g3, g4, g5, g6, g7]),
+        ..decode_origin_row(&origin_row)
+    }
+}
+
+/// The pre-fee row: the position and the timestamp, then the origin. The
+/// fee pair is zero, which is what those chains had.
+fn decode_origin_row(row: &[u8; 24]) -> HeaderValue {
+    let [core @ .., r0, r1, r2, r3, r4, r5, r6, r7] = *row;
+    HeaderValue {
+        l1_origin: u64::from_be_bytes([r0, r1, r2, r3, r4, r5, r6, r7]),
+        ..decode_core(&core)
+    }
+}
+
+/// The pre-origin row: the position and the timestamp, then 4 reserved
+/// bytes the old format never used. The origin and the fee pair are zero,
+/// which is what those chains had.
+fn decode_pre_origin_row(row: &[u8; 20]) -> HeaderValue {
+    let [core @ .., _reserved0, _reserved1, _reserved2, _reserved3] = *row;
+    decode_core(&core)
+}
+
+/// The fields every row width carries: the position and the timestamp.
+fn decode_core(row: &[u8; 16]) -> HeaderValue {
+    let [
+        t0,
+        t1,
+        t2,
+        t3,
+        o0,
+        o1,
+        o2,
+        o3,
+        l0,
+        l1,
+        l2,
+        l3,
+        l4,
+        l5,
+        l6,
+        l7,
+    ] = *row;
+    HeaderValue {
+        end_tx_idx: BPosition {
+            term_id: i32::from_be_bytes([t0, t1, t2, t3]),
+            term_offset: i32::from_be_bytes([o0, o1, o2, o3]),
+        },
+        l2_timestamp: u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
+        l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
+    }
 }
 
 // ---------- receipts ----------
@@ -525,7 +561,8 @@ mod tests {
     fn header_value_layout_is_pinned() {
         // `headers` value is an at-rest format: term_id (i32 BE), then
         // term_offset (i32 BE), then l2_timestamp (u64 BE), then l1_origin
-        // (u64 BE). Total: 24 bytes.
+        // (u64 BE), then base_fee (u128 BE), then gas_used (u64 BE).
+        // Total: 48 bytes.
         let v = HeaderValue {
             end_tx_idx: BPosition {
                 term_id: 0x0102_0304,
@@ -533,6 +570,8 @@ mod tests {
             },
             l2_timestamp: 0x1112_1314_1516_1718,
             l1_origin: 0x2122_2324_2526_2728,
+            base_fee: 0x3132_3334_3536_3738_3941_4243_4445_4647,
+            gas_used: 0x5152_5354_5556_5758,
         };
         assert_eq!(
             encode_header_value(&v),
@@ -541,16 +580,29 @@ mod tests {
                 0x05, 0x06, 0x07, 0x08, // term_offset BE
                 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // l2_timestamp BE
                 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // l1_origin BE
+                0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // base_fee BE, high half
+                0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, // base_fee BE, low half
+                0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, // gas_used BE
             ]
         );
         assert_eq!(decode_header_value(&encode_header_value(&v)).unwrap(), v);
     }
 
-    /// A state DB written before the origin field existed must keep
-    /// working. Its 20-byte rows mean origin 0, which is what those chains
+    /// A state DB written before the fee pair or the origin field existed
+    /// must keep working. A 24-byte row means a zero base fee and gas
+    /// used; a 20-byte row means origin 0 too, which is what those chains
     /// actually had.
     #[test]
-    fn pre_origin_header_rows_still_decode() {
+    fn pre_fee_and_pre_origin_header_rows_still_decode() {
+        let pre_fee = [
+            0x01, 0x02, 0x03, 0x04, // term_id BE
+            0x05, 0x06, 0x07, 0x08, // term_offset BE
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // l2_timestamp BE
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // l1_origin BE
+        ];
+        let v = decode_header_value(&pre_fee).unwrap();
+        assert_eq!(v.l1_origin, 0x2122_2324_2526_2728);
+        assert_eq!((v.base_fee, v.gas_used), (0, 0));
         let legacy = [
             0x01, 0x02, 0x03, 0x04, // term_id BE
             0x05, 0x06, 0x07, 0x08, // term_offset BE
@@ -560,7 +612,7 @@ mod tests {
         let v = decode_header_value(&legacy).unwrap();
         assert_eq!(v.l2_timestamp, 0x1112_1314_1516_1718);
         assert_eq!(v.l1_origin, 0);
-        // A value that is neither width is corruption, not a third format version.
+        // A value of another width is corruption, not a format version.
         assert!(decode_header_value(&legacy[..19]).is_err());
         assert!(decode_header_value(&[0u8; 32]).is_err());
     }

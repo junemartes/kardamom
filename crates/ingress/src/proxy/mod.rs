@@ -164,6 +164,9 @@ where
     /// value only increases, one writer, the `BlockBoundary` watcher, sets
     /// it, and many readers read it.
     pub(crate) latest_block_number: Arc<AtomicU64>,
+    /// The fee history of recent blocks: the boundary and receipt
+    /// watchers write it, the fee RPCs read it.
+    pub(crate) fee_history: Arc<crate::fee_history::FeeHistory>,
     /// Post-dedup receipt re-broadcast. The `tx_receipts` watcher forwards
     /// each first-seen receipt here, so `kardamom_subscribeReceipts`
     /// sessions see exactly one copy per tx, instead of the raw
@@ -215,6 +218,7 @@ where
             query: self.query.clone(),
             redis: self.redis.clone(),
             latest_block_number: self.latest_block_number.clone(),
+            fee_history: self.fee_history.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
             draining: self.draining.clone(),
@@ -267,6 +271,7 @@ where
             query,
             redis,
             latest_block_number: Arc::new(AtomicU64::new(0)),
+            fee_history: Arc::new(crate::fee_history::FeeHistory::default()),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -384,6 +389,11 @@ where
         }
     }
 
+    /// The fee history the fee RPCs read.
+    pub(crate) fn fee_history(&self) -> &crate::fee_history::FeeHistory {
+        &self.fee_history
+    }
+
     /// Returns the next globally unique `correlation_id` for this
     /// replica.
     ///
@@ -488,6 +498,7 @@ where
     pub fn begin_drain(&self) {
         self.draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        metrics::gauge!(crate::metrics::DRAINING).set(1.0);
         tracing::info!(
             pending = self.pending.len(),
             "ingress: draining; new submits refused"
@@ -532,6 +543,7 @@ where
     {
         let (jsonrpc_addr, jsonrpc_handle) =
             crate::json_rpc::start_jsonrpc_server(self.clone(), self.cfg.jsonrpc_bind).await?;
+        metrics::gauge!(crate::metrics::DRAINING).set(0.0);
         #[cfg(feature = "binary-protocol")]
         {
             if let Some(addr) = self.cfg.binary_tcp_bind {

@@ -29,7 +29,8 @@ class DaLagGuardTest {
     private static CanonicalSealerState state(long budget) {
         return new CanonicalSealerState(
                 64, 1, Set.of(), VoidLedger.Config.DISABLED,
-                CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, budget);
+                CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
+                CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budget);
     }
 
     /** One user record of the shared sender, by nonce. */
@@ -142,16 +143,16 @@ class DaLagGuardTest {
         CanonicalSealerState s = state(BUDGET);
         seal(s, 5);
         s.onPostedCursor(4L);
-        byte[] v8 = s.takeSnapshot();
-        CanonicalSealerState restored = CanonicalSealerState.load(v8, 64);
+        byte[] v9 = s.takeSnapshot();
+        CanonicalSealerState restored = CanonicalSealerState.load(v9, 64);
         assertEquals(4L, restored.postedHead());
         assertEquals(5L, restored.sealedHead());
 
-        // A version-7 snapshot: the same bytes without the trailing cursor,
-        // tagged 7.
-        byte[] v7 = java.util.Arrays.copyOf(v8, v8.length - 8);
-        java.nio.ByteBuffer.wrap(v7).order(java.nio.ByteOrder.BIG_ENDIAN).putInt(4, 7);
-        assertEquals(0L, CanonicalSealerState.load(v7, 64).postedHead(),
-                "a snapshot before version 8 carries no cursor");
+        // A version-8 snapshot: the same bytes without the trailing cursor,
+        // tagged 8.
+        byte[] v8 = java.util.Arrays.copyOf(v9, v9.length - 8);
+        java.nio.ByteBuffer.wrap(v8).order(java.nio.ByteOrder.BIG_ENDIAN).putInt(4, 8);
+        assertEquals(0L, CanonicalSealerState.load(v8, 64).postedHead(),
+                "a snapshot before version 9 carries no cursor");
     }
 }

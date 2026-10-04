@@ -41,7 +41,11 @@ use wiring::Boot;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    let boot = Boot::init(Args::parse()).await?;
+    let args = Args::parse();
+    if args.clear_verdict {
+        return wiring::clear_verdict(&args.state_dir);
+    }
+    let boot = Boot::init(args).await?;
     // Each turn runs the whole pipeline once. A refused replay stages a
     // peer checkpoint and comes back here for the next turn, which
     // adopts it; every other end leaves the loop.

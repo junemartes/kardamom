@@ -153,6 +153,15 @@ impl Ready {
 
         let mut cfg = kardamom_engine::ExecutorConfig {
             chain_id,
+            fees: self
+                .attested
+                .written
+                .streamed
+                .opened
+                .state
+                .genesis
+                .as_ref()
+                .and_then(|g| g.fees),
             // A validator always re-derives record identity. The
             // stream's sender and tx_hash are proxy claims, and
             // verification that trusts them re-executes the very theft

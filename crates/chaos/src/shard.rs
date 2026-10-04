@@ -46,6 +46,7 @@ impl Shard {
                 "node-replace-executor",
                 "state-checkpoint-restore",
                 "replay-window-resync",
+                "deploy-broken-image",
             ],
             Self::Ingress => &[
                 "graceful-ingress",
@@ -179,7 +180,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 39);
+        assert_eq!(all.len(), 40);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")

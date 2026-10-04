@@ -20,7 +20,7 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror]
+workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier]
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -36,6 +36,11 @@ workloads_common_vars:
   sealer_count: "{{ node_classes.sealer.count }}"
   sequencer_count: "{{ node_classes.sequencer.count }}"
   ingress_count: "{{ node_classes.ingress.count }}"
+  canary: "{{ workloads_canary }}"
+  # One value for the sequencer's tip, the sealer's ordering window, and
+  # the executor's and validator's fee schedule: "on" or "off". Empty
+  # leaves every job at its "off" default.
+  priority_fees: "{{ workloads_priority_fees }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -82,6 +87,7 @@ workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }
 workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
+workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
@@ -108,3 +114,23 @@ workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80
+# The poll budget of one Nomad deployment, in polls of workloads_poll_delay
+# seconds. It covers a job's progress_deadline (10 minutes), so a
+# deployment that Nomad has not decided yet is never read as a failure.
+workloads_deployment_retries: 220
+# Canary allocations for the ingress and the sequencer: 0 or 1. A canary
+# is one allocation more than the count, so it needs a spare node of its
+# class; the container profile has none.
+workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
+# The sealer members' admin port (cluster_ports.admin): the role reads
+# the leader from it for the staged roll.
+workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The operator binary that runs the smoke against a canary.
+workloads_cluster_binary: >-
+  {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
+     | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
+# The record of the deployed manifests, by environment: deployed/<env>/
+# images.digests is the last successful deploy, .previous the one before.
+# `just rollback <env>` deploys the previous one.
+workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
+workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"

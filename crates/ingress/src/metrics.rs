@@ -37,6 +37,12 @@ pub const CLUSTER_SEALED_HEAD: &str = "kardamom_ingress_cluster_sealed_head";
 pub const CLUSTER_RETAINED_FRAMES: &str = "kardamom_ingress_cluster_retained_frames";
 /// The oldest boundary block the sealer still retains: its replay floor.
 pub const CLUSTER_FLOOR_BLOCK: &str = "kardamom_ingress_cluster_floor_block";
+/// 0 while the proxy serves, 1 from the first moment of the shutdown
+/// drain. The readiness rule requires 0: a draining replica refuses new
+/// submits, so a health check must take it out of rotation at once. The
+/// gauge is unset before the listeners are up, which also reads as not
+/// ready.
+pub const DRAINING: &str = "kardamom_ingress_draining";
 
 /// Increments [`TX_REJECTED_TOTAL`] with the given `reason` label. This is
 /// the one place for the submit-path rejection counter, so every rejection
@@ -69,6 +75,7 @@ pub fn describe() {
         CLUSTER_FRAME_DROPPED_TOTAL,
         "malformed cluster egress frames dropped by the watermark observer (should stay 0)"
     );
+    metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
     metrics::describe_gauge!(
         CLUSTER_POSTED_HEAD,
         "the last L2 block posted to L1, from the cluster's status frame"

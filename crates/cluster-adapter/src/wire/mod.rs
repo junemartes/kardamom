@@ -5,15 +5,17 @@
 //!
 //! Ingress (Rust sequencer to cluster): one app message per record:
 //! ```text
-//!   [kind:u8 = 0][sender:20][nonce:u64 LE][deadline:u64 LE][canonical_id:32][record_type:u8][fields…]
+//!   [kind:u8 = 0][sender:20][nonce:u64 LE][deadline:u64 LE][tip:u128 LE][canonical_id:32][record_type:u8][fields…]
 //!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32][tx_data_session_id:i32]
 //!     DepositRef  fields = [deposit_position.term_id:i32][.term_offset:i32]
 //! ```
 //! The Java service parses `sender` and `nonce` for the per-sender
-//! contiguity guard, and `deadline` for the inclusion check (see
-//! `docs/agents/offer-inclusion-deadline-spec.md`): a known sender's ref with a nonce other than the
+//! contiguity guard, `deadline` for the inclusion check (see
+//! `docs/agents/offer-inclusion-deadline-spec.md`), and `tip` for the
+//! ordering window: a known sender's ref with a nonce other than the
 //! expected next one is rejected with [`EGRESS_KIND_CONTIGUITY_REJECT`],
-//! instead of silently sealing a canonical nonce gap. It also parses
+//! instead of silently sealing a canonical nonce gap, and a window of
+//! records relays in `(tip descending, arrival ascending)` order. It also parses
 //! `canonical_id` (at its fixed offset) for dedup, then relays everything
 //! from `canonical_id` onward verbatim. It never inspects `record_type` or
 //! `fields`. The guard header sits before the canonical id, so the relayed
@@ -58,9 +60,9 @@ pub use egress::{
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
+    GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
     encode_ingress_remote_epoch, encode_ingress_txref, encode_replay_request, encode_subscribe,
-    encode_void_request, ingress_deadline, ingress_sender_nonce, split_ingress,
+    encode_void_request, ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
 };
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
@@ -89,12 +91,12 @@ pub const KIND_SUBSCRIBE: u8 = 2;
 /// Ingress kind: a batch of ingress records
 /// `[kind:u8 = 3][count:u16 LE][per entry: len:u32 LE + entry bytes]`. Each
 /// entry is a complete single-record ingress frame
-/// (`[kind:u8 = 0][sender:20][nonce:u64][canonical_id:32][payload…]`). One
-/// cluster offer carries the whole batch. The service unpacks it and
+/// (`[kind:u8 = 0][sender:20][nonce:u64][deadline:u64][tip:u128][canonical_id:32][payload…]`).
+/// One cluster offer carries the whole batch. The service unpacks it and
 /// processes each entry exactly like an individually offered record, so
 /// consensus determinism, dedup, the contiguity guard, and the egress
 /// format all stay unchanged. Batching amortizes the per-offer round
-/// trip: each entry is about 75 bytes. Matches Java `KIND_BATCH`.
+/// trip: each entry is about 99 bytes. Matches Java `KIND_BATCH`.
 pub const KIND_BATCH: u8 = 3;
 /// Ingress kind: an origin-advancing record
 /// `[kind:u8 = 4][canonical_id:32][l1_origin:u64][slot_count:u32][record_type:u8][fields…]`.
@@ -366,7 +368,13 @@ pub const INGRESS_NONCE_OFFSET: usize = INGRESS_SENDER_OFFSET + SENDER_LEN;
 /// Byte offset of the inclusion deadline in a kind-0 ingress frame. The
 /// deadline is the last block the sealer may order the record into.
 pub const INGRESS_DEADLINE_OFFSET: usize = INGRESS_NONCE_OFFSET + 8;
-pub const INGRESS_CANONICAL_ID_OFFSET: usize = INGRESS_DEADLINE_OFFSET + 8;
+/// Byte offset of the tip in a kind-0 ingress frame: the amount in wei
+/// the sender bids for its place, as a `u128`. The sealer orders a window
+/// of records by it. Matches Java `TIP_OFFSET`.
+pub const INGRESS_TIP_OFFSET: usize = INGRESS_DEADLINE_OFFSET + 8;
+/// Length of the tip field.
+pub const TIP_LEN: usize = 16;
+pub const INGRESS_CANONICAL_ID_OFFSET: usize = INGRESS_TIP_OFFSET + TIP_LEN;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
@@ -420,6 +428,13 @@ fn rd_i32(b: &[u8], at: usize) -> Result<i32, WireError> {
 }
 fn rd_u64(b: &[u8], at: usize) -> Result<u64, WireError> {
     bytes::u64_le(b, at).ok_or_else(|| too_short(b, at, 8))
+}
+fn rd_u128(b: &[u8], at: usize) -> Result<u128, WireError> {
+    rd_slice(b, at, 16).map(|s| {
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(s);
+        u128::from_le_bytes(raw)
+    })
 }
 
 /// Read a `u32` length prefix at `at`, converted to `usize`. A real error

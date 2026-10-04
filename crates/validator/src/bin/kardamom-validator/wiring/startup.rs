@@ -43,14 +43,27 @@ impl Boot {
     /// config resolve fails.
     pub(crate) async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
-        kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id).await?;
+        kardamom_obs::init_service!(
+            "validator",
+            args.metrics_addr,
+            &args.host_id,
+            kardamom_obs::Readiness::up()
+                .equals(kardamom_validator::metrics::VERDICT_STANDING, 0.0)
+                .within(
+                    kardamom_validator::metrics::COMMITTED_BLOCK,
+                    kardamom_engine::metrics::VALIDATOR_SEALER_BLOCK_NUMBER,
+                    f64::from(args.ready_lag_blocks),
+                )
+        )
+        .await?;
         kardamom_engine::metrics::describe();
         kardamom_validator::metrics::describe();
 
         // The TOML supplies the `[cluster]` section. The canonical
         // tx_ordering stream is always the Aeron Cluster egress; all other
         // runtime tuning still comes from the CLI flags.
-        let raw = std::fs::read_to_string(&args.config).context("read validator config")?;
+        let config = args.config.as_deref().context("--config is required")?;
+        let raw = std::fs::read_to_string(config).context("read validator config")?;
         let mut file_cfg: ValidatorFileConfig =
             toml::from_str(&raw).context("parse validator config")?;
         // Per-node cluster egress endpoint. The cluster client's
@@ -93,6 +106,11 @@ impl Boot {
     /// End the events transport before the process exits.
     pub(crate) async fn close(self) {
         self.events.close().await;
+    }
+
+    /// The divergence verdict file beside this validator's state.
+    pub(crate) fn verdict_file(&self) -> kardamom_validator::verdict::VerdictFile {
+        kardamom_validator::verdict::VerdictFile::beside(&self.args.state_dir)
     }
 }
 
@@ -164,11 +182,7 @@ impl Startup {
             .open()
             .with_context(|| format!("open state env at {}", self.args.state_dir.display()))?;
         let recovery = read_recovery_point(&env).context("read state recovery point")?;
-        let start = ResumePoint {
-            block: recovery.last_committed_block,
-            record_count: recovery.last_fsynced_reader_position.as_index(),
-            l2_timestamp: recovery.last_committed_l2_timestamp,
-        };
+        let start = ResumePoint::from(&recovery);
         if start.is_resume() {
             tracing::info!(
                 resume_block = start.block,

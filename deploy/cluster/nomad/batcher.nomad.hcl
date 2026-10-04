@@ -153,11 +153,16 @@ job "batcher" {
       unlimited      = true
     }
 
+    # In place: a singleton with a static port restarts on its node.
+    # Healthy by its /ready check: the feed loop runs over the restored
+    # spool, so nothing is lost across the restart.
     update {
-      max_parallel     = 1
-      health_check     = "task_states"
-      min_healthy_time = "10s"
-      healthy_deadline = "2m"
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
@@ -271,6 +276,12 @@ job "batcher" {
         port     = "metrics"
         provider = "consul"
         tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

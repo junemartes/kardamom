@@ -67,6 +67,28 @@ pub enum IngressError {
         have: alloy_primitives::U256,
         want: alloy_primitives::U256,
     },
+    /// The tip rate is above the fee cap: the transaction can never pay
+    /// its bid. geth's message shape.
+    #[error(
+        "max priority fee per gas higher than max fee per gas: address {address}, \
+         maxPriorityFeePerGas: {max_priority_fee_per_gas}, maxFeePerGas: {max_fee_per_gas}"
+    )]
+    FeeInvalid {
+        address: Address,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    },
+    /// The fee cap is under the base fee of the latest block the
+    /// sequencer saw. geth's message shape.
+    #[error(
+        "max fee per gas less than block base fee: address {address}, maxFeePerGas: \
+         {max_fee_per_gas}, baseFee: {base_fee}"
+    )]
+    FeeTooLow {
+        address: Address,
+        max_fee_per_gas: u128,
+        base_fee: u128,
+    },
     /// No read layer could answer an account query: the local layer
     /// missed and no executor query is configured, or every endpoint
     /// failed.
@@ -145,6 +167,8 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::Expired(_)
             | IngressError::PastDeadline { .. }
             | IngressError::InsufficientFunds { .. }
+            | IngressError::FeeInvalid { .. }
+            | IngressError::FeeTooLow { .. }
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,

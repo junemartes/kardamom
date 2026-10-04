@@ -567,6 +567,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
     let mut feed = tokio::spawn(
         FeedLoop::new(feed_rx, sender, feed_cfg, spool, restored, posted_cursor).run(),
     );
+    metrics::gauge!(super::live_metric_names::FEED_RUNNING).set(1.0);
     let feed_result = tokio::select! {
         r = &mut feed => r.context("feed task panicked")?,
         () = bin_support::wait_for_shutdown() => {

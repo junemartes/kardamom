@@ -114,6 +114,12 @@ tx_receipts_stream_id = 1002
 tx_errors_channel = "aeron:udp?endpoint=239.192.56.17:40030|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_errors_stream_id = 1015
 
+# --- TxStatus: one record per step a transaction takes. The sequencers
+# publish Offered and Rejected, the ingress publishes Sealed, best effort;
+# the notifier subscribes. RAM only. Own group .29:40090, stream 1018.
+tx_status_channel = "aeron:udp?endpoint=239.192.56.29:40090|interface={{ env "meta.node_ip" }}/32|ttl=1"
+tx_status_stream_id = 1018
+
 # --- TxDeposits: DA watcher publishes Deposit envelopes; sequencers subscribe.
 tx_deposits_channel = "aeron:udp?endpoint=239.192.56.19:40040|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_deposits_stream_id = 1016

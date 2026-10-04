@@ -36,7 +36,8 @@ class SealerDaLagTest {
         cluster = new StubCluster();
         service = new SealerClusteredService(
             64, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, BUDGET);
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, BUDGET);
         service.onStart(cluster, null);
         publisher = cluster.addSession(1);
         consumer = cluster.addSession(2);

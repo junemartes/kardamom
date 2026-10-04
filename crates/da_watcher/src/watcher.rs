@@ -237,6 +237,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// break or an unreachable L1 raises the watcher's halt, and a good
     /// pass clears it.
     fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
+        kardamom_obs::ready::mark_now(metrics::LAST_TICK_UNIX_SECONDS);
         match outcome {
             Ok(0) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);

@@ -24,10 +24,12 @@
 //! chain in the process loop.
 
 mod events;
+mod halted;
 mod pipeline;
 mod revolve;
 mod run;
 mod startup;
 
+pub(crate) use halted::clear_verdict;
 pub(crate) use revolve::turn;
 pub(crate) use startup::Boot;

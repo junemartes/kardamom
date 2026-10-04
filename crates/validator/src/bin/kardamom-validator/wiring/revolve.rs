@@ -18,7 +18,6 @@
 use std::ops::ControlFlow;
 
 use anyhow::Result;
-use kardamom_obs::halt::{self, Halt, HaltCause};
 
 use super::run::{EngineOutcome, RunEnd};
 use super::startup::{Boot, Startup};
@@ -79,8 +78,28 @@ pub(crate) async fn revolution(boot: &Boot) -> Result<Verdict> {
         .spawn_attester()?
         .build_sink();
     let end = Box::pin(ready.run()).await?;
+    persist_divergence(boot, &end.outcome);
     let repaired = repair(boot, &end)?;
     Ok(verdict(&end.outcome, repaired))
+}
+
+/// Record a proven divergence beside the state, so the next start runs
+/// halted. A failed write is logged, not fatal: the exit status still
+/// carries the verdict, and the log line stays.
+fn persist_divergence(boot: &Boot, outcome: &EngineOutcome) {
+    let EngineOutcome::Diverged(reason) = outcome else {
+        return;
+    };
+    kardamom_validator::metrics::set_verdict_standing(true);
+    let file = boot.verdict_file();
+    match file.record(reason) {
+        Ok(()) => tracing::error!(path = %file.path().display(), "divergence verdict recorded"),
+        Err(e) => tracing::error!(
+            error = %e,
+            path = %file.path().display(),
+            "divergence verdict could not be recorded"
+        ),
+    }
 }
 
 /// The repair step of a failed revolution: the peer-checkpoint fallback
@@ -101,19 +120,22 @@ fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
     )
 }
 
-/// One turn of the process loop: a revolution, then its verdict.
-/// `Continue` means run again; `Break` means the process is done. An
-/// exit status leaves the process here, as the old exit path did.
+/// One turn of the process loop: the hold on a standing verdict, a
+/// revolution, then its verdict. `Continue` means run again; `Break`
+/// means the process is done. An exit status leaves the process here.
 ///
 /// # Errors
 ///
 /// Returns the revolution's error.
 pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFlow<()>> {
+    if super::halted::Halted::hold(boot).await?.is_break() {
+        return Ok(ControlFlow::Break(()));
+    }
     match revolution(boot).await? {
         Verdict::Done => return Ok(ControlFlow::Break(())),
         Verdict::Exit(status) => exit(status),
         Verdict::Halt(reason) => {
-            if hold_divergence(boot, reason).await.is_break() {
+            if super::halted::Halted::of(boot).hold_on(boot, reason).await.is_break() {
                 return Ok(ControlFlow::Break(()));
             }
             *revolutions += 1;
@@ -135,19 +157,6 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
         "resync: the pipeline starts again in-process and adopts the staged peer checkpoint"
     );
     Ok(ControlFlow::Continue(()))
-}
-
-/// Hold the process on a proven divergence: raise the halt, keep serving
-/// the metrics and the `/halt` record, make no progress, and wait for
-/// the operator's clear or the shutdown signal. `Continue` means the
-/// operator cleared the halt after the runbook's steps, so the pipeline
-/// runs again from its cursor and verifies the block again.
-async fn hold_divergence(boot: &Boot, reason: String) -> ControlFlow<()> {
-    halt::raise(Halt::new(HaltCause::ValidatorDivergence, reason));
-    tokio::select! {
-        () = boot.stop.cancelled() => ControlFlow::Break(()),
-        () = halt::cleared() => ControlFlow::Continue(()),
-    }
 }
 
 /// Leave the process with status 1: an availability problem, for the

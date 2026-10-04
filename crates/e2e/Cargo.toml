@@ -82,7 +82,7 @@ kardamom-obs = { path = "../obs", optional = true, features = ["test-support"] }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 clap = { workspace = true, optional = true }
-jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
+jsonrpsee = { workspace = true, features = ["http-client", "ws-client"], optional = true }
 # `test-support` exposes the fake EigenDA proxy the DA-parity harness
 # starts for the batcher's posting path and for `kardamom-reconstruct`.
 kardamom-batcher = { path = "../batcher", optional = true, features = ["test-support"] }
@@ -105,7 +105,7 @@ anyhow.workspace = true
 criterion.workspace = true
 hex = "0.4"
 libc.workspace = true
-jsonrpsee = { workspace = true, features = ["http-client"] }
+jsonrpsee = { workspace = true, features = ["http-client", "ws-client"] }
 kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-ingress = { path = "../ingress" }

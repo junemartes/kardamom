@@ -197,7 +197,15 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     kardamom_engine::bin_support::init_tracing();
     let cli = Cli::parse();
-    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id).await?;
+    // The live batcher is ready once its feed loop runs over the restored
+    // spool. The offline scan has no loop: its exporter being live is
+    // enough.
+    let readiness = if cli.live {
+        kardamom_obs::Readiness::up().equals(kardamom_batcher::live::FEED_RUNNING, 1.0)
+    } else {
+        kardamom_obs::Readiness::up()
+    };
+    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id, readiness).await?;
 
     if cli.live {
         return live_main(cli).await;

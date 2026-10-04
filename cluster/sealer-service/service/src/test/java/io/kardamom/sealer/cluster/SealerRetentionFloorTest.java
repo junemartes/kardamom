@@ -43,7 +43,8 @@ class SealerRetentionFloorTest {
     private static SealerClusteredService newService() {
         return new SealerClusteredService(
             64, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
-            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS, 0L);
+            CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, 0L);
     }
 
     private void deliver(

@@ -191,6 +191,8 @@ mod tests {
             end_tx_idx: kardamom_types::BPosition::from_index(0),
             l2_timestamp: 0,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         })
     }
 

@@ -169,6 +169,25 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         self
     }
 
+    /// Export one delivered boundary. The clustered sealer has no
+    /// Prometheus endpoint. The executor re-exports its boundary stream
+    /// as the `kardamom_sealer_*` series (see `crate::metrics`). The
+    /// validator exports the head under its own name, so its readiness
+    /// rule can compare the head with its committed block.
+    fn record_boundary(&self, block_number: u64) {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "block numbers stay far below 2^52"
+        )]
+        let head = block_number as f64;
+        if self.emit_sealer_metrics {
+            metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
+            metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(head);
+        } else {
+            metrics::gauge!(crate::metrics::VALIDATOR_SEALER_BLOCK_NUMBER).set(head);
+        }
+    }
+
     /// Deliver the next in-order item from the buffers, if it is provably
     /// next.
     ///
@@ -192,18 +211,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             self.cursor
                 .next_block
                 .store(nb.saturating_add(1), Ordering::Relaxed);
-            // The clustered sealer has no Prometheus endpoint. The
-            // executor re-exports its boundary stream here (see
-            // `crate::metrics`). The validator builds this
-            // subscription with the emission suppressed.
-            if self.emit_sealer_metrics {
-                metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "block numbers stay far below 2^52"
-                )]
-                metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(b.block_number as f64);
-            }
+            self.record_boundary(b.block_number);
             return Ok(Some((b.end_tx_idx, TxOrderingMessage::BoundaryStart(b))));
         }
         // A record can be delivered when nothing proves an earlier boundary

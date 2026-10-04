@@ -10,11 +10,13 @@ import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
+import io.kardamom.sealer.OrderingWindow;
 import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import io.kardamom.sealer.VoidLedger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import org.agrona.DirectBuffer;
@@ -37,6 +39,38 @@ public final class SealerClusteredService implements ClusteredService {
     /** Correlation id used when scheduling the repeating boundary timer. */
     public static final long BOUNDARY_TIMER_CORRELATION_ID = 1L;
 
+    /**
+     * Correlation id of the ordering window's hold timer. It is armed when a
+     * record opens a window and fires {@link OrderingWindow#HOLD_MS} later.
+     * The expiry is a log event, so every member flushes at the same log
+     * position. A stale expiry on an empty window is a no-op.
+     */
+    public static final long WINDOW_TIMER_CORRELATION_ID = 2L;
+
+    /**
+     * One record held in the ordering window: the parsed guard header, the
+     * relayed payload, and the session to answer a reject to.
+     */
+    private static final class HeldRecord {
+        final ClientSession session;
+        final byte[] canonicalId;
+        final byte[] sender;
+        final long nonce;
+        final long deadline;
+        final byte[] payload;
+
+        HeldRecord(
+                final ClientSession session, final byte[] canonicalId, final byte[] sender,
+                final long nonce, final long deadline, final byte[] payload) {
+            this.session = session;
+            this.canonicalId = canonicalId;
+            this.sender = sender;
+            this.nonce = nonce;
+            this.deadline = deadline;
+            this.payload = payload;
+        }
+    }
+
     /** Tick cadence for the boundary timer, in ms. Matches the 250 ms L2 tick. */
     private final long tickIntervalMs;
     private final int dedupCapacity;
@@ -52,6 +86,13 @@ public final class SealerClusteredService implements ClusteredService {
     private Cluster cluster;
     private CanonicalSealerState state;
     private SealerEgress egress;
+
+    /**
+     * The log position of the last entry this service applied. The admin
+     * endpoint reads it from another thread and compares it with the
+     * commit position: the gap is the service's lag behind the log.
+     */
+    private volatile long servicePosition;
 
     /** Malformed ingress frames dropped (logged at power-of-two counts). */
     private long droppedFrameCount = 0;
@@ -87,8 +128,6 @@ public final class SealerClusteredService implements ClusteredService {
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
 
-    // Scratch buffers for ingress id and sender extraction. Reuse them to
-    // avoid a per-message allocation on the single cluster service thread.
     private final VoidLedger.Config voidConfig;
     /**
      * The inclusion horizon, in blocks. Replicated configuration: every
@@ -104,9 +143,20 @@ public final class SealerClusteredService implements ClusteredService {
     private final long daLagBudgetBlocks;
     /** DA-lag rejects emitted (logged at power-of-two counts). */
     private long daLagRejectCount = 0;
+    /**
+     * The priority window in front of the record path. Replicated
+     * configuration: its size decides the relay order, so every member runs
+     * the same value, and a snapshot restore checks it. Size 0 passes every
+     * record through at once.
+     */
+    private final OrderingWindow<HeldRecord> window;
 
+    /**
+     * Scratch buffer for the id of an origin, remote-origin, or void frame.
+     * Reused to avoid a per-message allocation on the single cluster
+     * service thread. A held record copies its id instead.
+     */
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
-    private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
 
     public SealerClusteredService(
             int dedupCapacity,
@@ -118,7 +168,7 @@ public final class SealerClusteredService implements ClusteredService {
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
     }
 
-    /** The constructor with this member's inclusion horizon and the default DA-lag budget. */
+    /** The constructor with this member's inclusion horizon, no ordering window, and the default DA-lag budget. */
     public SealerClusteredService(
             int dedupCapacity,
             long tickIntervalMs,
@@ -127,10 +177,10 @@ public final class SealerClusteredService implements ClusteredService {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks) {
         this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, voidConfig,
-            inclusionHorizonBlocks, CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS);
+            inclusionHorizonBlocks, CanonicalSealerState.DEFAULT_ORDERING_WINDOW);
     }
 
-    /** The full constructor, with this member's inclusion horizon and DA-lag budget. */
+    /** The constructor with this member's ordering window size (0 for off) and the default DA-lag budget. */
     public SealerClusteredService(
             int dedupCapacity,
             long tickIntervalMs,
@@ -138,8 +188,23 @@ public final class SealerClusteredService implements ClusteredService {
             Set<Long> remoteOrigins,
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
+            int orderingWindow) {
+        this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, voidConfig,
+            inclusionHorizonBlocks, orderingWindow, CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS);
+    }
+
+    /** The full constructor, with this member's ordering window size and DA-lag budget. */
+    public SealerClusteredService(
+            int dedupCapacity,
+            long tickIntervalMs,
+            int memberId,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow,
             long daLagBudgetBlocks) {
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
+        this.window = new OrderingWindow<>(orderingWindow);
         this.daLagBudgetBlocks = daLagBudgetBlocks;
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
@@ -185,7 +250,7 @@ public final class SealerClusteredService implements ClusteredService {
         } else {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks, daLagBudgetBlocks);
+                inclusionHorizonBlocks, window.capacity(), daLagBudgetBlocks);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -221,7 +286,8 @@ public final class SealerClusteredService implements ClusteredService {
     void restore(final byte[] snapshot) {
         final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         this.state = CanonicalSealerState.load(
-            buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, daLagBudgetBlocks);
+            buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
+            daLagBudgetBlocks);
         this.egress = new SealerEgress(
             cluster, memberId, state.canonicalCount(), state.blockNumber());
         egress.readSnapshot(buf);
@@ -272,6 +338,7 @@ public final class SealerClusteredService implements ClusteredService {
             + " logPosition=" + logPosition
             + " role=" + cluster.role()
             + " block=" + state.blockNumber());
+        recordServicePosition();
     }
 
     @Override
@@ -304,6 +371,16 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        dispatchSessionMessage(session, buffer, offset, length);
+        recordServicePosition();
+    }
+
+    /** Decode the kind tag and dispatch one ingress frame. */
+    private void dispatchSessionMessage(
+            final ClientSession session,
+            final DirectBuffer buffer,
+            final int offset,
+            final int length) {
         if (length <= SealerWire.KIND_OFFSET) {
             // Malformed or too-short envelope: it cannot carry the kind tag.
             onMalformedFrame("ingress-envelope", length);
@@ -442,6 +519,9 @@ public final class SealerClusteredService implements ClusteredService {
                     tailLength);
         }
 
+        // The record closes the open block, so the window closes with it:
+        // a reorder never crosses a block.
+        flushWindow();
         final Optional<OriginAdvance> advance;
         try {
             advance =
@@ -510,6 +590,8 @@ public final class SealerClusteredService implements ClusteredService {
                     tailLength);
         }
 
+        // Same as an epoch: the window closes with the block.
+        flushWindow();
         final CanonicalSealerState.RemoteOriginOutcome outcome = state.onRemoteOriginRecord(
             canonicalIdScratch, originChainId, anchorNumber, slotCount, firstSeq, lastSeq,
             payload, cluster.time());
@@ -552,34 +634,70 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Process one single-record ingress frame at {@code offset}.
-     * Parse the guard header (sender and nonce) and the 32-byte canonical id
-     * at their fixed offsets. The payload is relayed as is and never
-     * inspected. Then dedup the record, check contiguity, and relay it if
-     * accepted. A contiguity reject answers the offering session with an
-     * {@link SealerWire#EGRESS_KIND_CONTIGUITY_REJECT} frame. Shared by the
+     * Hold one single-record ingress frame at {@code offset} in the
+     * ordering window. Parse the guard header (sender, nonce, deadline, tip)
+     * and the 32-byte canonical id at their fixed offsets. The payload is
+     * relayed as is and never inspected. The window flushes when it is
+     * full; a record that opens a window arms the hold timer. Shared by the
      * direct path and each {@link SealerWire#KIND_BATCH} entry.
      */
     private void processRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        buffer.getBytes(offset + SealerWire.CANONICAL_ID_OFFSET, canonicalIdScratch);
-        buffer.getBytes(offset + SealerWire.SENDER_OFFSET, senderScratch);
+        final byte[] canonicalId = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        buffer.getBytes(offset + SealerWire.CANONICAL_ID_OFFSET, canonicalId);
+        final byte[] sender = new byte[CanonicalSealerState.SENDER_LEN];
+        buffer.getBytes(offset + SealerWire.SENDER_OFFSET, sender);
         final long nonce = buffer.getLong(offset + SealerWire.NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final long deadline =
             buffer.getLong(offset + SealerWire.DEADLINE_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long tipLo = buffer.getLong(offset + SealerWire.TIP_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long tipHi =
+            buffer.getLong(offset + SealerWire.TIP_OFFSET + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
         final int payloadOffset = offset + SealerWire.RELAY_OFFSET;
         final int payloadLength = length - SealerWire.RELAY_OFFSET;
         final byte[] payload = new byte[payloadLength];
         if (payloadLength > 0) {
             buffer.getBytes(payloadOffset, payload);
         }
+        final boolean opened = window.isEmpty();
+        final boolean full = window.add(
+            sender, tipHi, tipLo, new HeldRecord(session, canonicalId, sender, nonce, deadline, payload));
+        if (full) {
+            flushWindow();
+            return;
+        }
+        if (opened) {
+            scheduleWindowTimer();
+        }
+    }
+
+    /**
+     * Close the ordering window: run the record path on every held record
+     * in {@code (tip descending, arrival ascending)} order, one sender's
+     * records in their arrival order. Dedup, the deadline, the window-full
+     * check, the contiguity guard, and the index assignment all run here,
+     * in the flush order, so the egress relays in that order.
+     */
+    private void flushWindow() {
+        final List<HeldRecord> held = window.flush();
+        for (HeldRecord record : held) {
+            admitRecord(record);
+        }
+    }
+
+    /**
+     * The record path for one held record: dedup the record, check its
+     * deadline and contiguity, and relay it if accepted. A reject answers
+     * the offering session with the matching egress frame.
+     */
+    private void admitRecord(final HeldRecord r) {
         final CanonicalSealerState.RecordOutcome outcome =
-            state.onRecord(canonicalIdScratch, senderScratch, nonce, deadline, payload);
+            state.onRecord(r.canonicalId, r.sender, r.nonce, r.deadline, r.payload);
         switch (outcome.kind) {
-            case CONTIGUITY_REJECT -> onContiguityReject(session, nonce, outcome.expectedNonce);
-            case PAST_DEADLINE -> onPastDeadline(session, nonce, outcome.maxInclusionBlock);
-            case WINDOW_FULL -> onWindowFull(session, nonce);
-            case DA_LAG_REJECT -> onDaLagReject(session, nonce);
+            case CONTIGUITY_REJECT -> onContiguityReject(r, outcome.expectedNonce);
+            case PAST_DEADLINE -> onPastDeadline(r, outcome.maxInclusionBlock);
+            case WINDOW_FULL -> onWindowFull(r);
+            case DA_LAG_REJECT -> onDaLagReject(r);
             case RELAYED -> outcome.relayed.ifPresent(egress::offerRelayed);
             case DUPLICATE -> { }
         }
@@ -622,7 +740,8 @@ public final class SealerClusteredService implements ClusteredService {
      * until the batcher posts again, so the sequencer reports it to the
      * client instead of republishing.
      */
-    private void onDaLagReject(final ClientSession session, final long nonce) {
+    private void onDaLagReject(final HeldRecord r) {
+        final long nonce = r.nonce;
         daLagRejectCount++;
         if (Long.bitCount(daLagRejectCount) == 1) {
             System.out.println("cluster DA-LAG-REJECT memberId=" + memberId
@@ -631,7 +750,7 @@ public final class SealerClusteredService implements ClusteredService {
                 + " budget=" + state.daLagBudgetBlocks()
                 + " totalDaLagRejected=" + daLagRejectCount);
         }
-        egress.offerDaLagReject(session, senderScratch, nonce, status());
+        egress.offerDaLagReject(r.session, r.sender, nonce, status());
     }
 
     /**
@@ -667,7 +786,8 @@ public final class SealerClusteredService implements ClusteredService {
      * dedup insert and no count. It is part of the deterministic state
      * machine and is identical on every member.
      */
-    private void onContiguityReject(final ClientSession session, final long nonce, final long expected) {
+    private void onContiguityReject(final HeldRecord r, final long expected) {
+        final long nonce = r.nonce;
         rejectedFrameCount++;
         if (Long.bitCount(rejectedFrameCount) == 1) {
             // Log to stdout like the other operational signals, so the chaos
@@ -677,7 +797,7 @@ public final class SealerClusteredService implements ClusteredService {
                 + " nonce=" + nonce + " expected=" + expected
                 + " totalRejected=" + rejectedFrameCount);
         }
-        egress.offerContiguityReject(session, senderScratch, nonce, expected);
+        egress.offerContiguityReject(r.session, r.sender, nonce, expected);
     }
 
     /**
@@ -685,8 +805,8 @@ public final class SealerClusteredService implements ClusteredService {
      * The record is not ordered, and no copy of it can be ordered later, so
      * the sequencer reports it to the client instead of republishing.
      */
-    private void onPastDeadline(
-            final ClientSession session, final long nonce, final long maxInclusionBlock) {
+    private void onPastDeadline(final HeldRecord r, final long maxInclusionBlock) {
+        final long nonce = r.nonce;
         pastDeadlineCount++;
         if (Long.bitCount(pastDeadlineCount) == 1) {
             System.out.println("cluster PAST-DEADLINE memberId=" + memberId
@@ -695,7 +815,7 @@ public final class SealerClusteredService implements ClusteredService {
                 + " totalPastDeadline=" + pastDeadlineCount);
         }
         egress.offerPastDeadline(
-            session, senderScratch, nonce, maxInclusionBlock, state.blockNumber());
+            r.session, r.sender, nonce, maxInclusionBlock, state.blockNumber());
     }
 
     /**
@@ -703,7 +823,8 @@ public final class SealerClusteredService implements ClusteredService {
      * forgotten to make room, so this is back-pressure: the next tick that
      * passes a deadline frees space, and the sequencer republishes.
      */
-    private void onWindowFull(final ClientSession session, final long nonce) {
+    private void onWindowFull(final HeldRecord r) {
+        final long nonce = r.nonce;
         windowFullCount++;
         if (Long.bitCount(windowFullCount) == 1) {
             System.out.println("cluster WINDOW-FULL memberId=" + memberId
@@ -711,14 +832,21 @@ public final class SealerClusteredService implements ClusteredService {
                 + " capacity=" + state.dedupCapacity()
                 + " totalWindowFull=" + windowFullCount);
         }
-        egress.offerWindowFull(session, senderScratch, nonce);
+        egress.offerWindowFull(r.session, r.sender, nonce);
     }
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        recordServicePosition();
+        if (correlationId == WINDOW_TIMER_CORRELATION_ID) {
+            flushWindow();
+            return;
+        }
         if (correlationId != BOUNDARY_TIMER_CORRELATION_ID) {
             return;
         }
+        // The window closes at a boundary: a reorder never crosses a block.
+        flushWindow();
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
         // The status rides every tick, so an observer sees the guard flip
@@ -739,6 +867,9 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        // The snapshot action is a log event, so every member closes the
+        // window here, and the snapshot never has to carry held records.
+        flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
         // Log to stdout, like the role line below. The block= value is the
         // proof of catch-up. The SNAPSHOT action is itself a replicated-log
@@ -770,7 +901,29 @@ public final class SealerClusteredService implements ClusteredService {
         // No external resources to release.
     }
 
+    /** The log position of the last applied entry; 0 before the first. */
+    long servicePosition() {
+        return servicePosition;
+    }
+
     // --- helpers ------------------------------------------------------------
+
+    private void recordServicePosition() {
+        servicePosition = cluster.logPosition();
+    }
+
+    /**
+     * Arm the ordering window's hold timer. Only the leader's call takes
+     * effect; the expiry replicates through the log, so every member
+     * flushes at the same position. Re-arming with the same correlation id
+     * replaces a stale pending expiry from an earlier window.
+     */
+    private void scheduleWindowTimer() {
+        final long deadline = cluster.time() + OrderingWindow.HOLD_MS;
+        while (!cluster.scheduleTimer(WINDOW_TIMER_CORRELATION_ID, deadline)) {
+            cluster.idleStrategy().idle();
+        }
+    }
 
     private void scheduleBoundaryTimer() {
         final long deadline = cluster.time() + tickIntervalMs;

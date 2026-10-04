@@ -15,6 +15,7 @@ pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod coordinated;
 pub(crate) mod da_lag;
+pub(crate) mod deploy;
 pub(crate) mod fleet;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -35,6 +36,7 @@ pub enum Case {
     NodeReplaceExecutor,
     StateCheckpointRestore,
     ReplayWindowResync,
+    DeployBrokenImage,
     ClusterLeaderKill,
     ClusterFollowerKill,
     ClusterMemberRejoin,
@@ -67,7 +69,7 @@ pub enum Case {
     PruneFloor,
 }
 
-const ALL: [Case; 41] = [
+const ALL: [Case; 42] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -79,6 +81,7 @@ const ALL: [Case; 41] = [
     Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
     Case::ReplayWindowResync,
+    Case::DeployBrokenImage,
     Case::ClusterLeaderKill,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
@@ -139,6 +142,7 @@ impl Case {
             Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
             Self::ReplayWindowResync => "replay-window-resync",
+            Self::DeployBrokenImage => "deploy-broken-image",
             Self::ClusterLeaderKill => "cluster-leader-kill",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
@@ -201,6 +205,9 @@ impl Case {
             | Self::DaLagHalt
             | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
+            // The failed deployment runs to the executor's healthy
+            // deadline, then the real manifest replaces three executors.
+            Self::DeployBrokenImage => inject + Duration::from_mins(12),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
@@ -278,6 +285,7 @@ impl Case {
             Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
+            Self::DeployBrokenImage => deploy::broken_image(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,

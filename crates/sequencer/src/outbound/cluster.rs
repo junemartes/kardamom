@@ -63,9 +63,7 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
     fn offer_batch(&mut self, many: &[RefOffer]) -> (usize, Option<SequencerError>) {
         let entries: Vec<Vec<u8>> = many
             .iter()
-            .map(|o| {
-                wire::encode_ingress_txref(&o.tx_ref, o.sender, o.nonce, o.max_inclusion_block)
-            })
+            .map(|o| wire::encode_ingress_txref(&o.tx_ref, o.guard))
             .collect();
         let frame = match wire::encode_ingress_batch(&entries) {
             Ok(frame) => frame,
@@ -85,12 +83,7 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
 
 impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I> {
     fn try_publish_ref(&mut self, offer: &RefOffer) -> Result<(), SequencerError> {
-        let bytes = wire::encode_ingress_txref(
-            &offer.tx_ref,
-            offer.sender,
-            offer.nonce,
-            offer.max_inclusion_block,
-        );
+        let bytes = wire::encode_ingress_txref(&offer.tx_ref, offer.guard);
         self.offer(&bytes)
     }
 
@@ -198,7 +191,9 @@ mod tests {
     }
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
-    use kardamom_cluster_adapter::wire::{EgressItem, encode_egress_record, split_ingress, txref};
+    use kardamom_cluster_adapter::wire::{
+        EgressItem, GuardHeader, encode_egress_record, split_ingress, txref,
+    };
     use kardamom_types::TxOrderingMessage;
 
     /// A ref offer with no deadline: these tests exercise the transport,
@@ -210,9 +205,11 @@ mod tests {
     ) -> RefOffer {
         RefOffer {
             tx_ref,
-            sender,
-            nonce,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                sender,
+                nonce,
+                ..GuardHeader::EXEMPT
+            },
         }
     }
 

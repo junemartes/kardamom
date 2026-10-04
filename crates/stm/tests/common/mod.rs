@@ -132,6 +132,7 @@ pub(crate) fn env() -> ExecEnv {
         chain_id: CHAIN_ID,
         block_number: 1,
         l2_timestamp: 1_700_000_000,
+        fees: kardamom_types::BlockFees::NONE,
     }
 }
 

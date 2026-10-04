@@ -26,9 +26,7 @@ pub struct TxError {
 }
 
 /// Reasons the sequencer rejects an inbound transaction. Add a new variant
-/// for each new rejection class. v0 ships only `DuplicatedTx`. Future
-/// variants may cover failed signature reverification, or malformed
-/// envelopes that slip past the proxy.
+/// for each new rejection class.
 #[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub enum TxErrorReason {
@@ -60,6 +58,24 @@ pub enum TxErrorReason {
         max_inclusion_block: u64,
         at_block: u64,
     },
+    /// The tip rate is above the fee cap, so the bid can never be paid.
+    /// The transaction is invalid, not merely unpayable. The client signs
+    /// again with a tip rate within the cap.
+    FeeInvalid {
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    },
+    /// The fee cap is under the base fee of the latest block the sequencer
+    /// has seen, so the transaction cannot be included at that price. The
+    /// client signs again with a higher cap.
+    FeeTooLow {
+        max_fee_per_gas: u128,
+        base_fee: u128,
+    },
+    /// The sender's balance, as the sequencer sees it, cannot cover the
+    /// worst case the transaction can be charged: the fee cap on every
+    /// gas unit plus the value.
+    InsufficientFunds { have: u128, want: u128 },
     /// The sealer refused the offer because the chain is halted on a DA
     /// lag: the sealed head is more than `budget_blocks` past the last
     /// block posted to L1. The transaction is not ordered. The client

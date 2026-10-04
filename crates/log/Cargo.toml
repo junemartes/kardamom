@@ -26,6 +26,7 @@ futures.workspace = true
 if-addrs.workspace = true
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
+metrics.workspace = true
 reqwest.workspace = true
 rkyv.workspace = true
 rusteron-archive.workspace = true
