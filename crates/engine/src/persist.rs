@@ -185,6 +185,8 @@ mod tests {
             end_tx_idx: BPosition::from_index(block_number),
             l2_timestamp: 1_700_000_000 + block_number,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         }
     }
 

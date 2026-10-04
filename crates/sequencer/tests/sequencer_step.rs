@@ -1,13 +1,15 @@
 //! Driver-level tests for `Sequencer::run_once` and `run`.
 
-use kardamom_types::TxDataLoc;
+use kardamom_types::{BlockBoundary, TxDataLoc, TxStage};
 use std::num::NonZeroU32;
 
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::partition::PartitionCount;
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_sequencer::testkit::{
-    Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
+    EnvelopeSpec, Rig, envelope_with, one_partition_cfg, pos,
+    signed_envelope as signed_tx_envelope, signer,
 };
 
 #[test]
@@ -47,6 +49,51 @@ fn past_nonce_emits_duplicate_notification() {
     assert!(matches!(
         errs[0].reason,
         kardamom_sequencer::TxErrorReason::DuplicatedTx { expected_nonce: 1 }
+    ));
+}
+
+/// A fee rejection reaches both side channels: the `tx_errors` event for
+/// the parked client, and a `Rejected` status keyed by the transaction's
+/// hash. The transaction is never offered, so no `Offered` status goes out.
+#[test]
+fn fee_rejection_publishes_the_rejected_status() {
+    let s = signer(9);
+    let env = envelope_with(
+        &s,
+        0,
+        300,
+        EnvelopeSpec {
+            real_hash: true,
+            ..EnvelopeSpec::default()
+        },
+    );
+    let tx_hash = env.tx_hash;
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), env);
+    let view = LatestBaseFee::new();
+    view.on_boundary(&BlockBoundary {
+        base_fee: 100_000_000_000,
+        gas_used: 15_000_000,
+        ..BlockBoundary::default()
+    });
+    let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
+    seq.enable_fees(FeeGate::on(view, None));
+
+    assert!(rig.step(&mut seq).unwrap());
+    assert!(rig.refs().is_empty());
+    let errs = rig.errors();
+    assert_eq!(errs.len(), 1);
+    assert!(matches!(
+        errs[0].reason,
+        kardamom_sequencer::TxErrorReason::FeeTooLow { .. }
+    ));
+    let statuses = rig.statuses();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].tx_hash, tx_hash);
+    assert!(matches!(
+        &statuses[0].stage,
+        TxStage::Rejected { sender, nonce: 0, reason: kardamom_sequencer::TxErrorReason::FeeTooLow { .. } }
+            if *sender == s.address()
     ));
 }
 

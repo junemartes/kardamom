@@ -12,3 +12,7 @@
 /// the ingress does not need a revm dependency. The `cfg_pinning` test in
 /// `kardamom-exec-core` checks that the two values stay equal.
 pub const TX_GAS_LIMIT_CAP: u64 = 16_777_216;
+
+/// Fixed per-block gas limit. Version 0 has no dynamic adjustment. The
+/// base fee schedule targets half of it (see [`crate::fees`]).
+pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;

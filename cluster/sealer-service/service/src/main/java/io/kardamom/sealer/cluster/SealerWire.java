@@ -11,11 +11,12 @@ import io.kardamom.sealer.CanonicalSealerState;
  *
  * <p><b>App envelope framing.</b> The Rust side defines the application envelope
  * as {@code { kind: u8, sender: 20B, nonce: u64 LE, deadline: u64 LE,
- * canonical_id: 32B, payload }}. The guard header ({@code sender},
- * {@code nonce}, {@code deadline}) and the 32-byte canonical id sit at fixed
- * offsets after the 1-byte {@code kind} tag. The opaque {@code payload}
- * follows. This class matches that layout: sender at {@link #SENDER_OFFSET},
- * nonce at {@link #NONCE_OFFSET}, deadline at {@link #DEADLINE_OFFSET}, id at
+ * tip: u128 LE, canonical_id: 32B, payload }}. The guard header
+ * ({@code sender}, {@code nonce}, {@code deadline}, {@code tip}) and the
+ * 32-byte canonical id sit at fixed offsets after the 1-byte {@code kind}
+ * tag. The opaque {@code payload} follows. This class matches that layout:
+ * sender at {@link #SENDER_OFFSET}, nonce at {@link #NONCE_OFFSET}, deadline
+ * at {@link #DEADLINE_OFFSET}, tip at {@link #TIP_OFFSET}, id at
  * {@link #CANONICAL_ID_OFFSET}, relay from {@link #RELAY_OFFSET}.</p>
  *
  * <p>TODO(envelope): Keep this byte framing in step with the Rust app envelope
@@ -38,8 +39,15 @@ public final class SealerWire {
      * {@code docs/agents/offer-inclusion-deadline-spec.md}.
      */
     public static final int DEADLINE_OFFSET = NONCE_OFFSET + Long.BYTES;
+    /**
+     * Offset of the u128 LE tip in the guard header: the amount in wei the
+     * sender bids for its place. The ordering window sorts by it.
+     */
+    public static final int TIP_OFFSET = DEADLINE_OFFSET + Long.BYTES;
+    /** Length, in bytes, of the tip field. */
+    public static final int TIP_LEN = 16;
     /** Offset of the 32-byte canonical id within the app envelope. */
-    public static final int CANONICAL_ID_OFFSET = DEADLINE_OFFSET + Long.BYTES;
+    public static final int CANONICAL_ID_OFFSET = TIP_OFFSET + TIP_LEN;
     /**
      * Offset from which the relayed payload is forwarded to egress.
      * It starts at the canonical id, not after it, so the relayed payload is

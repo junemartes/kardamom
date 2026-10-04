@@ -124,7 +124,9 @@ async fn spawn_writer_and_bal(
     // thread hands each block's tx captures to a grading thread
     // (measurement only; execution stays sequential). It is `None`
     // when the env flag is unset, for zero cost.
-    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env();
+    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env(
+        kardamom_types::BlockFees::genesis(genesis.and_then(|g| g.fees)).beneficiary,
+    );
 
     Ok(WriterAdapters {
         writer,
@@ -401,6 +403,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // path. See the field's doc for the full trade-off.
     let mut cfg = ExecutorConfig {
         chain_id,
+        fees: genesis.as_ref().and_then(|g| g.fees),
         ..ExecutorConfig::default()
     };
     // Always bound the tx_data join wait. A replica whose multicast

@@ -74,6 +74,9 @@ pub struct SequencerConfig {
     /// empty. See `crate::lookup`.
     #[serde(default)]
     pub lookup: crate::lookup::LookupConfig,
+    /// The `[fees]` section: priority fees on or off.
+    #[serde(default)]
+    pub fees: crate::fees::FeesConfig,
     /// The local account layer: the accounts of this replica's vslots
     /// that the `tx_receipts` batch rows touched. A lookup request for
     /// a resident sender is answered from it, with no executor query.
@@ -140,6 +143,7 @@ impl Default for SequencerConfig {
             cluster: ClusterConfig::default(),
             resync: crate::resync::ResyncConfig::default(),
             lookup: crate::lookup::LookupConfig::default(),
+            fees: crate::fees::FeesConfig::default(),
             live_accounts: LiveAccountsConfig::default(),
             cache: CacheConfig::default(),
             lane: None,

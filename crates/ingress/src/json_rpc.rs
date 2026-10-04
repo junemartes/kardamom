@@ -12,8 +12,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
-use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt};
+use alloy_primitives::{Address, B256, Bytes, Log, LogData, U64, U256};
+use alloy_rpc_types_eth::{BlockNumberOrTag, FeeHistory, TransactionReceipt};
 use jsonrpsee::core::{RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle, SubscriptionSink};
@@ -60,7 +60,40 @@ pub trait IngressEthApi {
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
 
     #[method(name = "getTransactionReceipt")]
-    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>>;
+    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<KardamomReceipt>>;
+
+    /// The base fee of each of the newest `block_count` closed blocks up
+    /// to `newest_block`, plus the next block's, the gas used ratio per
+    /// block, and the tip rate rewards at `reward_percentiles`.
+    #[method(name = "feeHistory")]
+    async fn fee_history(
+        &self,
+        block_count: U64,
+        newest_block: BlockNumberOrTag,
+        reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory>;
+
+    /// A tip rate a wallet can bid: the median of recent blocks' tips.
+    /// Zero is a valid bid at all times; there is no floor.
+    #[method(name = "maxPriorityFeePerGas")]
+    async fn max_priority_fee_per_gas(&self) -> RpcResult<U256>;
+
+    /// The next block's base fee plus the suggested tip rate.
+    #[method(name = "gasPrice")]
+    async fn gas_price(&self) -> RpcResult<U256>;
+}
+
+/// Ethereum's receipt, plus the chain's two tip fields: the tip rate the
+/// transaction paid, and the tip amount it paid on its whole gas limit.
+/// The extra fields serialize beside the standard ones, so an Ethereum
+/// client that ignores unknown fields reads the receipt as usual.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KardamomReceipt {
+    #[serde(flatten)]
+    pub receipt: TransactionReceipt,
+    pub priority_fee_per_gas: U256,
+    pub priority_fee_paid: U256,
 }
 
 /// Event stream payload for `kardamom_subscribeReceipts`. One subscription
@@ -74,7 +107,7 @@ pub trait IngressEthApi {
 pub enum ReceiptEvent {
     /// A tx executed, and its enriched receipt was observed on `tx_receipts`.
     #[serde(rename_all = "camelCase")]
-    Receipt { receipt: Box<TransactionReceipt> },
+    Receipt { receipt: Box<KardamomReceipt> },
     /// The sequencer rejected the tx.
     #[serde(rename_all = "camelCase")]
     TxError {
@@ -153,7 +186,7 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
         Ok(res.receipt.tx_hash)
     }
 
-    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
+    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<KardamomReceipt>> {
         // The in-memory `ReceiptCache` first, populated off the
         // tx_receipts stream; on a miss, one query to an executor's state
         // DB, the durable copy. Returns `null`, by JSON-RPC convention,
@@ -163,6 +196,43 @@ impl<Backend: ProxyBackend> IngressEthApiServer for IngressHandlers<Backend> {
             .receipt_by_hash(client_ip(), hash)
             .await
             .map(|r| RpcReceipt::from(&r).0))
+    }
+
+    async fn fee_history(
+        &self,
+        block_count: U64,
+        newest_block: BlockNumberOrTag,
+        reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory> {
+        let history = self.proxy.fee_history();
+        let newest = match newest_block {
+            BlockNumberOrTag::Number(n) => n,
+            // Every other tag names the newest closed block: the chain
+            // has no finality distinction the ingress can see.
+            _ => history.latest(),
+        };
+        history
+            .query(
+                block_count.to::<u64>(),
+                newest,
+                reward_percentiles.as_deref().unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned::<()>(
+                    -32000,
+                    format!("block {newest} is not in the fee history"),
+                    None,
+                )
+            })
+    }
+
+    async fn max_priority_fee_per_gas(&self) -> RpcResult<U256> {
+        Ok(U256::from(self.proxy.fee_history().suggested_tip()))
+    }
+
+    async fn gas_price(&self) -> RpcResult<U256> {
+        let history = self.proxy.fee_history();
+        Ok(U256::from(history.next_base_fee()) + U256::from(history.suggested_tip()))
     }
 }
 
@@ -329,8 +399,14 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
             ("expired".to_string(), Some(*expected_nonce))
         }
         // The deadline names a block, not a nonce, so the nonce field of
-        // this wire shape stays empty.
+        // this wire shape stays empty. The fee reasons name amounts, not
+        // a nonce, so it stays empty for them too.
         kardamom_types::TxErrorReason::PastDeadline { .. } => ("past-deadline".to_string(), None),
+        kardamom_types::TxErrorReason::FeeInvalid { .. } => ("fee-invalid".to_string(), None),
+        kardamom_types::TxErrorReason::FeeTooLow { .. } => ("fee-too-low".to_string(), None),
+        kardamom_types::TxErrorReason::InsufficientFunds { .. } => {
+            ("insufficient-funds".to_string(), None)
+        }
     }
 }
 
@@ -348,7 +424,7 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
 /// are both foreign to this crate: the orphan rule blocks `impl
 /// From<&Receipt> for TransactionReceipt` directly, but allows it for a
 /// local wrapper type.
-struct RpcReceipt(TransactionReceipt);
+struct RpcReceipt(KardamomReceipt);
 
 impl From<&kardamom_types::Receipt> for RpcReceipt {
     fn from(r: &kardamom_types::Receipt) -> Self {
@@ -398,19 +474,23 @@ impl From<&kardamom_types::Receipt> for RpcReceipt {
             // consumers is `Receipt::is_deposit()` on the native stream.
             _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
         };
-        Self(TransactionReceipt {
-            inner,
-            transaction_hash: r.tx_hash,
-            transaction_index: Some(r.transaction_index),
-            block_hash: None,
-            block_number: Some(r.block_number),
-            gas_used: r.gas_used,
-            effective_gas_price: r.effective_gas_price,
-            blob_gas_used: None,
-            blob_gas_price: None,
-            from: r.from,
-            to: r.to,
-            contract_address: r.contract_address,
+        Self(KardamomReceipt {
+            receipt: TransactionReceipt {
+                inner,
+                transaction_hash: r.tx_hash,
+                transaction_index: Some(r.transaction_index),
+                block_hash: None,
+                block_number: Some(r.block_number),
+                gas_used: r.gas_used,
+                effective_gas_price: r.effective_gas_price,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: r.from,
+                to: r.to,
+                contract_address: r.contract_address,
+            },
+            priority_fee_per_gas: U256::from(r.priority_fee_per_gas),
+            priority_fee_paid: U256::from(r.priority_fee_paid),
         })
     }
 }
