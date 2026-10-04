@@ -50,6 +50,18 @@ variable "executor_count" {
   default     = 3
 }
 
+# Priority fees, "on" or "off" (the genesis `[fees]` section). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -252,10 +264,11 @@ job "executor" {
 
       # The chain genesis comes from one source, config/genesis/dev.toml.
       # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
-      # plus the ERC-7955 factory predeploy.
+      # plus the ERC-7955 factory predeploy. With priority fees on, the
+      # fee schedule fragment follows it; the validator renders the same.
       template {
         destination = "local/genesis.toml"
-        data        = file("config/genesis/dev.toml")
+        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
       }
 
       service {

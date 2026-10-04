@@ -15,6 +15,9 @@ pub(crate) const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_ev
 /// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
 /// an explicit `Expired` error on `tx_errors`.
 pub(crate) const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+/// Envelopes the fee gate refused. Each one got a `FeeInvalid`,
+/// `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
+pub(crate) const FEE_REJECTED: &str = "kardamom_sequencer_fee_rejected_total";
 /// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
 /// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
 /// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
@@ -96,6 +99,7 @@ pub struct HotMetrics {
     pub dropped_past: metrics::Counter,
     pub evictions: metrics::Counter,
     pub expired: metrics::Counter,
+    pub fee_rejected: metrics::Counter,
     pub lookup_requests: metrics::Counter,
     pub wrong_shard: metrics::Counter,
     pub shadow_suppressed: metrics::Counter,
@@ -114,6 +118,7 @@ impl HotMetrics {
             dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
             expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
+            fee_rejected: counter!(FEE_REJECTED, "partition" => p.clone()),
             lookup_requests: counter!(NONCE_LOOKUP_REQUESTS, "partition" => p.clone()),
             wrong_shard: counter!(WRONG_SHARD_DROPPED, "partition" => p.clone()),
             shadow_suppressed: counter!(SHADOW_SUPPRESSED, "partition" => p.clone()),

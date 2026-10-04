@@ -1,6 +1,6 @@
 # Priority fees: admission at the sequencer, ordering at the sealer
 
-Status: designed, not built.
+Status: built.
 
 ## 1. Problem
 
@@ -203,11 +203,30 @@ all times by design, so a transaction never waits on an operator's price.
 1. The window's 5 ms as a cluster timer: Aeron Cluster timers are scheduled in
    milliseconds on the leader's clock and recorded in the log; the follower replays them at
    the same log position. Confirm the minimum timer resolution on the pinned version.
+
+   Answer (Aeron 1.44.0, the pinned `aeron-cluster`): the cluster clock is
+   `MillisecondClusterClock`, so a deadline is a millisecond. The consensus module serves
+   timers from a `WheelTimerService` whose default tick is 8 ms
+   (`aeron.cluster.wheel.tick.resolution`, rounded up to a power of two), so a 5 ms timer
+   fires on the first wheel tick at or after its deadline: up to 13 ms after the arm. The
+   sealer's `ClusterNode` sets the wheel tick to 1 ms (`wheelTickResolutionNs`), so the
+   hold fires within the millisecond. The expiry is a log event either way, so every
+   member flushes at the same log position.
 2. Whether `eth_feeHistory` and `eth_maxPriorityFeePerGas` on the ingress read the base
    fee history and the tips of recent blocks, so wallets price transactions as they do on
    Ethereum; the ingress has the headers and the receipts for it.
+
+   Answer: implemented. The executor's block boundary carries the block's base fee and gas
+   used, and every receipt its tip rate, so the ingress keeps a ring of the last 1024
+   closed blocks and serves `eth_feeHistory` (base fees, gas used ratios, reward
+   percentiles over the tip rates), `eth_maxPriorityFeePerGas` (the median tip of the
+   last 20 blocks; zero with no receipts, since there is no floor), and `eth_gasPrice`
+   (the next base fee plus that suggestion). The ingress holds no block headers; the
+   boundary is enough.
 3. The base fee at genesis and the gas target are chain values; the first values for
-   staging come with the chain upgrade that activates the schedule.
+   staging come with the chain upgrade that activates the schedule. The deploy's
+   `PRIORITY_FEES=on` appends `deploy/cluster/config/genesis/fees.toml` (one gwei, the
+   Anvil account #19 beneficiary) to the dev genesis; a real chain sets its own values.
 
 ## 6. Decided
 

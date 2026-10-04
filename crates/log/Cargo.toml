@@ -25,6 +25,7 @@ crossbeam-channel.workspace = true
 futures.workspace = true
 if-addrs.workspace = true
 kardamom-types.workspace = true
+metrics.workspace = true
 reqwest.workspace = true
 rkyv.workspace = true
 rusteron-archive.workspace = true

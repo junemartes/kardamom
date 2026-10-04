@@ -55,6 +55,9 @@
     - {name: ingress}
     - {name: executor, wait: false}
     - {name: state-mirror, wait: false}
+    # The notifier taps the sequencers' and the ingress's status stream
+    # and the executors' receipts; it needs none of them up to start.
+    - {name: notifier, wait: false}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -103,7 +106,7 @@
 
 - name: Wait for pipeline followers
   ansible.builtin.include_tasks: wait.yml
-  loop: [sequencer, executor, state-mirror, validator, da-watcher, monitoring]
+  loop: [sequencer, executor, state-mirror, notifier, validator, da-watcher, monitoring]
   loop_control:
     loop_var: workloads_wait_job
   when: not ansible_check_mode

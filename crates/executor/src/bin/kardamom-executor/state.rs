@@ -47,11 +47,7 @@ pub(crate) fn prepare_state(
 
     // Crash-recovery cursor. A non-genesis cursor means the node restarted
     // mid-chain. A fresh start is just a resume from the genesis cursor.
-    let start = ResumePoint {
-        block: recovery.last_committed_block,
-        record_count: recovery.last_fsynced_reader_position.as_index(),
-        l2_timestamp: recovery.last_committed_l2_timestamp,
-    };
+    let start = ResumePoint::from(&recovery);
     if start.is_resume() {
         tracing::info!(
             resume_block = start.block,

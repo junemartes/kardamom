@@ -457,6 +457,23 @@ downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
 deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
 by construction.
 
+## Notifier
+
+Off the hot path by construction: it reads `tx_status`, `tx_receipts` and
+`tx_errors` as one more multi-destination-cast subscriber, so a dead or slow
+notifier costs its own clients and nothing else. The `tx_status` publishers
+(sequencer, ingress) offer best effort and never block; a back-pressured
+frame is dropped after a bounded retry and counted
+(`kardamom_log_best_effort_dropped_total{stream_id="1018"}`). The receipt
+stream stays the truth: a client that misses a status reads the receipt.
+
+A restart loses the in-memory ring; a WebSocket client that reconnects
+replays what the new ring holds. Webhook subscriptions and their outboxes
+live on disk, so a restart resumes delivery from the persisted cursor,
+at least once. The two instances shard subscriptions by a rendezvous hash
+of the id and both store every registration; a lost instance's shard moves
+to the twin when the instance count changes.
+
 ## L1-governed upgrades (feature flags)
 
 A feature flag is turned on by an **upgrade transaction**: an L1 call to
