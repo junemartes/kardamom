@@ -169,13 +169,32 @@ pub(super) async fn assert_resumed_from_contract(
     Ok(())
 }
 
-/// The `covered_through_block=` field of the last start line.
+/// The `covered_through_block=` field of the last start line. The
+/// batcher's log colors each field name and its `=` with ANSI escapes,
+/// so the line is read without them.
 fn covered_in_last_start(logs: &str) -> Option<u64> {
-    logs.lines()
-        .rfind(|l| l.contains(START_LINE))?
+    without_ansi(logs.lines().rfind(|l| l.contains(START_LINE))?)
         .split_whitespace()
         .find_map(|field| field.strip_prefix("covered_through_block="))
         .and_then(|v| v.parse().ok())
+}
+
+/// `line` without its ANSI escape sequences (`ESC [` up to the final
+/// letter).
+fn without_ansi(line: &str) -> String {
+    line.split('\x1b')
+        .enumerate()
+        .map(|(i, part)| match i {
+            0 => part,
+            _ => part
+                .strip_prefix('[')
+                .and_then(|rest| {
+                    rest.find(|c: char| c.is_ascii_alphabetic())
+                        .map(|end| &rest[end + 1..])
+                })
+                .unwrap_or(part),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -189,5 +208,7 @@ mod tests {
             y live batcher starting last_batch_index=9 covered_through_block=45 chain_id=1\n";
         assert_eq!(covered_in_last_start(logs), Some(45));
         assert_eq!(covered_in_last_start("nothing"), None);
+        let colored = "\x1b[32m INFO\x1b[0m live batcher starting \x1b[3mlast_batch_index\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mcovered_through_block\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mchain_id\x1b[0m\x1b[2m=\x1b[0m1\n";
+        assert_eq!(covered_in_last_start(colored), Some(7));
     }
 }
