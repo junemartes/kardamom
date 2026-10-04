@@ -14,7 +14,7 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
-const JOBS: [&str; 14] = [
+const JOBS: [&str; 15] = [
     "aeron",
     "anvil",
     "cluster",
@@ -29,6 +29,7 @@ const JOBS: [&str; 14] = [
     "l1-indexer",
     "redis",
     "state-mirror",
+    "notifier",
 ];
 /// A throwaway group and port, so the probe never collides with the
 /// media driver's sockets.
@@ -54,6 +55,7 @@ const LIFECYCLE_MARKERS: &[&str] = &[
     "cluster egress silent",
     "RESYNC",
     "kardamom-state-mirror starting",
+    "kardamom-notifier starting",
     "rebuild:",
 ];
 const LIFECYCLE_EVENTS: usize = 60;

@@ -34,7 +34,7 @@ no file in the tree names its address:
 |-------|-------|------|
 | `control` | 1 | Nomad/Consul **server**, Docker registry, anvil (L1) |
 | `sequencer` | 2 | 2 lanes × 2 racing replicas (one job group per lane, `seq-<lane>`, expanded by Nomad HCL; ports `9001 + 10 * lane`) |
-| `ingress` | 2 | active/active JSON-RPC front door (:8545) |
+| `ingress` | 2 | active/active JSON-RPC front door (:8545); the notifier's status feed (:8547) |
 | `executor` | 3 | state-machine replica appliers (libmdbx state) |
 | `sealer` | 3 | **3-member Aeron Cluster (Raft)** — the Java `cluster` job: canonical ordering + archive-at-the-sealer durability folded into the Raft log |
 | `aux` | 1 | validator, da_watcher, batcher, monitoring (off the chaos blast radius) |
@@ -345,6 +345,7 @@ deploy/cluster/
     anvil.nomad.hcl         in-cluster L1 for the smoke test + da-watcher
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
+    notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one
     l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1, or the chaos-l1 shard)

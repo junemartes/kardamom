@@ -10,7 +10,7 @@ import unittest
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['ingress', 'sequencer', 'executor', 'validator', 'da-watcher', 'batcher', 'state-mirror',
-            'l1-indexer', 'da-store', 'l1-fault-proxy']
+            'l1-indexer', 'da-store', 'l1-fault-proxy', 'notifier']
 
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'ansible-playbook required')

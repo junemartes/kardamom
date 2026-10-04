@@ -4,7 +4,7 @@ An Ethereum rollup framework. The workspace is a set of Rust crates — the
 pipeline services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
 `kardamom-batcher`, `kardamom-da-watcher`) wired together over Aeron, the
 off-hot-path `kardamom-validator` (re-executes every block and fail-stops on
-divergence), shared libraries (`kardamom-types`, `kardamom-log`,
+divergence) and `kardamom-notifier` (transaction status events for clients), shared libraries (`kardamom-types`, `kardamom-log`,
 `kardamom-state`, `kardamom-obs`, `kardamom-engine` — the execution core shared
 by executor and validator — `kardamom-cluster-adapter`,
 `kardamom-cluster-client`), and tooling (`deployer`, `bench`, the `e2e` test

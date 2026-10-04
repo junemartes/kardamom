@@ -295,7 +295,7 @@ fn parked_entry_expires_at_ttl() {
             .is_empty(),
         "nothing expires before the deadline"
     );
-    assert_eq!(st.sweep_expired(t0 + TTL, 256), vec![(s(1), 5)]);
+    assert_eq!(st.sweep_expired(t0 + TTL, 256), vec![(s(1), 5, 55)]);
     assert!(
         st.sweep_expired(t0 + TTL, 256).is_empty(),
         "an expiry is reported once"
@@ -362,7 +362,7 @@ fn a_replaced_entry_takes_the_new_deadline() {
         NonceOutcome::BufferedReplaced
     );
     assert!(st.sweep_expired(t0 + TTL, 256).is_empty());
-    assert_eq!(st.sweep_expired(t0 + TTL + later, 256), vec![(s(1), 5)]);
+    assert_eq!(st.sweep_expired(t0 + TTL + later, 256), vec![(s(1), 5, 56)]);
 }
 
 #[test]

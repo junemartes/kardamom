@@ -28,7 +28,8 @@ use e2e::harness::services::{IngressOptions, ParkTimeout};
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
     account_layer, bridge, consistency, crash_recovery, da_parity, derivation, divergence,
-    nonce_gap, nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart, upgrade,
+    nonce_gap, nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart, tx_status,
+    upgrade,
 };
 
 /// The two pending-receipt park bounds every tuned-park test in this

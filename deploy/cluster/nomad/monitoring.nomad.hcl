@@ -85,11 +85,14 @@ locals {
       - job_name: kardamom-l1-indexer
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-l1-indexer-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      - job_name: kardamom-notifier
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-notifier-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
-    "kardamom-validator", "kardamom-state-mirror",
+    "kardamom-validator", "kardamom-state-mirror", "kardamom-notifier",
   ]
 }
 

@@ -158,6 +158,13 @@ contract_mirrors:
     required:
       - .consul:{{ ports.redis_sentinel }}
     forbidden: []
+  - path: deploy/cluster/nomad/notifier.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-notifier:{{ image_tag }}'
+      - static = {{ ports.notifier_feed }}
+      - static = {{ ports.notifier_metrics }}
+      - --log-config
+    forbidden: []
   - path: deploy/cluster/nomad/redis.nomad.hcl
     required:
       - static = {{ ports.redis_sentinel }}

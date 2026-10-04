@@ -18,6 +18,7 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
 | `kardamom-validator` | `127.0.0.1:9007` | — (no dashboard yet) |
+| `kardamom-notifier` | `127.0.0.1:9008` | `kardamom-notifier` |
 
 The validator's default is `9007` precisely because `9006` is the ingress
 default: running both locally with defaults used to race for one socket (the

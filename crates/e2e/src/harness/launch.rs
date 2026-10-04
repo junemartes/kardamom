@@ -338,9 +338,14 @@ impl LocalStack {
             None => None,
         };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
+        let notifier = cfg
+            .notifier
+            .then(|| services::spawn_notifier(&spec))
+            .transpose()?;
 
         let load_sampler = LoadSampler::start(root.path().join("host-load.log"));
         let stack = Self {
+            notifier,
             ingress,
             da_watcher,
             verified_l1: wirings.verified_l1,
@@ -386,6 +391,11 @@ impl LocalStack {
                 self.da_watcher
                     .as_ref()
                     .map(|w| ("da-watcher".to_string(), w.metrics_addr)),
+            )
+            .chain(
+                self.notifier
+                    .as_ref()
+                    .map(|n| ("notifier".to_string(), n.service.metrics_addr)),
             )
             .chain(
                 self.sequencers

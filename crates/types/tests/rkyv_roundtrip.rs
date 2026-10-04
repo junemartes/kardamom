@@ -177,6 +177,32 @@ fn tx_error_roundtrip() {
 }
 
 #[test]
+fn tx_status_roundtrip_every_stage() {
+    let hash = B256::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let error = TxError {
+        sender,
+        nonce: 9,
+        reason: TxErrorReason::Expired { expected_nonce: 8 },
+    };
+    let receipt = Receipt {
+        tx_hash: hash,
+        from: sender,
+        nonce: 9,
+        status: true,
+        ..Receipt::default()
+    };
+    for status in [
+        TxStatus::offered(hash, sender, 9),
+        TxStatus::sealed(hash),
+        TxStatus::executed(&receipt),
+        TxStatus::rejected(hash, &error),
+    ] {
+        assert_eq!(roundtrip(&status), status);
+    }
+}
+
+#[test]
 fn deposit_roundtrip_call() {
     let d = Deposit {
         source_hash: B256::repeat_byte(0xAA),
