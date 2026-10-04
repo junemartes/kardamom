@@ -511,7 +511,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         flush: Duration::from_millis(args.flush_ms.get()),
         idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
         target_payload_bytes: args.target_payload_bytes,
-        skip_through_block: resume.next_block.saturating_sub(1),
+        skip_through_block: resume.skip_through(l1.skip_through_block),
     };
     let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg, spool, restored).run());
     let feed_result = tokio::select! {

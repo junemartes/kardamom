@@ -27,6 +27,17 @@ pub struct BatchCursor {
 }
 
 impl BatchCursor {
+    /// The last block the feed drops without posting, when the reader
+    /// resumes at this cursor and L1 covers through `l1_covered`. A
+    /// cursor file can trail L1: a post confirms on L1, and the batcher
+    /// stops before it writes the cursor (a lost receipt, a kill). The
+    /// replay then sees blocks L1 already holds, and a second post of
+    /// them overlaps the record.
+    #[must_use]
+    pub fn skip_through(self, l1_covered: u64) -> u64 {
+        self.next_block.saturating_sub(1).max(l1_covered)
+    }
+
     /// A fresh consumer: no records seen, the first boundary is block 1,
     /// and nothing is posted (`lastBatchIndex` starts at 0 on-chain; batch
     /// indices start at 1).
@@ -349,6 +360,18 @@ mod tests {
         c.store(&path).unwrap();
         assert_eq!(BatchCursor::load(&path).unwrap(), Some(c));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_feed_skips_what_l1_covers_when_the_cursor_trails() {
+        let trailing = BatchCursor {
+            next_index: 43_773,
+            next_block: 660,
+            last_batch_index: 207,
+        };
+        assert_eq!(trailing.skip_through(662), 662);
+        assert_eq!(trailing.skip_through(600), 659);
+        assert_eq!(BatchCursor::genesis().skip_through(0), 0);
     }
 
     #[test]
