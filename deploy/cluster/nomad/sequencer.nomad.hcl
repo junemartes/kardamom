@@ -4,6 +4,15 @@ variable "image_ref" {
   type    = string
   default = ""
 }
+# The Nomad node pool of the job. An elastic pool registers its nodes in
+# a pool of its own (roles/nomad: node_pool); the workloads role passes
+# the pool id (workloads_node_pools). The default pool holds the fixed
+# servers.
+variable "node_pool" {
+  type    = string
+  default = "default"
+}
+
 variable "datacenter" {
   type    = string
   default = "dc1"
@@ -20,9 +29,27 @@ variable "executor_query_port" {
   type    = number
   default = 9024
 }
+# Priority fees, "on" or "off" (`[fees] priority`, through KARDAMOM_PRIORITY_FEES). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "metrics_base" {
   type    = number
   default = 9001
+}
+# Canary allocations per lane deployment: 0 or 1. A canary needs a spare
+# sequencer-class node; a profile without one keeps 0.
+variable "canary" {
+  type    = number
+  default = 0
 }
 variable "shard_table" {
   type        = list(number)
@@ -70,6 +97,7 @@ locals {
 job "sequencer" {
   datacenters = [var.datacenter]
   type        = "service"
+  node_pool   = var.node_pool
   constraint {
     attribute = "${meta.role}"
     value     = "sequencer"
@@ -98,17 +126,41 @@ job "sequencer" {
         unlimited      = true
       }
 
+      # One replica of a lane at a time, healthy by its /ready check:
+      # the lane left its startup resync and the cluster egress is
+      # attached. The twin keeps the lane publishing meanwhile. A
+      # failed instance reverts the job: a sequencer holds no state.
       update {
-        max_parallel     = 1
-        health_check     = "task_states"
-        min_healthy_time = "10s"
-        healthy_deadline = "2m"
-        auto_revert      = false
+        max_parallel      = 1
+        canary            = var.canary
+        auto_promote      = false
+        auto_revert       = true
+        health_check      = "checks"
+        min_healthy_time  = "15s"
+        healthy_deadline  = "3m"
+        progress_deadline = "10m"
       }
 
       network {
         mode = "host"
         port "egress" {}
+        # The exporter, one port per lane, so two lanes share a node.
+        port "metrics" {
+          static = var.metrics_base + 10 * parseint(group.key, 10)
+        }
+      }
+
+      service {
+        name     = "kardamom-sequencer"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics", "lane-${group.key}"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       dynamic "task" {
@@ -146,6 +198,7 @@ job "sequencer" {
           env {
             KARDAMOM_METRICS_ADDR = "0.0.0.0:${var.metrics_base + 10 * parseint(group.key, 10)}"
             KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-${group.key}"
+            KARDAMOM_PRIORITY_FEES = var.priority_fees == "on" ? "true" : "false"
           }
 
           template {

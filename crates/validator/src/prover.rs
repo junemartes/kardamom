@@ -297,6 +297,7 @@ fn assemble_prover_input(parts: ProverInputParts<'_>) -> Result<ProverInput, Exe
             l2_timestamp: env.l2_timestamp,
             l1_origin: 0,
         },
+        fees: env.fees,
         witness,
         proofs,
         records: wire_records(records)?,

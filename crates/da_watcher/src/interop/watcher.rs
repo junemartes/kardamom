@@ -402,6 +402,7 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropWatcher<S, P> {
 
     /// Count one pass under its outcome label.
     fn record_tick(&self, outcome: &'static str) {
+        kardamom_obs::ready::mark_now(metrics::LAST_TICK_UNIX_SECONDS);
         ::metrics::counter!(
             metrics::REMOTE_WATCHER_TICK_TOTAL,
             "origin" => self.origin_label.clone(),

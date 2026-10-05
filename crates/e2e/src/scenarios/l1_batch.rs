@@ -30,7 +30,7 @@ const COVERAGE_SLACK_BLOCKS: f64 = 60.0;
 /// # Errors
 /// Returns an error when the L1 RPC connection fails, when
 /// `lastBatchIndex` does not advance by 2 within 120s, when the posted
-/// batch history is not dense or has a gap, overlap, or empty blob set,
+/// batch history is not dense or has a gap, overlap, or empty certificate,
 /// or when L1 coverage lags the executor's head beyond the slack budget.
 pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -101,8 +101,8 @@ pub async fn l1_batch(t: &Target, l1_rpc: &str, settlement: Address) -> Result<(
             d.l2_block_end
         );
         ensure!(
-            !d.versioned_hashes.is_empty(),
-            "batch {} carries no blobs",
+            !d.da_cert.is_empty(),
+            "batch {} carries no DA certificate",
             d.index
         );
         expect_start = d

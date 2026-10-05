@@ -29,14 +29,16 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InsertOutcome {
+pub(crate) enum InsertOutcome<T> {
     Inserted,
     Replaced,
     /// The buffer was full. The furthest-future buffered nonce
     /// (`evicted_nonce`) was dropped to make room for this lower nonce,
-    /// to keep the drainable run.
+    /// to keep the drainable run. `evicted` is its value, so the caller
+    /// can tell its client.
     EvictedFuture {
         evicted_nonce: u64,
+        evicted: T,
     },
     /// The buffer was full, and this nonce was itself the furthest in the
     /// future. It was rejected, not buffered, so the lower drainable run is
@@ -98,7 +100,7 @@ impl<T> PendingBuffer<T> {
     /// Buffer a fresh future-nonce entry. The entry expires at `deadline`
     /// unless the gap below it fills first. An insert at an existing
     /// nonce replaces the value and the deadline.
-    pub(crate) fn insert(&mut self, nonce: u64, value: T, deadline: Instant) -> InsertOutcome {
+    pub(crate) fn insert(&mut self, nonce: u64, value: T, deadline: Instant) -> InsertOutcome<T> {
         let Some(capacity) = self.capacity else {
             return InsertOutcome::DroppedBufferDisabled;
         };
@@ -106,25 +108,29 @@ impl<T> PendingBuffer<T> {
             deadline: Some(deadline),
             value,
         };
-        // `Some(max)` means `nonce` is not already buffered, the buffer
-        // is full, and `max` is its highest buffered nonce: the capacity
-        // check itself yields the key it proves exists, so there is no
+        // `Some(entry)` means `nonce` is not already buffered, the buffer
+        // is full, and `entry` is its highest buffered nonce: the capacity
+        // check itself yields the entry it proves exists, so there is no
         // second, fallible lookup.
         let full_max = (!self.inner.contains_key(&nonce) && self.inner.len() >= capacity.get())
-            .then(|| self.inner.keys().next_back().copied())
+            .then(|| self.inner.last_entry())
             .flatten();
-        if let Some(max) = full_max {
+        if let Some(max_entry) = full_max {
             // The buffer is full. Keep the lowest `capacity` nonces (the
             // drainable run). The furthest-future nonce loses: either an
             // already-buffered max, or this incoming nonce if it is the
             // new max.
+            let max = *max_entry.key();
             if nonce > max {
                 // The incoming nonce is the furthest future. Reject it, and keep the run.
                 return InsertOutcome::RejectedTooFar { nonce };
             }
-            self.inner.remove(&max);
+            let evicted = max_entry.remove().value;
             self.inner.insert(nonce, slot);
-            return InsertOutcome::EvictedFuture { evicted_nonce: max };
+            return InsertOutcome::EvictedFuture {
+                evicted_nonce: max,
+                evicted,
+            };
         }
         match self.inner.entry(nonce) {
             Entry::Occupied(mut e) => {
@@ -272,7 +278,13 @@ mod tests {
         assert!(matches!(b.insert(12, 2, far()), InsertOutcome::Inserted));
         let r = b.insert(11, 3, far());
         assert!(
-            matches!(r, InsertOutcome::EvictedFuture { evicted_nonce: 12 }),
+            matches!(
+                r,
+                InsertOutcome::EvictedFuture {
+                    evicted_nonce: 12,
+                    evicted: 2
+                }
+            ),
             "got {r:?}"
         );
         assert!(b.contains(10));

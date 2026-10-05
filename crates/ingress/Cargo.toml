@@ -54,6 +54,8 @@ tokio.workspace = true
 tokio-util = { workspace = true }
 toml.workspace = true
 tower = { version = "0.5", features = ["util"] }
+# `Either` and `Ready`: the health route's future beside the RPC server's.
+futures.workspace = true
 tracing.workspace = true
 
 [[bin]]

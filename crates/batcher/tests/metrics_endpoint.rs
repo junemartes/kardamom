@@ -17,7 +17,7 @@ async fn batcher_metrics_endpoint_serves_expected_counters() {
 
     metrics::counter!(metric_names::BLOCKS_OBSERVED).increment(0);
     metrics::counter!(metric_names::BATCHES_POSTED).increment(0);
-    metrics::counter!(metric_names::BLOBS_POSTED).increment(0);
+    metrics::counter!(metric_names::PAYLOAD_BYTES_POSTED).increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;
     assert!(
@@ -29,8 +29,8 @@ async fn batcher_metrics_endpoint_serves_expected_counters() {
         "missing batches_posted counter; got:\n{body}"
     );
     assert!(
-        body.contains(metric_names::BLOBS_POSTED),
-        "missing blobs_posted counter; got:\n{body}"
+        body.contains(metric_names::PAYLOAD_BYTES_POSTED),
+        "missing payload_bytes_posted counter; got:\n{body}"
     );
     assert!(
         body.contains("service=\"batcher\""),

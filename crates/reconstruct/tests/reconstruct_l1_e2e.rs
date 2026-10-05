@@ -1,8 +1,8 @@
 //! Full DA round trip against a real L1 (anvil): deploy
-//! `KardamomL2Settlement`, post batches as real EIP-4844 blob transactions
-//! (blobs recorded in a DA store), then discard the original blocks, read
-//! the `BatchPosted` event log back, fetch the blobs from the DA store by
-//! the versioned hashes L1 committed to, decode and re-execute them, and
+//! `KardamomL2Settlement`, disperse batches through a fake EigenDA proxy
+//! and post their certificates, then discard the original blocks, read
+//! the `BatchPosted` event log back, fetch the payloads from the proxy by
+//! the certificates L1 committed to, decode and re-execute them, and
 //! check that the reconstructed state root equals the canonical
 //! (directly-executed) root.
 //!
@@ -19,13 +19,14 @@ use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_batcher::batch::ClosedBlock;
 use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
-use kardamom_batcher::da_store::FsBlobStore;
+use kardamom_batcher::da::DaProxy;
 use kardamom_batcher::l1::{post_batch, read_posted_batches, recover_blocks};
+use kardamom_batcher::testkit_da::FakeDaProxy;
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_engine::{ReplayBlock, replay_blocks};
 use kardamom_reconstruct::reconstruct_state;
-use kardamom_reconstruct::test_support::{CHAIN_ID as L2_CHAIN_ID, genesis, two_transfer_blocks};
+use kardamom_reconstruct::test_support::{genesis, test_genesis, two_transfer_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
@@ -43,7 +44,8 @@ async fn setup_l1_settlement() -> Option<(AnvilInstance, Address, PrivateKeySign
         return None;
     };
 
-    // The batcher EOA is a real funded anvil key so it can sign 4844 txs.
+    // The batcher EOA is a real funded anvil key so it can sign the
+    // `postBatch` txs.
     let batcher_signer: PrivateKeySigner = anvil.keys()[1].clone().into();
     let batcher_addr = batcher_signer.address();
 
@@ -95,29 +97,30 @@ async fn setup_l1_settlement() -> Option<(AnvilInstance, Address, PrivateKeySign
     Some((anvil, settlement, batcher_signer))
 }
 
-/// Post both blocks as real 4844 blob txs (one batch each) to `settlement`,
-/// then rebuild the frames purely from the on-chain event log and the DA
-/// store: read `BatchPosted`, fetch blobs by the versioned hashes L1
-/// committed to, and decode.
+/// Post both blocks (one batch each) to `settlement` through the fake
+/// proxy `fake`, then rebuild the frames purely from the on-chain event
+/// log and the proxy: read `BatchPosted`, fetch the payloads by the
+/// certificates L1 committed to, and decode.
 async fn post_and_recover_frames(
     post_provider: &impl Provider,
     settlement: Address,
+    fake: &FakeDaProxy,
     blocks: [ClosedBlock; 2],
 ) -> Vec<kardamom_batcher::BlockFrame> {
-    let da_dir = tempfile::tempdir().unwrap();
-    let da_store = FsBlobStore::open(da_dir.path()).unwrap();
+    let da = DaProxy::new(fake.url()).unwrap();
     let cfg = BatcherConfig::default();
     let mut prev_index = 0u64;
     for block in blocks {
         let batch = pack_blocks(&cfg, &[block]).unwrap();
-        prev_index = post_batch(post_provider, settlement, prev_index, &batch, &da_store)
+        prev_index = post_batch(post_provider, settlement, prev_index, &batch, &da)
             .await
             .expect("post batch to L1");
     }
     assert_eq!(prev_index, 2, "two batches posted");
-    assert!(
-        da_store.len().unwrap() >= 2,
-        "DA store holds the posted blobs"
+    assert_eq!(
+        fake.stored().len(),
+        2,
+        "the proxy holds the posted payloads"
     );
 
     let descriptors = read_posted_batches(post_provider, settlement, 0)
@@ -127,7 +130,7 @@ async fn post_and_recover_frames(
     assert_eq!(descriptors[0].index, 1);
     assert_eq!(descriptors[1].index, 2);
 
-    let frames = recover_blocks(&descriptors, &da_store).unwrap();
+    let frames = recover_blocks(&descriptors, &da).unwrap();
     assert_eq!(frames.len(), 2);
     frames
 }
@@ -142,7 +145,7 @@ fn assert_recovered_matches_oracle(
 ) {
     let recon_dir = tempfile::tempdir().unwrap();
     let recovered =
-        reconstruct_state(recon_dir.path(), L2_CHAIN_ID, &genesis(from), &[], frames).unwrap();
+        reconstruct_state(recon_dir.path(), &test_genesis(&genesis(from), &[]), frames).unwrap();
 
     let oracle_dir = tempfile::tempdir().unwrap();
     let oracle_env = StateEnvBuilder::new(oracle_dir.path())
@@ -165,8 +168,12 @@ fn assert_recovered_matches_oracle(
             txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
     ];
-    let oracle =
-        replay_blocks(oracle_env, L2_CHAIN_ID, &genesis(from), &[], oracle_blocks).unwrap();
+    let oracle = replay_blocks(
+        oracle_env,
+        &test_genesis(&genesis(from), &[]),
+        oracle_blocks,
+    )
+    .unwrap();
 
     assert_eq!(recovered.head_block, 2);
     assert_eq!(recovered.txs_applied, 3);
@@ -183,18 +190,22 @@ fn assert_recovered_matches_oracle(
 
 /// The rebuild-from-L1 scenario, sequenced from its four steps: deploy
 /// the settlement contract on a real L1 ([`setup_l1_settlement`]), build
-/// two blocks of transfers ([`two_transfer_blocks`]), post them as blob
-/// txs and recover the frames purely from L1 ([`post_and_recover_frames`]),
-/// then check the recovered root against the directly-executed one
-/// ([`assert_recovered_matches_oracle`]).
-#[tokio::test]
+/// two blocks of transfers ([`two_transfer_blocks`]), post them through
+/// the fake proxy and recover the frames purely from L1 and the proxy
+/// ([`post_and_recover_frames`]), then check the recovered root against
+/// the directly-executed one ([`assert_recovered_matches_oracle`]).
+///
+/// The proxy client blocks in place on the read path, so the runtime is
+/// multi-thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rebuild_from_l1_reconstructs_canonical_state_root() {
     let Some((anvil, settlement, batcher_signer)) = setup_l1_settlement().await else {
         return;
     };
+    let fake = FakeDaProxy::start();
 
-    // Posting provider: wallet-filled with the batcher key (fills nonce,
-    // gas, and blob fields).
+    // Posting provider: wallet-filled with the batcher key (fills nonce
+    // and gas).
     let post_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(batcher_signer))
         .connect_http(anvil.endpoint_url());
@@ -205,8 +216,13 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
     let to2 = address!("00000000000000000000000000000000000D0002");
     let (block1, block2) = two_transfer_blocks(&user, to1, to2);
 
-    let frames =
-        post_and_recover_frames(&post_provider, settlement, [block1.clone(), block2.clone()]).await;
+    let frames = post_and_recover_frames(
+        &post_provider,
+        settlement,
+        &fake,
+        [block1.clone(), block2.clone()],
+    )
+    .await;
 
     assert_recovered_matches_oracle(from, &frames, &block1, &block2);
 }

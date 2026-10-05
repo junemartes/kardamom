@@ -14,8 +14,8 @@ use kardamom_types::{AccountChange, TxEnvelope};
 use kardamom_bench::stm::BlockAt;
 
 use super::common::{
-    BlockOutputs, BlockRecs, EngineOpts, FeedPayload, FlowRecs, SettleJob, StatsExt, Workload,
-    assert_identical, open_mdbx_env, records,
+    BlockOutputs, BlockRecs, EngineOpts, FeedPayload, FlowRecs, NO_SINK, SettleJob, StatsExt,
+    Workload, assert_identical, open_mdbx_env, records,
 };
 use super::drive::{DriveParams, DriveState, MvChannels};
 
@@ -163,7 +163,7 @@ fn prepare_feed_payloads(
             b.recs
                 .iter()
                 .map(|(t, p, en)| {
-                    let prepared = kardamom_stm::execute::Prepared::new(en, *t, stats_b);
+                    let prepared = kardamom_stm::execute::Prepared::new(en, *t, stats_b, NO_SINK);
                     kardamom_stm::execute::PreparedTx {
                         tx_idx: *t,
                         position: *p,

@@ -64,6 +64,7 @@ fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxE
             gas_limit: 100_000,
             calldata_len: CALLDATA_BYTES,
             real_hash: true,
+            ..Default::default()
         },
     )
 }
@@ -114,11 +115,19 @@ fn sequencer_core_loop_allocation_profile() {
         warmup_total,
         "warmup must publish exactly one ref per envelope"
     );
-    // Pre-reserve the fake publisher's ref vector. This stops its growth
+    // Pre-reserve the fake publisher's offer vector. This stops its growth
     // doubling from affecting the measured counts. The real publisher holds
     // no such vector.
     rig.refs
-        .refs
+        .offers
+        .lock()
+        .unwrap()
+        .reserve(measured_total as usize + 16);
+    // The same for the fake side publisher's status vector: one `Offered`
+    // status per published ref. The real publisher encodes a frame
+    // instead, which `tx_status` costs on its own side channel.
+    rig.errors
+        .statuses
         .lock()
         .unwrap()
         .reserve(measured_total as usize + 16);

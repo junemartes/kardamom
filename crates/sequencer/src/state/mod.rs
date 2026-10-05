@@ -20,15 +20,16 @@ pub(crate) enum ProcessAction<T> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum NonceOutcome {
+pub(crate) enum NonceOutcome<T> {
     Matched,
     Buffered,
     /// This nonce was buffered. A further-future nonce (`evicted_nonce`)
     /// was dropped to make room, to keep the drainable low run. The
     /// dropped transaction is far in the future, and the client resubmits
-    /// it before it is needed.
+    /// it before it is needed. `evicted` is its payload.
     BufferedEvicting {
         evicted_nonce: u64,
+        evicted: T,
     },
     /// This nonce was itself the furthest in the future, and the buffer
     /// was full. So it was rejected, not buffered, to protect the
@@ -44,7 +45,7 @@ pub(crate) enum NonceOutcome {
 #[derive(Debug)]
 pub(crate) struct ProcessResult<T> {
     pub actions: Vec<ProcessAction<T>>,
-    pub outcome: NonceOutcome,
+    pub outcome: NonceOutcome<T>,
 }
 
 /// One parked entry's expiry, as the deadline heap orders it: earliest
@@ -174,7 +175,7 @@ impl<T> PartitionState<T> {
     /// Park a future nonce with a deadline of `now + tx_ttl`. A parked
     /// entry (inserted, replaced, or inserted with an eviction) also goes
     /// on the deadline heap; a rejected one does not.
-    fn park(&mut self, now: Instant, sender: Address, nonce: u64, payload: T) -> NonceOutcome {
+    fn park(&mut self, now: Instant, sender: Address, nonce: u64, payload: T) -> NonceOutcome<T> {
         let deadline = now + self.tx_ttl;
         let buf = self
             .pending
@@ -183,9 +184,16 @@ impl<T> PartitionState<T> {
         let (outcome, parked) = match buf.insert(nonce, payload, deadline) {
             InsertOutcome::Inserted => (NonceOutcome::Buffered, true),
             InsertOutcome::Replaced => (NonceOutcome::BufferedReplaced, true),
-            InsertOutcome::EvictedFuture { evicted_nonce } => {
-                (NonceOutcome::BufferedEvicting { evicted_nonce }, true)
-            }
+            InsertOutcome::EvictedFuture {
+                evicted_nonce,
+                evicted,
+            } => (
+                NonceOutcome::BufferedEvicting {
+                    evicted_nonce,
+                    evicted,
+                },
+                true,
+            ),
             InsertOutcome::RejectedTooFar { nonce } => {
                 (NonceOutcome::RejectedTooFar { nonce }, false)
             }
@@ -266,8 +274,8 @@ impl<T> PartitionState<T> {
     }
 
     /// Expire the parked entries whose deadline is at or before `now`.
-    /// Returns `(sender, nonce)` for each expired entry, at most `max` per
-    /// call. The cost is proportional to the popped heap entries, not to
+    /// Returns `(sender, nonce, payload)` for each expired entry, at most
+    /// `max` per call. The cost is proportional to the popped heap entries, not to
     /// the senders.
     ///
     /// Only an entry above the sender's expected nonce can expire. Such an
@@ -275,7 +283,7 @@ impl<T> PartitionState<T> {
     /// is drainable, or was rewound for a retry, and the state machine
     /// owns its fate. A popped deadline that no longer matches the slot is
     /// stale (see [`PendingBuffer::expire`]), and it expires nothing.
-    pub(crate) fn sweep_expired(&mut self, now: Instant, max: usize) -> Vec<(Address, u64)> {
+    pub(crate) fn sweep_expired(&mut self, now: Instant, max: usize) -> Vec<(Address, u64, T)> {
         std::iter::from_fn(|| self.pop_due(now).map(|d| self.expire_parked(d)))
             .flatten()
             .take(max)
@@ -293,14 +301,14 @@ impl<T> PartitionState<T> {
 
     /// Expire one popped heap entry, if it still names a live parked
     /// entry above the sender's expected nonce.
-    fn expire_parked(&mut self, d: ParkedDeadline) -> Option<(Address, u64)> {
+    fn expire_parked(&mut self, d: ParkedDeadline) -> Option<(Address, u64, T)> {
         if d.nonce <= self.next_nonce(d.sender) {
             return None;
         }
         self.pending
             .get_mut(&d.sender)?
             .expire(d.nonce, d.at)
-            .map(|_| (d.sender, d.nonce))
+            .map(|payload| (d.sender, d.nonce, payload))
     }
 
     /// The number of parked entries in the pending buffers of every
