@@ -14,7 +14,7 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
-const JOBS: [&str; 13] = [
+const JOBS: [&str; 16] = [
     "aeron",
     "anvil",
     "cluster",
@@ -25,9 +25,12 @@ const JOBS: [&str; 13] = [
     "ingress",
     "batcher",
     "da-watcher",
+    "l1-fault-proxy",
+    "l1-indexer",
     "redis",
     "state-mirror",
     "notifier",
+    "monitoring",
 ];
 /// A throwaway group and port, so the probe never collides with the
 /// media driver's sockets.

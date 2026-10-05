@@ -2,6 +2,7 @@
 //! assertions; the harness provides the load, the injection gate, and
 //! the common tail.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::accounts::Pin;
@@ -17,6 +18,7 @@ pub(crate) mod coordinated;
 pub(crate) mod da_lag;
 pub(crate) mod deploy;
 pub(crate) mod fleet;
+pub(crate) mod l1;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
@@ -67,9 +69,13 @@ pub enum Case {
     MirrorKillRebuild,
     DaLagHalt,
     PruneFloor,
+    L1Liar,
+    L1NullReceipts,
+    TwoDayOutage,
+    BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 42] = [
+const ALL: [Case; 46] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -112,6 +118,10 @@ const ALL: [Case; 42] = [
     Case::MirrorKillRebuild,
     Case::DaLagHalt,
     Case::PruneFloor,
+    Case::L1Liar,
+    Case::L1NullReceipts,
+    Case::TwoDayOutage,
+    Case::BatcherOutagePastRetention,
 ];
 
 impl Case {
@@ -173,6 +183,24 @@ impl Case {
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
             Self::DaLagHalt => "da-lag-halt",
             Self::PruneFloor => "prune-floor",
+            Self::L1Liar => "l1-liar",
+            Self::L1NullReceipts => "l1-null-receipts",
+            Self::TwoDayOutage => "two-day-outage",
+            Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
+        }
+    }
+
+    /// The case load's rate. The L1 cases run below the steady rate: a
+    /// fault that stops the batcher must not push its cursor past the
+    /// small egress retention their shard deploys.
+    #[must_use]
+    pub fn tps(self, k: &Knobs) -> NonZeroU32 {
+        match self {
+            Self::L1Liar
+            | Self::L1NullReceipts
+            | Self::TwoDayOutage
+            | Self::BatcherOutagePastRetention => k.l1_tps,
+            _ => k.tps,
         }
     }
 
@@ -228,6 +256,23 @@ impl Case {
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
+            }
+            // Three faults, each with its halt and resume waits.
+            Self::L1Liar => inject + (k.l1_fault + Duration::from_mins(3)) * 3,
+            // One fault, a batcher restart inside it, and the posts after.
+            Self::L1NullReceipts => inject + k.l1_fault + k.restart_slo + Duration::from_mins(3),
+            // The liar, two restarts, the floor passing, and the resume.
+            Self::TwoDayOutage => {
+                inject
+                    + k.l1_fault
+                    + k.restart_slo * 2
+                    + k.retention_freeze_cap
+                    + Duration::from_mins(5)
+            }
+            // The freeze until the floor passes, the restart, and the
+            // rebuild of the gap after it.
+            Self::BatcherOutagePastRetention => {
+                inject + k.retention_freeze_cap + k.restart_slo + Duration::from_mins(8)
             }
             _ => Duration::ZERO,
         };
@@ -322,6 +367,10 @@ impl Case {
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
             Self::DaLagHalt => da_lag::da_lag_halt(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
+            Self::L1Liar => l1::liar(h).await,
+            Self::L1NullReceipts => l1::null_receipts(h).await,
+            Self::TwoDayOutage => l1::two_day_outage(h).await,
+            Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
         }
     }
 }
@@ -341,6 +390,7 @@ mod tests {
             crate::Shard::Coordinated,
             crate::Shard::Retention,
             crate::Shard::Cache,
+            crate::Shard::L1,
         ] {
             shard
                 .cases()

@@ -15,6 +15,7 @@ use alloy_transport::layers::FallbackLayer;
 use alloy_transport_http::Http;
 use anyhow::{Context, Result, bail};
 use kardamom_obs::halt::{self, Clears, Halt, HaltCause};
+use metrics::gauge;
 use tokio::sync::mpsc::Receiver;
 use tower::Layer;
 use tracing::{info, warn};
@@ -31,21 +32,22 @@ use kardamom_log::discovery::StreamPlane;
 
 use crate::da::DaProxy;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile, resume_from_indexer};
+use super::cursor::{BatchCursor, L1Truth, reconcile};
+use super::feed::{FeedConfig, FeedLoop};
+use super::live_metric_names;
+use super::post_age::PostAge;
 use super::rebuild::{ArchiveRebuilder, Rebuilder};
 use super::refs_store::RefsStore;
-use super::spool::{Restored, Spool};
-use crate::indexer::IndexerClient;
-
-/// How a start waits for the indexer to reach the last posted batch: the
-/// indexer follows the finalized L1, about 13 minutes behind the head on
-/// Ethereum, and a batch posted just before the start is not there yet.
-const INDEXER_POLL: Duration = Duration::from_secs(12);
-const INDEXER_POLLS: u32 = 100;
 use super::events::EventsBeacon;
-use super::feed::{FeedConfig, FeedLoop};
 use super::posted_cursor::PostedCursor;
 use super::sender::{LiveSender, PostExhausted};
+use super::spool::{Restored, Spool};
+
+/// How often the post-age probe asks L1 for the last `BatchPosted` log.
+/// Its own cadence, apart from the feed loop's tick: one log query and
+/// one block read per probe, which a public endpoint tolerates at this
+/// rate and not at the feed's one-second tick.
+const POST_AGE_EVERY: Duration = Duration::from_secs(10);
 
 /// How long an `l1_unreachable` halt waits before the batcher starts
 /// again: long enough for a rate limit to lift, short enough that a post
@@ -93,7 +95,7 @@ const SEQUENTIAL_METHODS: &[&str] = &[
 /// # Errors
 /// Returns an error when the key does not parse, when `rpcs` is empty,
 /// or when an endpoint is not a URL.
-pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + 'static> {
+pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + Clone + 'static> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
     let transports = rpcs
         .iter()
@@ -151,13 +153,13 @@ pub struct LiveArgs {
     /// See [`FeedConfig::target_payload_bytes`].
     pub target_payload_bytes: NonZeroUsize,
     pub l1_retries: u32,
-    /// The inbox indexer's API. With it, a batcher without a cursor file
-    /// resumes just past the last posted batch, and no start reads
-    /// `BatchPosted` events from L1. Without it, a missing cursor file
-    /// replays from genesis.
+    /// The inbox indexer's API. A batcher without a cursor file reads the
+    /// last posted batch's blobs from it, when it holds them; a start
+    /// never waits on it.
     pub indexer_url: Option<String>,
     /// The settlement contract's deployment block: where a `BatchPosted`
-    /// scan starts when no indexer serves it.
+    /// scan starts, for the post-age probe and for a start without a
+    /// cursor file that the indexer cannot serve.
     pub settlement_deploy_block: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
@@ -198,33 +200,20 @@ struct L1Side<P> {
 }
 
 impl LiveArgs {
-    /// Connect to L1 and reconcile the durable cursor against it. The two
-    /// failure classes are typed at this boundary, so the service holds
-    /// the right halt for each.
-    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>, StartError> {
+    /// Connect to L1 and reconcile the durable cursor against it. The L1
+    /// reads retry until L1 answers, under the `l1_unreachable` halt; the
+    /// reconcile of a cursor file that is ahead of L1 is a refusal,
+    /// decided once. The failure classes are typed at this boundary, so
+    /// the service holds the right halt for each.
+    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + Clone + 'static>, StartError> {
         let provider = connect_l1(&self.rpcs, &self.key).map_err(StartError::L1)?;
         let da = DaProxy::new(&self.da_proxy).map_err(|e| StartError::Resume(e.into()))?;
-        let indexer = self.indexer_url.as_deref().map(IndexerClient::new);
-        let l1_truth = match &indexer {
-            Some(ix) => {
-                L1Truth::read_via_indexer(
-                    &provider,
-                    self.settlement,
-                    ix,
-                    INDEXER_POLL,
-                    INDEXER_POLLS,
-                )
-                .await
-            }
-            None => read_l1_truth(&provider, self.settlement, self.settlement_deploy_block).await,
-        }
-        .map_err(StartError::L1)?;
         let loaded = BatchCursor::load(&self.cursor_file).map_err(StartError::Resume)?;
-        let (cursor, skip_through_block) = match (loaded, &indexer) {
-            (None, Some(ix)) if l1_truth.last_batch_index > 0 => resume_from_indexer(ix, l1_truth)
-                .await
-                .map_err(StartError::Resume)?,
-            (loaded, _) => reconcile(loaded, l1_truth).map_err(StartError::Resume)?,
+        let resumed = self.resume_until_l1_answers(&provider, &da, loaded).await;
+        let l1_truth = resumed.l1_truth;
+        let (cursor, skip_through_block) = match resumed.rebuilt {
+            Some(rebuilt) => rebuilt,
+            None => reconcile(loaded, l1_truth).map_err(StartError::Resume)?,
         };
         info!(
             settlement = %self.settlement,
@@ -602,6 +591,17 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
     let mut run_cfg = RunConfig::resolve(args)?;
     run_cfg.resolve_cluster_ingress().await?;
 
+    gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
+        .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
+    let age_probe = tokio::spawn(
+        PostAge::new(
+            l1.provider.clone(),
+            args.settlement,
+            args.settlement_deploy_block,
+            POST_AGE_EVERY,
+        )
+        .run(),
+    );
     let sender = LiveSender::new(
         l1.provider,
         args.settlement,
@@ -609,7 +609,6 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
         l1.l1_truth.last_batch_index,
         args.l1_retries,
         args.cursor_file.clone(),
-        args.settlement_deploy_block,
     );
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,
@@ -618,7 +617,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
         flush: Duration::from_millis(args.flush_ms.get()),
         idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
         target_payload_bytes: args.target_payload_bytes,
-        skip_through_block: resume.next_block.saturating_sub(1),
+        skip_through_block: resume.skip_through(l1.skip_through_block),
     };
     // The sealer and the ingress learn the confirmed cursor before the
     // first post: each reader stack publishes the current value first.
@@ -638,6 +637,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
         }
         served => served.into_end(),
     };
+    age_probe.abort();
     service.run_cfg.plane.shutdown().await;
     if matches!(end, RunEnd::Shutdown) {
         // The cursor is reconciled against L1 truth on every restart, so

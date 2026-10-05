@@ -14,6 +14,7 @@ pub enum Shard {
     Coordinated,
     Retention,
     Cache,
+    L1,
 }
 
 impl Shard {
@@ -29,7 +30,17 @@ impl Shard {
             Self::Coordinated => "chaos-coordinated",
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
+            Self::L1 => "chaos-l1",
         }
+    }
+
+    /// Whether every case of the shard ends with the persisted-state
+    /// stage. The L1 cases each leave a DA record a silent gap could
+    /// hide in, so each one proves the rebuild from L1 before the next.
+    /// The last case's stage is the one in the shard's tail.
+    #[must_use]
+    pub fn audits_each_case(self) -> bool {
+        matches!(self, Self::L1)
     }
 
     /// The cases of the shard, in run order. The sequencer shard runs
@@ -96,6 +107,16 @@ impl Shard {
                 "pipeline-blackout-recover",
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
+            // A lying L1 in front of the followers. The outage past the
+            // retention runs last: it holds the load until the sealers'
+            // floor passes, the longest case, and a failure there must
+            // not hide the liar cases.
+            Self::L1 => &[
+                "l1-liar",
+                "l1-null-receipts",
+                "two-day-outage",
+                "batcher-outage-past-retention",
+            ],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
                 "redis-partition-ingress",
@@ -109,19 +130,25 @@ impl Shard {
     /// The deploy-time variables the shard's cluster needs. The cluster
     /// shard deploys the sealer with a short snapshot interval so the
     /// follower-kill case sees a snapshot; the retention shard deploys a
-    /// small egress retention so a freeze can overrun it.
+    /// small egress retention so a freeze can overrun it; the L1 shard
+    /// takes both, plus the fault proxy in front of the followers.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
             Self::Cluster => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
-                cluster_retention: None,
-                da_lag_budget_blocks: None,
+                ..DeployVars::default()
             },
             Self::Retention => DeployVars {
-                cluster_snapshot_interval_s: None,
                 cluster_retention: Some(6144),
-                da_lag_budget_blocks: None,
+                ..DeployVars::default()
+            },
+            Self::L1 => DeployVars {
+                cluster_snapshot_interval_s: Some(60),
+                cluster_retention: Some(6144),
+                l1_fault_proxy: true,
+                indexer_poll_s: Some(2),
+                ..DeployVars::default()
             },
             Self::Executor
             | Self::Ingress
@@ -147,6 +174,15 @@ impl Shard {
                 ("SQUEEZE_CPUS_PER_NODE", "0.4"),
             ],
             Self::Retention => &[("RUN_LOAD", "0"), ("KARDAMOM_CLUSTER_RETENTION", "6144")],
+            // One minute per fault: every assertion holds at one minute,
+            // and four cases with their state audits must fit the job's
+            // budget.
+            Self::L1 => &[
+                ("RUN_LOAD", "0"),
+                ("KARDAMOM_CLUSTER_RETENTION", "6144"),
+                ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
+                ("L1_FAULT_S", "60"),
+            ],
             Self::Executor
             | Self::Ingress
             | Self::Sequencer
@@ -172,6 +208,7 @@ mod tests {
             Shard::Coordinated,
             Shard::Retention,
             Shard::Cache,
+            Shard::L1,
         ]
         .iter()
         .flat_map(|s| s.cases().iter().copied())
@@ -180,7 +217,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 40);
+        assert_eq!(all.len(), 44);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -194,6 +231,7 @@ mod tests {
             Shard::Coordinated,
             Shard::Retention,
             Shard::Cache,
+            Shard::L1,
         ] {
             assert!(
                 shard.env().contains(&("RUN_LOAD", "0")),
@@ -201,5 +239,11 @@ mod tests {
                 shard.name()
             );
         }
+        assert!(Shard::L1.deploy_vars().l1_fault_proxy);
+        assert!(Shard::L1.audits_each_case() && !Shard::Retention.audits_each_case());
+        assert_eq!(
+            Shard::L1.cases().last(),
+            Some(&"batcher-outage-past-retention")
+        );
     }
 }

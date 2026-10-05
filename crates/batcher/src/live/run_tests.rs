@@ -90,7 +90,6 @@ fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
         0,
         0,
         dir.path().join("cursor.json"),
-        0,
     );
     let cfg = FeedConfig {
         blocks_per_batch: NonZeroUsize::new(100).unwrap(),

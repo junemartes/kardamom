@@ -7,7 +7,81 @@
 # unverified and only a counter moves. Nothing else in the system
 # notices, and that is exactly where a targeted forgery would sit
 # (issue #163). An alert turns that counter into a signal.
+#
+# The batcher and follower rules watch the one signal an L1 outage
+# cannot hide: the age of the last post as L1 serves it. A lying
+# endpoint that swallows the settlement's logs, a batcher that cannot
+# post, and a batcher that cannot start all make it grow. The chain
+# keeps sealing through every one of them, so no L2 signal pages.
 groups:
+  - name: kardamom-batcher
+    rules:
+      - alert: KardamomBatcherLastPostStale
+        # The last BatchPosted block on L1 is older than two idle flush
+        # waits: the batcher stopped posting, or the endpoint it reads
+        # stopped serving its posts. Both are an outage of the DA record.
+        expr: kardamom_batcher_last_post_age_seconds > 2 * kardamom_batcher_idle_flush_seconds
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "no batch posted to L1 for {{ $value }}s ({{ $labels.host_id }})"
+          description: "The last BatchPosted log L1 serves is {{ $value }}s old, past twice the batcher's idle flush wait. The batcher is not posting, or its L1 endpoint hides its posts. Check the batcher log and compare a second L1 endpoint."
+
+      - alert: KardamomBatcherResumeFailures
+        # A start could not read L1: the batcher retries in-process and
+        # counts every failure. The chain keeps sealing meanwhile, so
+        # this is the only signal.
+        expr: increase(kardamom_batcher_resume_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "batcher cannot resume from L1 ({{ $labels.host_id }})"
+          description: "{{ $value }} resume attempts failed in the last 10m. The batcher cannot read the settlement contract through its L1 endpoint. No batch is posted until it can."
+
+  - name: kardamom-l1-followers
+    rules:
+      - alert: KardamomL1IndexerTickErrors
+        # Over half the indexer's ticks fail: its L1 view broke (a chain
+        # break under a finalized block) or its endpoint does not answer.
+        # The indexer reports the fault every tick until an operator
+        # looks, so the rate stays high for as long as it lasts.
+        expr: >-
+          sum by (host_id) (rate(kardamom_l1_indexer_tick_total{outcome="error"}[5m]))
+          / sum by (host_id) (rate(kardamom_l1_indexer_tick_total[5m])) > 0.5
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "inbox indexer ticks failing ({{ $labels.host_id }})"
+          description: "Over half the indexer's ticks failed for 15m. The archive stops at its cursor. Inspect the indexer log for the first failed tick."
+
+      - alert: KardamomDaWatcherTickErrors
+        # The same for the da-watcher. Its error outcomes are named by
+        # kind (chain_break, parse_error, rpc_error); every outcome but
+        # ok counts.
+        expr: >-
+          sum by (host_id) (rate(kardamom_da_watcher_tick_total{outcome!="ok"}[5m]))
+          / sum by (host_id) (rate(kardamom_da_watcher_tick_total[5m])) > 0.5
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "da-watcher ticks failing ({{ $labels.host_id }})"
+          description: "Over half the da-watcher's ticks failed for 15m. No new epoch reaches the chain. Inspect the da-watcher log for the first failed tick."
+
+      - alert: KardamomL1SourceDisagreement
+        # Two L1 sources answered differently for the same block or log.
+        # A follower halts on this; it is never resolved by majority.
+        expr: increase(kardamom_l1_source_disagreement_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "L1 sources disagree ({{ $labels.host_id }})"
+          description: "A follower saw two L1 endpoints disagree in the last 10m and halted. Both answers are in its log. Decide which endpoint lies before the follower resumes."
+
   - name: kardamom-validator
     rules:
       - alert: KardamomValidatorEpochsUnverified

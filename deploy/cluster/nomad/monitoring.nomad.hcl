@@ -178,9 +178,15 @@ job "monitoring" {
 
       # Every metric carries host_id (set through --host-id on the
       # binary), so the dashboards group by host without relabel rules.
+      # The scrape targets follow the Consul service records, so the file
+      # renders again whenever a job stops or starts. A reload keeps the
+      # server, its alert states and its API up; the default restart
+      # takes them down on every job change.
       template {
-        destination = "local/prometheus.yml"
-        data        = <<-EOT
+        destination   = "local/prometheus.yml"
+        change_mode   = "signal"
+        change_signal = "SIGHUP"
+        data          = <<-EOT
           global:
             scrape_interval: 1s
             evaluation_interval: 5s

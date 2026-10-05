@@ -107,6 +107,12 @@ pub struct Knobs {
     pub da_lag_budget_blocks: Option<NonZeroU64>,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
+    /// How long one L1 fault of the chaos-l1 cases stays active.
+    pub l1_fault: Duration,
+    /// The case load of the chaos-l1 cases, below the steady rate: a
+    /// fault that stops the batcher must not push its cursor past the
+    /// small egress retention the shard deploys.
+    pub l1_tps: NonZeroU32,
     pub squeeze: Squeeze,
     /// Whether the load stage ran on this cluster, which decides whether
     /// the resize case may take a load-reserve account.
@@ -244,6 +250,8 @@ impl Knobs {
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
+            l1_fault: env.secs("L1_FAULT_S", 60)?,
+            l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,
             squeeze: Squeeze {
                 window: env.secs("SQUEEZE_S", 120)?,
                 cpus_per_node: env.or("SQUEEZE_CPUS_PER_NODE", "0.75"),
@@ -281,6 +289,8 @@ mod tests {
         assert_eq!(knobs.squeeze.cycles.get(), 3);
         assert_eq!(knobs.cluster_retention.map(NonZeroU64::get), Some(6144));
         assert_eq!(knobs.reschedule_slo, Duration::from_secs(200));
+        assert_eq!(knobs.l1_fault, Duration::from_secs(60));
+        assert_eq!(knobs.l1_tps.get(), 50);
         assert!(Knobs::read(&[("CHAOS_TPS", "0")]).is_err());
     }
 

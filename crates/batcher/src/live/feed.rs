@@ -295,9 +295,24 @@ impl<P: Provider> FeedLoop<P> {
                 self.flush_if_due().await?;
             }
             Err(_) => self.flush_if_due().await?,
-            Ok(None) => bail!("tx_ordering reader channel closed; see reader thread error"),
+            Ok(None) => {
+                self.post_pending().await?;
+                bail!("tx_ordering reader channel closed; see reader thread error")
+            }
         }
         Ok(())
+    }
+
+    /// Post the pending group, due or not. The reader stopped, so no
+    /// block joins the group any more. Its blocks are closed and spooled,
+    /// and a refused replay (the cursor past the sealers' retention) is
+    /// the case where nothing else can post them: the spool is their
+    /// only copy.
+    async fn post_pending(&mut self) -> Result<()> {
+        match self.pending.take() {
+            Some(group) => self.post_group(group).await,
+            None => Ok(()),
+        }
     }
 
     /// Close the current block. Buffer it for posting, unless L1 already

@@ -145,6 +145,31 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     }
 }
 
+/// The resume reads the covered block from the contract, with no event
+/// scan: a swallowed `BatchPosted` log changes nothing it reads.
+#[tokio::test]
+async fn l1_truth_comes_from_the_contract_not_the_logs() {
+    use kardamom_batcher::live::L1Truth;
+
+    let Some(s) = setup().await else {
+        eprintln!("SKIP: anvil unavailable");
+        return;
+    };
+    let before = L1Truth::read(&s.provider, s.settlement_addr).await.unwrap();
+    assert_eq!(
+        (before.last_batch_index, before.covered_through_block),
+        (0, 0)
+    );
+    let cert = Bytes::from(vec![0x02, 0xC0, 0xFF, 0xEE]);
+    s.post_batch(0, cert.clone(), 1, 5).await;
+    s.post_batch(1, cert, 6, 12).await;
+    let after = L1Truth::read(&s.provider, s.settlement_addr).await.unwrap();
+    assert_eq!(
+        (after.last_batch_index, after.covered_through_block),
+        (2, 12)
+    );
+}
+
 /// A `ClosedBlock` with no transactions, the smallest legal batch. Dense
 /// coverage posts empty blocks too.
 fn empty_block(block_number: u64, l2_timestamp: u64) -> kardamom_batcher::batch::ClosedBlock {
@@ -215,7 +240,6 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         0,
         2,
         cursor_path.clone(),
-        0,
     );
 
     // ----- act -----
