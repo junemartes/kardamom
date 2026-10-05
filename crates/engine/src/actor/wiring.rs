@@ -72,8 +72,9 @@ pub trait ExecPorts {
     /// Hook around each tx record. Use [`NoTxHook`](super::NoTxHook) for
     /// roles that wire none. The validator names
     /// [`VerifyRecordIdentity`](super::VerifyRecordIdentity). A pair
-    /// `(A, B)` stacks two hooks.
-    type TxHook: TxHook + 'static;
+    /// `(A, B)` stacks two hooks. `Option<H>` turns `H` on or off at
+    /// runtime. [`RoleHooks::none`] uses the `Default` value.
+    type TxHook: TxHook + Default + 'static;
 }
 
 /// The full set of port types one role plugs into [`Executor::run`]:
@@ -162,14 +163,16 @@ pub struct RoleHooks<W: EngineWiring> {
     /// messages apply. `None` trusts the pair's origin sequence as sent.
     /// Wired by the destination validator only.
     pub remote_epoch_observer: Option<W::RemoteEpoch>,
-    /// Hook around each tx record, run on the exec thread. `None` runs no
-    /// hook.
-    pub tx_hook: Option<W::TxHook>,
+    /// Hook around each tx record, run on the exec thread. The type
+    /// selects the hook, and this value carries its state.
+    pub tx_hook: W::TxHook,
 }
 
 impl<W: EngineWiring> RoleHooks<W> {
-    /// No role-specific behavior: streaming execution, no BAL capture, no
-    /// epoch check, and no tx hook. This is the shape the executor and most tests use.
+    /// No role-specific behavior: streaming execution, no BAL capture, and
+    /// no epoch check. The tx hook is the wiring's `Default`: off for
+    /// [`NoTxHook`](super::NoTxHook) and for `Option<_>`. This is the
+    /// shape most tests use.
     #[must_use]
     pub fn none() -> Self {
         Self {
@@ -178,7 +181,7 @@ impl<W: EngineWiring> RoleHooks<W> {
             block_exec: None,
             epoch_observer: None,
             remote_epoch_observer: None,
-            tx_hook: None,
+            tx_hook: W::TxHook::default(),
         }
     }
 }

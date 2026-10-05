@@ -39,6 +39,8 @@ impl Fixture {
             end_tx_idx: BPosition::from_index(1),
             l2_timestamp: 1,
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         };
         let delta = BlockDelta {
             block_number: 1,

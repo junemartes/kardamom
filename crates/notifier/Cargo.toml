@@ -1,0 +1,49 @@
+[package]
+name = "kardamom-notifier"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+# The notifier: taps `tx_status`, `tx_receipts` and `tx_errors`, keeps a
+# bounded ring of recent transaction status events, and fans them out to
+# WebSocket subscribers and webhook subscriptions. Off the hot path: a
+# slow client costs the client, never the chain. See
+# docs/specs/2026-10-01-transaction-status-events.md.
+
+[lib]
+name = "kardamom_notifier"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kardamom-notifier"
+path = "src/main.rs"
+
+[dependencies]
+kardamom-log = { workspace = true }
+kardamom-types = { workspace = true }
+kardamom-obs = { path = "../obs" }
+alloy-primitives = { workspace = true, features = ["serde"] }
+anyhow = { workspace = true }
+async-trait = "0.1"
+clap = { workspace = true }
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+jsonrpsee = { workspace = true }
+metrics = { workspace = true }
+reqwest = { workspace = true }
+rkyv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs"] }
+tokio-util = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+jsonrpsee = { workspace = true, features = ["ws-client"] }
+kardamom-obs = { path = "../obs", features = ["test-support"] }
+tempfile = { workspace = true }

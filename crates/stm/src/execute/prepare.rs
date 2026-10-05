@@ -1,4 +1,3 @@
-use crate::FEE_SINK;
 use crate::schedule;
 use kardamom_exec_core::exec_types::TxIndex;
 use kardamom_exec_core::executor::DecodedTx;
@@ -52,10 +51,15 @@ impl Prepared {
     /// Decode and predict, off the feed thread. Combines [`Self::decode`]
     /// and [`Self::predict`]; a caller that wants the per-phase split
     /// (see `BlockSession::push_tx`) calls those two directly instead.
-    pub fn new(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepared {
+    pub fn new(
+        envelope: &TxEnvelope,
+        tx_idx: TxIndex,
+        stats: &Stats,
+        sink: alloy_primitives::Address,
+    ) -> Prepared {
         let decoded = Self::decode(envelope, tx_idx);
         let (domains, domain_hashes, primary, cold) =
-            Self::predict(envelope, decoded.as_ref(), stats);
+            Self::predict(envelope, decoded.as_ref(), stats, sink);
         Prepared {
             decoded,
             domains,
@@ -82,10 +86,13 @@ impl Prepared {
     /// re-executes that one transaction at its canonical position.
     /// That is what makes it safe to compute here, concurrently, ahead
     /// of canonical order.
+    /// `sink` is the block's fee sink: every transaction credits it, so
+    /// it is never a scheduling domain.
     pub(super) fn predict(
         envelope: &TxEnvelope,
         decoded: Option<&DecodedTx>,
         stats: &Stats,
+        sink: alloy_primitives::Address,
     ) -> (Vec<DomainKey>, Vec<u64>, Option<DomainKey>, bool) {
         // The local index is irrelevant to prediction (it only labels
         // the observation), so preparation needs no position in the
@@ -98,7 +105,7 @@ impl Prepared {
         };
         let (domains, domain_hashes, primary) = predicted
             .into_iter()
-            .filter(|c| *c != DomainKey::Account(FEE_SINK))
+            .filter(|c| *c != DomainKey::Account(sink))
             .fold((Vec::new(), Vec::new(), None), |acc, c| {
                 Self::fold_domain(acc, c, envelope)
             });

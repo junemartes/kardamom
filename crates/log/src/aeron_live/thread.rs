@@ -331,6 +331,7 @@ impl AeronThread {
         ack: Option<CbSender<Result<BPosition, LogError>>>,
     ) {
         self.pending.push_back(PendingPublish {
+            stream_id: self.pubs.get(pub_id as usize).map(|e| e.stream_id),
             pub_id,
             bytes,
             ack,
@@ -353,6 +354,7 @@ impl AeronThread {
         self.pubs.push(PubEntry {
             publication,
             layout,
+            stream_id,
         });
         Ok((id, session_id))
     }

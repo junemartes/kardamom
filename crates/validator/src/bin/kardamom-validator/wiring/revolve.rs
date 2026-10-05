@@ -44,7 +44,7 @@ pub(crate) fn verdict(outcome: &EngineOutcome, repaired: Option<&str>) -> Verdic
         // Exit 2 is reserved for a proven divergence, the page-the-humans
         // signal. Any other engine failure is an availability problem,
         // not an integrity one, and must not look like one.
-        EngineOutcome::Diverged => Verdict::Exit(2),
+        EngineOutcome::Diverged(_) => Verdict::Exit(2),
         EngineOutcome::Failed(_) | EngineOutcome::Panicked => match repaired {
             Some("peer-checkpoint") => Verdict::Revolve,
             _ => Verdict::Exit(1),
@@ -72,8 +72,28 @@ pub(crate) async fn revolution(boot: &Boot) -> Result<Verdict> {
         .spawn_attester()?
         .build_sink();
     let end = Box::pin(ready.run()).await?;
+    persist_divergence(boot, &end.outcome);
     let repaired = repair(boot, &end)?;
     Ok(verdict(&end.outcome, repaired))
+}
+
+/// Record a proven divergence beside the state, so the next start runs
+/// halted. A failed write is logged, not fatal: the exit status still
+/// carries the verdict, and the log line stays.
+fn persist_divergence(boot: &Boot, outcome: &EngineOutcome) {
+    let EngineOutcome::Diverged(reason) = outcome else {
+        return;
+    };
+    kardamom_validator::metrics::set_verdict_standing(true);
+    let file = boot.verdict_file();
+    match file.record(reason) {
+        Ok(()) => tracing::error!(path = %file.path().display(), "divergence verdict recorded"),
+        Err(e) => tracing::error!(
+            error = %e,
+            path = %file.path().display(),
+            "divergence verdict could not be recorded"
+        ),
+    }
 }
 
 /// The repair step of a failed revolution: the peer-checkpoint fallback
@@ -82,7 +102,7 @@ fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
     let cause = match &end.outcome {
         EngineOutcome::Failed(e) => Some(e),
         EngineOutcome::Panicked => None,
-        EngineOutcome::Clean | EngineOutcome::Diverged => return Ok(None),
+        EngineOutcome::Clean | EngineOutcome::Diverged(_) => return Ok(None),
     };
     let args = &boot.args;
     crate::adoption::resync_after_engine_error(
@@ -94,14 +114,17 @@ fn repair(boot: &Boot, end: &RunEnd) -> Result<Option<&'static str>> {
     )
 }
 
-/// One turn of the process loop: a revolution, then its verdict.
-/// `Continue` means run again; `Break` means the process is done. An
-/// exit status leaves the process here, as the old exit path did.
+/// One turn of the process loop: the hold on a standing verdict, a
+/// revolution, then its verdict. `Continue` means run again; `Break`
+/// means the process is done. An exit status leaves the process here.
 ///
 /// # Errors
 ///
 /// Returns the revolution's error.
 pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFlow<()>> {
+    if super::halted::Halted::hold(boot).await?.is_break() {
+        return Ok(ControlFlow::Break(()));
+    }
     match revolution(boot).await? {
         Verdict::Done => return Ok(ControlFlow::Break(())),
         Verdict::Exit(status) => halt(status),
@@ -153,7 +176,10 @@ mod tests {
         );
         assert_eq!(verdict(&EngineOutcome::Panicked, None), Verdict::Exit(1));
         assert_eq!(
-            verdict(&EngineOutcome::Diverged, Some("peer-checkpoint")),
+            verdict(
+                &EngineOutcome::Diverged("mismatch".into()),
+                Some("peer-checkpoint")
+            ),
             Verdict::Exit(2)
         );
         assert_eq!(verdict(&EngineOutcome::Clean, None), Verdict::Done);

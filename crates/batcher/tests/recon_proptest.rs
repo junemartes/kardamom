@@ -86,8 +86,8 @@ proptest! {
             ..Default::default()
         };
         let batch = pack_blocks(&cfg, &blocks).unwrap();
-        prop_assert!(batch.blobs.len() <= 6, "exceeded 6-blob ceiling");
-        let reconstructed = reconstruct(&batch.blobs).unwrap();
+        prop_assert!(batch.payload.len() <= cfg.max_payload_bytes.get(), "exceeded the payload ceiling");
+        let reconstructed = reconstruct(&batch.payload).unwrap();
         let expected: Vec<BlockFrame> = blocks.iter().map(to_block_frame).collect();
         prop_assert_eq!(reconstructed, expected);
     }
@@ -108,7 +108,7 @@ proptest! {
             ..Default::default()
         };
         let batch = pack_blocks(&cfg, &blocks).unwrap();
-        let reconstructed = reconstruct(&batch.blobs).unwrap();
+        let reconstructed = reconstruct(&batch.payload).unwrap();
         let expected: Vec<BlockFrame> = blocks.iter().map(to_block_frame).collect();
         prop_assert_eq!(reconstructed, expected);
     }

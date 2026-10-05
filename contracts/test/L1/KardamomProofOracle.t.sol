@@ -104,10 +104,10 @@ contract KardamomProofOracleTest is Test {
 
     /// Post batch `index` covering blocks 100..101 with the digests' fold.
     function _postBatch(uint64 prev) internal {
-        bytes32[] memory h = new bytes32[](1);
-        h[0] = bytes32(uint256(0xC0FFEE));
         vm.prank(BATCHER);
-        settlement.postBatch(prev, h, 100, 101, _fold(_digests()));
+        settlement.postBatch(
+            prev, bytes.concat(bytes32(uint256(0xC0FFEE))), 100, 101, _fold(_digests())
+        );
     }
 
     function _claim() internal {

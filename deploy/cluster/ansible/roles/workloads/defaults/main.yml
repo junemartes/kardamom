@@ -20,9 +20,13 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror]
+workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier]
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
+# The Nomad node pool of a job, by job name: the pool id of an elastic
+# pool (the pool contract). A job without an entry stays in the default
+# pool, with the fixed servers.
+workloads_node_pools: {}
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
   partition_count: "{{ partition_count }}"
@@ -32,11 +36,46 @@ workloads_common_vars:
   sealer_count: "{{ node_classes.sealer.count }}"
   sequencer_count: "{{ node_classes.sequencer.count }}"
   ingress_count: "{{ node_classes.ingress.count }}"
+  canary: "{{ workloads_canary }}"
+  # One value for the sequencer's tip, the sealer's ordering window, and
+  # the executor's and validator's fee schedule: "on" or "off". Empty
+  # leaves every job at its "off" default.
+  priority_fees: "{{ workloads_priority_fees }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
+# workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
+# workloads_l1_rpc with the discovered one, and the jobs that take the
+# real L1 (the batcher, the da-watcher) read the given one.
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
+workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
+# The batcher's L1 key (KARDAMOM_L1_KEY of the batcher job). Empty keeps
+# the job's default, the anvil dev key.
+workloads_batcher_key: "{{ lookup('env', 'BATCHER_KEY') }}"
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
+# The EigenDA network the DA proxy disperses to (sepolia_testnet,
+# mainnet). Empty: the file-backed stand-in (nomad/da-store.nomad.hcl),
+# for a deployment without EigenDA. The proxy signs with the batcher's key and verifies against
+# the L1 RPC.
+workloads_eigenda_network: "{{ lookup('env', 'EIGENDA_NETWORK') }}"
+# The network's EigenDACertVerifierRouter. Empty: the job's default for
+# the network.
+workloads_eigenda_cert_verifier: "{{ lookup('env', 'EIGENDA_CERT_VERIFIER') }}"
+# The proxy's API port (nomad/da-proxy.nomad.hcl), and whether the deploy
+# waits for its /health before the batcher: off only where no node
+# answers, the isolation tests.
+workloads_da_proxy_port: 3100
+workloads_da_proxy_probe: true
+# The job behind the DA service: the proxy on an EigenDA network, the
+# stand-in without one.
+workloads_da_job: "{{ 'da-proxy' if workloads_eigenda_network | length > 0 else 'da-store' }}"
+# The batcher's posting cadence on a real L1 (nomad/batcher.nomad.hcl).
+# Empty keeps the job's defaults, which suit the in-cluster anvil.
+workloads_batcher_blocks_per_batch: "{{ lookup('env', 'BATCHER_BLOCKS_PER_BATCH') }}"
+workloads_batcher_flush_ms: "{{ lookup('env', 'BATCHER_FLUSH_MS') }}"
+workloads_batcher_idle_flush_ms: "{{ lookup('env', 'BATCHER_IDLE_FLUSH_MS') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
+# The settlement's deployment block on L1: where a BatchPosted scan starts.
+workloads_settlement_deploy_block: "{{ lookup('env', 'SETTLEMENT_DEPLOY_BLOCK') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
 workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
 workloads_l1_owner_key: >-
@@ -47,12 +86,78 @@ workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
 workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
+workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
 workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default('mainnet', true) }}"
-# The aux node by its Consul record; the light client listens there.
-workloads_aux_host: "{{ lookup('env', 'AUX_HOST') | default('aux-0.node.' ~ datacenter ~ '.consul', true) }}"
+# The light client by its Consul service record (nomad/l1-light-client.nomad.hcl).
+workloads_light_host: "{{ lookup('env', 'L1_LIGHT_CLIENT_HOST') | default('kardamom-l1-light-client.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
+# The lying L1 of the chaos-l1 shard (nomad/l1-fault-proxy.nomad.hcl).
+# On, the proxy sits in front of the in-cluster anvil, and every follower
+# (the batcher, the da-watcher, the inbox indexer) reads L1 through it,
+# so the harness can serve them the faults of a real outage.
+workloads_l1_fault_proxy: "{{ lookup('env', 'KARDAMOM_L1_FAULT_PROXY') | default('0', true) | bool }}"
+workloads_fault_proxy_url: "http://kardamom-l1-fault-proxy.service.{{ datacenter }}.consul:{{ ports.l1_fault_proxy }}"
+# The L1 the followers (the da-watcher, the indexer) walk block by block:
+# a comma-separated list; with two or more entries a block is accepted
+# only when two agree. Default: the fault proxy when it is deployed; else
+# the light client when one is deployed, else the real L1. A light client
+# behind an execution RPC without historical proofs serves only the
+# blocks it has seen, so a follower behind it stalls after a gap;
+# L1_FOLLOWERS_RPC then names the real L1 endpoints, and the light client
+# settles the reads it serves (workloads_followers_light_client).
+workloads_followers_rpc: >-
+  {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
+     else lookup('env', 'L1_FOLLOWERS_RPC')
+     | default('http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
+               if workloads_light_execution_rpc | length > 0 else workloads_l1_rpc, true) }}
+# The da-watcher's placeholder lockbox, for a deployment without one:
+# the deposit path is then idle, and the indexer archives empty epochs.
+workloads_zero_address: "0x0000000000000000000000000000000000000000"
+# The light client as the followers' tie-breaker: set when one runs and
+# L1_FOLLOWERS_RPC names other endpoints, so the light client is not in
+# the list twice.
+workloads_followers_light_client: >-
+  {{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
+     if workloads_light_execution_rpc | length > 0 and lookup('env', 'L1_FOLLOWERS_RPC') | length > 0
+     else '' }}
+# The inbox indexer (nomad/l1-indexer.nomad.hcl): deployed with the light
+# client, read by the batcher through its Consul service record. The
+# start block is optional: empty means the finalized block at its first
+# start.
+# The in-cluster anvil is minutes old, so behind the fault proxy the
+# indexer starts at its first block and the archive holds every batch.
+workloads_indexer_start_block: >-
+  {{ lookup('env', 'L1_INDEXER_START_BLOCK') | default('1' if workloads_l1_fault_proxy | bool else '', true) }}
+workloads_indexer_poll_s: "{{ lookup('env', 'L1_INDEXER_POLL_S') }}"
+# Whether the indexer job is part of this deployment: with a real L1, a
+# light client, or the fault proxy.
+workloads_indexer_deployed: >-
+  {{ workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0
+     or workloads_l1_fault_proxy | bool }}
+workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
+workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3
 workloads_poll_retries: 80
+# The poll budget of one Nomad deployment, in polls of workloads_poll_delay
+# seconds. It covers a job's progress_deadline (10 minutes), so a
+# deployment that Nomad has not decided yet is never read as a failure.
+workloads_deployment_retries: 220
+# Canary allocations for the ingress and the sequencer: 0 or 1. A canary
+# is one allocation more than the count, so it needs a spare node of its
+# class; the container profile has none.
+workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
+# The sealer members' admin port (cluster_ports.admin): the role reads
+# the leader from it for the staged roll.
+workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The operator binary that runs the smoke against a canary.
+workloads_cluster_binary: >-
+  {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
+     | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
+# The record of the deployed manifests, by environment: deployed/<env>/
+# images.digests is the last successful deploy, .previous the one before.
+# `just rollback <env>` deploys the previous one.
+workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
+workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"

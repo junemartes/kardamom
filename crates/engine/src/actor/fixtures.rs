@@ -56,7 +56,8 @@ impl<D, O, R> crate::ExecPorts for TestWiring<D, O, R> {
     type Epoch = crate::NoEpochCheck;
     type RemoteEpoch = crate::NoRemoteEpochCheck;
     type BlockExec = crate::NoBlockExec;
-    type TxHook = crate::VerifyRecordIdentity;
+    // Off unless `HarnessSetup::tx_hook` turns it on.
+    type TxHook = Option<crate::VerifyRecordIdentity>;
 }
 
 impl<D, O, R> crate::EngineWiring for TestWiring<D, O, R>

@@ -39,6 +39,8 @@ fn resume_executes_from_cursor_with_absolute_counts() {
         block: 1,
         record_count: 2,
         l2_timestamp: 1_700_000_000,
+        base_fee: 0,
+        gas_used: 0,
     });
 
     // Only post-cursor work: block 2's transaction and boundary, with
@@ -81,6 +83,8 @@ fn resume_after_empty_block_backlog() {
         block: 3,
         record_count: 0,
         l2_timestamp: 1_700_000_003,
+        base_fee: 0,
+        gas_used: 0,
     });
 
     // Block 4: the first real transaction (count 0 to 1).
@@ -125,6 +129,8 @@ fn resume_boundary_alignment_still_checked() {
             block: 1,
             record_count: 5,
             l2_timestamp: 1_700_000_000,
+            base_fee: 0,
+            gas_used: 0,
         })
         .spawn(rx_r2e);
     let res = h.join().expect("no panic");

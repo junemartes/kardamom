@@ -172,7 +172,10 @@ async fn s12c_verified_l1_broken_parent_chain_halts_validator() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s12d_verified_l1_swallowed_logs_halt_validator() {
-    run_verified_l1_case(e2e::harness::l1_verified::Fault::SwallowLogs).await;
+    run_verified_l1_case(e2e::harness::l1_verified::Fault::SwallowLogs {
+        address: alloy_primitives::Address::ZERO,
+    })
+    .await;
 }
 
 async fn run_verified_l1_case(fault: e2e::harness::l1_verified::Fault) {

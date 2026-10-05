@@ -1,14 +1,14 @@
-//! M8: a block group that overflows the 6-blob ceiling splits into several
-//! posts. A block that overflows on its own is a loud `BlockTooLarge`. And
-//! one remote-epoch record at the derivation cap fits in 5 blobs.
+//! M8: a block group that overflows the payload ceiling splits into
+//! several posts. A block that overflows on its own is a loud
+//! `BlockTooLarge`. And one remote-epoch record at the derivation cap
+//! fits in the default ceiling with room.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_batcher::batcher::{
-    Batcher, BatcherConfig, MAX_BLOBS_PER_BATCH, MockSender, pack_block_groups, pack_blocks,
+    Batcher, BatcherConfig, MockSender, pack_block_groups, pack_blocks,
 };
-use kardamom_batcher::blob::USABLE_BYTES_PER_BLOB;
 use kardamom_batcher::error::BatcherError;
 use kardamom_types::BPosition;
 use kardamom_types::num::usize_to_u64;
@@ -66,26 +66,30 @@ fn block_of(block_number: u64, raw_len: usize) -> ClosedBlock {
     }
 }
 
+/// A small ceiling, so the tests split on kilobytes, not megabytes.
+const CEILING: usize = 64 * 1024;
+
 fn uncompressed() -> BatcherConfig {
     BatcherConfig {
         compress: false,
         blocks_per_batch: std::num::NonZeroUsize::new(2).unwrap(),
+        max_payload_bytes: std::num::NonZeroUsize::new(CEILING).unwrap(),
         ..Default::default()
     }
 }
 
-/// About 4 blobs of payload: two such blocks overflow the ceiling.
-const FOUR_BLOBS: usize = 4 * USABLE_BYTES_PER_BLOB - 1_000;
-/// About 7 blobs of payload: one such block overflows on its own.
-const SEVEN_BLOBS: usize = 7 * USABLE_BYTES_PER_BLOB - 1_000;
+/// About two thirds of the ceiling: two such blocks overflow it.
+const TWO_THIRDS: usize = CEILING * 2 / 3 - 1_000;
+/// Over the ceiling: one such block overflows on its own.
+const OVER: usize = CEILING + CEILING / 6;
 
 #[test]
 fn group_over_the_ceiling_splits_at_block_boundaries() {
     let cfg = uncompressed();
-    let blocks = vec![block_of(10, FOUR_BLOBS), block_of(11, FOUR_BLOBS)];
+    let blocks = vec![block_of(10, TWO_THIRDS), block_of(11, TWO_THIRDS)];
     assert!(matches!(
         pack_blocks(&cfg, &blocks),
-        Err(BatcherError::Blob(_))
+        Err(BatcherError::Payload(_))
     ));
 
     let batches = pack_block_groups(&cfg, &blocks).unwrap();
@@ -99,8 +103,8 @@ fn group_over_the_ceiling_splits_at_block_boundaries() {
         (11, 11)
     );
     for b in &batches {
-        assert!(b.blobs.len() <= MAX_BLOBS_PER_BATCH);
-        assert_eq!(b.blobs.len(), 4);
+        assert!(b.payload.len() <= CEILING);
+        assert!(b.payload.len() > TWO_THIRDS);
     }
     // Each split batch equals the batch of that block alone.
     assert_eq!(
@@ -112,13 +116,13 @@ fn group_over_the_ceiling_splits_at_block_boundaries() {
 #[test]
 fn group_takes_the_largest_fitting_prefix() {
     let cfg = uncompressed();
-    let small = USABLE_BYTES_PER_BLOB / 2;
-    // 0.5 + 0.5 + 4 blobs fit together (5 blobs); the fourth block tips it.
+    let small = CEILING / 8;
+    // 1/8 + 1/8 + 2/3 fit together; the fourth block tips it.
     let blocks = vec![
         block_of(1, small),
         block_of(2, small),
-        block_of(3, FOUR_BLOBS),
-        block_of(4, FOUR_BLOBS),
+        block_of(3, TWO_THIRDS),
+        block_of(4, TWO_THIRDS),
         block_of(5, small),
     ];
     let batches = pack_block_groups(&cfg, &blocks).unwrap();
@@ -141,25 +145,23 @@ fn group_under_the_ceiling_is_one_batch() {
 #[test]
 fn single_oversize_block_is_a_named_fatal() {
     let cfg = uncompressed();
-    let blocks = vec![
-        block_of(41, 100),
-        block_of(42, SEVEN_BLOBS),
-        block_of(43, 100),
-    ];
+    let blocks = vec![block_of(41, 100), block_of(42, OVER), block_of(43, 100)];
     let err = pack_block_groups(&cfg, &blocks).unwrap_err();
     match err {
         BatcherError::BlockTooLarge {
             block_number,
-            blobs,
+            bytes,
+            ceiling,
         } => {
             assert_eq!(block_number, 42);
-            assert_eq!(blobs, 7);
+            assert!(bytes > ceiling);
+            assert_eq!(ceiling, CEILING);
         }
         other => panic!("expected BlockTooLarge, got {other:?}"),
     }
     let text = err.to_string();
     assert!(text.contains("block 42"), "{text}");
-    assert!(text.contains("7 blobs"), "{text}");
+    assert!(text.contains("-byte payload"), "{text}");
 
     // The single-block path names the block too.
     assert!(matches!(
@@ -174,9 +176,9 @@ fn single_oversize_block_is_a_named_fatal() {
 #[test]
 fn batcher_posts_a_split_group_as_two_batches() {
     let mut batcher = Batcher::new(uncompressed(), MockSender::default());
-    batcher.on_closed_block(block_of(10, FOUR_BLOBS)).unwrap();
+    batcher.on_closed_block(block_of(10, TWO_THIRDS)).unwrap();
     assert!(batcher.sender().sent.is_empty());
-    batcher.on_closed_block(block_of(11, FOUR_BLOBS)).unwrap();
+    batcher.on_closed_block(block_of(11, TWO_THIRDS)).unwrap();
     let sent = &batcher.sender().sent;
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[0].l2_block_end, 10);
@@ -225,7 +227,8 @@ fn record_at_the_derivation_cap_fits_in_five_blobs() {
         ..Default::default()
     };
     let batch = pack_blocks(&cfg, &[block]).unwrap();
-    assert_eq!(batch.blobs.len(), 5);
+    assert!(batch.payload.len() > MAX_REMOTE_EPOCH_WIRE_BYTES);
+    assert!(batch.payload.len() < cfg.max_payload_bytes.get() / 16);
 }
 
 /// The fixed byte counts in `kardamom_types::xchain` equal what the KAR1

@@ -138,7 +138,7 @@ impl<P: Provider<alloy_network::Ethereum> + Clone> L1BringUp<P> {
                     },
                     // The DA batch inbox. `l1Batcher` is the only address
                     // allowed to post, so it is the key the DA-parity test
-                    // uses to sign blob transactions.
+                    // uses to sign `postBatch` transactions.
                     Op::Deploy {
                         l2_chain_id: self.l2_chain_id,
                         id: ContractId::KardamomL2Settlement,
@@ -221,8 +221,8 @@ impl L1 {
             .arg("--slots-in-an-epoch")
             .arg("1");
         // Funds and impersonates DEV_OWNER, funds the batcher EOA only (it
-        // signs real blob transactions, so it needs a real balance, not
-        // impersonation), and predeploys the ERC-7955 factory bytecode
+        // signs real `postBatch` transactions, so it needs a real balance,
+        // not impersonation), and predeploys the ERC-7955 factory bytecode
         // anvil does not ship with.
         let Some(rig) = kardamom_deployer::testkit::AnvilRig::spawn(
             anvil,
