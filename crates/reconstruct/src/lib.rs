@@ -13,9 +13,9 @@
 //! validator. It lives in its own crate, not the batcher, so the batcher
 //! itself stays state-free: it only produces and decodes DA blobs.
 //!
-//! Deposits are out of scope here, for the same reason they are absent
-//! from the DA payload: the batcher's `MultiArchiveReader` skips
-//! `DepositRef`s. See [`kardamom_engine::replay`].
+//! L1 deposits are not in the DA payload: L1 fixes them, and each block's
+//! L1 origin fixes where they land. [`L1Epochs`] derives the epochs from L1
+//! and puts them at the head of the blocks they lead, before the replay.
 //!
 //! Cross-chain (interop) deliveries are in scope. Remote-epoch records
 //! travel in the DA payload by value (KAR1 v2, spec §16 Q8): they are not
@@ -23,6 +23,9 @@
 //! again as 0x7D transactions, at the head of the block each record leads.
 
 use std::path::Path;
+
+mod epochs;
+pub use epochs::L1Epochs;
 
 use kardamom_batcher::BlockFrame;
 use kardamom_engine::{CanonicalEnd, ReplayBlock, ReplayGenesis, ReplayOutcome, replay_blocks};
@@ -35,7 +38,8 @@ use kardamom_types::TxEnvelope;
 #[error("reconstruct: {0}")]
 pub struct ReconstructError(pub String);
 
-/// Convert a DA-recovered [`BlockFrame`] into an engine [`ReplayBlock`].
+/// Convert a DA-recovered [`BlockFrame`] into an engine [`ReplayBlock`]
+/// with no L1 epoch. [`L1Epochs::attach`] adds them.
 ///
 /// Each `TxFrame` becomes a [`TxEnvelope`]. Its proxy-stamped `sender` and
 /// `tx_hash` carry over verbatim across the blob round-trip. The execution
@@ -49,6 +53,7 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
             end_tx_idx: c.end_tx_idx,
             l1_origin: c.l1_origin,
         }),
+        l1_epochs: Vec::new(),
         remote_epochs: frame.remote_epochs.clone(),
         txs: frame
             .txs
@@ -86,7 +91,8 @@ pub fn strip_to_executor_image(state_dir: &Path) -> Result<(), ReconstructError>
 /// Re-execute DA-recovered `blocks` (in order) into a fresh durable state DB
 /// at `state_dir`, seeding genesis first. Returns the reconstructed head and
 /// state root. `blocks` must be the chain's blocks in canonical block order,
-/// as recovered from consecutive posted batches.
+/// as recovered from consecutive posted batches. This applies no L1
+/// deposit.
 ///
 /// # Errors
 ///
@@ -101,7 +107,7 @@ pub fn reconstruct_state(
         state_dir,
         durability: Durability::Durable,
     }
-    .run(genesis, blocks)
+    .run(genesis, blocks.iter().map(block_frame_to_replay).collect())
 }
 
 /// Where a reconstruction writes, and how hard each block commit syncs.
@@ -115,7 +121,7 @@ pub struct Reconstruction<'a> {
 }
 
 impl Reconstruction<'_> {
-    /// Re-execute DA-recovered `blocks`, in order, into the state DB.
+    /// Re-execute `blocks`, in order, into the state DB.
     ///
     /// # Errors
     ///
@@ -123,15 +129,13 @@ impl Reconstruction<'_> {
     pub fn run(
         &self,
         genesis: &ReplayGenesis<'_>,
-        blocks: &[BlockFrame],
+        blocks: Vec<ReplayBlock>,
     ) -> Result<ReplayOutcome, ReconstructError> {
         let env = StateEnvBuilder::new(self.state_dir)
             .durability(self.durability)
             .open()
             .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
-
-        let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
-        replay_blocks(env, genesis, replay).map_err(|e| ReconstructError(e.to_string()))
+        replay_blocks(env, genesis, blocks).map_err(|e| ReconstructError(e.to_string()))
     }
 }
 
@@ -322,6 +326,7 @@ mod tests {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
                 canonical_end: None,
+                l1_epochs: vec![],
                 remote_epochs: vec![],
                 txs: block1.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
@@ -329,6 +334,7 @@ mod tests {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
                 canonical_end: None,
+                l1_epochs: vec![],
                 remote_epochs: vec![],
                 txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
@@ -567,6 +573,7 @@ mod tests {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
                 canonical_end: None,
+                l1_epochs: vec![],
                 remote_epochs: vec![scenario.record],
                 txs: scenario
                     .block

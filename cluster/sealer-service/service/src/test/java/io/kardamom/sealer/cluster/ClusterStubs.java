@@ -34,6 +34,8 @@ final class ClusterStubs {
         int closes;
         /** When set, every offer reports {@link Publication#BACK_PRESSURED}. */
         boolean backPressured;
+        /** How many more offers this session takes before it reports back-pressure. */
+        long credit = Long.MAX_VALUE;
 
         StubSession(final long id) {
             this.id = id;
@@ -65,9 +67,10 @@ final class ClusterStubs {
         }
 
         public long offer(final DirectBuffer buffer, final int offset, final int length) {
-            if (backPressured) {
+            if (backPressured || credit == 0) {
                 return Publication.BACK_PRESSURED;
             }
+            credit--;
             final byte[] copy = new byte[length];
             buffer.getBytes(offset, copy);
             offered.add(copy);

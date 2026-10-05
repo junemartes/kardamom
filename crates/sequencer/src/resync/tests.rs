@@ -149,6 +149,46 @@ fn deposit_receipts_neither_confirm_nor_raise() {
     assert!(raised.is_empty() && confirmations.is_empty());
 }
 
+/// A receipt maps to one outcome. A deposit wins over a skip reason, so a
+/// deposit never confirms a genuine nonce-0 ref.
+#[test]
+fn a_receipt_maps_to_its_outcome() {
+    use kardamom_types::{Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY};
+    let receipt = |tx_type, skip_reason| Receipt {
+        tx_type,
+        nonce: 3,
+        from: s(1),
+        skip_reason,
+        ..Receipt::default()
+    };
+    let cases = [
+        (TX_TYPE_LEGACY, None, Outcome::Executed { nonce: 3 }),
+        (
+            TX_TYPE_LEGACY,
+            Some(SkipReason::NonceTooLow),
+            Outcome::Skipped {
+                nonce: 3,
+                reason: SkipReason::NonceTooLow,
+            },
+        ),
+        (TX_TYPE_DEPOSIT, None, Outcome::Deposit),
+        (
+            TX_TYPE_DEPOSIT,
+            Some(SkipReason::GasLimit),
+            Outcome::Deposit,
+        ),
+    ];
+    for (tx_type, skip_reason, outcome) in cases {
+        assert_eq!(
+            FloorUpdate::of_receipt(&receipt(tx_type, skip_reason)),
+            FloorUpdate {
+                sender: s(1),
+                outcome
+            }
+        );
+    }
+}
+
 /// This test pins a regression: a genuine nonce-0 transaction must confirm
 /// its ref, and raise the floor to 1. When nonce 0 was excluded wholesale,
 /// a one-transaction sender's ref could never confirm. The unconfirmed

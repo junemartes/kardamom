@@ -66,12 +66,9 @@ impl Boot {
         let raw = std::fs::read_to_string(config).context("read validator config")?;
         let mut file_cfg: ValidatorFileConfig =
             toml::from_str(&raw).context("parse validator config")?;
-        // Per-node cluster egress endpoint. The cluster client's
-        // egress_channel is this node's reachable address, so the deploy
-        // injects it rather than baking it into the static config file.
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
+        file_cfg
+            .cluster
+            .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
 
         tracing::info!(
             lanes = kardamom_types::shard_map::LANE_COUNT,

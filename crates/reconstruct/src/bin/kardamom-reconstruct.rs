@@ -8,10 +8,10 @@
 //! trie-aware state DB. This produces the reconstructed head and
 //! canonical state root.
 //!
-//! Scope: L2 transactions. Deposits are re-derivable from L1 events, a
-//! documented follow-up (see `kardamom_engine::replay`). With
-//! `--expect-root` it exits non-zero on any mismatch, so it also works as
-//! a chaos-suite assertion.
+//! Scope: L2 transactions, interop deliveries, and, with `--lockbox`, the
+//! L1 deposits each block's L1 origin names, derived from the lockbox logs.
+//! With `--expect-root` it exits non-zero on any mismatch, so it also works
+//! as a chaos-suite assertion.
 
 use std::path::PathBuf;
 
@@ -25,9 +25,11 @@ use kardamom_batcher::error::BatcherError;
 use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::indexer::IndexerClient;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
-use kardamom_reconstruct::Reconstruction;
+use kardamom_da_watcher::RpcL1Source;
+use kardamom_engine::ReplayBlock;
+use kardamom_reconstruct::{L1Epochs, Reconstruction, block_frame_to_replay};
 use kardamom_state::Durability;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Where the payloads come from: the proxy, or the indexer's archive.
 enum Source {
@@ -74,6 +76,13 @@ struct Cli {
     /// from.
     #[arg(long)]
     chain: PathBuf,
+
+    /// `ETHLockbox` proxy address. The rebuild derives the deposits of
+    /// each L1 epoch a block leads with from this contract's logs. Without
+    /// it, the rebuild leaves deposits out, and a chain with deposits
+    /// rebuilds to a wrong root.
+    #[arg(long)]
+    lockbox: Option<Address>,
 
     /// First L1 block to scan for `BatchPosted` events.
     #[arg(long, default_value_t = 0)]
@@ -143,6 +152,28 @@ impl Source {
 }
 
 impl Cli {
+    /// The replay blocks of `frames`, each led by the L1 epochs its origin
+    /// step names, read through `provider` from the `--lockbox` logs.
+    /// Without `--lockbox`, the blocks lead with no epoch.
+    async fn with_l1_epochs<P>(
+        &self,
+        provider: P,
+        frames: &[BlockFrame],
+    ) -> anyhow::Result<Vec<ReplayBlock>>
+    where
+        P: alloy_provider::Provider + Send + Sync + 'static,
+    {
+        let blocks = frames.iter().map(block_frame_to_replay).collect();
+        let Some(lockbox) = self.lockbox else {
+            warn!("no --lockbox: the rebuild leaves L1 deposits out");
+            return Ok(blocks);
+        };
+        L1Epochs::new(RpcL1Source::new(provider), lockbox)
+            .attach(blocks)
+            .await
+            .context("derive the L1 epochs")
+    }
+
     /// The payload source the flags name. clap guarantees one of the two.
     fn payload_source(&self) -> anyhow::Result<Source> {
         match (&self.da_proxy, &self.indexer_url) {
@@ -189,8 +220,10 @@ async fn main() -> anyhow::Result<()> {
     let blocks =
         recover_blocks(&descriptors, &source).context("recover blocks from the DA layer")?;
     let blocks = truncate(blocks, cli.through_block)?;
+    let blocks = cli.with_l1_epochs(provider, &blocks).await?;
     info!(
         blocks = blocks.len(),
+        epochs = blocks.iter().map(|b| b.l1_epochs.len()).sum::<usize>(),
         "recovered blocks from DA; re-executing"
     );
 
@@ -203,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         state_dir: &cli.state_dir,
         durability,
     }
-    .run(&replay_genesis, &blocks)
+    .run(&replay_genesis, blocks)
     .context("re-execute reconstructed blocks")?;
 
     info!(

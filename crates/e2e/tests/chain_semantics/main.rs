@@ -86,10 +86,14 @@ async fn post_and_verify_da(
 ) -> kardamom_batcher::testkit_da::FakeDaProxy {
     let fake = kardamom_batcher::testkit_da::FakeDaProxy::start();
     let da = kardamom_batcher::da::DaProxy::new(fake.url()).expect("da proxy client");
-    da_parity::post_to_l1(l1, l1.settlement, blocks, &da)
+    let batches = da_parity::post_to_l1(l1, l1.settlement, blocks, &da)
         .await
         .unwrap_or_else(|e| panic!("{what} post to L1: {e:?}"));
-    da_parity::assert_batches_on_l1(l1, l1.settlement, blocks.len(), &da)
+    let posted = da_parity::Posted {
+        batches,
+        blocks: blocks.len(),
+    };
+    da_parity::assert_batches_on_l1(l1, l1.settlement, &posted, &da)
         .await
         .unwrap_or_else(|e| panic!("{what} L1 batch log: {e:?}"));
     fake

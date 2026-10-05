@@ -107,8 +107,29 @@ its targets on the next deploy. Every metric is already labelled with
 ### Alerts
 
 `deploy/alerts.yml` holds the Prometheus alert rules. The monitoring job loads
-them as `rule_files`; firing alerts show on Prometheus's `/alerts` page. Check
-the rules with `promtool check rules deploy/alerts.yml`.
+them as `rule_files` and sends the firing alerts to the Alertmanager of the
+same allocation (port 9093 on the aux node, the `alertmanager` Consul
+service). Check the rules with `promtool check rules deploy/alerts.yml`.
+
+The rules of this file are the neutral ones: a fault the code reports as a
+counter. The operator of an environment keeps the tuned rules, the limits
+and the routing outside this repository, and gives them to the job through
+the Nomad variable `nomad/jobs/monitoring`:
+
+| Item | Content |
+| --- | --- |
+| `rules` | one Prometheus rule file, loaded next to `deploy/alerts.yml` |
+| `alertmanager` | the complete Alertmanager configuration, receivers included |
+
+```sh
+nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.yml
+```
+
+The job reads the variable with its workload identity, renders the two files
+and reloads Prometheus and Alertmanager in place (SIGHUP). Without the
+variable, Prometheus evaluates `deploy/alerts.yml` only, and Alertmanager
+routes every alert to a receiver that notifies nobody: the alerts show on
+its page and nowhere else.
 
 ### Rename map (historical — the metrics-namespace migration)
 

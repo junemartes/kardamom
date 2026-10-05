@@ -72,9 +72,11 @@ async fn s2_bridge_withdrawal_round_trip() {
 
 /// S8: what the batcher posts to L1, re-executed from L1 alone, must
 /// equal the state root the validator computed on its own. This is the
-/// "batcher's state matches the validator's" guarantee. This test posts
-/// the DA certificates to anvil, serves the payloads from a fake EigenDA
-/// proxy, and runs the real `kardamom-reconstruct --expect-root` binary.
+/// "batcher's state matches the validator's" guarantee. The workload
+/// holds an L1 deposit, which the payload does not carry: the rebuild
+/// derives it from L1. This test posts the DA certificates to anvil,
+/// serves the payloads from a fake EigenDA proxy, and runs the real
+/// `kardamom-reconstruct --lockbox --expect-root` binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s8_da_parity_batcher_matches_validator() {
@@ -87,19 +89,16 @@ async fn s8_da_parity_batcher_matches_validator() {
     let l1 = stack.l1().expect("l1");
     let params = da_parity::Params::default();
 
-    // 1. Run a deposit-free workload, then recover the canonical blocks it
-    //    produced from the pipeline's own receipts.
-    let blocks = da_parity::run_workload(&t, &params)
+    // 1. Run the workload: a deposit, then transfers, one of which spends
+    //    the deposit.
+    let workload = da_parity::run_workload(&t, l1, &params)
         .await
         .expect("S8 workload");
 
-    // 2. Disperse them through the DA proxy and post the certificates
-    //    to L1.
-    let da = post_and_verify_da(l1, &blocks, "S8").await;
-
-    // 3. The parity target: the validator's own committed root, read from
+    // 2. The parity target: the validator's own committed root, read from
     //    its live database once the chain has settled on it.
     let val_dir = stack.validator_state_dir().expect("validator state dir");
+    let head = workload.head();
     let expected_root = e2e::harness::metrics::poll_until(
         "validator root covering the workload",
         Duration::from_mins(1),
@@ -110,7 +109,6 @@ async fn s8_da_parity_batcher_matches_validator() {
                 .await
                 .unwrap_or(0.0);
             let committed = e2e::scenarios::metric_u64(committed_f64)?;
-            let head = blocks.last().map_or(0, |b| b.block_number);
             if committed < head {
                 return Ok(None);
             }
@@ -120,17 +118,30 @@ async fn s8_da_parity_batcher_matches_validator() {
     .await
     .expect("validator root");
 
-    // 4. Rebuild from L1 alone. The roots must match.
+    // 3. The canonical blocks the batcher would post: every header the
+    //    validator committed, with the workload's transactions placed by
+    //    their receipts. The blocks after the workload change no state.
+    let blocks = workload
+        .canonical_blocks(&val_dir)
+        .await
+        .expect("S8 canonical blocks");
+
+    // 4. Disperse them through the DA proxy and post the certificates
+    //    to L1.
+    let da = post_and_verify_da(l1, &blocks, "S8").await;
+
+    // 5. Rebuild from L1 alone. The roots must match.
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis =
         e2e::harness::services::repo_root().join("deploy/cluster/config/genesis/dev.toml");
-    da_parity::reconstruct_and_compare(
-        &l1.rpc_url(),
-        l1.settlement,
-        &da.url(),
-        &genesis,
-        recon_dir.path(),
-        expected_root,
-    )
+    let (l1_rpc, da_proxy) = (l1.rpc_url(), da.url());
+    da_parity::Reconstruct {
+        l1_rpc: &l1_rpc,
+        settlement: l1.settlement,
+        lockbox: l1.lockbox,
+        da_proxy: &da_proxy,
+        genesis: &genesis,
+    }
+    .compare(recon_dir.path(), expected_root)
     .expect("S8 DA parity");
 }
