@@ -50,7 +50,7 @@ mod tests;
 
 pub use egress::{
     EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
-    encode_replay_done, encode_replay_unavailable,
+    encode_replay_ahead, encode_replay_done, encode_replay_unavailable,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use egress::{
@@ -186,6 +186,13 @@ pub const EGRESS_KIND_REPLAY_UNAVAILABLE: u8 = 3;
 /// at completion time. The consumer exits catch-up ordering mode. Matches
 /// Java `EGRESS_KIND_REPLAY_DONE`.
 pub const EGRESS_KIND_REPLAY_DONE: u8 = 4;
+/// Egress kind: replay refused, because the requested cursor is past the
+/// sealer's head: `[kind:u8 = 11][head_index:u64][head_block:u64]`. The
+/// head is the next canonical index and the next block number, as in
+/// [`EGRESS_KIND_REPLAY_DONE`]. The consumer applied records that the
+/// sealer does not hold, so no replay and no repair from this stream can
+/// serve it. The consumer stops. Matches Java `EGRESS_KIND_REPLAY_AHEAD`.
+pub const EGRESS_KIND_REPLAY_AHEAD: u8 = 11;
 /// Egress kind: contiguity reject. A known sender's ingress record
 /// carried a nonce other than the expected next one, so sealing it would
 /// commit a canonical nonce gap:
@@ -402,8 +409,9 @@ pub enum WireError {
 
 /// Encode the shared `[kind:u8][a:u64 LE][b:u64 LE]` control frame. The
 /// replay request ([`KIND_REPLAY_REQUEST`]), replay-unavailable
-/// ([`EGRESS_KIND_REPLAY_UNAVAILABLE`]), and replay-done
-/// ([`EGRESS_KIND_REPLAY_DONE`]) messages are byte-identical, apart from
+/// ([`EGRESS_KIND_REPLAY_UNAVAILABLE`]), replay-done
+/// ([`EGRESS_KIND_REPLAY_DONE`]), and replay-ahead
+/// ([`EGRESS_KIND_REPLAY_AHEAD`]) messages are byte-identical, apart from
 /// the kind byte.
 fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 8 + 8);

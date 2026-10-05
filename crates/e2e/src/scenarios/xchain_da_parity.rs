@@ -24,9 +24,9 @@
 //! receiver's stored calldata, and the 0x7D receipts keyed by
 //! `remote_source_hash`.
 //!
-//! S8's honest limits carry over: deposit-free by construction (no
-//! `depositETH` runs here) and synthesized `l2_timestamp`s (no workload
-//! contract reads TIMESTAMP — the Outbox/Inbox predeploys read only
+//! Two limits: the workload is deposit-free (no `depositETH` runs here),
+//! and the blocks carry synthesized `l2_timestamp`s (no workload contract
+//! reads TIMESTAMP — the Outbox/Inbox predeploys read only
 //! `block.chainid`).
 
 use std::collections::BTreeMap;

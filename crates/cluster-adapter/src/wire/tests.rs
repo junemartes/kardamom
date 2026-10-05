@@ -520,6 +520,19 @@ fn a_void_record_with_no_index_is_too_short() {
 }
 
 #[test]
+fn replay_ahead_roundtrip() {
+    let b = encode_replay_ahead(5, 3);
+    assert_eq!(b[0], 11, "kind 11, as Java EGRESS_KIND_REPLAY_AHEAD");
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::ReplayAhead {
+            head_index: 5,
+            head_block: 3,
+        }
+    );
+}
+
+#[test]
 fn replay_unavailable_roundtrip() {
     let b = encode_replay_unavailable(100, 7);
     assert_eq!(
