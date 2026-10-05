@@ -42,6 +42,8 @@ pub struct DeployVars {
     pub cluster_snapshot_interval_s: Option<u64>,
     /// `-Dkardamom.cluster.retention` of the sealer, in frames.
     pub cluster_retention: Option<u64>,
+    /// `-Dkardamom.cluster.daLagBudgetBlocks` of the sealer, in blocks.
+    pub da_lag_budget_blocks: Option<u64>,
     /// Deploy the L1 fault proxy in front of the in-cluster anvil, and
     /// point the followers (the batcher, the da-watcher, the indexer) at
     /// it. The indexer is deployed only with it on a container cluster.
@@ -58,6 +60,9 @@ impl DeployVars {
         let retention = self
             .cluster_retention
             .map(|v| ("KARDAMOM_CLUSTER_RETENTION", v.to_string()));
+        let budget = self
+            .da_lag_budget_blocks
+            .map(|v| ("KARDAMOM_DA_LAG_BUDGET_BLOCKS", v.to_string()));
         let proxy = self
             .l1_fault_proxy
             .then(|| ("KARDAMOM_L1_FAULT_PROXY", "1".to_string()));
@@ -67,6 +72,7 @@ impl DeployVars {
         snapshot
             .into_iter()
             .chain(retention)
+            .chain(budget)
             .chain(proxy)
             .chain(poll)
             .collect()

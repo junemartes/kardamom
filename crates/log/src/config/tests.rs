@@ -144,6 +144,27 @@ fn tx_remote_epochs_defaults_present() {
 }
 
 #[test]
+fn events_defaults_present() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(ch.events_stream_id, 1019);
+    assert!(ch.events_channel.contains("events"));
+    // Aeron IPC routes by stream id, so a collision delivers another
+    // stream's frames to be rkyv-decoded as a ServiceEvent.
+    for other in [
+        ch.tx_receipts_stream_id,
+        ch.tx_receipts_stream_id + 1,
+        ch.tx_bal_stream_id,
+        ch.tx_errors_stream_id,
+        ch.tx_deposits_stream_id,
+        ch.tx_remote_epochs_stream_id,
+        ch.fsync_watermark_stream_id,
+        ch.tx_status_stream_id,
+    ] {
+        assert_ne!(ch.events_stream_id, other);
+    }
+}
+
+#[test]
 fn tx_status_defaults_present() {
     let ch = ChannelsConfig::default();
     assert_eq!(ch.tx_status_stream_id, 1018);
@@ -158,6 +179,7 @@ fn tx_status_defaults_present() {
         ch.tx_deposits_stream_id,
         ch.tx_remote_epochs_stream_id,
         ch.fsync_watermark_stream_id,
+        ch.events_stream_id,
     ] {
         assert_ne!(ch.tx_status_stream_id, other);
     }

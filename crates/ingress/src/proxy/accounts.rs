@@ -85,21 +85,19 @@ where
         self.redis.as_ref()?.account(address).await
     }
 
-    /// The ingress serves only the head. `latest`, `pending`, `safe`,
-    /// and `finalized` all name it: there is no L2 reorg, so the head is
-    /// final as soon as it exists. A number other than the latest block,
-    /// or `earliest`, asks for history the ingress does not hold.
+    /// The ingress serves only the head. `latest` and `pending` name it.
+    /// `safe` and `finalized` name the last block posted to L1, which is
+    /// the head only once the batcher caught up; behind the head they
+    /// ask for history the ingress does not hold, as a number other than
+    /// the latest block or `earliest` does.
     fn check_block_tag(&self, block: BlockNumberOrTag) -> Result<(), IngressError> {
         let latest = self.latest_block_number();
-        match block {
-            BlockNumberOrTag::Latest
-            | BlockNumberOrTag::Pending
-            | BlockNumberOrTag::Safe
-            | BlockNumberOrTag::Finalized => Ok(()),
-            BlockNumberOrTag::Number(n) if n == latest => Ok(()),
-            other => Err(IngressError::Decode(format!(
-                "block {other} not served: the ingress answers only the head (block {latest})"
-            ))),
+        let named = self.block_number_of(block)?;
+        if named == latest {
+            return Ok(());
         }
+        Err(IngressError::Decode(format!(
+            "block {block} (block {named}) not served: the ingress answers only the head (block {latest})"
+        )))
     }
 }
