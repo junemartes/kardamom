@@ -254,6 +254,10 @@ job "ingress" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "ingress-${NOMAD_ALLOC_INDEX}"
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node. The port is the ingress convention,
         # 9006 (the validator uses the same number on the aux node).

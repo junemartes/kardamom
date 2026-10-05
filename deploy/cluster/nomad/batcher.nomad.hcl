@@ -274,6 +274,10 @@ job "batcher" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID      = "batcher-${NOMAD_ALLOC_INDEX}"
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9002"
         KARDAMOM_L1_KEY       = "${var.batcher_key}"
       }

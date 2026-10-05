@@ -145,6 +145,10 @@ job "executor" {
       # chosen from data. This stays unset in normal operation, and is
       # harmless (log-only) when set.
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "executor-${NOMAD_ALLOC_INDEX}"
         # BAL attribution granularity. K=20 measured a 31% reduction
         # in frame bytes on contract workloads
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi

@@ -281,6 +281,10 @@ job "validator" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "validator-${NOMAD_ALLOC_INDEX}"
         # Validator metrics run on port 9006. The executor holds port
         # 9004 on the same host.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"
