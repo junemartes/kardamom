@@ -87,7 +87,7 @@ pub enum Outcome {
 impl Outcome {
     /// The nonce whose publish this confirms. `None` for a deposit.
     #[must_use]
-    pub fn confirmed(self) -> Option<u64> {
+    pub(crate) fn confirmed(self) -> Option<u64> {
         match self {
             Self::Executed { nonce } | Self::Skipped { nonce, .. } => Some(nonce),
             Self::Deposit => None,
@@ -96,7 +96,7 @@ impl Outcome {
 
     /// The floor this proves. `Some` only for an executed tx.
     #[must_use]
-    pub fn floor(self) -> Option<u64> {
+    pub(crate) fn floor(self) -> Option<u64> {
         match self {
             Self::Executed { nonce } => Some(nonce.saturating_add(1)),
             Self::Skipped { .. } | Self::Deposit => None,
