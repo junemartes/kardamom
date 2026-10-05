@@ -267,6 +267,9 @@ job "monitoring" {
         args = [
           "--config.file=/local/alertmanager.yml",
           "--storage.path=/alloc/data/alertmanager",
+          # One instance: no peer gossip. The default listener takes port
+          # 9094 on every interface of the host, outside the job's ports.
+          "--cluster.listen-address=",
         ]
       }
 
