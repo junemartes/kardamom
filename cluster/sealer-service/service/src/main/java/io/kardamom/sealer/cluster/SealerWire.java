@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.SealerSeed;
 
 /**
  * The Java side of the Kardamom cluster wire protocol. It defines app-envelope
@@ -150,6 +151,19 @@ public final class SealerWire {
     static final int POSTED_HEAD_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Exact length of a {@link #KIND_POSTED_CURSOR} frame. */
     static final int MIN_POSTED_CURSOR_LEN = POSTED_HEAD_OFFSET + Long.BYTES;
+
+    /**
+     * Seed record: {@code [kind:8][digest:32]}, the SHA-256 of the seed
+     * file the cluster started from. Only the service writes it, through
+     * {@code Cluster.offer}, so it reaches the log with no client session.
+     * A client frame of this kind is malformed. No Rust producer uses the
+     * number, and none may.
+     */
+    public static final byte KIND_SEED_EPOCH = 8;
+    /** Offset of the digest within a {@link #KIND_SEED_EPOCH} frame. */
+    static final int SEED_DIGEST_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Exact length of a {@link #KIND_SEED_EPOCH} frame. */
+    static final int SEED_EPOCH_LEN = SEED_DIGEST_OFFSET + SealerSeed.HASH_LEN;
 
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
