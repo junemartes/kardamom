@@ -485,9 +485,9 @@ impl IngressService {
     }
 
     /// Whether the CLI or the config file names a cluster egress channel.
+    /// The CLI endpoint is in the config from the load on.
     fn has_egress_channel(&self) -> bool {
-        self.args.cluster_egress_endpoint.is_some()
-            || !self.file_cfg.cluster.to_live().egress_channel.is_empty()
+        !self.file_cfg.cluster.egress_channel.is_empty()
     }
 
     /// Builds the config, opens Aeron, starts the cluster egress tap when
