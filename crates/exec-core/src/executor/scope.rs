@@ -214,16 +214,10 @@ impl<S: StateDatabase> Executor<S> {
         let signer = inbound_envelope.sender; // trusted from the proxy; no recovery
         let nonce = alloy_env.nonce();
         let to = alloy_env.to();
-        // Effective gas price mirrors the value `tx_env_from_alloy` feeds
-        // to revm: the legacy or 2930 `gas_price` when present, otherwise
-        // the 1559 or 4844 `max_fee_per_gas` cap. Version 0 has
-        // basefee = 0, so the cap is what gets paid.
-        let effective_gas_price = alloy_env
-            .gas_price()
-            .unwrap_or_else(|| alloy_env.max_fee_per_gas());
+        let fees = alloy_env.fees();
 
         let tx_env = alloy_env.tx_env(signer);
-        let outcome = match self.evm.transact(tx_env) {
+        let mut outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
             // Deterministic input invalidity: every replica computes the
             // same rejection from the same state and tx. Skip, never halt.
@@ -260,6 +254,12 @@ impl<S: StateDatabase> Executor<S> {
             }
         };
 
+        // The chain's settlement on top of revm's: the tip in full, the
+        // base fee as the receipt's price.
+        let gas_used = outcome.result.gas().tx_gas_used();
+        let price =
+            crate::settle::settle(&fees, self.env.fees, gas_used, &mut outcome.state, signer)?;
+
         // Build the write set from revm's per-tx EvmState. Only touched
         // and changed accounts and slots are emitted, which keeps the
         // per-tx hash stable across replicas. Revm iterates over an
@@ -284,7 +284,7 @@ impl<S: StateDatabase> Executor<S> {
             nonce,
             to,
             signer,
-            effective_gas_price,
+            price,
             write_set_hash,
         })?;
         Ok((receipt, ws))
@@ -387,7 +387,9 @@ impl<S: StateDatabase> Executor<S> {
             from: inputs.signer,
             to: inputs.to,
             contract_address,
-            effective_gas_price: inputs.effective_gas_price,
+            effective_gas_price: inputs.price.effective_gas_price,
+            priority_fee_per_gas: inputs.price.priority_fee_per_gas,
+            priority_fee_paid: inputs.price.priority_fee_paid,
             block_number: self.env.block_number,
             transaction_index: inputs.slot.tx_index_in_block,
             cumulative_gas_used,
@@ -408,7 +410,7 @@ struct TxReceiptInputs<'a> {
     nonce: u64,
     to: Option<Address>,
     signer: Address,
-    effective_gas_price: u128,
+    price: crate::settle::ReceiptPrice,
     write_set_hash: B256,
 }
 

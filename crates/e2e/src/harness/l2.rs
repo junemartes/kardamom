@@ -92,7 +92,7 @@ impl L2Client {
         })
     }
 
-    async fn call<T: jsonrpsee::core::DeserializeOwned>(
+    pub(crate) async fn call<T: jsonrpsee::core::DeserializeOwned>(
         &self,
         method: &str,
         params: jsonrpsee::core::params::ArrayParams,
@@ -222,6 +222,9 @@ pub struct SignedTransfer {
     pub nonce: u64,
 }
 
+/// The price per gas every standard shape pays: one gwei.
+const STANDARD_GAS_PRICE: u128 = 1_000_000_000;
+
 /// A legacy call with the standard 1 gwei gas price and no input, varying
 /// only in nonce, gas limit, recipient, and value. For callers that build
 /// an unsigned or deliberately mis-signed transaction directly, instead
@@ -231,7 +234,7 @@ pub fn legacy_tx(chain_id: u64, nonce: u64, gas_limit: u64, to: Address, value: 
     TxLegacy {
         chain_id: Some(chain_id),
         nonce,
-        gas_price: 1_000_000_000,
+        gas_price: STANDARD_GAS_PRICE,
         gas_limit,
         to: TxKind::Call(to),
         value,
@@ -244,6 +247,8 @@ pub fn legacy_tx(chain_id: u64, nonce: u64, gas_limit: u64, to: Address, value: 
 /// caller already carries.
 struct LegacyTxShape {
     gas_limit: u64,
+    /// The price per gas, in wei. The standard shapes pay one gwei.
+    gas_price: u128,
     to: TxKind,
     value: U256,
     input: Bytes,
@@ -266,7 +271,7 @@ fn sign_legacy(
     let mut tx = TxLegacy {
         chain_id: Some(chain_id),
         nonce,
-        gas_price: 1_000_000_000,
+        gas_price: spec.gas_price,
         gas_limit: spec.gas_limit,
         to: spec.to,
         value: spec.value,
@@ -314,7 +319,36 @@ pub fn sign_transfer(
             to: TxKind::Call(to),
             value: U256::from(value_wei),
             input: Bytes::new(),
+            gas_price: STANDARD_GAS_PRICE,
             what: "transfer",
+        },
+    )
+}
+
+/// A 21k-gas, 1-wei legacy transfer at `gas_price` wei per gas instead
+/// of the standard 1 gwei. The fee scenarios price a transaction under
+/// the base fee with it.
+///
+/// # Errors
+/// Returns an error when signing the transaction fails.
+pub fn sign_priced_transfer(
+    signer: &DerivedSigner,
+    chain_id: u64,
+    nonce: u64,
+    to: Address,
+    gas_price: u128,
+) -> Result<SignedTransfer> {
+    sign_legacy(
+        signer,
+        chain_id,
+        nonce,
+        LegacyTxShape {
+            gas_limit: 21_000,
+            gas_price,
+            to: TxKind::Call(to),
+            value: U256::from(1u64),
+            input: Bytes::new(),
+            what: "priced transfer",
         },
     )
 }
@@ -412,6 +446,7 @@ pub fn sign_create(
             to: TxKind::Create,
             value: U256::ZERO,
             input: Bytes::copy_from_slice(init_code),
+            gas_price: STANDARD_GAS_PRICE,
             what: "create",
         },
     )
@@ -440,6 +475,7 @@ pub fn sign_call(
             to: TxKind::Call(to),
             value,
             input: Bytes::copy_from_slice(input),
+            gas_price: STANDARD_GAS_PRICE,
             what: "call",
         },
     )

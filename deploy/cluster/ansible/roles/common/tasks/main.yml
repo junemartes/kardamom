@@ -63,6 +63,21 @@
     - not (kardamom_in_container | default(false) | bool)
     - common_sysctl_core.stat.exists
 
+# Every fixed Aeron port of the cluster (the stream channels from 40000 and
+# the sealer member and admin ports from 40200) lies inside the Linux
+# ephemeral range (32768-60999). An outbound socket or an Aeron
+# dynamic-control channel can take one of them first, and the service that
+# owns the port then fails to bind and crash-loops. Reserving the block takes
+# it out of the ephemeral pool. The key is per network namespace, so the
+# task applies on a machine and inside a node container alike.
+- name: Reserve the fixed cluster port block from the ephemeral range
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_local_reserved_ports
+    value: "{{ fixed_port_block }}"
+    sysctl_file: /etc/sysctl.d/99-kardamom-ports.conf
+    state: present
+    reload: true
+
 - name: Create on-node kardamom directories
   ansible.builtin.file:
     path: "{{ item }}"
@@ -74,7 +89,10 @@
     - "{{ paths.state_dir }}"
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
+    - "{{ paths.notifier_dir }}"
     - "{{ paths.batcher_dir }}"
+    - "{{ paths.l1_indexer_dir }}"
+    - "{{ paths.da_store_dir }}"
     - "{{ paths.config_dir }}"
 
 - name: Create the Aeron tmpfs mount point

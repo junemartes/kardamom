@@ -9,12 +9,12 @@
 //!    `pack_blocks` pipeline to produce the same `PostedBatch` the
 //!    lease-holder would broadcast.
 //! 4. Deploy `KardamomL2Settlement` through the kardamom factory, and call
-//!    `postBatch(prevBatchIndex, versionedHashes, l2BlockStart,
-//!    l2BlockEnd)` from the batcher EOA directly, with stub versioned
-//!    hashes instead of a real 4844 sidecar (`l1::post_batch` sends the
-//!    real sidecar; this test's scope is the calldata path and the
-//!    `BatchPosted` event, not sidecar broadcasting).
-//! 5. Reconstruct the L2 stream from the locally held blob bytes, and
+//!    `postBatch(prevBatchIndex, daCert, l2BlockStart, l2BlockEnd,
+//!    recordsCommitment)` from the batcher EOA directly, with a stub
+//!    certificate instead of one from a real dispersal (`l1::post_batch`
+//!    disperses through the EigenDA proxy; this test's scope is the
+//!    calldata path and the `BatchPosted` event, not dispersal).
+//! 5. Reconstruct the L2 stream from the locally held payload bytes, and
 //!    check it matches the inputs. This is the same invariant a real
 //!    L1-observer client would use to recover the L2 state.
 //!
@@ -24,7 +24,7 @@
 //! ordering must round-trip through the batcher exactly as the pre-split
 //! single-archive layout did.
 
-use alloy_primitives::{Address, B256, address};
+use alloy_primitives::{Address, B256, Bytes, address};
 use alloy_sol_types::SolEvent;
 use kardamom_batcher::batcher::{Batcher, BatcherConfig, MockSender, PostedBatch, pack_blocks};
 use kardamom_batcher::multi_archive_reader::{
@@ -33,6 +33,7 @@ use kardamom_batcher::multi_archive_reader::{
 use kardamom_batcher::recon::reconstruct;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_batcher::testkit::{MPlusOneArchives, write_m_plus_one_archives};
+use kardamom_batcher::testkit_da::FakeDaProxy;
 use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use tempfile::TempDir;
@@ -72,17 +73,14 @@ fn drive_batcher_pipeline(archives: &MPlusOneArchives, cfg: &BatcherConfig) -> P
     let posted = batcher.sender().sent[0].clone();
     assert_eq!(posted.l2_block_start, 42);
     assert_eq!(posted.l2_block_end, 42);
-    assert!(
-        !posted.blobs.is_empty(),
-        "batch must contain at least one blob"
-    );
+    assert!(!posted.payload.is_empty(), "batch must carry a payload");
     posted
 }
 
 /// One resolved record from the multi-archive reader: feed it into the
 /// accumulator, or, at a boundary, pack the closed block, reconstruct it
-/// from the just-packed blobs (mirroring what a section 6 L1-observer
-/// client does after downloading sidecar bytes from the beacon node), and
+/// from the just-packed payload (mirroring what a section 6 L1-observer
+/// client does after it fetches the payload from the DA proxy), and
 /// check it against the fixture.
 fn apply_resolved_record(
     batcher: &mut Batcher<MockSender>,
@@ -95,7 +93,7 @@ fn apply_resolved_record(
     };
     let pack = pack_blocks(cfg, std::slice::from_ref(&closed)).expect("pack");
 
-    let reconstructed = reconstruct(&pack.blobs).expect("reconstruct");
+    let reconstructed = reconstruct(&pack.payload).expect("reconstruct");
     assert_eq!(reconstructed.len(), 1);
     let block = &reconstructed[0];
     assert_eq!(block.block_number, 42);
@@ -109,16 +107,14 @@ fn apply_resolved_record(
     batcher.on_closed_block(closed).expect("on_closed");
 }
 
-/// Deploy `KardamomL2Settlement`, post `posted` with stub versioned
-/// hashes, and check the `BatchPosted` event. `None` if anvil is
+/// Deploy `KardamomL2Settlement`, post `posted` with a stub certificate,
+/// and check the `BatchPosted` event carries it. `None` if anvil is
 /// unavailable — the caller skips.
 ///
-/// Deterministic stub versioned hashes stand in for the real 4844
-/// sidecar's KZG-derived ones: the real broadcast path uses
-/// `alloy-consensus::BlobTransactionSidecar`, which needs the trusted
-/// setup to compute, out of scope here. The contract only stores and
-/// emits the hashes; it never opens the blob bytes, so a stub is enough to
-/// exercise the post-batch and event-emission path.
+/// A deterministic stub certificate (the fake proxy's, derived from the
+/// payload) stands in for the one a real dispersal returns. The contract
+/// only stores and emits the certificate; it never opens the payload, so
+/// a stub is enough to exercise the post-batch and event-emission path.
 async fn post_batch_to_anvil_and_verify_event(posted: &PostedBatch) -> Option<()> {
     let rig = AnvilRig::spawn(
         alloy_node_bindings::Anvil::new(),
@@ -147,16 +143,13 @@ async fn post_batch_to_anvil_and_verify_event(posted: &PostedBatch) -> Option<()
     assert_eq!(entries.len(), 1);
     let settlement_addr = entries[0].proxy;
 
-    let versioned_hashes: Vec<B256> = (0..posted.blobs.len())
-        .map(|i| B256::repeat_byte(0xA0 + u8::try_from(i).unwrap()))
-        .collect();
-    assert_eq!(versioned_hashes.len(), posted.blobs.len());
+    let da_cert: Bytes = FakeDaProxy::cert_of(&posted.payload);
 
     let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
     let receipt = settlement
         .postBatch(
             0,
-            versioned_hashes.clone(),
+            da_cert.clone(),
             posted.l2_block_start,
             posted.l2_block_end,
             posted.records_commitment,
@@ -183,16 +176,21 @@ async fn post_batch_to_anvil_and_verify_event(posted: &PostedBatch) -> Option<()
     assert_eq!(log_topics.len(), 2, "BatchPosted indexes only batchIndex");
     let idx = u64::from_be_bytes(log_topics[1].as_slice()[24..32].try_into().unwrap());
     assert_eq!(idx, 1, "first post advances index 0 -> 1");
+    let event = IKardamomL2Settlement::BatchPosted::decode_log(&log.inner).expect("decode event");
+    assert_eq!(
+        event.data.daCert, da_cert,
+        "the event carries the certificate the batcher posted"
+    );
     Some(())
 }
 
-/// Reconstruct `posted`'s locally-held blob bytes and check the result
+/// Reconstruct `posted`'s locally-held payload bytes and check the result
 /// matches the canonical input order. In production, a section 6 observer
-/// fetches the blob bytes from the L1 beacon node by versioned hash; this
-/// test uses the bytes it already has, because its scope is the offline,
-/// on-chain, and reconstruct invariant, not beacon-node integration.
+/// fetches the payload from the DA proxy by certificate; this test uses
+/// the bytes it already has, because its scope is the offline, on-chain,
+/// and reconstruct invariant, not proxy integration.
 fn assert_reconstructs_to_canonical_order(posted: &PostedBatch, canonical: &[u64]) {
-    let reconstructed = reconstruct(&posted.blobs).expect("reconstruct posted batch");
+    let reconstructed = reconstruct(&posted.payload).expect("reconstruct posted batch");
     assert_eq!(reconstructed.len(), 1);
     assert_canonical_order(&reconstructed[0].txs, canonical);
 }
@@ -216,6 +214,6 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
         return;
     }
 
-    // ----- assert: reconstruct from the locally-held blob bytes -----
+    // ----- assert: reconstruct from the locally-held payload bytes -----
     assert_reconstructs_to_canonical_order(&posted, &archives.canonical_order);
 }

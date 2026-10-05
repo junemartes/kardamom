@@ -57,7 +57,7 @@ fn bench_pack(c: &mut Criterion) {
         };
         b.iter(|| {
             let out = pack_blocks(&cfg, black_box(&block_600k)).unwrap();
-            black_box(out.blobs.len());
+            black_box(out.payload.len());
         });
     });
 
@@ -68,7 +68,7 @@ fn bench_pack(c: &mut Criterion) {
         };
         b.iter(|| {
             let out = pack_blocks(&cfg, black_box(&block_600k)).unwrap();
-            black_box(out.blobs.len());
+            black_box(out.payload.len());
         });
     });
     group.finish();

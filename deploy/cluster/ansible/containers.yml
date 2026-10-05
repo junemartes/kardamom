@@ -31,6 +31,7 @@
         kardamom_node: "{{ item.name }}"
         node_ip: "{{ item.ip }}"
         role: "{{ item.role }}"
+        node_roles: "{{ item.roles }}"
         tier: "{{ item.tier }}"
         node_index: "{{ item.index }}"
         control_plane: "{{ item.control_plane }}"

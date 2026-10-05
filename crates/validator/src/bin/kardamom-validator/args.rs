@@ -44,8 +44,16 @@ pub(crate) struct ValidatorFileConfig {
 )]
 pub(crate) struct Args {
     /// Path to the TOML config file. Its presence is checked; tuning uses flags.
-    #[arg(long)]
-    pub(crate) config: PathBuf,
+    /// Only `--clear-verdict` runs without it.
+    #[arg(long, required_unless_present = "clear_verdict")]
+    pub(crate) config: Option<PathBuf>,
+    /// Clear the divergence verdict beside `--state-dir` and exit. A
+    /// validator that runs halted on that verdict sees the removal within
+    /// its poll interval and resumes from its cursor. Nothing else starts:
+    /// no exporter, no Aeron. Run it from the validator's allocation, so
+    /// the state directory is the same one.
+    #[arg(long, default_value_t = false)]
+    pub(crate) clear_verdict: bool,
     /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
     #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
     pub(crate) log_config: Option<PathBuf>,
@@ -75,6 +83,13 @@ pub(crate) struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     pub(crate) state_durability: StateDurabilityArg,
+    /// Serve read-only state queries on this address: the committed
+    /// nonce, balance and receipt, and a block's transaction references
+    /// (`kardamom_getBlockRefs`) the batcher reads when the sealer no
+    /// longer retains the block. The same endpoint as the executor's flag
+    /// of this name. Off when unset.
+    #[arg(long, env = "KARDAMOM_NONCE_QUERY_ADDR")]
+    pub(crate) nonce_query_addr: Option<std::net::SocketAddr>,
     /// Local checkpoint staging dir for the replay-unavailable fallback.
     /// Peer checkpoints are fetched here and adopted on the next start.
     /// The validator never creates checkpoints, since its state is
@@ -125,6 +140,11 @@ pub(crate) struct Args {
     /// must not compete for one socket. See docs/observability.md.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9007")]
     pub(crate) metrics_addr: std::net::SocketAddr,
+    /// `/ready` passes while no divergence verdict stands and the
+    /// committed block is at most this many blocks behind the sealer's
+    /// head.
+    #[arg(long, env = "KARDAMOM_READY_LAG_BLOCKS", default_value_t = 8)]
+    pub(crate) ready_lag_blocks: u32,
     /// Host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     pub(crate) host_id: String,

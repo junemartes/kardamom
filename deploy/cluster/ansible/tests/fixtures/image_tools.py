@@ -29,7 +29,9 @@ if Path(sys.argv[0]).name == 'cosign':
     fail_at(args[0])
     if args[0] == 'sign-blob':
         manifest = Path(args[-1]).read_text()
-        assert len(manifest.splitlines()) == 10, manifest
+        # One record per image: aeron, redis, the eleven services of
+        # tests/test_images.py, cluster, the light client.
+        assert len(manifest.splitlines()) == 15, manifest
         Path(args[args.index('--bundle') + 1]).write_text(manifest)
     sys.exit(0)
 

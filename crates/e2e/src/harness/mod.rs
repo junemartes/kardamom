@@ -38,7 +38,7 @@ use anyhow::Result;
 pub use config::{DEV_CHAIN_ID, Genesis, StackConfig};
 use load_sampler::LoadSampler;
 use sealer::SealerCluster;
-use services::{ServiceSpec, Spawned, SpawnedIngress};
+use services::{ServiceSpec, Spawned, SpawnedIngress, SpawnedNotifier};
 use shutdown::ShutdownReport;
 
 use crate::scenarios::Target;
@@ -48,6 +48,7 @@ pub struct LocalStack {
     // Drop order matters. Services must die before the sealer and driver
     // they attach to, and the temp root must outlive everything. Fields
     // drop in declaration order.
+    notifier: Option<SpawnedNotifier>,
     ingress: SpawnedIngress,
     da_watcher: Option<Spawned>,
     verified_l1: Option<l1_verified::VerifiedL1>,
@@ -175,6 +176,12 @@ impl LocalStack {
         launch::StackLaunch::new(&self.cfg, self.root.path(), &self.driver, &self.sealer)
             .with_executor_query_port(self.executor_query_port)
             .assemble_spec(&self.genesis, self.log_config.as_deref())
+    }
+
+    /// The WS URL of this stack's notifier feed (`StackConfig::notifier`).
+    #[must_use]
+    pub fn notifier_ws_url(&self) -> Option<&str> {
+        self.notifier.as_ref().map(|n| n.ws_url.as_str())
     }
 
     /// The WS URL of this stack's validator feed

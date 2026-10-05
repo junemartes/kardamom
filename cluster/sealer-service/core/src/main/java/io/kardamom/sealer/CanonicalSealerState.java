@@ -68,6 +68,14 @@ public final class CanonicalSealerState {
      */
     public static final long DEFAULT_INCLUSION_HORIZON_BLOCKS = 64L;
 
+    /**
+     * Default ordering window: off. The deploy sets {@code 20} together with
+     * the sequencer's priority-fee setting, and every member must run the
+     * same value: the window decides the relay order inside the replicated
+     * state machine.
+     */
+    public static final int DEFAULT_ORDERING_WINDOW = 0;
+
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
     /**
      * Version 2 added the contiguity-guard sender map. Version 3 adds the
@@ -81,9 +89,11 @@ public final class CanonicalSealerState {
      * ({@code nextSeqKnown} + {@code nextSeq}). A v4 entry loads with an
      * unknown cursor, so the peer re-seeds its cursor on its next record
      * (trust-on-first-sight). A cluster can upgrade in place without a
-     * coordinated snapshot migration.
+     * coordinated snapshot migration. Version 8 adds the ordering window
+     * size at the tail, so a member that restores a snapshot checks its
+     * own setting against the one the cluster runs.
      */
-    private static final int SNAPSHOT_VERSION = 7;
+    private static final int SNAPSHOT_VERSION = 8;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -122,6 +132,13 @@ public final class CanonicalSealerState {
      * accept-or-reject inside the replicated state machine.
      */
     private final long inclusionHorizonBlocks;
+    /**
+     * The ordering window size, 0 for off. Replicated configuration like
+     * the two above: the window decides the relay order. The snapshot
+     * carries it, and a member that loads a snapshot taken with another
+     * value halts.
+     */
+    private final int orderingWindow;
 
     /**
      * Per-sender expected next nonce. This map is LRU-bounded at the dedup
@@ -284,6 +301,22 @@ public final class CanonicalSealerState {
             Set<Long> remoteOrigins,
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks) {
+        this(dedupCapacity, initialBlockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
+            DEFAULT_ORDERING_WINDOW);
+    }
+
+    /**
+     * The full constructor with the ordering window. {@code orderingWindow}
+     * is the record count a window holds before it flushes, or 0 for no
+     * window. Replicated configuration: every member must agree on it.
+     */
+    public CanonicalSealerState(
+            int dedupCapacity,
+            long initialBlockNumber,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
@@ -292,8 +325,12 @@ public final class CanonicalSealerState {
                     "inclusionHorizonBlocks must be > 0, got " + inclusionHorizonBlocks);
         }
         this.remoteOriginAllowlist = Set.copyOf(remoteOrigins);
+        if (orderingWindow < 0) {
+            throw new IllegalArgumentException("orderingWindow must be >= 0, got " + orderingWindow);
+        }
         this.dedupCapacity = dedupCapacity;
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
+        this.orderingWindow = orderingWindow;
         this.dedup = new LinkedHashMap<>();
         this.byDeadline = new TreeMap<>();
         this.expectedNonce = new LinkedHashMap<>(16, 0.75f, true) {
@@ -603,7 +640,7 @@ public final class CanonicalSealerState {
                 .relayed;
     }
 
-    private static boolean isZeroSender(byte[] sender20) {
+    static boolean isZeroSender(byte[] sender20) {
         for (byte b : sender20) {
             if (b != 0) {
                 return false;
@@ -932,6 +969,11 @@ public final class CanonicalSealerState {
         return dedupCapacity;
     }
 
+    /** The ordering window size this member runs, 0 for off. */
+    public int orderingWindow() {
+        return orderingWindow;
+    }
+
     /** Current number of ids held in the dedup window. */
     public int dedupSize() {
         return dedup.size();
@@ -991,7 +1033,8 @@ public final class CanonicalSealerState {
                 + 4 + senderCount * (SENDER_LEN + 8)
                 + 8 + 8 + 8
                 + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
-                + voids.snapshotLen(canonicalCount);
+                + voids.snapshotLen(canonicalCount)
+                + 4;
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -1032,6 +1075,8 @@ public final class CanonicalSealerState {
         }
         // v6 tail: the void window, then the open votes.
         voids.writeTo(buf, canonicalCount);
+        // v8 tail: the ordering window the cluster runs.
+        buf.putInt(orderingWindow);
         return buf.array();
     }
 
@@ -1085,6 +1130,25 @@ public final class CanonicalSealerState {
             Set<Long> remoteOrigins,
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks) {
+        return load(snapshot, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks,
+            DEFAULT_ORDERING_WINDOW);
+    }
+
+    /**
+     * {@link #load(byte[], int, Set, VoidLedger.Config, long)} with this
+     * member's ordering window. A version-8 snapshot carries the window the
+     * cluster runs; a member started with another value halts here, before
+     * it relays one record in a different order than its peers.
+     *
+     * @param orderingWindow this member's configured window size
+     */
+    public static CanonicalSealerState load(
+            byte[] snapshot,
+            int dedupCapacity,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow) {
         ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
@@ -1119,7 +1183,8 @@ public final class CanonicalSealerState {
         }
 
         CanonicalSealerState state = new CanonicalSealerState(
-                dedupCapacity, blockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks);
+                dedupCapacity, blockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
+                orderingWindow);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
@@ -1183,6 +1248,14 @@ public final class CanonicalSealerState {
         }
         if (version >= 6) {
             state.voids = VoidLedger.readFrom(buf, voidConfig);
+        }
+        if (version >= 8) {
+            int snapshotWindow = buf.getInt();
+            if (snapshotWindow != orderingWindow) {
+                throw new IllegalArgumentException(
+                        "snapshot orderingWindow " + snapshotWindow + " differs from this member's "
+                                + orderingWindow + " — members must agree on the ordering window");
+            }
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is

@@ -154,6 +154,15 @@ impl Ready {
 
         let mut cfg = kardamom_engine::ExecutorConfig {
             chain_id,
+            fees: self
+                .attested
+                .written
+                .streamed
+                .opened
+                .state
+                .genesis
+                .as_ref()
+                .and_then(|g| g.fees),
             ..kardamom_engine::ExecutorConfig::default()
         };
         // Always bound the tx_data join wait. A verifier that loses an
@@ -240,16 +249,27 @@ impl Ready {
             args,
             chain_id.get(),
             interop_serve,
-            state_env_for_rpc,
+            state_env_for_rpc.clone(),
             feed_resume_block,
         )
         .await?;
+        // The query endpoint holds a clone of the state env too, so it
+        // ends, and its end is awaited, before a revolution parks the env.
+        let query_server = args
+            .nonce_query_addr
+            .map(|addr| kardamom_state::serve_nonce_queries(addr, state_env_for_rpc))
+            .transpose()
+            .context("bind nonce query address")?;
 
         let ports = self.run_ports();
         let outcome = self.execute(ports).await;
         if let Some(server) = feed_server {
             let _ = server.stop();
             server.stopped().await;
+        }
+        if let Some(mut server) = query_server {
+            server.task.abort();
+            let _ = (&mut server.task).await;
         }
         Ok(RunEnd {
             outcome,
@@ -394,13 +414,11 @@ impl Running {
         }
         .wait()
         .await;
-        if !divergence.is_halted() {
+        let Some(reason) = divergence.halt_reason("divergence (no reason recorded)") else {
             return outcome;
-        }
-        if let Some(reason) = divergence.reason() {
-            tracing::error!(reason = %reason, "validator halted on divergence");
-        }
-        EngineOutcome::Diverged
+        };
+        tracing::error!(reason = %reason, "validator halted on divergence");
+        EngineOutcome::Diverged(reason)
     }
 }
 
@@ -605,12 +623,12 @@ pub(crate) struct RunEnd {
 
 /// The joined engine loop's outcome: a clean return, an engine-level
 /// failure (not necessarily a divergence), a task panic (no error value
-/// survives a panic), or a proven divergence.
+/// survives a panic), or a proven divergence with its reason.
 pub(crate) enum EngineOutcome {
     Clean,
     Failed(ExecutorError),
     Panicked,
-    Diverged,
+    Diverged(String),
 }
 
 /// Classify the joined engine loop's outcome. Latches a forged record

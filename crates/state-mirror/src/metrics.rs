@@ -7,6 +7,12 @@ const REBUILD_SECONDS: &str = "kardamom_state_mirror_rebuild_seconds";
 const REBUILDS_TOTAL: &str = "kardamom_state_mirror_rebuilds_total";
 const WRITE_RETRIES_TOTAL: &str = "kardamom_state_mirror_write_retries_total";
 const WAIT_REPLICA_ZERO_TOTAL: &str = "kardamom_state_mirror_wait_replica_zero_total";
+/// 1 while the mirror applies batches as they come: after its start
+/// decision and outside a rebuild. The readiness rule requires 1. The
+/// executors publish no batch for an empty block, so an idle chain gives
+/// the mirror nothing to advance on, and a time-based rule would fail
+/// a healthy mirror.
+pub(crate) const SERVING: &str = "kardamom_state_mirror_serving";
 
 /// Register the descriptions. Call once at startup.
 pub(crate) fn describe() {
@@ -29,11 +35,19 @@ pub(crate) fn describe() {
         WAIT_REPLICA_ZERO_TOTAL,
         "batches no replica acknowledged within the wait"
     );
+    metrics::describe_gauge!(
+        SERVING,
+        "1 while the mirror applies batches: started, and not in a rebuild"
+    );
 }
 
 pub(crate) fn record_batch(disagreed: u64) {
     metrics::counter!(BATCHES_APPLIED_TOTAL).increment(1);
     metrics::counter!(PRODUCER_DISAGREEMENT_TOTAL).increment(disagreed);
+}
+
+pub(crate) fn set_serving(serving: bool) {
+    metrics::gauge!(SERVING).set(if serving { 1.0 } else { 0.0 });
 }
 
 pub(crate) fn set_head(tx_idx: u64) {

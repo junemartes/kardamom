@@ -70,7 +70,7 @@ fn expected_frames(blocks: &[ClosedBlock]) -> Vec<BlockFrame> {
 fn roundtrip_one_block_compressed() {
     let blocks = vec![closed(1, 3)];
     let batch = pack_blocks(&BatcherConfig::default(), &blocks).unwrap();
-    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
 }
 
@@ -82,7 +82,7 @@ fn roundtrip_one_block_uncompressed() {
         ..Default::default()
     };
     let batch = pack_blocks(&cfg, &blocks).unwrap();
-    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
 }
 
@@ -96,7 +96,7 @@ fn roundtrip_five_blocks_grouped() {
     let batch = pack_blocks(&cfg, &blocks).unwrap();
     assert_eq!(batch.l2_block_start, 10);
     assert_eq!(batch.l2_block_end, 14);
-    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
 }
 
@@ -161,39 +161,37 @@ fn roundtrip_remote_epochs_multi_message_record() {
     ];
 
     let batch = pack_blocks(&BatcherConfig::default(), &blocks).unwrap();
-    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
     assert_eq!(reconstructed[1].remote_epochs, blocks[1].remote_epochs);
     assert!(reconstructed[0].remote_epochs.is_empty());
     assert!(reconstructed[2].remote_epochs.is_empty());
 }
 
-/// A record whose messages carry the Outbox's `MAX_DATA_BYTES` calldata cap:
-/// two such messages exceed one blob's 126 976 usable bytes, so the payload
-/// must span blobs — the SAME multi-blob mechanism an oversized tx batch uses
-/// (`pack_to_blobs` slicing, `pack_blocks`' 6-blob ceiling as the guard) —
-/// and still round-trip byte-identically.
+/// A record whose messages carry the Outbox's `MAX_DATA_BYTES` calldata
+/// cap: two such messages make a payload of several hundred kilobytes,
+/// and it still round-trips byte-identically.
 #[test]
-fn roundtrip_max_size_messages_span_blobs() {
+fn roundtrip_max_size_messages() {
     let big_a = vec![0x5A; MAX_DATA_BYTES];
     let big_b = vec![0xA5; MAX_DATA_BYTES];
     let mut block = closed(3, 1);
     block.remote_epochs = vec![remote_epoch(412_399, 0, &[&big_a, &big_b], false)];
     let blocks = vec![block];
 
-    // Uncompressed, so the payload size is the framed size and the blob
-    // spanning is deterministic (zstd would collapse the repeated bytes).
+    // Uncompressed, so the payload size is the framed size (zstd would
+    // collapse the repeated bytes).
     let cfg = BatcherConfig {
         compress: false,
         ..Default::default()
     };
     let batch = pack_blocks(&cfg, &blocks).unwrap();
     assert!(
-        batch.blobs.len() >= 2,
-        "two max-size messages must overflow a single blob (got {} blob(s))",
-        batch.blobs.len()
+        batch.payload.len() > 2 * MAX_DATA_BYTES,
+        "two max-size messages must be in the payload whole (got {} bytes)",
+        batch.payload.len()
     );
-    let reconstructed = reconstruct(&batch.blobs).unwrap();
+    let reconstructed = reconstruct(&batch.payload).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
     assert_eq!(
         reconstructed[0].remote_epochs[0]
@@ -244,7 +242,7 @@ fn records_commitment_binds_remote_epochs() {
     );
 
     // Recompute from the reconstructed frames: remote epochs first, then txs.
-    let frames = reconstruct(&led_batch.blobs).unwrap();
+    let frames = reconstruct(&led_batch.payload).unwrap();
     let recomputed = kardamom_types::batch_records_commitment(frames.iter().map(|f| {
         let mut d = kardamom_types::BlockRecordsDigest::new(f.block_number);
         for rec in &f.remote_epochs {
@@ -300,52 +298,35 @@ fn accumulator_attributes_remote_epochs_to_the_block_they_lead() {
     assert!(b3.remote_epochs.is_empty());
 }
 
-/// A DA store that returns wrong bytes of the right length must be caught
-/// before reconstruction, not silently rebuilt into a wrong chain. The
-/// versioned hash is only a filename to the store. L1's commitment is the
-/// authority, so `recover_blocks` recomputes it.
-#[test]
-fn corrupted_da_blob_is_rejected_against_its_commitment() {
-    use kardamom_batcher::da_store::{BlobSource, FsBlobStore};
-    use kardamom_batcher::l1::{BatchDescriptor, recover_blocks, verify_blob_against_hash};
+/// The recovery path reads a batch's payload by its certificate from the
+/// DA proxy, which is what the batcher posted. A certificate the proxy
+/// does not know is an error, not an empty batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_blocks_reads_the_posted_payload_by_certificate() {
+    use kardamom_batcher::da::DaProxy;
+    use kardamom_batcher::l1::{BatchDescriptor, recover_blocks};
+    use kardamom_batcher::testkit_da::FakeDaProxy;
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = FsBlobStore::open(dir.path()).unwrap();
+    let fake = FakeDaProxy::start();
+    let da = DaProxy::new(fake.url()).unwrap();
+    let blocks = vec![closed(1, 2), closed(2, 1)];
+    let batch = pack_blocks(&BatcherConfig::default(), &blocks).unwrap();
+    let da_cert = da.put(&batch.payload).await.unwrap();
+    assert_eq!(da_cert, FakeDaProxy::cert_of(&batch.payload));
 
-    // Pack a real payload and register it under its true versioned hash.
-    // Use the same helper the post path uses to derive what L1 commits to.
-    let blobs = kardamom_batcher::blob::pack_to_blobs(b"kardamom da integrity").unwrap();
-    let sidecar = kardamom_batcher::l1::build_sidecar(blobs.clone()).unwrap();
-    let vh = sidecar.versioned_hashes().next().unwrap();
-    store.put(vh, &blobs[0]).unwrap();
-
-    // Honest bytes verify, and reconstruction proceeds.
-    let good = store.fetch_blob(vh).unwrap();
-    verify_blob_against_hash(vh, &good).expect("untouched blob must verify");
-
-    // Now corrupt the stored bytes in place, keeping the length the same.
-    // This is exactly the shape a size check cannot see. Field elements
-    // keep their high byte zero (BLS modulus), so flip a low byte inside
-    // the payload region.
-    let mut corrupt = good;
-    corrupt[1234] ^= 0x01;
-    store.put(vh, &corrupt).unwrap();
-
-    let err = verify_blob_against_hash(vh, &store.fetch_blob(vh).unwrap())
-        .expect_err("corrupted blob must NOT verify against its commitment");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("does not match its commitment"),
-        "unexpected error: {msg}"
-    );
-
-    // And the recovery path itself must refuse, rather than decode garbage.
     let d = BatchDescriptor {
         index: 1,
-        versioned_hashes: vec![vh],
+        da_cert,
         l2_block_start: 1,
-        l2_block_end: 1,
+        l2_block_end: 2,
     };
-    let err = recover_blocks(&[d], &store).expect_err("recover_blocks must reject a corrupt blob");
-    assert!(format!("{err}").contains("does not match its commitment"));
+    let recovered = recover_blocks(std::slice::from_ref(&d), &da).unwrap();
+    assert_eq!(recovered, expected_frames(&blocks));
+
+    let unknown = BatchDescriptor {
+        da_cert: alloy_primitives::Bytes::from(vec![0x02, 0xBA, 0xD0]),
+        ..d
+    };
+    let err = recover_blocks(&[unknown], &da).unwrap_err().to_string();
+    assert!(err.contains("no such certificate"), "{err}");
 }
