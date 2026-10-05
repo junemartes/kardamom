@@ -131,7 +131,10 @@ impl Phase {
                     .await
             }
             Self::WrongHash | Self::BrokenChain => {
-                let state = l1.alert_state(STALE_POST_ALERT).await?;
+                let state = l1
+                    .alert_state(STALE_POST_ALERT)
+                    .await
+                    .unwrap_or_else(|e| Some(format!("unread ({e:#})")));
                 crate::log(format!(
                     "{ctx}: the alert {STALE_POST_ALERT} is {} under {}",
                     state.unwrap_or_else(|| "inactive".to_string()),

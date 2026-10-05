@@ -343,7 +343,12 @@ impl L1 {
         let run = std::cell::Cell::new(0_u32);
         let run_ref = &run;
         let outcome = poll::until(Budget::new(budget, every), |_| async move {
-            let state = self.alert_state(name).await?;
+            // A failed read breaks the held run, like an inactive state:
+            // a Prometheus restart loses the pending state too.
+            let state = self.alert_state(name).await.unwrap_or_else(|e| {
+                crate::log(format!("{ctx}: {e:#}; the held run starts again"));
+                None
+            });
             let active = state
                 .as_deref()
                 .is_some_and(|s| s == "pending" || s == "firing");
