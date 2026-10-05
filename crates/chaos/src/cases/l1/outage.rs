@@ -40,7 +40,10 @@ async fn spool_blocks(h: &Harness, aux: &str) -> anyhow::Result<usize> {
 
 /// Freeze the batcher with a non-empty spool, so the restart has a group
 /// to recover. The spool empties for an instant after every post, so a
-/// freeze that lands in that instant is thawed and tried again.
+/// freeze that lands in that instant is thawed and tried again. A
+/// verified freeze outlasts the Aeron client's service interval (10 s),
+/// so the batcher can restart on the thaw: the next try waits until it
+/// answers again.
 async fn freeze_with_spool(
     h: &Harness,
     aux: &str,
@@ -51,7 +54,7 @@ async fn freeze_with_spool(
     let target = &target;
     let outcome = poll::until(
         Budget::new(
-            Duration::from_secs(u64::from(FREEZE_ATTEMPTS) * 4),
+            (Duration::from_secs(4) + h.knobs.restart_slo) * FREEZE_ATTEMPTS,
             Duration::from_secs(1),
         ),
         |_| async move {
@@ -61,6 +64,7 @@ async fn freeze_with_spool(
                 return Ok::<_, anyhow::Error>(Some(blocks));
             }
             h.thaw(aux, inner).await?;
+            await_answering(h, target, ctx).await?;
             Ok(None)
         },
     )
@@ -68,6 +72,27 @@ async fn freeze_with_spool(
     outcome
         .or_fail(|_| crate::chaos_fail!("{ctx}: the spool was empty on every freeze"))
         .map(|(blocks, _)| blocks)
+}
+
+/// Wait until the batcher's metrics endpoint answers: after a thaw, the
+/// task can restart, and its container is gone until the new one runs.
+async fn await_answering(
+    h: &Harness,
+    target: &crate::metrics::Target,
+    ctx: &str,
+) -> anyhow::Result<()> {
+    let budget = Budget::new(h.knobs.restart_slo, Duration::from_secs(1));
+    poll::until(budget, |_| async move {
+        Ok::<_, anyhow::Error>(h.probes.scrape().answers(target).await.then_some(()))
+    })
+    .await?
+    .or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the batcher did not answer within {}s after a thaw",
+            t.as_secs()
+        )
+    })
+    .map(|_| ())
 }
 
 /// Hold until the ingress delta passed twice the retention, two minutes
@@ -189,9 +214,11 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         .evidence
         .count_lines(CLUSTER_TASK, SNAPSHOT_LINE, Streams::StdoutOnly)
         .await?;
+    let blocks = freeze_with_spool(h, &aux, &inner, ctx).await?;
+    // The baselines follow the freeze: a restart on a retried freeze
+    // logs its own lines, which must not count for the final thaw.
     let restored0 = count(h, SPOOL_RESTORED_LINE).await?;
     let rebuilt0 = count(h, REBUILT_LINE).await?;
-    let blocks = freeze_with_spool(h, &aux, &inner, ctx).await?;
     // A post in flight at the freeze still lands: read the covered
     // block once it has.
     tokio::time::sleep(Duration::from_secs(5)).await;
