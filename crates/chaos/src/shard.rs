@@ -37,6 +37,7 @@ impl Shard {
     /// Whether every case of the shard ends with the persisted-state
     /// stage. The L1 cases each leave a DA record a silent gap could
     /// hide in, so each one proves the rebuild from L1 before the next.
+    /// The last case's stage is the one in the shard's tail.
     #[must_use]
     pub fn audits_each_case(self) -> bool {
         matches!(self, Self::L1)
