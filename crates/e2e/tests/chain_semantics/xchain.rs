@@ -345,14 +345,15 @@ async fn s13_xchain_da_parity() {
     let da = post_and_verify_da(l1, &canonical.blocks, "S13").await;
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis = e2e::harness::services::repo_root().join("chains/dev-interop.toml");
-    if let Err(e) = da_parity::reconstruct_and_compare(
-        &l1.rpc_url(),
-        l1.settlement,
-        &da.url(),
-        &genesis,
-        recon_dir.path(),
-        expected_root,
-    ) {
+    let (l1_rpc, da_proxy) = (l1.rpc_url(), da.url());
+    let reconstruct = da_parity::Reconstruct {
+        l1_rpc: &l1_rpc,
+        settlement: l1.settlement,
+        lockbox: l1.lockbox,
+        da_proxy: &da_proxy,
+        genesis: &genesis,
+    };
+    if let Err(e) = reconstruct.compare(recon_dir.path(), expected_root) {
         report_s13_da_parity_failure(&canonical, recon_dir.path(), &exec_dir, &e);
     }
 

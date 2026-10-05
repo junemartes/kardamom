@@ -1,6 +1,6 @@
 # Rejoin the pipeline from a state rebuilt from L1
 
-Status: executor half in implementation. Sealer half and deposits: designed, not built.
+Status: executor half and deposits built. Sealer half: designed, not built.
 
 ## 1. Problem
 
@@ -70,8 +70,9 @@ field or from any other source, is a loud `REPLAY_UNAVAILABLE` and not a silent 
 
 **Limits.** A rebuild through a block of a version 2 blob gives a correct state with no
 cursor; the tool says so and refuses `--executor-image`. A mixed history is fine: the cursor
-comes from block H's own frame. If an L1 epoch and a remote epoch both lead the same block,
-the remote messages' rebuilt positions assume the L1 epoch came first.
+comes from block H's own frame. A block with a vacant slot (a voided entry or its void
+record) rebuilds its items at the tail of its range, so their receipt positions can differ
+from the live chain's; the root does not.
 
 ## 4. Sealer half (designed, not built)
 
@@ -94,21 +95,44 @@ version 3 blobs the rebuilt DB holds all five. The per-sender nonces and the ded
 may start empty. Every surviving consumer must still restart. This hook is the next step,
 after the executor half is proven in the chaos suite.
 
-## 5. Deposits (not started)
+## 5. Deposits (built)
 
 Deposits ride inside an epoch record, and the batcher skips epochs by design: a deposit is
 unsigned, so a blob-carried deposit would be an unverifiable claim. L1 fixes a deposit's
-identity and its order inside its epoch, and the block's `l1_origin`, which version 3 now
-carries, fixes its L2 placement. Interleaving them in the rebuild is phase E of
-`docs/agents/l1-origin-deposit-derivation-spec.md`. Until then a deposit-bearing range
-rebuilds its non-deposit state only. The chaos suite never deposits.
+identity and its order inside its epoch, and the block's `l1_origin`, which version 3
+carries, fixes its L2 placement.
+
+**The derivation.** `kardamom-reconstruct --lockbox <addr>` walks the blocks in order. When
+a block's origin moves from M to N, the block leads with the epochs M+1..N. Each epoch is
+`derive_epoch` over its L1 block's hash and lockbox logs: the rule the da-watcher and the
+validator use. The first step from origin 0 takes epoch N only, because the da-watcher
+starts at the finalized block it first sees. An origin below the one before is refused. A
+version 2 block carries no origin, leads with no epoch, and leaves the origin unchanged.
+
+**The replay.** Each epoch takes its marker slot, then each deposit takes a slot and runs
+through `execute_deposit_tx` (mint first, nonce check off, gas price 0), before remote
+epochs and transactions. The sealer forces a boundary before any epoch when the open block
+holds a record, so an epoch leads its block and a live block holds at most one epoch. A
+unit test drives the live exec thread and the replay over the same stream, both through
+the real writer with the trie on, and requires the same root and receipt positions.
+
+**The slot check.** A block whose items (epoch markers, deposits, remote records,
+transactions) need more slots than `end_tx_idx` minus the previous end is refused. Equality
+is not required: a voided entry and its void record take slots, apply nothing, and never
+reach the payload. So a missing deposit passes the slot check and fails the root check.
+Without `--lockbox` the rebuild leaves deposits out. The chaos suite never deposits and
+does not pass the flag.
 
 ## 6. Proof
 
 - Unit: the version 3 round trip, the version 2 decode, the mixed-version refusal; the live
   positions and the same root with and without the field; the refused cursor; the stripped
   image; the sealer's cursor check.
-- `reconstruct_l1_e2e`: the state rebuilt from anvil and the DA store carries the cursor.
+- Unit: the live exec thread and the replay give the same root and deposit positions; a
+  block whose epochs need more slots than its range holds is refused; the origin steps.
+- `reconstruct_l1_e2e`: the state rebuilt from anvil and the DA store carries the cursor,
+  and a lockbox deposit on anvil is derived and applied.
+- Chain semantics S8: a workload with a deposit rebuilds to the validator's root.
 - Chaos, every shard: the rebuilt cursor and header equal the validator's at the same block.
 - Chaos, `executor-fleet-total-wipe-recover`: all three executors lose state and
   checkpoints, the harness rebuilds an executor image from L1 on the host, installs it on

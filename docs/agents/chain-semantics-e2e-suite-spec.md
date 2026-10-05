@@ -113,7 +113,7 @@ Mixed workload (transfers, deploys, deposits) → drain + quiesce → live asser
 **S7 — `divergence_detection_is_not_vacuous`** (negative control for S6)
 The test process publishes onto the real streams: (a) a corrupted `BlockDelta` on `tx_bal` for a committed block → validator must log `"validator divergence detected — halting"` and exit 2 within a bound; (b) fresh stack, corrupted `Receipt` (wrong `write_set_hash`) on `tx_receipts` at a valid `tx_idx` → same fail-stop. Closes the `docs/failure-modes.md` "divergence injection" gap. (Deliberately *semantics*, not chaos: it proves the guarantee "if states disagreed, we would know".)
 
-**S8 — `da_parity_batcher_matches_validator`** (deposit-free workload — deposits are absent from the DA payload, a documented product gap this scenario makes impossible to forget)
+**S8 — `da_parity_batcher_matches_validator`** (the workload holds an L1 deposit; the payload does not carry it, and `kardamom-reconstruct --lockbox` derives it from L1)
 Workload → drain → harness collector assembles ordered blocks → `pack_blocks` → `post_batch` as **real EIP-4844 blob txs** to anvil's settlement contract (KZG sidecars; `reconstruct_l1_e2e` proved anvil accepts them) → assert `BatchPosted` CAS sequence → run the real `kardamom-reconstruct` binary with `--expect-root <validator's meta[state_root] at head>` against a fresh state dir → exit 0. Proves: L1-posted data alone re-derives exactly the state the validator attests.
 
 **S9 — `db_integrity_and_crash_consistency`**
