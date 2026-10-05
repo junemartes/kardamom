@@ -366,6 +366,10 @@ class DeployTest(unittest.TestCase):
             unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
             self.assertEqual(len(unblock), 1, name)
             self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A restarted driver waits out the active-driver window of its
+        # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
+        delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
+        self.assertEqual(delay_ns, (tolerance // 1000 + 5) * 1_000_000_000)
 
     @staticmethod
     def sequencer_env(plans):

@@ -300,6 +300,15 @@ impl Knobs {
         })
     }
 
+    /// The restart SLO of a hard-killed media driver. A new driver
+    /// refuses to start until the heartbeat in the `CnC` file of the
+    /// dead one is older than the driver timeout, the stall tolerance,
+    /// so the deploy delays the restart past it.
+    #[must_use]
+    pub fn driver_restart_slo(&self) -> Duration {
+        self.restart_slo.saturating_add(self.aeron_stall.get())
+    }
+
     /// The hard-kill ingress victim rotates with the CI run id, so the
     /// blast radius is not pinned to one replica forever.
     fn ingress_victim(env: &Source<'_>) -> anyhow::Result<u32> {

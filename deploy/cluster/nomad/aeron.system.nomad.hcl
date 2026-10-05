@@ -80,6 +80,11 @@ locals {
     "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
   ])
+  # A new driver refuses to start ("active driver detected") while the
+  # CnC heartbeat of a dead predecessor is younger than the driver
+  # timeout. So Nomad restarts the driver 5 s after that window. At
+  # Aeron's 10 s default, this is Nomad's own 15 s default delay.
+  driver_restart_delay = "${ceil(var.aeron_stall_tolerance_ms / 1000) + 5}s"
 }
 
 job "aeron" {
@@ -114,6 +119,11 @@ job "aeron" {
   }
 
   group "aeron" {
+    # Only the delay differs from Nomad's defaults; see the locals.
+    restart {
+      delay = local.driver_restart_delay
+    }
+
     # A system job rolls node by node: every pipeline process on a node
     # shares its driver, so two drivers must never restart together. The
     # driver's control channel is UDP, so no port check applies; the

@@ -825,7 +825,11 @@ check would pass against a feature that activated once and stopped.
   The jobs derive one more value from it: the publication unblock timeout,
   3/2 of the tolerance, because Aeron refuses to start a driver whose unblock
   timeout is not above its client liveness timeout. A client sends its
-  keepalive every 500 ms, far below the tolerance. The default is **10000**,
+  keepalive every 500 ms, far below the tolerance. A new ArchivingMediaDriver
+  refuses to start ("active driver detected") while the CnC heartbeat of a
+  dead predecessor is younger than its driver timeout, so the `aeron` job
+  restarts a failed driver after the tolerance plus 5 s: Nomad's own 15 s
+  default at 10 s. The default is **10000**,
   Aeron's own default, and staging and production keep it: a longer value
   delays the detection of a dead client or driver by the same amount. The
   Raft election and leader heartbeat timeouts are separate and do not change.
@@ -839,8 +843,8 @@ check would pass against a feature that activated once and stopped.
   The chaos cases that need an eviction read the same value
   (`StallTolerance` in `crates/chaos/src/knobs.rs`): the `sequencer-lapse` and
   `validator-lapse` freezes default to the tolerance plus 20 s, the
-  retention-overrun freeze lasts at least that long, and the ingress recovery
-  wait after a driver loss grows by the tolerance.
+  retention-overrun freeze lasts at least that long, and the driver restart
+  and ingress recovery waits after a driver loss grow by the tolerance.
 - **The observation path itself** (issue #76, fixed) — `docker kill` of a
   privileged DinD node stalls host-dockerd `docker exec` runner-wide for
   minutes, blacking out every exec-based probe at once; for three days this
