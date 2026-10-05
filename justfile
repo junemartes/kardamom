@@ -171,8 +171,10 @@ style:
         fi
     }
     # R11, R2 (too_many_lines at the threshold in clippy.toml), R8 (unreachable_pub).
+    # `assert_is_empty` (pedantic since Rust 1.99) wants `assert_eq!(x, [] as [T; 0])`
+    # in place of `assert!(x.is_empty())`; the typed empty array hides the intent.
     step "clippy pedantic" cargo clippy --workspace --all-targets --all-features --locked -- \
-        -D warnings -W clippy::pedantic -D unreachable_pub
+        -D warnings -W clippy::pedantic -D unreachable_pub -A clippy::assert_is_empty
     step "rustfmt" cargo fmt --all -- --check
     # R9, R13, R6, R11: patterns that a lint cannot express. Test files are exempt.
     forbidden() {
@@ -331,7 +333,7 @@ stage-dist dist:
     # The services the images wrap (the state mirror included), the settlement
     # deployer and the semantics runner the stages spawn, the operator binary,
     # and the archive tool the archive-corruption case runs on the host.
-    for bin in ingress sequencer executor validator da-watcher batcher state-mirror reconstruct deploy semantics cluster archive-rereplicate; do
+    for bin in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier reconstruct deploy semantics cluster archive-rereplicate; do
         cp "$rel/kardamom-$bin" "$dist/$rel/"
     done
     # The shard test executable carries a build hash; the newest one is this build's.
@@ -472,7 +474,7 @@ test-e2e-local: aeron-jar cluster-jar
     cargo build --bins --locked \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
-        -p kardamom-reconstruct
+        -p kardamom-reconstruct -p kardamom-notifier
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2 --skip s14_
     # S14 runs TWO full stacks (4 JVMs + 10 service processes) — the
@@ -611,6 +613,10 @@ images:
 # Converge workload jobs and settlement through Ansible.
 deploy:
     @just --justfile deploy/cluster/justfile deploy
+
+# Deploy the manifest the last successful deploy of <env> replaced.
+rollback env:
+    @just --justfile deploy/cluster/justfile rollback {{ env }}
 
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:

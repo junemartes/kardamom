@@ -5,7 +5,7 @@
 //!   `BlockBoundaryStart`.
 //! - For each closed block, or group of blocks (set by `blocks_per_batch`),
 //!   encodes KAR1, compresses with zstd if enabled, packs the result into
-//!   blobs, and hands the batch to a [`Sender`] for L1 broadcast.
+//!   payload, and hands the batch to a [`Sender`] for L1 broadcast.
 //!
 //! This is a single-instance design: no election or standby. If the batcher
 //! process dies, the L2 stops settling blocks until an operator restarts
@@ -13,11 +13,9 @@
 
 use std::num::NonZeroUsize;
 
-use alloy_eips::eip4844::Blob;
 use metrics::counter;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
-use crate::blob::pack_to_blobs;
 use crate::compress::{DEFAULT_LEVEL, encode_zstd};
 use crate::error::BatcherError;
 use crate::frame::{BlockCursor, BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
@@ -27,7 +25,7 @@ use crate::frame::{BlockCursor, BlockFrame, Kar1Payload, TxFrame, encode as fram
 pub mod metric_names {
     pub const BLOCKS_OBSERVED: &str = "kardamom_batcher_blocks_observed_total";
     pub const BATCHES_POSTED: &str = "kardamom_batcher_batches_posted_total";
-    pub const BLOBS_POSTED: &str = "kardamom_batcher_blobs_posted_total";
+    pub const PAYLOAD_BYTES_POSTED: &str = "kardamom_batcher_payload_bytes_posted_total";
 }
 
 /// Configuration for the batching loop.
@@ -37,8 +35,12 @@ pub struct BatcherConfig {
     /// one. Nonzero at the type level: zero would make every "group is
     /// full" comparison at the post site vacuously true.
     pub blocks_per_batch: NonZeroUsize,
-    /// Whether to zstd-compress the framed payload before blob packing.
+    /// Whether to zstd-compress the framed payload before it is posted.
     pub compress: bool,
+    /// The most bytes one post's payload may have. EigenDA takes 16 MiB
+    /// per blob; the proxy's encoding adds a little, so the default leaves
+    /// room. Nonzero at the type level: a zero ceiling fits no block.
+    pub max_payload_bytes: NonZeroUsize,
     /// zstd compression level when `compress` is true.
     pub compression_level: i32,
     /// The L2 chain id of the chain this batcher posts for. The records
@@ -54,18 +56,21 @@ impl Default for BatcherConfig {
             blocks_per_batch: NonZeroUsize::MIN,
             compress: true,
             compression_level: DEFAULT_LEVEL,
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             chain_id: 1,
         }
     }
 }
 
-/// The most blobs one L1 post can carry (EIP-4844).
-pub const MAX_BLOBS_PER_BATCH: usize = 6;
+/// The default payload ceiling: 15 MiB, under EigenDA's 16 MiB blob.
+pub const DEFAULT_MAX_PAYLOAD_BYTES: NonZeroUsize = NonZeroUsize::new(15 * 1024 * 1024).unwrap();
 
 /// A batch ready to post to L1.
 #[derive(Clone, Debug)]
 pub struct PostedBatch {
-    pub blobs: Vec<Blob>,
+    /// The framed blocks, zstd-compressed when the config says so: the
+    /// bytes EigenDA holds.
+    pub payload: Vec<u8>,
     pub l2_block_start: u64,
     pub l2_block_end: u64,
     /// The batch records commitment: the fold of per-block digests over the
@@ -127,10 +132,10 @@ impl<S: Sender> Batcher<S> {
 
     /// The reader thread calls this method when a `ClosedBlock` becomes
     /// available. If enough blocks are ready to form a batch, this method
-    /// builds the blobs and sends them to the sender.
+    /// packs the payload and sends it to the sender.
     ///
     /// # Errors
-    /// Returns an error when packing the group into blobs fails, or when
+    /// Returns an error when packing the group fails, or when
     /// [`Sender::post`] fails.
     pub fn on_closed_block(&mut self, block: ClosedBlock) -> Result<(), BatcherError> {
         counter!(metric_names::BLOCKS_OBSERVED).increment(1);
@@ -140,10 +145,10 @@ impl<S: Sender> Batcher<S> {
         }
         let group = std::mem::take(&mut self.pending_blocks);
         for batch in pack_block_groups(&self.cfg, &group)? {
-            let blob_count = batch.blobs.len() as u64;
+            let payload_bytes = batch.payload.len() as u64;
             self.sender.post(batch)?;
             counter!(metric_names::BATCHES_POSTED).increment(1);
-            counter!(metric_names::BLOBS_POSTED).increment(blob_count);
+            counter!(metric_names::PAYLOAD_BYTES_POSTED).increment(payload_bytes);
         }
         Ok(())
     }
@@ -152,12 +157,12 @@ impl<S: Sender> Batcher<S> {
 /// A pure helper that turns a group of `ClosedBlock`s into a `PostedBatch`.
 ///
 /// Steps: encode KAR1, compress with zstd if enabled, then pack into at
-/// most [`MAX_BLOBS_PER_BATCH`] blobs. A group that overflows the ceiling
+/// most `max_payload_bytes`. A group that overflows the ceiling
 /// is an error. Use [`pack_block_groups`] to split such a group.
 ///
 /// # Errors
-/// Returns an error when `blocks` is empty, when frame encoding or blob
-/// packing fails, or when the group overflows the blob ceiling.
+/// Returns an error when `blocks` is empty, when frame encoding fails, or
+/// when the group overflows the payload ceiling.
 pub fn pack_blocks(
     cfg: &BatcherConfig,
     blocks: &[ClosedBlock],
@@ -172,17 +177,18 @@ pub fn pack_blocks(
     } else {
         framed
     };
-    let blobs = pack_to_blobs(&to_pack)?;
-    if blobs.len() > MAX_BLOBS_PER_BATCH {
+    let ceiling = cfg.max_payload_bytes.get();
+    if to_pack.len() > ceiling {
         if let [only] = blocks {
             return Err(BatcherError::BlockTooLarge {
                 block_number: only.block_number,
-                blobs: blobs.len(),
+                bytes: to_pack.len(),
+                ceiling,
             });
         }
-        return Err(BatcherError::Blob(format!(
-            "batch overflowed {MAX_BLOBS_PER_BATCH}-blob ceiling: produced {}",
-            blobs.len()
+        return Err(BatcherError::Payload(format!(
+            "batch overflowed the {ceiling}-byte ceiling: {} bytes",
+            to_pack.len()
         )));
     }
     let l2_block_start = first_block.block_number;
@@ -191,20 +197,20 @@ pub fn pack_blocks(
         blocks.iter().map(|b| block_records_digest(cfg.chain_id, b)),
     );
     Ok(PostedBatch {
-        blobs,
+        payload: to_pack,
         l2_block_start,
         l2_block_end,
         records_commitment,
     })
 }
 
-/// Split a group of `ClosedBlock`s into as many batches as the blob
+/// Split a group of `ClosedBlock`s into as many batches as the payload
 /// ceiling needs, in block order.
 ///
 /// The rule: take the largest prefix that packs to at most
-/// [`MAX_BLOBS_PER_BATCH`] blobs, post it, then repeat on the rest. A
-/// prefix search by bisection assumes that a longer prefix packs to more
-/// blobs. zstd can break that assumption. That only costs an extra batch:
+/// `max_payload_bytes`, post it, then repeat on the rest. A prefix search
+/// by bisection assumes that a longer prefix packs to more bytes. zstd
+/// can break that assumption. That only costs an extra batch:
 /// every batch this function returns did pack within the ceiling. A block
 /// that overflows the ceiling on its own returns
 /// [`BatcherError::BlockTooLarge`].
@@ -226,7 +232,7 @@ pub fn pack_block_groups(
     Ok(out)
 }
 
-/// Pack the largest prefix of `blocks` that fits the blob ceiling. Returns
+/// Pack the largest prefix of `blocks` that fits the payload ceiling. Returns
 /// the batch and the prefix length.
 fn pack_largest_prefix(
     cfg: &BatcherConfig,
@@ -234,7 +240,7 @@ fn pack_largest_prefix(
 ) -> Result<(PostedBatch, usize), BatcherError> {
     match pack_blocks(cfg, blocks) {
         Ok(batch) => return Ok((batch, blocks.len())),
-        Err(e) if e.is_blob_overflow() => {}
+        Err(e) if e.is_payload_overflow() => {}
         Err(e) => return Err(e),
     }
     // The whole group overflows. A single block does not reach here: it
@@ -278,7 +284,7 @@ impl PrefixSearch {
                 self.lo = mid;
                 Ok(())
             }
-            Err(e) if e.is_blob_overflow() => {
+            Err(e) if e.is_payload_overflow() => {
                 self.hi = mid;
                 Ok(())
             }

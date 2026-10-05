@@ -2,7 +2,7 @@
 //!
 //! Parses a TOML [`SequencerConfig`], opens one `tx_data` subscriber per
 //! lane it reads, the Aeron Cluster (Raft) ref publisher (`tx_ordering`),
-//! and a `tx_errors` publisher for rejection signals. Runs the sequencer
+//! and the `tx_errors` and `tx_status` publishers. Runs the sequencer
 //! main loop on a dedicated blocking thread until SIGTERM or Ctrl-C.
 //!
 //! The lag-detection, receipt-floor, and nonce-lookup feed tasks live in
@@ -20,12 +20,13 @@ use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::fees::FeeGate;
 use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::sequencer::Shutdown;
 use kardamom_types::shard_map::VslotSet;
@@ -138,6 +139,11 @@ struct Args {
     /// Not relevant when receipts ride multicast (the cluster deploy).
     #[arg(long)]
     executor_count: Option<NonZeroU32>,
+    /// Priority fees on or off (`[fees] priority`). Must match the
+    /// sealer's `-Dkardamom.cluster.orderingWindow` (20 for on, 0 for
+    /// off): the deploy sets both from one value.
+    #[arg(long, env = "KARDAMOM_PRIORITY_FEES")]
+    priority_fees: Option<bool>,
 }
 
 /// Fold the CLI and env overrides into the TOML-loaded config: the
@@ -209,6 +215,7 @@ fn apply_plain_overrides(args: &Args, cfg: &mut SequencerConfig) {
     resync.boundary_silence_ms = args
         .resync_boundary_silence_ms
         .unwrap_or(resync.boundary_silence_ms);
+    cfg.fees.priority = args.priority_fees.unwrap_or(cfg.fees.priority);
 }
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
@@ -222,12 +229,13 @@ struct Handles {
     deposits_sub: TxDepositsSubscriberHandle,
     remote_epochs_sub: TxRemoteEpochsSubscriberHandle,
     errors_pub: TxErrorsPublisherHandle,
+    status_pub: TxStatusPublisherHandle,
 }
 
 impl Handles {
     /// Open every handle this sequencer needs, for the lanes of `cfg`.
-    /// `tx_errors` follows the plane's transport; the rest still open on
-    /// their static channels.
+    /// `tx_errors` and `tx_status` follow the plane's transport; the rest
+    /// still open on their static channels.
     async fn open(
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
@@ -251,6 +259,10 @@ impl Handles {
                 .publisher::<TxErrorsPublisherHandle>(rt)
                 .await
                 .context("open TxErrorsPublisherHandle")?,
+            status_pub: plane
+                .publisher::<TxStatusPublisherHandle>(rt)
+                .await
+                .context("open TxStatusPublisherHandle")?,
         })
     }
 
@@ -273,6 +285,8 @@ struct ResyncWiring {
     controller: kardamom_sequencer::resync::ResyncController,
     /// `None` when the config has no executor query endpoints.
     lookup: Option<LookupRequester>,
+    /// The fee admission gate, off unless `[fees] priority` is on.
+    fees: FeeGate,
     feeds: ResyncFeeds,
 }
 
@@ -281,6 +295,8 @@ struct ResyncWiring {
 struct ResyncFeeds {
     watermark_task: tokio::task::JoinHandle<()>,
     receipts_task: tokio::task::JoinHandle<()>,
+    /// `None` when priority fees are off.
+    base_fee_task: Option<tokio::task::JoinHandle<()>>,
     /// `None` when the nonce lookup is off.
     lookup_task: Option<tokio::task::JoinHandle<()>>,
     #[allow(
@@ -298,6 +314,11 @@ impl ResyncFeeds {
         }
         if let Err(e) = self.receipts_task.await {
             tracing::warn!(?e, "receipts-floors task panicked");
+        }
+        if let Some(task) = self.base_fee_task
+            && let Err(e) = task.await
+        {
+            tracing::warn!(?e, "base-fee task panicked");
         }
         // The lookup task exits on the token, or on the closed request
         // channel after the main loop ends.
@@ -373,6 +394,20 @@ impl ResyncWiring {
         let receipts_task = feeds::ReceiptFloorFeed::new(vslots, floor_tx.clone(), live_writer)
             .spawn(receipts_sub, shutdown.clone());
 
+        // The fee gate: the base fee view follows the executors' boundary
+        // side stream, over the same publisher set as the receipts. Off,
+        // no boundary task runs.
+        let (fees, base_fee_task) = if cfg.fees.priority {
+            let view = kardamom_sequencer::fees::LatestBaseFee::new();
+            let boundaries = plane
+                .tx_receipt_boundaries_subscriber(receipts_rt, executor_count)
+                .context("open tx_receipts boundaries")?;
+            let task = feeds::BaseFeeFeed::new(view.clone()).spawn(boundaries, shutdown.clone());
+            (FeeGate::on(view, Some(live.clone())), Some(task))
+        } else {
+            (FeeGate::off(), None)
+        };
+
         // The nonce lookup task. It shares the floor channel with the
         // receipts feed: an executor's committed nonce is floor evidence
         // of the same kind as a receipt.
@@ -381,9 +416,11 @@ impl ResyncWiring {
         Ok(Self {
             controller,
             lookup,
+            fees,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
+                base_fee_task,
                 lookup_task,
                 main_rt,
             },
@@ -490,11 +527,24 @@ fn log_nonce_floor_sources(cfg: &SequencerConfig) {
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("sequencer", args.metrics_addr, args.host_id.as_ref()).await?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
     apply_cli_overrides(&args, &mut cfg)?;
     cfg.validate().context("validate config")?;
+    // Ready while the cluster egress delivered a boundary within the
+    // boundary-silence window: the session is open and the twin's dedup
+    // window is attached. The sealer ticks a boundary on an idle chain
+    // too, so this holds before the first transaction.
+    kardamom_obs::init_service!(
+        "sequencer",
+        args.metrics_addr,
+        args.host_id.as_ref(),
+        kardamom_obs::Readiness::up().fresh(
+            kardamom_sequencer::metrics::LAST_BOUNDARY_UNIX_SECONDS,
+            std::time::Duration::from_millis(cfg.resync.boundary_silence_ms),
+        )
+    )
+    .await?;
     // Contract line for the CI drift check: this must match the cluster
     // JVM's -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
     kardamom_sequencer::metrics::record_start_time();
@@ -577,11 +627,15 @@ async fn main() -> anyhow::Result<()> {
         main_pub: cluster_pub.clone(),
         epoch_pub: cluster_pub.clone(),
         remote_epoch_pub: cluster_pub,
-        tx_errors: handles.errors_pub,
+        side: kardamom_sequencer::outbound::SideChannels {
+            errors: handles.errors_pub,
+            status: handles.status_pub,
+        },
         epochs: handles.deposits_sub,
         remote_epochs: handles.remote_epochs_sub,
         resync: Some(resync.controller),
         lookup: resync.lookup,
+        fees: resync.fees,
         shutdown: shutdown.clone(),
     }
     .spawn();

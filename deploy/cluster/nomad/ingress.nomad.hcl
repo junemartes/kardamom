@@ -49,6 +49,15 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Nomad node pool of the job. An elastic pool registers its nodes in
+# a pool of its own (roles/nomad: node_pool); the workloads role passes
+# the pool id (workloads_node_pools). The default pool holds the fixed
+# servers.
+variable "node_pool" {
+  type    = string
+  default = "default"
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -75,9 +84,19 @@ variable "inclusion_horizon_blocks" {
   default = "64"
 }
 
+# Canary allocations per deployment: 0 or 1. A canary is one more
+# allocation than count, so it needs a spare ingress-class node; a
+# profile without one keeps 0. The role promotes a canary only after the
+# smoke passes against it.
+variable "canary" {
+  type    = number
+  default = 0
+}
+
 job "ingress" {
   datacenters = [var.datacenter]
   type        = "service"
+  node_pool   = var.node_pool
 
   constraint {
     attribute = "${meta.role}"
@@ -115,12 +134,19 @@ job "ingress" {
       unlimited      = true
     }
 
+    # One replica at a time, healthy by its Consul check (/health: the
+    # listeners are up and no drain runs). A failed instance reverts the
+    # job to its last stable version: the ingress holds no state, so the
+    # revert is safe.
     update {
-      max_parallel     = 1
-      health_check     = "checks"
-      min_healthy_time = "10s"
-      healthy_deadline = "2m"
-      auto_revert      = false
+      max_parallel      = 1
+      canary            = var.canary
+      auto_promote      = false
+      auto_revert       = true
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "3m"
+      progress_deadline = "10m"
     }
 
     network {
@@ -263,18 +289,23 @@ job "ingress" {
         memory = 512
       }
 
-      # The RPC front door as a Consul service: the rpc-proxy pool is
+      # The RPC front door as a Consul service: the edge (a load balancer,
+      # or a client inside the network) reaches the replicas as
       # ingress-jsonrpc.service.consul.
       service {
         name     = "ingress-jsonrpc"
         port     = "jsonrpc"
         provider = "consul"
 
-        # The JSON-RPC server only answers POSTs, so a TCP connect
-        # check is the right liveness signal here.
+        # GET /health on the RPC port: 200 while the proxy serves, 503
+        # from the first moment of the shutdown drain. The load
+        # balancer runs the same check, so a draining replica leaves
+        # the rotation before its parked submits finish.
         check {
-          type     = "tcp"
-          interval = "10s"
+          type     = "http"
+          path     = "/health"
+          method   = "GET"
+          interval = "5s"
           timeout  = "2s"
         }
       }

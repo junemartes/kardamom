@@ -106,7 +106,13 @@ struct Args {
 async fn main() -> Result<()> {
     kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init_service!("state-mirror", args.metrics_addr, args.host_id.as_str()).await?;
+    kardamom_obs::init_service!(
+        "state-mirror",
+        args.metrics_addr,
+        args.host_id.as_str(),
+        kardamom_obs::Readiness::up().equals(metrics::SERVING, 1.0)
+    )
+    .await?;
     kardamom_cache::metrics::describe();
     metrics::describe();
 

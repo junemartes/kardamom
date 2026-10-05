@@ -31,6 +31,7 @@ full-pipeline-e2e = [
     "dep:kardamom-exec-core",
     "dep:kardamom-deployer",
     "dep:kardamom-ingress",
+    "dep:kardamom-l1-fault-proxy",
     "dep:kardamom-obs",
     "dep:kardamom-state",
     "dep:libc",
@@ -76,14 +77,19 @@ kardamom-deployer = { path = "../deployer", optional = true, features = ["test-s
 # The metric name `INGRESS_QUEUE_DEPTH` re-exports; e2e itself never
 # drives the ingress binary directly (Target-L/-C spawn it as a process).
 kardamom-ingress = { path = "../ingress", optional = true }
+# The L1 fault proxy, driven in-process as the validator's interposed L1
+# view in the derivation scenarios.
+kardamom-l1-fault-proxy = { path = "../l1_fault_proxy", optional = true }
 # `testkit` (free_port/free_udp_port/scrape) is the shared home for the
 # ephemeral-port and metrics-scrape helpers every harness process needs.
 kardamom-obs = { path = "../obs", optional = true, features = ["test-support"] }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 clap = { workspace = true, optional = true }
-jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
-kardamom-batcher = { path = "../batcher", optional = true }
+jsonrpsee = { workspace = true, features = ["http-client", "ws-client"], optional = true }
+# `test-support` exposes the fake EigenDA proxy the DA-parity harness
+# starts for the batcher's posting path and for `kardamom-reconstruct`.
+kardamom-batcher = { path = "../batcher", optional = true, features = ["test-support"] }
 kardamom-state = { path = "../state", optional = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -103,7 +109,7 @@ anyhow.workspace = true
 criterion.workspace = true
 hex = "0.4"
 libc.workspace = true
-jsonrpsee = { workspace = true, features = ["http-client"] }
+jsonrpsee = { workspace = true, features = ["http-client", "ws-client"] }
 kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-ingress = { path = "../ingress" }

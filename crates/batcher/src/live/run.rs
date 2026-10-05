@@ -1,32 +1,49 @@
 //! Live service wiring: CLI args, the reader stack, and the feed-loop task.
 
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_client::RpcClient;
 use alloy_signer_local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use alloy_transport::layers::FallbackLayer;
+use alloy_transport_http::Http;
+use anyhow::{Context, Result, bail};
+use metrics::gauge;
 use tokio::sync::mpsc::Receiver;
+use tower::Layer;
 use tracing::{info, warn};
 
 use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader,
+    JoinBuffer, JoinRecoveryFactory, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs,
+    TxOrderingReader,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
 use kardamom_log::discovery::StreamPlane;
 
-use crate::da_store::FsBlobStore;
+use crate::da::DaProxy;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth, reconcile};
+use super::cursor::{BatchCursor, L1Truth, reconcile};
 use super::feed::{FeedConfig, FeedLoop};
+use super::live_metric_names;
+use super::post_age::PostAge;
+use super::rebuild::{ArchiveRebuilder, Rebuilder};
+use super::refs_store::RefsStore;
 use super::sender::LiveSender;
+use super::spool::{Restored, Spool};
+
+/// How often the post-age probe asks L1 for the last `BatchPosted` log.
+/// Its own cadence, apart from the feed loop's tick: one log query and
+/// one block read per probe, which a public endpoint tolerates at this
+/// rate and not at the feed's one-second tick.
+const POST_AGE_EVERY: Duration = Duration::from_secs(10);
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
 /// the same `[cluster]` section shape as the executor and the validator.
@@ -36,26 +53,57 @@ pub(crate) struct BatcherFileConfig {
     pub cluster: kardamom_engine::reader::cluster::ClusterConfig,
 }
 
-/// Parse the batcher key. Connect the wallet-backed L1 provider and the
-/// local DA blob store. The live service and the offline `--dry-run=false`
-/// post path share this signer, provider, and blob-store setup.
+/// The methods the batcher sends, tried one endpoint at a time in score
+/// order, so a failed or rate-limited endpoint falls back to the next
+/// one inside the request. A method outside this set fans out to every
+/// endpoint and takes the first answer, which is wrong for a nonce or a
+/// send: two endpoints at different heights answer differently.
+const SEQUENTIAL_METHODS: &[&str] = &[
+    "eth_blockNumber",
+    "eth_call",
+    "eth_chainId",
+    "eth_estimateGas",
+    "eth_feeHistory",
+    "eth_gasPrice",
+    "eth_getBlockByNumber",
+    "eth_getLogs",
+    "eth_getTransactionCount",
+    "eth_getTransactionReceipt",
+    "eth_maxPriorityFeePerGas",
+    "eth_sendRawTransaction",
+    "eth_sendRawTransactionSync",
+];
+
+/// Parse the batcher key. Connect the wallet-backed L1 provider over
+/// `rpcs`, and the local DA blob store. The live service and the offline
+/// `--dry-run=false` post path share this signer, provider, and
+/// blob-store setup.
+///
+/// With more than one endpoint, every request goes to the best-scored
+/// endpoint first and falls back to the next on an error or an HTTP 429;
+/// the scores rank a failing endpoint last for the requests after it.
 ///
 /// # Errors
-/// Returns an error when the key does not parse, or the L1 RPC connection
-/// or the blob store fails to open.
-pub async fn connect_l1(
-    rpc: &str,
-    key: &str,
-    da_dir: &Path,
-) -> Result<(impl Provider + 'static, FsBlobStore)> {
+/// Returns an error when the key does not parse, when `rpcs` is empty,
+/// or when an endpoint is not a URL.
+pub fn connect_l1(rpcs: &[String], key: &str) -> Result<impl Provider + Clone + 'static> {
     let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
-    let provider = ProviderBuilder::new()
+    let transports = rpcs
+        .iter()
+        .map(|rpc| {
+            rpc.parse::<reqwest::Url>()
+                .map(Http::new)
+                .with_context(|| format!("--l1-rpc {rpc} is not a URL"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let count = NonZeroUsize::new(transports.len()).context("--l1-rpc names no endpoint")?;
+    let service = FallbackLayer::default()
+        .with_active_transport_count(count)
+        .with_sequential_methods(SEQUENTIAL_METHODS.iter().map(ToString::to_string).collect())
+        .layer(transports);
+    Ok(ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
-        .connect(rpc)
-        .await
-        .with_context(|| format!("connect L1 RPC {rpc}"))?;
-    let da_store = FsBlobStore::open(da_dir)?;
-    Ok((provider, da_store))
+        .connect_client(RpcClient::new(service, false)))
 }
 
 /// Everything [`run`] needs from the CLI, already validated. The binary
@@ -63,13 +111,17 @@ pub async fn connect_l1(
 /// first, so its error messages can name the exact flag combination.
 #[derive(Debug, Clone)]
 pub struct LiveArgs {
-    pub rpc: String,
+    /// The L1 endpoints, best first. See [`connect_l1`].
+    pub rpcs: Vec<String>,
     pub key: String,
     pub settlement: Address,
-    pub da_store: PathBuf,
+    /// The EigenDA proxy's URL (`http://host:port`).
+    pub da_proxy: String,
     /// TOML supplying the `[cluster]` section ([`BatcherFileConfig`]).
     pub config: PathBuf,
     pub cursor_file: PathBuf,
+    /// The spool of consumed, unposted blocks (`spool`).
+    pub spool_dir: PathBuf,
     pub log_config: Option<PathBuf>,
     pub aeron_dir: Option<PathBuf>,
     /// The L2 chain id. See [`BatcherConfig::chain_id`].
@@ -86,7 +138,26 @@ pub struct LiveArgs {
     /// long. Nonzero at the type level: 0 makes the flush timeout expire
     /// at once, a busy loop.
     pub flush_ms: NonZeroU64,
+    /// The flush wait for a group of empty blocks. See
+    /// [`FeedConfig::idle_flush`].
+    pub idle_flush_ms: NonZeroU64,
+    /// See [`FeedConfig::target_payload_bytes`].
+    pub target_payload_bytes: NonZeroUsize,
     pub l1_retries: u32,
+    /// The inbox indexer's API. A batcher without a cursor file reads the
+    /// last posted batch's blobs from it, when it holds them; a start
+    /// never waits on it.
+    pub indexer_url: Option<String>,
+    /// The settlement contract's deployment block: where a `BatchPosted`
+    /// scan starts, for the post-age probe and for a start without a
+    /// cursor file that the indexer cannot serve.
+    pub settlement_deploy_block: u64,
+    /// The query endpoints of the executors and the validator
+    /// (`http://host:port`). When the sealer refuses the replay, the
+    /// references of the gap up to its floor are read from here, and the
+    /// bytes from the `tx_data` archives. Empty: a refused replay is a
+    /// fail-stop.
+    pub block_refs_sources: Vec<String>,
 }
 
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
@@ -94,19 +165,26 @@ pub struct LiveArgs {
 /// (already covered by L1).
 struct L1Side<P> {
     provider: P,
-    da_store: FsBlobStore,
+    da: DaProxy,
     l1_truth: L1Truth,
     cursor: BatchCursor,
     skip_through_block: u64,
 }
 
 impl LiveArgs {
-    /// Connect to L1 and reconcile the durable cursor against it.
-    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + 'static>> {
-        let (provider, da_store) = connect_l1(&self.rpc, &self.key, &self.da_store).await?;
-        let l1_truth = read_l1_truth(&provider, self.settlement).await?;
-        let (cursor, skip_through_block) =
-            reconcile(BatchCursor::load(&self.cursor_file)?, l1_truth)?;
+    /// Connect to L1 and reconcile the durable cursor against it. The L1
+    /// reads retry until L1 answers; the reconcile of a cursor file that
+    /// is ahead of L1 is a refusal, decided once.
+    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + Clone + 'static>> {
+        let provider = connect_l1(&self.rpcs, &self.key)?;
+        let da = DaProxy::new(&self.da_proxy)?;
+        let loaded = BatchCursor::load(&self.cursor_file)?;
+        let resumed = self.resume_until_l1_answers(&provider, &da, loaded).await;
+        let l1_truth = resumed.l1_truth;
+        let (cursor, skip_through_block) = match resumed.rebuilt {
+            Some(rebuilt) => rebuilt,
+            None => reconcile(loaded, l1_truth)?,
+        };
         info!(
             settlement = %self.settlement,
             last_batch_index = l1_truth.last_batch_index,
@@ -119,7 +197,7 @@ impl LiveArgs {
         );
         Ok(L1Side {
             provider,
-            da_store,
+            da,
             l1_truth,
             cursor,
             skip_through_block,
@@ -173,6 +251,19 @@ impl RunConfig {
         Ok(())
     }
 
+    /// The join-miss refetch factory: the `tx_data` archives, reached
+    /// from this node's refetch endpoints. `None` when the deployment
+    /// configures no archive or no local endpoint.
+    fn join_recovery(&mut self, args: &LiveArgs) -> Option<JoinRecoveryFactory> {
+        bin_support::archive_join_recovery(
+            &mut self.plane,
+            &self.aeron_cfg,
+            args.aeron_dir.as_deref(),
+            args.archive_control_response_endpoint.as_deref(),
+            args.replay_destination_endpoint.as_deref(),
+        )
+    }
+
     fn spawn_reader_stack(
         &mut self,
         args: &LiveArgs,
@@ -180,13 +271,7 @@ impl RunConfig {
     ) -> Result<ReaderStack<impl Send + use<>>> {
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
         let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
-        let join_recovery = bin_support::archive_join_recovery(
-            &mut self.plane,
-            &self.aeron_cfg,
-            args.aeron_dir.as_deref(),
-            args.archive_control_response_endpoint.as_deref(),
-            args.replay_destination_endpoint.as_deref(),
-        );
+        let join_recovery = self.join_recovery(args);
 
         // A dedicated cluster runtime, exactly as in the executor and
         // validator. The cluster session must never contend with the
@@ -280,22 +365,39 @@ struct ReaderHandles<G> {
     ordering_handle: JoinHandle<Result<(), ExecutorError>>,
 }
 
+/// Why a reader stack ended, as [`ReaderHandles::end`] classifies it.
+enum ReaderEnd {
+    /// The sealer refused the replay: the cursor is below its retention
+    /// floor, and `oldest_block` is the oldest block it still holds.
+    ReplayRefused { oldest_block: u64 },
+    /// Every other failure, with the reader thread's error for context.
+    Failed(anyhow::Error),
+}
+
 impl<G> ReaderHandles<G> {
     /// The feed loop returns only on failure (channel closed, or a post
-    /// that stopped it). Surface the reader threads' errors for context
-    /// before propagating `feed_err`. The channel-closed case's root
-    /// cause lives there.
-    fn surface_errors(self, feed_err: anyhow::Error) -> anyhow::Error {
+    /// that stopped it). Classify the end from the reader threads'
+    /// errors: the channel-closed case's root cause lives there. The
+    /// handles drop here, so the cluster session and the runtime close
+    /// before a new stack opens.
+    fn end(self, feed_err: anyhow::Error) -> ReaderEnd {
         warn!(error = %format!("{feed_err:#}"), "feed loop exited");
         if self.ordering_handle.is_finished()
             && let Ok(Err(re)) = self.ordering_handle.join()
         {
-            return anyhow::anyhow!("tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})");
+            if let ExecutorError::ClusterReplayUnavailable { oldest_block, .. } = re {
+                return ReaderEnd::ReplayRefused { oldest_block };
+            }
+            return ReaderEnd::Failed(anyhow::anyhow!(
+                "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
+            ));
         }
-        self.join_handles
-            .into_iter()
-            .find_map(|h| Self::stream_reader_failure(h, &feed_err))
-            .unwrap_or(feed_err)
+        ReaderEnd::Failed(
+            self.join_handles
+                .into_iter()
+                .find_map(|h| Self::stream_reader_failure(h, &feed_err))
+                .unwrap_or(feed_err),
+        )
     }
 
     /// `h`'s error, if it already finished and failed.
@@ -319,45 +421,225 @@ impl<G> ReaderHandles<G> {
 /// `tx_deposits` feed the join buffers, archive refetch runs on a join miss,
 /// and the canonical ordering comes from the Aeron Cluster egress, with the
 /// replay request seeded from the durable cursor. Runs until SIGTERM,
+/// What a restart continues: the spool's blocks, when they continue the
+/// confirmed cursor, and the cursor the reader resumes at. A spool that
+/// starts elsewhere (a cursor file restored from a backup, a spool from
+/// another chain) is dropped, and the reader resumes at the confirmed
+/// cursor. Blocks L1 already covers (through `skip_through_block`) are
+/// dropped first: a post that confirmed after the spool write.
+fn continue_from_spool(
+    spool: &Spool,
+    cursor: BatchCursor,
+    skip_through_block: u64,
+) -> Result<(Restored, BatchCursor)> {
+    spool.clear_through(skip_through_block)?;
+    let restored = spool.load()?;
+    let expected_first = cursor.next_block.max(skip_through_block.saturating_add(1));
+    let continues = restored
+        .blocks
+        .first()
+        .is_some_and(|first| first.block_number == expected_first)
+        && restored
+            .blocks
+            .windows(2)
+            .all(|w| w[1].block_number == w[0].block_number.saturating_add(1));
+    if !continues {
+        if let Some(first) = restored.blocks.first() {
+            warn!(
+                spool_first = first.block_number,
+                expected_first, "spool does not continue the confirmed cursor; dropping it"
+            );
+            spool.clear_through(u64::MAX)?;
+        }
+        return Ok((
+            Restored {
+                blocks: Vec::new(),
+                oldest_written: None,
+            },
+            cursor,
+        ));
+    }
+    let resume = restored.blocks.last().map_or(cursor, |last| BatchCursor {
+        next_index: last.end_tx_idx.as_index(),
+        next_block: last.block_number.saturating_add(1),
+        last_batch_index: cursor.last_batch_index,
+    });
+    Ok((restored, resume))
+}
+
 /// Ctrl-C, or a feed-loop failure that stops it.
+///
+/// The resume sources, in order: the spool, the sealer's replay from the
+/// cursor, and a rebuild from the state databases' references and the
+/// `tx_data` archives for a gap the sealer no longer retains. A refused
+/// replay is answered once: the rebuild fills the gap up to the sealer's
+/// floor, and the stack starts again at the floor. A second refusal is a
+/// fail-stop.
 ///
 /// # Errors
 /// Returns an error when L1 setup, cursor reconcile, config parsing, or the
 /// reader stack fails to start, or when the feed loop exits with a failure.
 pub async fn run(args: LiveArgs) -> Result<()> {
     let l1 = args.start_l1_side().await?;
+    let spool = Spool::open(&args.spool_dir)?;
+    let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
     let mut run_cfg = RunConfig::resolve(&args)?;
     run_cfg.resolve_cluster_ingress().await?;
-    let ReaderStack { handles, feed_rx } = run_cfg.spawn_reader_stack(&args, l1.cursor)?;
 
+    gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
+        .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
+    let age_probe = tokio::spawn(
+        PostAge::new(
+            l1.provider.clone(),
+            args.settlement,
+            args.settlement_deploy_block,
+            POST_AGE_EVERY,
+        )
+        .run(),
+    );
     let sender = LiveSender::new(
         l1.provider,
         args.settlement,
-        l1.da_store,
+        l1.da,
         l1.l1_truth.last_batch_index,
         args.l1_retries,
-        args.cursor_file,
+        args.cursor_file.clone(),
     );
     let feed_cfg = FeedConfig {
         blocks_per_batch: args.blocks_per_batch,
         compress: args.compress,
         chain_id: args.chain_id,
         flush: Duration::from_millis(args.flush_ms.get()),
-        skip_through_block: l1.skip_through_block,
+        idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
+        target_payload_bytes: args.target_payload_bytes,
+        skip_through_block: resume.skip_through(l1.skip_through_block),
     };
-    let mut feed = tokio::spawn(FeedLoop::new(feed_rx, sender, feed_cfg).run());
-    let feed_result = tokio::select! {
-        r = &mut feed => r.context("feed task panicked")?,
-        () = bin_support::wait_for_shutdown() => {
-            // Exit cleanly. The cursor is reconciled against L1 truth on
-            // every restart, so tearing down mid-batch loses nothing.
-            info!("shutdown signal received; stopping live batcher");
-            run_cfg.plane.shutdown().await;
-            return Ok(());
+    let feed = FeedLoop::new(sender, feed_cfg, spool, restored);
+    let store = RefsStore::new(args.block_refs_sources.clone());
+    let mut service = Service { args, run_cfg };
+    let served = match service.serve(feed, resume).await? {
+        Served::Done => Served::Done,
+        Served::Refused {
+            mut feed,
+            oldest_block,
+        } => {
+            let factory = service.run_cfg.join_recovery(&service.args).context(
+                "the sealer refused the replay, and the rebuild from references needs the \
+                 tx_data archives: --replay-destination-endpoint, \
+                 --archive-control-response-endpoint and the archive endpoints of channels.toml",
+            )?;
+            let rebuilder = ArchiveRebuilder { factory };
+            let resume =
+                recover_from_refs(&store, rebuilder, &mut feed, resume, oldest_block).await?;
+            service.serve(*feed, resume).await?
         }
     };
-    match feed_result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(handles.surface_errors(e)),
+    if let Served::Refused { oldest_block, .. } = served {
+        bail!(
+            "the sealer refused the replay again after the rebuild filled the gap: its floor \
+             moved to block {oldest_block}; a restart rebuilds the new gap"
+        );
+    }
+    // Exit cleanly. The cursor is reconciled against L1 truth on every
+    // restart, so tearing down mid-batch loses nothing.
+    info!("shutdown signal received; stopping live batcher");
+    age_probe.abort();
+    service.run_cfg.plane.shutdown().await;
+    Ok(())
+}
+
+/// Rebuild the gap between the cursor and the sealer's floor into the
+/// feed loop: the references from the state databases, the bytes from the
+/// archives through `rebuilder`. Returns the cursor the reader resumes
+/// at: the end of the floor block, which the sealer holds.
+///
+/// # Errors
+/// Returns an error when no query endpoint is configured, when a block
+/// of the gap is not served, when a block does not continue its
+/// predecessor, or when the rebuild fails.
+async fn recover_from_refs<P: Provider, R: Rebuilder>(
+    store: &RefsStore,
+    rebuilder: R,
+    feed: &mut FeedLoop<P>,
+    resume: BatchCursor,
+    oldest_block: u64,
+) -> Result<BatchCursor> {
+    if store.is_empty() {
+        bail!(
+            "the sealer refused the replay from block {} (its oldest retained block is \
+             {oldest_block}) and no --block-refs-source is set; the gap is not recoverable \
+             from here",
+            resume.next_block
+        );
+    }
+    warn!(
+        from_block = resume.next_block,
+        oldest_block,
+        "sealer replay refused; rebuilding the gap from the state databases and the archives"
+    );
+    let refs = store.blocks(resume, oldest_block).await?;
+    // The archive client is thread-bound and blocks on each replay; the
+    // runtime's other tasks keep running on their own workers.
+    let blocks = tokio::task::block_in_place(|| rebuilder.rebuild(refs))?;
+    let resumed = feed.absorb(blocks)?;
+    info!(
+        replay_from_index = resumed.next_index,
+        replay_from_block = resumed.next_block,
+        "gap rebuilt; resuming at the sealer's floor"
+    );
+    Ok(resumed)
+}
+
+/// What one reader stack did: ran until shutdown, or ended on a refused
+/// replay with the feed loop handed back for the recovery. The loop is
+/// boxed: it is the one large value, and `Done` carries none.
+enum Served<P> {
+    Done,
+    Refused {
+        feed: Box<FeedLoop<P>>,
+        oldest_block: u64,
+    },
+}
+
+/// The live service's fixed parts across reader stacks: the arguments
+/// and the resolved config.
+struct Service {
+    args: LiveArgs,
+    run_cfg: RunConfig,
+}
+
+impl Service {
+    /// Run `feed` on a reader stack that resumes at `resume`, until
+    /// shutdown or a failure. A refused replay hands the feed loop back;
+    /// every other failure is the error. The caller ends the plane after
+    /// a shutdown.
+    async fn serve<P: Provider + 'static>(
+        &mut self,
+        feed: FeedLoop<P>,
+        resume: BatchCursor,
+    ) -> Result<Served<P>> {
+        let ReaderStack { handles, feed_rx } =
+            self.run_cfg.spawn_reader_stack(&self.args, resume)?;
+        let mut task = tokio::spawn(async move {
+            let mut feed = feed;
+            let why = feed.run(feed_rx).await;
+            (feed, why)
+        });
+        metrics::gauge!(super::live_metric_names::FEED_RUNNING).set(1.0);
+        let (feed, why) = tokio::select! {
+            r = &mut task => r.context("feed task panicked")?,
+            () = bin_support::wait_for_shutdown() => return Ok(Served::Done),
+        };
+        match handles.end(why) {
+            ReaderEnd::ReplayRefused { oldest_block } => Ok(Served::Refused {
+                feed: Box::new(feed),
+                oldest_block,
+            }),
+            ReaderEnd::Failed(e) => Err(e),
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod tests;

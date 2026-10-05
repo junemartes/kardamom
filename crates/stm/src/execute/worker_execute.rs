@@ -7,7 +7,6 @@ use super::config::nanos;
 use super::metrics::{Metrics, TxResult};
 use super::recycle::RecyclePools;
 use super::view::MvView;
-use crate::FEE_SINK;
 use crate::mv::MvCache;
 use crate::mv::ReadRecord;
 use alloy_primitives::B256;
@@ -144,9 +143,7 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
         ));
     };
     let (signer, nonce, to) = (job.envelope.sender, alloy_env.nonce(), alloy_env.to());
-    let effective_gas_price = alloy_env
-        .gas_price()
-        .unwrap_or_else(|| alloy_env.max_fee_per_gas());
+    let fees = alloy_env.fees();
     let tx_env = reaim_and_build_tx_env(evm, job.local_idx, alloy_env, signer);
     let t_evm = std::time::Instant::now();
     let outcome = match evm.transact(tx_env) {
@@ -186,7 +183,7 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
             signer,
             nonce,
             to,
-            effective_gas_price,
+            fees,
         },
         fresh_reads,
     )
@@ -194,15 +191,15 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
 
 /// A transaction that ran (did not skip): its EVM outcome, plus the
 /// fields [`execute_one`] already resolved (the signer, the decoded
-/// nonce and recipient, the effective gas price) so [`build_tx_result`]
-/// does not re-derive them from the decoded envelope.
+/// nonce and recipient, the fee fields) so [`build_tx_result`] does not
+/// re-derive them from the decoded envelope.
 struct Ran {
     outcome: revm::context::result::ResultAndState,
     evm_ns: u64,
     signer: alloy_primitives::Address,
     nonce: u64,
     to: Option<alloy_primitives::Address>,
-    effective_gas_price: u128,
+    fees: kardamom_types::TxFees,
 }
 
 /// Turn one successful EVM outcome into a [`TxResult`]: publish the
@@ -229,10 +226,15 @@ fn build_tx_result<S: StateDatabase>(
         signer,
         nonce,
         to,
-        effective_gas_price,
+        fees,
     } = ran;
     metrics.evm_ns.fetch_add(evm_ns, Ordering::Relaxed);
     let gas_used = outcome.result.gas().tx_gas_used();
+    // The chain's settlement on top of revm's, exactly as the sequential
+    // path applies it: the tip in full, the base fee as the price.
+    let price =
+        kardamom_exec_core::settle::settle(&fees, env.fees, gas_used, &mut outcome.state, signer)?;
+    let sink = env.fees.beneficiary;
     // Build wire logs straight from the borrowed result: no
     // intermediate `logs.clone()` (topic Vecs and data Bytes per log).
     let (status, wire_logs) = status_and_wire_logs(&outcome.result);
@@ -254,10 +256,11 @@ fn build_tx_result<S: StateDatabase>(
     // sink (Accumulator: all workers see block-start; the commit pass
     // computes the prefixes).
     let t_pub = std::time::Instant::now();
-    mv.publish_write_set(job.local_idx, &ws, FEE_SINK);
+    mv.publish_write_set(job.local_idx, &ws, sink);
     let pub_ns = nanos(t_pub.elapsed());
     metrics.publish_ns.fetch_add(pub_ns, Ordering::Relaxed);
-    let sink_fee_delta = sink_fee_delta(&ws, sink_start_balance, env.block_number, job.tx_idx)?;
+    let sink_fee_delta =
+        sink_fee_delta(&ws, sink, sink_start_balance, env.block_number, job.tx_idx)?;
     let reads = {
         // Take this transaction's read log back out of the worker's
         // view. The replacement comes from the recycle pool (cleared,
@@ -284,7 +287,7 @@ fn build_tx_result<S: StateDatabase>(
         nonce,
         signer,
         to,
-        effective_gas_price,
+        price,
         block_number: env.block_number,
         local_idx: job.local_idx,
     });
@@ -304,11 +307,12 @@ fn build_tx_result<S: StateDatabase>(
 /// instead of splitting it into a bool and a sentinel value.
 fn sink_fee_delta(
     ws: &WriteSet,
+    sink: alloy_primitives::Address,
     sink_start_balance: U256,
     block_number: u64,
     tx_idx: TxIndex,
 ) -> Result<Option<U256>, ExecutorError> {
-    let Some((_, fields)) = ws.accounts.iter().find(|(a, _)| *a == FEE_SINK) else {
+    let Some((_, fields)) = ws.accounts.iter().find(|(a, _)| *a == sink) else {
         return Ok(None);
     };
     Ok(Some(fee_delta_from_sink(
@@ -435,7 +439,7 @@ struct ReceiptArgs<'a> {
     nonce: u64,
     signer: alloy_primitives::Address,
     to: Option<alloy_primitives::Address>,
-    effective_gas_price: u128,
+    price: kardamom_exec_core::settle::ReceiptPrice,
     block_number: u64,
     local_idx: u32,
 }
@@ -454,7 +458,7 @@ fn build_receipt(args: ReceiptArgs<'_>) -> Receipt {
         nonce,
         signer,
         to,
-        effective_gas_price,
+        price,
         block_number,
         local_idx,
     } = args;
@@ -475,7 +479,9 @@ fn build_receipt(args: ReceiptArgs<'_>) -> Receipt {
         from: signer,
         to,
         contract_address,
-        effective_gas_price,
+        effective_gas_price: price.effective_gas_price,
+        priority_fee_per_gas: price.priority_fee_per_gas,
+        priority_fee_paid: price.priority_fee_paid,
         block_number,
         transaction_index: u64::from(local_idx),
         // Canonical prefix sums land in the commit pass.

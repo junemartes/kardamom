@@ -10,6 +10,10 @@ use kardamom_state::{Durability, StateEnv, StateEnvBuilder, StateWriter, WriterH
 use kardamom_stm::execute::{Scheduler, StmOutcome};
 use kardamom_types::{AccountChange, BPosition, Receipt, TxEnvelope};
 
+/// The fee sink of the bench workloads: they run no fee schedule, so
+/// every tip burns at the zero address.
+pub(crate) const NO_SINK: alloy_primitives::Address = alloy_primitives::Address::ZERO;
+
 /// The engine knobs. These map onto `PoolConfig`.
 pub(crate) struct EngineOpts {
     pub(crate) worker_counts: Vec<NonZeroUsize>,

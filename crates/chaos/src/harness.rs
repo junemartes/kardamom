@@ -309,7 +309,7 @@ impl Harness {
             completeness: Completeness::Accepted,
             fixed_rate: false,
             duration: window,
-            tps: self.knobs.tps,
+            tps: case.tps(&self.knobs),
             retry_submit: case.load_retry(&self.knobs),
             max_gap: self.knobs.load_max_gap,
             drain_timeout: self
