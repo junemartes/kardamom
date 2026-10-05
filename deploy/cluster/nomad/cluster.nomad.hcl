@@ -257,6 +257,26 @@ job "cluster" {
           }
         }
 
+        # The bootstrap flag of a new cluster. A blank member (no recording
+        # log) starts at log position 0 only when this file reads "true";
+        # every other blank member copies the latest snapshot from a peer
+        # first (ClusterNode, StartMode). The file is "true" while the Nomad
+        # variable nomad/jobs/cluster exists. Only the bootstrap deploy of
+        # the workloads role (KARDAMOM_CLUSTER_BOOTSTRAP=1 on a job that
+        # Nomad does not know yet) writes that variable, and the role
+        # deletes it when the new cluster is up. The member reads the file
+        # at each start, not an env var: Nomad keeps the env of a task
+        # across a restart in place, but it renders this file again when
+        # the variable goes. The change mode is noop: the deletion must not
+        # restart a running member.
+        template {
+          destination = "local/bootstrap"
+          change_mode = "noop"
+          data        = <<-EOT
+          {{- range nomadVarList "nomad/jobs/cluster" }}{{ if eq .Path "nomad/jobs/cluster" }}true{{ end }}{{ end }}
+          EOT
+        }
+
         # These are JVM options for the image ENTRYPOINT
         # (java -Xmx384m -cp ... ClusterNode). They must go through env,
         # not docker `args`. docker `args` land after the main class, so

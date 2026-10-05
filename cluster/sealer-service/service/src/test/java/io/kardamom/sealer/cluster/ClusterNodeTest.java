@@ -44,6 +44,12 @@ final class ClusterNodeTest {
     }
 
     @Test
+    void peerConsensusEndpointsListsEveryOtherMember() {
+        assertEquals("192.168.56.52:40201,192.168.56.53:40201", ClusterNode.peerConsensusEndpoints(MEMBERS, 0));
+        assertEquals("192.168.56.51:40201,192.168.56.53:40201", ClusterNode.peerConsensusEndpoints(MEMBERS, 1));
+    }
+
+    @Test
     void memberEndpointsThrowsOnUnknownId() {
         assertThrows(IllegalArgumentException.class, () -> ClusterNode.memberEndpoints(MEMBERS, 7));
     }

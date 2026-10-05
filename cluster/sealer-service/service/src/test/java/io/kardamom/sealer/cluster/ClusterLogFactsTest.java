@@ -6,8 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.aeron.cluster.ClusterBackup;
-import io.aeron.cluster.ClusterBackup.Configuration.ReplayStart;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.service.Cluster;
@@ -15,10 +13,9 @@ import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
 import io.aeron.test.SystemTestWatcher;
 import io.aeron.test.Tests;
-import io.aeron.test.cluster.TestBackupNode;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
-import java.io.IOException;
+import io.aeron.test.driver.RedirectingNameResolver;
 import java.nio.file.Path;
 import java.util.EnumSet;
 import java.util.List;
@@ -47,11 +44,11 @@ import org.junit.jupiter.api.io.TempDir;
  *       follower stays in the election: it waits in
  *       {@code FOLLOWER_CATCHUP_AWAIT} until the leader heartbeat timeout
  *       (10 s in TestCluster), then starts again at {@code INIT}. Its commit position stays 0.</li>
- *   <li>A ClusterBackup with {@code ReplayStart.LATEST_SNAPSHOT} records the
- *       log from the latest snapshot position. Its cluster and archive
- *       directories, copied into a wiped member, let that member restore
- *       from the snapshot, catch up from the leader, and reach the leader's
- *       state.</li>
+ *   <li>{@link PeerSeed}, a ClusterBackup with
+ *       {@code ReplayStart.LATEST_SNAPSHOT} that writes into a wiped
+ *       member's own directories, records the log from the latest snapshot
+ *       position. The member then restores from the snapshot, catches up
+ *       from the leader, and reaches the leader's state.</li>
  *   <li>An intact follower whose log ends below the purge point replays its
  *       own log, then sticks the same way as a wiped follower. The leader
  *       refuses the replay from the follower's log end. This case stays in
@@ -72,11 +69,12 @@ class ClusterLogFactsTest {
     private static final long LOG_BYTES_BEFORE_SNAPSHOT = 4L * SEGMENT_LENGTH;
     private static final long LOG_BYTES_TAIL = 8L * 1024;
 
-    /**
-     * The prefix of the node directories. TestCluster puts member {@code i}
-     * in {@code node-i}, and the backup node in {@code node-3}.
-     */
+    /** The prefix of the node directories. TestCluster puts member {@code i} in {@code node-i}. */
     private static final String NODE_DIR = "node";
+
+    /** The TestCluster member host names, which every member's media driver maps to localhost. */
+    private static final String NODE_NAMES =
+            "node0,localhost,localhost|node1,localhost,localhost|node2,localhost,localhost";
 
     /** The leader's archive error when a replay starts below the purged recording start. */
     private static final String REPLAY_BELOW_START = "is less than recording start position=";
@@ -102,7 +100,7 @@ class ClusterLogFactsTest {
     @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
     void wipedFollowerCannotRejoinAfterPurge() {
         systemTestWatcher.ignoreErrorsMatching(error -> error.contains(REPLAY_BELOW_START));
-        try (Run run = new Run(ReplayStart.BEGINNING)) {
+        try (Run run = new Run()) {
             run.appendLog(LOG_BYTES_BEFORE_SNAPSHOT);
             final long logStart = run.snapshotAndPurge();
             final TestNode wiped = run.cluster.startStaticNode(run.stopFollower(), true);
@@ -118,16 +116,16 @@ class ClusterLogFactsTest {
 
     @Test
     @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
-    void backupSeededMemberRejoinsFromLatestSnapshot() throws IOException {
-        try (Run run = new Run(ReplayStart.LATEST_SNAPSHOT)) {
+    void peerSeededMemberRejoinsFromLatestSnapshot() {
+        try (Run run = new Run()) {
             run.appendLog(LOG_BYTES_BEFORE_SNAPSHOT);
             final long logStart = run.snapshotAndPurge();
             final long snapshotPosition = run.leaderProbe.latestSnapshotLogPosition();
             run.appendLog(LOG_BYTES_TAIL);
             final int memberId = run.stopFollower();
+            new StateDir(nodeDir(memberId)).clear();
 
-            final long backupLogStart = run.backUpToLeaderCommit();
-            new BackupSeed(nodeDir(MEMBER_COUNT)).copyInto(nodeDir(memberId));
+            final long seededPosition = peerSeed(memberId).run();
             run.reconnectClient();
             run.appendLog(LOG_BYTES_TAIL);
             final TestNode rejoined = run.cluster.startStaticNode(memberId, false);
@@ -135,10 +133,11 @@ class ClusterLogFactsTest {
             run.snapshot(List.of(run.leader, rejoined));
 
             assertTrue(logStart > 0, "the purge must remove the first log segments");
-            assertEquals(snapshotPosition, backupLogStart,
-                    "the backup records the log from the latest snapshot position");
+            assertEquals(snapshotPosition, seededPosition, "the seed copies the latest snapshot");
+            assertEquals(snapshotPosition, new MemberProbe(rejoined).logStartPosition(),
+                    "the seed records the log from the latest snapshot position");
             assertTrue(((SealerTestService) rejoined.service()).restoredFromSnapshot(),
-                    "the seeded member must start from the backup's snapshot");
+                    "the seeded member must start from the seeded snapshot");
             assertEquals(Cluster.Role.FOLLOWER, rejoined.role());
             assertArrayEquals(run.leaderProbe.latestServiceSnapshot(),
                     new MemberProbe(rejoined).latestServiceSnapshot(),
@@ -150,7 +149,7 @@ class ClusterLogFactsTest {
     @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
     void intactFollowerBelowPurgePointSticksInCatchup() {
         systemTestWatcher.ignoreErrorsMatching(error -> error.contains(REPLAY_BELOW_START));
-        try (Run run = new Run(ReplayStart.BEGINNING)) {
+        try (Run run = new Run()) {
             run.appendLog(LOG_BYTES_TAIL);
             final TestNode lagging = run.cluster.followers().get(0);
             run.cluster.awaitCommitPosition(lagging, run.leader.commitPosition());
@@ -172,6 +171,19 @@ class ClusterLogFactsTest {
         return baseDir.resolve(NODE_DIR + "-" + memberId);
     }
 
+    /** The production peer seed of a stopped member, with the member's TestCluster directories and endpoints. */
+    private PeerSeed peerSeed(final int memberId) {
+        final String members = TestCluster.clusterMembers(0, MEMBER_COUNT);
+        final MemberContexts contexts = new MemberContexts(
+                baseDir.resolve("seed-aeron").toString(),
+                nodeDir(memberId).resolve("consensus-module").toString(),
+                nodeDir(memberId).resolve("archive").toString(),
+                ClusterNode.memberEndpoints(members, memberId),
+                new RedirectingNameResolver(NODE_NAMES));
+        return new PeerSeed(memberId, ClusterNode.peerConsensusEndpoints(members, memberId), contexts,
+                PeerSeed.Timing.DEFAULT);
+    }
+
     /** One cluster for one test: the members, the leader, and a connected client. */
     private final class Run implements AutoCloseable {
         final TestCluster cluster;
@@ -180,13 +192,12 @@ class ClusterLogFactsTest {
         private AeronCluster client;
         private int nextRecordId = 0;
 
-        Run(final ReplayStart replayStart) {
+        Run() {
             this.cluster = ClusterTestHarness.start(systemTestWatcher,
                     ClusterTestHarness.builder(MEMBER_COUNT, DEDUP_CAPACITY, TICK_MS)
                             .withLogChannel(LOG_CHANNEL)
                             .withSegmentFileLength(SEGMENT_LENGTH)
-                            .withClusterBaseDir(baseDir.resolve(NODE_DIR).toString())
-                            .replayStart(replayStart));
+                            .withClusterBaseDir(baseDir.resolve(NODE_DIR).toString()));
             this.leader = cluster.awaitLeader();
             this.leaderProbe = new MemberProbe(leader);
             this.client = cluster.connectClient();
@@ -223,22 +234,6 @@ class ClusterLogFactsTest {
             final TestNode follower = cluster.followers().get(0);
             cluster.stopNode(follower);
             return follower.index();
-        }
-
-        /**
-         * Run a ClusterBackup node until its live log reaches the leader's
-         * commit position, then close it. The test waits for
-         * {@code BACKING_UP}: the agent enters it only after
-         * {@code LIVE_LOG_REPLAY} and {@code UPDATE_RECORDING_LOG}, and
-         * {@code LIVE_LOG_REPLAY} is too short to poll. Return the start
-         * position of the backup's log recording.
-         */
-        long backUpToLeaderCommit() {
-            try (TestBackupNode backup = cluster.startClusterBackupNode(true)) {
-                cluster.awaitBackupState(ClusterBackup.State.BACKING_UP);
-                cluster.awaitBackupLiveLogPosition(leader.commitPosition());
-                return backup.recordingLogStartPosition();
-            }
         }
 
         /** Replace the client, whose session can time out while the test waits on other members. */

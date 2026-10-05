@@ -211,6 +211,17 @@ role smokes the ingress canary by its node address, promotes it, and only then
 replaces the old instances. `auto_revert` is on for those two stateless
 classes only.
 
+A new sealer cluster needs one bootstrap. A blank sealer member (no Raft
+recording log) starts at log position 0 only during the bootstrap. Every
+other blank member copies the latest snapshot from a peer before it starts,
+and it waits while no peer answers. Set `KARDAMOM_CLUSTER_BOOTSTRAP=1` for
+the first deploy of a new cluster. The role then writes the Nomad variable
+`nomad/jobs/cluster` while it registers the new cluster job, and deletes it
+when the deployment ends. The role ignores the flag when Nomad knows the
+job, so a re-deploy with the flag is safe. `just container-up` and the
+chaos bring-up set the flag. Do not set it when you register a purged job
+again for a cluster that holds state.
+
 A successful deploy records its manifest under `deployed/<env>/` (`KARDAMOM_ENV`,
 default `local`): `images.digests` is what runs, `images.digests.previous` is
 what it replaced. `just rollback <env>` deploys the previous one; it is a
