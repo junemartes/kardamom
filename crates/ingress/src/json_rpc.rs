@@ -140,6 +140,21 @@ pub trait IngressKardamomApi {
     /// streams everything.
     #[subscription(name = "subscribeReceipts", item = ReceiptEvent)]
     async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
+
+    /// The block number a tag names: `latest` and `pending` the head,
+    /// `safe` the last block posted to L1, `finalized` the last block
+    /// whose batch L1 finalized. The batcher does not observe L1
+    /// finality today, so `finalized` serves the posted head too. A
+    /// client that cannot accept a revert waits for `safe`.
+    #[method(name = "blockNumberByTag")]
+    async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256>;
+
+    /// The chain status: the posted and sealed heads, the DA-lag budget,
+    /// the roots (the live halts every pause waits on), the sealer as
+    /// this ingress observes it, this ingress's own state, and the latest
+    /// state of every service on the `events` stream.
+    #[method(name = "chainStatus")]
+    async fn chain_status(&self) -> RpcResult<serde_json::Value>;
 }
 
 pub(crate) struct IngressHandlers<Backend: ProxyBackend> {
@@ -242,6 +257,17 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
         self.proxy
             .submit_raw_async(client_ip(), bytes)
             .await
+            .map_err(ErrorObjectOwned::from)
+    }
+
+    async fn chain_status(&self) -> RpcResult<serde_json::Value> {
+        Ok(self.proxy.chain_status())
+    }
+
+    async fn block_number_by_tag(&self, tag: BlockNumberOrTag) -> RpcResult<U256> {
+        self.proxy
+            .block_number_of(tag)
+            .map(U256::from)
             .map_err(ErrorObjectOwned::from)
     }
 
@@ -407,6 +433,8 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
         kardamom_types::TxErrorReason::InsufficientFunds { .. } => {
             ("insufficient-funds".to_string(), None)
         }
+        // A halt names the chain's state, not a nonce.
+        kardamom_types::TxErrorReason::DaLag { .. } => ("da-lag".to_string(), None),
     }
 }
 

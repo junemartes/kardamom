@@ -165,6 +165,16 @@ where
             count_reject("draining");
             return Err(IngressError::Draining);
         }
+        // A paused ingress refuses submits: a root upstream (the sealer's
+        // DA-lag guard or lost quorum, or every executor halted) cannot
+        // take the transaction, or an operator paused it. The sealer
+        // would refuse a record of a DA lag too; answering here saves the
+        // round trip and names the root. A state one tick stale costs one
+        // resubmit, nothing more.
+        if let Some(pause) = kardamom_obs::lifecycle::process().slots().pause {
+            count_reject("paused");
+            return Err(self.paused_error(pause));
+        }
 
         if let Err(e) = self.rate_limiter.check(client_ip) {
             let _ = e; // This error carries no data.

@@ -31,11 +31,14 @@ use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscr
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
-use kardamom_log::aeron_live::{AeronRuntime, TxStatusPublisherHandle};
+use kardamom_log::aeron_live::{
+    AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
+};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_log::recorder::RecorderThreads;
 use kardamom_obs::bin::wait_for_shutdown;
+use kardamom_obs::events::{Beacon, Identity};
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
 use recorders::{
@@ -463,14 +466,39 @@ impl IngressService {
         // drops, or when the observer ends. The bus is a tokio `broadcast`
         // channel, so the send never blocks. A send with no live receiver
         // is not an error here.
-        let running =
-            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender(), status)
-                .spawn(guard)
-                .context("spawn cluster watermark thread")?;
+        let running = watermark::ClusterWatermarkPump::new(
+            observer,
+            subscription.watermark_sender(),
+            subscription.cluster_status_sender(),
+            status,
+        )
+        .spawn(guard)
+        .context("spawn cluster watermark thread")?;
         tracing::info!(
             "kardamom-ingress: on-quorum watermark and tx_status Sealed via Aeron Cluster egress"
         );
         Ok(running)
+    }
+
+    /// Publish this ingress's lifecycle and the sealer's, as this ingress
+    /// observes it, on the `events` stream.
+    async fn spawn_beacons(
+        plane: &mut StreamPlane,
+        rt: &AeronRuntime,
+        proxy: &IngressProxy<LiveIngressPublication, LiveIngressSubscription>,
+    ) -> Result<()> {
+        let events: ServiceEventsPublisherHandle =
+            plane.publisher(rt).await.context("open events")?;
+        events.spawn_process_beacon();
+        let sealer = Beacon::new(
+            Identity {
+                service: kardamom_ingress::chain::SEALER.to_string(),
+                instance: kardamom_ingress::chain::SEALER_INSTANCE.to_string(),
+            },
+            proxy.sealer().subscribe(),
+        );
+        events.spawn_beacon(sealer);
+        Ok(())
     }
 
     /// Open the status publisher and start the egress tap on `opened`.
@@ -537,6 +565,7 @@ impl IngressService {
 
         let drain_timeout = cfg.pending_receipt_timeout;
         let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
+        Self::spawn_beacons(&mut opened.plane, &opened.rt, &proxy).await?;
         let drainer = proxy.clone();
         let handle = proxy.start().await.context("IngressProxy::start")?;
         tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");

@@ -23,6 +23,7 @@
 //! receipts sink, the engine loop, and shutdown). [`revolve`] wraps the
 //! chain in the process loop.
 
+mod events;
 mod halted;
 mod pipeline;
 mod revolve;

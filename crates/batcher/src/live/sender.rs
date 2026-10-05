@@ -17,6 +17,27 @@ use crate::l1::post_batch;
 use super::cursor::{BatchCursor, L1Truth};
 use super::live_metric_names;
 
+/// The post of one batch failed on every attempt of the retry budget: L1
+/// does not answer, or every send failed. The batcher halts on it
+/// (`l1_unreachable`) and starts its post again after a backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PostExhausted {
+    pub(crate) prev_index: u64,
+    pub(crate) attempts: u32,
+}
+
+impl std::fmt::Display for PostExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "post batch (prev_index {}) failed after {} attempts",
+            self.prev_index, self.attempts
+        )
+    }
+}
+
+impl std::error::Error for PostExhausted {}
+
 /// A streaming L1 sender. It posts one packed group at a time, strictly
 /// serialized by the contract's CAS check, and persists the cursor only
 /// after a confirmed post.
@@ -117,11 +138,11 @@ impl<P: Provider> LiveSender<P> {
         // not silently back to zero.
         let attempt = attempt.saturating_add(1);
         if attempt > self.max_retries {
-            return Err(e).with_context(|| {
-                format!(
-                    "post batch (prev_index {}) after {attempt} attempts",
-                    self.prev_index
-                )
+            // The typed context lets the service tell an exhausted post
+            // from a refusal, and halt instead of ending.
+            return Err(e).context(PostExhausted {
+                prev_index: self.prev_index,
+                attempts: attempt,
             });
         }
         counter!(live_metric_names::L1_POST_RETRIES).increment(1);

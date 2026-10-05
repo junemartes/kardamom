@@ -378,6 +378,15 @@ pub struct ChannelsConfig {
     pub tx_remote_epochs_channel: ChannelUri,
     pub tx_remote_epochs_stream_id: i32,
 
+    /// `events`: every service's lifecycle state (`ServiceEvent`:
+    /// running, halted, paused, resumed), at once on a change and on a
+    /// 5 s heartbeat. Every service publishes, best effort; the ingress
+    /// and the validator subscribe. RAM only, not recorded: visibility
+    /// and the liveness of the services off the log. Nothing that changes
+    /// the canonical order reads it.
+    pub events_channel: ChannelUri,
+    pub events_stream_id: i32,
+
     /// `TxBal`: the per-block BAL (Block Access List; the executor's
     /// `BlockDelta` of account, storage, and code mutations plus receipts
     /// for a sealed block). Every executor replica publishes one
@@ -631,6 +640,12 @@ impl Default for ChannelsConfig {
             // (1004), fsync (1010), tx_errors (1015).
             tx_remote_epochs_channel: "aeron:ipc?alias=tx-remote-epochs".into(),
             tx_remote_epochs_stream_id: 1017,
+            // 1019 leaves 1018 to the transaction status stream and stays
+            // clear of every other block: receipts (1002, 1003), BAL
+            // (1004), fsync (1010), tx_errors (1015), tx_deposits (1016),
+            // tx_remote_epochs (1017).
+            events_channel: "aeron:ipc?alias=events".into(),
+            events_stream_id: 1019,
             // 1004 sits in the free range between the receipt block
             // (1002, 1003) and the fsync-watermark block (1010). BAL is
             // another executor output, so it lives near receipts.
