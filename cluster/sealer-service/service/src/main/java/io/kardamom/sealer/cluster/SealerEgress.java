@@ -135,8 +135,10 @@ final class SealerEgress {
     /**
      * Serve a client replay request.
      * Re-offer every retained frame at or after the requested cursor to the
-     * requesting session only, then send a REPLAY_DONE marker, or
-     * REPLAY_UNAVAILABLE when eviction has outrun the request. This runs the
+     * requesting session only, then send a REPLAY_DONE marker. Send a
+     * REPLAY_UNAVAILABLE marker instead when the cursor is past the head,
+     * when it does not name one point of the stream, or when the retained
+     * frames no longer reach back to it. This runs the
      * same way on every member, from the replicated log, but only the
      * leader's session offers reach the client. {@code upToIndex} and
      * {@code upToBlock} are the state machine's current canonical count and
@@ -159,6 +161,16 @@ final class SealerEgress {
             final long fromBlock,
             final long upToIndex,
             final long upToBlock) {
+        if (fromIndex > upToIndex || fromBlock > upToBlock) {
+            // A consumer ahead of the head applied records that this member
+            // does not hold, for example after a wipe or a re-seed. A
+            // REPLAY_DONE would let the consumer drop each new record below
+            // its cursor as a duplicate and diverge silently. The refusal
+            // stops it.
+            refuseReplay(session, fromIndex, fromBlock,
+                "AHEAD head=(" + upToIndex + "," + upToBlock + ")");
+            return;
+        }
         final long lowerEnd = retainedBoundaryEnd(fromBlock - 1);
         final long upperEnd = retainedBoundaryEnd(fromBlock);
         if (!cursorInsideBlock(fromIndex, lowerEnd, upperEnd)) {
@@ -168,19 +180,13 @@ final class SealerEgress {
             // twice, and no consumer-side check can see it: the consumer
             // seeds every counter from the same cursor. This member holds
             // the boundaries, so it is the one place that can refuse.
-            System.out.println("cluster REPLAY memberId=" + memberId
-                + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
-                + ") SKEWED block " + fromBlock + " spans (" + lowerEnd + "," + upperEnd + ")");
-            offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+            refuseReplay(session, fromIndex, fromBlock,
+                "SKEWED block " + fromBlock + " spans (" + lowerEnd + "," + upperEnd + ")");
             return;
         }
         if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
-            // Log to stdout, like the role lines, so the chaos suite can grep
-            // it next to its other signals. The service has no other logger.
-            System.out.println("cluster REPLAY memberId=" + memberId
-                + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
-                + ") UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
-            offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+            refuseReplay(session, fromIndex, fromBlock,
+                "UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
             return;
         }
         long served = 0;
@@ -204,6 +210,19 @@ final class SealerEgress {
             + ") served=" + served + " dropped=" + dropped
             + " retained=" + retained.size());
         offerControl(session, SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock);
+    }
+
+    /**
+     * Refuse a replay request with REPLAY_UNAVAILABLE, which carries the
+     * retention floors, and log the reason. The log goes to stdout, like
+     * the role lines, so the chaos suite can grep it next to its other
+     * signals. The service has no other logger.
+     */
+    private void refuseReplay(
+            final ClientSession session, final long fromIndex, final long fromBlock, final String reason) {
+        System.out.println("cluster REPLAY memberId=" + memberId
+            + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock + ") " + reason);
+        offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
     }
 
     /** Byte offset of {@code endTxIdx} in a boundary frame: after the kind and the block number. */

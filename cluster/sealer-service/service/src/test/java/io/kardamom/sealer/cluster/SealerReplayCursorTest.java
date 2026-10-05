@@ -19,6 +19,10 @@ import org.junit.jupiter.api.Test;
  * member holds the boundaries, so it refuses a pair outside the block it
  * names. A state rebuilt from L1 with a wrong end index is the case this
  * guards: the refusal routes the consumer into its repair path.
+ *
+ * <p>A pair ahead of the head names records that the member does not hold.
+ * A REPLAY_DONE would make the consumer drop every new record below its
+ * cursor as a duplicate, so the member refuses that pair too.</p>
  */
 class SealerReplayCursorTest {
 
@@ -105,6 +109,31 @@ class SealerReplayCursorTest {
         final StubSession consumer = replay(2, 4, 1);
         assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
         assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_RELAYED));
+    }
+
+    @Test
+    void aResumeAtTheHeadIsDone() {
+        // The head is index 5 in the open block 3.
+        final StubSession consumer = replay(2, 5, 3);
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_RELAYED));
+        assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_DONE));
+    }
+
+    @Test
+    void anIndexAheadOfTheHeadIsRefused() {
+        // Index 6 lies inside the open block 3, but no record 5 exists yet.
+        final StubSession consumer = replay(2, 6, 3);
+        assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_DONE));
+    }
+
+    @Test
+    void aBlockAheadOfTheHeadIsRefused() {
+        // Block 3 is open, so no boundary of block 3 or 4 exists yet.
+        final StubSession consumer = replay(2, 5, 4);
+        assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_DONE));
     }
 
     @Test

@@ -59,6 +59,20 @@ pub enum ExecutorError {
         oldest_block: u64,
     },
 
+    /// The cluster head lies below this consumer's delivery cursor: the
+    /// sealer lost canonical records that this consumer already applied,
+    /// for example after a wipe. The consumer stops, because each new record
+    /// falls below its cursor and drops as a duplicate.
+    #[error(
+        "cluster head (index {up_to_index}, block {up_to_block}) is behind the delivery cursor (index {next_index}, block {next_block}) — the sealer lost applied records"
+    )]
+    ClusterBehindCursor {
+        next_index: u64,
+        next_block: u64,
+        up_to_index: u64,
+        up_to_block: u64,
+    },
+
     /// `sequencer_id` is the `tx_data` lane index, `TxRef::shard_id`. It
     /// names the archive that holds the envelope, not the process that
     /// published the ref.

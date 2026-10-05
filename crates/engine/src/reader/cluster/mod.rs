@@ -208,8 +208,11 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         match item {
             EgressItem::Record { index, msg } => self.ingest_record(index, msg),
             EgressItem::Boundary(b) => self.ingest_boundary(b)?,
-            EgressItem::ReplayDone { .. } => {
-                self.catching_up = false;
+            EgressItem::ReplayDone {
+                up_to_index,
+                up_to_block,
+            } => {
+                self.end_replay(up_to_index, up_to_block)?;
             }
             // Every reject is offered only to the offering sequencer
             // session. An executor session cannot receive one. Ignore them
@@ -230,6 +233,32 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             }
         }
         self.check_pending_overflow()
+    }
+
+    /// End the catch-up at a `REPLAY_DONE` marker. The marker carries the
+    /// sealer's head: the next canonical index and the next block number.
+    /// The frames before the marker in the session come from the head or
+    /// below, so a head below the delivery cursor means the sealer lost
+    /// records that this consumer applied. Each new record then falls
+    /// below the cursor and drops as a duplicate, so this fails instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::ClusterBehindCursor`] when the head lies
+    /// below the delivery cursor.
+    fn end_replay(&mut self, up_to_index: u64, up_to_block: u64) -> Result<(), ExecutorError> {
+        let next_index = self.cursor.next_index.load(Ordering::Relaxed);
+        let next_block = self.cursor.next_block.load(Ordering::Relaxed);
+        if up_to_index < next_index || up_to_block < next_block {
+            return Err(ExecutorError::ClusterBehindCursor {
+                next_index,
+                next_block,
+                up_to_index,
+                up_to_block,
+            });
+        }
+        self.catching_up = false;
+        Ok(())
     }
 
     /// Buffer one canonical record. Drops a duplicate below the delivery
