@@ -5,7 +5,9 @@ import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.Relayed;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -95,10 +97,21 @@ final class SealerEgress {
      * Without replay, frames committed while a client had no session are
      * lost forever, leaving an unrecoverable gap in its canonical stream.
      * This is deterministic across members, since it is derived from the
-     * replicated log. It is not snapshotted (v1): a member restarted from a
-     * snapshot sets its retention floors from the restored state (see
-     * {@link SealerClusteredService#onStart}) and serves REPLAY_UNAVAILABLE
-     * for pre-restart ranges instead.
+     * replicated log.
+     *
+     * <p>The window of {@link #retentionCap} frames is a minimum, not a
+     * maximum: a frame past the window is evicted only when its block is
+     * posted to L1 ({@link #postedHead}). Nothing a batcher has not
+     * confirmed on L1 is dropped, so the batcher can always replay from
+     * its cursor. The DA-lag guard bounds the growth: the sealer refuses
+     * user records at {@code daLagBudgetBlocks} past the posted head, so
+     * the stretched window holds at most the budget's blocks plus one
+     * flush, in heap.</p>
+     *
+     * <p>The frames above the posted head ride the snapshot
+     * ({@link #writeSnapshot}), so a member restored from a snapshot keeps
+     * the floor at the posted head instead of raising it to the restore
+     * point.</p>
      */
     private final java.util.ArrayDeque<RetainedFrame> retained = new java.util.ArrayDeque<>();
     private final int retentionCap =
@@ -106,6 +119,11 @@ final class SealerEgress {
     /** First record index / boundary block still guaranteed retained. */
     private long firstRetainedIndex;
     private long firstRetainedBlock;
+    /**
+     * The last L2 block the batcher confirmed on L1, echoed from the state
+     * machine. A frame of a block at or below it may leave the window.
+     */
+    private long postedHead;
 
     // Staging buffer for egress framing. Reuse it to avoid a per-message
     // allocation on the single cluster service thread.
@@ -125,6 +143,32 @@ final class SealerEgress {
     /** Mark a session as a canonical-stream consumer. */
     void addConsumer(final long sessionId) {
         consumerSessions.add(sessionId);
+    }
+
+    /**
+     * Adopt the posted head as the retention floor, and evict what the
+     * window no longer needs: frames past the window whose block is now
+     * posted. Log-driven, so every member evicts the same frames at the
+     * same point of the log.
+     */
+    void setPostedHead(final long postedHead) {
+        this.postedHead = postedHead;
+        prune();
+    }
+
+    /** The frames retained for replay. */
+    int retainedCount() {
+        return retained.size();
+    }
+
+    /** The oldest record index still retained. */
+    long firstRetainedIndex() {
+        return firstRetainedIndex;
+    }
+
+    /** The oldest boundary block still retained. */
+    long firstRetainedBlock() {
+        return firstRetainedBlock;
     }
 
     /** Remove a closed session's consumer mark. */
@@ -337,12 +381,21 @@ final class SealerEgress {
         offerToSession(session, pos);
     }
 
-    /** Retain an already-framed egress frame for future replays, up to a limit. */
+    /**
+     * Retain an already-framed egress frame for future replays. The window
+     * is pruned after the add: a frame leaves only when it is past the
+     * window and its block is posted.
+     */
     private void retain(final int length, final boolean boundary, final long key) {
         final byte[] copy = new byte[length];
         egressBuffer.getBytes(0, copy);
         retained.addLast(new RetainedFrame(copy, boundary, key));
-        while (retained.size() > retentionCap) {
+        prune();
+    }
+
+    /** Evict from the front while the window is over its cap and the oldest frame is posted. */
+    private void prune() {
+        while (retained.size() > retentionCap && isPosted(retained.peekFirst())) {
             final RetainedFrame evicted = retained.removeFirst();
             if (evicted.boundary) {
                 firstRetainedBlock = evicted.key + 1;
@@ -350,6 +403,143 @@ final class SealerEgress {
                 firstRetainedIndex = evicted.key + 1;
             }
         }
+    }
+
+    /**
+     * Whether the oldest retained frame belongs to a posted block. A record
+     * at the front of the deque was emitted after the last evicted boundary
+     * and before the boundary of {@link #firstRetainedBlock}, so that is
+     * its block.
+     */
+    private boolean isPosted(final RetainedFrame oldest) {
+        final long block = oldest.boundary ? oldest.key : firstRetainedBlock;
+        return block <= postedHead;
+    }
+
+    /**
+     * Frame and broadcast the chain's status to every session, or offer it
+     * to one session: {@code kind(1) | posted_head(8) | sealed_head(8) |
+     * budget(8) | halted(1) | retained(8) | floor_index(8) | floor_block(8)}.
+     * Not retained: a session that announces itself gets the current one.
+     */
+    void offerStatus(final ClusterStatus status) {
+        final int len = frameStatus(status);
+        for (final ClientSession session : cluster.clientSessions()) {
+            offerToSession(session, len);
+        }
+    }
+
+    /** {@link #offerStatus(ClusterStatus)} to one session. */
+    void offerStatus(final ClientSession session, final ClusterStatus status) {
+        offerToSession(session, frameStatus(status));
+    }
+
+    private int frameStatus(final ClusterStatus status) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_STATUS);
+        pos += Byte.BYTES;
+        buf.putLong(pos, status.postedHead(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.sealedHead(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.budgetBlocks(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, status.halted() ? (byte) 1 : (byte) 0);
+        pos += Byte.BYTES;
+        buf.putLong(pos, status.retainedFrames(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.floorIndex(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.floorBlock(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        return pos;
+    }
+
+    /**
+     * Frame and offer a DA-lag reject to the offering session:
+     * {@code [kind:10][sender:20][nonce:u64 LE][sealed_head:u64 LE][posted_head:u64 LE][budget:u64 LE]}.
+     */
+    void offerDaLagReject(
+            final ClientSession session,
+            final byte[] sender20,
+            final long nonce,
+            final ClusterStatus status) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_DA_LAG_REJECT);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, sender20);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.sealedHead(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.postedHead(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.budgetBlocks(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
+    }
+
+    /**
+     * Append the retained frames to a snapshot, after the state section:
+     * {@code count(4) | count * (boundary(1) | key(8) | len(4) | frame)},
+     * big-endian like the state. Every member retains the same frames at
+     * the same log position, so every member writes the same bytes.
+     */
+    byte[] writeSnapshot() {
+        int size = 4;
+        for (final RetainedFrame f : retained) {
+            size += 1 + 8 + 4 + f.frame.length;
+        }
+        final ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
+        buf.putInt(retained.size());
+        for (final RetainedFrame f : retained) {
+            buf.put(f.boundary ? (byte) 1 : (byte) 0);
+            buf.putLong(f.key);
+            buf.putInt(f.frame.length);
+            buf.put(f.frame);
+        }
+        return buf.array();
+    }
+
+    /**
+     * Restore the retained frames a snapshot carries, and set the floors
+     * from the oldest of them. A snapshot without a retention section (a
+     * version before 8) leaves the floors at the restore point, where the
+     * constructor put them.
+     */
+    void readSnapshot(final ByteBuffer buf) {
+        if (!buf.hasRemaining()) {
+            return;
+        }
+        final int count = buf.getInt();
+        for (int i = 0; i < count; i++) {
+            final boolean boundary = buf.get() != 0;
+            final long key = buf.getLong();
+            final byte[] frame = new byte[buf.getInt()];
+            buf.get(frame);
+            retained.addLast(new RetainedFrame(frame, boundary, key));
+        }
+        setFloorsFromRetained();
+    }
+
+    /**
+     * The floors after a restore: the oldest retained record and boundary.
+     * A record at the front belongs to the block of the first retained
+     * boundary; with no retained boundary, the floors stay at the restore
+     * point.
+     */
+    private void setFloorsFromRetained() {
+        firstRetainedBlock = retained.stream()
+            .filter(f -> f.boundary)
+            .mapToLong(f -> f.key)
+            .reduce(firstRetainedBlock, Math::min);
+        firstRetainedIndex = retained.stream()
+            .filter(f -> !f.boundary)
+            .mapToLong(f -> f.key)
+            .reduce(firstRetainedIndex, Math::min);
     }
 
     void offerRelayed(final Relayed relayed) {

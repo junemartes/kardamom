@@ -43,6 +43,13 @@ import java.util.TreeMap;
  *       A rejected record is answered with a reject outcome and never
  *       enters the dedup window. The peer position is independent of the
  *       L1 origin, and it is not stamped into boundaries.</li>
+ *   <li><b>DA-lag guard</b> — {@link #onPostedCursor(long)} adopts the
+ *       batcher's confirmed cursor (the last L2 block posted to L1), and
+ *       {@link #onRecord(byte[], byte[], long, long, byte[])} refuses a
+ *       user record while the sealed head is more than
+ *       {@code daLagBudgetBlocks} past it. Deposits and boundaries still
+ *       enter. The cursor is in the replicated log and the budget is
+ *       shared configuration, so every member refuses the same records.</li>
  *   <li><b>Snapshot</b> — {@link #takeSnapshot()} and {@link #load(byte[], int)}
  *       round-trip the full state for cluster snapshots.</li>
  * </ul>
@@ -76,6 +83,15 @@ public final class CanonicalSealerState {
      */
     public static final int DEFAULT_ORDERING_WINDOW = 0;
 
+    /**
+     * Default DA-lag budget, in blocks: how far the sealed head may run past
+     * the last block posted to L1 before the sealer refuses new
+     * transactions. About three hours at one block a second. Zero turns the
+     * guard off; a chain that would rather stay live and risk the loss of
+     * the unposted blocks sets it in the open.
+     */
+    public static final long DEFAULT_DA_LAG_BUDGET_BLOCKS = 10_000L;
+
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
     /**
      * Version 2 added the contiguity-guard sender map. Version 3 adds the
@@ -91,9 +107,11 @@ public final class CanonicalSealerState {
      * (trust-on-first-sight). A cluster can upgrade in place without a
      * coordinated snapshot migration. Version 8 adds the ordering window
      * size at the tail, so a member that restores a snapshot checks its
-     * own setting against the one the cluster runs.
+     * own setting against the one the cluster runs. Version 9 adds the
+     * posted head (the batcher's confirmed cursor) after the window; an
+     * older snapshot restores 0, the value before any cursor was published.
      */
-    private static final int SNAPSHOT_VERSION = 8;
+    private static final int SNAPSHOT_VERSION = 9;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -215,6 +233,20 @@ public final class CanonicalSealerState {
      */
     private VoidLedger voids;
 
+    /**
+     * How far the sealed head may run past {@link #postedHead} before
+     * {@link #onRecord} refuses user records. Zero turns the guard off.
+     * Replicated configuration, like {@link #inclusionHorizonBlocks}.
+     */
+    private final long daLagBudgetBlocks;
+
+    /**
+     * The last L2 block the batcher confirmed on L1, echoed from the
+     * batcher's cursor record in the ordered input. It only moves up. Zero
+     * until the batcher publishes its first cursor.
+     */
+    private long postedHead;
+
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
 
@@ -306,9 +338,10 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * The full constructor with the ordering window. {@code orderingWindow}
-     * is the record count a window holds before it flushes, or 0 for no
-     * window. Replicated configuration: every member must agree on it.
+     * The constructor with the ordering window and the default DA-lag
+     * budget. {@code orderingWindow} is the record count a window holds
+     * before it flushes, or 0 for no window. Replicated configuration:
+     * every member must agree on it.
      */
     public CanonicalSealerState(
             int dedupCapacity,
@@ -317,12 +350,39 @@ public final class CanonicalSealerState {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow) {
+        this(dedupCapacity, initialBlockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
+            orderingWindow, DEFAULT_DA_LAG_BUDGET_BLOCKS);
+    }
+
+    /**
+     * The full constructor, with the ordering window and this member's
+     * DA-lag budget. Both are replicated configuration: every member must
+     * agree on them, because they decide the relay order and
+     * accept-or-reject inside the replicated state machine.
+     *
+     * @param orderingWindow    the record count a window holds before it
+     *                          flushes, or 0 for no window
+     * @param daLagBudgetBlocks how far the sealed head may run past the
+     *                          posted head; zero turns the guard off
+     */
+    public CanonicalSealerState(
+            int dedupCapacity,
+            long initialBlockNumber,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow,
+            long daLagBudgetBlocks) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
         if (inclusionHorizonBlocks <= 0) {
             throw new IllegalArgumentException(
                     "inclusionHorizonBlocks must be > 0, got " + inclusionHorizonBlocks);
+        }
+        if (daLagBudgetBlocks < 0) {
+            throw new IllegalArgumentException(
+                    "daLagBudgetBlocks must be >= 0, got " + daLagBudgetBlocks);
         }
         this.remoteOriginAllowlist = Set.copyOf(remoteOrigins);
         if (orderingWindow < 0) {
@@ -331,6 +391,8 @@ public final class CanonicalSealerState {
         this.dedupCapacity = dedupCapacity;
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
         this.orderingWindow = orderingWindow;
+        this.daLagBudgetBlocks = daLagBudgetBlocks;
+        this.postedHead = 0L;
         this.dedup = new LinkedHashMap<>();
         this.byDeadline = new TreeMap<>();
         this.expectedNonce = new LinkedHashMap<>(16, 0.75f, true) {
@@ -477,7 +539,13 @@ public final class CanonicalSealerState {
             /** The open block had passed the record's deadline. */
             PAST_DEADLINE,
             /** The window was at capacity, so no decision was taken. */
-            WINDOW_FULL
+            WINDOW_FULL,
+            /**
+             * The sealed head is more than the DA-lag budget past the posted
+             * head, so the chain refuses new transactions until the batcher
+             * posts again. Nothing was inserted or counted.
+             */
+            DA_LAG_REJECT
         }
 
         public final Kind kind;
@@ -512,6 +580,10 @@ public final class CanonicalSealerState {
 
         static RecordOutcome windowFull() {
             return new RecordOutcome(Kind.WINDOW_FULL, Optional.empty(), 0L, 0L);
+        }
+
+        static RecordOutcome daLagReject() {
+            return new RecordOutcome(Kind.DA_LAG_REJECT, Optional.empty(), 0L, 0L);
         }
     }
 
@@ -553,6 +625,16 @@ public final class CanonicalSealerState {
         // does not move a sender's expected nonce.
         if (blockNumber > deadline) {
             return RecordOutcome.pastDeadline(deadline);
+        }
+        // The DA-lag guard runs after the dedup and deadline checks, so a
+        // re-offer of an ordered record is still absorbed as a duplicate,
+        // and before the window and the contiguity guard, so a refused
+        // record moves nothing: the sender's expected nonce stays, and the
+        // client's resubmit after the batcher posts is accepted as fresh.
+        // The all-zero sender is exempt: deposits keep entering, so the
+        // chain's L1 view stays current while it waits.
+        if (!isZeroSender(sender20) && daLagHalted()) {
+            return RecordOutcome.daLagReject();
         }
         if (dedup.size() >= dedupCapacity) {
             // Back-pressure, not a verdict: nothing is forgotten to make
@@ -920,6 +1002,52 @@ public final class CanonicalSealerState {
         return RemoteOriginOutcome.relayed(new RemoteOriginAdvance(forced, new Relayed(index, payload)));
     }
 
+    /**
+     * Adopt the batcher's confirmed cursor: {@code postedHead} is the last
+     * L2 block posted to L1. The value only moves up; a cursor at or below
+     * the current one is a re-offer or a stale batcher, and changes
+     * nothing. A cursor past the sealed head names a block this chain has
+     * not sealed, so it is refused.
+     *
+     * @return whether the posted head advanced
+     * @throws IllegalArgumentException if {@code postedHead} is past the
+     *         sealed head
+     */
+    public boolean onPostedCursor(long postedHead) {
+        if (postedHead > sealedHead()) {
+            throw new IllegalArgumentException(
+                    "posted head " + postedHead + " is past the sealed head " + sealedHead());
+        }
+        if (postedHead <= this.postedHead) {
+            return false;
+        }
+        this.postedHead = postedHead;
+        return true;
+    }
+
+    /** The last L2 block the batcher confirmed on L1; 0 before the first cursor. */
+    public long postedHead() {
+        return postedHead;
+    }
+
+    /** The last sealed block: the block before the one the next tick stamps. */
+    public long sealedHead() {
+        return blockNumber - 1;
+    }
+
+    /** The DA-lag budget this member runs with; 0 means the guard is off. */
+    public long daLagBudgetBlocks() {
+        return daLagBudgetBlocks;
+    }
+
+    /**
+     * Whether the DA-lag guard refuses user records: the budget is on, and
+     * the sealed head is more than the budget past the posted head.
+     */
+    public boolean daLagHalted() {
+        return daLagBudgetBlocks > 0 && sealedHead() - postedHead > daLagBudgetBlocks;
+    }
+
     /** L1 origin currently stamped into boundaries. */
     public long l1Origin() {
         return l1Origin;
@@ -1023,7 +1151,8 @@ public final class CanonicalSealerState {
      * loading. Version 5 widens each peer entry by 9 bytes (the lane
      * cursor); a version-4 snapshot is parsed with the 16-byte entry.
      * Version 6 adds the void ledger after the peer map: see
-     * {@link VoidLedger#writeTo}.</p>
+     * {@link VoidLedger#writeTo}. Version 8 adds the posted head (8) after
+     * the void ledger.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
@@ -1034,7 +1163,8 @@ public final class CanonicalSealerState {
                 + 8 + 8 + 8
                 + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
                 + voids.snapshotLen(canonicalCount)
-                + 4;
+                + 4
+                + 8;
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -1077,6 +1207,8 @@ public final class CanonicalSealerState {
         voids.writeTo(buf, canonicalCount);
         // v8 tail: the ordering window the cluster runs.
         buf.putInt(orderingWindow);
+        // v9 tail: the posted head.
+        buf.putLong(postedHead);
         return buf.array();
     }
 
@@ -1149,7 +1281,33 @@ public final class CanonicalSealerState {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow) {
-        ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
+        return load(ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN), dedupCapacity,
+            remoteOrigins, voidConfig, inclusionHorizonBlocks, orderingWindow,
+            DEFAULT_DA_LAG_BUDGET_BLOCKS);
+    }
+
+    /**
+     * Restore a state from {@code buf}, and leave the buffer positioned
+     * after the state section. The service appends its egress retention
+     * after the state, and reads it from the same buffer.
+     *
+     * @param buf                    the snapshot, positioned at its magic
+     * @param dedupCapacity          this member's configured window cap
+     * @param remoteOrigins          the peer-chain allowlist
+     * @param voidConfig             the void ledger's configuration
+     * @param inclusionHorizonBlocks the deadline horizon, in blocks
+     * @param orderingWindow         this member's configured window size
+     * @param daLagBudgetBlocks      the DA-lag budget, in blocks
+     * @return the restored state
+     */
+    public static CanonicalSealerState load(
+            ByteBuffer buf,
+            int dedupCapacity,
+            Set<Long> remoteOrigins,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow,
+            long daLagBudgetBlocks) {
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
             throw new IllegalArgumentException(
@@ -1184,7 +1342,7 @@ public final class CanonicalSealerState {
 
         CanonicalSealerState state = new CanonicalSealerState(
                 dedupCapacity, blockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
-                orderingWindow);
+                orderingWindow, daLagBudgetBlocks);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
@@ -1256,6 +1414,9 @@ public final class CanonicalSealerState {
                         "snapshot orderingWindow " + snapshotWindow + " differs from this member's "
                                 + orderingWindow + " — members must agree on the ordering window");
             }
+        }
+        if (version >= 9) {
+            state.postedHead = buf.getLong();
         }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is

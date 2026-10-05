@@ -126,7 +126,7 @@ impl Default for ReaderConfig {
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
             voter_id: None,
-            void_wait: Duration::from_secs(120),
+            void_wait: Duration::from_mins(2),
         }
     }
 }

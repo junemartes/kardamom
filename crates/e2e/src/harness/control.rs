@@ -185,12 +185,6 @@ impl LocalStack {
         Ok(path)
     }
 
-    /// Wait for the validator process to exit on its own. Returns its
-    /// exit code (exit code 2 is the divergence fail-stop).
-    pub fn wait_validator_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
-        self.validator.as_mut()?.proc.wait_exit(timeout)
-    }
-
     #[must_use]
     pub fn validator_log(&self) -> Option<String> {
         let v = self.validator.as_ref()?;

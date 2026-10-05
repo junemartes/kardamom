@@ -128,6 +128,20 @@ fn truncate(blocks: Vec<BlockFrame>, through: Option<u64>) -> anyhow::Result<Vec
         .collect())
 }
 
+impl Source {
+    /// Refuse an indexer source that is not running. The proxy has no
+    /// lifecycle record to read.
+    async fn require_running(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Proxy(_) => Ok(()),
+            Self::Indexer(indexer) => indexer
+                .require_running()
+                .await
+                .context("the indexer source is not running"),
+        }
+    }
+}
+
 impl Cli {
     /// The payload source the flags name. clap guarantees one of the two.
     fn payload_source(&self) -> anyhow::Result<Source> {
@@ -171,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let source = cli.payload_source()?;
+    source.require_running().await?;
     let blocks =
         recover_blocks(&descriptors, &source).context("recover blocks from the DA layer")?;
     let blocks = truncate(blocks, cli.through_block)?;

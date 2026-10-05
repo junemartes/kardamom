@@ -391,9 +391,9 @@ class RemoteOriginRecordTest {
      * The bytes after the version-3 origin trio in a snapshot with no peers
      * and a disabled void ledger: the peer count (4), then the version-6
      * void entry count (4) and vote count (4), then the version-8 ordering
-     * window (4).
+     * window (4) and the version-9 posted head (8).
      */
-    private static final int PEER_AND_VOID_TAIL = 4 * Integer.BYTES;
+    private static final int PEER_AND_VOID_TAIL = 4 * Integer.BYTES + Long.BYTES;
 
     @Test
     void a_v4_snapshot_loads_with_unknown_cursors() {

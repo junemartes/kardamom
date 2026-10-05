@@ -259,3 +259,34 @@ async fn log_queries_are_cross_checked() {
     // The next query: both mocks answer no log, so they agree.
     assert!(set.logs(&Filter::new()).await.unwrap().is_empty());
 }
+
+/// A read the source set cannot serve names its halt: a disagreement is
+/// `l1_source_disagreement`, a set with too few answers is
+/// `l1_unreachable`, like a provider that does not answer.
+#[test]
+fn a_source_halt_names_its_halt_cause() {
+    use kardamom_obs::halt::HaltCause;
+
+    let disagreement = L1SourceError::Halt(SourceHalt::Disagreement {
+        what: "block 7".into(),
+        a_name: "a".into(),
+        a: "0x01".into(),
+        b_name: "b".into(),
+        b: "0x02".into(),
+    });
+    assert_eq!(
+        disagreement.halt_cause(),
+        Some(HaltCause::L1SourceDisagreement)
+    );
+    let no_quorum = L1SourceError::Halt(SourceHalt::NoQuorum {
+        answered: 1,
+        needed: 2,
+        configured: 3,
+    });
+    assert_eq!(no_quorum.halt_cause(), Some(HaltCause::L1Unreachable));
+    assert_eq!(
+        L1SourceError::Provider("refused".into()).halt_cause(),
+        Some(HaltCause::L1Unreachable)
+    );
+    assert_eq!(L1SourceError::NotFinalized.halt_cause(), None);
+}
