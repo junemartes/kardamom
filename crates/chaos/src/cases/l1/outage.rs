@@ -25,31 +25,77 @@ const REBUILD_BUDGET: Duration = Duration::from_secs(240);
 /// How many times the freeze is retried to land on a non-empty spool.
 const FREEZE_ATTEMPTS: u32 = 10;
 
-/// The spool's block files on the aux node.
-async fn spool_blocks(h: &Harness, aux: &str) -> anyhow::Result<usize> {
-    h.nodes
-        .exec(
-            aux,
-            "ls /opt/kardamom/batcher/spool 2>/dev/null | grep -c '\\.block$' || true",
+/// The spool of the batcher on the aux node.
+const SPOOL_DIR: &str = "/opt/kardamom/batcher/spool";
+
+/// One freeze attempt on the aux node, in one exec: SIGSTOP the batcher,
+/// read its process state from `/proc`, count the spool's block files,
+/// and SIGCONT it again unless it is stopped with a non-empty spool. The
+/// attempt takes about one second. So a retried attempt stays far under
+/// the Aeron client's service interval (10 s), and the thaw does not
+/// restart the batcher. A scrape of the frozen exporter waits for its
+/// timeout, and does not fit.
+struct FreezeAttempt<'a> {
+    aux: &'a str,
+    inner: &'a str,
+}
+
+impl FreezeAttempt<'_> {
+    /// The shell script of the attempt. It prints the process state and
+    /// the count of spooled blocks.
+    fn script(&self) -> String {
+        let inner = self.inner;
+        format!(
+            "docker kill -s STOP {inner} >/dev/null || exit 1
+pid=$(docker inspect -f '{{{{.State.Pid}}}}' {inner})
+state=?
+for _ in $(seq 1 40); do
+  state=$(sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f1)
+  [ \"$state\" = T ] && break
+  sleep 0.05
+done
+blocks=$(ls {SPOOL_DIR} 2>/dev/null | grep -c '\\.block$' || true)
+if [ \"$state\" != T ] || [ \"$blocks\" = 0 ]; then docker kill -s CONT {inner} >/dev/null; fi
+echo \"$state $blocks\""
         )
-        .await?
-        .trim()
-        .parse()
-        .map_err(|e| crate::chaos_fail!("spool listing is not a count: {e}"))
+    }
+
+    /// Run the attempt. `Some(blocks)` when the batcher stays frozen with
+    /// `blocks` spooled blocks; `None` when the spool was empty and the
+    /// batcher runs again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec fails, or if the process is not
+    /// stopped after the signal.
+    async fn run(&self, h: &Harness, ctx: &str) -> anyhow::Result<Option<usize>> {
+        let out = h.nodes.exec(self.aux, &self.script()).await?;
+        let (state, blocks) = out.trim().split_once(' ').ok_or_else(|| {
+            crate::chaos_fail!("{ctx}: the freeze attempt printed no state and count: {out:?}")
+        })?;
+        anyhow::ensure!(
+            state == "T",
+            "{}: {ctx}: freeze did NOT take effect (process state {state:?} after SIGSTOP, not T)",
+            crate::FAIL_PREFIX
+        );
+        let blocks: usize = blocks
+            .parse()
+            .map_err(|e| crate::chaos_fail!("{ctx}: spool listing is not a count: {e}"))?;
+        Ok((blocks > 0).then_some(blocks))
+    }
 }
 
 /// Freeze the batcher with a non-empty spool, so the restart has a group
-/// to recover. The spool empties for an instant after every post, so a
-/// freeze that lands in that instant is thawed and tried again. A
-/// verified freeze outlasts the Aeron client's service interval (10 s),
-/// so the batcher can restart on the thaw: the next try waits until it
-/// answers again.
+/// to recover. The spool empties for an instant after every post, so an
+/// attempt that lands in that instant thaws the batcher and tries again.
 async fn freeze_with_spool(
     h: &Harness,
     aux: &str,
     inner: &str,
     ctx: &str,
 ) -> anyhow::Result<usize> {
+    let attempt = FreezeAttempt { aux, inner };
+    let attempt = &attempt;
     let target = h.probes.aux_target(BATCHER_PORT);
     let target = &target;
     let outcome = poll::until(
@@ -58,20 +104,20 @@ async fn freeze_with_spool(
             Duration::from_secs(1),
         ),
         |_| async move {
-            h.freeze_verified(aux, inner, target, ctx).await?;
-            let blocks = spool_blocks(h, aux).await?;
-            if blocks > 0 {
-                return Ok::<_, anyhow::Error>(Some(blocks));
+            let frozen = attempt.run(h, ctx).await?;
+            if frozen.is_none() {
+                await_answering(h, target, ctx).await?;
             }
-            h.thaw(aux, inner).await?;
-            await_answering(h, target, ctx).await?;
-            Ok(None)
+            Ok::<_, anyhow::Error>(frozen)
         },
     )
     .await?;
-    outcome
-        .or_fail(|_| crate::chaos_fail!("{ctx}: the spool was empty on every freeze"))
-        .map(|(blocks, _)| blocks)
+    let (blocks, _) =
+        outcome.or_fail(|_| crate::chaos_fail!("{ctx}: the spool was empty on every freeze"))?;
+    crate::log(format!(
+        "{ctx}: freeze verified (process state T, {blocks} spooled blocks)"
+    ));
+    Ok(blocks)
 }
 
 /// Wait until the batcher's metrics endpoint answers: after a thaw, the
