@@ -15,6 +15,9 @@ variable "datacenter" {
 job "node-exporter" {
   datacenters = [var.datacenter]
   type        = "system"
+  # Every pool: a system job stays in the default pool without this, and
+  # an elastic node joins a pool of its own.
+  node_pool = "all"
 
   group "node-exporter" {
     network {

@@ -161,7 +161,7 @@ async fn setup(fx: &Fixtures) -> Option<Scenario<impl Provider + Clone>> {
     settlement
         .postBatch(
             0,
-            vec![B256::repeat_byte(0xA1)],
+            Bytes::from(vec![0x02, 0xA1]),
             fx.pv.block_number,
             fx.pv.block_number,
             commitment,

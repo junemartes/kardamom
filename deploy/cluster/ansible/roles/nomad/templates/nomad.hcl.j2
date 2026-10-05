@@ -60,10 +60,16 @@ client {
   # node_ip and node_index feed the jobs that still form an endpoint or
   # a host id from the node. Their removal belongs to the dynamic MDC
   # cutover; until then every profile stamps them.
+{# The role set (node_roles): an inventory gives it as a comma list, the
+   container contract as a list; a node without one hosts its class only. #}
+{% set roles_set = ((node_roles.split(',') if node_roles is string else node_roles) if node_roles is defined else [role]) | map('trim') | list %}
   meta {
     kardamom_node = "{{ kardamom_node }}"
     cluster_id    = "{{ cluster_id }}"
     role          = "{{ role }}"
+    # roles: the service classes this node hosts, a comma list; the
+    # service jobs constrain on it with set_contains.
+    roles         = "{{ roles_set | join(',') }}"
     tier          = "{{ tier }}"
     pool          = "{{ node_pool | default('default') }}"
     # node_ip: this node's private address. sequencer.nomad.hcl and
@@ -75,8 +81,9 @@ client {
     node_index    = "{{ node_index | default(sequencer_id | default('0')) }}"
     # archive_topics: the topics this node's Aeron archive records, for
     # the kardamom-aeron-archive service record (nomad/aeron.system.nomad.hcl).
-    # The ingress nodes record tx_data, the aux node records tx_deposits.
-    archive_topics = "{{ 'tx_data' if role == 'ingress' else ('tx_deposits' if role == 'aux' else '') }}"
+    # The ingress nodes record tx_data; the da-watcher's node records
+    # tx_deposits (it publishes there).
+    archive_topics = "{{ 'tx_data' if 'ingress' in roles_set else ('tx_deposits' if 'da-watcher' in roles_set else '') }}"
   }
 }
 

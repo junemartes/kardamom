@@ -70,17 +70,26 @@ impl<'a> StackLaunch<'a> {
     }
 
     /// Materialise the genesis for `cfg.chain_id`: the canonical TOML
-    /// as-is at the default id, or a patched copy in the stack root (only
-    /// the `chain_id` line rewritten — alloc + predeploy bytecode ride
-    /// along byte-identical, so the deployer's drift guard keeps watching
-    /// the ONE canonical copy).
+    /// as-is at the default id with fees off, or a patched copy in the
+    /// stack root (the `chain_id` line rewritten, the fee schedule
+    /// fragment appended with priority fees on — alloc + predeploy
+    /// bytecode ride along byte-identical, so the deployer's drift guard
+    /// keeps watching the ONE canonical copy).
     fn materialise_genesis(&self, canonical: &Path) -> Result<PathBuf> {
         let chain_id = self.cfg.chain_id;
-        if chain_id == DEV_CHAIN_ID {
+        if chain_id == DEV_CHAIN_ID && !self.cfg.priority_fees {
             return Ok(canonical.to_path_buf());
         }
-        let src = std::fs::read_to_string(canonical)
+        let mut src = std::fs::read_to_string(canonical)
             .with_context(|| format!("read genesis {}", canonical.display()))?;
+        if self.cfg.priority_fees {
+            let fragment = super::config::Genesis::fees_fragment(&services::repo_root());
+            src.push('\n');
+            src.push_str(
+                &std::fs::read_to_string(&fragment)
+                    .with_context(|| format!("read fee fragment {}", fragment.display()))?,
+            );
+        }
         let i = src
             .lines()
             .position(|l| l.trim_start().starts_with("chain_id"))
@@ -144,7 +153,9 @@ impl<'a> StackLaunch<'a> {
             attester_key: super::l1::ATTESTER_KEY.to_string(),
         });
         let verified_l1 = match (self.cfg.verified_l1, l1) {
-            (true, Some(l)) => Some(super::l1_verified::VerifiedL1::spawn(&l.rpc_url()).await?),
+            (true, Some(l)) => Some(
+                super::l1_verified::VerifiedL1::spawn(&l.rpc_url(), "127.0.0.1:0".parse()?).await?,
+            ),
             _ => None,
         };
         let validator = match (&da_watcher, &verified_l1) {
@@ -175,6 +186,7 @@ impl<'a> StackLaunch<'a> {
             aeron_dir: &self.driver.aeron_dir,
             cluster_ingress_endpoints: &self.sealer.ingress_endpoints,
             shards: self.cfg.shards,
+            priority_fees: self.cfg.priority_fees,
             tx_ttl: self.cfg.ingress.pending_receipt_timeout.as_duration(),
             executor_query: std::net::SocketAddr::from(([127, 0, 0, 1], self.executor_query_port)),
             chain_id: self.cfg.chain_id.get(),
@@ -300,6 +312,7 @@ impl LocalStack {
                     cfg.sealer_members,
                     cfg.cluster_tick_ms,
                     &cfg.remote_origins,
+                    cfg.priority_fees,
                 )?;
                 Ok((driver, sealer))
             })?;
@@ -336,9 +349,14 @@ impl LocalStack {
             None => None,
         };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
+        let notifier = cfg
+            .notifier
+            .then(|| services::spawn_notifier(&spec))
+            .transpose()?;
 
         let load_sampler = LoadSampler::start(root.path().join("host-load.log"));
         let stack = Self {
+            notifier,
             ingress,
             da_watcher,
             verified_l1: wirings.verified_l1,
@@ -384,6 +402,11 @@ impl LocalStack {
                 self.da_watcher
                     .as_ref()
                     .map(|w| ("da-watcher".to_string(), w.metrics_addr)),
+            )
+            .chain(
+                self.notifier
+                    .as_ref()
+                    .map(|n| ("notifier".to_string(), n.service.metrics_addr)),
             )
             .chain(
                 self.sequencers

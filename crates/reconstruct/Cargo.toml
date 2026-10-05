@@ -45,6 +45,9 @@ test-support = [
 
 [dev-dependencies]
 kardamom-reconstruct = { path = ".", features = ["test-support"] }
+# `test-support` exposes the fake EigenDA proxy the L1 round-trip test
+# posts through.
+kardamom-batcher = { path = "../batcher", features = ["test-support"] }
 kardamom-deployer = { path = "../deployer" }
 alloy-network.workspace = true
 alloy-signer-local.workspace = true

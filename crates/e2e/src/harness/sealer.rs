@@ -56,8 +56,10 @@ impl SealerCluster {
         members: NonZeroUsize,
         tick_ms: NonZeroU64,
         remote_origins: &[u64],
+        priority_fees: bool,
     ) -> Result<Self> {
         let mut launch = SealerLaunch::new(root, repo_root, members, tick_ms, remote_origins)?;
+        launch.ordering_window = if priority_fees { 20 } else { 0 };
         launch.spawn_all()?;
         launch.await_ready()?;
         Ok(launch.finish())
@@ -75,6 +77,9 @@ struct SealerLaunch<'a> {
     tick_ms: NonZeroU64,
     /// The sealer's remote-origin allowlist. Empty disables interop.
     remote_origins: &'a [u64],
+    /// `-Dkardamom.cluster.orderingWindow`: 20 with priority fees on, 0
+    /// for first come, first served.
+    ordering_window: u32,
     members_str: String,
     ingress_endpoints: String,
     procs: Vec<Proc>,
@@ -97,6 +102,7 @@ impl<'a> SealerLaunch<'a> {
             members,
             tick_ms,
             remote_origins,
+            ordering_window: 0,
             members_str,
             ingress_endpoints,
             procs: Vec::new(),
@@ -161,6 +167,10 @@ impl<'a> SealerLaunch<'a> {
         ))
         .arg("-Dkardamom.cluster.ingressStreamId=101")
         .arg(format!("-Dkardamom.cluster.tickMs={}", self.tick_ms))
+        .arg(format!(
+            "-Dkardamom.cluster.orderingWindow={}",
+            self.ordering_window
+        ))
         .arg(format!(
             "-Dkardamom.cluster.remoteOrigins={}",
             self.remote_origins

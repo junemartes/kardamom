@@ -11,6 +11,7 @@ use tokio::sync::broadcast;
 use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
+use crate::fee_history::FeeHistory;
 use crate::pending::PendingReceipts;
 use crate::receipt_cache::ReceiptCache;
 use crate::seen_receipts::SeenReceipts;
@@ -26,7 +27,7 @@ where
     pub(super) fn spawn_block_boundary_watcher(&self) {
         BroadcastWatcher::new(
             self.subscription.subscribe_block_boundaries(),
-            BlockBoundaryWatcher::new(self.latest_block_number.clone()),
+            BlockBoundaryWatcher::new(self.latest_block_number.clone(), self.fee_history.clone()),
         )
         .spawn();
     }
@@ -51,6 +52,7 @@ where
                 self.cache.clone(),
                 self.tx_error_dedup.clone(),
                 self.receipt_feed.clone(),
+                self.fee_history.clone(),
             ),
         )
         .spawn();
@@ -73,14 +75,19 @@ where
     }
 }
 
-/// Folds block boundaries into the proxy's latest-block counter.
+/// Folds block boundaries into the proxy's latest-block counter and the
+/// fee history.
 struct BlockBoundaryWatcher {
     latest: Arc<AtomicU64>,
+    fee_history: Arc<FeeHistory>,
 }
 
 impl BlockBoundaryWatcher {
-    fn new(latest: Arc<AtomicU64>) -> Self {
-        Self { latest }
+    fn new(latest: Arc<AtomicU64>, fee_history: Arc<FeeHistory>) -> Self {
+        Self {
+            latest,
+            fee_history,
+        }
     }
 }
 
@@ -88,6 +95,7 @@ impl Watch<BlockBoundary> for BlockBoundaryWatcher {
     /// `fetch_max` keeps the counter increasing without a lock.
     async fn on_item(&mut self, b: BlockBoundary) {
         self.latest.fetch_max(b.block_number, Ordering::AcqRel);
+        self.fee_history.on_boundary(&b);
     }
 }
 
@@ -165,6 +173,7 @@ struct TxReceiptsWatcher {
     seen: SeenReceipts,
     error_dedup: Arc<TxErrorDedup>,
     feed: broadcast::Sender<Receipt>,
+    fee_history: Arc<FeeHistory>,
 }
 
 impl TxReceiptsWatcher {
@@ -173,6 +182,7 @@ impl TxReceiptsWatcher {
         cache: Arc<ReceiptCache>,
         error_dedup: Arc<TxErrorDedup>,
         feed: broadcast::Sender<Receipt>,
+        fee_history: Arc<FeeHistory>,
     ) -> Self {
         Self {
             pending,
@@ -180,6 +190,7 @@ impl TxReceiptsWatcher {
             seen: SeenReceipts::default(),
             error_dedup,
             feed,
+            fee_history,
         }
     }
 }
@@ -198,6 +209,8 @@ impl Watch<Receipt> for TxReceiptsWatcher {
         // Success overrides rejection. This marks the outcome, so a
         // racing replica's late DuplicatedTx for this tx gets dropped.
         self.error_dedup.record_success(sender, nonce);
+        self.fee_history
+            .on_receipt(receipt.block_number, receipt.priority_fee_per_gas);
         self.cache.insert(receipt.clone());
         // This re-broadcasts the deduped event to subscription-mode
         // clients. `send` errors only when no subscriber exists, which is

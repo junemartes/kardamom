@@ -252,6 +252,7 @@ async fn arm_and_assert_fault_detected(
         .await?
         .checked_add(1)
         .context("L1 finalized block number is implausibly close to u64::MAX")?;
+    let lockbox = stack.l1().context("l1")?.lockbox;
     let served_at_arm = stack.verified_l1().context("mock verified L1")?.served();
     let verified_at_arm = t
         .validator_metric_opt(super::VALIDATOR_EPOCHS_VERIFIED)
@@ -263,6 +264,7 @@ async fn arm_and_assert_fault_detected(
         .set_fault(match fault {
             Fault::WrongBlockHash { .. } => Fault::WrongBlockHash { from_block: from },
             Fault::BrokenParentChain { .. } => Fault::BrokenParentChain { from_block: from },
+            Fault::SwallowLogs { .. } => Fault::SwallowLogs { address: lockbox },
             other => other,
         });
     // SwallowLogs is only a lie if there is a log to swallow. Arm the
@@ -271,7 +273,7 @@ async fn arm_and_assert_fault_detected(
     // validator's interposed view reports none. With the wrong order, the
     // epoch would be empty on both sides, and the case would pass while
     // testing nothing.
-    if fault == Fault::SwallowLogs {
+    if matches!(fault, Fault::SwallowLogs { .. }) {
         let signers = l2::dev_signers_total(3)?;
         stack
             .l1()

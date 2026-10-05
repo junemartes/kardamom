@@ -2,8 +2,8 @@
 //!
 //! This test proves "the batcher's state matches the validator's state" the
 //! only way that claim is falsifiable. It takes what the live pipeline
-//! actually executed, posts it to L1 as real EIP-4844 blobs, and throws away
-//! the originals. Then it rebuilds the chain from L1 data alone. The
+//! actually executed, disperses it through the EigenDA proxy, posts the
+//! certificates to L1, and throws away the originals. Then it rebuilds the chain from L1 data alone. The
 //! rebuilt state root must equal the root the validator computed on its own
 //! and attests to.
 //!
@@ -12,8 +12,8 @@
 //! the real block grouping and the in-block order of the transactions it
 //! submitted. It does not reimplement the executor's reader, and it does
 //! not invent any data. (This also means `kardamom-reconstruct`'s inputs
-//! are exactly what a recovery operator would have: L1 logs, blobs, and
-//! genesis.)
+//! are exactly what a recovery operator would have: L1 logs, the DA
+//! proxy, and genesis.)
 //!
 //! Two known limits come from today's code, not from the test:
 //!
@@ -39,7 +39,7 @@ use alloy_primitives::{Address, B256};
 use anyhow::{Context, Result};
 use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
-use kardamom_batcher::da_store::FsBlobStore;
+use kardamom_batcher::da::DaProxy;
 use kardamom_batcher::l1::{post_batch, read_posted_batches, recover_blocks};
 use kardamom_types::{BPosition, TxEnvelope};
 
@@ -142,7 +142,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
         let recorded: Vec<RecordedTx> = txs
             .iter()
             .map(|e| RecordedTx {
-                // The blob payload does not carry positions (only the
+                // The DA payload does not carry positions (only the
                 // block, timestamp, and per-tx bytes do). So the canonical
                 // index is a faithful stand-in here.
                 position: BPosition::from_index(e.transaction_index),
@@ -176,9 +176,9 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
     Ok(blocks)
 }
 
-/// Post `blocks` to the settlement contract as real EIP-4844 blob
-/// transactions, one batch per block. Check that L1's compare-and-set
-/// batch indices advance with no gaps.
+/// Post `blocks` to the settlement contract, one batch per block: each
+/// payload goes through the DA proxy `da`, and its certificate goes on
+/// L1. Check that L1's compare-and-set batch indices advance with no gaps.
 ///
 /// # Errors
 /// Returns an error when a block fails to pack or post, when the posted
@@ -188,7 +188,7 @@ pub async fn post_to_l1(
     l1: &L1,
     settlement: Address,
     blocks: &[ClosedBlock],
-    da_store: &FsBlobStore,
+    da: &DaProxy,
 ) -> Result<()> {
     let provider = l1.wallet(crate::harness::l1::BATCHER_KEY)?;
     let cfg = BatcherConfig::default();
@@ -196,7 +196,7 @@ pub async fn post_to_l1(
     for block in blocks {
         let batch = pack_blocks(&cfg, std::slice::from_ref(block))
             .with_context(|| format!("pack block {}", block.block_number))?;
-        let next = post_batch(&provider, settlement, prev_index, &batch, da_store)
+        let next = post_batch(&provider, settlement, prev_index, &batch, da)
             .await
             .with_context(|| format!("post block {} to L1", block.block_number))?;
         anyhow::ensure!(
@@ -213,16 +213,13 @@ pub async fn post_to_l1(
     Ok(())
 }
 
-/// Run `kardamom-reconstruct` against `da_dir`, requiring the rebuilt
-/// state root to equal `expect_root`.
-///
 /// The parts of a `kardamom-reconstruct` invocation that stay fixed
 /// across the main run and its non-vacuity control: the L1 endpoint, the
-/// settlement contract, and the DA store and genesis to rebuild from.
+/// settlement contract, and the DA proxy and genesis to rebuild from.
 struct Reconstruct<'a> {
     l1_rpc: &'a str,
     settlement: Address,
-    da_dir: &'a Path,
+    da_proxy: &'a str,
     genesis: &'a Path,
 }
 
@@ -237,8 +234,7 @@ impl Reconstruct<'_> {
         std::process::Command::new(bin)
             .args(["--l1-rpc", self.l1_rpc])
             .args(["--settlement", &self.settlement.to_string()])
-            .arg("--da-store")
-            .arg(self.da_dir)
+            .args(["--da-proxy", self.da_proxy])
             .arg("--chain")
             .arg(self.genesis)
             .arg("--state-dir")
@@ -249,8 +245,8 @@ impl Reconstruct<'_> {
     }
 }
 
-/// Rebuild the chain from L1 alone. Require the root to equal
-/// `expected_root`, the validator's live root.
+/// Rebuild the chain from L1 and the DA proxy at `da_proxy` alone.
+/// Require the root to equal `expected_root`, the validator's live root.
 ///
 /// This runs the real `kardamom-reconstruct` binary, not the library. This
 /// exercises the operator-facing path, including its `--expect-root` gate.
@@ -262,7 +258,7 @@ impl Reconstruct<'_> {
 pub fn reconstruct_and_compare(
     l1_rpc: &str,
     settlement: Address,
-    da_dir: &Path,
+    da_proxy: &str,
     genesis: &Path,
     state_dir: &Path,
     expected_root: B256,
@@ -270,7 +266,7 @@ pub fn reconstruct_and_compare(
     let reconstruct = Reconstruct {
         l1_rpc,
         settlement,
-        da_dir,
+        da_proxy,
         genesis,
     };
     let out = reconstruct.run(state_dir, expected_root)?;
@@ -302,17 +298,19 @@ pub fn reconstruct_and_compare(
     Ok(())
 }
 
-/// Verify that the L1 log alone yields the batches just posted. This is
-/// what a recovery operator starts from.
+/// Verify that the L1 log alone yields the batches just posted, and that
+/// the DA proxy `da` serves every certificate in it. This is what a
+/// recovery operator starts from.
 ///
 /// # Errors
-/// Returns an error when the batch count, ordering, or blob presence does
-/// not match `expected`, or when recovering blocks from the blobs fails.
+/// Returns an error when the batch count, ordering, or certificate
+/// presence does not match `expected`, or when recovering blocks from the
+/// DA proxy fails.
 pub async fn assert_batches_on_l1(
     l1: &L1,
     settlement: Address,
     expected: usize,
-    da_store: &FsBlobStore,
+    da: &DaProxy,
 ) -> Result<()> {
     let provider = l1.provider()?;
     let descriptors = read_posted_batches(&provider, settlement, 0)
@@ -330,13 +328,13 @@ pub async fn assert_batches_on_l1(
             d.index
         );
         anyhow::ensure!(
-            !d.versioned_hashes.is_empty(),
-            "batch {} has no blobs",
+            !d.da_cert.is_empty(),
+            "batch {} has no DA certificate",
             d.index
         );
     }
-    // Check that the blobs L1 committed to can be fetched and decoded.
-    let frames = recover_blocks(&descriptors, da_store).context("recover blocks from blobs")?;
+    // Check that the payloads L1 committed to can be fetched and decoded.
+    let frames = recover_blocks(&descriptors, da).context("recover blocks from the DA proxy")?;
     anyhow::ensure!(
         frames.len() == expected,
         "recovered {} block frames from {expected} batches",

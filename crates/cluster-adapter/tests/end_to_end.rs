@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 use alloy_primitives::Address;
 use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_cluster_adapter::wire::{
-    encode_egress_boundary, encode_egress_record, split_ingress, txref,
+    GuardHeader, encode_egress_boundary, encode_egress_record, split_ingress, txref,
 };
 use kardamom_engine::reader::TxOrderingSubscription;
 use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
@@ -87,33 +87,41 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
     publisher
         .try_publish_ref(&RefOffer {
             tx_ref: a,
-            sender,
-            nonce: 0,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                sender,
+                nonce: 0,
+                ..GuardHeader::EXEMPT
+            },
         })
         .unwrap();
     publisher
         .try_publish_ref(&RefOffer {
             tx_ref: b,
-            sender,
-            nonce: 1,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                sender,
+                nonce: 1,
+                ..GuardHeader::EXEMPT
+            },
         })
         .unwrap();
     publisher
         .try_publish_ref(&RefOffer {
             tx_ref: a,
-            sender,
-            nonce: 0,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                sender,
+                nonce: 0,
+                ..GuardHeader::EXEMPT
+            },
         })
         .unwrap(); // duplicate (republish)
     publisher
         .try_publish_ref(&RefOffer {
             tx_ref: c,
-            sender,
-            nonce: 2,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                sender,
+                nonce: 2,
+                ..GuardHeader::EXEMPT
+            },
         })
         .unwrap();
 

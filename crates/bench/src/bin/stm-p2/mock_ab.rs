@@ -14,7 +14,9 @@ use kardamom_stm::execute::execute_block_sequential;
 use kardamom_types::{BPosition, TxEnvelope};
 
 use super::args::Args;
-use super::common::{BlockOutputs, EngineOpts, StatsExt, Workload, assert_identical, records};
+use super::common::{
+    BlockOutputs, EngineOpts, NO_SINK, StatsExt, Workload, assert_identical, records,
+};
 
 /// Pass 0 is the timed sequential baseline, plus caches. For each
 /// block: the pre-block delta (the base), the canonical outputs, and a
@@ -169,7 +171,7 @@ struct BaselinePass {
 /// untimed in production; timed here to measure that cost in isolation.
 fn prepare_all(recs: &[(TxIndex, BPosition, TxEnvelope)], stats_before: &Stats) {
     for (t, _, e) in recs {
-        let _ = kardamom_stm::execute::Prepared::new(e, *t, stats_before);
+        let _ = kardamom_stm::execute::Prepared::new(e, *t, stats_before, NO_SINK);
     }
 }
 
@@ -394,7 +396,7 @@ fn run_one_case(
             tx_idx: *t,
             position: *p,
             envelope: e.clone(),
-            prepared: kardamom_stm::execute::Prepared::new(e, *t, &case.stats),
+            prepared: kardamom_stm::execute::Prepared::new(e, *t, &case.stats, NO_SINK),
         })
         .collect();
     let t = Instant::now();

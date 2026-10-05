@@ -13,7 +13,7 @@
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
@@ -186,7 +186,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     let receipt = settlement
         .postBatch(
             0,
-            vec![B256::repeat_byte(0xA1)],
+            Bytes::from(vec![0x02, 0xA1]),
             batch.l2_block_start,
             batch.l2_block_end,
             batch.records_commitment,
@@ -242,7 +242,7 @@ async fn missing_proof_file_reports_not_ready() {
     settlement
         .postBatch(
             0,
-            vec![B256::repeat_byte(0xA1)],
+            Bytes::from(vec![0x02, 0xA1]),
             batch.l2_block_start,
             batch.l2_block_end,
             batch.records_commitment,

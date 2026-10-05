@@ -28,6 +28,11 @@
 //! are in `buffers.rs`. Both re-export here, so the crate root is the one
 //! import path.
 
+// The `#[async_trait]` and `#[rpc]` macros expand trait methods to functions
+// that carry a bare `#[must_use]` and return a pinned boxed future, which is
+// `#[must_use]` on its own. The lint fires in the macros' output, so the crate
+// allows it here.
+#![allow(clippy::double_must_use)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -53,6 +58,7 @@ pub mod epoch_verify;
 pub mod interop;
 pub mod metrics;
 pub mod prover;
+pub mod verdict;
 pub mod witness;
 
 mod block_accum;

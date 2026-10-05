@@ -91,6 +91,23 @@
     group: root
     mode: "0644"
 
+- name: Install the enrollment client
+  ansible.builtin.copy:
+    src: kardamom-enroll
+    dest: "{{ elastic_image_enrollment_client }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the CA bundle of the environment
+  ansible.builtin.copy:
+    src: "{{ elastic_image_ca_file }}"
+    dest: /etc/kardamom/ca.pem
+    owner: root
+    group: root
+    mode: "0644"
+  when: elastic_image_ca_file | length > 0
+
 - name: Write the enrollment client argument vector
   ansible.builtin.copy:
     dest: /etc/kardamom/group_vars/production/enrollment.yml

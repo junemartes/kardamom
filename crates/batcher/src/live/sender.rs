@@ -11,10 +11,10 @@ use metrics::{counter, gauge};
 use tracing::{info, warn};
 
 use crate::batcher::{PostedBatch, metric_names};
-use crate::da_store::FsBlobStore;
+use crate::da::DaProxy;
 use crate::l1::post_batch;
 
-use super::cursor::{BatchCursor, L1Truth, read_l1_truth};
+use super::cursor::{BatchCursor, L1Truth};
 use super::live_metric_names;
 
 /// A streaming L1 sender. It posts one packed group at a time, strictly
@@ -23,7 +23,7 @@ use super::live_metric_names;
 pub struct LiveSender<P> {
     provider: P,
     settlement: Address,
-    da_store: FsBlobStore,
+    da: DaProxy,
     prev_index: u64,
     max_retries: u32,
     cursor_path: PathBuf,
@@ -33,7 +33,7 @@ impl<P: Provider> LiveSender<P> {
     pub fn new(
         provider: P,
         settlement: Address,
-        da_store: FsBlobStore,
+        da: DaProxy,
         prev_index: u64,
         max_retries: u32,
         cursor_path: PathBuf,
@@ -41,7 +41,7 @@ impl<P: Provider> LiveSender<P> {
         Self {
             provider,
             settlement,
-            da_store,
+            da,
             prev_index,
             max_retries,
             cursor_path,
@@ -99,7 +99,7 @@ impl<P: Provider> LiveSender<P> {
             self.settlement,
             self.prev_index,
             batch,
-            &self.da_store,
+            &self.da,
         )
         .await
         {
@@ -146,7 +146,7 @@ impl<P: Provider> LiveSender<P> {
         batch: &PostedBatch,
         e: &crate::error::BatcherError,
     ) -> Result<bool> {
-        let truth = read_l1_truth(&self.provider, self.settlement).await;
+        let truth = L1Truth::read(&self.provider, self.settlement).await;
         let next_index = self.next_index()?;
         match truth {
             Ok(t) if t.last_batch_index == next_index => {
@@ -206,7 +206,7 @@ impl<P: Provider> LiveSender<P> {
     /// Record the metrics and log line for a confirmed post.
     fn record_post_metrics(&self, batch: &PostedBatch) {
         counter!(metric_names::BATCHES_POSTED).increment(1);
-        counter!(metric_names::BLOBS_POSTED).increment(batch.blobs.len() as u64);
+        counter!(metric_names::PAYLOAD_BYTES_POSTED).increment(batch.payload.len() as u64);
         // Metric value; f64 precision loss only above 2^52, never
         // reached by an L2 block number.
         #[allow(
@@ -225,7 +225,7 @@ impl<P: Provider> LiveSender<P> {
             batch_index = self.prev_index,
             l2_block_start = batch.l2_block_start,
             l2_block_end = batch.l2_block_end,
-            blobs = batch.blobs.len(),
+            payload_bytes = batch.payload.len(),
             "batch confirmed on L1"
         );
     }

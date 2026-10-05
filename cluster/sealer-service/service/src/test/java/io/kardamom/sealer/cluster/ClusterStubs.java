@@ -86,6 +86,8 @@ final class ClusterStubs {
     static final class StubCluster implements Cluster {
         final HashMap<Long, ClientSession> sessions = new HashMap<>();
         final IdleStrategy idleStrategy = new YieldingIdleStrategy();
+        /** Every timer the service armed, as {@code (correlationId, deadline)} pairs. */
+        final List<long[]> scheduledTimers = new ArrayList<>();
 
         StubSession addSession(final long id) {
             final StubSession session = new StubSession(id);
@@ -138,6 +140,7 @@ final class ClusterStubs {
         }
 
         public boolean scheduleTimer(final long correlationId, final long deadline) {
+            scheduledTimers.add(new long[] {correlationId, deadline});
             return true;
         }
 
