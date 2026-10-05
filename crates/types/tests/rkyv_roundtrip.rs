@@ -74,6 +74,8 @@ fn receipt_roundtrip() {
         to: Some(Address::repeat_byte(0x88)),
         contract_address: None,
         effective_gas_price: 1_000_000_000_000,
+        priority_fee_per_gas: 0,
+        priority_fee_paid: 0,
         block_number: 42,
         transaction_index: 3,
         cumulative_gas_used: 84_000,
@@ -98,6 +100,8 @@ fn receipt_roundtrip_contract_creation() {
         to: None,
         contract_address: Some(Address::repeat_byte(0x33)),
         effective_gas_price: 0,
+        priority_fee_per_gas: 0,
+        priority_fee_paid: 0,
         block_number: 1,
         transaction_index: 0,
         cumulative_gas_used: 100_000,
@@ -123,6 +127,8 @@ fn receipt_roundtrip_invalid_skip() {
         to: None,
         contract_address: None,
         effective_gas_price: 0,
+        priority_fee_per_gas: 0,
+        priority_fee_paid: 0,
         block_number: 7,
         transaction_index: 2,
         cumulative_gas_used: 42_000,
@@ -148,6 +154,8 @@ fn boundary_roundtrip() {
         end_tx_idx: pos(1, 999),
         l2_timestamp: 1_700_000_000,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     };
     assert_eq!(roundtrip(&end), end);
 }
@@ -174,6 +182,32 @@ fn tx_error_roundtrip() {
         reason: TxErrorReason::DuplicatedTx { expected_nonce: 12 },
     };
     assert_eq!(roundtrip(&e), e);
+}
+
+#[test]
+fn tx_status_roundtrip_every_stage() {
+    let hash = B256::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let error = TxError {
+        sender,
+        nonce: 9,
+        reason: TxErrorReason::Expired { expected_nonce: 8 },
+    };
+    let receipt = Receipt {
+        tx_hash: hash,
+        from: sender,
+        nonce: 9,
+        status: true,
+        ..Receipt::default()
+    };
+    for status in [
+        TxStatus::offered(hash, sender, 9),
+        TxStatus::sealed(hash),
+        TxStatus::executed(&receipt),
+        TxStatus::rejected(hash, &error),
+    ] {
+        assert_eq!(roundtrip(&status), status);
+    }
 }
 
 #[test]

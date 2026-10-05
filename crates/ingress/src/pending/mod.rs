@@ -418,6 +418,27 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             max_inclusion_block: *max_inclusion_block,
             at_block: *at_block,
         },
+        TxErrorReason::FeeInvalid {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => IngressError::FeeInvalid {
+            address: sender,
+            max_fee_per_gas: *max_fee_per_gas,
+            max_priority_fee_per_gas: *max_priority_fee_per_gas,
+        },
+        TxErrorReason::FeeTooLow {
+            max_fee_per_gas,
+            base_fee,
+        } => IngressError::FeeTooLow {
+            address: sender,
+            max_fee_per_gas: *max_fee_per_gas,
+            base_fee: *base_fee,
+        },
+        TxErrorReason::InsufficientFunds { have, want } => IngressError::InsufficientFunds {
+            address: sender,
+            have: alloy_primitives::U256::from(*have),
+            want: alloy_primitives::U256::from(*want),
+        },
     }
 }
 

@@ -87,6 +87,8 @@ mod commit_tests;
 #[cfg(test)]
 mod exec_pipeline_tests;
 #[cfg(test)]
+mod exec_refs_tests;
+#[cfg(test)]
 mod exec_resume_tests;
 #[cfg(test)]
 mod exec_tests;

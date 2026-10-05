@@ -269,7 +269,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     harness.drain_round_robin();
 
     // Cross-sequencer invariants on the shared B log.
-    let refs = harness.b.refs.lock().unwrap().clone();
+    let refs = harness.b.refs();
     assert_eq!(
         refs.len(),
         total_input,

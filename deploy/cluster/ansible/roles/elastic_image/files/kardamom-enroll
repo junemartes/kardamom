@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""kardamom-enroll: the enrollment client of an elastic node.
+
+The bootstrap unit runs it before any agent starts (roles/enroll). It
+reads the first-boot inputs of the node (/etc/kardamom/node.yml, written
+by cloud-init from the pool contract), presents the node to the
+enrollment service of the environment over TLS, and writes what the
+service returns: the node credentials as YAML (enroll_secrets_file) and
+the agent TLS material into the Consul and Nomad TLS directories.
+
+The service verifies the node by its Cloud identity: the private address
+the request comes from must belong to a running server of the project
+with the labels of the pool. Nothing here is a secret; the image carries
+only the CA bundle of the environment (/etc/kardamom/ca.pem).
+
+Exit status 0 means every file is in place. Any other status leaves the
+node without credentials, and the profile role refuses it.
+"""
+
+import argparse
+import grp
+import json
+import os
+import pwd
+import socket
+import ssl
+import sys
+import urllib.error
+import urllib.request
+
+import yaml
+
+NODE_FILE = "/etc/kardamom/node.yml"
+CA_FILE = "/etc/kardamom/ca.pem"
+SECRETS_FILE = "/etc/kardamom/secrets.yml"
+SECRET_KEYS = ("consul_gossip_key", "consul_agent_token", "consul_dns_token", "nomad_consul_token")
+
+
+def read_yaml(path):
+    with open(path, encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def write_private(path, content, owner=None, mode=0o600):
+    """Write a file with its mode set before any content lands in it."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o750, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.chmod(path, mode)
+    if owner:
+        uid = pwd.getpwnam(owner).pw_uid
+        gid = grp.getgrnam(owner).gr_gid
+        os.chown(path, uid, gid)
+        os.chown(directory, uid, gid)
+
+
+def enroll(endpoint, request, ca_file, timeout):
+    context = ssl.create_default_context(cafile=ca_file)
+    body = json.dumps(request).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/v1/enroll",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def write_tls(directory, owner, ca_pem, cert_pem, key_pem):
+    write_private(os.path.join(directory, "ca.pem"), ca_pem, owner, 0o644)
+    write_private(os.path.join(directory, "cert.pem"), cert_pem, owner, 0o644)
+    write_private(os.path.join(directory, "key.pem"), key_pem, owner, 0o640)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--node-file", default=NODE_FILE)
+    parser.add_argument("--ca-file", default=CA_FILE)
+    parser.add_argument("--secrets-file", default=SECRETS_FILE)
+    parser.add_argument("--consul-tls-dir", default="/etc/consul.d/tls")
+    parser.add_argument("--nomad-tls-dir", default="/etc/nomad.d/tls")
+    parser.add_argument("--timeout", type=float, default=30.0)
+    args = parser.parse_args()
+
+    node = read_yaml(args.node_file)
+    endpoints = node.get("enroll_endpoints") or []
+    if not endpoints:
+        print("kardamom-enroll: no enroll_endpoints in " + args.node_file, file=sys.stderr)
+        return 2
+    request = {
+        "cluster_id": node.get("cluster_id", ""),
+        "node_pool": node.get("node_pool", ""),
+        "role": node.get("role", ""),
+        "hostname": socket.gethostname(),
+    }
+
+    result = None
+    for endpoint in endpoints:
+        try:
+            result = enroll(endpoint, request, args.ca_file, args.timeout)
+            break
+        except urllib.error.HTTPError as error:
+            # A refusal is final: the service answered, and it said no.
+            detail = error.read().decode("utf-8", "replace").strip()
+            print(f"kardamom-enroll: {endpoint} refused the node: {error.code} {detail}", file=sys.stderr)
+            return 3
+        except (OSError, ValueError) as error:
+            print(f"kardamom-enroll: {endpoint} did not answer: {error}", file=sys.stderr)
+    if result is None:
+        return 4
+
+    missing = [key for key in SECRET_KEYS if not result.get(key)]
+    for section in ("consul", "nomad"):
+        if not result.get(section, {}).get("cert_pem") or not result.get(section, {}).get("key_pem"):
+            missing.append(section)
+    if not result.get("ca_pem"):
+        missing.append("ca_pem")
+    if missing:
+        print("kardamom-enroll: the answer lacks " + ", ".join(missing), file=sys.stderr)
+        return 5
+
+    write_tls(args.consul_tls_dir, "consul", result["ca_pem"], result["consul"]["cert_pem"], result["consul"]["key_pem"])
+    write_tls(args.nomad_tls_dir, "nomad", result["ca_pem"], result["nomad"]["cert_pem"], result["nomad"]["key_pem"])
+    secrets = {key: result[key] for key in SECRET_KEYS}
+    write_private(args.secrets_file, yaml.safe_dump(secrets, default_flow_style=False), None, 0o600)
+    print("kardamom-enroll: enrolled " + request["hostname"] + " in " + request["node_pool"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

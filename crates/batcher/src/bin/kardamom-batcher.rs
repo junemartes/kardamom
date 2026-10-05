@@ -73,7 +73,7 @@ struct Cli {
 
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
     /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, and
-    /// `--da-store`.
+    /// `--da-proxy`.
     ///
     /// This is a real boolean value flag, not `SetTrue`. With clap's
     /// default bool action, `--dry-run=false` is rejected outright
@@ -88,9 +88,12 @@ struct Cli {
     )]
     dry_run: bool,
 
-    /// L1 JSON-RPC endpoint for live blob posting.
-    #[arg(long, env = "KARDAMOM_L1_RPC")]
-    l1_rpc: Option<String>,
+    /// L1 JSON-RPC endpoints for live posting: repeat the flag, or
+    /// separate the endpoints with commas. A request goes to the best
+    /// endpoint first and falls back to the next on an error or a rate
+    /// limit.
+    #[arg(long, env = "KARDAMOM_L1_RPC", value_delimiter = ',', num_args = 1..)]
+    l1_rpc: Vec<String>,
 
     /// The batcher EOA private key (hex). Must equal the `settlement`'s
     /// `l1Batcher`.
@@ -142,22 +145,57 @@ struct Cli {
     /// confirmed L1 post. Live mode only; required there.
     #[arg(long, env = "KARDAMOM_BATCHER_CURSOR")]
     cursor_file: Option<PathBuf>,
+    /// The spool of consumed, unposted blocks. A restart continues its
+    /// pending group from it and asks the sealers only for what follows.
+    /// Defaults to `spool` beside the cursor file.
+    #[arg(long, env = "KARDAMOM_BATCHER_SPOOL")]
+    spool_dir: Option<PathBuf>,
+    /// The inbox indexer's API (`http://host:port`). A batcher without a
+    /// cursor file then resumes just past the last posted batch, from the
+    /// batch's own blobs, instead of replaying from genesis; and no start
+    /// scans `BatchPosted` events on L1.
+    #[arg(long, env = "KARDAMOM_INDEXER_URL")]
+    indexer_url: Option<String>,
+    /// The settlement contract's deployment block: where a `BatchPosted`
+    /// scan starts when no indexer serves it. 0 is fine on anvil.
+    #[arg(long, env = "KARDAMOM_SETTLEMENT_DEPLOY_BLOCK", default_value_t = 0)]
+    settlement_deploy_block: u64,
+    /// The query endpoints of the executors and the validator
+    /// (`http://host:port`): repeat the flag, or separate them with
+    /// commas. They keep, with every receipt, where the transaction's
+    /// bytes are on the `tx_data` archives. When the sealer no longer
+    /// retains the cursor, the batcher reads each missing block's
+    /// references from the first endpoint that serves it, fetches the
+    /// bytes from the archives, and resumes at the sealer's floor.
+    /// Without them, a refused replay is a fail-stop.
+    #[arg(long, env = "KARDAMOM_BLOCK_REFS_SOURCES", value_delimiter = ',', num_args = 1..)]
+    block_refs_source: Vec<String>,
 
-    /// Post a partial group if the oldest pending block has waited this
-    /// long. Must be nonzero: 0 makes the flush timeout expire at once, a
-    /// busy loop.
+    /// Post a partial group that holds a transaction once its oldest
+    /// block has waited this long. Must be nonzero: 0 posts every block.
     #[arg(long, default_value = "2000")]
     flush_ms: NonZeroU64,
+
+    /// The same wait for a group of empty blocks. An idle chain closes a
+    /// block a second and each post costs gas, so a real L1 takes hours
+    /// here. Defaults to `--flush-ms`.
+    #[arg(long)]
+    idle_flush_ms: Option<NonZeroU64>,
+
+    /// Post a group once its raw bytes reach this, before any timer: one
+    /// full post per fee. 14 MiB stays under the 15 MiB payload ceiling
+    /// and the DA layer's 16 MiB blob after compression, so it is one post.
+    #[arg(long, default_value_t = NonZeroUsize::new(14 * 1024 * 1024).unwrap())]
+    target_payload_bytes: NonZeroUsize,
 
     /// Bounded retries per L1 post before fail-stop (live mode).
     #[arg(long, default_value_t = 5)]
     l1_retries: u32,
 
-    /// The DA blob store directory. Each posted blob is written here, keyed
-    /// by its versioned hash, so `kardamom-reconstruct` can fetch the bytes
-    /// later.
-    #[arg(long)]
-    da_store: Option<PathBuf>,
+    /// The EigenDA proxy (`http://host:port`). Every batch's payload is
+    /// dispersed through it; the certificate it returns goes on L1.
+    #[arg(long, env = "KARDAMOM_DA_PROXY")]
+    da_proxy: Option<String>,
 
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9002")]
@@ -172,7 +210,15 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     kardamom_engine::bin_support::init_tracing();
     let cli = Cli::parse();
-    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id).await?;
+    // The live batcher is ready once its feed loop runs over the restored
+    // spool. The offline scan has no loop: its exporter being live is
+    // enough.
+    let readiness = if cli.live {
+        kardamom_obs::Readiness::up().equals(kardamom_batcher::live::FEED_RUNNING, 1.0)
+    } else {
+        kardamom_obs::Readiness::up()
+    };
+    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id, readiness).await?;
 
     if cli.live {
         return live_main(cli).await;
@@ -186,15 +232,15 @@ impl Cli {
     /// The L1 flag tuple both post paths require. `mode` names the flag
     /// that asked for it, so the error message stays exact (`--live` or
     /// `--dry-run=false`).
-    fn require_l1_flags(&self, mode: &str) -> Result<(&String, &String, Address, &PathBuf)> {
+    fn require_l1_flags(&self, mode: &str) -> Result<(&[String], &String, Address, &String)> {
         match (
-            self.l1_rpc.as_ref(),
+            self.l1_rpc.as_slice(),
             self.l1_key.as_ref(),
             self.settlement,
-            self.da_store.as_ref(),
+            self.da_proxy.as_ref(),
         ) {
-            (Some(r), Some(k), Some(s), Some(d)) => Ok((r, k, s, d)),
-            _ => bail!("{mode} requires --l1-rpc, --l1-key, --settlement and --da-store"),
+            (r @ [_, ..], Some(k), Some(s), Some(d)) => Ok((r, k, s, d)),
+            _ => bail!("{mode} requires --l1-rpc, --l1-key, --settlement and --da-proxy"),
         }
     }
 
@@ -259,10 +305,10 @@ impl Cli {
         settlement: Address,
         mut prev_index: u64,
         sent_batches: &[PostedBatch],
-        da_store: &kardamom_batcher::FsBlobStore,
+        da: &kardamom_batcher::DaProxy,
     ) -> anyhow::Result<u64> {
         for batch in sent_batches {
-            prev_index = post_batch(provider, settlement, prev_index, batch, da_store)
+            prev_index = post_batch(provider, settlement, prev_index, batch, da)
                 .await
                 .context("post batch to L1")?;
         }
@@ -274,22 +320,23 @@ impl Cli {
     async fn post_or_dry_run(&self, sent_batches: &[PostedBatch]) -> anyhow::Result<()> {
         let live = !self.dry_run;
         if live {
-            let (rpc, key, settlement, da_dir) = self.require_l1_flags("--dry-run=false")?;
-            let (provider, da_store) = live::connect_l1(rpc, key, da_dir).await?;
+            let (rpcs, key, settlement, da_proxy) = self.require_l1_flags("--dry-run=false")?;
+            let provider = live::connect_l1(rpcs, key)?;
+            let da = kardamom_batcher::DaProxy::new(da_proxy)?;
 
             // Start from the contract's current index (CAS replay guard).
             let prev_index = live::read_last_batch_index(&provider, settlement).await?;
             info!(%settlement, start_index = prev_index, "live L1 posting");
 
             let head_index =
-                Self::post_all_batches(&provider, settlement, prev_index, sent_batches, &da_store)
+                Self::post_all_batches(&provider, settlement, prev_index, sent_batches, &da)
                     .await?;
             info!(
                 posted = sent_batches.len(),
                 head_index, "live posting complete"
             );
         } else {
-            if self.l1_rpc.is_some() || self.settlement.is_some() {
+            if !self.l1_rpc.is_empty() || self.settlement.is_some() {
                 warn!("L1 args supplied but --dry-run is set; not broadcasting");
             }
             info!(
@@ -311,7 +358,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
             "--live requires --dry-run=false: a live batcher that does not post is not a DA service"
         );
     }
-    let (rpc, key, settlement, da_dir) = cli.require_l1_flags("--live")?;
+    let (rpcs, key, settlement, da_proxy) = cli.require_l1_flags("--live")?;
     let config = cli
         .config
         .clone()
@@ -322,11 +369,15 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         .context("--live requires --cursor-file")?;
 
     live::run(live::LiveArgs {
-        rpc: rpc.clone(),
+        rpcs: rpcs.to_vec(),
         key: key.clone(),
         settlement,
-        da_store: da_dir.clone(),
+        da_proxy: da_proxy.clone(),
         config,
+        spool_dir: cli
+            .spool_dir
+            .clone()
+            .unwrap_or_else(|| cursor_file.with_file_name("spool")),
         cursor_file,
         log_config: cli.log_config.clone(),
         aeron_dir: cli.aeron_dir.clone(),
@@ -337,8 +388,13 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         blocks_per_batch: cli.blocks_per_batch,
         compress: !cli.no_compress,
         flush_ms: cli.flush_ms,
+        idle_flush_ms: cli.idle_flush_ms.unwrap_or(cli.flush_ms),
+        target_payload_bytes: cli.target_payload_bytes,
         l1_retries: cli.l1_retries,
         chain_id: cli.chain_id,
+        indexer_url: cli.indexer_url.clone(),
+        settlement_deploy_block: cli.settlement_deploy_block,
+        block_refs_sources: cli.block_refs_source.clone(),
     })
     .await
 }

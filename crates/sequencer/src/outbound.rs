@@ -16,10 +16,12 @@
 //! bubbles up.
 //!
 //! The sequencer also emits a [`types::TxError`] on the dedicated
-//! `tx_errors` channel ([`TxErrorPublisher`]) when an inbound transaction
-//! fails the nonce gate (today: past-nonce or duplicate; more variants may
-//! come later). Ingress reads that channel and releases the parked client
-//! right away with a JSON-RPC error.
+//! `tx_errors` channel ([`SideChannelPublisher`]) when an inbound
+//! transaction fails the nonce gate (today: past-nonce or duplicate; more
+//! variants may come later). Ingress reads that channel and releases the
+//! parked client right away with a JSON-RPC error. The same port carries
+//! the `tx_status` stream: an `Offered` status for every ref the
+//! sequencer offers, and a `Rejected` status next to every error.
 //!
 //! All surfaces are traits, so unit tests can use the in-memory fakes (no
 //! Aeron media driver needed). Production wiring binds them to the real
@@ -27,10 +29,10 @@
 
 pub mod cluster;
 
-use alloy_primitives::Address;
-use kardamom_log::aeron_live::TxErrorsPublisherHandle;
+use kardamom_cluster_adapter::wire::GuardHeader;
+use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{EpochRecord, TxError, TxRef};
+use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
 
 use crate::error::SequencerError;
 
@@ -41,9 +43,9 @@ use crate::error::SequencerError;
 #[derive(Clone, Copy, Debug)]
 pub struct RefOffer {
     pub tx_ref: TxRef,
-    pub sender: Address,
-    pub nonce: u64,
-    pub max_inclusion_block: u64,
+    /// The sealer's guard header: the sender and nonce for the contiguity
+    /// guard, the inclusion deadline, and the tip the record bids.
+    pub guard: GuardHeader,
 }
 
 /// `TxOrdering` publisher contract, the canonical orderer. Publishes tiny
@@ -110,23 +112,36 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
-/// `TxErrors` channel publisher. This is best-effort: the caller logs
-/// errors and does not propagate them. The canonical state has already
-/// advanced, or the inbound transaction was rejected, so there is nothing
-/// to roll back.
-pub trait TxErrorPublisher: Send {
+/// The side channels: `tx_errors` and `tx_status`. Both are best effort.
+/// The caller logs a failure and does not propagate it. The canonical
+/// state has already advanced, or the inbound transaction was rejected,
+/// so there is nothing to roll back.
+pub trait SideChannelPublisher: Send {
     fn publish_error(&mut self, e: TxError);
+    fn publish_status(&mut self, s: TxStatus);
 }
 
-/// The live adapter. The sequencer publishes rejections (today: duplicate
-/// or past-nonce) on the `tx_errors` Aeron channel. Ingress reads them to
-/// release parked clients early. A publish failure is logged and dropped:
-/// the canonical state has already advanced, or the transaction was
-/// rejected, so there is nothing to roll back.
-impl TxErrorPublisher for TxErrorsPublisherHandle {
+/// The live side channels. The sequencer publishes rejections on the
+/// `tx_errors` Aeron channel, which the ingress reads to release parked
+/// clients early, and statuses on the `tx_status` channel, which the
+/// notifier reads. A publish failure is logged and dropped: the canonical
+/// state has already advanced, or the transaction was rejected, so there
+/// is nothing to roll back.
+pub struct SideChannels {
+    pub errors: TxErrorsPublisherHandle,
+    pub status: TxStatusPublisherHandle,
+}
+
+impl SideChannelPublisher for SideChannels {
     fn publish_error(&mut self, e: TxError) {
-        if let Err(err) = self.publish(&e) {
+        if let Err(err) = self.errors.publish(&e) {
             tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
+        }
+    }
+
+    fn publish_status(&mut self, s: TxStatus) {
+        if let Err(err) = self.status.publish_best_effort(&s) {
+            tracing::warn!(error = %err, "tx_status publish failed (dropped)");
         }
     }
 }
@@ -140,16 +155,19 @@ pub mod fakes {
     use std::sync::{Arc, Mutex};
 
     use kardamom_types::xchain::RemoteEpochRecord;
-    use kardamom_types::{EpochRecord, TxRef};
+    use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
-    use super::{RefOffer, SequencerError, TxError, TxErrorPublisher, TxOrderingRefPublisher};
+    use super::{RefOffer, SequencerError, SideChannelPublisher, TxError, TxOrderingRefPublisher};
 
-    /// In-memory `tx_ordering` publisher. Records every published `TxRef`,
+    /// In-memory `tx_ordering` publisher. Records every published offer,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
     /// can check the canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
-        pub refs: Arc<Mutex<Vec<TxRef>>>,
+        /// Every published offer whole, guard header included. One vector
+        /// holds the whole record: the allocation harness reserves it,
+        /// so the fake costs the measured loop nothing.
+        pub offers: Arc<Mutex<Vec<RefOffer>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
@@ -160,7 +178,7 @@ pub mod fakes {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.refs.lock().unwrap().push(offer.tx_ref);
+            self.offers.lock().unwrap().push(*offer);
             Ok(())
         }
 
@@ -184,14 +202,38 @@ pub mod fakes {
         }
     }
 
-    #[derive(Default, Clone)]
-    pub struct InMemoryTxErrorPublisher {
-        pub errors: Arc<Mutex<Vec<TxError>>>,
+    impl InMemoryTxOrderingRefPublisher {
+        /// The `TxRef` of every published offer, in arrival order.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the offers mutex is poisoned.
+        #[must_use]
+        pub fn refs(&self) -> Vec<TxRef> {
+            self.offers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|o| o.tx_ref)
+                .collect()
+        }
     }
 
-    impl TxErrorPublisher for InMemoryTxErrorPublisher {
+    /// In-memory side channels. Records every error and every status in
+    /// arrival order.
+    #[derive(Default, Clone)]
+    pub struct InMemorySidePublisher {
+        pub errors: Arc<Mutex<Vec<TxError>>>,
+        pub statuses: Arc<Mutex<Vec<TxStatus>>>,
+    }
+
+    impl SideChannelPublisher for InMemorySidePublisher {
         fn publish_error(&mut self, e: TxError) {
             self.errors.lock().unwrap().push(e);
+        }
+
+        fn publish_status(&mut self, s: TxStatus) {
+            self.statuses.lock().unwrap().push(s);
         }
     }
 }
@@ -212,9 +254,10 @@ mod tests {
                 BPosition::default(),
                 0,
             ),
-            sender: Address::ZERO,
-            nonce,
-            max_inclusion_block: u64::MAX,
+            guard: GuardHeader {
+                nonce,
+                ..GuardHeader::EXEMPT
+            },
         }
     }
 
@@ -223,7 +266,7 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         p.try_publish_ref(&offer(0)).unwrap();
         p.try_publish_ref(&offer(1)).unwrap();
-        assert_eq!(p.refs.lock().unwrap().len(), 2);
+        assert_eq!(p.refs().len(), 2);
     }
 
     #[test]
@@ -237,14 +280,17 @@ mod tests {
     }
 
     #[test]
-    fn fake_tx_error_records_emissions() {
-        let mut p = InMemoryTxErrorPublisher::default();
-        p.publish_error(TxError {
+    fn fake_side_channels_record_errors_and_statuses() {
+        let mut p = InMemorySidePublisher::default();
+        let error = TxError {
             sender: Address::repeat_byte(0xAB),
             nonce: 7,
             reason: TxErrorReason::DuplicatedTx { expected_nonce: 10 },
-        });
+        };
+        p.publish_status(TxStatus::rejected(B256::repeat_byte(0x01), &error));
+        p.publish_error(error);
         assert_eq!(p.errors.lock().unwrap().len(), 1);
+        assert_eq!(p.statuses.lock().unwrap().len(), 1);
     }
 
     fn test_epoch(n: u64) -> EpochRecord {

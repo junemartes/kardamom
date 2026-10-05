@@ -11,6 +11,7 @@
 //! | `last_committed_end_tx_position`     | `BPosition` (8 B, i32 BE + i32 BE) |
 //! | `last_fsynced_reader_position`       | `BPosition` (8 B)              |
 //! | `schema_version`                     | `u32 BE`                       |
+//! | `l1_rebuilt_end_tx_position`         | `BPosition` (8 B)              |
 
 use kardamom_types::BPosition;
 
@@ -23,6 +24,16 @@ pub(crate) const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
 pub(crate) const KEY_LAST_COMMITTED_END_TX_POSITION: &[u8] = b"last_committed_end_tx_position";
 pub(crate) const KEY_LAST_FSYNCED_READER_POSITION: &[u8] = b"last_fsynced_reader_position";
 pub(crate) const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
+/// The canonical end of the last block this database rebuilt from its L1
+/// payload. A rebuild starts from genesis, so every block at or below the
+/// mark is rebuilt. A `tx_hash_index` row at or below the mark carries no
+/// archive reference: the payload has none, and the bytes are on L1. The
+/// key is absent on a database that rebuilt no block.
+///
+/// This is a fact of one node, not of the chain. The deep compare leaves
+/// it out, and reads it to accept such a row against a peer's row with a
+/// reference.
+pub(crate) const KEY_L1_REBUILT_END_TX_POSITION: &[u8] = b"l1_rebuilt_end_tx_position";
 /// A presence-only flag. It is written once, when genesis allocations are
 /// seeded into a fresh env (see `crate::genesis::seed_genesis`).
 ///

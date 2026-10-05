@@ -8,7 +8,7 @@
 //! optional layers compose as `Either<Outer<Either<Inner<P>, P>>,
 //! Either<Inner<P>, P>>`; nesting further composes the same way.
 
-use kardamom_types::{BlockBoundary, BlockDelta, ReceiptRows};
+use kardamom_types::{BlockBoundary, BlockDelta, ReceiptRows, TxRef};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -93,13 +93,21 @@ pub trait StateWriterSignal: Send {
 /// Hand-off queue from the executor to the state writer. The state writer
 /// reads these entries and applies the block delta to libmdbx.
 pub trait StateWriterQueue: Send {
-    /// Submit `block`'s delta to the writer.
+    /// Submit `block`'s delta to the writer, with the reference of each
+    /// of its transactions: where the bytes are on a `tx_data` archive,
+    /// kept with the receipt so the batcher can rebuild a block the sealer
+    /// no longer retains.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the writer's channel is closed (the writer
     /// thread is gone).
-    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError>;
+    fn submit(
+        &mut self,
+        block: BlockBoundary,
+        delta: BlockDelta,
+        refs: Vec<TxRef>,
+    ) -> Result<(), ExecutorError>;
 }
 
 /// One of two [`TxReceiptsPublication`] shapes, chosen at construction

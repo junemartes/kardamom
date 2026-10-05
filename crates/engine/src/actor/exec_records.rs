@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use kardamom_types::xchain::XChainMessage;
-use kardamom_types::{BPosition, Deposit, SnapshotSource, TxEnvelope};
+use kardamom_types::{BPosition, Deposit, SnapshotSource, TxEnvelope, TxRef};
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
@@ -42,6 +42,7 @@ impl<W: ExecPorts> ExecState<W> {
             chain_id: self.cfg.chain_id.get(),
             block_number,
             l2_timestamp: self.cursor.l2_ts,
+            fees: self.cursor.fees,
         }
     }
 
@@ -165,6 +166,7 @@ impl<W: ExecPorts> ExecState<W> {
         &mut self,
         envelope: TxEnvelope,
         position: BPosition,
+        tx_ref: TxRef,
     ) -> Result<Flow, ExecutorError> {
         let tx_idx = self.next_idx()?;
         // The hook runs at arrival, before the streaming or whole-block
@@ -176,6 +178,7 @@ impl<W: ExecPorts> ExecState<W> {
             envelope: &envelope,
         };
         self.observers.tx_hook.before(&tx)?;
+        self.block.refs.push(tx_ref);
         let env = self.exec_env(self.cursor.block);
         let Streaming { scope, shadow } = match &mut self.block.run {
             // Whole-block strategy: defer to the boundary, so batches can

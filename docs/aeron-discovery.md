@@ -30,7 +30,8 @@ The migrated streams and their publishers:
 | `tx_data` (one record per lane) | ingress | sequencer, executor, validator, batcher, ingress archives |
 | `tx_receipts` | executor | ingress, sequencer, validator |
 | `tx_receipt_boundaries` | executor | ingress |
-| `tx_errors` | sequencer | ingress |
+| `tx_errors` | sequencer | ingress, notifier |
+| `tx_status` | sequencer, ingress | notifier |
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
@@ -193,10 +194,10 @@ the shared media driver could take a port first.
 
 | Job | Publications |
 | --- | --- |
-| ingress | 8 `tx_data` lanes |
+| ingress | 8 `tx_data` lanes, `tx_status` |
 | executor | receipts, boundaries, BAL |
 | da-watcher | deposits, remote epochs |
-| sequencer lane `n` | `tx_errors` |
+| sequencer lane `n` | `tx_errors`, `tx_status` |
 
 The aeron system job registers the archive record with the node's
 `archive_topics` meta: `tx_data` on the ingress nodes, `tx_deposits` on

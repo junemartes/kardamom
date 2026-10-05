@@ -59,16 +59,23 @@ job "state-mirror" {
       unlimited      = true
     }
 
+    # One mirror at a time, healthy by its /ready check: it applied a
+    # batch within the stale window, so it is attached to tx_receipts.
     update {
-      max_parallel     = 1
-      health_check     = "task_states"
-      min_healthy_time = "10s"
-      healthy_deadline = "2m"
-      auto_revert      = false
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
       mode = "host"
+      # The exporter, as a Consul service: the /ready check reads it.
+      port "metrics" {
+        static = 9007
+      }
     }
 
     task "state-mirror" {
@@ -118,17 +125,31 @@ job "state-mirror" {
       # The [cache] section: the three sentinels by their node records.
       # The mirror asks them for the primary and asks again after a
       # failure.
+      # The sentinels by their Consul service record, which resolves to
+      # the healthy sentinels; the mirror resolves it again after a
+      # failure.
       template {
         destination = "local/state-mirror.toml"
         data        = <<EOF
 [cache]
 sentinels = [
-  "redis://aux-0.node.${var.datacenter}.consul:26379",
-  "redis://ingress-0.node.${var.datacenter}.consul:26379",
-  "redis://ingress-1.node.${var.datacenter}.consul:26379",
+  "redis://redis-sentinel.service.${var.datacenter}.consul:26379",
 ]
 master_name = "kardamom"
 EOF
+      }
+
+      service {
+        name     = "kardamom-state-mirror"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

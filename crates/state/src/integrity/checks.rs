@@ -301,7 +301,7 @@ impl<'a> Sweep<'a> {
             self.problem(format!("receipt {tx_hash:?} missing from tx_hash_index"));
             return Ok(());
         };
-        match decode_tx_hash_value(&index_bytes) {
+        match decode_tx_hash_value(&index_bytes).map(|v| v.tx_idx) {
             Ok(indexed_pos) if indexed_pos == pos => (),
             Ok(indexed_pos) => self.problem(format!(
                 "tx_hash_index[{tx_hash}] -> {indexed_pos:?}, receipt sits at {pos:?}"
@@ -336,7 +336,7 @@ impl<'a> Sweep<'a> {
         k: &[u8],
         v: &[u8],
     ) -> Result<(), StateError> {
-        let pos = match decode_tx_hash_value(v) {
+        let pos = match decode_tx_hash_value(v).map(|v| v.tx_idx) {
             Ok(pos) => pos,
             Err(e) => {
                 self.problem(format!("tx_hash_index value: {e}"));

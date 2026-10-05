@@ -12,7 +12,7 @@ default = []
 docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 # Exposes the anvil e2e test scaffold (`testkit`) to this crate's own
 # integration tests, each of which cargo treats as a separate crate.
-test-support = []
+test-support = ["dep:tempfile"]
 
 [dependencies]
 kardamom-types.workspace = true
@@ -23,11 +23,12 @@ kardamom-log.workspace = true
 # crate, keeping the state DB confined to the executor, validator, and that tool.
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
-# populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
-# `contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json` at
-# compile time and cargo guarantees a crate's deps are compiled (and their
-# build scripts run) before the crate itself is compiled. Without this,
-# parallel build-script execution races on forge install.
+# populating `contracts/out/`. The `AcceptingVerifier` binding in `testkit.rs`
+# loads `contracts/out/KardamomProofOracle.t.sol/AcceptingVerifier.json` at
+# compile time, and cargo compiles a crate's deps (and runs their build
+# scripts) before the crate itself. Without this, parallel build-script
+# execution races on forge install. The ABI-only bindings read the committed
+# files in `contracts/abi/`, which need no forge build.
 kardamom-deployer = { path = "../deployer" }
 
 alloy-primitives.workspace = true
@@ -41,6 +42,12 @@ alloy-contract.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
 alloy-signer-local.workspace = true
+# The L1 endpoint list: one HTTP transport per endpoint behind the
+# fallback layer, so a request falls back on an error or a rate limit.
+alloy-transport.workspace = true
+alloy-transport-http.workspace = true
+alloy-rpc-client.workspace = true
+tower.workspace = true
 
 bytes.workspace = true
 rkyv.workspace = true
@@ -59,11 +66,13 @@ kardamom-obs = { path = "../obs" }
 kardamom-engine.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+reqwest.workspace = true
 
 clap.workspace = true
 # Live L1 posting is async; genesis is TOML.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 toml.workspace = true
+tempfile = { workspace = true, optional = true }
 
 [build-dependencies]
 anyhow.workspace = true
@@ -81,6 +90,10 @@ alloy-node-bindings.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
 serde_json.workspace = true
+
+[[bin]]
+name = "kardamom-da-store"
+path = "src/bin/kardamom-da-store.rs"
 
 [[bin]]
 name = "kardamom-batcher"

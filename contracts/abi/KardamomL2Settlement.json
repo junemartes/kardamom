@@ -95,9 +95,9 @@
         "internalType": "uint64"
       },
       {
-        "name": "blobVersionedHashes",
-        "type": "bytes32[]",
-        "internalType": "bytes32[]"
+        "name": "daCert",
+        "type": "bytes",
+        "internalType": "bytes"
       },
       {
         "name": "l2BlockStart",
@@ -160,10 +160,10 @@
         "internalType": "uint64"
       },
       {
-        "name": "blobHashes",
-        "type": "bytes32[]",
+        "name": "daCert",
+        "type": "bytes",
         "indexed": false,
-        "internalType": "bytes32[]"
+        "internalType": "bytes"
       },
       {
         "name": "l2BlockStart",
@@ -246,7 +246,7 @@
   },
   {
     "type": "error",
-    "name": "EmptyBlobs",
+    "name": "EmptyCert",
     "inputs": []
   },
   {

@@ -192,10 +192,15 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             return Ok(FactoryStatus::AlreadyDeployed);
         }
 
-        // (c) Deploy impl via ERC-7955.
-        let impl_salt = crate::addresses::factory_impl_salt();
-        self.send_erc7955_tx(operator, impl_salt, &factory_impl_initcode)
-            .await?;
+        // (c) Deploy impl via ERC-7955. The impl's salt holds no owner,
+        // so every owner's factory on a chain shares one impl: a second
+        // owner finds it present, and a CREATE2 of the same initcode and
+        // salt would revert.
+        if !self.code_present(impl_addr).await? {
+            let impl_salt = crate::addresses::factory_impl_salt();
+            self.send_erc7955_tx(operator, impl_salt, &factory_impl_initcode)
+                .await?;
+        }
 
         // (d) Deploy proxy via ERC-7955.
         let proxy_salt = crate::addresses::factory_proxy_salt();

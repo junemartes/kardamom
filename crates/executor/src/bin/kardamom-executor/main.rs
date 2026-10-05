@@ -33,7 +33,7 @@ use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
-    MdbxWriterSignal, Outbound, RoleHooks,
+    MdbxWriterSignal, NoTxHook, Outbound, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::AeronRuntime;
@@ -124,7 +124,9 @@ async fn spawn_writer_and_bal(
     // thread hands each block's tx captures to a grading thread
     // (measurement only; execution stays sequential). It is `None`
     // when the env flag is unset, for zero cost.
-    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env();
+    let footprint_shadow = kardamom_engine::shadow::Shadow::spawn_from_env(
+        kardamom_types::BlockFees::genesis(genesis.and_then(|g| g.fees)).beneficiary,
+    );
 
     Ok(WriterAdapters {
         writer,
@@ -259,7 +261,17 @@ struct Boot {
 impl Boot {
     async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
-        kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id).await?;
+        kardamom_obs::init_service!(
+            "executor",
+            args.metrics_addr,
+            &args.host_id,
+            kardamom_obs::Readiness::up().within(
+                kardamom_engine::metrics::BLOCK_NUMBER,
+                kardamom_engine::metrics::SEALER_BLOCK_NUMBER,
+                f64::from(args.ready_lag_blocks),
+            )
+        )
+        .await?;
         kardamom_engine::metrics::describe();
         let file_cfg = load_file_config(&args)?;
         tracing::info!(
@@ -396,6 +408,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
 
     let mut cfg = ExecutorConfig {
         chain_id,
+        fees: genesis.as_ref().and_then(|g| g.fees),
         ..ExecutorConfig::default()
     };
     // Always bound the tx_data join wait. A replica whose multicast
@@ -452,7 +465,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
                 // Sequencer-side rejection would only buy
                 // defense-in-depth, at the cost of an ecrecover per tx on
                 // the hot path. See the hook's doc for the full trade-off.
-                tx_hook: None,
+                tx_hook: NoTxHook,
             },
         )
         .run()

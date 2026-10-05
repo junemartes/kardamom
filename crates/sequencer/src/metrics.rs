@@ -15,6 +15,9 @@ pub(crate) const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_ev
 /// Parked entries that waited on a nonce gap past `tx_ttl`. Each one got
 /// an explicit `Expired` error on `tx_errors`.
 pub(crate) const PENDING_BUFFER_EXPIRED: &str = "kardamom_sequencer_pending_expired_total";
+/// Envelopes the fee gate refused. Each one got a `FeeInvalid`,
+/// `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
+pub(crate) const FEE_REJECTED: &str = "kardamom_sequencer_fee_rejected_total";
 /// Nonce lookups. `NONCE_LOOKUP_REQUESTS` counts the parks that asked for
 /// one. `NONCE_LOOKUPS` counts the queries the task ran, by `outcome`
 /// (`ok`, `error`, `timeout`, `shed`). `NONCE_LOOKUPS_IN_FLIGHT` is the
@@ -51,6 +54,11 @@ pub(crate) const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skip
 pub(crate) const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub(crate) const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
 pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
+/// The unix time of the last boundary frame the cluster egress delivered.
+/// The readiness rule requires one within the boundary-silence window:
+/// the sealer emits a boundary every tick, so a recent one proves the
+/// session is open and the egress attached, on an idle chain too.
+pub const LAST_BOUNDARY_UNIX_SECONDS: &str = "kardamom_sequencer_last_boundary_unix_seconds";
 /// A gauge for refs that are published but not yet receipt-confirmed as
 /// committed. A counter for refs that are rewound and republished after
 /// the confirm timeout. A steady nonzero republish rate means offers land
@@ -91,6 +99,7 @@ pub struct HotMetrics {
     pub dropped_past: metrics::Counter,
     pub evictions: metrics::Counter,
     pub expired: metrics::Counter,
+    pub fee_rejected: metrics::Counter,
     pub lookup_requests: metrics::Counter,
     pub wrong_shard: metrics::Counter,
     pub shadow_suppressed: metrics::Counter,
@@ -109,6 +118,7 @@ impl HotMetrics {
             dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
             evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
             expired: counter!(PENDING_BUFFER_EXPIRED, "partition" => p.clone()),
+            fee_rejected: counter!(FEE_REJECTED, "partition" => p.clone()),
             lookup_requests: counter!(NONCE_LOOKUP_REQUESTS, "partition" => p.clone()),
             wrong_shard: counter!(WRONG_SHARD_DROPPED, "partition" => p.clone()),
             shadow_suppressed: counter!(SHADOW_SUPPRESSED, "partition" => p.clone()),

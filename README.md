@@ -4,7 +4,7 @@ An Ethereum rollup framework. The workspace is a set of Rust crates — the
 pipeline services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
 `kardamom-batcher`, `kardamom-da-watcher`) wired together over Aeron, the
 off-hot-path `kardamom-validator` (re-executes every block and fail-stops on
-divergence), shared libraries (`kardamom-types`, `kardamom-log`,
+divergence) and `kardamom-notifier` (transaction status events for clients), shared libraries (`kardamom-types`, `kardamom-log`,
 `kardamom-state`, `kardamom-obs`, `kardamom-engine` — the execution core shared
 by executor and validator — `kardamom-cluster-adapter`,
 `kardamom-cluster-client`), and tooling (`deployer`, `bench`, the `e2e` test
@@ -173,7 +173,7 @@ Beyond `cargo test`, two suites answer different questions.
 scenario drivers (`crates/e2e/src/scenarios/`) covers L1↔L2 bridge round-trips
 against a real anvil, nonce ordering and RPC liveness through
 `eth_sendRawTransaction`, validator↔executor state parity (down to a
-byte-level comparison of the two libmdbx databases), DA parity (blobs posted
+byte-level comparison of the two libmdbx databases), DA parity (payloads posted
 to L1, re-executed, matched against the validator's root), and state-DB
 integrity across normal operation and an unclean crash. They run on two
 targets:

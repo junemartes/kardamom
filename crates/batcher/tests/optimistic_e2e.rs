@@ -13,7 +13,7 @@
 use std::num::NonZeroU64;
 use std::path::Path;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use kardamom_batcher::BatchAccumulator;
 use kardamom_batcher::batcher::pack_blocks;
@@ -194,7 +194,7 @@ async fn scenario_a_honest_claim_and_finalize<P: Provider + Clone>(
     s.settlement
         .postBatch(
             0,
-            vec![B256::repeat_byte(0xA1)],
+            Bytes::from(vec![0x02, 0xA1]),
             7,
             8,
             batch.records_commitment,
@@ -245,7 +245,7 @@ async fn lying_claim_is_challenged_and_rewound<P: Provider + Clone>(
     s.settlement
         .postBatch(
             1,
-            vec![B256::repeat_byte(0xA2)],
+            Bytes::from(vec![0x02, 0xA2]),
             7,
             8,
             batch.records_commitment,

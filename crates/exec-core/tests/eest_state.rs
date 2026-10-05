@@ -216,6 +216,7 @@ impl PreparedCase {
             chain_id: cfg.chain_id,
             block_number: block.number.try_into().unwrap_or(0),
             l2_timestamp: block.timestamp.try_into().unwrap_or(0),
+            fees: kardamom_types::BlockFees::NONE,
         };
 
         let mut alloc = Alloc::default();

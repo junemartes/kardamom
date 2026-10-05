@@ -15,6 +15,16 @@ variable "datacenter" {
   default     = "dc1"
 }
 
+# anvil's "finalized" tag is the head minus two epochs, 32 slots each by
+# default: 64 blocks behind. The followers (the da-watcher, the indexer)
+# walk only finalized blocks, so on a young chain they see nothing. One
+# slot per epoch puts finality two blocks behind the head.
+variable "slots_in_an_epoch" {
+  type        = string
+  description = "anvil's --slots-in-an-epoch. Empty: anvil's default, 32. The chaos-l1 shard sets 1, so the followers see finality two blocks behind the head."
+  default     = ""
+}
+
 job "anvil" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -72,10 +82,13 @@ job "anvil" {
         # 127.0.0.1:8545. Override the entrypoint, so the args reach
         # anvil unchanged.
         entrypoint = ["anvil"]
-        args = [
-          "--host", "0.0.0.0",
-          "--port", "8546",
-        ]
+        args = concat(
+          [
+            "--host", "0.0.0.0",
+            "--port", "8546",
+          ],
+          var.slots_in_an_epoch != "" ? ["--slots-in-an-epoch", var.slots_in_an_epoch] : [],
+        )
       }
 
       resources {
