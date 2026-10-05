@@ -1,14 +1,15 @@
 //! The cluster egress watermark thread: folds the cluster's egress
-//! progress into the proxy's on-quorum watermark bus, and publishes a
-//! `Sealed` status for every relayed transaction.
+//! progress into the proxy's on-quorum watermark bus, publishes a
+//! `Sealed` status for every relayed transaction, and folds the cluster's
+//! status frames into the proxy's status channel.
 
 use std::ops::ControlFlow;
 
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
-use kardamom_ingress::cluster::ClusterWatermarkObserver;
+use kardamom_ingress::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
 use kardamom_log::aeron_live::TxStatusPublisherHandle;
-use kardamom_types::{QuorumWatermark, TxStatus};
-use tokio::sync::broadcast;
+use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// The watermark thread's state: the egress observer, the watermark bus,
@@ -20,6 +21,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 pub(crate) struct ClusterWatermarkPump {
     observer: ClusterWatermarkObserver<LiveEgress>,
     tx: broadcast::Sender<QuorumWatermark>,
+    cluster_status: watch::Sender<ClusterStatus>,
     status: TxStatusPublisherHandle,
     stop: CancellationToken,
 }
@@ -46,11 +48,13 @@ impl ClusterWatermarkPump {
     pub(crate) fn new(
         observer: ClusterWatermarkObserver<LiveEgress>,
         tx: broadcast::Sender<QuorumWatermark>,
+        cluster_status: watch::Sender<ClusterStatus>,
         status: TxStatusPublisherHandle,
     ) -> Self {
         Self {
             observer,
             tx,
+            cluster_status,
             status,
             stop: CancellationToken::new(),
         }
@@ -79,23 +83,33 @@ impl ClusterWatermarkPump {
         while let ControlFlow::Continue(()) = self.step() {}
     }
 
-    /// Poll one egress frame: send its durable count, and publish the
-    /// `Sealed` status of the transaction it relayed. `Break` ends the
-    /// thread: the stop token fired, or the observer ended.
+    /// Poll one egress event: send a durable count and publish the
+    /// `Sealed` status of the transaction a frame relayed, or send a
+    /// status to the status channel. `Break` ends the thread: the stop
+    /// token fired, or the observer ended.
     fn step(&mut self) -> ControlFlow<()> {
         if self.stop.is_cancelled() {
             return ControlFlow::Break(());
         }
-        let Some(progress) = self.observer.next_progress() else {
-            return ControlFlow::Break(());
-        };
+        match self.observer.next_event() {
+            None => return ControlFlow::Break(()),
+            Some(Observed::Progress(progress)) => self.forward_progress(progress),
+            Some(Observed::Status(status)) => {
+                self.cluster_status.send_replace(status);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Send a frame's durable count, and publish the `Sealed` status of
+    /// the transaction it relayed.
+    fn forward_progress(&self, progress: EgressProgress) {
         if let Some(position) = progress.durable {
             let _ = self.tx.send(QuorumWatermark { position });
         }
         if let Some(tx_hash) = progress.sealed {
             self.publish_sealed(tx_hash);
         }
-        ControlFlow::Continue(())
     }
 
     /// Publish one `Sealed` status. An encode failure is logged and the

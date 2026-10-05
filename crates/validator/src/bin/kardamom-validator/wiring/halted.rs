@@ -1,14 +1,18 @@
 //! The halted mode. A standing divergence verdict beside the state means
 //! the chain diverged and an operator has not yet looked. The validator
-//! then serves its metrics and the verdict, makes no progress, and waits.
-//! It leaves the mode when the operator clears the verdict, or on the
-//! shutdown signal.
+//! then raises the `validator_divergence` halt, serves its metrics, the
+//! verdict and the `/halt` record, makes no progress, and waits. The
+//! verdict file keeps the halt across a restart. The validator leaves the
+//! mode when the operator clears it, by `POST /halt/clear` or by
+//! `--clear-verdict`, or on the shutdown signal. Either clear ends both
+//! the halt and the file.
 
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use kardamom_obs::halt::{self, Halt, HaltCause};
 use kardamom_validator::verdict::VerdictFile;
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +41,11 @@ impl Halted {
         Self { file, poll }
     }
 
+    /// The halted wait over the verdict file of `boot`.
+    pub(crate) fn of(boot: &Boot) -> Self {
+        Self::new(boot.verdict_file(), VERDICT_POLL)
+    }
+
     /// Hold the process while a verdict stands. `Continue` means the
     /// turn goes on and starts the pipeline; `Break` means the shutdown
     /// signal arrived during the hold.
@@ -45,25 +54,54 @@ impl Halted {
     ///
     /// Returns an error when the verdict file cannot be read.
     pub(crate) async fn hold(boot: &Boot) -> Result<ControlFlow<()>> {
-        let halted = Self::new(boot.verdict_file(), VERDICT_POLL);
+        let halted = Self::of(boot);
         let Some(reason) = halted.file.standing().context("read the verdict file")? else {
             kardamom_validator::metrics::set_verdict_standing(false);
             return Ok(ControlFlow::Continue(()));
         };
-        kardamom_validator::metrics::set_verdict_standing(true);
         tracing::error!(
             reason = %reason,
             path = %halted.file.path().display(),
             "validator halted on a standing divergence verdict; clear it to resume"
         );
-        match halted.wait(&boot.stop).await {
-            HaltedEnd::Stopped => Ok(ControlFlow::Break(())),
+        Ok(halted.hold_on(boot, reason).await)
+    }
+
+    /// Raise the divergence halt for `reason` and wait for a clear or the
+    /// shutdown signal. A clear by either route removes the verdict and
+    /// the halt. `Continue` means the operator cleared it after the
+    /// runbook's steps, so the pipeline runs again from its cursor and
+    /// verifies the block again.
+    pub(crate) async fn hold_on(&self, boot: &Boot, reason: String) -> ControlFlow<()> {
+        kardamom_validator::metrics::set_verdict_standing(true);
+        halt::raise(Halt::new(HaltCause::ValidatorDivergence, reason));
+        let end = tokio::select! {
+            end = self.wait(&boot.stop) => end,
+            () = halt::cleared() => HaltedEnd::Cleared,
+        };
+        match end {
+            HaltedEnd::Stopped => ControlFlow::Break(()),
             HaltedEnd::Cleared => {
-                kardamom_validator::metrics::set_verdict_standing(false);
+                self.end_hold();
                 tracing::info!("divergence verdict cleared; the validator resumes from its cursor");
-                Ok(ControlFlow::Continue(()))
+                ControlFlow::Continue(())
             }
         }
+    }
+
+    /// End both records of a cleared divergence: the verdict file and the
+    /// halt. A file that cannot be removed is logged: the next start then
+    /// holds again, which is the safe side.
+    fn end_hold(&self) {
+        if let Err(e) = self.file.clear() {
+            tracing::error!(
+                error = %e,
+                path = %self.file.path().display(),
+                "the cleared divergence verdict could not be removed"
+            );
+        }
+        halt::clear();
+        kardamom_validator::metrics::set_verdict_standing(false);
     }
 
     /// Wait until the verdict is gone or `stop` cancels, whichever comes

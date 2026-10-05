@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use super::record::Topic;
 use crate::config::InterfaceSelector;
 use crate::error::LogError;
 
@@ -44,17 +45,22 @@ pub fn advertise_ip(selector: &InterfaceSelector) -> Result<Ipv4Addr, LogError> 
     }
 }
 
-/// The URI of a dynamic MDC publication with its control endpoint on
-/// `ip` and port 0, with the configured flow control when `flow_control`
-/// is not empty. The media driver binds an OS-chosen port, and
+/// The URI of a dynamic MDC publication of `topic` with its control
+/// endpoint on `ip` and port 0, with the configured flow control when
+/// `flow_control` is not empty, and with the topic's own term length when
+/// it has one. The media driver binds an OS-chosen port, and
 /// [`crate::aeron_live::AeronRuntime::open_mdc_publication`] reads it back.
 #[must_use]
-pub fn publication_uri(ip: IpAddr, flow_control: &str) -> String {
+pub fn publication_uri(ip: IpAddr, flow_control: &str, topic: Topic) -> String {
     let control = SocketAddr::new(ip, 0);
     let mut uri = format!("aeron:udp?control={control}|control-mode=dynamic");
     if !flow_control.is_empty() {
         uri.push_str("|fc=");
         uri.push_str(flow_control);
+    }
+    if let Some(term_length) = topic.term_length() {
+        uri.push_str("|term-length=");
+        uri.push_str(&term_length.to_string());
     }
     uri
 }
@@ -75,17 +81,26 @@ mod tests {
     fn uris_carry_control_mode_and_flow_control() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 56, 31));
         assert_eq!(
-            publication_uri(ip, ""),
+            publication_uri(ip, "", Topic::TxData),
             "aeron:udp?control=192.168.56.31:0|control-mode=dynamic"
         );
         assert_eq!(
-            publication_uri(ip, "min"),
+            publication_uri(ip, "min", Topic::TxData),
             "aeron:udp?control=192.168.56.31:0|control-mode=dynamic|fc=min"
         );
         let control: SocketAddr = "192.168.56.31:40300".parse().unwrap();
         assert_eq!(
             destination_uri(IpAddr::V4(Ipv4Addr::new(192, 168, 56, 41)), control),
             "aeron:udp?endpoint=192.168.56.41:0|control=192.168.56.31:40300|control-mode=dynamic"
+        );
+    }
+
+    #[test]
+    fn the_events_publication_carries_the_minimum_term_length() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 56, 31));
+        assert_eq!(
+            publication_uri(ip, "min", Topic::ServiceEvents),
+            "aeron:udp?control=192.168.56.31:0|control-mode=dynamic|fc=min|term-length=65536"
         );
     }
 

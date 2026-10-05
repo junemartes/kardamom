@@ -36,7 +36,7 @@ use kardamom_engine::{
     MdbxWriterSignal, Outbound, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
-use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
@@ -394,6 +394,13 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
 
     let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, args).await?;
+    // This replica's lifecycle on the `events` stream: the ingress pauses
+    // submits once every executor is halted.
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(&rt_pub)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
 
     let WriterAdapters {
         mut writer,

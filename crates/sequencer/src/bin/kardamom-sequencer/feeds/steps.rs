@@ -8,6 +8,7 @@ use std::ops::ControlFlow;
 
 use kardamom_cache::QueryError;
 use kardamom_sequencer::metrics as seq_metrics;
+use kardamom_sequencer::resync::SealerRefusal;
 
 use super::{EgressWatermarkFeed, NonceLookupFeed};
 
@@ -15,21 +16,12 @@ impl EgressWatermarkFeed {
     /// Forward one contiguity reject to the publish loop's reject
     /// channel. Drops it, with a warning, only when the channel is full:
     /// the confirm-timeout sweep still recovers a dropped reject, later.
-    /// Forward one past-deadline reject to the publish loop. A full
-    /// channel means the loop has stalled far past the horizon already,
-    /// and every ref in flight is late: dropping is safe, because the
+    /// Forward one terminal refusal to the publish loop. A full channel
+    /// means the loop has stalled far past the horizon already, and
+    /// every ref in flight is refused: dropping is safe, because the
     /// confirm-timeout sweep still clears the ledger.
-    pub(super) fn forward_past_deadline(
-        &self,
-        sender: Address,
-        nonce: u64,
-        max_inclusion_block: u64,
-        at_block: u64,
-    ) {
-        match self
-            .deadline_tx
-            .try_send((sender, nonce, max_inclusion_block, at_block))
-        {
+    pub(super) fn forward_refusal(&self, refusal: SealerRefusal) {
+        match self.deadline_tx.try_send(refusal) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 tracing::warn!(

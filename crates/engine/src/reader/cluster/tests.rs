@@ -206,3 +206,42 @@ fn malformed_frame_is_skipped_not_fatal() {
     let (_pos, msg) = sub.next().unwrap();
     assert!(matches!(msg, TxOrderingMessage::BoundaryStart(_)));
 }
+
+/// The batcher's cursor is one system record on the session's ingress:
+/// kind 7, then the posted head. The sealer reads it by fixed offsets.
+#[test]
+fn the_posted_cursor_publisher_offers_the_kind_7_record() {
+    use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
+
+    let ingress = FakeIngress::new();
+    let sub = ClusterTxOrderingSubscription::new(FakeEgress::new()).with_ingress(ingress.clone());
+    let mut publisher = sub.posted_cursor_publisher();
+    assert_eq!(publisher.publish(0x0102), OfferOutcome::Accepted);
+    assert_eq!(
+        ingress.accepted(),
+        vec![vec![7u8, 0x02, 0x01, 0, 0, 0, 0, 0, 0]],
+        "kind 7, then the head as u64 LE"
+    );
+    ingress.set_outcome(OfferOutcome::NotConnected);
+    assert_eq!(publisher.publish(3), OfferOutcome::NotConnected);
+}
+
+/// The status and the DA-lag reject are not records of the ordering: a
+/// consumer skips them and delivers the stream around them.
+#[test]
+fn status_and_da_lag_frames_are_skipped() {
+    use kardamom_cluster_adapter::wire::{encode_da_lag_reject, encode_status};
+
+    let egress = FakeEgress::new();
+    egress.push(encode_status(&kardamom_types::ClusterStatus::default()));
+    egress.push(encode_da_lag_reject(
+        alloy_primitives::Address::ZERO,
+        0,
+        &kardamom_types::ClusterStatus::default(),
+    ));
+    egress.push(encode_egress_record(0, &relayed_txref(0, 1)).unwrap());
+    egress.push(encode_egress_boundary(1, 1, 250, 0));
+    let mut sub = ClusterTxOrderingSubscription::new(egress);
+    assert_eq!(label(sub.next().unwrap()), "r0");
+    assert_eq!(label(sub.next().unwrap()), "b1");
+}

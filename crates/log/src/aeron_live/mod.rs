@@ -42,8 +42,9 @@
 //!   receipts plus slim boundaries (not recorded). The executor
 //!   publishes; the ingress, sequencers, and validators subscribe.
 //! - `TxErrors`, `TxStatus`, `TxDeposits`, `TxRemoteEpochs`,
-//!   `FsyncWatermark` publisher/subscriber pairs: one stream each (see
-//!   `handles::simple`).
+//!   `ServiceEvents`, `FsyncWatermark` publisher/subscriber pairs: one
+//!   stream each (see `handles::simple`). The `ServiceEvents` pair also
+//!   spawns the beacon and the board of `kardamom_obs::events`.
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
@@ -69,10 +70,10 @@ mod runtime;
 mod thread;
 
 pub use handles::simple::{
-    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, TxDepositsPublisherHandle,
-    TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
-    TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
-    TxStatusSubscriberHandle,
+    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, ServiceEventsPublisherHandle,
+    ServiceEventsSubscriberHandle, TxDepositsPublisherHandle, TxDepositsSubscriberHandle,
+    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{

@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod store;
 
 use alloy_primitives::{B256, Bytes};
+use kardamom_obs::halt::{Halt, HaltCause};
 use serde::{Deserialize, Serialize};
 
 /// One posted batch, as the indexer keeps it: the `BatchPosted` event's
@@ -61,7 +62,9 @@ pub struct Cursor {
     pub last_batch: Option<u64>,
 }
 
-/// Errors of the indexer.
+/// Errors of the indexer. A chain break and an L1 source that does not
+/// answer put the follower in a halt (see [`IndexerError::halt`]); every
+/// other error is a failed tick that the next tick retries.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
     #[error("L1 source: {0}")]
@@ -88,4 +91,23 @@ pub enum IndexerError {
     Batcher(#[from] kardamom_batcher::error::BatcherError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl IndexerError {
+    /// The halt this error puts the follower in: `l1_chain_break` for a
+    /// block that does not descend from the indexed one, `l1_unreachable`
+    /// for a provider that does not answer, and the halt of an L1 read
+    /// that failed ([`kardamom_da_watcher::L1SourceError::halt_cause`]).
+    /// `None` for every other error. Every one of these halts clears by
+    /// itself: the follower retries the same range on every tick.
+    #[must_use]
+    pub fn halt(&self) -> Option<Halt> {
+        let cause = match self {
+            Self::ChainBreak { .. } => Some(HaltCause::L1ChainBreak),
+            Self::Source(e) => e.halt_cause(),
+            Self::Provider(_) => Some(HaltCause::L1Unreachable),
+            _ => None,
+        };
+        cause.map(|cause| Halt::new(cause, self.to_string()))
+    }
 }

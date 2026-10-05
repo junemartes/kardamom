@@ -121,7 +121,7 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<PubHandle, LogError> {
-        let uri = publication_uri(IpAddr::V4(self.ip), &self.cfg.flow_control);
+        let uri = publication_uri(IpAddr::V4(self.ip), &self.cfg.flow_control, key.topic);
         let (publication, control) = rt.open_mdc_publication(&uri, key.stream_id)?;
         let record = PublisherRecord {
             id: self.instance.service_id(key.topic, key.stream_id),

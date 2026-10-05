@@ -145,12 +145,15 @@ impl Written {
                 let attester::SpawnedAttester {
                     handle,
                     task: _task,
-                } = attester::spawn_attester(&AttesterConfig {
-                    l1_rpc_url,
-                    oracle,
-                    signer: key.into_signer(),
-                    post_interval_blocks: args.attester_post_interval.get(),
-                });
+                } = attester::spawn_attester(
+                    &AttesterConfig {
+                        l1_rpc_url,
+                        oracle,
+                        signer: key.into_signer(),
+                        post_interval_blocks: args.attester_post_interval.get(),
+                    },
+                    self.streamed.opened.base.attester.clone(),
+                );
                 tracing::info!(
                     oracle = %oracle,
                     post_interval_blocks = args.attester_post_interval.get().get(),
