@@ -1,6 +1,6 @@
 # Rejoin the pipeline from a state rebuilt from L1
 
-Status: executor half and deposits built. Sealer half: designed, not built.
+Status: executor half, sealer half and deposits built.
 
 ## 1. Problem
 
@@ -162,3 +162,7 @@ does not pass the flag.
   checkpoints, the harness rebuilds an executor image from L1 on the host, installs it on
   each node, and the executors resume from it with no checkpoint restore; the recovery
   probe and the end-of-shard persisted-state audit then prove the result.
+- Chaos, `sealer-fleet-total-wipe-recover`: all three sealer members lose their
+  directories. The members start from the seed at the posted head, the executors and the
+  validator resume on the rebuilt state at `(E_H, H + 1)`, an executor that keeps the old
+  chain gets `REPLAY_AHEAD`, and the da-watcher resumes after the seed's L1 origin.

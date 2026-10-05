@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
-use super::rebuild::{Rebuild, Target};
+use super::rebuild::{Output, Rebuild, Target};
 
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
@@ -104,7 +104,8 @@ impl<'a> StateAudit<'a> {
             harness: self.harness,
             evidence: directory,
             target,
-            executor_image: false,
+            output: Output::Check,
+            sealer_seed: None,
         })
     }
 

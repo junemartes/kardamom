@@ -30,7 +30,7 @@ impl SavedJob {
             .send()
             .await?
             .error_for_status()
-            .context("stop job for state audit")?;
+            .with_context(|| format!("stop job {}", self.id))?;
         let outcome = poll::until(Budget::secs(120, 2), |_| async {
             let allocs = self.nomad.allocations(&self.id).await?;
             Ok(allocs
@@ -43,15 +43,28 @@ impl SavedJob {
         Ok(())
     }
 
+    /// The definition Nomad held at the capture.
+    pub(crate) fn definition(&self) -> &Value {
+        &self.definition
+    }
+
+    /// Register the saved definition again, and wait until its
+    /// allocations run.
     pub(crate) async fn restore(&self) -> anyhow::Result<()> {
+        self.register(&self.definition).await
+    }
+
+    /// Register `definition` under the saved job's id, and wait until the
+    /// allocations of that version run.
+    pub(crate) async fn register(&self, definition: &Value) -> anyhow::Result<()> {
         self.nomad
             .http
             .post(self.nomad.url("/v1/jobs"))
-            .json(&serde_json::json!({"Job": self.definition}))
+            .json(&serde_json::json!({"Job": definition}))
             .send()
             .await?
             .error_for_status()
-            .context("restore job after state audit")?;
+            .with_context(|| format!("register job {}", self.id))?;
         let desired = self.nomad.job(&self.id).await?;
         let outcome = poll::until(Budget::secs(180, 3), |_| async {
             Ok(desired
@@ -59,8 +72,13 @@ impl SavedJob {
                 .map(|_| ()))
         })
         .await?;
-        outcome
-            .or_fail(|_| anyhow::anyhow!("job {} did not recover after state audit", self.id))?;
+        outcome.or_fail(|_| {
+            anyhow::anyhow!(
+                "job {} version {} did not run after its registration",
+                self.id,
+                desired.version
+            )
+        })?;
         Ok(())
     }
 }

@@ -139,6 +139,45 @@ impl Nomad {
         format!("{}{path}", self.base)
     }
 
+    /// Write the variable at `path` with `items`, as `nomad var put`
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Nomad refuses the write.
+    pub(crate) async fn put_variable(
+        &self,
+        path: &str,
+        items: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let url = self.url(&format!("/v1/var/{path}"));
+        self.http
+            .put(&url)
+            .json(&serde_json::json!({ "Path": path, "Items": items }))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .with_context(|| format!("PUT {url}"))?;
+        Ok(())
+    }
+
+    /// Delete the variable at `path`, as `nomad var purge` does. A
+    /// variable that does not exist is deleted already.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Nomad refuses the delete.
+    pub(crate) async fn delete_variable(&self, path: &str) -> anyhow::Result<()> {
+        let url = self.url(&format!("/v1/var/{path}"));
+        self.http
+            .delete(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .with_context(|| format!("DELETE {url}"))?;
+        Ok(())
+    }
+
     /// Every allocation of `job`, in any client status.
     ///
     /// # Errors

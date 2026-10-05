@@ -86,15 +86,16 @@ The genesis is `deploy/cluster/config/genesis/dev.toml`. With
 
 Run the rebuild twice into two new directories. The first run writes the
 executor image and the sealer seed. The second run keeps the trie, which the
-validator needs. Pass `--lockbox "$LOCKBOX"` where the tool has the flag: on a
-chain with deposits, the root is wrong without it.
+validator needs. `--lockbox` derives the L1 deposits into the rebuilt state:
+on a chain with deposits, the root is wrong without it.
 
 ```sh
 kardamom-reconstruct --l1-rpc "$L1_RPC" --settlement "$SETTLEMENT" --da-proxy "$DA_PROXY" \
-  --chain genesis.toml --through-block "$H" --state-dir executor-image \
-  --executor-image --sealer-seed seed.bin
+  --chain genesis.toml --lockbox "$LOCKBOX" --through-block "$H" \
+  --state-dir executor-image --executor-image --sealer-seed seed.bin
 kardamom-reconstruct --l1-rpc "$L1_RPC" --settlement "$SETTLEMENT" --da-proxy "$DA_PROXY" \
-  --chain genesis.toml --through-block "$H" --state-dir validator-db
+  --chain genesis.toml --lockbox "$LOCKBOX" --through-block "$H" \
+  --state-dir validator-db
 ```
 
 Check both report lines (`reconstructed head=...`):
@@ -164,15 +165,16 @@ restores one of its checkpoints, skips the records of the new chain.
    done
    ```
 
-2. Give every member the seed. A seed carries no remote-origin anchor, so a
-   seeded member runs with interop off: its allowlist must be empty.
+2. Give every member the seed. The cluster job mounts `/opt/kardamom/seed` and
+   passes `-Dkardamom.cluster.seedSnapshot`, empty in a normal deploy. A seed
+   carries no remote-origin anchor, so a seeded member runs with interop off:
+   its allowlist must be empty. The job's variable `cluster_seed_snapshot`
+   does both; on the saved job, `jq` does the same:
 
    ```sh
-   jq '.Job.TaskGroups[].Tasks[] |= (
-         .Config.volumes += ["/opt/kardamom/seed:/opt/kardamom/seed:ro"]
-         | .Env.JAVA_TOOL_OPTIONS |= (
-             gsub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins=")
-             + " -Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin"))' \
+   jq '.Job.TaskGroups[].Tasks[].Env.JAVA_TOOL_OPTIONS |= (
+         sub("-Dkardamom.cluster.seedSnapshot=[^ ]*"; "-Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin")
+         | sub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins="))' \
      cluster.json > cluster-seeded.json
    ```
 

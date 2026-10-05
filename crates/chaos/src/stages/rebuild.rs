@@ -68,10 +68,47 @@ impl Rebuilt {
     /// The `end_tx_idx=` field of the report: the rebuilt resume cursor.
     /// `None` when the payload of the last block carried none.
     pub(crate) fn end_tx_idx(&self) -> Option<u64> {
+        self.field("end_tx_idx=")
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// The `state_root=` field of the report.
+    pub(crate) fn state_root(&self) -> Option<&str> {
+        self.field("state_root=")
+    }
+
+    /// The value of the report field that starts with `name`.
+    fn field(&self, name: &str) -> Option<&str> {
         self.report
             .split_whitespace()
-            .find_map(|field| field.strip_prefix("end_tx_idx="))
-            .and_then(|value| value.parse().ok())
+            .find_map(|field| field.strip_prefix(name))
+    }
+}
+
+/// What a rebuild leaves in its state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// A parity check: this host reads the state after the tool exits and
+    /// then discards it, so the per-block fdatasync buys nothing. On a CI
+    /// disk it turned a one-minute rebuild into nine.
+    Check,
+    /// The image an executor resumes on: the tool removes the trie, the
+    /// hashed mirror and the stored root after its checks. The image
+    /// outlives the tool, so it keeps every sync.
+    ExecutorImage,
+    /// A state that keeps the trie, which a validator resumes on. It
+    /// outlives the tool, so it keeps every sync.
+    ValidatorState,
+}
+
+impl Output {
+    /// The tool's flag for this output, if it has one.
+    fn flag(&self) -> Option<&'static str> {
+        match self {
+            Self::Check => Some("--no-sync"),
+            Self::ExecutorImage => Some("--executor-image"),
+            Self::ValidatorState => None,
+        }
     }
 }
 
@@ -86,9 +123,10 @@ pub(crate) struct Rebuild<'a> {
     /// under it.
     pub(crate) evidence: PathBuf,
     pub(crate) target: Target,
-    /// Write the image an executor resumes on: the tool removes the
-    /// trie, the hashed mirror and the stored root after its checks.
-    pub(crate) executor_image: bool,
+    pub(crate) output: Output,
+    /// Where the tool writes the seed a wiped sealer cluster starts
+    /// from, when the caller wants one.
+    pub(crate) sealer_seed: Option<PathBuf>,
 }
 
 impl Rebuild<'_> {
@@ -231,18 +269,14 @@ impl Rebuild<'_> {
             .target
             .root
             .map(|root| vec!["--expect-root".to_string(), format!("{root:#x}")]);
-        // A parity check reads the result on this host after the tool
-        // exits and then discards it, so the per-block fdatasync buys
-        // nothing, and on a CI disk it turned a one-minute rebuild into
-        // nine. An executor image is installed on the executors and
-        // outlives the tool, so it keeps every sync.
-        let mode = if self.executor_image {
-            "--executor-image"
-        } else {
-            "--no-sync"
-        };
-        root.into_iter()
-            .chain(std::iter::once(vec![mode.to_string()]))
+        let output = self.output.flag().map(|flag| vec![flag.to_string()]);
+        let seed = self
+            .sealer_seed
+            .as_ref()
+            .map(|path| vec!["--sealer-seed".to_string(), path.display().to_string()]);
+        [root, output, seed]
+            .into_iter()
+            .flatten()
             .flatten()
             .collect()
     }

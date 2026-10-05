@@ -160,7 +160,7 @@ with three distinct, tested modes:
   the backlog drains.
   What this does not cover: all three members *wiped*. No in-cluster copy
   is left; the members start from a seed rebuilt from L1 (the sealer fleet
-  rebuild below).
+  rebuild below, `sealer-fleet-total-wipe-recover`).
 
 - **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
   persistence; the executors' state is the truth. The whole redis job
@@ -723,8 +723,28 @@ or below the sealer's origin; the sealer drops each one as a regression.
 The validator resumes on a rebuilt state that keeps the trie, with no step of
 its own. Its cursor comes from the same meta keys as an executor's, and its
 verify floor is H. It needs no other file: the prover spool, the claims and
-the epoch verifier start empty. No test starts a validator on a rebuilt state
-yet, so this rests on the code path alone.
+the epoch verifier start empty.
+
+**The chaos case** `sealer-fleet-total-wipe-recover` (the fleet shard, last)
+proves the procedure end to end. It stops the ingresses, lets the batcher
+post everything, stops the batcher, and mines L1 blocks until one more epoch
+seals: the blocks after H then hold epochs and no transaction, so the revert
+takes no receipt from the load. Then it stops every job, rebuilds the state
+at H twice (the executor image with the seed, and the validator's state),
+and wipes every copy of the old chain. One executor keeps its old state on
+purpose. The assertions:
+
+- all three members log `sealer state SEEDED` at H and E_H, none logs
+  `FRESH`, all confirm the seed and take the first snapshot; started again
+  without the seed property, all restore the snapshot;
+- the sealer serves the fresh executors from `(E_H, H + 1)`, and answers the
+  stale executor with `REPLAY_AHEAD`; no executor restores or fetches a
+  checkpoint;
+- the validator commits past H on its rebuilt state;
+- the da-watcher's first ticks publish every finalized L1 block after M;
+- the batcher posts again, and L1's record stays contiguous from H;
+- the recovery probe passes, and the end-of-shard audit compares the
+  executors with the validator and rebuilds the head from L1.
 
 The output attester is not deployed. It posts a root for every block the
 validator commits, not only for posted blocks, so where it runs, L1 can hold

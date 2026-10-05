@@ -165,7 +165,9 @@ jobs:
         # now the deploy uses the clustered sealer — see "Configure shard").
         # chaos-fleet takes every replica of one role down at once: the sealer
         # quorum, the whole sealer set, the whole executor set, with and
-        # without their state databases, and the whole redis job.
+        # without their state databases, and the whole redis job. Its last
+        # case wipes the whole sealer set and restarts the chain from a seed
+        # rebuilt from L1.
         # chaos-coordinated crosses the redundancy of a role: both ingresses,
         # and both replicas of a sequencer lane.
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the

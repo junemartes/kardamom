@@ -138,6 +138,19 @@ impl L1 {
         quantity(&self.rpc("eth_blockNumber", json!([])).await?)
     }
 
+    /// Mine `blocks` L1 blocks. Anvil mines a block only for a
+    /// transaction, so while nothing posts, the finalized tip stands
+    /// still and the da-watcher publishes no epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if anvil refuses.
+    pub async fn mine(&self, blocks: u64) -> anyhow::Result<()> {
+        self.rpc("anvil_mine", json!([format!("{blocks:#x}")]))
+            .await
+            .map(|_| ())
+    }
+
     /// The contract's `lastBatchIndex`.
     ///
     /// # Errors
