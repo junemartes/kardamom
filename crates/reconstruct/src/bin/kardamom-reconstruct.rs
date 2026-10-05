@@ -187,6 +187,7 @@ impl SeedRequest<'_> {
             path = %self.path.display(),
             block = seed.block,
             end_tx_idx = seed.end_tx_idx,
+            l1_origin = seed.l1_origin,
             senders = seed.senders.len(),
             "sealer seed written"
         );

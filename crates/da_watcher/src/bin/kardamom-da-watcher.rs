@@ -32,7 +32,7 @@ use clap::Parser;
 use kardamom_da_watcher::interop::{
     CursorFile, CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
-use kardamom_da_watcher::{DaWatcherConfig, L1Endpoints};
+use kardamom_da_watcher::{DaWatcherConfig, L1Endpoints, L1ResumeAfter};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsPublisherHandle,
     TxRemoteEpochsPublisherHandle,
@@ -72,6 +72,13 @@ struct Args {
     /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
     #[arg(long)]
     lockbox: Option<String>,
+    /// The last L1 block whose epoch the chain holds: the L1 origin of
+    /// the head that a sealer cluster was seeded at. The first tick then
+    /// publishes every finalized block after it. Without the flag, the
+    /// watcher starts at the finalized tip and skips the blocks before
+    /// it, so a restart after a seed would lose their deposits.
+    #[arg(long, requires = "l1_rpc")]
+    l1_resume_after: Option<L1ResumeAfter>,
     /// Polling cadence in seconds (default 12). Must be nonzero: 0 reaches
     /// `tokio::time::interval`, which panics on a zero period.
     #[arg(long, default_value = "12")]
@@ -247,6 +254,7 @@ impl Args {
                     cfg: DaWatcherConfig {
                         lockbox,
                         poll_interval: Duration::from_secs(self.poll_interval_secs.get()),
+                        resume_after: self.l1_resume_after,
                     },
                 }))
             }
