@@ -14,12 +14,14 @@
 //! on every tick, and resumes by itself when the source serves a block
 //! that descends from the indexed one. An L1 source that does not
 //! answer halts it the same way (`l1_unreachable`).
+//!
+//! Every L1 read, the `BatchPosted` logs included, goes through the
+//! [`L1Source`], so a source set cross-checks it between endpoints.
 
 use std::num::NonZeroU64;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
-use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, Log};
 use alloy_sol_types::SolEvent;
 use kardamom_batcher::da::DaProxy;
@@ -51,18 +53,16 @@ pub struct FollowConfig {
 }
 
 /// The pieces a [`Follower`] is built from.
-pub struct FollowerParts<S, P> {
+pub struct FollowerParts<S> {
     pub source: S,
-    pub provider: P,
     pub da: DaProxy,
     pub store: Store,
     pub cfg: FollowConfig,
 }
 
 /// The follower.
-pub struct Follower<S, P> {
+pub struct Follower<S> {
     source: S,
-    provider: P,
     da: DaProxy,
     store: Store,
     cfg: FollowConfig,
@@ -100,16 +100,15 @@ impl BatchEntry {
     }
 }
 
-impl<S: L1Source, P: Provider> Follower<S, P> {
+impl<S: L1Source> Follower<S> {
     /// Build a follower on an opened store; resume from its cursor.
     ///
     /// # Errors
     /// Returns an error when the cursor does not parse.
-    pub fn open(parts: FollowerParts<S, P>) -> Result<Self, IndexerError> {
+    pub fn open(parts: FollowerParts<S>) -> Result<Self, IndexerError> {
         let cursor = parts.store.cursor()?;
         Ok(Self {
             source: parts.source,
-            provider: parts.provider,
             da: parts.da,
             store: parts.store,
             cfg: parts.cfg,
@@ -207,9 +206,7 @@ impl<S: L1Source, P: Provider> Follower<S, P> {
             .event_signature(IKardamomL2Settlement::BatchPosted::SIGNATURE_HASH)
             .from_block(from)
             .to_block(to);
-        let logs = self.provider.get_logs(&filter).await.map_err(|e| {
-            IndexerError::Provider(format!("get_logs BatchPosted [{from}, {to}]: {e}"))
-        })?;
+        let logs = self.source.logs(&filter).await?;
         logs.iter().map(BatchEntry::from_log).collect()
     }
 

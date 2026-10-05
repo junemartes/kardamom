@@ -110,21 +110,18 @@ pub enum MonitorError {
 
 impl MonitorError {
     /// The halt this error puts the watcher in: `l1_chain_break` for a
-    /// block that does not descend from the published one,
-    /// `l1_unreachable` for an L1 source that does not answer. `None` for
-    /// every other error. Both halts clear by themselves: the watcher
-    /// retries the same range on every tick.
+    /// block that does not descend from the published one, and the halt
+    /// of an L1 read that failed ([`L1SourceError::halt_cause`]). `None`
+    /// for every other error. Every one of these halts clears by itself:
+    /// the watcher retries the same range on every tick.
     #[must_use]
     pub fn halt(&self) -> Option<Halt> {
-        match self {
-            Self::ChainBreak { .. } => Some(Halt::new(HaltCause::L1ChainBreak, self.to_string())),
-            Self::Tip(L1SourceError::Provider(_))
-            | Self::Logs(L1SourceError::Provider(_))
-            | Self::BlockHash(L1SourceError::Provider(_)) => {
-                Some(Halt::new(HaltCause::L1Unreachable, self.to_string()))
-            }
+        let cause = match self {
+            Self::ChainBreak { .. } => Some(HaltCause::L1ChainBreak),
+            Self::Tip(e) | Self::Logs(e) | Self::BlockHash(e) => e.halt_cause(),
             _ => None,
-        }
+        };
+        cause.map(|cause| Halt::new(cause, self.to_string()))
     }
 }
 

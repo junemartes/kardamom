@@ -96,17 +96,18 @@ pub enum IndexerError {
 impl IndexerError {
     /// The halt this error puts the follower in: `l1_chain_break` for a
     /// block that does not descend from the indexed one, `l1_unreachable`
-    /// for an L1 source that does not answer. `None` for every other
-    /// error. Both halts clear by themselves: the follower retries the
-    /// same range on every tick.
+    /// for a provider that does not answer, and the halt of an L1 read
+    /// that failed ([`kardamom_da_watcher::L1SourceError::halt_cause`]).
+    /// `None` for every other error. Every one of these halts clears by
+    /// itself: the follower retries the same range on every tick.
     #[must_use]
     pub fn halt(&self) -> Option<Halt> {
-        match self {
-            Self::ChainBreak { .. } => Some(Halt::new(HaltCause::L1ChainBreak, self.to_string())),
-            Self::Source(kardamom_da_watcher::L1SourceError::Provider(_)) | Self::Provider(_) => {
-                Some(Halt::new(HaltCause::L1Unreachable, self.to_string()))
-            }
+        let cause = match self {
+            Self::ChainBreak { .. } => Some(HaltCause::L1ChainBreak),
+            Self::Source(e) => e.halt_cause(),
+            Self::Provider(_) => Some(HaltCause::L1Unreachable),
             _ => None,
-        }
+        };
+        cause.map(|cause| Halt::new(cause, self.to_string()))
     }
 }

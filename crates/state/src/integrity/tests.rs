@@ -10,6 +10,25 @@ use crate::writer::{StateWriter, TrieMode, WriteBatch};
 /// Build a small 2-block chain, with receipts, through the trie-aware
 /// writer into `dir`. Seed it with a genesis account.
 fn build_db(dir: &std::path::Path) {
+    build_db_with(dir, [WriteBatch::new, WriteBatch::new]);
+}
+
+/// How a fixture writes one block: the receipt's hash and position go to
+/// a reference when the writer keeps one.
+type BlockWrite = fn(BlockBoundary, BlockDelta) -> WriteBatch;
+
+/// The block written with its reference on an archive.
+fn with_ref(boundary: BlockBoundary, delta: BlockDelta) -> WriteBatch {
+    let refs = delta
+        .receipts
+        .iter()
+        .map(|r| kardamom_types::TxRef::new(r.tx_hash, 0, r.tx_idx, -9))
+        .collect();
+    WriteBatch::with_refs(boundary, delta, refs)
+}
+
+/// [`build_db`] with block `n` written by `writes[n - 1]`.
+fn build_db_with(dir: &std::path::Path, writes: [BlockWrite; 2]) {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
         .open()
@@ -22,7 +41,7 @@ fn build_db(dir: &std::path::Path) {
     }];
     crate::genesis::seed_genesis(&env, &genesis_accounts, &[]).unwrap();
     let mut handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
-    for block in 1..=2u64 {
+    for (block, write) in (1..=2u64).zip(writes) {
         let receipt = Receipt {
             tx_idx: BPosition::from_index(block),
             tx_hash: B256::from(U256::from(0x00BE_EF00 + block)),
@@ -51,10 +70,7 @@ fn build_db(dir: &std::path::Path) {
             base_fee: 0,
             gas_used: 0,
         };
-        handle
-            .delta_tx
-            .send(WriteBatch::new(boundary, delta))
-            .unwrap();
+        handle.delta_tx.send(write(boundary, delta)).unwrap();
     }
     handle.shutdown().unwrap();
 }
@@ -243,6 +259,40 @@ fn a_bounded_compare_tolerates_one_empty_tail_block_only() {
         diffs
             .iter()
             .any(|d| d.starts_with("receipts: extra key in b")),
+        "{diffs:?}"
+    );
+}
+
+/// A node that rebuilt a block from L1 keeps no archive reference for its
+/// transactions. The deep compare accepts that row against a peer's row
+/// with a reference at the same position. A row without a reference past
+/// the rebuilt mark is still a difference.
+#[test]
+fn a_rebuilt_row_matches_a_referenced_row_only_up_to_the_mark() {
+    let live = tempfile::tempdir().unwrap();
+    let rebuilt = tempfile::tempdir().unwrap();
+    let unmarked = tempfile::tempdir().unwrap();
+    build_db_with(live.path(), [with_ref, with_ref]);
+    build_db_with(rebuilt.path(), [WriteBatch::rebuilt_from_l1, with_ref]);
+    build_db_with(
+        unmarked.path(),
+        [WriteBatch::rebuilt_from_l1, WriteBatch::new],
+    );
+    let live = open(live.path());
+    assert!(
+        deep_compare(&open(rebuilt.path()), &live)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        deep_compare(&live, &open(rebuilt.path()))
+            .unwrap()
+            .is_empty()
+    );
+    let diffs = deep_compare(&open(unmarked.path()), &live).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert!(
+        diffs[0].starts_with("tx_hash_index[") && diffs[0].contains("(8 vs 21 bytes)"),
         "{diffs:?}"
     );
 }

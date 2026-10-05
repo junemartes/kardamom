@@ -34,7 +34,7 @@ use kardamom_types::{
     SnapshotSource, TxEnvelope,
 };
 
-use crate::actor::{StateWriterQueue, StateWriterSignal};
+use crate::actor::StateWriterSignal;
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
@@ -449,7 +449,7 @@ impl<'a> Replay<'a> {
             gas_used,
         };
         self.fees = self.fees.next(gas_used);
-        self.queue.submit(boundary, block_delta)?;
+        self.queue.submit_rebuilt(boundary, block_delta)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
         self.counters.head_end_tx_idx = block.canonical_end.map(|end| end.end_tx_idx);

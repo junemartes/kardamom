@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use kardamom_types::xchain::XChainMessage;
-use kardamom_types::{BPosition, Deposit, SnapshotSource, TxEnvelope};
+use kardamom_types::{BPosition, Deposit, SnapshotSource, TxEnvelope, TxRef};
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
@@ -128,6 +128,7 @@ impl<W: ExecPorts> ExecState<W> {
         &mut self,
         envelope: TxEnvelope,
         position: BPosition,
+        tx_ref: TxRef,
     ) -> Result<Flow, ExecutorError> {
         let tx_idx = self.next_idx()?;
         // One check point for both execution modes. The code checks this at
@@ -139,6 +140,7 @@ impl<W: ExecPorts> ExecState<W> {
             tracing::error!(block = self.cursor.block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
             return Err(e);
         }
+        self.block.refs.push(tx_ref);
         if self.hooks.block_exec.is_some() {
             // Whole-block strategy: defer to the boundary, so batches can
             // execute concurrently.

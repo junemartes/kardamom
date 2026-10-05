@@ -55,6 +55,15 @@ variable "lockbox_address" {
   default     = ""
 }
 
+# The query endpoint (group_vars/all.yml, ports.validator_query): the
+# committed nonce, balance and receipt, and a block's transaction
+# references, which the batcher reads when the sealer no longer retains
+# the block.
+variable "query_port" {
+  type    = number
+  default = 9025
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -163,6 +172,11 @@ job "validator" {
       port "metrics" {
         static = 9006
       }
+      # The query endpoint, as a Consul service: the batcher reads block
+      # references from it by the service record.
+      port "query" {
+        static = var.query_port
+      }
       # The cluster egress (response) port, unique per allocation. A
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
@@ -223,6 +237,10 @@ job "validator" {
           # persistent mount, never the executor's /opt/kardamom/state
           # root. This is a separate mdbx environment.
           "--state-dir", "/opt/kardamom/state/validator",
+          # The query endpoint: a block's transaction references, next
+          # to the executors'. The validator keeps, with every receipt,
+          # where the transaction's bytes are on the tx_data archives.
+          "--nonce-query-addr", "${meta.node_ip}:${var.query_port}",
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope, it
           # replays in-band from the durability archives listed in
@@ -305,6 +323,12 @@ job "validator" {
           interval = "10s"
           timeout  = "2s"
         }
+      }
+
+      service {
+        name     = "kardamom-validator-query"
+        port     = "query"
+        provider = "consul"
       }
 
       resources {

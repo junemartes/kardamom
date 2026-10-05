@@ -83,6 +83,13 @@ pub(crate) struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     pub(crate) state_durability: StateDurabilityArg,
+    /// Serve read-only state queries on this address: the committed
+    /// nonce, balance and receipt, and a block's transaction references
+    /// (`kardamom_getBlockRefs`) the batcher reads when the sealer no
+    /// longer retains the block. The same endpoint as the executor's flag
+    /// of this name. Off when unset.
+    #[arg(long, env = "KARDAMOM_NONCE_QUERY_ADDR")]
+    pub(crate) nonce_query_addr: Option<std::net::SocketAddr>,
     /// Local checkpoint staging dir for the replay-unavailable fallback.
     /// Peer checkpoints are fetched here and adopted on the next start.
     /// The validator never creates checkpoints, since its state is

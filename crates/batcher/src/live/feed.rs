@@ -7,6 +7,7 @@ use alloy_provider::Provider;
 use anyhow::{Context, Result, bail};
 use metrics::{counter, gauge};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 use kardamom_engine::reader::ReaderToExec;
 use kardamom_types::BlockBoundaryStart;
@@ -18,7 +19,6 @@ use crate::error::BatcherError;
 use kardamom_types::xchain::remote_epoch_wire_bytes;
 
 use super::cursor::BatchCursor;
-use super::posted_cursor::PostedCursor;
 use super::spool::{Restored, Spool};
 
 /// How often the group's timers are checked when no record arrives.
@@ -120,9 +120,10 @@ impl PendingGroup {
 /// [`LiveSender`]. The reader thread feeds it over a bounded tokio channel,
 /// until that channel closes or a post fails and stops the loop. This is
 /// crash-only: there is no graceful drain. The cursor is at-least-once, and
-/// a restart re-observes records.
+/// a restart re-observes records. The loop outlives one reader stack: a
+/// refused replay ends the stack, the store fills the gap into the
+/// group, and the loop runs on the next stack's channel.
 pub(crate) struct FeedLoop<P> {
-    rx: Receiver<ReaderToExec>,
     sender: LiveSender<P>,
     cfg: FeedConfig,
     pack_cfg: BatcherConfig,
@@ -130,8 +131,10 @@ pub(crate) struct FeedLoop<P> {
     pending: Option<PendingGroup>,
     /// The consumed, unposted blocks on disk (`super::spool`).
     spool: Spool,
-    /// The cursor the sealer and the ingress learn after every post.
-    cursor: PostedCursor,
+    /// The last L2 block posted to L1. Each reader stack publishes it to
+    /// the sealer and the ingress (`super::posted_cursor`); the loop
+    /// outlives a stack, so it owns the value, not the publisher.
+    posted: watch::Sender<u64>,
 }
 
 impl PendingGroup {
@@ -167,12 +170,11 @@ impl<P: Provider> FeedLoop<P> {
     /// A loop whose pending group starts as `restored`, the spool's
     /// content; the reader resumes just past it (see `run`).
     pub(crate) fn new(
-        rx: Receiver<ReaderToExec>,
         sender: LiveSender<P>,
         cfg: FeedConfig,
         spool: Spool,
         restored: Restored,
-        cursor: PostedCursor,
+        posted_head: u64,
     ) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
@@ -189,27 +191,66 @@ impl<P: Provider> FeedLoop<P> {
             );
         }
         Self {
-            rx,
             sender,
             cfg,
             pack_cfg,
             acc: BatchAccumulator::new(),
             pending,
             spool,
-            cursor,
+            posted: watch::Sender::new(posted_head),
         }
     }
 
-    /// Run until the channel closes or a post fails after its retry budget.
+    /// The posted head, for the reader stack's publisher.
+    pub(crate) fn posted(&self) -> watch::Receiver<u64> {
+        self.posted.subscribe()
+    }
+
+    /// Run on `rx` until the channel closes or a post fails after its
+    /// retry budget, and return why: the ordering channel closed, or
+    /// [`LiveSender::post_confirmed`] failed after its retry budget.
+    pub(crate) async fn run(&mut self, mut rx: Receiver<ReaderToExec>) -> anyhow::Error {
+        loop {
+            let event = tokio::time::timeout(TICK, rx.recv()).await;
+            if let Err(why) = self.handle_event(event).await {
+                return why;
+            }
+        }
+    }
+
+    /// The block the reader resumes after: re-observed blocks up to it
+    /// drop.
+    #[cfg(test)]
+    pub(crate) fn skip_through_block(&self) -> u64 {
+        self.cfg.skip_through_block
+    }
+
+    /// The blocks in the pending group.
+    #[cfg(test)]
+    pub(crate) fn pending_blocks(&self) -> usize {
+        self.pending.as_ref().map_or(0, |g| g.blocks.len())
+    }
+
+    /// Add rebuilt blocks, in order, as if the sealer had served them:
+    /// into the spool and the pending group. The reader
+    /// then resumes just past them, and re-observed blocks up to the last
+    /// one drop. Returns the cursor the reader resumes at.
     ///
     /// # Errors
-    /// Returns an error when the ordering channel closes, or when
-    /// [`LiveSender::post_confirmed`] fails after its retry budget.
-    pub(crate) async fn run(mut self) -> Result<()> {
-        loop {
-            let event = tokio::time::timeout(TICK, self.rx.recv()).await;
-            self.handle_event(event).await?;
+    /// Returns an error when the spool write fails, or a block number
+    /// overflows.
+    pub(crate) fn absorb(&mut self, blocks: Vec<ClosedBlock>) -> Result<BatchCursor> {
+        let count = blocks.len();
+        let mut resume = self
+            .pending
+            .as_ref()
+            .map_or(BatchCursor::genesis(), |g| g.cursor);
+        for closed in blocks {
+            resume = self.push_closed(closed)?;
         }
+        self.cfg.skip_through_block = resume.next_block.saturating_sub(1);
+        counter!(live_metric_names::REBUILT_BLOCKS).increment(count as u64);
+        Ok(resume)
     }
 
     /// One [`Self::run`] tick: a channel event (a new record to buffer, or
@@ -275,6 +316,12 @@ impl<P: Provider> FeedLoop<P> {
             counter!(live_metric_names::SKIPPED_POSTED_BLOCKS).increment(1);
             return Ok(());
         }
+        self.push_closed(closed).map(|_| ())
+    }
+
+    /// Spool `closed` and add it to the pending group. Returns the cursor
+    /// a post right after this call confirms.
+    fn push_closed(&mut self, closed: ClosedBlock) -> Result<BatchCursor> {
         let next_block = closed
             .block_number
             .checked_add(1)
@@ -304,7 +351,7 @@ impl<P: Provider> FeedLoop<P> {
             reason = "pending-block count never nears 2^52"
         )]
         gauge!(live_metric_names::PENDING_BLOCKS).set(group.blocks.len() as f64);
-        Ok(())
+        Ok(cursor)
     }
 
     /// Post the pending group if it is due.
@@ -343,7 +390,8 @@ impl<P: Provider> FeedLoop<P> {
         let cursor = group.cursor_at(batch.l2_block_end)?;
         self.sender.post_confirmed(batch, cursor).await?;
         self.spool.clear_through(batch.l2_block_end)?;
-        self.cursor.publish(batch.l2_block_end).await
+        self.posted.send_replace(batch.l2_block_end);
+        Ok(())
     }
 }
 

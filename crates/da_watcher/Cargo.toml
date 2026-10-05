@@ -21,8 +21,10 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
+alloy-transport.workspace = true
 
 async-trait = "0.1"
+futures.workspace = true
 jsonrpsee = { workspace = true }
 metrics = { workspace = true }
 serde_json = { workspace = true }

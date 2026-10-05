@@ -6,6 +6,8 @@
 use anyhow::{Context, Result};
 use kardamom_engine::bin_support::LiveCursorPublisher;
 use kardamom_engine::reader::cluster::OfferOutcome;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// The publisher the feed loop holds. The offer blocks on the session
@@ -18,6 +20,18 @@ pub(crate) struct PostedCursor {
 impl PostedCursor {
     pub(crate) fn new(inner: LiveCursorPublisher) -> Self {
         Self { inner }
+    }
+
+    /// Publish the value of `posted` at once, then each change, until the
+    /// caller aborts the task at the end of its reader stack. The sealer
+    /// and the ingress learn the confirmed cursor before the first post.
+    pub(crate) fn follow(self, mut posted: watch::Receiver<u64>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut head = *posted.borrow_and_update();
+            while self.publish(head).await.is_ok() && posted.changed().await.is_ok() {
+                head = *posted.borrow_and_update();
+            }
+        })
     }
 
     /// Publish `posted_head`. A refused offer is logged, not fatal: the
