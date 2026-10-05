@@ -218,6 +218,7 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     // The baselines follow the freeze: a restart on a retried freeze
     // logs its own lines, which must not count for the final thaw.
     let restored0 = count(h, SPOOL_RESTORED_LINE).await?;
+    let rebuilding0 = count(h, REBUILDING_LINE).await?;
     let rebuilt0 = count(h, REBUILT_LINE).await?;
     // A post in flight at the freeze still lands: read the covered
     // block once it has.
@@ -231,6 +232,13 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         "{ctx}: the floor passed ({delta} frames in {}s); thawing",
         held.as_secs()
     ));
+    let sealed = h
+        .probes
+        .executor_progress()
+        .await
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no executor head at the thaw"))?;
+    let sealed = u64::try_from(sealed)
+        .map_err(|e| crate::chaos_fail!("{ctx}: the executor head is not a block: {e}"))?;
     if h.thaw(&aux, &inner).await.is_err() {
         crate::log(format!(
             "{ctx}: SIGCONT failed (the task was replaced mid-freeze); the log asserts own the verdict"
@@ -239,13 +247,68 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     let budget = h.knobs.restart_slo + Duration::from_secs(60);
     await_line(h, SPOOL_RESTORED_LINE, restored0, budget, ctx).await?;
     await_spool_posted(&l1, covered0, ctx).await?;
-    await_line(h, REBUILT_LINE, rebuilt0, budget + REBUILD_BUDGET, ctx).await?;
+    let lines = Baselines {
+        rebuilding: rebuilding0,
+        rebuilt: rebuilt0,
+    };
+    if !await_rebuilt_or_served(h, &l1, lines, sealed, budget + REBUILD_BUDGET, ctx).await? {
+        return l1.assert_contiguous(ctx).await;
+    }
     let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
     let floor = field_in_last(&logs, REBUILDING_LINE, "oldest_block").ok_or_else(|| {
         crate::chaos_fail!("{ctx}: the rebuild line names no oldest_block (the sealers' floor)")
     })?;
     await_covered_through(&l1, floor, ctx).await?;
     l1.assert_contiguous(ctx).await
+}
+
+/// The batcher log counts before the thaw.
+#[derive(Clone, Copy)]
+struct Baselines {
+    rebuilding: usize,
+    rebuilt: usize,
+}
+
+/// Wait for one of the two ends of the outage. The sealers refused the
+/// replay and the batcher rebuilt the gap from references (`true`). Or
+/// the sealers kept every frame above the posted head, served the
+/// replay, and L1 covers through `sealed`, the head at the thaw, with no
+/// refusal on the way (`false`). The retention never prunes below the
+/// posted head, so the second is the expected end; the first stays valid
+/// for a sealer that prunes by the window alone.
+async fn await_rebuilt_or_served(
+    h: &Harness,
+    l1: &L1,
+    base: Baselines,
+    sealed: u64,
+    budget: Duration,
+    ctx: &str,
+) -> anyhow::Result<bool> {
+    let outcome = poll::until(
+        Budget::new(budget, Duration::from_secs(5)),
+        |_| async move {
+            if count(h, REBUILT_LINE).await? > base.rebuilt {
+                return Ok::<_, anyhow::Error>(Some(true));
+            }
+            let served = l1.covered_through().await? >= sealed
+                && count(h, REBUILDING_LINE).await? == base.rebuilding;
+            Ok(served.then_some(false))
+        },
+    )
+    .await?;
+    let (rebuilt, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: within {}s the batcher neither rebuilt a refused gap nor posted through block {sealed}, the head at the thaw",
+            t.as_secs()
+        )
+    })?;
+    if !rebuilt {
+        crate::log(format!(
+            "{ctx}: the sealers kept the range above the posted head and served the replay: L1 covers through {sealed} with no refusal ({}s)",
+            elapsed.as_secs()
+        ));
+    }
+    Ok(rebuilt)
 }
 
 /// L1 covers through `floor`: the rebuilt gap and the sealers' floor
