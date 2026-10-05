@@ -17,12 +17,13 @@ import org.agrona.DirectBuffer;
  * through a {@code Supplier<TestNode.TestService[]>}. So this class injects
  * an external {@code ClusteredService} by composition: the harness drives
  * this object, which forwards every call verbatim to the production
- * service. It adds or intercepts no behavior.
- *
- * <p>Shared by {@link SealerClusterFailoverTest} and {@link SealerReplayTest}.</p>
+ * service. Every callback, the snapshot write included, runs the production
+ * code. The only addition is the {@link #restoredFromSnapshot()} probe.
  */
 final class SealerTestService extends TestNode.TestService {
     private final SealerClusteredService delegate;
+    /** Written on the service thread in onStart. The test thread reads it. */
+    private volatile boolean restoredFromSnapshot;
 
     SealerTestService(final int dedupCapacity, final long tickMs, final int memberId) {
         this.delegate = new SealerClusteredService(dedupCapacity, tickMs, memberId);
@@ -30,20 +31,19 @@ final class SealerTestService extends TestNode.TestService {
 
     @Override
     public void onStart(final Cluster cluster, final Image snapshotImage) {
-        // Snapshot-recovery limitation:
-        // - On a snapshot-recovery start, both super.onStart and delegate.onStart
-        //   get the same snapshot Image.
-        // - An Image is a consumable cursor: the first caller to poll it drains it.
-        //   The second caller then sees an empty image and starts from genesis
-        //   without warning.
-        // - This is harmless here only because these tests never take a snapshot;
-        //   snapshotImage is always null.
-        // - Do not reuse this wrapper for a snapshot or recovery test case as-is.
-        //   In that case, only the delegate may consume the snapshot Image; give
-        //   super a null or no-op image instead. Otherwise the production service
-        //   loses its recovered state.
-        super.onStart(cluster, snapshotImage); // Lets the harness latch its Cluster reference.
+        // An Image is a consumable cursor. TestNode.TestService.onStart reads
+        // its own fixed snapshot format from the image and stops the service
+        // on any other format. So super gets a null image and only latches
+        // the Cluster reference. The delegate alone reads the snapshot Image
+        // and restores the real sealer state.
+        super.onStart(cluster, null);
+        restoredFromSnapshot = snapshotImage != null;
         delegate.onStart(cluster, snapshotImage);
+    }
+
+    /** True when this service started from a snapshot image, not at genesis. */
+    boolean restoredFromSnapshot() {
+        return restoredFromSnapshot;
     }
 
     @Override
