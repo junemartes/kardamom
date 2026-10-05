@@ -123,14 +123,52 @@ fn replay_done_below_the_cursor_is_fatal() {
         Err(ExecutorError::ClusterBehindCursor {
             next_index: 5,
             next_block: 3,
-            up_to_index: 0,
-            up_to_block: 1,
+            head_index: 0,
+            head_block: 1,
         })
     ));
     assert!(matches!(
         behind(5, 2),
-        Err(ExecutorError::ClusterBehindCursor { up_to_block: 2, .. })
+        Err(ExecutorError::ClusterBehindCursor { head_block: 2, .. })
     ));
+}
+
+/// The sealer's `REPLAY_AHEAD` refusal stops the consumer with the head
+/// in the error. No repair starts: the replay-refused fallback does not
+/// take this error, so it fetches no checkpoint and parks no state.
+#[test]
+fn replay_ahead_is_fatal_and_starts_no_repair() {
+    let egress = FakeEgress::new();
+    egress.push(wire::encode_replay_ahead(0, 1));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
+    egress.close();
+    let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3));
+    let err = sub.next().unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutorError::ClusterBehindCursor {
+            next_index: 5,
+            next_block: 3,
+            head_index: 0,
+            head_block: 1,
+        }
+    ));
+
+    let state_dir = tempfile::tempdir().unwrap();
+    std::fs::write(state_dir.path().join("mdbx.dat"), b"state").unwrap();
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let repaired = crate::bin_support::replay_unavailable_fallback(
+        Some(&err),
+        Some(checkpoint_dir.path()),
+        &["127.0.0.1:1".to_string()],
+        state_dir.path(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(repaired, None, "no resync outcome");
+    assert!(!state_dir.path().join("stale").exists(), "no state parked");
+    assert!(state_dir.path().join("mdbx.dat").exists());
 }
 
 /// A head at the delivery cursor ends the replay with nothing to deliver.

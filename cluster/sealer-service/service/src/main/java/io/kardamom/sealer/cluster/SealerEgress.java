@@ -135,10 +135,10 @@ final class SealerEgress {
     /**
      * Serve a client replay request.
      * Re-offer every retained frame at or after the requested cursor to the
-     * requesting session only, then send a REPLAY_DONE marker. Send a
-     * REPLAY_UNAVAILABLE marker instead when the cursor is past the head,
-     * when it does not name one point of the stream, or when the retained
-     * frames no longer reach back to it. This runs the
+     * requesting session only, then send a REPLAY_DONE marker. Send
+     * REPLAY_AHEAD with the head instead when the cursor is past the head.
+     * Send REPLAY_UNAVAILABLE when the cursor does not name one point of
+     * the stream, or when the retained frames do not reach it. This runs the
      * same way on every member, from the replicated log, but only the
      * leader's session offers reach the client. {@code upToIndex} and
      * {@code upToBlock} are the state machine's current canonical count and
@@ -165,10 +165,12 @@ final class SealerEgress {
             // A consumer ahead of the head applied records that this member
             // does not hold, for example after a wipe or a re-seed. A
             // REPLAY_DONE would let the consumer drop each new record below
-            // its cursor as a duplicate and diverge silently. The refusal
-            // stops it.
-            refuseReplay(session, fromIndex, fromBlock,
+            // its cursor as a duplicate and diverge silently. A repair from
+            // this stream cannot serve it either, so REPLAY_AHEAD carries the
+            // head and stops it.
+            logReplay(session, fromIndex, fromBlock,
                 "AHEAD head=(" + upToIndex + "," + upToBlock + ")");
+            offerControl(session, SealerWire.EGRESS_KIND_REPLAY_AHEAD, upToIndex, upToBlock);
             return;
         }
         final long lowerEnd = retainedBoundaryEnd(fromBlock - 1);
@@ -214,15 +216,23 @@ final class SealerEgress {
 
     /**
      * Refuse a replay request with REPLAY_UNAVAILABLE, which carries the
-     * retention floors, and log the reason. The log goes to stdout, like
-     * the role lines, so the chaos suite can grep it next to its other
-     * signals. The service has no other logger.
+     * retention floors, and log the reason.
      */
     private void refuseReplay(
             final ClientSession session, final long fromIndex, final long fromBlock, final String reason) {
-        System.out.println("cluster REPLAY memberId=" + memberId
-            + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock + ") " + reason);
+        logReplay(session, fromIndex, fromBlock, reason);
         offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+    }
+
+    /**
+     * Log the outcome of a replay request. The log goes to stdout, like the
+     * role lines, so the chaos suite can grep it next to its other signals.
+     * The service has no other logger.
+     */
+    private void logReplay(
+            final ClientSession session, final long fromIndex, final long fromBlock, final String outcome) {
+        System.out.println("cluster REPLAY memberId=" + memberId
+            + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock + ") " + outcome);
     }
 
     /** Byte offset of {@code endTxIdx} in a boundary frame: after the kind and the block number. */

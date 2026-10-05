@@ -38,6 +38,8 @@ pub enum EgressItem {
     },
     /// Replay complete up to (exclusive) the given live cursor.
     ReplayDone { up_to_index: u64, up_to_block: u64 },
+    /// Replay refused: the requested cursor is past the sealer's head.
+    ReplayAhead { head_index: u64, head_block: u64 },
     /// Contiguity reject. The service refused to seal `sender`'s ref at
     /// `nonce`, because it expected `expected`. Republish from `expected`:
     /// the unconfirmed ledger holds the missing refs.
@@ -90,6 +92,10 @@ impl EgressItem {
             EGRESS_KIND_REPLAY_DONE => Ok(Self::ReplayDone {
                 up_to_index: rd_u64(buf, 1)?,
                 up_to_block: rd_u64(buf, 9)?,
+            }),
+            super::EGRESS_KIND_REPLAY_AHEAD => Ok(Self::ReplayAhead {
+                head_index: rd_u64(buf, 1)?,
+                head_block: rd_u64(buf, 9)?,
             }),
             EGRESS_KIND_CONTIGUITY_REJECT => Self::decode_contiguity_reject(buf),
             EGRESS_KIND_PAST_DEADLINE => Self::decode_past_deadline(buf),
@@ -354,6 +360,12 @@ pub fn encode_replay_unavailable(oldest_index: u64, oldest_block: u64) -> Vec<u8
 #[must_use]
 pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_DONE, up_to_index, up_to_block)
+}
+
+/// Frame a replay-ahead refusal exactly as the Java service does.
+#[must_use]
+pub fn encode_replay_ahead(head_index: u64, head_block: u64) -> Vec<u8> {
+    encode_kind_2u64(super::EGRESS_KIND_REPLAY_AHEAD, head_index, head_block)
 }
 
 /// Frame a contiguity reject exactly as the Java service does. The real

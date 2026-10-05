@@ -95,6 +95,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
             // arrive here, so this arm ignores them as a safeguard.
             Ok(
                 EgressItem::ReplayDone { .. }
+                | EgressItem::ReplayAhead { .. }
                 | EgressItem::ReplayUnavailable { .. }
                 | EgressItem::ContiguityReject { .. }
                 | EgressItem::RemoteOriginReject { .. }

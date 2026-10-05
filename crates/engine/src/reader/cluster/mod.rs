@@ -214,6 +214,12 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             } => {
                 self.end_replay(up_to_index, up_to_block)?;
             }
+            EgressItem::ReplayAhead {
+                head_index,
+                head_block,
+            } => {
+                return Err(self.behind_cursor(head_index, head_block));
+            }
             // Every reject is offered only to the offering sequencer
             // session. An executor session cannot receive one. Ignore them
             // defensively.
@@ -241,24 +247,31 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// below, so a head below the delivery cursor means the sealer lost
     /// records that this consumer applied. Each new record then falls
     /// below the cursor and drops as a duplicate, so this fails instead.
+    /// The sealer answers such a cursor with `REPLAY_AHEAD`; this check
+    /// covers a sealer that answers `REPLAY_DONE` instead.
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::ClusterBehindCursor`] when the head lies
     /// below the delivery cursor.
     fn end_replay(&mut self, up_to_index: u64, up_to_block: u64) -> Result<(), ExecutorError> {
-        let next_index = self.cursor.next_index.load(Ordering::Relaxed);
-        let next_block = self.cursor.next_block.load(Ordering::Relaxed);
-        if up_to_index < next_index || up_to_block < next_block {
-            return Err(ExecutorError::ClusterBehindCursor {
-                next_index,
-                next_block,
-                up_to_index,
-                up_to_block,
-            });
+        if up_to_index < self.cursor.next_index.load(Ordering::Relaxed)
+            || up_to_block < self.cursor.next_block.load(Ordering::Relaxed)
+        {
+            return Err(self.behind_cursor(up_to_index, up_to_block));
         }
         self.catching_up = false;
         Ok(())
+    }
+
+    /// The error for a sealer head below the delivery cursor.
+    fn behind_cursor(&self, head_index: u64, head_block: u64) -> ExecutorError {
+        ExecutorError::ClusterBehindCursor {
+            next_index: self.cursor.next_index.load(Ordering::Relaxed),
+            next_block: self.cursor.next_block.load(Ordering::Relaxed),
+            head_index,
+            head_block,
+        }
     }
 
     /// Buffer one canonical record. Drops a duplicate below the delivery
