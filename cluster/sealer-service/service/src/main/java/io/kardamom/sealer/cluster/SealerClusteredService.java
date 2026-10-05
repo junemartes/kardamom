@@ -301,6 +301,7 @@ public final class SealerClusteredService implements ClusteredService {
         System.out.println("cluster SESSION close memberId=" + memberId
             + " session=" + session.id() + " reason=" + closeReason);
         egress.removeConsumer(session.id());
+        egress.dropBacklog(session.id());
     }
 
     @Override
@@ -311,6 +312,10 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        // Every log-driven callback first sends what the egress backlogs
+        // hold, so a back-pressured session catches up between frames, and
+        // the stall deadline is checked at least once per tick.
+        egress.drainBacklogs();
         dispatchSessionMessage(session, buffer, offset, length);
         recordServicePosition();
     }
@@ -720,6 +725,7 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
         recordServicePosition();
+        egress.drainBacklogs();
         if (correlationId == WINDOW_TIMER_CORRELATION_ID) {
             flushWindow();
             return;
@@ -765,7 +771,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onRoleChange(Cluster.Role newRole) {
-        // No role-specific behavior: the cluster log is replicated, so every
+        // No role-specific state: the cluster log is replicated, so every
         // member runs the same deterministic state machine. Only the
         // leader's egress offers reach external clients. Log the role change
         // so the chaos suite (deploy/cluster/scripts/chaos.sh) can grep the
@@ -773,6 +779,10 @@ public final class SealerClusteredService implements ClusteredService {
         // on purpose. Do not switch it to slf4j without also updating the
         // chaos suite's leader detection.
         System.out.println("cluster role=" + newRole + " memberId=" + memberId);
+        // The egress backlogs belong to the clients of this member's
+        // leadership. Those clients reconnect to the next leader and replay
+        // from there, and a follower's offers never reach a client.
+        egress.dropBacklogs();
     }
 
     @Override

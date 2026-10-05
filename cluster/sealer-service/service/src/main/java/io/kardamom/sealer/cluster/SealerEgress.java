@@ -1,25 +1,25 @@
 package io.kardamom.sealer.cluster;
 
-import io.aeron.Publication;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
-import org.agrona.DirectBuffer;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.collections.LongHashSet;
-import org.agrona.concurrent.UnsafeBuffer;
 
 /**
  * The egress layer of {@link SealerClusteredService}.
  * It frames relayed records, boundaries, and control messages, offers them
- * with the deadline-then-close semantics documented on
- * {@link #OFFER_DEADLINE_NS}, targets the record fan-out at announced
- * consumers, and keeps a bounded set of framed egress to serve client replay
- * requests.
+ * through the per-session backlogs of {@link SessionBacklogs}, targets the
+ * record fan-out at announced consumers, and keeps a bounded set of framed
+ * egress to serve client replay requests.
  *
  * <p>This class is single-threaded by design: every method here runs on the
  * one clustered-service thread (Aeron {@code ClusteredService} callbacks),
@@ -29,32 +29,6 @@ import org.agrona.concurrent.UnsafeBuffer;
  */
 final class SealerEgress {
 
-    /**
-     * Per-frame egress-offer deadline, per session.
-     *
-     * <p>Offers run on the single clustered-service thread. An unbounded
-     * retry against one wedged client session (its egress image full because
-     * the subscriber stopped draining) would block record relaying and the
-     * boundary tick for the whole cluster. But silently dropping the frame
-     * is worse: a client that misses a boundary seals two blocks as one, and
-     * provably diverges. A retry bounded only by a small number of idle
-     * cycles is not safe either, since it can expire during an ordinary,
-     * sub-millisecond burst of back-pressure.</p>
-     *
-     * <p>So this retries up to a real deadline, and on timeout closes the
-     * session. This is an explicit signal the client can act on: it
-     * reconnects, and the executor's boundary-alignment fail-stop plus
-     * archive crash recovery self-heals. This is never a silent gap. The
-     * wall clock is safe to use here, because egress offers are member-local
-     * IO (only the leader's offers reach clients), not replicated state.</p>
-     *
-     * <p>The one-second grace period keeps the cost of a dead session to one
-     * deadline before it closes, while not closing a live client that is
-     * only riding out a brief CPU spike. A close forces that client through
-     * reconnect, fail-stop, and crash recovery, so false positives are
-     * costly and should stay rare.</p>
-     */
-    private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
     /** One retained, already-framed egress frame (record or boundary). */
     private static final class RetainedFrame {
@@ -67,11 +41,18 @@ final class SealerEgress {
             this.boundary = boundary;
             this.key = key;
         }
+
+        /** Whether a replay from {@code (fromIndex, fromBlock)} includes this frame. */
+        boolean wanted(final long fromIndex, final long fromBlock) {
+            return boundary ? key >= fromBlock : key >= fromIndex;
+        }
     }
 
     private final Cluster cluster;
     /** This cluster member's id, logged on egress operational signals. */
     private final int memberId;
+    /** The offer path, with one backlog for each session that pushes back. */
+    private final SessionBacklogs backlogs;
 
     /**
      * Session ids that announced themselves as canonical-stream consumers
@@ -118,6 +99,8 @@ final class SealerEgress {
             final long firstRetainedBlock) {
         this.cluster = cluster;
         this.memberId = memberId;
+        this.backlogs = new SessionBacklogs(
+            memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT);
         this.firstRetainedIndex = firstRetainedIndex;
         this.firstRetainedBlock = firstRetainedBlock;
     }
@@ -133,6 +116,25 @@ final class SealerEgress {
     }
 
     /**
+     * Send the queued frames that each session takes now, and close each
+     * session past a backlog limit. Call it only from a log-driven callback:
+     * Aeron rejects an offer or a close from {@code doBackgroundWork}.
+     */
+    void drainBacklogs() {
+        backlogs.drain();
+    }
+
+    /** Drop the backlog of a closed session. */
+    void dropBacklog(final long sessionId) {
+        backlogs.drop(sessionId);
+    }
+
+    /** Drop every backlog, because this member's role changed. */
+    void dropBacklogs() {
+        backlogs.dropAll();
+    }
+
+    /**
      * Serve a client replay request.
      * Re-offer every retained frame at or after the requested cursor to the
      * requesting session only, then send a REPLAY_DONE marker, or
@@ -142,16 +144,13 @@ final class SealerEgress {
      * {@code upToBlock} are the state machine's current canonical count and
      * block number, stamped into the REPLAY_DONE marker.
      *
-     * <p>This method serves the replay synchronously. A prior attempt at a
-     * timer-driven chunked drain also made live broadcasts skip mid-replay
-     * sessions, which changed the steady-state egress flow and caused
-     * consumers to freeze at their first record. Correctness matters more
-     * than the leader-stall optimization that change was after. In
-     * practice, the stall stays small: a wedged consumer costs one
-     * {@link #OFFER_DEADLINE_NS} on its first frame and is then closed.
-     * The close is asynchronous, so the offer loop skips the session while
-     * it is closing; the offer itself never returns CLOSED in that window.
-     * Healthy consumers drain retained frames at line rate.</p>
+     * <p>This method hands every wanted frame to the offer path at once, in
+     * retained order. The frames that the session cannot take now wait in
+     * its backlog, and live frames queue behind them, so the session gets
+     * the replay, then the REPLAY_DONE marker, then the live stream. The
+     * backlog keeps the retained arrays, not copies. A wedged session costs
+     * the service thread no wait: its backlog closes it at the stall
+     * deadline.</p>
      */
     void handleReplayRequest(
             final ClientSession session,
@@ -183,25 +182,20 @@ final class SealerEgress {
             offerControl(session, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
             return;
         }
-        long served = 0;
-        long dropped = 0;
-        for (final RetainedFrame f : retained) {
-            final boolean wanted = f.boundary ? f.key >= fromBlock : f.key >= fromIndex;
-            if (wanted) {
-                // Count delivered frames, not attempted ones. An offer into a
-                // closed or back-pressured session returns false. Counting it
-                // as served would make a wholesale-dropped replay look the
-                // same as a successful one in these logs.
-                if (offerBytesToSession(session, f.frame)) {
-                    served++;
-                } else {
-                    dropped++;
-                }
-            }
-        }
+        // Count each outcome apart. A dropped replay must not look the same
+        // as a served one in these logs.
+        final Map<SessionBacklogs.Outcome, Long> outcomes = retained.stream()
+            .filter(f -> f.wanted(fromIndex, fromBlock))
+            .map(f -> backlogs.offer(session, f.frame))
+            .collect(Collectors.groupingBy(
+                Function.identity(),
+                () -> new EnumMap<>(SessionBacklogs.Outcome.class),
+                Collectors.counting()));
         System.out.println("cluster REPLAY memberId=" + memberId
             + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
-            + ") served=" + served + " dropped=" + dropped
+            + ") served=" + outcomes.getOrDefault(SessionBacklogs.Outcome.SENT, 0L)
+            + " queued=" + outcomes.getOrDefault(SessionBacklogs.Outcome.QUEUED, 0L)
+            + " dropped=" + outcomes.getOrDefault(SessionBacklogs.Outcome.DROPPED, 0L)
             + " retained=" + retained.size());
         offerControl(session, SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock);
     }
@@ -355,17 +349,16 @@ final class SealerEgress {
     void offerRelayed(final Relayed relayed) {
         final int len = frameRelayed(relayed);
         retain(len, false, relayed.index);
-        offerToConsumers(len);
+        offerToConsumers(staged(len));
     }
 
     /**
-     * Offer the frame staged in {@link #egressBuffer} to every session that
-     * announced itself as a canonical-stream consumer: the executors, the
-     * validator, and ingress observers. This excludes the publisher-only
-     * sequencer sessions, which used to receive, and then drop, every
-     * record. On a saturated leader, the per-session unicast offer is the
-     * dominant cost, so cutting the session list this way directly raises
-     * the ceiling.
+     * Offer {@code frame} to every session that announced itself as a
+     * canonical-stream consumer: the executors, the validator, and ingress
+     * observers. This excludes the publisher-only sequencer sessions, which
+     * drop every record they get. On a saturated leader, the per-session
+     * unicast offer is the dominant cost, so cutting the session list this
+     * way directly raises the ceiling.
      *
      * <p>This falls back to a broadcast to all sessions while no consumer
      * has announced itself, such as the window right after a restart, or a
@@ -374,18 +367,10 @@ final class SealerEgress {
      * session because the executor replicas consume the canonical stream on
      * their own sessions.</p>
      */
-    private void offerToConsumers(final int len) {
-        if (consumerSessions.isEmpty()) {
-            for (final ClientSession session : cluster.clientSessions()) {
-                offerToSession(session, len);
-            }
-            return;
-        }
-        for (final ClientSession session : cluster.clientSessions()) {
-            if (consumerSessions.contains(session.id())) {
-                offerToSession(session, len);
-            }
-        }
+    private void offerToConsumers(final byte[] frame) {
+        cluster.clientSessions().stream()
+            .filter(session -> consumerSessions.isEmpty() || consumerSessions.contains(session.id()))
+            .forEach(session -> backlogs.offer(session, frame));
     }
 
     /**
@@ -412,14 +397,13 @@ final class SealerEgress {
     void offerBoundary(final Boundary boundary) {
         final int len = frameBoundary(boundary);
         retain(len, true, boundary.blockNumber);
+        final byte[] frame = staged(len);
         // Boundaries stay broadcast to every session, unlike relayed records.
         // There is at most one per tick, and the sequencer's boundary-only
         // lag feed (connect_with_egress_kind_filter) consumes them without a
         // SUBSCRIBE announcement. Filtering boundaries by consumer would
         // leave it unserved.
-        for (final ClientSession session : cluster.clientSessions()) {
-            offerToSession(session, len);
-        }
+        cluster.clientSessions().forEach(session -> backlogs.offer(session, frame));
     }
 
     /**
@@ -443,98 +427,18 @@ final class SealerEgress {
     }
 
     /**
-     * Offer one frame to one session, with the deadline-then-close semantics
-     * described on {@link #OFFER_DEADLINE_NS}. This is the single offer
-     * loop: both egress paths, the staged buffer and the retained raw frame,
-     * go through it, so the close semantics cannot drift between them.
-     *
-     * <p>On a terminal result, CLOSED means the session is already gone. Any
-     * other terminal result, such as MAX_POSITION_EXCEEDED (the egress
-     * publication hit its position limit and is now permanently dead), must
-     * close the session. Returning silently would leave a zombie session,
-     * kept alive by ingress keep-alives, while every frame for it is
-     * dropped.</p>
-     *
-     * <p>When the deadline runs out under persistent back-pressure, this
-     * session's subscriber has stopped draining. Close it instead of
-     * dropping frames, since a gap would be silent corruption. Note that
-     * the close event may never reach the client, because it rides the same
-     * wedged egress. The client's delivered-frame liveness watchdog is the
-     * actual recovery path.</p>
-     *
-     * <p>A session that is closing gets no offer. {@link ClientSession#close}
-     * only asks the consensus module to close the session; the session stays
-     * in {@link Cluster#clientSessions()} until the close comes back through
-     * the log, and its publication is still the wedged one. Without this
-     * guard every frame in between spins the full deadline on the same
-     * session again, so one dead session costs the service thread tens of
-     * seconds instead of one, and the boundary tick stops for that long.</p>
+     * Offer the frame staged in {@link #egressBuffer} to one session. The
+     * frame is copied out first, because a backlog keeps the array it gets,
+     * and the next frame reuses the staging buffer.
      */
-    private boolean offerWithDeadline(
-        final ClientSession session, final DirectBuffer buffer, final int length) {
-        if (session.isClosing()) {
-            return false;
-        }
-        final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
-        long result;
-        do {
-            result = session.offer(buffer, 0, length);
-            if (result >= 0) {
-                return true;
-            }
-            if (!retryable(result)) {
-                if (result != Publication.CLOSED) {
-                    closeSessionLoudly(session, "terminal offer result " + result);
-                }
-                return false;
-            }
-        } while (System.nanoTime() < deadline);
-        closeSessionLoudly(session, "offer deadline exhausted (back-pressure)");
-        return false;
-    }
-
-    /** Offer a retained raw frame through {@link #offerWithDeadline}. */
-    private boolean offerBytesToSession(final ClientSession session, final byte[] frame) {
-        return offerWithDeadline(session, new UnsafeBuffer(frame), frame.length);
-    }
-
-    /**
-     * Close a session, and log the reason on stdout.
-     * The SessionEvent(CLOSED) that the consensus module emits for the
-     * client travels over the very egress publication that just failed, so
-     * the client may never see it. Its liveness watchdog is what actually
-     * recovers it. This log line is then the only durable record of why the
-     * session died.
-     */
-    private void closeSessionLoudly(final ClientSession session, final String reason) {
-        System.out.println("cluster EGRESS-CLOSE memberId=" + memberId
-            + " session=" + session.id() + " reason=" + reason);
-        session.close();
-    }
-
-    /** Offer the staged {@code egressBuffer} head through {@link #offerWithDeadline}. */
     private void offerToSession(final ClientSession session, final int length) {
-        offerWithDeadline(session, egressBuffer, length);
+        backlogs.offer(session, staged(length));
     }
 
-    /** Whether a negative offer result is retryable within the deadline. */
-    private boolean retryable(final long offerResult) {
-        // BACK_PRESSURED and ADMIN_ACTION are transient flow control.
-        // NOT_CONNECTED is also retryable within the deadline: an egress
-        // publication is legitimately unconnected for a moment at session
-        // open, and after a leader failover while the new leader re-creates
-        // it. But a session whose egress never (re)connects within the
-        // deadline must be closed by the caller, not skipped. Its
-        // keep-alives still flow through ingress, so the consensus module
-        // keeps it alive while this service silently drops every frame for
-        // it, a zombie session the client cannot detect. CLOSED and
-        // MAX_POSITION_EXCEEDED stay terminal.
-        if (offerResult == Publication.BACK_PRESSURED
-                || offerResult == Publication.ADMIN_ACTION
-                || offerResult == Publication.NOT_CONNECTED) {
-            cluster.idleStrategy().idle();
-            return true;
-        }
-        return false;
+    /** A copy of the first {@code length} bytes of {@link #egressBuffer}. */
+    private byte[] staged(final int length) {
+        final byte[] frame = new byte[length];
+        egressBuffer.getBytes(0, frame);
+        return frame;
     }
 }
