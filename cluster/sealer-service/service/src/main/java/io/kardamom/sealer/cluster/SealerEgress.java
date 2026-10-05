@@ -349,7 +349,15 @@ final class SealerEgress {
     void offerRelayed(final Relayed relayed) {
         final int len = frameRelayed(relayed);
         retain(len, false, relayed.index);
-        offerToConsumers(staged(len));
+        offerToConsumers(lastRetained());
+    }
+
+    /**
+     * The frame that {@link #retain} added last. The offers send this array:
+     * a backlog keeps the array it gets, and a retained array never changes.
+     */
+    private byte[] lastRetained() {
+        return retained.peekLast().frame;
     }
 
     /**
@@ -397,7 +405,7 @@ final class SealerEgress {
     void offerBoundary(final Boundary boundary) {
         final int len = frameBoundary(boundary);
         retain(len, true, boundary.blockNumber);
-        final byte[] frame = staged(len);
+        final byte[] frame = lastRetained();
         // Boundaries stay broadcast to every session, unlike relayed records.
         // There is at most one per tick, and the sequencer's boundary-only
         // lag feed (connect_with_egress_kind_filter) consumes them without a
