@@ -86,8 +86,8 @@ pub struct Knobs {
     pub account_base: u32,
     /// The funded account of the smoke gate. No case load spends it, so
     /// the recovery probe uses it as the sender with nothing in flight
-    /// during an outage. A reuse run on a used chain passes another,
-    /// unused, account through `KARDAMOM_CHAOS_GATE_ACCOUNT`.
+    /// during an outage. The smoke gate and the probe read its next
+    /// nonce, so a reuse run on a used chain keeps it.
     pub gate_account: u32,
     /// Which ingress replica the hard kill targets, 0 or 1.
     pub ingress_victim: u32,
