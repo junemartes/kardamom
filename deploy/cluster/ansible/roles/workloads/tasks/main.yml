@@ -90,7 +90,8 @@
       wait: false
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_rpc': workloads_followers_rpc} if workloads_l1_rpc_given | length > 0 else {}) }}
+           | combine({'l1_rpc': workloads_followers_rpc} if workloads_l1_rpc_given | length > 0 else {})
+           | combine({'l1_light_client_rpc': workloads_followers_light_client} if workloads_followers_light_client | length > 0 else {}) }}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -152,6 +153,7 @@
       name: l1-indexer
       vars:
         l1_rpc: "{{ workloads_followers_rpc }}"
+        l1_light_client_rpc: "{{ workloads_followers_light_client }}"
         settlement_address: "{{ workloads_resolved_settlement }}"
         lockbox_address: "{{ workloads_lockbox_address }}"
         start_block: "{{ workloads_indexer_start_block }}"

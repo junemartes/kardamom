@@ -94,16 +94,25 @@ workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default(
 # The light client by its Consul service record (nomad/l1-light-client.nomad.hcl).
 workloads_light_host: "{{ lookup('env', 'L1_LIGHT_CLIENT_HOST') | default('kardamom-l1-light-client.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
-# The L1 the followers (the da-watcher, the indexer) walk block by block.
-# Default: the light client when one is deployed, else the real L1. A
-# light client behind an execution RPC without historical proofs serves
-# only the blocks it has seen, so a follower behind it stalls after a
-# gap; L1_FOLLOWERS_RPC then names the real L1, and the validator keeps
-# its verified view.
+# The L1 the followers (the da-watcher, the indexer) walk block by block:
+# a comma-separated list; with two or more entries a block is accepted
+# only when two agree. Default: the light client when one is deployed,
+# else the real L1. A light client behind an execution RPC without
+# historical proofs serves only the blocks it has seen, so a follower
+# behind it stalls after a gap; L1_FOLLOWERS_RPC then names the real
+# L1 endpoints, and the light client settles the reads it serves
+# (workloads_followers_light_client).
 workloads_followers_rpc: >-
   {{ lookup('env', 'L1_FOLLOWERS_RPC')
      | default('http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
                if workloads_light_execution_rpc | length > 0 else workloads_l1_rpc, true) }}
+# The light client as the followers' tie-breaker: set when one runs and
+# L1_FOLLOWERS_RPC names other endpoints, so the light client is not in
+# the list twice.
+workloads_followers_light_client: >-
+  {{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
+     if workloads_light_execution_rpc | length > 0 and lookup('env', 'L1_FOLLOWERS_RPC') | length > 0
+     else '' }}
 # The inbox indexer (nomad/l1-indexer.nomad.hcl): deployed with the light
 # client, read by the batcher through its Consul service record. The
 # start block is optional: empty means the finalized block at its first

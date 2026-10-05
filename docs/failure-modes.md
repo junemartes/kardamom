@@ -383,9 +383,49 @@ packed batch to L1 as it closes. A restart replays the canonical stream from
 its durable cursor — written only after a confirmed post — and skips blocks
 L1 already covers, so the failure mode is a growing L1-posting lag, not data
 loss and never a double post (the contract CAS rejects those loudly). Its
-real dependencies are cluster replay retention (an aged-out cursor is a
-fail-stop: unpostable ordering is a permanent DA gap and must be loud) and
-L1 gas/RPC health. See `docs/agents/batcher-live-l1-spec.md`.
+real dependencies are one surviving state database and L1 gas/RPC health.
+See `docs/agents/batcher-live-l1-spec.md`.
+
+**Retention is a latency, not a loss, while one state database and one
+archive survive.** The resume has three sources, in order:
+
+1. The spool: every block the batcher consumed and did not post yet, on
+   its own disk. A restart continues the pending group from it.
+2. The sealer's replay from the cursor, inside its egress retention.
+3. A rebuild from what the nodes already keep. The state database of every
+   executor and of the validator holds the ordering: the `headers` table
+   maps a block to its canonical end and its L1 origin, and the `receipts`
+   table holds one row per canonical position with the transaction's hash.
+   The `tx_data` archives hold every raw transaction the ingress accepted,
+   on both ingress nodes. The link between them is the `TxRef` the egress
+   record carried; the state writer now keeps it with the receipt (the
+   `tx_hash_index` row gains the shard id, the publisher session and the
+   archive position, 13 bytes; an 8-byte row written before still
+   decodes). When the sealer answers `REPLAY_UNAVAILABLE` past the cursor,
+   the batcher reads each missing block's references from the query
+   endpoints it names with `--block-refs-source`
+   (`kardamom_getBlockRefs`: the block's canonical end, its L1 origin and
+   timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)` per
+   transaction in canonical order, deposits excluded), fetches the bytes
+   from the archives through the join-miss refetch the engine uses, checks
+   each hash against its bytes and each block's end against its
+   predecessor's, closes the blocks as the live feed closes them, fills the
+   spool and the pending group, and resumes at the sealer's floor. The
+   rebuilt range packs to the bytes the live path posts.
+
+A second refusal after the rebuild is a fail-stop, and so is a refusal
+without a query endpoint or without the refetch endpoints. A block that
+carried a cross-chain message cannot be rebuilt this way: its remote-epoch
+record is in no archive, and the query endpoint refuses the block instead
+of answering a shorter list. Nothing is pruned below the posted head: the
+reference rows live with the receipts, which nothing deletes, and the
+rebuild never touches the archives' retention.
+
+**L1 endpoints.** `--l1-rpc` takes a list. A request goes to the best
+endpoint first and falls back to the next on an error or an HTTP 429; a
+failing endpoint ranks last for the requests after it. The batcher reads
+only what the contract commits to, so it does not cross-check hashes; the
+followers do (below).
 
 Each batch's payload is dispersed to EigenDA through the proxy
 (`nomad/da-proxy.nomad.hcl`), and the certificate the disperser returns is
@@ -417,6 +457,20 @@ lost — the Raft log on a quorum of sealers *and* every node's `tx_ordering` /
 `tx_data` archive — the L2 state is still recoverable from L1 and the DA
 layer alone, because the posted payloads carry the full ordered `raw_tx`
 stream.
+
+The backstop covers what L1 holds. A range the batcher never posted is on
+no L1 and in no DA store; its copies are the sealer's egress retention, the
+ordering in every state database and the bytes on the `tx_data` archives
+(the batcher section above). A block rebuilt from L1 carries no archive
+reference: its bytes are on L1 already, and the batcher never asks for it.
+The rebuild sets the `l1_rebuilt_end_tx_position` meta mark to the end of
+the last rebuilt block. A `tx_hash_index` row at or below the mark stops
+at the position. `kardamom_getBlockRefs` answers such a block with the
+JSON-RPC error -32001 and the cause, and the batcher asks the next query
+endpoint. The deep compare of two state databases compares the position
+of every row. It accepts a row without a reference against a row with one
+only at or below the mark of the node that keeps the shorter row. The
+reference is not in the trie, so the roots of every consumer stay equal.
 
 `kardamom-reconstruct` walks the `BatchPosted` event log, fetches each batch's
 payload from the DA proxy (or the indexer's archive) by the certificate L1
@@ -456,6 +510,22 @@ at-least-once within a run. Duplicates after a retry or restart are absorbed
 downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
 deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
 by construction.
+
+**Two L1 sources.** The followers (the da-watcher and the indexer) read L1
+through a set of endpoints (`--l1-rpc`, a list; `--l1-light-client-rpc`,
+the light client). A block's ids and a log query are accepted when two
+sources agree, or when the light client serves them. The finalized tip is
+the lowest one the agreeing sources report. One public endpoint alone is
+trusted only when it is the only one configured. A source that errors or
+answers HTTP 429 rotates out for a backoff, and the set goes on with the
+rest; with every source out, or fewer than the rule needs, the tick fails
+and repeats. A disagreement the light client does not settle is a halt
+every tick, with both answers in the log and in
+`kardamom_l1_source_disagreement_total`; it is never resolved by a majority
+of public endpoints, since two can share a backend. With a light client the
+source that disagrees with it is the liar, and rotates out. The halt cause
+is one typed value (`SourceHalt`: `l1_source_disagreement`,
+`l1_sources_out`) that the error, the log line and the counter carry.
 
 ## Notifier
 
@@ -607,8 +677,11 @@ check would pass against a feature that activated once and stopped.
 - **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.
-- **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
-  gas spikes is designed (lag + catch-up) but not chaos-tested.
+- **L1 outage** — the followers cross-check two L1 sources and the
+  batcher rebuilds a range the sealer no longer retains from the state
+  databases' references and the `tx_data` archives (the batcher section). The chaos cases that reproduce the
+  staging incident (`l1-liar`, `batcher-outage-past-retention`,
+  `two-day-outage`) are the proof that closes this gap.
 - ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
   suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
   onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
