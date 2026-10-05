@@ -8,6 +8,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -41,6 +42,31 @@ record StateDir(Path root) {
                 .ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID))
                 .map(entry -> entry.logPosition)
                 .orElse(AeronArchive.NULL_POSITION));
+    }
+
+    /** The log positions of the valid consensus module snapshots, in recording log order. */
+    List<Long> snapshotPositions() {
+        return withRecordingLog(log -> log.entries().stream()
+                .filter(entry -> entry.isValid
+                        && entry.type == RecordingLog.ENTRY_TYPE_SNAPSHOT
+                        && entry.serviceId == ConsensusModule.Configuration.SERVICE_ID)
+                .map(entry -> entry.logPosition)
+                .toList());
+    }
+
+    /** The archive recording id of the Raft log. */
+    long logRecordingId() {
+        return withRecordingLog(RecordingLog::findLastTermRecordingId);
+    }
+
+    /**
+     * Delete the recording log and keep the rest. The next start then
+     * finds no recording log, so it seeds the member from a peer, and the
+     * seed clears the rest. The running consensus module keeps its open
+     * file until the process exits.
+     */
+    void dropRecordingLog() {
+        unchecked(() -> Files.deleteIfExists(root.resolve(RecordingLog.RECORDING_LOG_FILE_NAME)));
     }
 
     /** Delete everything under the directory. Create the directory when it is missing. */

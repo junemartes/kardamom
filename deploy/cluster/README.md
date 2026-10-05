@@ -222,6 +222,12 @@ job, so a re-deploy with the flag is safe. `just container-up` and the
 chaos bring-up set the flag. Do not set it when you register a purged job
 again for a cluster that holds state.
 
+Each sealer member purges its own Raft log behind its snapshots. It keeps
+the log of the 3 newest snapshots (`KARDAMOM_CLUSTER_LOG_PURGE_KEEP`, 0
+turns the purge off) and of every block that the batcher has not posted.
+A member that stops for longer than that margin seeds from a peer when it
+comes back; see `docs/failure-modes.md`.
+
 A successful deploy records its manifest under `deployed/<env>/` (`KARDAMOM_ENV`,
 default `local`): `images.digests` is what runs, `images.digests.previous` is
 what it replaced. `just rollback <env>` deploys the previous one; it is a

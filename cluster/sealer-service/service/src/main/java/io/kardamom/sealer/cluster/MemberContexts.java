@@ -2,6 +2,7 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.NameResolver;
 import io.aeron.driver.ThreadingMode;
@@ -16,6 +17,16 @@ import java.nio.file.Path;
  * opens.
  */
 final class MemberContexts {
+    /** The archive's control channel for clients in this process. */
+    private static final String LOCAL_CONTROL_CHANNEL = "aeron:ipc?term-length=64k";
+    /**
+     * The archive segment file of a new recording: one term of the Raft
+     * log (8 MiB, the log channel's term-length). A log purge removes whole
+     * segment files only, so a small segment keeps little log below the
+     * purge point.
+     */
+    private static final int SEGMENT_FILE_LENGTH = 8 * 1024 * 1024;
+
     private final String aeronDir;
     private final String clusterDir;
     private final String archiveDir;
@@ -80,12 +91,25 @@ final class MemberContexts {
             .aeronDirectoryName(aeronDir)
             .archiveDir(new File(archiveDir))
             .controlChannel("aeron:udp?endpoint=" + endpoints[4])
-            .localControlChannel("aeron:ipc?term-length=64k")
+            .localControlChannel(LOCAL_CONTROL_CHANNEL)
+            .segmentFileLength(SEGMENT_FILE_LENGTH)
             .replicationChannel("aeron:udp?endpoint=" + host() + ":0")
             // The catalog level must be at least the recording level.
             .fileSyncLevel(ClusterNode.fileSyncLevel())
             .catalogFileSyncLevel(ClusterNode.fileSyncLevel())
             .recordingEventsEnabled(false)
             .threadingMode(ArchiveThreadingMode.SHARED);
+    }
+
+    /**
+     * A client context for this member's archive over IPC. The client
+     * creates its own Aeron client on this member's media driver, so it
+     * shares no state with the consensus module.
+     */
+    AeronArchive.Context localArchiveClient() {
+        return new AeronArchive.Context()
+            .aeronDirectoryName(aeronDir)
+            .controlRequestChannel(LOCAL_CONTROL_CHANNEL)
+            .controlResponseChannel(LOCAL_CONTROL_CHANNEL);
     }
 }

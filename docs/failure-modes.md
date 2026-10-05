@@ -145,7 +145,25 @@ with three distinct, tested modes:
   ClusterBackup). It restores the snapshot and catches up from the leader.
   A blank member starts at log position 0 only on the bootstrap of a new
   cluster (`KARDAMOM_CLUSTER_BOOTSTRAP=1`). Without a peer, it waits and logs
-  `cluster SEED waiting-for-peer`.
+  `cluster SEED waiting-for-peer`. The drill first waits for the leader's
+  `cluster LOG PURGED` line, so the rejoin runs against a purged log.
+- **Raft log purge** — each member purges its own Raft log below the newest
+  snapshot that is older than the 3 newest snapshots
+  (`kardamom.cluster.logPurgeKeepSnapshots`, 0 turns it off) and whose block
+  the batcher has posted. So the log keeps every unposted block, and at the
+  300 s snapshot interval it keeps at least 15 minutes. A follower that stops
+  for less rejoins from its own log. A blank member seeds from a peer. The
+  purge logs `cluster LOG PURGED memberId=.. position=.. block=..
+  postedHead=..`. Its in-JVM tests are `ClusterLogPurgeTest`.
+- **Follower below the purge point** — a follower that stopped for longer than
+  the margin restarts with a log that ends below the leader's purge point. The
+  leader's archive refuses its catch-up, and its election cycles while Nomad
+  sees a live container. After 300 s without commit progress
+  (`kardamom.cluster.catchupStallS`, 0 turns it off), the join watchdog logs
+  `cluster CATCHUP STALL`, deletes the member's recording log, and exits with
+  code 4. The relaunch finds no recording log, so it seeds from a peer and
+  rejoins. The member holds no committed entry that the leader lacks: it was
+  behind the leader.
 - **Quorum loss** (`cluster-quorum-loss-recover`) — two nodes killed: the
   pipeline **must stall** (the suite asserts the executor block gauge goes
   *flat* — progress without quorum would be unsafe, unreplicated ordering).
