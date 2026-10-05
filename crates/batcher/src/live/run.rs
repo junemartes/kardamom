@@ -33,13 +33,13 @@ use kardamom_log::discovery::StreamPlane;
 use crate::da::DaProxy;
 
 use super::cursor::{BatchCursor, L1Truth, reconcile};
+use super::events::EventsBeacon;
 use super::feed::{FeedConfig, FeedLoop};
 use super::live_metric_names;
 use super::post_age::PostAge;
+use super::posted_cursor::PostedCursor;
 use super::rebuild::{ArchiveRebuilder, Rebuilder};
 use super::refs_store::RefsStore;
-use super::events::EventsBeacon;
-use super::posted_cursor::PostedCursor;
 use super::sender::{LiveSender, PostExhausted};
 use super::spool::{Restored, Spool};
 
