@@ -148,6 +148,7 @@ impl Shard {
                 cluster_retention: Some(6144),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
+                ..DeployVars::default()
             },
             Self::Executor
             | Self::Ingress

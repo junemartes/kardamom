@@ -333,12 +333,12 @@ pub struct ResyncController {
     /// This confirms by reject, dropping the ledger entry.
     reject_rx: Receiver<(Address, u64, u64)>,
     reject_rx_dead: bool,
-    /// `(sender, nonce, max_inclusion_block, at_block)` past-deadline
-    /// rejects, forwarded by the egress-watermark thread. The sealer
-    /// refused a ref whose inclusion deadline the open block had passed.
-    /// No copy of it can be ordered later, so the publish loop drops the
-    /// ledger entry and tells the client, instead of republishing.
-    deadline_rx: Receiver<(Address, u64, u64, u64)>,
+    /// The sealer's terminal refusals, forwarded by the egress-watermark
+    /// thread: a ref whose inclusion deadline the open block had passed,
+    /// or one the DA-lag guard refused. No republish can order either
+    /// now, so the publish loop drops the ledger entry and tells the
+    /// client, instead of republishing.
+    deadline_rx: Receiver<SealerRefusal>,
     deadline_rx_dead: bool,
     watermark: SharedWatermark,
     last_watermark: u64,
@@ -449,7 +449,7 @@ impl ResyncController {
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
         reject_rx: Receiver<(Address, u64, u64)>,
-        deadline_rx: Receiver<(Address, u64, u64, u64)>,
+        deadline_rx: Receiver<SealerRefusal>,
         watermark: SharedWatermark,
     ) -> Result<Self, ResyncConfigError> {
         let enter_threshold = cfg.enter_threshold()?;
@@ -574,9 +574,9 @@ impl ResyncController {
     ///   vanished, so rewind the unconfirmed ledger and republish.
     ///
     /// Bounded per iteration, like the floor drain.
-    /// Drain the past-deadline rejects the sealer answered this shard
-    /// with. Each one is a transaction that will never be ordered.
-    pub fn drain_deadline_rejects(&mut self) -> Vec<(Address, u64, u64, u64)> {
+    /// Drain the terminal refusals the sealer answered this shard with.
+    /// Each one is a transaction no republish can order now.
+    pub fn drain_deadline_rejects(&mut self) -> Vec<SealerRefusal> {
         drain_bounded(
             &self.deadline_rx,
             &mut self.deadline_rx_dead,
@@ -720,6 +720,17 @@ impl ResyncController {
     }
 }
 
+/// One terminal refusal from the sealer: the ref of `sender` at `nonce`
+/// is not ordered, and `reason` is what the client is told. The past
+/// deadline and the DA lag share this path, because the remedy is the
+/// same: drop the ledger entry and tell the client, who resubmits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealerRefusal {
+    pub sender: Address,
+    pub nonce: u64,
+    pub reason: kardamom_types::TxErrorReason,
+}
+
 /// What [`ResyncChannel::open`] hands back: the controller (publish
 /// loop), the floor-update sender (receipts thread), the `(sender,
 /// nonce, expected)` contiguity-reject sender (egress-watermark thread),
@@ -731,9 +742,9 @@ pub struct ResyncChannel {
     pub controller: ResyncController,
     pub floor_tx: Sender<FloorUpdate>,
     pub reject_tx: Sender<(Address, u64, u64)>,
-    /// `(sender, nonce, max_inclusion_block, at_block)`. The sealer
-    /// refused these for being late, and no copy of them can be ordered.
-    pub deadline_tx: Sender<(Address, u64, u64, u64)>,
+    /// The sealer's terminal refusals: late refs, and refs the DA-lag
+    /// guard refused. No republish can order them now.
+    pub deadline_tx: Sender<SealerRefusal>,
     pub watermark: SharedWatermark,
 }
 

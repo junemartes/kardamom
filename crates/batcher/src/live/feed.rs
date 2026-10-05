@@ -7,6 +7,7 @@ use alloy_provider::Provider;
 use anyhow::{Context, Result, bail};
 use metrics::{counter, gauge};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 use kardamom_engine::reader::ReaderToExec;
 use kardamom_types::BlockBoundaryStart;
@@ -130,6 +131,10 @@ pub(crate) struct FeedLoop<P> {
     pending: Option<PendingGroup>,
     /// The consumed, unposted blocks on disk (`super::spool`).
     spool: Spool,
+    /// The last L2 block posted to L1. Each reader stack publishes it to
+    /// the sealer and the ingress (`super::posted_cursor`); the loop
+    /// outlives a stack, so it owns the value, not the publisher.
+    posted: watch::Sender<u64>,
 }
 
 impl PendingGroup {
@@ -169,6 +174,7 @@ impl<P: Provider> FeedLoop<P> {
         cfg: FeedConfig,
         spool: Spool,
         restored: Restored,
+        posted_head: u64,
     ) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
@@ -191,7 +197,13 @@ impl<P: Provider> FeedLoop<P> {
             acc: BatchAccumulator::new(),
             pending,
             spool,
+            posted: watch::Sender::new(posted_head),
         }
+    }
+
+    /// The posted head, for the reader stack's publisher.
+    pub(crate) fn posted(&self) -> watch::Receiver<u64> {
+        self.posted.subscribe()
     }
 
     /// Run on `rx` until the channel closes or a post fails after its
@@ -392,7 +404,9 @@ impl<P: Provider> FeedLoop<P> {
     async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
         let cursor = group.cursor_at(batch.l2_block_end)?;
         self.sender.post_confirmed(batch, cursor).await?;
-        self.spool.clear_through(batch.l2_block_end)
+        self.spool.clear_through(batch.l2_block_end)?;
+        self.posted.send_replace(batch.l2_block_end);
+        Ok(())
     }
 }
 

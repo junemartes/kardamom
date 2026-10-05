@@ -11,9 +11,11 @@ use crate::knobs::Knobs;
 
 pub(crate) mod archive;
 pub(crate) mod cache;
+pub(crate) mod chain_status;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod coordinated;
+pub(crate) mod da_lag;
 pub(crate) mod deploy;
 pub(crate) mod fleet;
 pub(crate) mod l1;
@@ -65,13 +67,15 @@ pub enum Case {
     RedisPartitionIngress,
     RedisTotalLossRecover,
     MirrorKillRebuild,
+    DaLagHalt,
+    PruneFloor,
     L1Liar,
     L1NullReceipts,
     TwoDayOutage,
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 44] = [
+const ALL: [Case; 46] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -112,6 +116,8 @@ const ALL: [Case; 44] = [
     Case::RedisPartitionIngress,
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
+    Case::DaLagHalt,
+    Case::PruneFloor,
     Case::L1Liar,
     Case::L1NullReceipts,
     Case::TwoDayOutage,
@@ -175,6 +181,8 @@ impl Case {
             Self::RedisPartitionIngress => "redis-partition-ingress",
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
+            Self::DaLagHalt => "da-lag-halt",
+            Self::PruneFloor => "prune-floor",
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
             Self::TwoDayOutage => "two-day-outage",
@@ -221,9 +229,10 @@ impl Case {
             Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
-            Self::RetentionOverrun | Self::RetentionOverrunValidator => {
-                inject + k.retention_freeze_cap + Duration::from_mins(2)
-            }
+            Self::RetentionOverrun
+            | Self::RetentionOverrunValidator
+            | Self::DaLagHalt
+            | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             // The failed deployment runs to the executor's healthy
             // deadline, then the real manifest replaces three executors.
@@ -286,6 +295,10 @@ impl Case {
     pub fn load_retry(self, k: &Knobs) -> u32 {
         match self {
             Self::ResizeScaleOutIn => 60,
+            // The chain refuses every submit while it is halted, at once,
+            // and the load's retry delay grows with the attempt: 120
+            // attempts cover a halt of about 24 minutes.
+            Self::DaLagHalt => 120,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -353,6 +366,8 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
+            Self::DaLagHalt => da_lag::da_lag_halt(h).await,
+            Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,
             Self::TwoDayOutage => l1::two_day_outage(h).await,

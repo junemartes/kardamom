@@ -30,6 +30,7 @@
 //! Reacting to a deletion of an older range mid-run without a restart is a
 //! follow-up.
 
+mod gate;
 mod oracle;
 mod sinks;
 mod state;
@@ -41,6 +42,7 @@ use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 
+pub use gate::AttesterGate;
 pub use oracle::{AttesterError, OutputPoster};
 pub use sinks::{AttesterHandle, AttestingReceiptSink};
 pub use state::Output;
@@ -75,16 +77,19 @@ pub struct SpawnedAttester {
 /// Spawn the background attestation task. Call this from within a tokio
 /// runtime. The task runs until every [`AttesterHandle`] clone is dropped.
 ///
+/// While `gate` is paused, the task posts nothing and keeps every leaf and
+/// root pending; it posts at once when the gate opens again.
+///
 /// On startup, it resumes from the latest non-deleted on-chain output (see
 /// [`OutputPoster::latest_attested_block`]). So a deleted, challenged,
 /// latest output is re-attested from the leaves the validator re-collects
 /// on replay. A failed `proposeOutput` keeps its leaves pending and
 /// retries at the next cadence point.
 #[must_use]
-pub fn spawn_attester(cfg: &AttesterConfig) -> SpawnedAttester {
+pub fn spawn_attester(cfg: &AttesterConfig, gate: AttesterGate) -> SpawnedAttester {
     let poster = build_poster(cfg);
     let (handle, rx) = AttesterHandle::channel();
-    let task = tokio::spawn(AttesterLoop::new(poster, rx, cfg.post_interval_blocks).run());
+    let task = tokio::spawn(AttesterLoop::new(poster, rx, cfg.post_interval_blocks, gate).run());
     SpawnedAttester { handle, task }
 }
 
@@ -104,6 +109,7 @@ struct AttesterLoop<P: Provider<Ethereum> + Clone> {
     rx: tokio::sync::mpsc::UnboundedReceiver<AttesterMsg>,
     state: AttestState,
     interval: NonZeroU64,
+    gate: AttesterGate,
 }
 
 impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
@@ -111,6 +117,7 @@ impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
         poster: OutputPoster<P>,
         rx: tokio::sync::mpsc::UnboundedReceiver<AttesterMsg>,
         interval: NonZeroU64,
+        gate: AttesterGate,
     ) -> Self {
         // `last_attested` starts at 0; `run` overwrites it with the
         // resumed on-chain value once the async lookup returns, before
@@ -120,6 +127,7 @@ impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
             rx,
             state: AttestState::new(0, interval),
             interval,
+            gate,
         }
     }
 
@@ -141,11 +149,22 @@ impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
             post_interval_blocks = self.interval.get(),
             "attester task started"
         );
-        while let Some(msg) = self.rx.recv().await {
-            self.fold_msg(msg);
-            self.post_due().await;
-        }
+        while self.step().await.is_continue() {}
         tracing::info!("attester task stopping (all handles dropped)");
+    }
+
+    /// Fold one message, or see the gate change; then post what is due.
+    /// `Break` once every handle dropped.
+    async fn step(&mut self) -> std::ops::ControlFlow<()> {
+        tokio::select! {
+            msg = self.rx.recv() => match msg {
+                Some(msg) => self.fold_msg(msg),
+                None => return std::ops::ControlFlow::Break(()),
+            },
+            () = self.gate.changed() => {}
+        }
+        self.post_due().await;
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Fold one attester message into `self.state`.
@@ -161,6 +180,9 @@ impl<P: Provider<Ethereum> + Clone> AttesterLoop<P> {
     /// complete, so either message (leaves or a root) can be the one that
     /// releases it.
     async fn post_due(&mut self) {
+        if self.gate.paused() {
+            return;
+        }
         let Some((block, state_root)) = self.state.next_attestable() else {
             return;
         };

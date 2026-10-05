@@ -237,7 +237,7 @@ fn park<'a>(
         index,
         tx_hash: LOST,
     };
-    VoidPark::new(sub, backlog, 3, record, Duration::from_secs(60))
+    VoidPark::new(sub, backlog, 3, record, Duration::from_mins(1))
 }
 
 #[test]

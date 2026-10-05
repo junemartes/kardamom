@@ -35,6 +35,9 @@ use kardamom_log::aeron_live::{
     IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
+use kardamom_obs::events::SEALER_SILENCE;
+use kardamom_obs::halt::{HaltCause, HaltRef};
+use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
@@ -44,7 +47,7 @@ use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::{OriginLane, Pump};
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncController, SharedWatermark, elapsed_ms_saturating,
+    FloorUpdate, ResyncController, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
@@ -115,10 +118,10 @@ pub(crate) struct EgressWatermarkFeed {
     silence_ms: u64,
     partition: u32,
     watermark: SharedWatermark,
-    /// `(sender, nonce, max_inclusion_block, at_block)`: the refs the
-    /// sealer refused for being late. The publish loop drops each one and
-    /// tells the client.
-    deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
+    /// The refs the sealer refused for good: late ones, and ones the
+    /// DA-lag guard refused. The publish loop drops each one and tells
+    /// the client.
+    deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     /// Anchored at feed start, not `None`. The cluster emits a boundary
     /// every tick, so "never seen a boundary" past the silence window is
@@ -127,6 +130,10 @@ pub(crate) struct EgressWatermarkFeed {
     /// condition persists, `flag`'s re-arm repeats the flag once per
     /// silence window: a bounded, genuinely alarming heartbeat.
     last_boundary_at: Option<Instant>,
+    /// When the last boundary arrived, never re-armed. Past
+    /// [`SEALER_SILENCE`] the replica pauses on the sealer's lost quorum;
+    /// the next boundary resumes it.
+    last_boundary_seen: Instant,
 }
 
 impl EgressWatermarkFeed {
@@ -135,7 +142,7 @@ impl EgressWatermarkFeed {
         partition: u32,
         watermark: SharedWatermark,
         reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
-        deadline_tx: crossbeam_channel::Sender<(Address, u64, u64, u64)>,
+        deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     ) -> Self {
         Self {
             silence_ms,
@@ -144,6 +151,7 @@ impl EgressWatermarkFeed {
             deadline_tx,
             reject_tx,
             last_boundary_at: Some(Instant::now()),
+            last_boundary_seen: Instant::now(),
         }
     }
 
@@ -174,7 +182,18 @@ impl EgressWatermarkFeed {
     /// could be a partition from egress, or a dead cluster boundary
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
-        self.flag(Instant::now());
+        let now = Instant::now();
+        self.flag(now);
+        self.pause_on_silence(now);
+    }
+
+    /// Pause the replica on the sealer's lost quorum once no boundary
+    /// arrived for [`SEALER_SILENCE`]. A frame that is not a boundary
+    /// does not end the silence.
+    fn pause_on_silence(&self, now: Instant) {
+        if now.saturating_duration_since(self.last_boundary_seen) >= SEALER_SILENCE {
+            process().follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
+        }
     }
 
     fn on_frame(&mut self, frame: &[u8]) {
@@ -185,6 +204,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_deadline_frame(frame) {
+            return;
+        }
+        if self.on_da_lag_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -258,7 +280,14 @@ impl EgressWatermarkFeed {
                         at_block,
                         "sealer past-deadline reject received; dropping the ref"
                     );
-                    self.forward_past_deadline(sender, nonce, max_inclusion_block, at_block);
+                    self.forward_refusal(SealerRefusal {
+                        sender,
+                        nonce,
+                        reason: kardamom_types::TxErrorReason::PastDeadline {
+                            max_inclusion_block,
+                            at_block,
+                        },
+                    });
                 }
                 true
             }
@@ -276,6 +305,47 @@ impl EgressWatermarkFeed {
             }
             _ => false,
         }
+    }
+
+    /// Handle one DA-lag reject frame. Returns `true` when `frame` was
+    /// one, so the caller does not also check it for a boundary.
+    ///
+    /// The sealer refused the ref because the chain is halted on a DA
+    /// lag. No republish can order it until the batcher posts again, so
+    /// it takes the terminal-refusal channel: the publish loop drops the
+    /// ledger entry and tells the client to resubmit later.
+    fn on_da_lag_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_DA_LAG_REJECT) {
+            return false;
+        }
+        if let Ok(EgressItem::DaLagReject {
+            sender,
+            nonce,
+            sealed_head,
+            posted_head,
+            budget_blocks,
+        }) = EgressItem::decode(frame)
+        {
+            tracing::warn!(
+                partition = self.partition,
+                ?sender,
+                nonce,
+                sealed_head,
+                posted_head,
+                budget_blocks,
+                "sealer DA-lag reject received; dropping the ref"
+            );
+            self.forward_refusal(SealerRefusal {
+                sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::DaLag {
+                    sealed_head,
+                    posted_head,
+                    budget_blocks,
+                },
+            });
+        }
+        true
     }
 
     /// Handle one remote-origin-reject frame. Returns `true` when
@@ -322,6 +392,8 @@ impl EgressWatermarkFeed {
             let now = Instant::now();
             self.flag(now);
             self.last_boundary_at = Some(now);
+            self.last_boundary_seen = now;
+            process().follow(None);
             kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
             self.watermark.store(b.end_tx_idx.as_index());
         }
@@ -785,6 +857,7 @@ where
             if let Some(requester) = lookup {
                 sequencer.enable_nonce_lookup(requester);
             }
+            sequencer.enable_pause(process().subscribe());
             sequencer.enable_fees(fees);
             let mut ports = Ports {
                 tx_data: &mut tx_data,

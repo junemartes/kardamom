@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use alloy_provider::Provider;
 use anyhow::Result;
+use kardamom_obs::halt::{self, Halt, HaltCause};
 use metrics::counter;
 use tracing::warn;
 
@@ -54,7 +55,8 @@ impl LiveArgs {
     /// Resume, again after every failure, until L1 answers. A batcher
     /// without L1 has nothing to do, and an exit would hide the failure
     /// behind the orchestrator's restart loop: the exporter stays up, each
-    /// failure counts on the resume-failures metric, and the log names it.
+    /// failure counts on the resume-failures metric, raises the
+    /// `l1_unreachable` halt, and the log names it.
     pub(super) async fn resume_until_l1_answers<P: Provider>(
         &self,
         provider: &P,
@@ -92,6 +94,9 @@ impl LiveArgs {
             error = %format!("{error:#}"),
             "resume failed; L1 did not answer; retrying"
         );
+        // The batcher is halted while L1 does not answer. The halt clears
+        // when the reader stack starts.
+        halt::raise(Halt::new(HaltCause::L1Unreachable, format!("{error:#}")));
         tokio::time::sleep(backoff).await;
         None
     }

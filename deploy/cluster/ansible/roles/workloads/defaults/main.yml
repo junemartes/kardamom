@@ -88,6 +88,7 @@ workloads_batcher_eoa: "{{ lookup('env', 'BATCHER_EOA') | default('0x3C44CdDdB6a
 workloads_chain_id: "{{ lookup('env', 'L2_CHAIN_ID') | default(chain_id, true) }}"
 workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
 workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
+workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"

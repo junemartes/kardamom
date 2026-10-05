@@ -74,8 +74,12 @@ class RemoteOriginFrameTest {
     }
 
     /** Egress frame kinds the consumer saw, in order. */
+    /** The kinds the consumer saw, without the status frames every announcement and tick carry. */
     private List<Byte> kinds() {
-        return consumer.offered.stream().map(f -> f[0]).toList();
+        return consumer.offered.stream()
+                .map(f -> f[0])
+                .filter(k -> k != SealerWire.EGRESS_KIND_STATUS)
+                .toList();
     }
 
     /** Canonical indices of the relayed records the consumer saw, in order. */

@@ -121,7 +121,7 @@ impl Discovered {
     ) -> Result<PubHandle, LogError> {
         let port = self.ports.allocate()?;
         let control = SocketAddr::new(IpAddr::V4(self.ip), port);
-        let uri = publication_uri(control, &self.cfg.flow_control);
+        let uri = publication_uri(control, &self.cfg.flow_control, key.topic);
         let publication = rt.open_publication(&uri, key.stream_id)?;
         let record = PublisherRecord {
             id: self.instance.service_id(key.topic, key.stream_id),
