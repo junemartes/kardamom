@@ -135,8 +135,12 @@ tx_remote_epochs_stream_id = 1017
 # resumed), at once on a change and on a 5 s heartbeat. Every service
 # publishes, best effort; the ingress and the validator subscribe. RAM
 # only. Nothing that changes the canonical order reads it. Own group
-# .31:40100, stream 1019 (1018 is the transaction status stream).
-events_channel = "aeron:udp?endpoint=239.192.56.31:40100|interface={{ env "meta.node_ip" }}/32|ttl=1"
+# .31:40100, stream 1019 (1018 is the transaction status stream). The term
+# length is 64 KiB, the Aeron minimum: every subscriber driver holds one
+# image of three terms per publisher, and the driver default (4 MiB) makes
+# that about 190 MB on an ingress node. The discovery plane sets the same
+# term length on its events publications.
+events_channel = "aeron:udp?endpoint=239.192.56.31:40100|interface={{ env "meta.node_ip" }}/32|ttl=1|term-length=65536"
 events_stream_id = 1019
 
 # --- TxBal: per-block BAL (the executor's BlockDelta). The executor publishes
