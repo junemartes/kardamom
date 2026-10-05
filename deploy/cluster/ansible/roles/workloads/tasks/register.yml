@@ -1,0 +1,48 @@
+---
+# Plan workloads_job_definition as workloads_register_job and register it
+# when the plan shows a change. Both the deploy of a job and one step of
+# the sealer roll come through here.
+- name: Plan {{ workloads_register_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_register_job }}/plan?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Job: "{{ workloads_job_definition }}"
+      Diff: true
+  register: workloads_plan
+  check_mode: false
+
+# The body is one expression, so JobModifyIndex stays an integer. A quoted
+# template ("{{ ... }}", with or without `| int`) reaches the module as a
+# string on ansible-core 2.17, the pin of the deploy path, and Nomad
+# answers 400 ("cannot unmarshal string into ... JobModifyIndex of type
+# uint64"). ansible-core 2.19 keeps the type either way.
+- name: Register changed job {{ workloads_register_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body: >-
+      {{ {'Job': workloads_job_definition,
+          'EnforceIndex': true,
+          'JobModifyIndex': workloads_plan.json.JobModifyIndex} }}
+  when:
+    - not ansible_check_mode
+    - workloads_register_submit | bool
+    - workloads_plan.json.Diff.Type != 'None'
+  changed_when: true
+
+- name: Report planned change for {{ workloads_register_job }}
+  ansible.builtin.debug:
+    msg: "{{ workloads_plan.json.Diff.Type }}"
+  changed_when: workloads_plan.json.Diff.Type != 'None'
+  when: ansible_check_mode
+
+- name: Remember desired groups for readiness checks
+  ansible.builtin.set_fact:
+    workloads_jobs: "{{ workloads_jobs | combine({workloads_register_job: workloads_job_definition}) }}"

@@ -1,9 +1,10 @@
 # kardamom-batcher is a live service. It tails the canonical ordering
 # from the Aeron Cluster egress, joining tx_data exactly like the
-# validator's front end. It packs KAR1 into zstd blob batches as
-# boundaries arrive, and posts each to the in-cluster anvil L1
-# (`KardamomL2Settlement.postBatch`, EIP-4844 blob txs), recording blob
-# bytes in the DA store for `kardamom-reconstruct`.
+# validator's front end. It packs KAR1 into zstd payloads as boundaries
+# arrive, disperses each through the EigenDA proxy
+# (nomad/da-proxy.nomad.hcl), and posts the certificate to L1
+# (`KardamomL2Settlement.postBatch`); `kardamom-reconstruct` reads the
+# payloads back by certificate.
 #
 # Durability: L1's `lastBatchIndex` and `BatchPosted` events are the
 # record of what has posted. The cursor file under
@@ -11,6 +12,12 @@
 # that record, written only after a confirmed post. A restart replays
 # from the cursor, and skips blocks L1 already covers. See
 # docs/agents/batcher-live-l1-spec.md.
+#
+# A restart past the sealer's retention rebuilds the gap: the query
+# endpoints of the executors and the validator (--block-refs-source)
+# serve each block's transaction references, and the tx_data archives
+# serve the bytes through the join-miss refetch. Retention is a latency
+# while one state database and one archive survive.
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
@@ -66,19 +73,80 @@ variable "executor_count" {
   default     = 3
 }
 
+# The inbox indexer's API. With it, a batcher whose node is fresh resumes
+# just past the last posted batch (public #455). Empty: no indexer, the
+# job's replay-from-genesis behavior.
+# The settlement's deployment block: where a BatchPosted scan starts. A
+# public endpoint caps a log query's range; 0 suits anvil.
+variable "settlement_deploy_block" {
+  type        = string
+  description = "The settlement's deployment block on L1. Empty: 0."
+  default     = ""
+}
+
+variable "indexer_url" {
+  type        = string
+  description = "The inbox indexer's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
+  default     = ""
+}
+
+# The EigenDA proxy (nomad/da-proxy.nomad.hcl): the batcher disperses
+# every payload through it and posts the certificate on L1.
+variable "da_proxy" {
+  type        = string
+  description = "The EigenDA proxy's URL. The default is the in-cluster proxy by its Consul service record."
+  default     = "http://kardamom-da-proxy.service.consul:3100"
+}
+
+# The posting cadence. The sealer closes about one block a second even
+# when idle, and every block is posted, so a real L1 pays one post per
+# blocks_per_batch seconds: 5 is right for anvil, 300 for a testnet.
+variable "blocks_per_batch" {
+  type        = string
+  description = "Blocks per post. The default suits the in-cluster anvil; a real L1 takes a larger group."
+  default     = "5"
+}
+
+variable "flush_ms" {
+  type        = string
+  description = "Post a group that holds a transaction after this wait, in milliseconds."
+  default     = "3000"
+}
+
+variable "idle_flush_ms" {
+  type        = string
+  description = "Post a group of empty blocks after this wait, in milliseconds. Empty: the same as flush_ms."
+  default     = ""
+}
+
 variable "l1_rpc" {
   type        = string
-  description = "The L1 JSON-RPC endpoint. The default is the in-cluster anvil by its Consul service record."
+  description = "The L1 JSON-RPC endpoints, comma-separated, best first. A request falls back to the next on an error or a rate limit. The default is the in-cluster anvil by its Consul service record."
   default     = "http://anvil.service.consul:8546"
+}
+
+# The query endpoints that serve block references: every executor's
+# (group_vars/all.yml, ports.executor_nonce_query) and the validator's
+# (ports.validator_query), by the records the jobs register.
+variable "executor_query_port" {
+  type    = number
+  default = 9024
+}
+
+variable "validator_query_port" {
+  type    = number
+  default = 9025
 }
 
 job "batcher" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds batcher (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "batcher"
   }
 
   group "batcher" {
@@ -104,15 +172,25 @@ job "batcher" {
       unlimited      = true
     }
 
+    # In place: a singleton with a static port restarts on its node.
+    # Healthy by its /ready check: the feed loop runs over the restored
+    # spool, so nothing is lost across the restart.
     update {
-      max_parallel     = 1
-      health_check     = "task_states"
-      min_healthy_time = "10s"
-      healthy_deadline = "2m"
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9002
+      }
       # The cluster egress (response) port, unique per allocation. A
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
@@ -135,52 +213,64 @@ job "batcher" {
         # so the pin holds.
         force_pull = true
         # Read-only rootfs. The batcher's
-        # writable surfaces are the cursor file, the DA blob store,
-        # and the aeron directory. All are explicit bind mounts below,
+        # writable surfaces are the cursor file and the aeron
+        # directory. All are explicit bind mounts below,
         # plus Nomad's alloc, local, and secrets mounts. cluster-e2e
         # validates this.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
-          # The cursor file and DA blob store live under the persistent
-          # mount.
+          # The cursor file lives under the persistent mount.
           "/opt/kardamom/batcher:/opt/kardamom/batcher",
         ]
-        args = [
-          "--live",
-          "--dry-run=false",
-          "--config", "/local/batcher.toml",
-          "--log-config", "/local/channels.toml",
-          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          # This allocation's cluster-egress (response) endpoint, for
-          # the batcher's own cluster client session: the node IP and a
-          # Nomad dynamic port, so it never clashes with the validator's
-          # on the same node.
-          "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
-          # The void voter id: the second id after the executors'
-          # (cluster.nomad.hcl builds the sealer's voter list the same way).
-          "--void-voter-id", format("%d", var.executor_count + 1),
-          # Join-miss archive refetch (tx_data and tx_deposits). Same
-          # contract as the validator's flags, on this allocation's
-          # dynamic ports.
-          "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
-          "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
-          "--l1-rpc", var.l1_rpc,
-          "--settlement", "${var.settlement_address}",
-          "--da-store", "/opt/kardamom/batcher/da",
-          "--cursor-file", "/opt/kardamom/batcher/cursor.json",
-          # Group a few blocks per batch. The sealer emits about 1
-          # boundary a second even when idle, and dense DA coverage
-          # means empty blocks get posted too. Grouping keeps idle L1
-          # traffic to about 1 tx every 5 seconds.
-          "--blocks-per-batch", "5",
-          "--flush-ms", "3000",
-          # The L2 chain id. The records commitment digests each
-          # remote-epoch message leaf, which commits to this id. Same
-          # value as the executor and validator jobs.
-          "--chain-id", "412346",
-        ]
+        args = concat(
+          [
+            "--live",
+            "--dry-run=false",
+            "--config", "/local/batcher.toml",
+            "--log-config", "/local/channels.toml",
+            "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+            # This allocation's cluster-egress (response) endpoint, for
+            # the batcher's own cluster client session: the node IP and a
+            # Nomad dynamic port, so it never clashes with the validator's
+            # on the same node.
+            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
+            # The void voter id: the second id after the executors'
+            # (cluster.nomad.hcl builds the sealer's voter list the same way).
+            "--void-voter-id", format("%d", var.executor_count + 1),
+            # Join-miss archive refetch (tx_data and tx_deposits). Same
+            # contract as the validator's flags, on this allocation's
+            # dynamic ports.
+            "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+            "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
+            "--l1-rpc", var.l1_rpc,
+            "--settlement", "${var.settlement_address}",
+            "--da-proxy", var.da_proxy,
+            "--cursor-file", "/opt/kardamom/batcher/cursor.json",
+            "--spool-dir", "/opt/kardamom/batcher/spool",
+            # The block references: the executors' query endpoints by
+            # node name, then the validator's by its service record.
+            "--block-refs-source", join(",", concat(
+              [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"],
+              ["http://kardamom-validator-query.service.${var.datacenter}.consul:${var.validator_query_port}"],
+            )),
+            # Group a few blocks per batch. The sealer emits about 1
+            # boundary a second even when idle, and dense DA coverage
+            # means empty blocks get posted too. Grouping keeps idle L1
+            # traffic to about 1 tx every 5 seconds on anvil; a real L1
+            # takes a larger group (the workloads role, BATCHER_BLOCKS_PER_BATCH).
+            "--blocks-per-batch", var.blocks_per_batch,
+            "--flush-ms", var.flush_ms,
+            # The L2 chain id. The records commitment digests each
+            # remote-epoch message leaf, which commits to this id. Same
+            # value as the executor and validator jobs.
+            "--chain-id", "412346",
+          ],
+          var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
+          var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
+          var.settlement_deploy_block != "" ? ["--settlement-deploy-block", var.settlement_deploy_block] : [],
+        )
       }
 
       env {
@@ -204,6 +294,19 @@ job "batcher" {
       template {
         destination = "local/batcher.toml"
         data        = file("config/executor.toml")
+      }
+
+      service {
+        name     = "kardamom-batcher"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

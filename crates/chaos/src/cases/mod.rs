@@ -2,6 +2,7 @@
 //! assertions; the harness provides the load, the injection gate, and
 //! the common tail.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use crate::accounts::Pin;
@@ -13,7 +14,9 @@ pub(crate) mod cache;
 pub(crate) mod cluster;
 pub(crate) mod component;
 pub(crate) mod coordinated;
+pub(crate) mod deploy;
 pub(crate) mod fleet;
+pub(crate) mod l1;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
@@ -33,6 +36,7 @@ pub enum Case {
     NodeReplaceExecutor,
     StateCheckpointRestore,
     ReplayWindowResync,
+    DeployBrokenImage,
     ClusterLeaderKill,
     ClusterFollowerKill,
     ClusterMemberRejoin,
@@ -61,9 +65,13 @@ pub enum Case {
     RedisPartitionIngress,
     RedisTotalLossRecover,
     MirrorKillRebuild,
+    L1Liar,
+    L1NullReceipts,
+    TwoDayOutage,
+    BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 39] = [
+const ALL: [Case; 44] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -75,6 +83,7 @@ const ALL: [Case; 39] = [
     Case::NodeReplaceExecutor,
     Case::StateCheckpointRestore,
     Case::ReplayWindowResync,
+    Case::DeployBrokenImage,
     Case::ClusterLeaderKill,
     Case::ClusterFollowerKill,
     Case::ClusterMemberRejoin,
@@ -103,6 +112,10 @@ const ALL: [Case; 39] = [
     Case::RedisPartitionIngress,
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
+    Case::L1Liar,
+    Case::L1NullReceipts,
+    Case::TwoDayOutage,
+    Case::BatcherOutagePastRetention,
 ];
 
 impl Case {
@@ -133,6 +146,7 @@ impl Case {
             Self::NodeReplaceExecutor => "node-replace-executor",
             Self::StateCheckpointRestore => "state-checkpoint-restore",
             Self::ReplayWindowResync => "replay-window-resync",
+            Self::DeployBrokenImage => "deploy-broken-image",
             Self::ClusterLeaderKill => "cluster-leader-kill",
             Self::ClusterFollowerKill => "cluster-follower-kill",
             Self::ClusterMemberRejoin => "cluster-member-rejoin",
@@ -161,6 +175,24 @@ impl Case {
             Self::RedisPartitionIngress => "redis-partition-ingress",
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
+            Self::L1Liar => "l1-liar",
+            Self::L1NullReceipts => "l1-null-receipts",
+            Self::TwoDayOutage => "two-day-outage",
+            Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
+        }
+    }
+
+    /// The case load's rate. The L1 cases run below the steady rate: a
+    /// fault that stops the batcher must not push its cursor past the
+    /// small egress retention their shard deploys.
+    #[must_use]
+    pub fn tps(self, k: &Knobs) -> NonZeroU32 {
+        match self {
+            Self::L1Liar
+            | Self::L1NullReceipts
+            | Self::TwoDayOutage
+            | Self::BatcherOutagePastRetention => k.l1_tps,
+            _ => k.tps,
         }
     }
 
@@ -192,6 +224,9 @@ impl Case {
                 inject + k.retention_freeze_cap + Duration::from_mins(2)
             }
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
+            // The failed deployment runs to the executor's healthy
+            // deadline, then the real manifest replaces three executors.
+            Self::DeployBrokenImage => inject + Duration::from_mins(12),
             Self::LookupBlackout => inject + k.restart_slo * 2 + Duration::from_mins(5),
             // The freeze, the election, and the recovery polls.
             Self::RedisPrimaryFreeze | Self::RedisPrimaryKill | Self::RedisPartitionIngress => {
@@ -212,6 +247,23 @@ impl Case {
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
+            }
+            // Three faults, each with its halt and resume waits.
+            Self::L1Liar => inject + (k.l1_fault + Duration::from_mins(3)) * 3,
+            // One fault, a batcher restart inside it, and the posts after.
+            Self::L1NullReceipts => inject + k.l1_fault + k.restart_slo + Duration::from_mins(3),
+            // The liar, two restarts, the floor passing, and the resume.
+            Self::TwoDayOutage => {
+                inject
+                    + k.l1_fault
+                    + k.restart_slo * 2
+                    + k.retention_freeze_cap
+                    + Duration::from_mins(5)
+            }
+            // The freeze until the floor passes, the restart, and the
+            // rebuild of the gap after it.
+            Self::BatcherOutagePastRetention => {
+                inject + k.retention_freeze_cap + k.restart_slo + Duration::from_mins(8)
             }
             _ => Duration::ZERO,
         };
@@ -265,6 +317,7 @@ impl Case {
             Self::NodeReplaceExecutor => component::node_replace_executor(h).await,
             Self::StateCheckpointRestore => component::state_checkpoint_restore(h).await,
             Self::ReplayWindowResync => component::replay_window_resync(h).await,
+            Self::DeployBrokenImage => deploy::broken_image(h).await,
             Self::ClusterLeaderKill => cluster::leader_kill(h).await,
             Self::ClusterFollowerKill => cluster::follower_kill(h).await,
             Self::ClusterMemberRejoin => cluster::member_rejoin(h).await,
@@ -299,6 +352,10 @@ impl Case {
             Self::RedisPartitionIngress => cache::redis_partition_ingress(h).await,
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
+            Self::L1Liar => l1::liar(h).await,
+            Self::L1NullReceipts => l1::null_receipts(h).await,
+            Self::TwoDayOutage => l1::two_day_outage(h).await,
+            Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
         }
     }
 }
@@ -318,6 +375,7 @@ mod tests {
             crate::Shard::Coordinated,
             crate::Shard::Retention,
             crate::Shard::Cache,
+            crate::Shard::L1,
         ] {
             shard
                 .cases()

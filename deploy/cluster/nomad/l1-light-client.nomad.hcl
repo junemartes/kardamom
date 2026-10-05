@@ -66,6 +66,14 @@ variable "rpc_port" {
   default = 8548
 }
 
+# Digest-pinned image, as in the other service jobs: helios publishes
+# none, so the images role wraps its pinned release binary.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -76,9 +84,12 @@ job "l1-light-client" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The node whose role set holds validator: the validator reads the
+  # light client by its Consul service (roles/workloads, workloads_light_host).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "validator"
   }
 
   group "l1-light-client" {
@@ -108,13 +119,18 @@ job "l1-light-client" {
 
     network {
       mode = "host"
+      # The RPC port, as a Consul service: the validator reads it by the
+      # service record (roles/workloads, workloads_light_host).
+      port "rpc" {
+        static = var.rpc_port
+      }
     }
 
     task "helios" {
       driver = "docker"
 
       config {
-        image        = "ghcr.io/a16z/helios:latest"
+        image        = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-l1-light-client:dev"
         force_pull   = true
         network_mode = "host"
         args = [
@@ -137,6 +153,12 @@ job "l1-light-client" {
       # against receiptsRoot pulls a block's full receipt set. This is
       # sized generously rather than tightly; it is a rounding error
       # next to the validator it sits beside.
+      service {
+        name     = "kardamom-l1-light-client"
+        port     = "rpc"
+        provider = "consul"
+      }
+
       resources {
         cpu    = 500
         memory = 512

@@ -42,6 +42,12 @@ pub struct DeployVars {
     pub cluster_snapshot_interval_s: Option<u64>,
     /// `-Dkardamom.cluster.retention` of the sealer, in frames.
     pub cluster_retention: Option<u64>,
+    /// Deploy the L1 fault proxy in front of the in-cluster anvil, and
+    /// point the followers (the batcher, the da-watcher, the indexer) at
+    /// it. The indexer is deployed only with it on a container cluster.
+    pub l1_fault_proxy: bool,
+    /// The indexer's poll cadence, in seconds.
+    pub indexer_poll_s: Option<u64>,
 }
 
 impl DeployVars {
@@ -52,7 +58,18 @@ impl DeployVars {
         let retention = self
             .cluster_retention
             .map(|v| ("KARDAMOM_CLUSTER_RETENTION", v.to_string()));
-        snapshot.into_iter().chain(retention).collect()
+        let proxy = self
+            .l1_fault_proxy
+            .then(|| ("KARDAMOM_L1_FAULT_PROXY", "1".to_string()));
+        let poll = self
+            .indexer_poll_s
+            .map(|v| ("L1_INDEXER_POLL_S", v.to_string()));
+        snapshot
+            .into_iter()
+            .chain(retention)
+            .chain(proxy)
+            .chain(poll)
+            .collect()
     }
 }
 
@@ -149,6 +166,34 @@ impl Lifecycle {
         }
         run_inheriting(cmd, "ansible-playbook ansible/cluster.yml").await?;
         Ok(contract)
+    }
+
+    /// Deploy the workloads of the cluster at `nomad_addr` from the image
+    /// manifest at `manifest`, a path relative to `deploy/cluster`, and
+    /// report whether the deploy succeeded. The output streams to this
+    /// process's stdout and stderr. A failed deploy is a result here, not
+    /// an error: the broken-image case expects one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the playbook cannot be spawned.
+    pub async fn deploy(&self, nomad_addr: &str, manifest: &str) -> anyhow::Result<bool> {
+        let env = vec![
+            ("NOMAD_ADDR", nomad_addr.to_string()),
+            ("DIGEST_MANIFEST", manifest.to_string()),
+            ("KARDAMOM_ENV", "chaos".to_string()),
+        ];
+        let mut cmd = self.command("ansible-playbook", &env);
+        cmd.args(["-i", "localhost,", "ansible/deploy.yml"]);
+        if let Ok(extra) = std::env::var(CLUSTER_VARS_ENV) {
+            cmd.args(["--extra-vars", &extra]);
+        }
+        let status = cmd
+            .stdin(Stdio::null())
+            .status()
+            .await
+            .context("spawn ansible-playbook ansible/deploy.yml")?;
+        Ok(status.success())
     }
 
     /// Replace one node the way a cloud provider replaces a machine: the

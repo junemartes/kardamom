@@ -75,6 +75,8 @@ impl BlockAt {
             end_tx_idx: BPosition::from_index(end),
             l2_timestamp: self.timestamp(),
             l1_origin: 0,
+            base_fee: 0,
+            gas_used: 0,
         }
     }
 

@@ -274,8 +274,9 @@ fn report_s13_da_parity_failure(
 /// delivery flow runs unchanged on a `DevInterop` stack that also carries the
 /// anvil L1 (the S8 DA-posting idiom); the canonical blocks — remote-epoch
 /// records attached to the block each one led — are recovered from the
-/// pipeline's own receipts, posted to L1 as real EIP-4844 blobs, and
-/// `kardamom-reconstruct --expect-root` (plus S8's non-vacuity control) must
+/// pipeline's own receipts, dispersed through the DA proxy with the
+/// certificates posted to L1, and `kardamom-reconstruct --expect-root`
+/// (plus S8's non-vacuity control) must
 /// rebuild the executor's exact state from L1 data alone: root match,
 /// `Inbox.delivered`/`nextSeq` equal, 0x7D receipts reproduced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -337,17 +338,17 @@ async fn s13_xchain_da_parity() {
     let expected_root =
         xchain_da_parity::executor_state_root(&exec_dir).expect("root the executor state");
 
-    // 5. Post to L1 as real blob txs, then rebuild from L1 alone — the
-    //    `--expect-root` gate plus its non-vacuity control (S8's machinery,
-    //    reused verbatim).
+    // 5. Disperse through the DA proxy, post the certificates to L1, then
+    //    rebuild from L1 alone — the `--expect-root` gate plus its
+    //    non-vacuity control (S8's machinery, reused verbatim).
     let l1 = stack.l1().expect("l1");
-    let da_dir = post_and_verify_da(l1, &canonical.blocks, "S13").await;
+    let da = post_and_verify_da(l1, &canonical.blocks, "S13").await;
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis = e2e::harness::services::repo_root().join("chains/dev-interop.toml");
     if let Err(e) = da_parity::reconstruct_and_compare(
         &l1.rpc_url(),
         l1.settlement,
-        da_dir.path(),
+        &da.url(),
         &genesis,
         recon_dir.path(),
         expected_root,

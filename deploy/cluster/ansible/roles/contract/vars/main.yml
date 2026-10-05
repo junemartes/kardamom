@@ -91,12 +91,32 @@ contract_mirrors:
       - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
     forbidden:
       - '"--shards"'
+  - path: deploy/cluster/nomad/l1-light-client.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-light-client:{{ image_tag }}'
+    forbidden: []
+  - path: deploy/cluster/nomad/da-store.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-da-store:{{ image_tag }}'
+      - '"{{ paths.da_store_dir }}:{{ paths.da_store_dir }}"'
+    forbidden: []
+  - path: deploy/cluster/nomad/l1-indexer.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-indexer:{{ image_tag }}'
+      - '"{{ paths.l1_indexer_dir }}:{{ paths.l1_indexer_dir }}"'
+    forbidden: []
   - path: deploy/cluster/nomad/aeron.system.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-aeron:{{ image_tag }}'
       - tags = ["${meta.role}"]
       - chain_id          = "{{ chain_id }}"
       - cluster_id        = "${meta.cluster_id}"
+    forbidden: []
+  - path: deploy/cluster/nomad/l1-fault-proxy.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-l1-fault-proxy:{{ image_tag }}'
+      - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
+      - default     = {{ ports.l1_fault_proxy }}
     forbidden: []
   - path: deploy/cluster/nomad/anvil.nomad.hcl
     required:
@@ -106,7 +126,7 @@ contract_mirrors:
   - path: deploy/cluster/config/sequencer.toml.tpl
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
-      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - '"redis://redis-sentinel.service.consul:{{ ports.redis_sentinel }}"'
       - master_name = "kardamom"
     forbidden: []
   - path: deploy/cluster/nomad/validator.nomad.hcl
@@ -137,6 +157,13 @@ contract_mirrors:
   - path: deploy/cluster/nomad/state-mirror.nomad.hcl
     required:
       - .consul:{{ ports.redis_sentinel }}
+    forbidden: []
+  - path: deploy/cluster/nomad/notifier.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-notifier:{{ image_tag }}'
+      - static = {{ ports.notifier_feed }}
+      - static = {{ ports.notifier_metrics }}
+      - --log-config
     forbidden: []
   - path: deploy/cluster/nomad/redis.nomad.hcl
     required:
@@ -170,6 +197,6 @@ contract_mirrors:
   - path: deploy/cluster/config/ingress.toml
     required:
       - ingress_endpoints = "{{ contract_ingress_endpoints }}"
-      - '"redis://aux-0.node.consul:{{ ports.redis_sentinel }}"'
+      - '"redis://redis-sentinel.service.consul:{{ ports.redis_sentinel }}"'
       - master_name = "kardamom"
     forbidden: []

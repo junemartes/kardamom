@@ -33,6 +33,11 @@ pub enum ReaderToExec {
     Tx {
         envelope: TxEnvelope,
         position: BPosition,
+        /// The reference the canonical stream carried: where the bytes
+        /// are on a `tx_data` archive. The state writer keeps it with
+        /// the receipt, so a block the sealer no longer retains can be
+        /// rebuilt from the archive.
+        tx_ref: kardamom_types::TxRef,
     },
     Deposit(Deposit),
     /// An L1 epoch marker. It advances the block's L1 origin and consumes the
@@ -296,6 +301,7 @@ where
         Ok(self.send(ReaderToExec::Tx {
             envelope: env,
             position,
+            tx_ref,
         }))
     }
 

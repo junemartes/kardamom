@@ -1,0 +1,66 @@
+---
+# The canary gate: one transfer through the ingress, with a receipt. The
+# ingress canary is smoked by its own node address, so the transfer goes
+# through the new instance and nothing else. The sequencer canary is
+# healthy by its own check (its lane publishes and the egress is
+# attached); the smoke then goes through the running ingress and proves
+# the chain still accepts a transaction with the canary in place. A
+# failed smoke fails the play, and the deployment stays unpromoted: the
+# old instances keep serving, and `nomad deployment fail` removes the
+# canary.
+- name: Read the allocations of deployment {{ workloads_deployment_id }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/deployment/allocations/{{ workloads_deployment_id }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_deployment_allocations
+
+- name: Read the running ingress allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/ingress/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_ingress_allocations
+
+- name: Pick the smoke target of the canary of {{ workloads_wait_job }}
+  ansible.builtin.set_fact:
+    workloads_smoke_node: >-
+      {{ (workloads_deployment_allocations.json
+          | selectattr('DeploymentStatus.Canary', 'equalto', true)
+          | map(attribute='NodeID') | first)
+         if workloads_wait_job == 'ingress' else
+         (workloads_ingress_allocations.json
+          | selectattr('ClientStatus', 'equalto', 'running')
+          | rejectattr('DeploymentStatus.Canary', 'equalto', true)
+          | map(attribute='NodeID') | first) }}
+
+- name: Read the node of the smoke target
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/node/{{ workloads_smoke_node }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_smoke_node_info
+
+# The node's advertised HTTP address is its node_ip, as in anvil.yml.
+- name: Smoke the canary of {{ workloads_wait_job }}
+  ansible.builtin.command:
+    argv:
+      - "{{ workloads_cluster_binary }}"
+      - smoke
+      - --rpc
+      - "http://{{ workloads_smoke_node_info.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ ports.ingress_rpc }}"
+  environment:
+    CHAIN_ID: "{{ workloads_chain_id }}"
+  changed_when: false
+
+- name: Promote the canary of {{ workloads_wait_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/deployment/promote/{{ workloads_deployment_id }}?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      DeploymentID: "{{ workloads_deployment_id }}"
+      All: true
+  changed_when: true

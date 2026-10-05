@@ -17,12 +17,18 @@
 //! The proxy holds no canonical state. You can add or remove a proxy at
 //! any time.
 
+// The `#[async_trait]` and `#[rpc]` macros expand trait methods to functions
+// that carry a bare `#[must_use]` and return a pinned boxed future, which is
+// `#[must_use]` on its own. The lint fires in the macros' output, so the crate
+// allows it here.
+#![allow(clippy::double_must_use)]
 pub mod aeron_adapters;
 pub(crate) mod binary;
 pub mod channels;
 pub mod cluster;
 pub mod config;
 pub mod error;
+pub(crate) mod fee_history;
 pub mod json_rpc;
 pub mod metrics;
 pub(crate) mod pending;

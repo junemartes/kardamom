@@ -5,10 +5,14 @@ import {KardamomUUPSBase} from "../factory/KardamomUUPSBase.sol";
 
 /// @title KardamomL2Settlement
 /// @notice A pure data-availability sink. It records `(prevBatchIndex,
-///         blobHashes, l2BlockStart, l2BlockEnd)` and emits `BatchPosted`.
-///         A compare-and-swap check on `prevBatchIndex` guards against
-///         replay. This contract stores no state root; state-root
-///         attestation is a deferred validator concern.
+///         daCert, l2BlockStart, l2BlockEnd)` and emits `BatchPosted`.
+///         The batch bytes live in EigenDA; `daCert` is the certificate
+///         EigenDA's disperser returned for them, opaque to this contract.
+///         A reader retrieves the bytes by the certificate through the
+///         EigenDA proxy, which checks the certificate and the bytes
+///         against it. A compare-and-swap check on `prevBatchIndex`
+///         guards against replay. This contract stores no state root;
+///         state-root attestation is a deferred validator concern.
 /// @dev    Only the Kardamom factory can upgrade this contract, through
 ///         `KardamomUUPSBase`.
 contract KardamomL2Settlement is KardamomUUPSBase {
@@ -31,10 +35,12 @@ contract KardamomL2Settlement is KardamomUUPSBase {
     /// @notice The posted batches, by index. Index 0 is never used.
     mapping(uint64 => BatchEntry) public batches;
 
-    /// @notice Emitted on every successful `postBatch` call.
+    /// @notice Emitted on every successful `postBatch` call. `daCert` is
+    ///         the only place the certificate is kept: a reader takes it
+    ///         from the log, as the blob hashes of a 4844 post would be.
     event BatchPosted(
         uint64 indexed batchIndex,
-        bytes32[] blobHashes,
+        bytes daCert,
         uint64 l2BlockStart,
         uint64 l2BlockEnd,
         bytes32 recordsCommitment
@@ -42,7 +48,7 @@ contract KardamomL2Settlement is KardamomUUPSBase {
 
     error NotBatcher();
     error StaleBatchIndex();
-    error EmptyBlobs();
+    error EmptyCert();
     error BadBlockRange();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -58,18 +64,18 @@ contract KardamomL2Settlement is KardamomUUPSBase {
     /// @notice Record a posted batch on L1.
     /// @dev    Reverts unless `msg.sender == l1Batcher` and
     ///         `prevBatchIndex == lastBatchIndex` (the replay-protection
-    ///         check). Blob bytes travel in the 4844 sidecar and are not
-    ///         stored on chain; only their versioned hashes stay here.
+    ///         check). The batch bytes are not on chain: the certificate
+    ///         names them in EigenDA.
     function postBatch(
         uint64 prevBatchIndex,
-        bytes32[] calldata blobVersionedHashes,
+        bytes calldata daCert,
         uint64 l2BlockStart,
         uint64 l2BlockEnd,
         bytes32 recordsCommitment
     ) external {
         if (msg.sender != l1Batcher) revert NotBatcher();
         if (prevBatchIndex != lastBatchIndex) revert StaleBatchIndex();
-        if (blobVersionedHashes.length == 0) revert EmptyBlobs();
+        if (daCert.length == 0) revert EmptyCert();
         if (l2BlockEnd < l2BlockStart) revert BadBlockRange();
 
         uint64 next = prevBatchIndex + 1;
@@ -77,6 +83,6 @@ contract KardamomL2Settlement is KardamomUUPSBase {
         batches[next] = BatchEntry({
             l2BlockStart: l2BlockStart, l2BlockEnd: l2BlockEnd, recordsCommitment: recordsCommitment
         });
-        emit BatchPosted(next, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment);
+        emit BatchPosted(next, daCert, l2BlockStart, l2BlockEnd, recordsCommitment);
     }
 }

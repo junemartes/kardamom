@@ -1,6 +1,7 @@
 //! [`StateWriter::apply`]: persists one write batch inside a single mdbx
 //! read-write transaction.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use signet_libmdbx::tx::aliases::RwTxSync;
@@ -11,18 +12,18 @@ use kardamom_types::{BlockBoundary, BlockDelta};
 
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_READER_POSITION,
-    KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
+    KEY_L1_REBUILT_END_TX_POSITION, KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION,
+    KEY_LAST_FSYNCED_READER_POSITION, KEY_STATE_ROOT, encode_b_position, encode_b256, encode_u64,
 };
 use crate::schema::{
     HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
-    TABLE_STORAGE, TABLE_TX_HASH_INDEX, encode_block_key, encode_header_value,
-    encode_receipt_value, encode_storage_key, encode_storage_value, encode_tx_hash_key,
-    encode_tx_hash_value,
+    TABLE_STORAGE, TABLE_TX_HASH_INDEX, TxDataRef, TxIndexValue, encode_block_key,
+    encode_header_value, encode_receipt_value, encode_storage_key, encode_storage_value,
+    encode_tx_hash_key, encode_tx_hash_value,
 };
 use crate::trie;
 
-use super::{StateWriter, TrieMode, WriteBatch};
+use super::{StateWriter, TrieMode, TxRefs, WriteBatch};
 
 /// Per-section stopwatches for one `apply` call, reported when
 /// `KARDAMOM_WRITER_TIMING` is set.
@@ -158,6 +159,8 @@ impl<'a> BatchWriter<'a> {
             end_tx_idx: boundary.end_tx_idx,
             l2_timestamp: boundary.l2_timestamp,
             l1_origin: boundary.l1_origin,
+            base_fee: boundary.base_fee,
+            gas_used: boundary.gas_used,
         };
         self.txn.put(
             self.headers,
@@ -168,25 +171,36 @@ impl<'a> BatchWriter<'a> {
         Ok(self)
     }
 
-    /// Write every receipt, then its `tx_hash_index` entry.
+    /// Write every receipt, then its `tx_hash_index` entry, with the
+    /// transaction's archive reference when the block carried one.
     ///
     /// This lets a caller serve `eth_getTransactionReceipt(hash)` with two
     /// reads: `StateDatabase::get_tx_position(hash)`, then
-    /// `StateDatabase::get_receipt(pos)`.
-    fn receipts_and_index(mut self, delta: &BlockDelta) -> Result<Self, StateError> {
+    /// `StateDatabase::get_receipt(pos)`, and the batcher read where a
+    /// block's bytes are once the sealer no longer retains the block.
+    fn receipts_and_index(mut self, batch: &WriteBatch) -> Result<Self, StateError> {
         let t = Instant::now();
+        let delta = &batch.delta;
+        // The references by hash: a lookup per receipt, not a walk per
+        // receipt. The map's order never reaches the table.
+        let refs: &[_] = match &batch.refs {
+            TxRefs::Archive(refs) => refs,
+            TxRefs::RebuiltFromL1 => &[],
+        };
+        let data: HashMap<_, _> = refs.iter().map(|r| (r.tx_hash, TxDataRef::of(r))).collect();
         // Receipts arrive in ascending BPosition order, so use a cursor.
         // One pass writes each receipt and collects its hash-index entry,
         // instead of a second walk over `delta.receipts` just to build `hk`.
         let mut cur = self.txn.cursor(self.receipts)?;
-        let mut hk: Vec<([u8; 32], [u8; 8])> = Vec::with_capacity(delta.receipts.len());
+        let mut hk: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(delta.receipts.len());
         for r in &delta.receipts {
             let pos_key = encode_b_position(r.tx_idx);
             cur.put(&pos_key, &encode_receipt_value(r), WriteFlags::UPSERT)?;
-            hk.push((
-                encode_tx_hash_key(r.tx_hash),
-                encode_tx_hash_value(r.tx_idx),
-            ));
+            let value = TxIndexValue {
+                tx_idx: r.tx_idx,
+                data: data.get(&r.tx_hash).copied(),
+            };
+            hk.push((encode_tx_hash_key(r.tx_hash), encode_tx_hash_value(&value)));
         }
         // The hash index's keys are random. Sort them first, so the cursor
         // gets the same locality benefit.
@@ -201,7 +215,17 @@ impl<'a> BatchWriter<'a> {
 
     /// Write the block-level durable cursors, last so a reader never sees a
     /// cursor advance past data the same transaction has not yet committed.
-    fn meta_cursors(self, boundary: &BlockBoundary) -> Result<Self, StateError> {
+    /// A block rebuilt from L1 also moves the rebuilt mark to its end.
+    fn meta_cursors(self, batch: &WriteBatch) -> Result<Self, StateError> {
+        let boundary = &batch.boundary;
+        if matches!(batch.refs, TxRefs::RebuiltFromL1) {
+            self.txn.put(
+                self.meta,
+                KEY_L1_REBUILT_END_TX_POSITION,
+                encode_b_position(boundary.end_tx_idx),
+                WriteFlags::UPSERT,
+            )?;
+        }
         self.txn.put(
             self.meta,
             KEY_LAST_COMMITTED_BLOCK,
@@ -284,8 +308,8 @@ impl StateWriter {
             .accounts(&batch.delta)?
             .code(&batch.delta)?
             .header(&batch.boundary)?
-            .receipts_and_index(&batch.delta)?
-            .meta_cursors(&batch.boundary)?
+            .receipts_and_index(batch)?
+            .meta_cursors(batch)?
             .advance_state_root(&batch.boundary, &batch.delta)?
             .finish();
 
