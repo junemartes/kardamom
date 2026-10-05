@@ -12,12 +12,16 @@ use kardamom_engine::reader::ReaderToExec;
 use kardamom_types::BlockBoundaryStart;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
-use crate::batcher::{
-    BatcherConfig, MAX_BLOBS_PER_BATCH, PostedBatch, metric_names, pack_block_groups,
-};
+use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_block_groups};
 use crate::error::BatcherError;
 
+use kardamom_types::xchain::remote_epoch_wire_bytes;
+
 use super::cursor::BatchCursor;
+use super::spool::{Restored, Spool};
+
+/// How often the group's timers are checked when no record arrives.
+const TICK: Duration = Duration::from_secs(1);
 use super::live_metric_names;
 use super::sender::LiveSender;
 
@@ -28,25 +32,64 @@ pub(crate) struct FeedConfig {
     pub compress: bool,
     /// The L2 chain id. See [`BatcherConfig::chain_id`].
     pub chain_id: u64,
-    /// Post a partial group if the oldest pending block has waited this long.
+    /// Post the group when its oldest block has waited this long and the
+    /// group holds a transaction or a remote-epoch record.
     pub flush: Duration,
+    /// The same, for a group of empty blocks. A real L1 takes a long one:
+    /// an idle chain closes a block a second, and each post costs gas.
+    pub idle_flush: Duration,
+    /// Post the group once its blocks' raw bytes reach this: one full
+    /// post per fee, under the payload ceiling so it stays one post.
+    pub target_payload_bytes: NonZeroUsize,
     /// Drop closed blocks at or below this number without posting. L1
     /// already covers them, from the startup reconcile.
     pub skip_through_block: u64,
 }
 
 /// A pending close-policy group: the blocks buffered so far, when the
-/// oldest one arrived (for the flush timeout), and the [`BatchCursor`] a
-/// post of this group right now would confirm. Existing only while
-/// non-empty makes an empty post unrepresentable, instead of checked with
-/// a `blocks.last()` at post time.
+/// oldest one arrived (for the flush timers), whether any block carries
+/// something to post beyond its boundary, and the [`BatchCursor`] a post
+/// of this group right now would confirm. Existing only while non-empty
+/// makes an empty post unrepresentable, instead of checked with a
+/// `blocks.last()` at post time.
 struct PendingGroup {
     since: Instant,
     blocks: Vec<ClosedBlock>,
+    /// A transaction or a remote-epoch record is in the group: the
+    /// shorter flush timer applies.
+    has_traffic: bool,
+    /// The raw bytes of the group's transactions and records, an upper
+    /// bound of the compressed payload.
+    raw_bytes: usize,
     cursor: BatchCursor,
 }
 
+/// The raw bytes a closed block adds to a payload: its transactions and
+/// its remote-epoch records as framed, before compression.
+fn raw_bytes_of(block: &ClosedBlock) -> usize {
+    let txs: usize = block.txs.iter().map(|t| t.envelope.raw_tx.len()).sum();
+    let records: usize = block
+        .remote_epochs
+        .iter()
+        .map(|r| remote_epoch_wire_bytes(r.messages.iter().map(|m| m.input.len())))
+        .sum();
+    txs.saturating_add(records)
+}
+
 impl PendingGroup {
+    /// The group is due: it is full by count or by bytes, or its oldest
+    /// block has waited past the timer its contents select.
+    fn due(&self, cfg: &FeedConfig) -> bool {
+        let timer = if self.has_traffic {
+            cfg.flush
+        } else {
+            cfg.idle_flush
+        };
+        self.blocks.len() >= cfg.blocks_per_batch.get()
+            || self.raw_bytes >= cfg.target_payload_bytes.get()
+            || self.since.elapsed() >= timer
+    }
+
     /// The cursor a post that ends at `block_number` confirms: the group's
     /// cursor when that is the group's last block, else the cursor just
     /// past the named block.
@@ -76,48 +119,133 @@ impl PendingGroup {
 /// [`LiveSender`]. The reader thread feeds it over a bounded tokio channel,
 /// until that channel closes or a post fails and stops the loop. This is
 /// crash-only: there is no graceful drain. The cursor is at-least-once, and
-/// a restart re-observes records.
+/// a restart re-observes records. The loop outlives one reader stack: a
+/// refused replay ends the stack, the store fills the gap into the
+/// group, and the loop runs on the next stack's channel.
 pub(crate) struct FeedLoop<P> {
-    rx: Receiver<ReaderToExec>,
     sender: LiveSender<P>,
     cfg: FeedConfig,
     pack_cfg: BatcherConfig,
     acc: BatchAccumulator,
     pending: Option<PendingGroup>,
+    /// The consumed, unposted blocks on disk (`super::spool`).
+    spool: Spool,
+}
+
+impl PendingGroup {
+    /// The group a restarted batcher continues: the spooled blocks, aged
+    /// from the oldest one's write.
+    fn restored(restored: Restored) -> Option<Self> {
+        let last = restored.blocks.last()?;
+        let age = restored
+            .oldest_written
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        let has_traffic = restored
+            .blocks
+            .iter()
+            .any(|b| !b.txs.is_empty() || !b.remote_epochs.is_empty());
+        let raw_bytes = restored.blocks.iter().map(raw_bytes_of).sum();
+        let cursor = BatchCursor {
+            next_index: last.end_tx_idx.as_index(),
+            next_block: last.block_number.saturating_add(1),
+            last_batch_index: 0,
+        };
+        Some(Self {
+            since: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+            blocks: restored.blocks,
+            has_traffic,
+            raw_bytes,
+            cursor,
+        })
+    }
 }
 
 impl<P: Provider> FeedLoop<P> {
-    pub(crate) fn new(rx: Receiver<ReaderToExec>, sender: LiveSender<P>, cfg: FeedConfig) -> Self {
+    /// A loop whose pending group starts as `restored`, the spool's
+    /// content; the reader resumes just past it (see `run`).
+    pub(crate) fn new(
+        sender: LiveSender<P>,
+        cfg: FeedConfig,
+        spool: Spool,
+        restored: Restored,
+    ) -> Self {
         let pack_cfg = BatcherConfig {
             blocks_per_batch: cfg.blocks_per_batch,
             compress: cfg.compress,
             chain_id: cfg.chain_id,
             ..Default::default()
         };
+        let pending = PendingGroup::restored(restored);
+        if let Some(group) = &pending {
+            tracing::info!(
+                blocks = group.blocks.len(),
+                through = group.cursor.next_block.saturating_sub(1),
+                "pending group restored from the spool"
+            );
+        }
         Self {
-            rx,
             sender,
             cfg,
             pack_cfg,
             acc: BatchAccumulator::new(),
-            pending: None,
+            pending,
+            spool,
         }
     }
 
-    /// Run until the channel closes or a post fails after its retry budget.
+    /// Run on `rx` until the channel closes or a post fails after its
+    /// retry budget, and return why: the ordering channel closed, or
+    /// [`LiveSender::post_confirmed`] failed after its retry budget.
+    pub(crate) async fn run(&mut self, mut rx: Receiver<ReaderToExec>) -> anyhow::Error {
+        loop {
+            let event = tokio::time::timeout(TICK, rx.recv()).await;
+            if let Err(why) = self.handle_event(event).await {
+                return why;
+            }
+        }
+    }
+
+    /// The block the reader resumes after: re-observed blocks up to it
+    /// drop.
+    #[cfg(test)]
+    pub(crate) fn skip_through_block(&self) -> u64 {
+        self.cfg.skip_through_block
+    }
+
+    /// The blocks in the pending group.
+    #[cfg(test)]
+    pub(crate) fn pending_blocks(&self) -> usize {
+        self.pending.as_ref().map_or(0, |g| g.blocks.len())
+    }
+
+    /// Add rebuilt blocks, in order, as if the sealer had served them:
+    /// into the spool and the pending group. The reader
+    /// then resumes just past them, and re-observed blocks up to the last
+    /// one drop. Returns the cursor the reader resumes at.
     ///
     /// # Errors
-    /// Returns an error when the ordering channel closes, or when
-    /// [`LiveSender::post_confirmed`] fails after its retry budget.
-    pub(crate) async fn run(mut self) -> Result<()> {
-        loop {
-            let event = tokio::time::timeout(self.cfg.flush, self.rx.recv()).await;
-            self.handle_event(event).await?;
+    /// Returns an error when the spool write fails, or a block number
+    /// overflows.
+    pub(crate) fn absorb(&mut self, blocks: Vec<ClosedBlock>) -> Result<BatchCursor> {
+        let count = blocks.len();
+        let mut resume = self
+            .pending
+            .as_ref()
+            .map_or(BatchCursor::genesis(), |g| g.cursor);
+        for closed in blocks {
+            resume = self.push_closed(closed)?;
         }
+        self.cfg.skip_through_block = resume.next_block.saturating_sub(1);
+        counter!(live_metric_names::REBUILT_BLOCKS).increment(count as u64);
+        Ok(resume)
     }
 
     /// One [`Self::run`] tick: a channel event (a new record to buffer, or
-    /// the channel closing), or the flush timeout, whichever comes first.
+    /// the channel closing), or the tick, whichever comes first. The
+    /// group's timers are checked on every boundary and on every tick: a
+    /// live chain closes a block a second, so a check only when the
+    /// channel is quiet would never run.
     async fn handle_event(
         &mut self,
         event: Result<Option<ReaderToExec>, tokio::time::error::Elapsed>,
@@ -152,17 +280,27 @@ impl<P: Provider> FeedLoop<P> {
             }
             Ok(Some(ReaderToExec::Boundary(b))) => {
                 self.observe_boundary(&b)?;
-                let full = self.cfg.blocks_per_batch.get();
-                self.flush_if(|g| g.blocks.len() >= full).await?;
+                self.flush_if_due().await?;
             }
-            // Flush timeout.
-            Err(_) => {
-                let flush = self.cfg.flush;
-                self.flush_if(|g| g.since.elapsed() >= flush).await?;
+            Err(_) => self.flush_if_due().await?,
+            Ok(None) => {
+                self.post_pending().await?;
+                bail!("tx_ordering reader channel closed; see reader thread error")
             }
-            Ok(None) => bail!("tx_ordering reader channel closed; see reader thread error"),
         }
         Ok(())
+    }
+
+    /// Post the pending group, due or not. The reader stopped, so no
+    /// block joins the group any more. Its blocks are closed and spooled,
+    /// and a refused replay (the cursor past the sealers' retention) is
+    /// the case where nothing else can post them: the spool is their
+    /// only copy.
+    async fn post_pending(&mut self) -> Result<()> {
+        match self.pending.take() {
+            Some(group) => self.post_group(group).await,
+            None => Ok(()),
+        }
     }
 
     /// Close the current block. Buffer it for posting, unless L1 already
@@ -181,6 +319,12 @@ impl<P: Provider> FeedLoop<P> {
             counter!(live_metric_names::SKIPPED_POSTED_BLOCKS).increment(1);
             return Ok(());
         }
+        self.push_closed(closed).map(|_| ())
+    }
+
+    /// Spool `closed` and add it to the pending group. Returns the cursor
+    /// a post right after this call confirms.
+    fn push_closed(&mut self, closed: ClosedBlock) -> Result<BatchCursor> {
         let next_block = closed
             .block_number
             .checked_add(1)
@@ -191,11 +335,16 @@ impl<P: Provider> FeedLoop<P> {
             // `LiveSender::post_confirmed` stamps `last_batch_index`.
             last_batch_index: 0,
         };
+        self.spool.append(&closed)?;
         let group = self.pending.get_or_insert_with(|| PendingGroup {
             since: Instant::now(),
             blocks: Vec::new(),
+            has_traffic: false,
+            raw_bytes: 0,
             cursor,
         });
+        group.has_traffic |= !closed.txs.is_empty() || !closed.remote_epochs.is_empty();
+        group.raw_bytes = group.raw_bytes.saturating_add(raw_bytes_of(&closed));
         group.blocks.push(closed);
         group.cursor = cursor;
         // Metric value; f64 precision loss only above 2^52, never reached
@@ -205,14 +354,13 @@ impl<P: Provider> FeedLoop<P> {
             reason = "pending-block count never nears 2^52"
         )]
         gauge!(live_metric_names::PENDING_BLOCKS).set(group.blocks.len() as f64);
-        Ok(())
+        Ok(cursor)
     }
 
-    /// Post the pending group if `ready` says it's due — the shape both
-    /// the `Boundary` arm (the group fills) and the flush-timeout arm (the
-    /// flush deadline elapses) share.
-    async fn flush_if(&mut self, ready: impl FnOnce(&PendingGroup) -> bool) -> Result<()> {
-        if let Some(group) = self.pending.take_if(|g| ready(g)) {
+    /// Post the pending group if it is due.
+    async fn flush_if_due(&mut self) -> Result<()> {
+        let cfg = &self.cfg;
+        if let Some(group) = self.pending.take_if(|g| g.due(cfg)) {
             self.post_group(group).await?;
         }
         Ok(())
@@ -243,7 +391,8 @@ impl<P: Provider> FeedLoop<P> {
     /// own cursor.
     async fn post_one(&mut self, batch: &PostedBatch, group: &PendingGroup) -> Result<()> {
         let cursor = group.cursor_at(batch.l2_block_end)?;
-        self.sender.post_confirmed(batch, cursor).await
+        self.sender.post_confirmed(batch, cursor).await?;
+        self.spool.clear_through(batch.l2_block_end)
     }
 }
 
@@ -252,15 +401,87 @@ impl<P: Provider> FeedLoop<P> {
 fn log_pack_error(e: BatcherError) -> anyhow::Error {
     if let BatcherError::BlockTooLarge {
         block_number,
-        blobs,
+        bytes,
+        ceiling,
     } = &e
     {
         tracing::error!(
             block = block_number,
-            blobs,
-            ceiling = MAX_BLOBS_PER_BATCH,
-            "FATAL: one block alone exceeds the blob ceiling; the batcher cannot post it"
+            bytes,
+            ceiling,
+            "FATAL: one block alone exceeds the payload ceiling; the batcher cannot post it"
         );
     }
     e.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    fn cfg() -> FeedConfig {
+        FeedConfig {
+            blocks_per_batch: NonZeroUsize::new(3).unwrap(),
+            compress: false,
+            chain_id: 1,
+            flush: Duration::from_secs(60),
+            idle_flush: Duration::from_secs(3600),
+            target_payload_bytes: NonZeroUsize::new(1000).unwrap(),
+            skip_through_block: 0,
+        }
+    }
+
+    fn empty_block(block_number: u64) -> ClosedBlock {
+        ClosedBlock {
+            block_number,
+            l2_timestamp: 0,
+            end_tx_idx: kardamom_types::BPosition {
+                term_id: 0,
+                term_offset: 0,
+            },
+            l1_origin: 0,
+            remote_epochs: Vec::new(),
+            txs: Vec::new(),
+        }
+    }
+
+    fn group(age: Duration, blocks: u64, has_traffic: bool) -> PendingGroup {
+        PendingGroup {
+            since: Instant::now().checked_sub(age).unwrap(),
+            blocks: (1..=blocks).map(empty_block).collect(),
+            has_traffic,
+            raw_bytes: 0,
+            cursor: BatchCursor::genesis(),
+        }
+    }
+
+    #[test]
+    fn a_group_with_traffic_waits_the_short_timer() {
+        assert!(!group(Duration::from_secs(59), 1, true).due(&cfg()));
+        assert!(group(Duration::from_secs(60), 1, true).due(&cfg()));
+    }
+
+    #[test]
+    fn an_idle_group_waits_the_long_timer() {
+        assert!(!group(Duration::from_secs(60), 1, false).due(&cfg()));
+        assert!(!group(Duration::from_secs(3599), 1, false).due(&cfg()));
+        assert!(group(Duration::from_secs(3600), 1, false).due(&cfg()));
+    }
+
+    #[test]
+    fn a_full_group_is_due_at_once() {
+        assert!(group(Duration::ZERO, 3, false).due(&cfg()));
+        assert!(!group(Duration::ZERO, 2, true).due(&cfg()));
+    }
+
+    #[test]
+    fn a_group_at_the_byte_target_is_due_at_once() {
+        let mut g = group(Duration::ZERO, 1, true);
+        g.raw_bytes = 999;
+        assert!(!g.due(&cfg()));
+        g.raw_bytes = 1000;
+        assert!(g.due(&cfg()));
+    }
 }

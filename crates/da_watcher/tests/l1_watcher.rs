@@ -314,3 +314,30 @@ async fn block_hash_failure_stops_the_range() {
     assert!(matches!(err, MonitorError::BlockHash(_)));
     assert_eq!(w.cursor(), Some(150));
 }
+
+#[tokio::test]
+async fn a_block_that_does_not_descend_from_the_published_one_is_refused() {
+    let pub_ = InMemoryEpochPublisher::default();
+    let src = MockL1Source::new();
+    // Blocks 10 and 11 publish; 12 then claims a parent that is not 11's
+    // hash, twice: the watcher refuses it each time and keeps its cursor.
+    src.push_tip(Ok(11));
+    src.push_logs(Ok(vec![]));
+    src.push_tip(Ok(12));
+    src.push_logs(Ok(vec![]));
+    src.push_tip(Ok(12));
+    src.push_logs(Ok(vec![]));
+    src.parent_lies.lock().unwrap().insert(12);
+    let mut w = watcher(&pub_, src, Some(9));
+    assert_eq!(w.process_once().await.unwrap(), 2);
+    assert_eq!(w.cursor(), Some(11));
+    let err = w.process_once().await.unwrap_err();
+    assert!(
+        matches!(err, MonitorError::ChainBreak { number: 12, .. }),
+        "expected a chain break, got {err}"
+    );
+    assert_eq!(w.cursor(), Some(11));
+    assert_eq!(pub_.published.lock().unwrap().len(), 2);
+    let err = w.process_once().await.unwrap_err();
+    assert!(matches!(err, MonitorError::ChainBreak { number: 12, .. }));
+}

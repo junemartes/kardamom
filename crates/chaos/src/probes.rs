@@ -19,6 +19,11 @@ pub const MIRROR_PORT: u16 = 9007;
 /// The ingress and the validator share this port on different nodes.
 pub const INGRESS_PORT: u16 = 9006;
 pub const VALIDATOR_PORT: u16 = 9006;
+/// The batcher, the da-watcher and the inbox indexer export on the aux
+/// node beyond loopback, so the monitoring job scrapes them.
+pub const BATCHER_PORT: u16 = 9002;
+pub const DA_WATCHER_PORT: u16 = 9005;
+pub const INDEXER_PORT: u16 = 9009;
 /// Lane 0's metrics port: `9001 + 10 * lane`.
 pub const SEQUENCER_LANE0_PORT: u16 = 9001;
 /// The Nomad task name inside the `cluster` job.
@@ -128,6 +133,27 @@ impl Probes {
     #[must_use]
     pub fn validator_target(&self) -> Target {
         Target::loopback(&self.validator.container, VALIDATOR_PORT)
+    }
+
+    /// One exporter on the aux node, reached over the bridge.
+    #[must_use]
+    pub fn aux_target(&self, port: u16) -> Target {
+        Target::bridged(self.validator.ip, &self.validator.container, port)
+    }
+
+    /// The first-sample value of `metric` on the aux exporter at `port`.
+    /// `None` on a failed scrape.
+    pub async fn aux_metric(&self, port: u16, metric: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.aux_target(port)).await?;
+        metrics::first(&body, metric)
+    }
+
+    /// The label-filtered sum of `metric` on the aux exporter at `port`:
+    /// zero when the exporter answers without the label, `None` on a
+    /// failed scrape.
+    pub async fn aux_metric_where(&self, port: u16, metric: &str, label: &str) -> Option<i64> {
+        let body = self.scrape.fetch(&self.aux_target(port)).await?;
+        metrics::sum_where(&body, metric, label)
     }
 
     /// One ingress node's loopback target.

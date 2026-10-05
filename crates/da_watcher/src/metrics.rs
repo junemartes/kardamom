@@ -12,6 +12,13 @@ pub const EPOCHS_PUBLISHED_TOTAL: &str = "kardamom_da_watcher_epochs_published_t
 /// `L1_FINALIZED`, this gives the origin lag used by the rule-5 liveness
 /// alarm.
 pub const EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
+/// Two L1 sources answered differently for one block or one log query,
+/// and no light client settled it. Any increase is an alert: one of the
+/// endpoints lies, and the follower halts until they agree.
+pub const L1_SOURCE_DISAGREEMENT_TOTAL: &str = "kardamom_l1_source_disagreement_total";
+/// An L1 source rotated out of its set for a backoff, labelled by source
+/// name and reason (`error`, `rate_limited`, `disagreement`).
+pub const L1_SOURCE_ROTATIONS_TOTAL: &str = "kardamom_l1_source_rotations_total";
 
 // Interop watcher (crate::interop) counterparts. All carry an `origin` label
 // (the peer chain id) because one process may watch several peers and a
@@ -26,6 +33,9 @@ pub const REMOTE_WATCHER_TICK_TOTAL: &str = "kardamom_da_watcher_remote_tick_tot
 /// exactly the one whose gauge is flat while the peer keeps sending — the
 /// interop analogue of the L1 origin lag.
 pub const REMOTE_CURSOR_SEQ: &str = "kardamom_da_watcher_remote_cursor_seq";
+/// The unix time of the last completed tick of any watcher. The
+/// readiness rule requires one within two poll periods.
+pub const LAST_TICK_UNIX_SECONDS: &str = "kardamom_da_watcher_last_tick_unix_seconds";
 /// Failed durable-cursor writes. Non-fatal by design (a stale cursor resumes
 /// harmlessly through dedup), but a GROWING count means the next restart
 /// replays further and further back — an operator alarm, not an error path.
@@ -46,6 +56,14 @@ pub fn describe() {
     metrics::describe_gauge!(
         EPOCH_ORIGIN,
         "highest L1 block number an epoch has been published for; L1_FINALIZED minus this is the origin lag"
+    );
+    metrics::describe_counter!(
+        L1_SOURCE_DISAGREEMENT_TOTAL,
+        "L1 source disagreements on a block or a log query; any increase means an endpoint lies"
+    );
+    metrics::describe_counter!(
+        L1_SOURCE_ROTATIONS_TOTAL,
+        "L1 sources rotated out for a backoff, labelled by source and reason"
     );
     metrics::describe_counter!(
         REMOTE_MESSAGES_RECEIVED_TOTAL,

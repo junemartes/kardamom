@@ -50,6 +50,18 @@ impl DecodedTx {
     pub fn tx_env(&self, signer: Address) -> TxEnv {
         tx_env_from_alloy(&self.0, signer)
     }
+
+    /// The fee fields, as the settlement reads them. A legacy or 2930
+    /// transaction carries one price, read as both the cap and the rate.
+    #[must_use]
+    pub fn fees(&self) -> kardamom_types::TxFees {
+        kardamom_types::TxFees {
+            gas_limit: self.0.gas_limit(),
+            max_fee_per_gas: self.0.max_fee_per_gas(),
+            max_priority_fee_per_gas: self.0.priority_fee_or_price(),
+            legacy: !self.0.is_dynamic_fee(),
+        }
+    }
 }
 
 impl core::ops::Deref for DecodedTx {

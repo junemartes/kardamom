@@ -5,10 +5,14 @@ use std::path::Path;
 use alloy_primitives::Address;
 use alloy_provider::Provider;
 use anyhow::{Context, Result, bail};
+
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::l1::read_posted_batches;
+use crate::da::DaProxy;
+use crate::frame::BlockFrame;
+use crate::indexer::IndexerClient;
+use crate::l1::{read_posted_batches, recover_blocks};
 use crate::settlement::IKardamomL2Settlement;
 
 /// The durable cursor: the ordering-stream position matching the last
@@ -23,6 +27,17 @@ pub struct BatchCursor {
 }
 
 impl BatchCursor {
+    /// The last block the feed drops without posting, when the reader
+    /// resumes at this cursor and L1 covers through `l1_covered`. A
+    /// cursor file can trail L1: a post confirms on L1, and the batcher
+    /// stops before it writes the cursor (a lost receipt, a kill). The
+    /// replay then sees blocks L1 already holds, and a second post of
+    /// them overlaps the record.
+    #[must_use]
+    pub fn skip_through(self, l1_covered: u64) -> u64 {
+        self.next_block.saturating_sub(1).max(l1_covered)
+    }
+
     /// A fresh consumer: no records seen, the first boundary is block 1,
     /// and nothing is posted (`lastBatchIndex` starts at 0 on-chain; batch
     /// indices start at 1).
@@ -64,17 +79,16 @@ impl BatchCursor {
 }
 
 /// What L1 says has been posted: the CAS counter, and the block the chain
-/// is covered through (the latest `BatchPosted.l2BlockEnd`; 0 when nothing
-/// is posted yet, since L2 blocks start at 1).
+/// is covered through (the `l2BlockEnd` the contract stores with that
+/// batch; 0 when nothing is posted yet, since L2 blocks start at 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct L1Truth {
+pub struct L1Truth {
     pub last_batch_index: u64,
     pub covered_through_block: u64,
 }
 
-/// The settlement contract's CAS counter (`lastBatchIndex`). Both
-/// [`read_l1_truth`] and the offline post path use this. The offline path
-/// needs only the counter, not the `BatchPosted` event scan.
+/// The settlement contract's CAS counter (`lastBatchIndex`). The offline
+/// post path needs only the counter.
 ///
 /// # Errors
 /// Returns an error when the contract call fails.
@@ -86,31 +100,143 @@ pub async fn read_last_batch_index<P: Provider>(provider: &P, settlement: Addres
         .context("read lastBatchIndex")
 }
 
-/// Read the settlement contract's view. The event scan runs from L1 block
-/// 0. This is fine against the dev-cluster anvil. A long-lived L1 should
-/// pass a deployment block hint here.
-pub(crate) async fn read_l1_truth<P: Provider>(
-    provider: &P,
-    settlement: Address,
-) -> Result<L1Truth> {
-    let last = read_last_batch_index(provider, settlement).await?;
-    if last == 0 {
-        return Ok(L1Truth {
+impl L1Truth {
+    const fn nothing_posted() -> Self {
+        Self {
             last_batch_index: 0,
             covered_through_block: 0,
-        });
+        }
     }
-    let posted = read_posted_batches(provider, settlement, 0)
-        .await
-        .context("read BatchPosted events")?;
-    let head = posted
-        .iter()
-        .find(|d| d.index == last)
-        .with_context(|| format!("lastBatchIndex={last} but no BatchPosted event with it"))?;
-    Ok(L1Truth {
-        last_batch_index: last,
-        covered_through_block: head.l2_block_end,
-    })
+
+    /// The settlement contract's view, through two `eth_call`s: the CAS
+    /// counter, and the covered block the contract stores with that
+    /// batch. No event scan and no indexer: an endpoint that swallows the
+    /// `BatchPosted` logs, or an indexer behind the head, cannot stall a
+    /// start.
+    ///
+    /// # Errors
+    /// Returns an error when a contract call fails.
+    pub async fn read<P: Provider>(provider: &P, settlement: Address) -> Result<Self> {
+        let contract = IKardamomL2Settlement::new(settlement, provider);
+        let last = contract
+            .lastBatchIndex()
+            .call()
+            .await
+            .context("read lastBatchIndex")?;
+        if last == 0 {
+            return Ok(Self::nothing_posted());
+        }
+        let entry = contract
+            .batches(last)
+            .call()
+            .await
+            .with_context(|| format!("read batches({last})"))?;
+        Ok(Self {
+            last_batch_index: last,
+            covered_through_block: entry.l2BlockEnd,
+        })
+    }
+}
+
+/// Where the last posted batch's payload comes from when no cursor file
+/// exists: the indexer's archive when it holds the batch, else the
+/// `BatchPosted` log and the DA proxy, the inputs of a rebuild. Neither
+/// waits: an indexer behind the head answers at once, and the read falls
+/// through to L1.
+pub(crate) struct PayloadSources<'a, P> {
+    pub(crate) indexer: Option<&'a IndexerClient>,
+    pub(crate) provider: &'a P,
+    pub(crate) da: &'a DaProxy,
+    pub(crate) settlement: Address,
+    /// Where the `BatchPosted` scan starts.
+    pub(crate) deploy_block: u64,
+}
+
+impl<P: Provider> PayloadSources<'_, P> {
+    /// The cursor a fresh batcher resumes from when L1 already holds
+    /// batches: the position just past the last posted batch, read from
+    /// that batch's own blobs. The blobs carry each block's cursor
+    /// (`BlockCursor`), so the replay request names a point of the stream
+    /// the sealer can check, instead of genesis, which the cluster's
+    /// retention cannot serve.
+    ///
+    /// # Errors
+    /// Returns an error when no source serves the batch, a blob fails
+    /// verification, or the batch's last block is not L1's covered block.
+    pub(crate) async fn resume(&self, l1: L1Truth) -> Result<(BatchCursor, u64)> {
+        let blocks = match self.blocks_from_indexer(l1.last_batch_index).await? {
+            Some(blocks) => blocks,
+            None => self.blocks_from_l1(l1.last_batch_index).await?,
+        };
+        resume_from_blocks(&blocks, l1)
+    }
+
+    /// The batch's blocks from the indexer, or `None` without an indexer
+    /// or while it has not reached the batch.
+    async fn blocks_from_indexer(&self, index: u64) -> Result<Option<Vec<BlockFrame>>> {
+        let Some(indexer) = self.indexer else {
+            return Ok(None);
+        };
+        let Some(descriptor) = indexer.batch(index).await? else {
+            warn!(
+                last_batch_index = index,
+                "indexer has not reached the last batch; reading it from L1 and the DA proxy"
+            );
+            return Ok(None);
+        };
+        let blocks = recover_blocks(std::slice::from_ref(&descriptor), indexer)
+            .with_context(|| format!("recover batch {index} from the indexer"))?;
+        Ok(Some(blocks))
+    }
+
+    /// The batch's blocks from its `BatchPosted` log and the DA proxy.
+    async fn blocks_from_l1(&self, index: u64) -> Result<Vec<BlockFrame>> {
+        let posted = read_posted_batches(self.provider, self.settlement, self.deploy_block)
+            .await
+            .context("read BatchPosted events")?;
+        let descriptor = posted
+            .into_iter()
+            .find(|d| d.index == index)
+            .with_context(|| format!("lastBatchIndex={index} but no BatchPosted event with it"))?;
+        recover_blocks(std::slice::from_ref(&descriptor), self.da)
+            .with_context(|| format!("recover batch {index} from the DA proxy"))
+    }
+}
+
+/// [`PayloadSources::resume`] on recovered blocks. A batch of version-2
+/// blobs carries no cursor; then the replay starts at genesis, as
+/// without a source.
+pub(crate) fn resume_from_blocks(blocks: &[BlockFrame], l1: L1Truth) -> Result<(BatchCursor, u64)> {
+    let last = blocks
+        .last()
+        .with_context(|| format!("batch {} holds no block", l1.last_batch_index))?;
+    if last.block_number != l1.covered_through_block {
+        bail!(
+            "batch {} ends at block {} but L1 says it covers through {}",
+            l1.last_batch_index,
+            last.block_number,
+            l1.covered_through_block
+        );
+    }
+    let Some(cursor) = last.cursor else {
+        warn!(
+            last_batch_index = l1.last_batch_index,
+            "last batch carries no block cursor (version 2 blobs); replaying from genesis"
+        );
+        return Ok(genesis_reconcile(l1));
+    };
+    let next_block = last
+        .block_number
+        .checked_add(1)
+        .context("block_number overflowed u64")?;
+    Ok((
+        BatchCursor {
+            next_index: cursor.end_tx_idx,
+            next_block,
+            last_batch_index: l1.last_batch_index,
+        },
+        l1.covered_through_block,
+    ))
 }
 
 /// Reconcile the cursor file against L1 at startup. Returns the cursor to
@@ -155,6 +281,70 @@ fn genesis_reconcile(l1: L1Truth) -> (BatchCursor, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::BlockCursor;
+
+    fn truth(last_batch_index: u64, covered_through_block: u64) -> L1Truth {
+        L1Truth {
+            last_batch_index,
+            covered_through_block,
+        }
+    }
+
+    fn frame(block_number: u64, cursor: Option<BlockCursor>) -> BlockFrame {
+        BlockFrame {
+            block_number,
+            cursor,
+            ..BlockFrame::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_batcher_resumes_just_past_the_last_posted_batch() {
+        let blocks = [
+            frame(
+                11,
+                Some(BlockCursor {
+                    end_tx_idx: 30,
+                    l1_origin: 5,
+                }),
+            ),
+            frame(
+                12,
+                Some(BlockCursor {
+                    end_tx_idx: 40,
+                    l1_origin: 5,
+                }),
+            ),
+        ];
+        let (cursor, skip) = resume_from_blocks(&blocks, truth(7, 12)).unwrap();
+        assert_eq!(
+            cursor,
+            BatchCursor {
+                next_index: 40,
+                next_block: 13,
+                last_batch_index: 7,
+            }
+        );
+        assert_eq!(skip, 12);
+    }
+
+    #[test]
+    fn a_batch_without_block_cursors_replays_from_genesis() {
+        let blocks = [frame(12, None)];
+        let (cursor, skip) = resume_from_blocks(&blocks, truth(7, 12)).unwrap();
+        assert_eq!(cursor, BatchCursor::genesis());
+        assert_eq!(skip, 12);
+    }
+
+    #[test]
+    fn a_batch_that_does_not_end_at_the_covered_block_is_refused() {
+        let blocks = [frame(11, Some(BlockCursor::default()))];
+        let err = resume_from_blocks(&blocks, truth(7, 12))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ends at block 11"), "{err}");
+        assert!(resume_from_blocks(&[], truth(7, 12)).is_err());
+    }
 
     #[test]
     fn cursor_roundtrip_and_missing() {
@@ -170,6 +360,18 @@ mod tests {
         c.store(&path).unwrap();
         assert_eq!(BatchCursor::load(&path).unwrap(), Some(c));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_feed_skips_what_l1_covers_when_the_cursor_trails() {
+        let trailing = BatchCursor {
+            next_index: 43_773,
+            next_block: 660,
+            last_batch_index: 207,
+        };
+        assert_eq!(trailing.skip_through(662), 662);
+        assert_eq!(trailing.skip_through(600), 659);
+        assert_eq!(BatchCursor::genesis().skip_through(0), 0);
     }
 
     #[test]

@@ -18,16 +18,18 @@
 
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::multi_archive_reader::ResolvedRecord;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 pub struct RecordedTx {
     pub position: BPosition,
     pub envelope: TxEnvelope,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// It serializes with rkyv for the live batcher's spool (`live::spool`).
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 pub struct ClosedBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,

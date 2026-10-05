@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 
 use crate::source::LockboxLog;
 use tokio::sync::oneshot;
@@ -80,6 +80,21 @@ pub enum MonitorError {
     /// cursor past this.
     #[error("epoch derivation failed: {0}")]
     Derive(EpochError),
+    /// Block `number` does not descend from the block this watcher
+    /// published before it: its parent hash is not the hash of `number - 1`.
+    /// A finalized chain never reorgs, so the provider served an
+    /// inconsistent view, or it lies (issue #163). Never advance the cursor
+    /// past this: the next tick reads the block again, against the same
+    /// anchor.
+    #[error(
+        "L1 block {number} does not descend from the published block {}: parent {parent}, expected {expected}",
+        number - 1
+    )]
+    ChainBreak {
+        number: u64,
+        expected: B256,
+        parent: B256,
+    },
     /// The L1 has not yet produced a finalized block. This is a tick-level
     /// outcome, not an error, so dashboards do not alarm before finality
     /// starts on a freshly started chain.
@@ -117,6 +132,13 @@ pub struct L1Watcher<S, P> {
     lockbox: Address,
     poll_interval: Duration,
     cursor: Option<u64>,
+    /// The last block this watcher published: its number and its hash.
+    /// The next block must name that hash as its parent. Verifying each
+    /// block alone would let an L1 endpoint serve any hash for any number;
+    /// the link forces it to fabricate a consistent chain instead. The
+    /// anchor starts empty on every start, so the first block after a
+    /// restart is not linked; the validator keeps its own chain (issue #163).
+    anchor: Option<(u64, B256)>,
 }
 
 impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
@@ -128,6 +150,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             lockbox: config.lockbox,
             poll_interval: config.poll_interval,
             cursor: None,
+            anchor: None,
         }
     }
 
@@ -189,6 +212,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// Count and log one pass's outcome. Only a closed publisher stops
     /// the loop; every other error retries on the next tick.
     fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
+        kardamom_obs::ready::mark_now(metrics::LAST_TICK_UNIX_SECONDS);
         match outcome {
             Ok(0) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
@@ -204,6 +228,10 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             Err(MonitorError::PublisherClosed) => {
                 warn!(target: "da_watcher", "publisher closed; exiting");
                 return ControlFlow::Break(());
+            }
+            Err(ref e @ MonitorError::ChainBreak { .. }) => {
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "chain_break").increment(1);
+                warn!(target: "da_watcher", error = %e, "tick failed (the L1 view is not a chain)");
             }
             Err(
                 ref e @ (MonitorError::Tip(L1SourceError::Decode(_))
@@ -341,11 +369,21 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         // fetched per block. `derive_epoch` then checks every log's
         // block_hash against it. This is what catches a reorg between the log
         // query and this read.
-        let hash = self
+        let (hash, parent) = self
             .source
-            .block_hash(number)
+            .block_ids(number)
             .await
             .map_err(MonitorError::BlockHash)?;
+        if let Some((published, expected)) = self.anchor
+            && number == published + 1
+            && parent != expected
+        {
+            return Err(MonitorError::ChainBreak {
+                number,
+                expected,
+                parent,
+            });
+        }
         let epoch = derive_epoch(number, hash, &logs).map_err(MonitorError::Derive)?;
         let deposits = epoch.deposits.len();
 
@@ -356,6 +394,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
                 // epochs. Dedup would absorb a repeat, but the cursor also
                 // drives the origin-lag signal, and it should not go backwards.
                 self.cursor = Some(number);
+                self.anchor = Some((number, hash));
                 ::metrics::counter!(metrics::EPOCHS_PUBLISHED_TOTAL).increment(1);
                 ::metrics::counter!(metrics::DEPOSITS_DETECTED_TOTAL).increment(deposits as u64);
                 // Metric value; f64 precision loss only above 2^52,

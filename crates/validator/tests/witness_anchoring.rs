@@ -225,6 +225,7 @@ fn export_prover_fixture_if_requested(
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
         },
+        fees: kardamom_types::BlockFees::NONE,
         witness: witness.clone(),
         proofs: proofs.clone(),
         records: records

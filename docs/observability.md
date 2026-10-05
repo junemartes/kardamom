@@ -18,6 +18,7 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
 | `kardamom-validator` | `127.0.0.1:9007` | — (no dashboard yet) |
+| `kardamom-notifier` | `127.0.0.1:9008` | `kardamom-notifier` |
 
 The validator's default is `9007` precisely because `9006` is the ingress
 default: running both locally with defaults used to race for one socket (the
@@ -136,7 +137,7 @@ its page and nowhere else.
 | --- | --- |
 | `batcher.blocks_observed_total` | `kardamom_batcher_blocks_observed_total` |
 | `batcher.batches_posted_total` | `kardamom_batcher_batches_posted_total` |
-| `batcher.blobs_posted_total` | `kardamom_batcher_blobs_posted_total` |
+| `batcher.payload_bytes_posted_total` | `kardamom_batcher_payload_bytes_posted_total` |
 | `sealer_boundaries_emitted_total` | `kardamom_sealer_boundaries_emitted_total` |
 | `sealer_block_number` | `kardamom_sealer_block_number` |
 | `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
@@ -184,13 +185,20 @@ Two low-rate counters deserve standing alerts:
   dedup, receipt-floor resync) let an invalid record into the canonical log:
   investigate the source, the chain itself is fine.
 
-The live batcher (#39) adds a settlement-health group on port 9002: in live
-mode `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
+The live batcher adds a settlement-health group on port 9002: in live
+mode `kardamom_batcher_batches_posted_total` / `_payload_bytes_posted_total` count
 **confirmed L1 posts** (not packed batches), `kardamom_batcher_last_posted_block`
 vs `kardamom_executor_block_number` is the DA-freshness lag to watch,
 `_l1_post_retries_total` flags a flaky L1, and `_skipped_posted_blocks_total`
 counts stale-cursor re-observations after a restart (bounded and expected —
 sustained growth means the cursor file is not being persisted).
+`kardamom_batcher_last_post_age_seconds` is the age of the last `BatchPosted`
+block as L1 serves it, read from L1 every ten seconds and never from the
+batcher's memory: it grows when the batcher stops posting and when its L1
+endpoint hides its posts; `KardamomBatcherLastPostStale` pages when it passes
+twice `kardamom_batcher_idle_flush_seconds`. `kardamom_batcher_resume_failures_total`
+counts starts whose L1 read failed; the start retries in-process, so the
+counter is scrapeable, and `KardamomBatcherResumeFailures` pages on the first.
 
 ## Quick start
 

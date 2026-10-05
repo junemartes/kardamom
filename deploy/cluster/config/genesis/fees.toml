@@ -1,0 +1,17 @@
+# The chain's fee schedule (kardamom_types::fees::FeeSchedule). The
+# executor and validator jobs append this fragment to the genesis when
+# the deploy runs with PRIORITY_FEES=on, so every state consumer reads
+# the same schedule.
+#
+# base_fee_initial: the base fee of the first block, in wei per gas. The
+# schedule moves it by at most one eighth per block toward a target of
+# half the block gas limit. One gwei is Ethereum's own initial base fee.
+#
+# beneficiary: the account that collects every tip. Anvil account #19
+# (pk 0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6)
+# on the dev chain: a known key, so a dev tool can spend the tips. Do not
+# use it on a real chain.
+
+[fees]
+base_fee_initial = 1000000000
+beneficiary = "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199"

@@ -155,6 +155,9 @@ where
     {
         let mut cfg = self.env.cfg_env();
         cfg.disable_nonce_check = true;
+        // A derived transaction carries no price. It runs under any base
+        // fee and pays nothing, as a deposit does on Ethereum L2s.
+        cfg.disable_base_fee = true;
         let mut evm = Context::mainnet()
             .with_db(&mut *self.cache)
             .with_block(self.env.block_env())
@@ -250,6 +253,8 @@ where
             to: identity.to,
             contract_address: None,
             effective_gas_price: 0,
+            priority_fee_per_gas: 0,
+            priority_fee_paid: 0,
             block_number: self.env.block_number,
             transaction_index: self.slot.tx_index_in_block,
             cumulative_gas_used,

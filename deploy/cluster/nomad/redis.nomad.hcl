@@ -2,11 +2,14 @@
 # primary, one replica, and three sentinels. See
 # docs/specs/2026-09-13-redis-account-cache-design.md, section 6.
 #
-# Placement: the primary on aux-0, the replica on ingress-1, and one
-# sentinel each on aux-0, ingress-0, and ingress-1. aux has count 1, so a
-# replica there adds nothing. The executor nodes are memory-pressured
-# (executor, mirror, Aeron driver). The ingress nodes are light, and a
-# sentinel is tiny. No new node class.
+# Placement, by the role set of a node (group_vars/all.yml,
+# node_classes): the primary on the node whose roles hold redis-primary,
+# the replica on the node with redis-replica, one sentinel on each of
+# three nodes with redis. Production gives redis three nodes of its own;
+# the local profile packs them onto aux-0 and the ingress nodes. No group
+# names a node or a node index: an instance announces the node record of
+# the node it runs on, and the replica and the sentinels read the
+# primary's node from its Consul service.
 #
 # The readers (ingress, sequencer, mirror) discover the primary through
 # the sentinels, not through Consul. Consul carries the three services for
@@ -35,8 +38,9 @@ job "redis" {
     count = 1
 
     constraint {
-      attribute = "${meta.role}"
-      value     = "aux"
+      attribute = "${meta.roles}"
+      operator  = "set_contains"
+      value     = "redis-primary"
     }
 
     restart {
@@ -72,7 +76,7 @@ job "redis" {
           # two identities for one instance: a failover promoted one and
           # reconfigured the other as its replica, so the node replicated
           # from itself and never served (issue #373).
-          "--replica-announce-ip", "aux-0.node.${var.datacenter}.consul",
+          "--replica-announce-ip", "${node.unique.name}.node.${var.datacenter}.consul",
         ]
       }
 
@@ -99,12 +103,9 @@ job "redis" {
     count = 1
 
     constraint {
-      attribute = "${meta.role}"
-      value     = "ingress"
-    }
-    constraint {
-      attribute = "${meta.node_index}"
-      value     = "1"
+      attribute = "${meta.roles}"
+      operator  = "set_contains"
+      value     = "redis-replica"
     }
 
     restart {
@@ -132,14 +133,25 @@ job "redis" {
         args = [
           "redis-server", "/usr/local/etc/redis/redis.conf",
           "--dir", "/local",
-          # The primary, by its node record. A sentinel failover
-          # reconfigures this replica in place.
-          "--replicaof", "aux-0.node.${var.datacenter}.consul", "6379",
+          # The primary, by its node record (REDIS_PRIMARY_NODE, from
+          # its Consul service). A sentinel failover reconfigures this
+          # replica in place.
+          "--replicaof", "${REDIS_PRIMARY_NODE}.node.${var.datacenter}.consul", "6379",
           # The node record this replica reports to its primary. See the
           # primary task: the sentinels must know each instance by one
           # name.
-          "--replica-announce-ip", "ingress-1.node.${var.datacenter}.consul",
+          "--replica-announce-ip", "${node.unique.name}.node.${var.datacenter}.consul",
         ]
+      }
+      # The node of the primary, read once at start: the task waits for
+      # the primary's service. A later failover is the sentinels' work.
+      template {
+        destination = "local/primary.env"
+        env         = true
+        change_mode = "noop"
+        data        = <<EOF
+{{ with service "redis-primary" }}REDIS_PRIMARY_NODE={{ (index . 0).Node }}{{ end }}
+EOF
       }
 
       service {
@@ -165,9 +177,9 @@ job "redis" {
     count = 3
 
     constraint {
-      attribute = "${meta.role}"
-      operator  = "regexp"
-      value     = "^(aux|ingress)$"
+      attribute = "${meta.roles}"
+      operator  = "set_contains"
+      value     = "redis"
     }
     constraint {
       operator = "distinct_hosts"
@@ -212,7 +224,7 @@ port 26379
 dir /local
 sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
-sentinel monitor kardamom aux-0.node.${var.datacenter}.consul 6379 2
+{{ with service "redis-primary" }}sentinel monitor kardamom {{ (index . 0).Node }}.node.${var.datacenter}.consul 6379 2{{ end }}
 sentinel down-after-milliseconds kardamom 5000
 sentinel failover-timeout kardamom 30000
 sentinel parallel-syncs kardamom 1

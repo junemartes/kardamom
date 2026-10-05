@@ -75,7 +75,7 @@ impl GuestBlock {
     #[must_use]
     pub fn run(input: ProverInput) -> GuestRun {
         let block = Self::from_records(input.boundary.block_number, input.records);
-        let env = ExecEnv::new(input.chain_id, &input.boundary);
+        let env = ExecEnv::new(input.chain_id, &input.boundary).with_fees(input.fees);
         let granularity = input.granularity;
         let mut bal_slice: &[u8] = &input.bal_rlp;
         let expected_bal = alloy_eip7928::BlockAccessList::decode(&mut bal_slice)

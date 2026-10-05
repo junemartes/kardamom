@@ -1,0 +1,24 @@
+[package]
+name = "kardamom-l1-fault-proxy"
+version.workspace = true
+edition.workspace = true
+description = "An L1 JSON-RPC proxy that lies on command: the fault model of the L1-outage chaos cases"
+
+[lib]
+name = "kardamom_l1_fault_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kardamom-l1-fault-proxy"
+path = "src/bin/kardamom-l1-fault-proxy.rs"
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["serde"] }
+anyhow.workspace = true
+clap.workspace = true
+kardamom-obs = { path = "../obs" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] }
+tracing.workspace = true
