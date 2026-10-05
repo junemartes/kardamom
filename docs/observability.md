@@ -45,6 +45,16 @@ appear on the executor's `:9004` endpoint (labelled with the executor's
 boundary stream *as observed at each executor's subscription*, not
 JVM-internal state.
 
+Every service that drives a cluster session (the sequencer, the executor,
+the ingress, the validator, the batcher) exports the state of that session
+under its own `service` label: `kardamom_cluster_client_connected` (1 while
+the session is open), `kardamom_cluster_client_leader_member_id` (the leader
+the ingress publication points at), `kardamom_cluster_client_leader_changes_total`
+(a redirect or a new leader event) and `kardamom_cluster_client_sessions_total`.
+A leader change rate above zero in steady state is an election; a client that
+stays disconnected finds no member that answers. These series observe the
+Raft set from its clients, not from inside the JVM.
+
 All binaries read the same `KARDAMOM_METRICS_ADDR` env var, so a value
 shared across colocated services makes them race for one socket — prefer the
 per-service `--metrics-addr` flag when overriding more than one service.

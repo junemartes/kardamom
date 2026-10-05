@@ -204,6 +204,7 @@ pub fn connect_with(
     cfg: LiveClusterConfig,
     opts: ConnectOptions,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    crate::metrics::describe();
     SessionConnect::new(rt, cfg, opts)?
         .open_egress()?
         .open_ingress()?
