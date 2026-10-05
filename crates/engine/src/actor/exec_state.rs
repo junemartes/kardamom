@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use kardamom_types::{BlockBoundary, SnapshotSource};
+use kardamom_types::{BlockBoundary, BlockFees, SnapshotSource};
 
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
@@ -108,6 +108,10 @@ pub(super) struct Cursor {
     /// code already consumed that boundary before the restart. So its
     /// persisted value seeds the state. See [`ResumePoint::l2_timestamp`].
     pub(super) l2_ts: u64,
+    /// The fees of the block in flight: its base fee and beneficiary.
+    /// Advanced at each boundary from the block's gas used, and seeded
+    /// from the resume cursor and the chain's schedule.
+    pub(super) fees: BlockFees,
     /// The next absolute record index, which is also the cumulative count
     /// of canonical records this exec thread has consumed.
     ///
@@ -177,6 +181,7 @@ impl<W: ExecPorts> ExecState<W> {
                 },
         } = inputs;
         let snapshot = snapshots.snapshot_after(start.block);
+        let fees = start.block_fees(cfg.fees);
         Self {
             cfg,
             io: ExecIo {
@@ -205,6 +210,7 @@ impl<W: ExecPorts> ExecState<W> {
                 // silently re-execute the chain from genesis.
                 block: start.block.saturating_add(1),
                 l2_ts: start.l2_timestamp,
+                fees,
                 next_tx_idx: TxIndex(start.record_count),
             },
             metrics: ExecMetrics {

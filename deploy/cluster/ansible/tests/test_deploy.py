@@ -18,7 +18,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
-            'batcher', 'state-mirror']
+            'batcher', 'state-mirror', 'notifier', 'da-store']
+# The images the manifest pins beyond the default deployment: the jobs a
+# real L1 or the chaos-l1 shard adds.
+MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -44,28 +47,118 @@ class NomadAPI(BaseHTTPRequestHandler):
             assert body['EnforceIndex'] is True
             state['jobs'][body['Job']['ID']] = body['Job']
             state['writes'].append(body['Job']['ID'])
+            if body['Job']['ID'] in state['deployments']:
+                state['deployments'][body['Job']['ID']].registered(body['Job'])
+            # The sealer groups that carry the roll's new retention, per
+            # registration: the staged roll adds one group per step.
+            if body['Job']['ID'] == 'cluster':
+                state.setdefault('rolled', []).append(sorted(
+                    g['Name'] for g in body['Job']['TaskGroups'] if 'retention=4096' in json.dumps(g)))
             self.respond({'JobModifyIndex': 1})
+        elif self.path.startswith('/v1/deployment/promote/'):
+            name = self.path.split('/')[4].split('?')[0]
+            assert body['All'] is True
+            state['deployments'][name].promote()
+            self.respond({'EvalID': 'promoted'})
         else:
             raise AssertionError(self.path)
 
     def do_GET(self):
-        name = self.path.split('/')[3].split('?')[0]
+        parts = self.path.split('?')[0].split('/')
+        parts += [''] * (6 - len(parts))
         state = self.server.state
-        if '/allocations?' in self.path:
-            allocs = []
-            job = state['jobs'][name]
-            for group in job['TaskGroups']:
-                # The scheduler places a system group on the nodes its
-                # constraints admit; the playbook must not assume a node count.
-                count = 8 if job['Type'] == 'system' else group['Count']
-                for i in range(count):
-                    # Historical/stopping allocations must not satisfy readiness.
-                    stale = state.get('missing_replica') == name and i > 0
-                    allocs.append({'TaskGroup': group['Name'], 'JobVersion': 0 if stale else 1,
-                                   'DesiredStatus': 'run', 'ClientStatus': 'running'})
+        if parts[2] == 'deployment' and parts[3] == 'allocations':
+            allocs = self.allocations(parts[4])
+            allocs[0]['DeploymentStatus']['Canary'] = True
             self.respond(allocs)
+        elif parts[2] == 'deployment':
+            # The deployment's verdict, by the job's scripted outcome.
+            self.respond(state['deployments'][parts[3]].state())
+        elif parts[2] == 'node':
+            # Every node advertises an address of this fake API, so the
+            # member status and the smoke target resolve back here. A
+            # sealer node gets its own loopback address, so the status
+            # request names the member through the Host header.
+            self.respond({'ID': parts[3], 'HTTPAddr': f'{self.node_ip(parts[3])}:{self.server.server_port}'})
+        elif parts[1] == 'status':
+            # The sealer member status of the node the Host header names;
+            # member 0 leads unless the test says otherwise.
+            octet = int(self.headers['Host'].split(':')[0].rsplit('.', 1)[1])
+            node = f'node-cluster-{octet - 1}'
+            default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
+            self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED'})
+        elif parts[2] == 'job' and parts[4] == 'deployment':
+            # A job with a scripted deployment gets one; every other job
+            # has none, like a system job.
+            deployment = state['deployments'].get(parts[3])
+            self.respond(deployment.state(poll=False) if deployment else None)
+        elif parts[2] == 'job' and parts[4] == 'allocations':
+            self.respond(self.allocations(parts[3]))
+        elif parts[2] == 'job':
+            self.respond(state['jobs'].get(parts[3], {}) | {'Version': 1})
         else:
-            self.respond({'Version': 1})
+            raise AssertionError(self.path)
+
+    @staticmethod
+    def node_ip(node):
+        if node.startswith('node-cluster-'):
+            return f'127.0.0.{int(node.rsplit("-", 1)[1]) + 1}'
+        return '127.0.0.1'
+
+    def allocations(self, name):
+        state = self.server.state
+        allocs = []
+        job = state['jobs'][name]
+        for group in job['TaskGroups']:
+            # The scheduler places a system group on the nodes its
+            # constraints admit; the playbook must not assume a node count.
+            count = 8 if job['Type'] == 'system' else group['Count']
+            for i in range(count):
+                # Historical/stopping allocations must not satisfy readiness.
+                stale = state.get('missing_replica') == name and i > 0
+                allocs.append({'TaskGroup': group['Name'], 'JobVersion': 0 if stale else 1,
+                               'DesiredStatus': 'run', 'ClientStatus': 'running',
+                               'NodeID': f'node-{group["Name"]}',
+                               'DeploymentStatus': {'Canary': False}})
+        return allocs
+
+
+class Deployment:
+    """A scripted Nomad deployment of one job: its ID is the job name.
+
+    `outcomes` is the status sequence the polls read, one per poll, and
+    the last one repeats. A `canary` deployment reports one healthy,
+    unpromoted canary until the role promotes it; every poll after the
+    promotion reads `successful`.
+    """
+
+    def __init__(self, name, outcomes, canary=False):
+        self.name = name
+        self.outcomes = list(outcomes)
+        self.canary = canary
+        self.promoted = False
+        self.polls = 0
+        self.groups = ['group']
+
+    def registered(self, job):
+        self.groups = [g['Name'] for g in job['TaskGroups']]
+
+    def promote(self):
+        assert self.canary and not self.promoted, 'promotion of a deployment without a waiting canary'
+        self.promoted = True
+
+    def state(self, poll=True):
+        if self.canary and not self.promoted:
+            status = 'running'
+        elif self.canary:
+            status = 'successful'
+        else:
+            status = self.outcomes[min(self.polls, len(self.outcomes) - 1)]
+            self.polls += int(poll)
+        groups = {g: {'DesiredCanaries': 1 if self.canary else 0, 'Promoted': self.promoted,
+                      'HealthyAllocs': 1, 'DesiredTotal': 2} for g in self.groups}
+        return {'ID': self.name, 'JobVersion': 1, 'Status': status,
+                'StatusDescription': f'scripted {status}', 'TaskGroups': groups}
 
 
 @unittest.skipUnless(shutil.which('nomad') and shutil.which('ansible-playbook'),
@@ -76,9 +169,14 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.manifest = Path(self.tmp.name) / 'images.digests'
         self.manifest.write_text(''.join(
-            f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in SERVICES))
-        self.api = ThreadingHTTPServer(('127.0.0.1', 0), NomadAPI)
-        self.api.state = {'jobs': {}, 'writes': []}
+            f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in MANIFEST))
+        # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
+        self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
+        self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {}}
+        self.record_dir = Path(self.tmp.name) / 'deployed'
+        self.smoke = Path(self.tmp.name) / 'smoke.sh'
+        self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n')
+        self.smoke.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.api.server_close)
@@ -94,6 +192,11 @@ class DeployTest(unittest.TestCase):
             'workloads_poll_delay': 0,
             'workloads_light_execution_rpc': '',
             'workloads_light_consensus_rpc': '',
+            'workloads_da_proxy_probe': False,
+            'workloads_deployment_retries': 3,
+            'workloads_record_dir': str(self.record_dir),
+            'workloads_cluster_binary': str(self.smoke),
+            'workloads_sealer_admin_port': self.api.server_port,
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
@@ -109,7 +212,8 @@ class DeployTest(unittest.TestCase):
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
-                    'state-mirror', 'validator', 'da-watcher', 'monitoring', 'batcher']
+                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'monitoring', 'da-store',
+                    'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
@@ -184,16 +288,62 @@ class DeployTest(unittest.TestCase):
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_file_sync_level': '2',
             'workloads_remote_origins': '412399',
+            'workloads_priority_fees': 'on',
         }, check=True)
         plans = self.api.state['plans']
         self.assertIn('l1-light-client', plans)
         self.assertTrue(all(job['Namespace'] == 'staging' for job in plans.values()))
         validator = json.dumps(plans['validator'])
-        self.assertIn('http://aux-0.node.dc1.consul:8548', validator)
+        self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', validator)
         self.assertNotIn('http://execution.example', validator)
+        # The indexer follows the light client and reads the payloads from
+        # the DA proxy; the batcher resumes from the indexer.
+        indexer = json.dumps(plans['l1-indexer'])
+        self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', indexer)
+        self.assertIn('http://kardamom-da-proxy.service.consul:3100', indexer)
+        self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        # One value turns priority fees on for every role that has a say.
+        self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
+        self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')
+        for name in ('executor', 'validator'):
+            self.assertIn('base_fee_initial', self.genesis_template(plans[name]), name)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_fault_proxy_routes_the_followers_through_it(self):
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'}, check=True)
+        plans = self.api.state['plans']
+        proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
+        self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
+        anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
+        for job in ('batcher', 'da-watcher', 'l1-indexer'):
+            self.assertIn(proxy, json.dumps(plans[job]), job)
+        indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
+        self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
+        self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
+        self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_priority_fees_default_off_on_every_role(self):
+        self.run_deploy(check=True)
+        plans = self.api.state['plans']
+        self.assertIn('-Dkardamom.cluster.orderingWindow=0', json.dumps(plans['cluster']))
+        self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
+        for name in ('executor', 'validator'):
+            self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    @staticmethod
+    def sequencer_env(plans):
+        return plans['sequencer']['TaskGroups'][0]['Tasks'][0]['Env']
+
+    @staticmethod
+    def genesis_template(job):
+        templates = [t for g in job['TaskGroups'] for t in g['Tasks'][0]['Templates']
+                     if t['DestPath'] == 'local/genesis.toml']
+        return templates[0]['EmbeddedTmpl']
 
     def test_resize_reuses_deployment_inputs_and_image_pins(self):
         settings = {
@@ -235,6 +385,74 @@ class DeployTest(unittest.TestCase):
         self.api.state['missing_replica'] = 'ingress'
         self.run_deploy(success=False)
         self.assertNotIn('executor', self.api.state['writes'])
+
+    def test_a_deployment_is_waited_to_its_verdict(self):
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['running', 'running', 'successful'])
+        self.run_deploy()
+        self.assertEqual(self.api.state['deployments']['ingress'].polls, 3)
+        self.assertIn('executor', self.api.state['writes'])
+
+    def test_a_failed_deployment_stops_the_deploy_at_its_job(self):
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['running', 'failed'])
+        output = self.run_deploy(success=False)
+        self.assertIn('scripted failed', output)
+        self.assertNotIn('executor', self.api.state['writes'])
+        self.assertFalse((self.record_dir / 'images.digests').exists(), 'a failed deploy records nothing')
+
+    def test_an_undecided_deployment_fails_when_the_budget_runs_out(self):
+        self.api.state['deployments']['executor'] = Deployment('executor', ['running'])
+        self.run_deploy(success=False)
+        self.assertNotIn('batcher', self.api.state['writes'])
+
+    def test_a_canary_is_smoked_by_its_node_then_promoted(self):
+        self.api.state['deployments']['ingress'] = Deployment('ingress', [], canary=True)
+        self.run_deploy()
+        self.assertTrue(self.api.state['deployments']['ingress'].promoted)
+        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, ['smoke --rpc http://127.0.0.1:8545'])
+
+    def test_a_failed_smoke_leaves_the_canary_unpromoted(self):
+        self.api.state['deployments']['sequencer'] = Deployment('sequencer', [], canary=True)
+        self.run_deploy({'workloads_cluster_binary': '/usr/bin/false'}, success=False)
+        self.assertFalse(self.api.state['deployments']['sequencer'].promoted)
+        self.assertNotIn('batcher', self.api.state['writes'])
+
+    def test_a_successful_deploy_records_the_manifest_and_keeps_the_previous_one(self):
+        self.run_deploy()
+        first = self.manifest.read_text()
+        self.assertEqual((self.record_dir / 'images.digests').read_text(), first)
+        self.assertFalse((self.record_dir / 'images.digests.previous').exists())
+        self.manifest.write_text(first.replace('a' * 64, 'b' * 64))
+        self.run_deploy()
+        self.assertEqual((self.record_dir / 'images.digests').read_text(), self.manifest.read_text())
+        self.assertEqual((self.record_dir / 'images.digests.previous').read_text(), first)
+
+    def sealer_roll(self, leader):
+        """Deploy twice: the second deploy edits the sealer, with `leader` leading."""
+        self.run_deploy()
+        self.api.state['roles'] = {f'node-cluster-{i}': 'LEADER' if i == leader else 'FOLLOWER' for i in range(3)}
+        self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
+        self.api.state['writes'] = []
+        self.run_deploy({'workloads_cluster_retention': '4096'})
+        return [g['Name'] for g in self.api.state['jobs']['cluster']['TaskGroups']]
+
+    def test_the_sealer_rolls_followers_first_and_the_leader_last(self):
+        groups = self.sealer_roll(leader=1)
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(sorted(groups), ['cluster-0', 'cluster-1', 'cluster-2'])
+        # Every step holds the current definition of the members not rolled
+        # yet, so the retention reaches the groups in the roll order.
+        retention = [('-Dkardamom.cluster.retention=4096' in json.dumps(g)) for g in
+                     self.api.state['jobs']['cluster']['TaskGroups']]
+        self.assertTrue(all(retention), retention)
+        self.assertEqual(self.api.state['deployments']['cluster'].polls, 3)
+        # Member 1 leads: the followers 0 and 2 roll first, then the leader.
+        self.assertEqual(self.api.state['rolled'][1:],
+                         [['cluster-0'], ['cluster-0', 'cluster-2'], ['cluster-0', 'cluster-1', 'cluster-2']])
+
+    def test_a_fresh_sealer_registers_in_one_step(self):
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'].count('cluster'), 1)
 
 
 if __name__ == '__main__':

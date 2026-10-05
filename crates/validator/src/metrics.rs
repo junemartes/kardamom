@@ -13,7 +13,10 @@ const ROWS_VERIFIED_TOTAL: &str = "validator_rows_verified_total";
 /// account with no recorded local value, or rows at a position whose
 /// local receipt carried none. Not a fault.
 const ROWS_UNVERIFIED_TOTAL: &str = "validator_rows_unverified_total";
-const COMMITTED_BLOCK: &str = "validator_committed_block";
+pub const COMMITTED_BLOCK: &str = "validator_committed_block";
+/// 1 while a divergence verdict stands in the verdict file beside the
+/// state, 0 otherwise. The readiness rule and the alert read it.
+pub const VERDICT_STANDING: &str = "validator_verdict_standing";
 const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
 /// Epochs whose deposits were re-derived from L1 and matched.
 const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
@@ -76,6 +79,10 @@ pub fn describe() {
     );
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
     metrics::describe_gauge!(
+        VERDICT_STANDING,
+        "1 while a divergence verdict stands beside the state, 0 otherwise"
+    );
+    metrics::describe_gauge!(
         STATE_ROOT_BLOCK,
         "Block number of the most recent OBSERVED MPT state root (set only when \
          the committed snapshot actually yielded a root — an independent \
@@ -100,6 +107,11 @@ pub fn resync_counter(outcome: &'static str) -> metrics::Counter {
 /// Sustained growth means BAL delivery to this node is genuinely broken.
 pub fn counter_bal_sub_reopen() {
     metrics::counter!(BAL_SUB_REOPEN_TOTAL).increment(1);
+}
+
+/// Mirror the verdict file: 1 while a verdict stands, 0 otherwise.
+pub fn set_verdict_standing(standing: bool) {
+    metrics::gauge!(VERDICT_STANDING).set(if standing { 1.0 } else { 0.0 });
 }
 
 pub fn counter_divergence() {

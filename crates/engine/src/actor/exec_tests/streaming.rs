@@ -63,6 +63,8 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         end_tx_idx: _,
         l1_origin: _,
         l2_timestamp: _,
+        base_fee: _,
+        gas_used: _,
     } = boundary;
 }
 
@@ -92,6 +94,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
             input: bytes::Bytes::default(),
         }),
         ReaderToExec::Tx {
+            tx_ref: kardamom_types::TxRef::default(),
             envelope: legacy(&signer, to, 1, 1_000),
             position: pos(64),
         },

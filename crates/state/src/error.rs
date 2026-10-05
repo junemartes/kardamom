@@ -67,6 +67,27 @@ pub enum StateError {
         incremental: alloy_primitives::B256,
         rebuilt: alloy_primitives::B256,
     },
+    /// The references of a committed block cannot rebuild its payload.
+    /// The query endpoint answers this as a JSON-RPC error with the cause.
+    #[error("block {block} cannot be rebuilt from references: {cause}")]
+    NoBlockRefs { block: u64, cause: NoRefsCause },
+}
+
+/// Why a committed block has no full list of references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum NoRefsCause {
+    /// The node rebuilt the block from its L1 payload, which carries no
+    /// archive reference. The block is on L1 already.
+    #[error("this node rebuilt the block from L1, so it keeps no archive reference for it")]
+    RebuiltFromL1,
+    /// A transaction other than a deposit has no reference: a cross-chain
+    /// message, whose remote-epoch record is in no archive, or a row
+    /// written before the reference existed.
+    #[error("transaction {tx_hash} (type {tx_type:#x}) has no archive reference")]
+    Unreferenced {
+        tx_hash: alloy_primitives::B256,
+        tx_type: u8,
+    },
 }
 
 impl From<signet_libmdbx::ReadError> for StateError {

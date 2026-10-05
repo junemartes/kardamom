@@ -35,10 +35,10 @@ pub mod epoch;
 pub mod error;
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes;
+pub mod fees;
 pub mod inbound;
 pub mod lookup;
 pub mod metrics;
-mod nonce_decode;
 pub mod outbound;
 pub mod partition;
 pub(crate) mod pending;
@@ -51,6 +51,7 @@ pub mod shutdown;
 pub(crate) mod state;
 #[cfg(any(test, feature = "testing"))]
 pub mod testkit;
+mod tx_decode;
 mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};

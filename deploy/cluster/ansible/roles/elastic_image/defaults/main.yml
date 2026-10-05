@@ -9,7 +9,15 @@ elastic_image_ansible_root: /opt/kardamom/ansible
 # The profile values the image carries (nonsecret): the inventory group
 # vars of the production profile.
 elastic_image_profile_vars_file: "{{ playbook_dir }}/inventories/production/group_vars/production/profile.yml"
-# The enrollment client the image carries, and its argument vector. Empty
+# The CA bundle of the environment (nonsecret), the one file the client
+# needs to trust the enrollment service. Empty means no bundle: the
+# client cannot verify a service, and the node fails closed.
+elastic_image_ca_file: ""
+# The enrollment client the image carries (files/kardamom-enroll: it
+# reads /etc/kardamom/node.yml, presents the node to the enrollment
+# service of the environment, and writes the credentials and the TLS
+# material that roles/enroll loads), and its argument vector. Empty
 # means no enrollment: the node then fails closed at first boot on the
 # production profile.
-elastic_image_enrollment_argv: []
+elastic_image_enrollment_client: /usr/local/bin/kardamom-enroll
+elastic_image_enrollment_argv: ["{{ elastic_image_enrollment_client }}"]

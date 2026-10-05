@@ -1,32 +1,26 @@
-//! Reconstruction support for the section 6 conformance test.
+//! Reconstruction: the payload the batcher posted, back to block frames.
 //!
-//! Takes the blobs the batcher posted. The L1 calldata holds only the
-//! versioned hashes and block range; the blob bytes themselves come from the
-//! beacon-chain blob sidecar. Rebuilds the `Vec<BlockFrame>` the batcher fed
-//! in. This validates the whole batcher pipeline with one round trip.
+//! The L1 calldata holds only the certificate and the block range; the
+//! payload comes from EigenDA by the certificate. This rebuilds the
+//! `Vec<BlockFrame>` the batcher fed in, the whole pipeline in one round
+//! trip.
 
-use alloy_eips::eip4844::Blob;
-
-use crate::blob::unpack_from_blobs;
 use crate::compress::decode_zstd;
 use crate::error::BatcherError;
 use crate::frame::{BlockFrame, Kar1Payload, decode as frame_decode};
 
-/// Reconstruct the per-block tx stream from a sequence of blobs.
+/// Reconstruct the per-block tx stream from one posted batch's payload.
 ///
-/// `blobs` must be the in-order set of blobs for one posted batch. This
-/// function unpacks the 31-byte field encoding. It checks whether the
-/// unpacked bytes are a zstd stream, and decompresses them if so. Then it
-/// decodes the KAR1 framing.
+/// The payload is a zstd stream or a bare KAR1 frame; the zstd magic
+/// tells them apart.
 ///
 /// # Errors
-/// Returns an error when unpacking, decompression, or KAR1 decoding fails.
-pub fn reconstruct(blobs: &[Blob]) -> Result<Vec<BlockFrame>, BatcherError> {
-    let raw = unpack_from_blobs(blobs)?;
-    let framed = if is_zstd(&raw) {
-        decode_zstd(&raw)?
+/// Returns an error when decompression or KAR1 decoding fails.
+pub fn reconstruct(payload: &[u8]) -> Result<Vec<BlockFrame>, BatcherError> {
+    let framed = if is_zstd(payload) {
+        decode_zstd(payload)?
     } else {
-        raw
+        payload.to_vec()
     };
     let payload: Kar1Payload = frame_decode(&framed)?;
     Ok(payload.blocks)

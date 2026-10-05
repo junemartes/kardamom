@@ -1,0 +1,38 @@
+---
+# Poll the deployment until Nomad decides it, or until a canary waits for
+# promotion: a healthy canary that is not promoted holds the deployment
+# at `running`, and the role is the one that promotes it, after the
+# smoke. A deployment Nomad marks failed fails the play here, before the
+# next job is touched. Retries that run out fail the play the same way.
+- name: Poll the deployment of {{ workloads_wait_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/deployment/{{ workloads_deployment_id }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_deployment
+  vars:
+    workloads_canary_waiting: >-
+      {{ workloads_deployment.json.TaskGroups | default({}) | dict2items
+         | selectattr('value.DesiredCanaries', 'gt', 0)
+         | rejectattr('value.Promoted', 'equalto', true)
+         | selectattr('value.HealthyAllocs', 'ge', 1) | list | length > 0 }}
+  until: workloads_deployment.json.Status != 'running' or workloads_canary_waiting | bool
+  retries: "{{ workloads_deployment_retries }}"
+  delay: "{{ workloads_poll_delay }}"
+
+- name: Fail the play on a failed deployment of {{ workloads_wait_job }}
+  ansible.builtin.fail:
+    msg: >-
+      Deployment {{ workloads_deployment_id }} of {{ workloads_wait_job }} is
+      {{ workloads_deployment.json.Status }}: {{ workloads_deployment.json.StatusDescription }}
+  when: workloads_deployment.json.Status not in ['successful', 'running']
+
+- name: Gate and promote the canary of {{ workloads_wait_job }}
+  ansible.builtin.include_tasks: canary.yml
+  when: workloads_deployment.json.Status == 'running'
+
+# After the promotion, Nomad replaces the remaining instances; the same
+# poll runs once more, to the deployment's verdict.
+- name: Wait for the promoted deployment of {{ workloads_wait_job }}
+  ansible.builtin.include_tasks: deployment.yml
+  when: workloads_deployment.json.Status == 'running'

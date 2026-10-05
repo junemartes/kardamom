@@ -12,8 +12,10 @@ pub enum BatcherError {
     Compress(String),
     #[error("frame: {0}")]
     Frame(String),
-    #[error("blob: {0}")]
-    Blob(String),
+    #[error("data availability: {0}")]
+    Da(String),
+    #[error("payload: {0}")]
+    Payload(String),
     #[error("l1: {0}")]
     L1(String),
     #[error("config: {0}")]
@@ -30,17 +32,21 @@ pub enum BatcherError {
     /// One block on its own packs to more than the 6-blob ceiling. The
     /// batcher cannot split a block, so it cannot post this one.
     #[error(
-        "block {block_number} alone packs to {blobs} blobs; the ceiling is 6 blobs; \
+        "block {block_number} alone is a {bytes}-byte payload; the ceiling is {ceiling} bytes; \
          the batcher cannot post this block"
     )]
-    BlockTooLarge { block_number: u64, blobs: usize },
+    BlockTooLarge {
+        block_number: u64,
+        bytes: usize,
+        ceiling: usize,
+    },
 }
 
 impl BatcherError {
-    /// True for the blob-ceiling overflow of a group that a shorter prefix
-    /// can still fit.
+    /// True for the payload-ceiling overflow of a group that a shorter
+    /// prefix can still fit.
     #[must_use]
-    pub fn is_blob_overflow(&self) -> bool {
-        matches!(self, Self::Blob(_))
+    pub fn is_payload_overflow(&self) -> bool {
+        matches!(self, Self::Payload(_))
     }
 }

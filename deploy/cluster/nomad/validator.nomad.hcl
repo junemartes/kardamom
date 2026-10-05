@@ -54,12 +54,33 @@ variable "lockbox_address" {
   default     = ""
 }
 
+# The query endpoint (group_vars/all.yml, ports.validator_query): the
+# committed nonce, balance and receipt, and a block's transaction
+# references, which the batcher reads when the sealer no longer retains
+# the block.
+variable "query_port" {
+  type    = number
+  default = 9025
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
 }
 
+# Priority fees, "on" or "off" (the genesis `[fees]` section). The deploy sets every job's
+# fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
+# sealer's ordering window, and the executor's fee schedule cannot
+# disagree. Ansible deployment passes -var from PRIORITY_FEES.
+variable "priority_fees" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.priority_fees)
+    error_message = "The priority_fees value must be on or off."
+  }
+}
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -70,9 +91,11 @@ job "validator" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds validator (group_vars/all.yml, node_classes).
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "validator"
   }
 
   group "validator" {
@@ -117,13 +140,42 @@ job "validator" {
       mode     = "delay"
     }
 
+    # A node loss reschedules the validator like every other service.
+    # A divergence is a state, not a dead process: the verdict file
+    # beside its state survives the move, and the validator comes up
+    # halted on the new node until an operator clears it.
     reschedule {
-      attempts  = 0
-      unlimited = false
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    # In place: a singleton with a static port restarts on its node.
+    # Healthy by its /ready check: no divergence verdict stands and the
+    # committed block is within the lag budget of the sealer's head, so
+    # a deploy never passes over a divergence.
+    update {
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "15s"
+      healthy_deadline  = "5m"
+      progress_deadline = "10m"
+      auto_revert       = false
     }
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9006
+      }
+      # The query endpoint, as a Consul service: the batcher reads block
+      # references from it by the service record.
+      port "query" {
+        static = var.query_port
+      }
       # The cluster egress (response) port, unique per allocation. A
       # fixed port sat in the node's ephemeral range, where the shared
       # media driver's port-0 discovery sockets could take it first.
@@ -184,6 +236,10 @@ job "validator" {
           # persistent mount, never the executor's /opt/kardamom/state
           # root. This is a separate mdbx environment.
           "--state-dir", "/opt/kardamom/state/validator",
+          # The query endpoint: a block's transaction references, next
+          # to the executors'. The validator keeps, with every receipt,
+          # where the transaction's bytes are on the tx_data archives.
+          "--nonce-query-addr", "${meta.node_ip}:${var.query_port}",
           # Join-miss archive refetch (tx_data and tx_deposits). When
           # the live multicast misses a canonical ref's envelope, it
           # replays in-band from the durability archives listed in
@@ -248,9 +304,30 @@ job "validator" {
       }
 
       # The chain genesis comes from one source: config/genesis/dev.toml.
+      # With priority fees on, the fee schedule fragment follows it, as
+      # on the executor: both roles compute the same roots.
       template {
         destination = "local/genesis.toml"
-        data        = file("config/genesis/dev.toml")
+        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
+      }
+
+      service {
+        name     = "kardamom-validator"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
+      }
+
+      service {
+        name     = "kardamom-validator-query"
+        port     = "query"
+        provider = "consul"
       }
 
       resources {

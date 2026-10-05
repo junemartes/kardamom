@@ -13,6 +13,7 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-executor",
     "kardamom-da-watcher",
     "kardamom-ingress",
+    "kardamom-notifier",
 ];
 
 fn dashboards_dir() -> PathBuf {

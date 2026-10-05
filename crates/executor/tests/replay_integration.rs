@@ -66,6 +66,8 @@ impl Collected {
                     end_tx_idx: _,
                     l2_timestamp: _,
                     l1_origin: _,
+                    base_fee: _,
+                    gas_used: _,
                 } = b;
                 assert!((1..=3).contains(&block_number));
                 self.boundaries += 1;

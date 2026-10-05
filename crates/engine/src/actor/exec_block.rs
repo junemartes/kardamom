@@ -28,6 +28,12 @@ pub(super) struct BlockState<W: ExecPorts> {
     /// feed both this list and the streaming `tx_receipts` publisher. This
     /// clone cost is flagged for saturation validation.
     pub(super) receipts: Vec<kardamom_types::Receipt>,
+    /// The reference of every transaction of the block, in arrival
+    /// order: where its bytes are on a `tx_data` archive. The boundary
+    /// hands them to the state writer, which keeps each one with its
+    /// receipt, so the batcher can rebuild a block the sealer no longer
+    /// retains. One 56-byte copy per transaction.
+    pub(super) refs: Vec<kardamom_types::TxRef>,
     /// Per-block RPC enrichment counters.
     pub(super) tx_index: u64,
     pub(super) cumulative_gas_used: u64,
@@ -48,6 +54,7 @@ impl<W: ExecPorts> BlockState<W> {
         Self {
             delta: PendingDelta::new(),
             receipts: Vec::new(),
+            refs: Vec::new(),
             tx_index: 0,
             cumulative_gas_used: 0,
             apply_elapsed: None,
