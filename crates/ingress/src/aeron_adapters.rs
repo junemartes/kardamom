@@ -11,17 +11,19 @@ use std::future::Future;
 use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsReceiver,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, ServiceEventsSubscriberHandle,
+    TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsReceiver,
 };
 use kardamom_log::discovery::StreamPlane;
+use kardamom_obs::events::BoardView;
 use kardamom_types::{
-    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptBatch, TxEnvelope,
-    TxError,
+    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
+    ReceiptBatch, TxEnvelope, TxError,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription};
@@ -211,16 +213,22 @@ pub struct LiveIngressSubscription {
     local_fsync: broadcast::Sender<FsyncWatermark>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
     tx_errors: broadcast::Sender<TxError>,
+    /// The latest cluster status, fed by the binary's egress observer
+    /// like the watermark bus.
+    cluster_status: watch::Sender<ClusterStatus>,
+    /// The board of every service's latest state, fed by the `events`
+    /// subscription.
+    service_board: watch::Receiver<BoardView>,
 }
 
 impl LiveIngressSubscription {
-    /// Open the four subscriber handles through `plane`: `tx_errors`,
-    /// receipts, and boundaries follow the plane's transport; the fsync
-    /// watermark still opens on its static channel.
+    /// Open the five subscriber handles through `plane`: `tx_errors`,
+    /// receipts, boundaries, and `events` follow the plane's transport;
+    /// the fsync watermark still opens on its static channel.
     ///
     /// # Errors
     ///
-    /// Returns `IngressError::Internal` if any of the four subscriber
+    /// Returns `IngressError::Internal` if any of the five subscriber
     /// handles fails to open.
     pub fn open(
         rt: &AeronRuntime,
@@ -237,6 +245,7 @@ impl LiveIngressSubscription {
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(BUS_CAPACITY);
         let (tx_errors_tx, _) = broadcast::channel::<TxError>(BUS_CAPACITY);
+        let (cluster_status_tx, _) = watch::channel(ClusterStatus::default());
 
         let mds = channels.tx_receipts_mds_enabled();
         if mds {
@@ -285,6 +294,12 @@ impl LiveIngressSubscription {
             .map_err(|e| IngressError::internal("open tx_errors", e))?;
         Pump::new(errors_sub, tx_errors_tx.clone()).spawn();
 
+        // This is the events stream to the board of service states.
+        let service_board = plane
+            .subscriber::<ServiceEventsSubscriberHandle>(rt)
+            .map_err(|e| IngressError::internal("open events", e))?
+            .spawn_board();
+
         Ok(Self {
             receipts: receipts_tx,
             live,
@@ -292,7 +307,16 @@ impl LiveIngressSubscription {
             local_fsync: local_fsync_tx,
             block_boundaries: block_boundaries_tx,
             tx_errors: tx_errors_tx,
+            cluster_status: cluster_status_tx,
+            service_board,
         })
+    }
+
+    /// Producer side of the cluster status, fed by the same egress
+    /// observer as [`Self::watermark_sender`].
+    #[must_use]
+    pub fn cluster_status_sender(&self) -> watch::Sender<ClusterStatus> {
+        self.cluster_status.clone()
     }
 
     /// Producer side of the quorum and durable watermark bus. In the
@@ -324,6 +348,12 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn live_accounts(&self) -> Arc<LiveAccounts> {
         self.live.clone()
+    }
+    fn cluster_status(&self) -> watch::Receiver<ClusterStatus> {
+        self.cluster_status.subscribe()
+    }
+    fn service_board(&self) -> watch::Receiver<BoardView> {
+        self.service_board.clone()
     }
 }
 

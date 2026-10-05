@@ -30,8 +30,12 @@ pub(crate) enum Verdict {
     /// A peer checkpoint is staged and the stale state parked: run the
     /// pipeline again, which adopts it.
     Revolve,
-    /// Leave the process with this status: 2 for a proven divergence, 1
-    /// for every other failure the process cannot repair.
+    /// A proven divergence, with its reason: the process holds, halted,
+    /// until an operator clears it, then runs the pipeline again from
+    /// its cursor.
+    Halt(String),
+    /// Leave the process with this status: 1, an availability failure
+    /// the process cannot repair, for the orchestrator to restart.
     Exit(i32),
 }
 
@@ -41,10 +45,12 @@ pub(crate) enum Verdict {
 pub(crate) fn verdict(outcome: &EngineOutcome, repaired: Option<&str>) -> Verdict {
     match outcome {
         EngineOutcome::Clean => Verdict::Done,
-        // Exit 2 is reserved for a proven divergence, the page-the-humans
-        // signal. Any other engine failure is an availability problem,
+        // A proven divergence is a state of the chain, not a property of
+        // one process, so it halts the process instead of ending it: an
+        // exit loses the reason and invites a restart against the same
+        // fault. Any other engine failure is an availability problem,
         // not an integrity one, and must not look like one.
-        EngineOutcome::Diverged(_) => Verdict::Exit(2),
+        EngineOutcome::Diverged(reason) => Verdict::Halt(reason.clone()),
         EngineOutcome::Failed(_) | EngineOutcome::Panicked => match repaired {
             Some("peer-checkpoint") => Verdict::Revolve,
             _ => Verdict::Exit(1),
@@ -127,7 +133,22 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
     }
     match revolution(boot).await? {
         Verdict::Done => return Ok(ControlFlow::Break(())),
-        Verdict::Exit(status) => halt(status),
+        Verdict::Exit(status) => exit(status),
+        Verdict::Halt(reason) => {
+            if super::halted::Halted::of(boot)
+                .hold_on(boot, reason)
+                .await
+                .is_break()
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+            *revolutions += 1;
+            tracing::info!(
+                revolutions,
+                "divergence halt cleared; the pipeline starts again from its cursor"
+            );
+            return Ok(ControlFlow::Continue(()));
+        }
         Verdict::Revolve => (),
     }
     if boot.stop.is_cancelled() {
@@ -142,16 +163,14 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
     Ok(ControlFlow::Continue(()))
 }
 
-/// Leave the process. Status 1 is an availability problem, for the
-/// orchestrator to restart; status 2 is a proven divergence.
-fn halt(status: i32) -> ! {
-    if status == 1 {
-        tracing::error!(
-            "validator halted on an engine error (NOT a proven divergence); if the \
-             cluster refused replay and no peer checkpoint qualified, rebuild state \
-             via kardamom-reconstruct or restore a checkpoint"
-        );
-    }
+/// Leave the process with status 1: an availability problem, for the
+/// orchestrator to restart.
+fn exit(status: i32) -> ! {
+    tracing::error!(
+        "validator halted on an engine error (NOT a proven divergence); if the \
+         cluster refused replay and no peer checkpoint qualified, rebuild state \
+         via kardamom-reconstruct or restore a checkpoint"
+    );
     std::process::exit(status);
 }
 
@@ -180,7 +199,7 @@ mod tests {
                 &EngineOutcome::Diverged("mismatch".into()),
                 Some("peer-checkpoint")
             ),
-            Verdict::Exit(2)
+            Verdict::Halt("mismatch".into())
         );
         assert_eq!(verdict(&EngineOutcome::Clean, None), Verdict::Done);
     }

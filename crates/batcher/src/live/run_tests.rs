@@ -100,7 +100,7 @@ fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
         target_payload_bytes: NonZeroUsize::new(1 << 20).unwrap(),
         skip_through_block: 0,
     };
-    FeedLoop::new(sender, cfg, spool, restored)
+    FeedLoop::new(sender, cfg, spool, restored, 0)
 }
 
 /// A rebuilder over a map of envelopes: the test's archive.
@@ -198,4 +198,19 @@ async fn a_refused_replay_without_a_source_is_a_fail_stop_that_names_the_setting
     .await
     .unwrap_err();
     assert!(err.to_string().contains("--block-refs-source"), "{err:#}");
+}
+
+/// L1 silence clears by itself; a refused resume waits for an operator.
+#[test]
+fn a_start_failure_names_its_halt() {
+    let l1 = StartError::L1(anyhow::anyhow!("connect L1 RPC http://l1: refused"));
+    let halt = l1.halt();
+    assert_eq!(halt.cause, HaltCause::L1Unreachable);
+    assert!(halt.detail.contains("connect L1 RPC"), "{}", halt.detail);
+    assert_eq!(halt.clears, Clears::Auto);
+
+    let resume = StartError::Resume(anyhow::anyhow!("spool does not continue the cursor"));
+    let halt = resume.halt();
+    assert_eq!(halt.cause, HaltCause::ReplayUnavailable);
+    assert_eq!(halt.clears, Clears::Operator);
 }

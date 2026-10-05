@@ -350,6 +350,11 @@ pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscripti
     kardamom_cluster_adapter::LiveIngress,
 >;
 
+/// The batcher's posted-cursor publisher over the live cluster session,
+/// named here for the same reason as [`LiveTxOrderingSub`].
+pub type LiveCursorPublisher =
+    crate::reader::cluster::PostedCursorPublisher<kardamom_cluster_adapter::LiveIngress>;
+
 /// Spawn a dedicated cluster Aeron runtime, on its own thread, using the
 /// same aeron dir. The cluster session must never contend with `tx_data` or
 /// receipts work on the main runtimes. Connect the cluster `tx_ordering`

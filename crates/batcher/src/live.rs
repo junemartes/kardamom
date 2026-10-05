@@ -31,9 +31,11 @@
 //! [`BatchAccumulator`]: crate::batch::BatchAccumulator
 
 mod cursor;
+mod events;
 mod feed;
 pub mod poll;
 mod post_age;
+mod posted_cursor;
 mod rebuild;
 mod refs_store;
 mod resume;

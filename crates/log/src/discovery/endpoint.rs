@@ -3,6 +3,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
+use super::record::Topic;
 use crate::config::InterfaceSelector;
 use crate::error::LogError;
 
@@ -135,14 +136,19 @@ impl PortAllocator {
     }
 }
 
-/// The URI of a dynamic MDC publication bound to `control`, with the
-/// configured flow control when `flow_control` is not empty.
+/// The URI of a dynamic MDC publication of `topic` bound to `control`,
+/// with the configured flow control when `flow_control` is not empty, and
+/// with the topic's own term length when it has one.
 #[must_use]
-pub fn publication_uri(control: SocketAddr, flow_control: &str) -> String {
+pub fn publication_uri(control: SocketAddr, flow_control: &str, topic: Topic) -> String {
     let mut uri = format!("aeron:udp?control={control}|control-mode=dynamic");
     if !flow_control.is_empty() {
         uri.push_str("|fc=");
         uri.push_str(flow_control);
+    }
+    if let Some(term_length) = topic.term_length() {
+        uri.push_str("|term-length=");
+        uri.push_str(&term_length.to_string());
     }
     uri
 }
@@ -195,16 +201,25 @@ mod tests {
     fn uris_carry_control_mode_and_flow_control() {
         let control: SocketAddr = "192.168.56.31:40300".parse().unwrap();
         assert_eq!(
-            publication_uri(control, ""),
+            publication_uri(control, "", Topic::TxData),
             "aeron:udp?control=192.168.56.31:40300|control-mode=dynamic"
         );
         assert_eq!(
-            publication_uri(control, "min"),
+            publication_uri(control, "min", Topic::TxData),
             "aeron:udp?control=192.168.56.31:40300|control-mode=dynamic|fc=min"
         );
         assert_eq!(
             destination_uri(IpAddr::V4(Ipv4Addr::new(192, 168, 56, 41)), control),
             "aeron:udp?endpoint=192.168.56.41:0|control=192.168.56.31:40300|control-mode=dynamic"
+        );
+    }
+
+    #[test]
+    fn the_events_publication_carries_the_minimum_term_length() {
+        let control: SocketAddr = "192.168.56.31:40300".parse().unwrap();
+        assert_eq!(
+            publication_uri(control, "min", Topic::ServiceEvents),
+            "aeron:udp?control=192.168.56.31:40300|control-mode=dynamic|fc=min|term-length=65536"
         );
     }
 

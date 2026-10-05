@@ -24,6 +24,33 @@ const SINK: Address = address!("000000000000000000000000000000000000dEaD");
 const GAS_PRICE: u128 = 1_000_000_000;
 const GAS_LIMIT: u64 = 21_000;
 
+/// The JSON-RPC error code of a halted chain, as the ingress answers a
+/// submit with (`kardamom_ingress::error::CHAIN_HALTED_CODE`).
+pub const CHAIN_HALTED_CODE: i64 = -32010;
+
+/// The error object of a refused call: its code and its message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl RpcError {
+    fn from_json(err: &serde_json::Value) -> Self {
+        Self {
+            code: err
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            message: err
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+}
+
 /// A JSON-RPC client of one ingress.
 #[derive(Debug, Clone)]
 pub struct Rpc {
@@ -55,6 +82,19 @@ impl Rpc {
         method: &str,
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
+        match self.call_typed(method, params).await? {
+            Ok(result) => Ok(result),
+            Err(err) => anyhow::bail!("{method} error: {} ({})", err.message, err.code),
+        }
+    }
+
+    /// One call whose refusal the caller reads: `Ok(Err(..))` carries the
+    /// error object, `Err(..)` a transport or decode failure.
+    async fn call_typed(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<Result<serde_json::Value, RpcError>> {
         let body =
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let response: serde_json::Value = self
@@ -68,12 +108,12 @@ impl Rpc {
             .await
             .with_context(|| format!("decode {method} response"))?;
         if let Some(err) = response.get("error") {
-            anyhow::bail!("{method} error: {err}");
+            return Ok(Err(RpcError::from_json(err)));
         }
-        Ok(response
+        Ok(Ok(response
             .get("result")
             .cloned()
-            .unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null)))
     }
 
     /// Whether the JSON-RPC listener answers. `eth_chainId` reads no state,
@@ -99,6 +139,17 @@ impl Rpc {
         )
         .await
         .map(|_| ())
+    }
+
+    /// The ingress's chain status: the heads, the roots, and every
+    /// service's latest state on the `events` stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub async fn chain_status(&self) -> anyhow::Result<serde_json::Value> {
+        self.call("kardamom_chainStatus", serde_json::json!([]))
+            .await
     }
 
     /// The next nonce of genesis account `account`, from the latest
@@ -148,10 +199,49 @@ impl Rpc {
     /// the submit fails, no receipt arrives in time, or the receipt
     /// status is not `0x1`.
     pub async fn transfer_smoke(&self, account: u32, budget: Duration) -> anyhow::Result<()> {
+        let nonce = self.nonce_of(account).await?;
+        self.transfer_at(account, nonce, budget).await
+    }
+
+    /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signer cannot derive, the submit fails,
+    /// no receipt arrives in time, or the receipt status is not `0x1`.
+    pub async fn transfer_at(
+        &self,
+        account: u32,
+        nonce: u64,
+        budget: Duration,
+    ) -> anyhow::Result<()> {
+        let hash = self.send_transfer(account, nonce).await?.map_err(|e| {
+            anyhow::anyhow!("eth_sendRawTransaction error: {} ({})", e.message, e.code)
+        })?;
+        crate::log(format!(
+            "smoke: account #{account} sent {hash} through {}",
+            self.url
+        ));
+        self.await_receipt(&hash, budget).await
+    }
+
+    /// Sign and submit a one-wei transfer from genesis account `account`
+    /// at `nonce`. `Ok(Ok(hash))` is an accepted submit, `Ok(Err(..))` the
+    /// ingress's refusal, for a case that expects one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signer cannot derive or the call fails.
+    pub async fn send_transfer(
+        &self,
+        account: u32,
+        nonce: u64,
+    ) -> anyhow::Result<Result<String, RpcError>> {
         let signer = Self::genesis_signer(account)?;
         let mut tx = TxLegacy {
             chain_id: Some(self.chain_id),
-            nonce: self.nonce_at(signer.address).await?,
+            nonce,
             gas_price: GAS_PRICE,
             gas_limit: GAS_LIMIT,
             to: TxKind::Call(SINK),
@@ -165,21 +255,18 @@ impl Rpc {
         let envelope: TxEnvelope = tx.into_signed(sig).into();
         let mut raw = Vec::with_capacity(110);
         envelope.encode_2718(&mut raw);
-        let hash = self
-            .call(
+        let answer = self
+            .call_typed(
                 "eth_sendRawTransaction",
                 serde_json::json!([format!("0x{}", hex(&raw))]),
             )
             .await?;
-        let hash = hash
-            .as_str()
-            .context("eth_sendRawTransaction returned no hash")?
-            .to_string();
-        crate::log(format!(
-            "smoke: account #{account} sent {hash} through {}",
-            self.url
-        ));
-        self.await_receipt(&hash, budget).await
+        Ok(answer.and_then(|hash| {
+            hash.as_str().map(str::to_string).ok_or_else(|| RpcError {
+                code: 0,
+                message: "eth_sendRawTransaction returned no hash".to_string(),
+            })
+        }))
     }
 
     async fn await_receipt(&self, hash: &str, budget: Duration) -> anyhow::Result<()> {
