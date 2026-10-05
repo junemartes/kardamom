@@ -1,13 +1,15 @@
 //! `batcher-outage-past-retention`: the batcher is frozen until the
 //! sealers' egress floor passes its cursor and a snapshot lands, then
-//! thawed. Its restart recovers what its spool held; the rest of the
-//! gap waits on an executor's block refs and the `tx_data` archive.
+//! thawed. Its restart posts what its spool held, rebuilds the rest of
+//! the gap from the state databases' block references and the `tx_data`
+//! archives, and posts on past the sealers' floor.
 
 use std::cell::Cell;
 use std::time::Duration;
 
-use super::batcher::{REFUSED_LINE, SPOOL_RESTORED_LINE, count, require_posting};
-use super::halt::await_batcher_halted_on_replay;
+use super::batcher::{
+    REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, count, field_in_last, require_posting,
+};
 use crate::harness::Harness;
 use crate::l1::L1;
 use crate::nomad::Streams;
@@ -16,6 +18,10 @@ use crate::probes::{BATCHER_PORT, CLUSTER_TASK};
 
 /// The sealer's line for a snapshot, on every member.
 const SNAPSHOT_LINE: &str = "snapshot TAKEN";
+/// How long the rebuild of the gap may take past the restart: the
+/// references of every block, and the bytes of every transaction from
+/// the archives.
+const REBUILD_BUDGET: Duration = Duration::from_secs(240);
 /// How many times the freeze is retried to land on a non-empty spool.
 const FREEZE_ATTEMPTS: u32 = 10;
 
@@ -184,7 +190,7 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         .count_lines(CLUSTER_TASK, SNAPSHOT_LINE, Streams::StdoutOnly)
         .await?;
     let restored0 = count(h, SPOOL_RESTORED_LINE).await?;
-    let refused0 = count(h, REFUSED_LINE).await?;
+    let rebuilt0 = count(h, REBUILT_LINE).await?;
     let blocks = freeze_with_spool(h, &aux, &inner, ctx).await?;
     // A post in flight at the freeze still lands: read the covered
     // block once it has.
@@ -206,9 +212,32 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     let budget = h.knobs.restart_slo + Duration::from_secs(60);
     await_line(h, SPOOL_RESTORED_LINE, restored0, budget, ctx).await?;
     await_spool_posted(&l1, covered0, ctx).await?;
-    await_batcher_halted_on_replay(h, refused0, budget, ctx).await?;
-    crate::log(format!(
-        "{ctx}: SKIPPED (second half): the sealers refused the replay past the spool; the recovery from an executor's block refs and the tx_data archive waits on kardamom_getBlockRefs"
-    ));
+    await_line(h, REBUILT_LINE, rebuilt0, budget + REBUILD_BUDGET, ctx).await?;
+    let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
+    let floor = field_in_last(&logs, REBUILDING_LINE, "oldest_block").ok_or_else(|| {
+        crate::chaos_fail!("{ctx}: the rebuild line names no oldest_block (the sealers' floor)")
+    })?;
+    await_covered_through(&l1, floor, ctx).await?;
     l1.assert_contiguous(ctx).await
+}
+
+/// L1 covers through `floor`: the rebuilt gap and the sealers' floor
+/// block are posted.
+async fn await_covered_through(l1: &L1, floor: u64, ctx: &str) -> anyhow::Result<()> {
+    let outcome = poll::until(Budget::secs(180, 5), |_| async move {
+        let covered = l1.covered_through().await?;
+        Ok::<_, anyhow::Error>((covered >= floor).then_some(covered))
+    })
+    .await?;
+    let (covered, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: L1 did not cover the sealers' floor block {floor} within {}s — the rebuilt gap was not posted",
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: the gap was rebuilt and posted: L1 covers through {covered}, past the floor {floor} ({}s)",
+        elapsed.as_secs()
+    ));
+    Ok(())
 }

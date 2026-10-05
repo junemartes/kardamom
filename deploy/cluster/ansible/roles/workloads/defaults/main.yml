@@ -100,12 +100,14 @@ workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548'
 # so the harness can serve them the faults of a real outage.
 workloads_l1_fault_proxy: "{{ lookup('env', 'KARDAMOM_L1_FAULT_PROXY') | default('0', true) | bool }}"
 workloads_fault_proxy_url: "http://kardamom-l1-fault-proxy.service.{{ datacenter }}.consul:{{ ports.l1_fault_proxy }}"
-# The L1 the followers (the da-watcher, the indexer) walk block by block.
-# Default: the fault proxy when it is deployed; else the light client
-# when one is deployed, else the real L1. A light client behind an
-# execution RPC without historical proofs serves only the blocks it has
-# seen, so a follower behind it stalls after a gap; L1_FOLLOWERS_RPC then
-# names the real L1, and the validator keeps its verified view.
+# The L1 the followers (the da-watcher, the indexer) walk block by block:
+# a comma-separated list; with two or more entries a block is accepted
+# only when two agree. Default: the fault proxy when it is deployed; else
+# the light client when one is deployed, else the real L1. A light client
+# behind an execution RPC without historical proofs serves only the
+# blocks it has seen, so a follower behind it stalls after a gap;
+# L1_FOLLOWERS_RPC then names the real L1 endpoints, and the light client
+# settles the reads it serves (workloads_followers_light_client).
 workloads_followers_rpc: >-
   {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
      else lookup('env', 'L1_FOLLOWERS_RPC')
@@ -114,6 +116,13 @@ workloads_followers_rpc: >-
 # The da-watcher's placeholder lockbox, for a deployment without one:
 # the deposit path is then idle, and the indexer archives empty epochs.
 workloads_zero_address: "0x0000000000000000000000000000000000000000"
+# The light client as the followers' tie-breaker: set when one runs and
+# L1_FOLLOWERS_RPC names other endpoints, so the light client is not in
+# the list twice.
+workloads_followers_light_client: >-
+  {{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
+     if workloads_light_execution_rpc | length > 0 and lookup('env', 'L1_FOLLOWERS_RPC') | length > 0
+     else '' }}
 # The inbox indexer (nomad/l1-indexer.nomad.hcl): deployed with the light
 # client, read by the batcher through its Consul service record. The
 # start block is optional: empty means the finalized block at its first

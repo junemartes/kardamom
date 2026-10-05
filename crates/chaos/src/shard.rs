@@ -107,9 +107,9 @@ impl Shard {
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // A lying L1 in front of the followers. The outage past the
-            // retention runs last: its second half waits on the block
-            // refs recovery, and a failure there must not hide the
-            // liar cases.
+            // retention runs last: it holds the load until the sealers'
+            // floor passes, the longest case, and a failure there must
+            // not hide the liar cases.
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",

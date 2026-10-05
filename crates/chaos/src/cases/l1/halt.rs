@@ -1,12 +1,11 @@
 //! The one place a case judges "the service halted". Today the judgment
 //! reads what each service exports: the followers' tick-outcome
-//! counters, the batcher's refusal line. The halt record
+//! counters. The halt record
 //! (`kardamom_halt{service, cause, recovery}` and the `/halt` route)
 //! replaces those reads here, and nowhere else.
 
 use std::time::Duration;
 
-use super::batcher::{REFUSED_LINE, count};
 use super::followers::Followers;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
@@ -46,34 +45,6 @@ pub(super) async fn await_followers_halted(
         "{ctx}: both followers halted after {}s ({})",
         elapsed.as_secs(),
         now.show()
-    ));
-    Ok(())
-}
-
-/// The batcher halted on a replay the sealers refused: its cursor is
-/// past the retention floor. `refused0` is the refusal count before.
-pub(super) async fn await_batcher_halted_on_replay(
-    h: &Harness,
-    refused0: usize,
-    budget: Duration,
-    ctx: &str,
-) -> anyhow::Result<()> {
-    let outcome = poll::until(
-        Budget::new(budget, Duration::from_secs(5)),
-        |_| async move {
-            Ok::<_, anyhow::Error>((count(h, REFUSED_LINE).await? > refused0).then_some(()))
-        },
-    )
-    .await?;
-    let ((), elapsed) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: the batcher never halted on a refused replay within {}s",
-            t.as_secs()
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: the batcher halted on the refused replay after {}s",
-        elapsed.as_secs()
     ));
     Ok(())
 }

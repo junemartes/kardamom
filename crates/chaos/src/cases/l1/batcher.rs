@@ -17,9 +17,11 @@ pub(super) const START_LINE: &str = "live batcher starting";
 const OLD_RESUME_LINES: [&str; 2] = ["indexer behind L1; waiting", "no BatchPosted event with it"];
 /// The line of a restart that found its pending group on disk.
 pub(super) const SPOOL_RESTORED_LINE: &str = "pending group restored from the spool";
-/// The line of a replay the sealers refused: the cursor is past the
-/// retention floor.
-pub(super) const REFUSED_LINE: &str = "cluster replay unavailable";
+/// The line of a replay the sealers refused, with the floor block
+/// (`oldest_block=`): the rebuild from references starts.
+pub(super) const REBUILDING_LINE: &str = "sealer replay refused; rebuilding the gap";
+/// The line of a rebuilt gap: the reader resumes at the sealers' floor.
+pub(super) const REBUILT_LINE: &str = "gap rebuilt; resuming at the sealer's floor";
 
 /// The confirmed posts of the running batcher: zero when the exporter
 /// answers before its first post, `None` when it does not answer.
@@ -142,7 +144,7 @@ pub(super) async fn assert_resumed_from_contract(
         )
     })?;
     let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
-    let covered = covered_in_last_start(&logs)
+    let covered = field_in_last(&logs, START_LINE, "covered_through_block")
         .ok_or_else(|| crate::chaos_fail!("{ctx}: the start line names no covered block"))?;
     let now = l1.covered_through().await?;
     anyhow::ensure!(
@@ -169,13 +171,14 @@ pub(super) async fn assert_resumed_from_contract(
     Ok(())
 }
 
-/// The `covered_through_block=` field of the last start line. The
+/// The numeric `field=` of the last log line that holds `needle`. The
 /// batcher's log colors each field name and its `=` with ANSI escapes,
 /// so the line is read without them.
-fn covered_in_last_start(logs: &str) -> Option<u64> {
-    without_ansi(logs.lines().rfind(|l| l.contains(START_LINE))?)
+pub(super) fn field_in_last(logs: &str, needle: &str, field: &str) -> Option<u64> {
+    let prefix = format!("{field}=");
+    without_ansi(logs.lines().rfind(|l| l.contains(needle))?)
         .split_whitespace()
-        .find_map(|field| field.strip_prefix("covered_through_block="))
+        .find_map(|word| word.strip_prefix(prefix.as_str()).map(str::to_string))
         .and_then(|v| v.parse().ok())
 }
 
@@ -206,9 +209,18 @@ mod tests {
         let logs = "x live batcher starting covered_through_block=5 replay_from_block=6\n\
             noise\n\
             y live batcher starting last_batch_index=9 covered_through_block=45 chain_id=1\n";
-        assert_eq!(covered_in_last_start(logs), Some(45));
-        assert_eq!(covered_in_last_start("nothing"), None);
+        assert_eq!(
+            field_in_last(logs, START_LINE, "covered_through_block"),
+            Some(45)
+        );
+        assert_eq!(
+            field_in_last("nothing", START_LINE, "covered_through_block"),
+            None
+        );
         let colored = "\x1b[32m INFO\x1b[0m live batcher starting \x1b[3mlast_batch_index\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mcovered_through_block\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mchain_id\x1b[0m\x1b[2m=\x1b[0m1\n";
-        assert_eq!(covered_in_last_start(colored), Some(7));
+        assert_eq!(
+            field_in_last(colored, START_LINE, "covered_through_block"),
+            Some(7)
+        );
     }
 }

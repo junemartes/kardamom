@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::accounts::{Accounts, Pin};
-use crate::cases::{Case, L1Record};
+use crate::cases::Case;
 use crate::contract::NodeContract;
 use crate::evidence::Evidence;
 use crate::inject::Killed;
@@ -87,9 +87,6 @@ pub struct Harness {
     pub rpc_url: String,
     pub(crate) accounts: Accounts,
     pub(crate) killed: Option<Killed>,
-    /// The DA record on L1 after the cases so far; the persisted-state
-    /// stage reads it.
-    pub(crate) l1_record: L1Record,
 }
 
 impl Harness {
@@ -111,7 +108,6 @@ impl Harness {
             probes,
             accounts: Accounts::new(knobs.account_base, knobs.run_load),
             killed: None,
-            l1_record: L1Record::Complete,
             knobs,
             lifecycle,
             rpc_url,
@@ -159,7 +155,6 @@ impl Harness {
         crate::log(format!(
             "================= CHAOS CASE: {name} ================="
         ));
-        self.l1_record = self.l1_record.after(case);
         let account = self.pick_account(case)?;
         let window = case.window(&self.knobs);
         let rx0 = self.probes.ingress_counts().await;

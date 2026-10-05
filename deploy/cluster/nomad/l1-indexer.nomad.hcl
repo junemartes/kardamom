@@ -19,7 +19,15 @@
 
 variable "l1_rpc" {
   type        = string
-  description = "The L1 JSON-RPC endpoint the indexer follows: the light client (nomad/l1-light-client.nomad.hcl), so every block, log, and hash is verified before it is archived."
+  description = "The L1 JSON-RPC endpoints the indexer follows, comma-separated. With two or more, a block, a log query or a hash is archived only when two agree."
+  default     = ""
+}
+
+# The light client's endpoint, when one runs: its answer settles a read
+# it serves, and a public endpoint that disagrees with it is the liar.
+variable "l1_light_client_rpc" {
+  type        = string
+  description = "The L1 light client's endpoint (nomad/l1-light-client.nomad.hcl). Empty: none."
   default     = ""
 }
 
@@ -145,6 +153,7 @@ job "l1-indexer" {
           ],
           var.start_block != "" ? ["--start-block", var.start_block] : [],
           var.poll_interval_secs != "" ? ["--poll-interval-secs", var.poll_interval_secs] : [],
+          var.l1_light_client_rpc != "" ? ["--l1-light-client-rpc", var.l1_light_client_rpc] : [],
         )
       }
 

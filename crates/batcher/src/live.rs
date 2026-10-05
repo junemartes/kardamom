@@ -10,6 +10,13 @@
 //! deposits are absent from DA by design. A reconstructor re-derives them
 //! from L1.
 //!
+//! Resume sources, in order: the spool (the blocks consumed and not yet
+//! posted), the sealer's replay from the cursor, and, when the sealer no
+//! longer retains the cursor, a rebuild of the gap up to the sealer's
+//! floor from the references an executor or the validator keeps and the
+//! bytes the `tx_data` archives hold. Retention is a latency, not a loss,
+//! while one state database and one archive survive.
+//!
 //! Durability model:
 //! - L1 (`lastBatchIndex` and the `BatchPosted` event) is the authoritative
 //!   record of what has been posted.
@@ -27,6 +34,9 @@ mod cursor;
 mod feed;
 pub mod poll;
 mod post_age;
+mod rebuild;
+mod refs_store;
+mod resume;
 mod run;
 mod sender;
 mod spool;
@@ -67,6 +77,10 @@ pub(crate) mod live_metric_names {
     /// Starts whose L1 read failed. The start retries in-process, so the
     /// counter is scrapeable while L1 stays unreachable.
     pub(crate) const RESUME_FAILURES: &str = "kardamom_batcher_resume_failures_total";
+    /// Blocks rebuilt from the state databases' references and the
+    /// `tx_data` archives after the sealer refused the replay: the gap
+    /// between the cursor and the sealer's retention floor.
+    pub(crate) const REBUILT_BLOCKS: &str = "kardamom_batcher_rebuilt_blocks_total";
     /// 1 once the feed loop runs over the spool it restored. The
     /// readiness rule of the live batcher requires it.
     pub const FEED_RUNNING: &str = "kardamom_batcher_feed_running";

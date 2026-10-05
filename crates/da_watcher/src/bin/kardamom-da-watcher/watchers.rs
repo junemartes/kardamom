@@ -5,10 +5,10 @@
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use alloy_provider::ProviderBuilder;
+use anyhow::Context;
 
 use kardamom_da_watcher::interop::{CursorReconcile, InteropWatcher, WsRemoteChainSource};
-use kardamom_da_watcher::{L1Watcher, RpcL1Source, WatcherHandle};
+use kardamom_da_watcher::{L1Watcher, WatcherHandle};
 use kardamom_log::aeron_live::{TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle};
 use kardamom_obs::bin::wait_for_shutdown;
 
@@ -56,21 +56,23 @@ impl Watchers {
         let mut handles: Vec<(WatcherKind, WatcherHandle)> = Vec::new();
 
         if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
-            let provider = ProviderBuilder::new()
-                .connect(&l1.rpc)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", l1.rpc))?;
             tracing::info!(
-                l1_rpc = %l1.rpc,
+                l1_rpc = ?l1.endpoints.rpcs,
+                l1_light_client = ?l1.endpoints.light_client,
                 lockbox = ?l1.cfg.lockbox,
                 poll_interval = ?l1.cfg.poll_interval,
                 "kardamom-da-watcher: publishing L1 epochs onto tx_deposits"
             );
+            let sources = l1
+                .endpoints
+                .connect()
+                .await
+                .context("connect the L1 sources")?;
             handles.push((
                 WatcherKind::L1,
                 L1Watcher::spawn(
                     LiveTxDepositsPublisher::new(tx_deposits_pub),
-                    RpcL1Source::new(provider),
+                    sources,
                     l1.cfg,
                 ),
             ));
