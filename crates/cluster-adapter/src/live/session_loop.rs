@@ -435,7 +435,6 @@ impl SessionLoop {
     /// move together with the publication, so a failed open keeps all three
     /// on the old leader.
     fn on_reconnect(&mut self, leader_member_id: i32, ingress_endpoints: String) {
-        crate::metrics::record_leader(leader_member_id);
         let Some(p) = open_leader_pub(
             &self.rt,
             &ingress_endpoints,
@@ -456,6 +455,7 @@ impl SessionLoop {
         self.ingress = p;
         self.endpoints = ingress_endpoints;
         self.target_member = leader_member_id;
+        crate::metrics::record_leader(leader_member_id);
     }
 
     /// Duty 1a: egress-liveness watchdog (every session, see
