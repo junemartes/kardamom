@@ -632,11 +632,20 @@ and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
 which also gives the flag-day procedure for a wiped sealer set and the seed
 hook that would replace it.
 
-Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
-skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
-events via the `da_watcher` path — interleaving them into the reconstruction is
-a documented follow-up, so a deposit-bearing range currently reconstructs its
-non-deposit state exactly and is flagged rather than silently diverging.
+Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
+absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
+would be an unverifiable claim. With `--lockbox`, the rebuild derives them from
+L1: when a block's L1 origin moves from M to N, the block leads with the epochs
+M+1..N, each derived from that L1 block's lockbox logs through `derive_epoch`,
+the rule the da-watcher and the validator use. Each epoch takes a marker slot
+and one slot per deposit at the head of its block, as on the live stream. The
+first step from origin 0 takes epoch N only: the da-watcher starts at the
+finalized block it first sees. A block whose items need more slots than its
+canonical range holds is refused. A smaller need is accepted, because a vacant
+slot (a voided entry or its void record) never reaches the payload; a missing
+deposit then shows as a root mismatch at `--expect-root`. Without `--lockbox`
+the rebuild leaves deposits out, and a chain with deposits rebuilds to a wrong
+root.
 
 **A gap in the record is loud.** Every case of the chaos-l1 shard ends with
 the persisted-state stage: the state at the validator's drained head is
@@ -837,9 +846,6 @@ check would pass against a feature that activated once and stopped.
   CRC-verify + targeted-heal path (`archive-corruption` chaos case). Still
   open: `tx_ordering` archive re-replication (today it self-heals only via the
   Java cluster's Raft log replication on rejoin).
-- **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
-  transactions; re-deriving L1 deposits from `DepositInitiated` events and
-  interleaving them in canonical order is a follow-up.
 - **L1 outage** — the followers cross-check two L1 sources, and the
   batcher rebuilds a range the sealer no longer retains from the state
   databases' references and the `tx_data` archives (the batcher section).
