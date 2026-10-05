@@ -555,6 +555,22 @@ refusal routes the consumer into its repair path. A cold start sends the
 block end exactly; a reconnect inside an open block sends an index between
 the two ends; a start from genesis has no boundary to check.
 
+**A resume cursor ahead of the head is a refusal.** A sealer that lost its
+stream, for example in a total wipe, can come back behind its consumers. A
+consumer whose index or block is past the sealer's head applied records the
+sealer does not hold. The sealer answers `REPLAY_AHEAD` (egress kind 11),
+which carries its head, and logs `cluster REPLAY ... AHEAD
+head=(index,block)`. A `REPLAY_DONE` would let the consumer drop each new
+record below its cursor as a duplicate and diverge with no signal. The
+consumer checks the same rule on its side: a `REPLAY_DONE` whose head is
+below the delivery cursor also stops it. Both give `ClusterBehindCursor`.
+No repair path takes this error. The replay-unavailable repair fetches a
+peer checkpoint, but after a sealer wipe every peer is ahead of the head
+too, so a repair would only park the local state and loop. The executor,
+the validator and the batcher exit with status 1. The orchestrator restarts
+each one, and each restart stops at the same refusal
+until the sealer serves the stream again.
+
 **A lying or absent L1 endpoint.** The batcher's start reads the settlement
 contract: `lastBatchIndex`, and the `l2BlockEnd` the contract stores with
 that batch. Two `eth_call`s, no event scan, no wait on the inbox indexer.
