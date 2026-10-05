@@ -45,17 +45,26 @@ instruction per sentence.
 
 ## Mechanical checks
 
-`just style` runs, for the whole workspace with all features:
+`just style` runs three steps and reports every failure at the end. It exits non-zero when any step fails.
 
-1. `cargo clippy --all-targets -- -D warnings -W clippy::pedantic`
-2. `cargo clippy` with `too_many_lines` at threshold 100 (the mandatory R2 bound)
-3. `cargo check` with `-W unreachable_pub`
-4. `cargo fmt --check`
-5. A grep that fails on `debug_assert!`, `.max(1)`, `Box<dyn`, and
-   `allow(clippy::too_many_arguments)` in production code
+1. **Clippy.** One run for the whole workspace, with all targets and all features:
+   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings -W clippy::pedantic -D unreachable_pub -A clippy::assert_is_empty`
+   - `clippy::pedantic` covers R11. It includes `too_many_lines`, which enforces R2.
+   - The threshold of `too_many_lines` is `too-many-lines-threshold = 100` in `clippy.toml`.
+   - `-D unreachable_pub` covers R8.
+   - `assert_is_empty` is allowed. It wants `assert_eq!(x, [] as [T; 0])` in place of `assert!(x.is_empty())`. The typed empty array hides the intent.
+2. **rustfmt.** `cargo fmt --all -- --check`.
+3. **Forbidden patterns.** A grep over the `.rs` files of `crates` and `guest`. It fails on these patterns:
+   - `debug_assert!` (R9).
+   - `.max(1)` (R13).
+   - `dyn`, as a word (R6). The grep also finds a `Box<` that rustfmt splits from its `dyn` on the next line.
+   - `allow(clippy::too_many_arguments)` (R11).
 
-The judgment rules (R1, R5, R6, R7, R9, R10, R14, R15, R16) are reviewed by reading.
+   Test files are exempt: a path with a `test` or `tests` directory, a `*_test.rs` or `*_tests.rs` file, `tests.rs`, and `test_support`.
+
+The judgment rules have no check in `just style`. Read the diff against them: R1, R5, R7, R9, R10, R14, R15 and R16. The grep covers only the literal patterns of R6 and R9, not their intent.
+R3, R4 and R12 also have no dedicated check.
 
 ## Audit
 
-The audit of 2026-09-07 applied these rules to the whole workspace (PR #275).
+The audit of 2026-09-07 applied these rules to the whole workspace.
