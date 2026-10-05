@@ -64,7 +64,7 @@ variable "nomad_region" {
 
 variable "nomad_tls_dir" {
   type        = string
-  description = "The directory with the agent TLS material on the aux node (ca.pem). Empty means the Nomad API speaks plain HTTP."
+  description = "The directory with the agent TLS material on the monitoring node (ca.pem). Empty means the Nomad API speaks plain HTTP."
   default     = ""
 }
 
@@ -138,6 +138,9 @@ locals {
         consul_sd_configs:
           - server: 127.0.0.1:8500
             services: ["${var.cluster_id}-nomad", "${var.cluster_id}-nomad-client"]
+            # A server registers its http, rpc and serf ports under one
+            # name; only the http port serves the metrics.
+            tags: [http]
         relabel_configs:
           - source_labels: [__meta_consul_node]
             target_label: node
