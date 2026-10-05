@@ -225,6 +225,12 @@ node_classes:
 
 # Aeron Cluster (Raft) sealer member ports (uniform per role; unique by node IP).
 cluster_member_count: 3
+# The block of fixed ports that the common role reserves from the kernel's
+# ephemeral range (net.ipv4.ip_local_reserved_ports). Every fixed Aeron port
+# below (the channels and cluster_ports) must lie inside it; the deploy
+# isolation test checks that.
+fixed_port_block: "40000-40299"
+
 cluster_ports:
   ingress: 40200          # client-facing ingress (sequencer cluster-client connects here)
   consensus: 40201        # Raft consensus
