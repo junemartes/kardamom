@@ -667,8 +667,9 @@ blocks after H are reverted: their receipts are revoked. The procedure is
    E_H, the canonical end of H.
 3. Every executor and the validator resume on the rebuilt state at
    `(E_H, H + 1)`.
-4. The da-watcher starts with `--l1-resume-after M`, where M is the L1 origin
-   of H.
+4. The sequencers start, and then the da-watcher with `--l1-resume-after M`,
+   where M is the L1 origin of H. A sequencer reads the epochs live, with no
+   replay, so the da-watcher must not publish before the sequencers subscribe.
 
 Every copy of the reverted chain must go, because each one resumes or
 publishes past the new stream:

@@ -39,9 +39,23 @@ The genesis is `deploy/cluster/config/genesis/dev.toml`. With
 `PRIORITY_FEES=on`, append `fees.toml` to it, as the validator job does:
 `cat dev.toml fees.toml > genesis.toml`.
 
-### 1. Find the posted head H and stop the pipeline
+### 1. Stop the pipeline and find the posted head H
 
-1. Read H, the `l2BlockEnd` of the last posted batch:
+1. Save each job and stop it. The saved file is the job you start again
+   later. `nomad job stop` without `-purge` keeps the job's history. Stop the
+   batcher last, after `lastBatchIndex` held still for a minute: every block
+   it posts is a block that the revert keeps.
+
+   ```sh
+   for job in ingress sequencer da-watcher state-mirror cluster executor validator batcher; do
+     nomad job inspect "$job" > "$job.json"
+   done
+   for job in ingress sequencer da-watcher state-mirror cluster; do nomad job stop "$job"; done
+   cast call "$SETTLEMENT" 'lastBatchIndex()(uint64)' --rpc-url "$L1_RPC"
+   nomad job stop batcher
+   ```
+
+2. Read H, the `l2BlockEnd` of the last posted batch:
 
    ```sh
    LAST=$(cast call "$SETTLEMENT" 'lastBatchIndex()(uint64)' --rpc-url "$L1_RPC")
@@ -49,21 +63,11 @@ The genesis is `deploy/cluster/config/genesis/dev.toml`. With
          --rpc-url "$L1_RPC" | sed -n 2p)
    ```
 
-2. Save each job and stop it. The saved file is the job you start again
-   later. `nomad job stop` without `-purge` keeps the job's history.
-
-   ```sh
-   for job in ingress sequencer da-watcher batcher state-mirror; do
-     nomad job inspect "$job" > "$job.json" && nomad job stop "$job"
-   done
-   for job in cluster executor validator; do nomad job inspect "$job" > "$job.json"; done
-   nomad job stop cluster
-   ```
-
 3. Record the old head and the reverted transactions while the executors still
-   serve their old state. Every executor holds the same chain. The list holds
-   L2 transactions only: the deposits of the reverted blocks come again from
-   L1 in step 6.
+   serve their old state. Read `kardamom_executor_block_number` on each
+   executor, and use the executor with the highest head. The list holds L2
+   transactions only: the deposits of the reverted blocks come again from L1
+   in step 6.
 
    ```sh
    OLD_HEAD=$(curl -s http://executor-0.node.dc1.consul:9004/metrics \
@@ -218,7 +222,11 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    checkpoint of the old chain survived: stop, and do step 3 again.
 2. Start the state mirrors: `nomad job run -json state-mirror.json`. They find
    the cache empty and rebuild it from an executor's newest checkpoint.
-3. Start the da-watcher after block M. Without the flag, it starts at the
+3. Start the sequencers: `nomad job run -json sequencer.json`. They must run
+   before the da-watcher starts. A sequencer reads the da-watcher's epochs
+   live, with no replay, so an epoch published before the sequencers
+   subscribe never reaches the sealer.
+4. Start the da-watcher after block M. Without the flag, it starts at the
    finalized tip, and the deposits of the blocks between M and the tip are
    lost. If M is 0, the chain holds no epoch: leave out the flag.
 
@@ -228,10 +236,13 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    nomad job run -json da-watcher-resume.json
    ```
 
-4. Start the sequencers, the ingresses and the batcher:
+   Read the da-watcher's metrics on the aux node:
+   `kardamom_da_watcher_epochs_published_total` equals
+   `kardamom_da_watcher_l1_finalized_block_number` minus M.
+5. Start the ingresses and the batcher:
 
    ```sh
-   for job in sequencer ingress batcher; do nomad job run -json "$job.json"; done
+   for job in ingress batcher; do nomad job run -json "$job.json"; done
    ```
 
 ### 7. Verify
