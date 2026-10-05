@@ -2281,6 +2281,7 @@ dependencies = [
  "kardamom-deployer",
  "kardamom-exec-core",
  "kardamom-ingress",
+ "kardamom-l1-fault-proxy",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",
@@ -3870,6 +3871,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kardamom-bench",
+ "kardamom-l1-fault-proxy",
  "kardamom-state",
  "kardamom-types",
  "reqwest 0.13.4",
@@ -4111,6 +4113,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kardamom-l1-fault-proxy"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "clap",
+ "kardamom-obs",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -94,18 +94,28 @@ workloads_light_network: "{{ lookup('env', 'L1_LIGHT_CLIENT_NETWORK') | default(
 # The light client by its Consul service record (nomad/l1-light-client.nomad.hcl).
 workloads_light_host: "{{ lookup('env', 'L1_LIGHT_CLIENT_HOST') | default('kardamom-l1-light-client.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_light_port: "{{ lookup('env', 'L1_LIGHT_CLIENT_PORT') | default('8548', true) }}"
+# The lying L1 of the chaos-l1 shard (nomad/l1-fault-proxy.nomad.hcl).
+# On, the proxy sits in front of the in-cluster anvil, and every follower
+# (the batcher, the da-watcher, the inbox indexer) reads L1 through it,
+# so the harness can serve them the faults of a real outage.
+workloads_l1_fault_proxy: "{{ lookup('env', 'KARDAMOM_L1_FAULT_PROXY') | default('0', true) | bool }}"
+workloads_fault_proxy_url: "http://kardamom-l1-fault-proxy.service.{{ datacenter }}.consul:{{ ports.l1_fault_proxy }}"
 # The L1 the followers (the da-watcher, the indexer) walk block by block:
 # a comma-separated list; with two or more entries a block is accepted
-# only when two agree. Default: the light client when one is deployed,
-# else the real L1. A light client behind an execution RPC without
-# historical proofs serves only the blocks it has seen, so a follower
-# behind it stalls after a gap; L1_FOLLOWERS_RPC then names the real
-# L1 endpoints, and the light client settles the reads it serves
-# (workloads_followers_light_client).
+# only when two agree. Default: the fault proxy when it is deployed; else
+# the light client when one is deployed, else the real L1. A light client
+# behind an execution RPC without historical proofs serves only the
+# blocks it has seen, so a follower behind it stalls after a gap;
+# L1_FOLLOWERS_RPC then names the real L1 endpoints, and the light client
+# settles the reads it serves (workloads_followers_light_client).
 workloads_followers_rpc: >-
-  {{ lookup('env', 'L1_FOLLOWERS_RPC')
+  {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
+     else lookup('env', 'L1_FOLLOWERS_RPC')
      | default('http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
                if workloads_light_execution_rpc | length > 0 else workloads_l1_rpc, true) }}
+# The da-watcher's placeholder lockbox, for a deployment without one:
+# the deposit path is then idle, and the indexer archives empty epochs.
+workloads_zero_address: "0x0000000000000000000000000000000000000000"
 # The light client as the followers' tie-breaker: set when one runs and
 # L1_FOLLOWERS_RPC names other endpoints, so the light client is not in
 # the list twice.
@@ -117,7 +127,16 @@ workloads_followers_light_client: >-
 # client, read by the batcher through its Consul service record. The
 # start block is optional: empty means the finalized block at its first
 # start.
-workloads_indexer_start_block: "{{ lookup('env', 'L1_INDEXER_START_BLOCK') }}"
+# The in-cluster anvil is minutes old, so behind the fault proxy the
+# indexer starts at its first block and the archive holds every batch.
+workloads_indexer_start_block: >-
+  {{ lookup('env', 'L1_INDEXER_START_BLOCK') | default('1' if workloads_l1_fault_proxy | bool else '', true) }}
+workloads_indexer_poll_s: "{{ lookup('env', 'L1_INDEXER_POLL_S') }}"
+# Whether the indexer job is part of this deployment: with a real L1, a
+# light client, or the fault proxy.
+workloads_indexer_deployed: >-
+  {{ workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0
+     or workloads_l1_fault_proxy | bool }}
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3

@@ -12,10 +12,14 @@
     workloads_job: {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
 
 # The development L1: anvil runs only when no real L1 is given (L1_RPC).
+# Behind the fault proxy, the followers walk finalized blocks, so anvil
+# finalizes two blocks behind its head (one slot per epoch).
 - name: Deploy the development L1
   ansible.builtin.include_tasks: job.yml
   vars:
-    workloads_job: {name: anvil}
+    workloads_job:
+      name: anvil
+      vars: "{{ {'slots_in_an_epoch': '1'} if workloads_l1_fault_proxy | bool else {} }}"
   when: workloads_l1_rpc | length == 0
 
 - name: Discover the in-cluster L1 through the Nomad API
@@ -24,6 +28,14 @@
     - workloads_l1_rpc | length == 0
     - workloads_settlement_address | length == 0
     - not ansible_check_mode
+
+# The lying L1 of the chaos-l1 shard: every follower reads anvil through
+# it, and the harness sets its faults. It comes up before its consumers.
+- name: Deploy the L1 fault proxy
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job: {name: l1-fault-proxy}
+  when: workloads_l1_fault_proxy | bool
 
 - name: Resolve settlement before deploying its consumers
   ansible.builtin.import_tasks: settlement.yml
@@ -83,14 +95,15 @@
         l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
     # The watcher derives the epochs the validator checks. It walks the
-    # followers' L1 (workloads_followers_rpc): the light client when one
-    # runs and can serve every block, else the real L1; the in-cluster
-    # anvil otherwise.
+    # followers' L1 (workloads_followers_rpc): the fault proxy when it is
+    # deployed, else the light client when one runs and can serve every
+    # block, else the real L1; the in-cluster anvil otherwise.
     - name: da-watcher
       wait: false
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_rpc': workloads_followers_rpc} if workloads_l1_rpc_given | length > 0 else {})
+           | combine({'l1_rpc': workloads_followers_rpc}
+                     if workloads_l1_rpc_given | length > 0 or workloads_l1_fault_proxy | bool else {})
            | combine({'l1_light_client_rpc': workloads_followers_light_client} if workloads_followers_light_client | length > 0 else {}) }}
   loop_control:
     loop_var: workloads_job
@@ -144,8 +157,9 @@
 # The indexer archives the posted batches and the epoch inputs; it
 # walks the followers' L1 and reads the payloads from the DA proxy (the
 # job's default, by its service record). It comes up before the
-# batcher, which resumes from it. It needs a real L1: it follows
-# finality, which anvil does not have.
+# batcher, which reads a lost cursor's batch from it. It follows
+# finality: a real L1, or the in-cluster anvil behind the fault proxy,
+# which finalizes two blocks behind its head.
 - name: Deploy the inbox indexer
   ansible.builtin.include_tasks: job.yml
   vars:
@@ -155,9 +169,11 @@
         l1_rpc: "{{ workloads_followers_rpc }}"
         l1_light_client_rpc: "{{ workloads_followers_light_client }}"
         settlement_address: "{{ workloads_resolved_settlement }}"
-        lockbox_address: "{{ workloads_lockbox_address }}"
+        lockbox_address: >-
+          {{ workloads_lockbox_address if workloads_lockbox_address | length > 0 else workloads_zero_address }}
         start_block: "{{ workloads_indexer_start_block }}"
-  when: workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0
+        poll_interval_secs: "{{ workloads_indexer_poll_s }}"
+  when: workloads_indexer_deployed | bool
 
 - name: Deploy the live batcher
   ansible.builtin.include_tasks: job.yml
@@ -165,18 +181,20 @@
     workloads_job:
       name: batcher
       # The real L1 and the batcher's own key when one is given; the
-      # job's defaults (the in-cluster anvil, the dev key) otherwise. The
-      # indexer, when it runs, so a fresh batcher node resumes from it.
+      # job's defaults (the in-cluster anvil, the dev key) otherwise; the
+      # fault proxy when it is deployed. The indexer, when it runs, so a
+      # fresh batcher node reads its last batch from it.
       vars: >-
         {{ {'settlement_address': workloads_resolved_settlement}
            | combine({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})
+           | combine({'l1_rpc': workloads_fault_proxy_url} if workloads_l1_fault_proxy | bool else {})
            | combine({'batcher_key': workloads_batcher_key} if workloads_batcher_key | length > 0 else {})
            | combine({'blocks_per_batch': workloads_batcher_blocks_per_batch} if workloads_batcher_blocks_per_batch | length > 0 else {})
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
-                     if workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0 else {}) }}
+                     if workloads_indexer_deployed | bool else {}) }}
 
 - name: Record the deployed manifest
   ansible.builtin.import_tasks: record.yml

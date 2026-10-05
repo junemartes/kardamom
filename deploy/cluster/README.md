@@ -369,7 +369,8 @@ deploy/cluster/
     notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one
-    l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1 only)
+    l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1, or the chaos-l1 shard)
+    l1-fault-proxy.nomad.hcl   the lying L1 of the chaos-l1 shard, in front of anvil
   config/                   *.toml(.tpl) pulled into the job specs via file();
                             channels.toml.tpl is the shared LogConfig
   ansible/contract.yml      validate configuration mirrors and routing inputs
