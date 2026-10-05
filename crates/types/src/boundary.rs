@@ -37,4 +37,11 @@ pub struct BlockBoundary {
     /// This value comes from [`BlockBoundaryStart::l1_origin`]. Downstream
     /// consumers and the DA payload see the same origin the sealer set.
     pub l1_origin: u64,
+    /// The base fee the block's transactions paid, in wei per gas. The
+    /// executor derives it from the previous block (see [`crate::fees`]);
+    /// the ingress reports it, and the sequencer prices the next block's
+    /// offers from it together with `gas_used`.
+    pub base_fee: u128,
+    /// The gas the block's transactions used.
+    pub gas_used: u64,
 }

@@ -50,17 +50,28 @@ variable "datacenter" {
 # verifying client closes that.
 variable "l1_rpc" {
   type        = string
-  description = "The L1 JSON-RPC endpoint the watcher derives epochs from. Default: the in-cluster anvil by its Consul service record. Point it at the light client on a real network."
+  description = "The L1 JSON-RPC endpoints the watcher derives epochs from, comma-separated. With two or more, a block is accepted when two agree. Default: the in-cluster anvil by its Consul service record."
   default     = "http://anvil.service.consul:8546"
+}
+
+# The light client's endpoint, when one runs: its answer settles a read
+# it serves, and a public endpoint that disagrees with it is the liar.
+variable "l1_light_client_rpc" {
+  type        = string
+  description = "The L1 light client's endpoint (nomad/l1-light-client.nomad.hcl). Empty: none."
+  default     = ""
 }
 
 job "da-watcher" {
   datacenters = [var.datacenter]
   type        = "service"
 
+  # The nodes whose role set holds da-watcher (group_vars/all.yml,
+  # node_classes); their archive records tx_deposits.
   constraint {
-    attribute = "${meta.role}"
-    value     = "aux"
+    attribute = "${meta.roles}"
+    operator  = "set_contains"
+    value     = "da-watcher"
   }
 
   group "da-watcher" {
@@ -94,6 +105,11 @@ job "da-watcher" {
 
     network {
       mode = "host"
+      # The metrics port, as a Consul service: monitoring scrapes the
+      # service, not a node name.
+      port "metrics" {
+        static = 9005
+      }
     }
 
     task "da-watcher" {
@@ -115,17 +131,20 @@ job "da-watcher" {
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
-        args = [
-          "--l1-rpc", var.l1_rpc,
-          "--lockbox", "${var.lockbox_address}",
-          "--log-config", "/local/channels.toml",
-          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          "--poll-interval-secs", "1",
-          # Record tx_deposits to the archive, so a restarted
-          # executor can replay deposit envelopes (Phase 2 crash
-          # recovery).
-          "--archive-durability",
-        ]
+        args = concat(
+          [
+            "--l1-rpc", var.l1_rpc,
+            "--lockbox", "${var.lockbox_address}",
+            "--log-config", "/local/channels.toml",
+            "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+            "--poll-interval-secs", "1",
+            # Record tx_deposits to the archive, so a restarted
+            # executor can replay deposit envelopes (Phase 2 crash
+            # recovery).
+            "--archive-durability",
+          ],
+          var.l1_light_client_rpc != "" ? ["--l1-light-client-rpc", var.l1_light_client_rpc] : [],
+        )
       }
 
       env {
@@ -143,6 +162,19 @@ job "da-watcher" {
         # there re-renders the file; the process reads it once at start
         # and follows the catalog through discovery, so never restart.
         change_mode = "noop"
+      }
+
+      service {
+        name     = "kardamom-da-watcher"
+        port     = "metrics"
+        provider = "consul"
+        tags     = ["metrics"]
+        check {
+          type     = "http"
+          path     = "/ready"
+          interval = "10s"
+          timeout  = "2s"
+        }
       }
 
       resources {

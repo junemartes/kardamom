@@ -10,7 +10,6 @@ use super::prepare::domain_hash;
 use super::session::BoundLayers;
 use super::view::{BlockInput, MvView};
 use super::worker_execute::{ExecCtx, TxJob, WorkerEvm, execute_one, take_read_buf};
-use crate::FEE_SINK;
 use crate::mv::ReadRecord;
 use kardamom_exec_core::error::ExecutorError;
 use kardamom_types::StateDatabase;
@@ -335,6 +334,7 @@ impl<S: StateDatabase> Acquire<'_, S> {
 /// sharing that no lock granularity removes. Returns `(own, foreign)`.
 fn record_write_domains(
     r: &Result<TxResult, ExecutorError>,
+    sink: alloy_primitives::Address,
     worker: usize,
     n_workers: usize,
 ) -> (u64, u64) {
@@ -343,7 +343,7 @@ fn record_write_domains(
     };
     res.ws.accounts.iter().fold(
         (0u64, 0u64),
-        |(own, foreign), (addr, _)| match tally_write_domain(*addr, worker, n_workers) {
+        |(own, foreign), (addr, _)| match tally_write_domain(*addr, sink, worker, n_workers) {
             WriteDomain::Own => (own + 1, foreign),
             WriteDomain::Foreign => (own, foreign + 1),
             WriteDomain::Deferred => (own, foreign),
@@ -363,10 +363,11 @@ enum WriteDomain {
 /// Classify one written account's domain against `worker`.
 fn tally_write_domain(
     addr: alloy_primitives::Address,
+    sink: alloy_primitives::Address,
     worker: usize,
     n_workers: usize,
 ) -> WriteDomain {
-    if addr == FEE_SINK {
+    if addr == sink {
         return WriteDomain::Deferred;
     }
     if domain_hash(addr.as_slice(), n_workers) == worker {
@@ -420,6 +421,7 @@ fn build_worker_evm<'a, S: StateDatabase>(
     let view = MvView::new(
         &ctx.mv,
         input,
+        ctx.env.fees.beneficiary,
         bound.sink_start.clone(),
         &ctx.base_cache,
         &ctx.metrics,
@@ -575,7 +577,7 @@ impl<S: StateDatabase> JobArgs<'_, S> {
         // instrumentation was a measurable share of the work it claimed
         // to measure.
         let done_at = nanos(ctx.started.elapsed());
-        let (own, foreign) = record_write_domains(&r, worker, n_workers);
+        let (own, foreign) = record_write_domains(&r, ctx.env.fees.beneficiary, worker, n_workers);
         locals.record(t_busy_at, done_at, own, foreign);
         let outcome = record_result(ctx, job, r);
         if outcome.is_continue() {

@@ -50,6 +50,8 @@ final class IngressFrames {
         pos += Long.BYTES;
         buf.putLong(pos, Long.MAX_VALUE, ByteOrder.LITTLE_ENDIAN); // no deadline
         pos += Long.BYTES;
+        buf.putBytes(pos, new byte[SealerWire.TIP_LEN]); // no tip
+        pos += SealerWire.TIP_LEN;
         buf.putBytes(pos, canonicalId32);
         pos += canonicalId32.length;
         buf.putBytes(pos, canonicalId32); // opaque payload, relayed verbatim
@@ -140,9 +142,16 @@ final class IngressFrames {
         return recordFrame(idTag, sender20, nonce, Long.MAX_VALUE);
     }
 
-    /** {@link #recordFrame(int, byte[], long)} with an explicit deadline. */
+    /** {@link #recordFrame(int, byte[], long)} with an explicit deadline and no tip. */
     static byte[] recordFrame(
             final int idTag, final byte[] sender20, final long nonce, final long deadline) {
+        return recordFrame(idTag, sender20, nonce, deadline, 0L);
+    }
+
+    /** {@link #recordFrame(int, byte[], long, long)} with a tip (the low 64 bits of it). */
+    static byte[] recordFrame(
+            final int idTag, final byte[] sender20, final long nonce, final long deadline,
+            final long tip) {
         final byte[] out = new byte[SealerWire.CANONICAL_ID_OFFSET
                 + CanonicalSealerState.CANONICAL_ID_LEN + 1];
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
@@ -150,6 +159,8 @@ final class IngressFrames {
         buf.putBytes(SealerWire.SENDER_OFFSET, sender20);
         buf.putLong(SealerWire.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
         buf.putLong(SealerWire.DEADLINE_OFFSET, deadline, ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(SealerWire.TIP_OFFSET, tip, ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(SealerWire.TIP_OFFSET + Long.BYTES, 0L, ByteOrder.LITTLE_ENDIAN);
         buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, recordId(idTag));
         buf.putByte(out.length - 1, (byte) idTag);
         buf.getBytes(0, out);

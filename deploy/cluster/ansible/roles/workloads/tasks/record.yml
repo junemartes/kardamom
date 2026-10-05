@@ -1,0 +1,42 @@
+---
+# The record of this deploy: the manifest it deployed becomes the
+# environment's current one, and the one it replaced becomes the
+# previous one, with their signature bundles. `just rollback <env>`
+# deploys the previous one through the normal path.
+- name: Create the record directory
+  ansible.builtin.file:
+    path: "{{ workloads_record_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Read the recorded manifest
+  ansible.builtin.stat:
+    path: "{{ workloads_record_dir }}/images.digests"
+  register: workloads_recorded
+
+- name: Keep the replaced manifest as the previous one
+  ansible.builtin.copy:
+    src: "{{ workloads_record_dir }}/images.digests{{ item }}"
+    dest: "{{ workloads_record_dir }}/images.digests.previous{{ item }}"
+    remote_src: true
+    mode: "0644"
+  loop: ["", ".sigbundle"]
+  when:
+    - workloads_recorded.stat.exists
+    - lookup('file', workloads_record_dir ~ '/images.digests') != lookup('file', workloads_manifest)
+    - (workloads_record_dir ~ '/images.digests' ~ item) is file
+
+- name: Record the deployed manifest
+  ansible.builtin.copy:
+    src: "{{ workloads_manifest }}{{ item }}"
+    dest: "{{ workloads_record_dir }}/images.digests{{ item }}"
+    remote_src: true
+    mode: "0644"
+  loop: ["", ".sigbundle"]
+  when: (workloads_manifest ~ item) is file
+
+- name: Drop a stale signature of the deployed manifest
+  ansible.builtin.file:
+    path: "{{ workloads_record_dir }}/images.digests.sigbundle"
+    state: absent
+  when: not (workloads_manifest ~ '.sigbundle') is file

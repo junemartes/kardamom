@@ -13,7 +13,7 @@ contract KardamomL2SettlementTest is Test {
 
     event BatchPosted(
         uint64 indexed batchIndex,
-        bytes32[] blobHashes,
+        bytes daCert,
         uint64 l2BlockStart,
         uint64 l2BlockEnd,
         bytes32 recordsCommitment
@@ -39,17 +39,17 @@ contract KardamomL2SettlementTest is Test {
     }
 
     function test_only_batcher_can_post() public {
-        bytes32[] memory hashes = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.expectRevert(KardamomL2Settlement.NotBatcher.selector);
-        settlement.postBatch(0, hashes, 1, 1, RC);
+        settlement.postBatch(0, cert, 1, 1, RC);
     }
 
     function test_post_emits_event_and_advances_index() public {
-        bytes32[] memory hashes = _hashes(2);
+        bytes memory cert = _cert(2);
         vm.prank(BATCHER);
         vm.expectEmit(true, false, false, true);
-        emit BatchPosted(1, hashes, 10, 15, RC);
-        settlement.postBatch(0, hashes, 10, 15, RC);
+        emit BatchPosted(1, cert, 10, 15, RC);
+        settlement.postBatch(0, cert, 10, 15, RC);
         assertEq(settlement.lastBatchIndex(), 1);
         (uint64 s0, uint64 e0, bytes32 rc) = settlement.batches(1);
         assertEq(s0, 10);
@@ -58,42 +58,41 @@ contract KardamomL2SettlementTest is Test {
     }
 
     function test_post_rejects_stale_prev_index() public {
-        bytes32[] memory hashes = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.prank(BATCHER);
-        settlement.postBatch(0, hashes, 0, 0, RC);
+        settlement.postBatch(0, cert, 0, 0, RC);
         // lastBatchIndex is now 1; reposting with prevBatchIndex=0 must revert.
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.StaleBatchIndex.selector);
-        settlement.postBatch(0, hashes, 1, 1, RC);
+        settlement.postBatch(0, cert, 1, 1, RC);
     }
 
     function test_post_rejects_future_prev_index() public {
-        bytes32[] memory hashes = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.StaleBatchIndex.selector);
-        settlement.postBatch(5, hashes, 0, 0, RC);
+        settlement.postBatch(5, cert, 0, 0, RC);
     }
 
-    function test_post_rejects_empty_blob_array() public {
-        bytes32[] memory empty = new bytes32[](0);
+    function test_post_rejects_empty_cert() public {
         vm.prank(BATCHER);
-        vm.expectRevert(KardamomL2Settlement.EmptyBlobs.selector);
-        settlement.postBatch(0, empty, 0, 0, RC);
+        vm.expectRevert(KardamomL2Settlement.EmptyCert.selector);
+        settlement.postBatch(0, "", 0, 0, RC);
     }
 
     function test_post_rejects_inverted_block_range() public {
-        bytes32[] memory hashes = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.BadBlockRange.selector);
-        settlement.postBatch(0, hashes, 10, 5, RC);
+        settlement.postBatch(0, cert, 10, 5, RC);
     }
 
     function test_index_advances_monotonically_across_three_posts() public {
-        bytes32[] memory h = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.startPrank(BATCHER);
-        settlement.postBatch(0, h, 0, 0, RC);
-        settlement.postBatch(1, h, 1, 2, RC);
-        settlement.postBatch(2, h, 3, 5, RC);
+        settlement.postBatch(0, cert, 0, 0, RC);
+        settlement.postBatch(1, cert, 1, 2, RC);
+        settlement.postBatch(2, cert, 3, 5, RC);
         vm.stopPrank();
         assertEq(settlement.lastBatchIndex(), 3);
     }
@@ -107,19 +106,20 @@ contract KardamomL2SettlementTest is Test {
 
     function testFuzz_index_advances_on_each_post(uint8 n) public {
         n = uint8(bound(n, 1, 32));
-        bytes32[] memory h = _hashes(1);
+        bytes memory cert = _cert(1);
         vm.startPrank(BATCHER);
         for (uint64 i = 0; i < n; i++) {
-            settlement.postBatch(i, h, i, i, RC);
+            settlement.postBatch(i, cert, i, i, RC);
         }
         vm.stopPrank();
         assertEq(settlement.lastBatchIndex(), n);
     }
 
-    function _hashes(uint256 n) internal pure returns (bytes32[] memory out) {
-        out = new bytes32[](n);
+    /// A certificate of `n` words, as opaque as a real one is to the
+    /// contract.
+    function _cert(uint256 n) internal pure returns (bytes memory out) {
         for (uint256 i = 0; i < n; i++) {
-            out[i] = bytes32(uint256(0xC0FFEE) + i);
+            out = bytes.concat(out, bytes32(uint256(0xC0FFEE) + i));
         }
     }
 }

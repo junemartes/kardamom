@@ -28,6 +28,8 @@ fn boundary(block: u64) -> BlockBoundary {
         end_tx_idx: BPosition::from_index(block),
         l2_timestamp: 1_700_000_000 + block,
         l1_origin: 0,
+        base_fee: 0,
+        gas_used: 0,
     }
 }
 

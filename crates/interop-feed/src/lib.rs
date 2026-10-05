@@ -35,6 +35,10 @@
 //! convention as a `U256` string and is narrowed to the protocol's `u128` on
 //! decode, where an over-range value is a decode fault rather than a wrap.
 
+// The `#[rpc]` subscription methods expand to functions that carry a bare
+// `#[must_use]` and return a pinned boxed future, which is `#[must_use]` on
+// its own. The lint fires in the macro's output, so it is allowed here.
+#![allow(clippy::double_must_use)]
 use alloy_primitives::{Address, B256, Bytes, U256};
 use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;

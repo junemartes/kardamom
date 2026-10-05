@@ -26,6 +26,12 @@ pub const TX_ERROR_DUPLICATE_TOTAL: &str = "kardamom_ingress_tx_error_duplicate_
 /// mismatch shipped, and records are being lost silently. See
 /// `crate::cluster`.
 pub const CLUSTER_FRAME_DROPPED_TOTAL: &str = "kardamom_ingress_cluster_frames_dropped_total";
+/// 0 while the proxy serves, 1 from the first moment of the shutdown
+/// drain. The readiness rule requires 0: a draining replica refuses new
+/// submits, so a health check must take it out of rotation at once. The
+/// gauge is unset before the listeners are up, which also reads as not
+/// ready.
+pub const DRAINING: &str = "kardamom_ingress_draining";
 
 /// Increments [`TX_REJECTED_TOTAL`] with the given `reason` label. This is
 /// the one place for the submit-path rejection counter, so every rejection
@@ -58,6 +64,7 @@ pub fn describe() {
         CLUSTER_FRAME_DROPPED_TOTAL,
         "malformed cluster egress frames dropped by the watermark observer (should stay 0)"
     );
+    metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
 }
 
 #[cfg(test)]

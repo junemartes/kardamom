@@ -100,6 +100,13 @@ pub struct IngressConfig {
     pub inclusion_horizon_blocks: NonZeroU64,
 }
 
+/// The deadline that never passes. The sealer reads the guard header's
+/// deadline as a signed 64-bit integer and refuses a record once its block
+/// number is above it, so the largest positive signed value is the one
+/// "no deadline" the sealer accepts; `u64::MAX` would read as `-1` and
+/// expire every transaction at once.
+pub const NO_DEADLINE: u64 = i64::MAX as u64;
+
 impl IngressConfig {
     /// The inclusion deadline to stamp on an envelope, given the newest
     /// block boundary this proxy has seen.
@@ -119,9 +126,11 @@ impl IngressConfig {
     #[must_use]
     pub fn inclusion_deadline(&self, latest_block_number: u64) -> u64 {
         if latest_block_number == 0 {
-            return u64::MAX;
+            return NO_DEADLINE;
         }
-        latest_block_number.saturating_add(self.inclusion_horizon_blocks.get())
+        latest_block_number
+            .saturating_add(self.inclusion_horizon_blocks.get())
+            .min(NO_DEADLINE)
     }
 
     /// The `tx_data` lane of `sender`: the shard map, or the identity rule
@@ -202,9 +211,10 @@ mod tests {
         let cfg = IngressConfig::default();
         assert_eq!(cfg.inclusion_deadline(500), 564);
         // A proxy that has seen no boundary stamps no deadline.
-        assert_eq!(cfg.inclusion_deadline(0), u64::MAX);
-        // The horizon never wraps past the end of the range.
-        assert_eq!(cfg.inclusion_deadline(u64::MAX), u64::MAX);
+        assert_eq!(cfg.inclusion_deadline(0), NO_DEADLINE);
+        // The horizon never wraps past the end of the range, and never
+        // passes the value the sealer reads as a negative deadline.
+        assert_eq!(cfg.inclusion_deadline(u64::MAX), NO_DEADLINE);
     }
 
     #[test]

@@ -12,10 +12,13 @@
 //!
 //! ## Layering
 //!
-//! - [`source::L1Source`]: an async trait for the two L1 reads the watcher
-//!   needs (`finalized_block_number`, `lockbox_logs`). The trait is the seam
-//!   for tests (a mock impl) and for production
+//! - [`source::L1Source`]: an async trait for the L1 reads the followers
+//!   need (`finalized_block_number`, `block_ids`, `logs`). The trait is the
+//!   seam for tests (a mock impl) and for production
 //!   ([`rpc_source::RpcL1Source`], backed by an alloy provider).
+//! - [`sources::L1Sources`]: the set of sources a follower runs on. Two
+//!   sources must agree on a block or a log query, or the light client
+//!   serves it; a source that fails or lies rotates out for a backoff.
 //! - [`publisher::EpochPublisher`]: the sink for the
 //!   [`kardamom_types::Deposit`] records the watcher emits. Production wraps
 //!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`. Tests use the
@@ -55,11 +58,17 @@
 //! `kardamom_types::xchain`, for the same reason the deposit rule lives in
 //! `kardamom_types::epoch`.
 
+// The `#[async_trait]` and `#[rpc]` macros expand trait methods to functions
+// that carry a bare `#[must_use]` and return a pinned boxed future, which is
+// `#[must_use]` on its own. The lint fires in the macros' output, so the crate
+// allows it here.
+#![allow(clippy::double_must_use)]
 pub mod interop;
 pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;
 pub mod source;
+pub mod sources;
 pub mod watcher;
 
 // The deposit-derivation rule lives in `kardamom_types::epoch`, so the
@@ -70,4 +79,5 @@ pub use kardamom_types::epoch::{
 pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
 pub use source::{L1Source, L1SourceError};
+pub use sources::{L1Endpoints, L1Sources, SourceHalt};
 pub use watcher::{DaWatcherConfig, L1Watcher, MonitorError, WatcherHandle};

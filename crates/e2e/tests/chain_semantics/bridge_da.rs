@@ -73,8 +73,8 @@ async fn s2_bridge_withdrawal_round_trip() {
 /// S8: what the batcher posts to L1, re-executed from L1 alone, must
 /// equal the state root the validator computed on its own. This is the
 /// "batcher's state matches the validator's" guarantee. This test posts
-/// real EIP-4844 blobs to anvil and runs the real
-/// `kardamom-reconstruct --expect-root` binary.
+/// the DA certificates to anvil, serves the payloads from a fake EigenDA
+/// proxy, and runs the real `kardamom-reconstruct --expect-root` binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s8_da_parity_batcher_matches_validator() {
@@ -93,8 +93,9 @@ async fn s8_da_parity_batcher_matches_validator() {
         .await
         .expect("S8 workload");
 
-    // 2. Post them to L1 as real blob transactions.
-    let da_dir = post_and_verify_da(l1, &blocks, "S8").await;
+    // 2. Disperse them through the DA proxy and post the certificates
+    //    to L1.
+    let da = post_and_verify_da(l1, &blocks, "S8").await;
 
     // 3. The parity target: the validator's own committed root, read from
     //    its live database once the chain has settled on it.
@@ -126,7 +127,7 @@ async fn s8_da_parity_batcher_matches_validator() {
     da_parity::reconstruct_and_compare(
         &l1.rpc_url(),
         l1.settlement,
-        da_dir.path(),
+        &da.url(),
         &genesis,
         recon_dir.path(),
         expected_root,

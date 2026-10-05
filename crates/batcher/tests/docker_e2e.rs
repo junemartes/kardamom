@@ -20,7 +20,7 @@
 //!
 //! Then it runs the full batcher pipeline through the
 //! [`MultiArchiveReader`]: read, resolve, accumulate, pack, reconstruct,
-//! and check the blobs. It checks that a `BatchPosted`-shaped
+//! and check the payload. It checks that a `BatchPosted`-shaped
 //! `PostBatchParams` could be assembled.
 //!
 //! The synthetic segment files are written directly, with the batcher's
@@ -103,7 +103,7 @@ fn apply_resolved_record(
         return;
     };
     let pack = pack_blocks(cfg, std::slice::from_ref(&closed)).expect("pack");
-    let reconstructed = reconstruct(&pack.blobs).expect("reconstruct round-trips the pipeline");
+    let reconstructed = reconstruct(&pack.payload).expect("reconstruct round-trips the pipeline");
     assert_eq!(reconstructed.len(), 1);
     assert_eq!(reconstructed[0].block_number, 1);
     assert_eq!(

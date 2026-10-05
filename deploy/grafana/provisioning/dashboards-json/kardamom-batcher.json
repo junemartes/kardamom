@@ -124,6 +124,31 @@
       "title": "Build info",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "instance": true, "job": true}, "indexByName": {}, "renameByName": {}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "id": 6,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_batcher_last_post_age_seconds{host_id=~\"$host\"}",
+          "legendFormat": "age {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "2 * kardamom_batcher_idle_flush_seconds{host_id=~\"$host\"}",
+          "legendFormat": "alert threshold {{host_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Last post age on L1 (from L1, not from the batcher)",
+      "type": "timeseries"
     }
   ]
 }
