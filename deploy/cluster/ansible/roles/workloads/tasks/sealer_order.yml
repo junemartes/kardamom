@@ -1,0 +1,57 @@
+---
+# The roll order from the members' own status: every follower's group
+# first, the leader's last. A member reports its role on its admin
+# endpoint; the controller reaches it by the node address the Nomad API
+# advertises, as it reaches anvil.
+- name: Read the running sealer allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/cluster/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_sealer_allocations
+
+- name: Keep the running members
+  ansible.builtin.set_fact:
+    workloads_sealer_running: >-
+      {{ workloads_sealer_allocations.json
+         | selectattr('ClientStatus', 'equalto', 'running')
+         | selectattr('DesiredStatus', 'equalto', 'run') | list }}
+
+- name: Read the node of every member
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/node/{{ item.NodeID }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  loop: "{{ workloads_sealer_running }}"
+  loop_control:
+    label: "{{ item.TaskGroup }}"
+  register: workloads_sealer_nodes
+
+- name: Read the status of every member
+  ansible.builtin.uri:
+    url: "http://{{ item.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ workloads_sealer_admin_port }}/status"
+    return_content: true
+  loop: "{{ workloads_sealer_nodes.results }}"
+  loop_control:
+    label: "{{ item.item.TaskGroup }}"
+  register: workloads_sealer_status
+
+- name: Order the followers first and the leader last
+  ansible.builtin.set_fact:
+    workloads_sealer_order: >-
+      {{ (workloads_sealer_members | rejectattr('role', 'equalto', 'LEADER') | map(attribute='group') | list)
+         + (workloads_sealer_members | selectattr('role', 'equalto', 'LEADER') | map(attribute='group') | list) }}
+  vars:
+    workloads_sealer_members: >-
+      {{ workloads_sealer_running | map(attribute='TaskGroup')
+         | zip(workloads_sealer_status.results | map(attribute='json.role'))
+         | map('zip', ['group', 'role']) | map('map', 'reverse') | map('community.general.dict') | list }}
+
+- name: Require one leader and every member
+  ansible.builtin.assert:
+    that:
+      - workloads_sealer_status.results | selectattr('json.role', 'equalto', 'LEADER') | list | length == 1
+      - workloads_sealer_order | length == workloads_sealer_new.TaskGroups | length
+    fail_msg: >-
+      The sealer has no settled leader or a member is down
+      ({{ workloads_sealer_status.results | map(attribute='json') | list }}); the roll waits for a whole quorum.

@@ -34,13 +34,6 @@ use kardamom_footprint::grade::grade_block;
 use kardamom_footprint::{Cell, TxObs, envelope_view};
 use kardamom_types::TxEnvelope;
 
-/// The fee sink. Every tx credits it (a universal write cell). The
-/// `Accumulator` strategy services it with deferred commutative folding.
-/// So conflict analysis excludes it. This
-/// mirrors `kardamom_exec_core::block_env`: beneficiary = address(0),
-/// basefee = 0, the documented V0 burn.
-pub(crate) const FEE_SINK: Address = Address::ZERO;
-
 /// Pair-grading cap per block. Grading does O(n²) set intersections. CI-scale
 /// blocks have at most ~600 txs; saturated dev-host blocks have ~2,700. This
 /// cap stops a burst block from wedging the shadow thread for seconds.
@@ -197,15 +190,21 @@ impl GradedBlock {
 pub struct Shadow {
     rx: Receiver<ShadowBlock>,
     stats: Stats,
+    /// The fee sink: the block's beneficiary. Every tx credits it (a
+    /// universal write cell), and the `Accumulator` strategy services it
+    /// with deferred commutative folding, so conflict analysis excludes
+    /// it.
+    sink: Address,
     exclude: HashSet<Cell>,
 }
 
 impl Shadow {
-    pub(crate) fn new(rx: Receiver<ShadowBlock>) -> Self {
+    pub(crate) fn new(rx: Receiver<ShadowBlock>, sink: Address) -> Self {
         Self {
             rx,
             stats: Stats::default(),
-            exclude: HashSet::from([Cell::Account(FEE_SINK)]),
+            sink,
+            exclude: HashSet::from([Cell::Account(sink)]),
         }
     }
 
@@ -217,14 +216,14 @@ impl Shadow {
     /// # Panics
     ///
     /// Panics if the OS refuses to spawn the thread.
-    pub fn spawn_from_env() -> Option<Sender<ShadowBlock>> {
+    pub fn spawn_from_env(sink: Address) -> Option<Sender<ShadowBlock>> {
         if std::env::var("KARDAMOM_FOOTPRINT_SHADOW").ok().as_deref() != Some("1") {
             return None;
         }
         let (tx, rx) = bounded::<ShadowBlock>(8);
         std::thread::Builder::new()
             .name("footprint-shadow".into())
-            .spawn(move || Self::new(rx).run())
+            .spawn(move || Self::new(rx, sink).run())
             .expect("spawn footprint-shadow");
         tracing::info!(target: "kardamom_executor::shadow", "footprint shadow ENABLED (measurement only; execution stays sequential)");
         Some(tx)
@@ -248,7 +247,7 @@ impl Shadow {
         let accumulator_reads = block
             .captures
             .iter()
-            .filter(|c| c.touches.account_reads.contains(&FEE_SINK))
+            .filter(|c| c.touches.account_reads.contains(&self.sink))
             .count();
 
         let obs = block.into_observations();

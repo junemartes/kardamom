@@ -3,4 +3,4 @@
 node_classes:
   control: { count: 1, tier: control }
   worker: { count: 3, tier: worker }
-  aux: { count: 1, tier: worker }
+  aux: { count: 1, tier: worker, roles: [redis, redis-primary], instance_roles: { "0": [batcher] } }

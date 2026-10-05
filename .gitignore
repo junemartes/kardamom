@@ -29,6 +29,9 @@ __pycache__/
 # signature bundle (written by the CI signing step, P0.5)
 deploy/cluster/images.digests
 deploy/cluster/images.digests.sigbundle
+# the record of the deployed manifests, per environment (written by the
+# workloads role; `just rollback <env>` reads it)
+deploy/cluster/deployed/
 
 
 # dhat heap profiles written by crates/bench alloc_profile tests

@@ -32,6 +32,7 @@ pub mod executor;
 pub mod features;
 #[cfg(feature = "std")]
 pub mod metrics;
+pub mod settle;
 #[cfg(feature = "std")]
 pub mod state;
 pub mod stateless;

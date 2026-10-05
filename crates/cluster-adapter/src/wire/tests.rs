@@ -41,7 +41,15 @@ fn depositref() -> DepositRef {
 fn txref_ingress_relay_egress_roundtrip() {
     let r = txref();
     let sender = Address::repeat_byte(0x42);
-    let ingress = encode_ingress_txref(&r, sender, 7, 4242);
+    let ingress = encode_ingress_txref(
+        &r,
+        GuardHeader {
+            sender,
+            nonce: 7,
+            max_inclusion_block: 4242,
+            tip: 0,
+        },
+    );
     assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (sender, 7));
     // Mirror the Java service: parse the id, relay from the canonical id.
     let (cid, relayed) = split_ingress(&ingress).unwrap();
@@ -89,10 +97,16 @@ fn boundary_roundtrip() {
 }
 
 #[test]
-fn ingress_layout_is_kind_sender_nonce_deadline_id_then_fields() {
+fn ingress_layout_is_kind_sender_nonce_deadline_tip_id_then_fields() {
     let r = txref();
     let sender = Address::repeat_byte(0x42);
-    let b = encode_ingress_txref(&r, sender, 0x0102_0304_0506_0708, 0x0A0B_0C0D_0E0F_1011);
+    let guard = GuardHeader {
+        sender,
+        nonce: 0x0102_0304_0506_0708,
+        max_inclusion_block: 0x0A0B_0C0D_0E0F_1011,
+        tip: 0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
+    };
+    let b = encode_ingress_txref(&r, guard);
     assert_eq!(b[0], KIND_INGRESS_RECORD);
     assert_eq!(&b[1..21], sender.as_slice());
     assert_eq!(
@@ -105,9 +119,15 @@ fn ingress_layout_is_kind_sender_nonce_deadline_id_then_fields() {
         0x0A0B_0C0D_0E0F_1011u64.to_le_bytes(),
         "deadline is little-endian at offset 29 (Java DEADLINE_OFFSET)"
     );
-    assert_eq!(&b[37..69], r.tx_hash.as_slice());
-    assert_eq!(b[69], RT_TXREF);
-    assert_eq!(b[70], 3); // shard_id
+    assert_eq!(
+        b[37..53],
+        0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20u128.to_le_bytes(),
+        "tip is little-endian at offset 37 (Java TIP_OFFSET)"
+    );
+    assert_eq!(ingress_tip(&b).unwrap(), guard.tip);
+    assert_eq!(&b[53..85], r.tx_hash.as_slice());
+    assert_eq!(b[85], RT_TXREF);
+    assert_eq!(b[86], 3); // shard_id
     // The relayed payload begins with the canonical ID. The guard header
     // never reaches the executors.
     let (_cid, relayed) = split_ingress(&b).unwrap();
@@ -276,13 +296,27 @@ fn window_full_roundtrip() {
 /// payload: an executor reads the same bytes whether a record carries a
 /// deadline or not.
 #[test]
-fn the_deadline_stays_out_of_the_relayed_payload() {
+fn the_deadline_and_the_tip_stay_out_of_the_relayed_payload() {
     let r = txref();
-    let sender = Address::repeat_byte(0x42);
-    let early = encode_ingress_txref(&r, sender, 7, 100);
-    let late = encode_ingress_txref(&r, sender, 7, 900);
+    let guard = GuardHeader {
+        sender: Address::repeat_byte(0x42),
+        nonce: 7,
+        max_inclusion_block: 100,
+        tip: 0,
+    };
+    let early = encode_ingress_txref(&r, guard);
+    let late = encode_ingress_txref(
+        &r,
+        GuardHeader {
+            max_inclusion_block: 900,
+            tip: 5_000,
+            ..guard
+        },
+    );
     assert_eq!(ingress_deadline(&early).unwrap(), 100);
     assert_eq!(ingress_deadline(&late).unwrap(), 900);
+    assert_eq!(ingress_tip(&early).unwrap(), 0);
+    assert_eq!(ingress_tip(&late).unwrap(), 5_000);
     assert_eq!(
         split_ingress(&early).unwrap().1,
         split_ingress(&late).unwrap().1
@@ -378,9 +412,7 @@ fn replay_request_roundtrip() {
     assert_eq!(b[0], KIND_REPLAY_REQUEST);
     assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
     // A record ingress message is not a replay request.
-    assert!(
-        decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0, u64::MAX)).is_err()
-    );
+    assert!(decode_replay_request(&encode_ingress_txref(&txref(), GuardHeader::EXEMPT)).is_err());
 }
 
 #[test]

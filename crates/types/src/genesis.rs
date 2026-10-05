@@ -4,7 +4,8 @@
 //! derives `serde::Deserialize` directly. The only custom serde code is on
 //! the string-parsed `balance` and `code` fields. `Genesis::validate` checks
 //! chain id != 0 and duplicate alloc addresses. The TOML loader calls it
-//! after parsing.
+//! after parsing. The optional `[fees]` section holds the chain's fee
+//! schedule (see [`crate::fees::FeeSchedule`]).
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -17,6 +18,12 @@ pub struct Genesis {
     pub chain_id: u64,
     #[serde(default)]
     pub alloc: Vec<AllocEntry>,
+    /// The fee schedule. Absent means no schedule: a zero base fee, and
+    /// every tip burns. It is a chain value: every state consumer reads
+    /// it from the same genesis, so every one of them charges the same
+    /// fees and computes the same roots.
+    #[serde(default)]
+    pub fees: Option<crate::fees::FeeSchedule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
