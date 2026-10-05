@@ -220,6 +220,7 @@ impl Case {
         let floor = match self {
             Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
+            Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
             Self::RetentionOverrun | Self::RetentionOverrunValidator => {
                 inject + k.retention_freeze_cap + Duration::from_mins(2)
             }

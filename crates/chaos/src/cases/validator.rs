@@ -118,7 +118,9 @@ async fn val_debug(h: &Harness) {
 /// newborn (the freeze exceeded the driver's client liveness, so the
 /// process fail-stopped and Nomad restarted it) verifies live from a
 /// fresh counter. Both end verifying live, caught up, with zero
-/// divergences.
+/// divergences. The default window is the evicting freeze of the
+/// deployed Aeron stall tolerance, so the newborn path stays the
+/// expected one at any tolerance.
 pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
     let node = h.probes.validator.container.clone();
     let inner = validator_inner(h, "validator-lapse").await?;

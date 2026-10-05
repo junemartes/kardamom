@@ -44,10 +44,42 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
+}
+
+# The Aeron timeouts of the Java media driver and its Java clients, all
+# from the one stall tolerance:
+# - aeron.driver.timeout (ms): the clients in this JVM wait this long
+#   for a stalled driver.
+# - aeron.client.liveness.timeout (ns): the driver waits this long for a
+#   stalled client before it evicts the client. A client sends a
+#   keepalive every 500 ms, far below it.
+# - aeron.publication.unblock.timeout (ns): Aeron requires it above the
+#   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+locals {
+  aeron_stall_opts = join(" ", [
+    "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
+    "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
+    "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+  ])
 }
 
 job "aeron" {
@@ -166,7 +198,7 @@ job "aeron" {
         # multiple of 32). The Aeron default is 1408, which fragments or
         # drops on that path. A datagram of 1344 also fits every other
         # path (a Docker bridge, a Cloud Network, the loopback).
-        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344"
+        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts}"
       }
 
       # The archive record of the discovery contract
