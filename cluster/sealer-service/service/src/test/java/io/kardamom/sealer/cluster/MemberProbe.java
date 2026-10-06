@@ -9,8 +9,11 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.RecordingLog;
 import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestNode;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 import org.agrona.collections.MutableLong;
 import org.agrona.concurrent.YieldingIdleStrategy;
 import org.agrona.concurrent.errors.ErrorLogReader;
@@ -26,6 +29,7 @@ final class MemberProbe {
     private static final String REPLAY_CHANNEL = "aeron:ipc";
     private static final int REPLAY_STREAM_ID = 1_955;
     private static final int SEALER_SERVICE_ID = 0;
+    private static final Pattern REPLAY_START = Pattern.compile("requested replay start position=(\\d+)");
 
     private final TestNode node;
 
@@ -66,6 +70,22 @@ final class MemberProbe {
                 (observations, firstTimestamp, lastTimestamp, encodedException) ->
                         count.addAndGet(encodedException.contains(text) ? observations : 0));
         return count.get();
+    }
+
+    /**
+     * The replay start positions in the consensus module errors whose
+     * text contains {@code text} and {@code "requested replay start
+     * position="}.
+     */
+    List<Long> refusedReplayStarts(final String text) {
+        final List<Long> starts = new ArrayList<>();
+        ErrorLogReader.read(
+                node.consensusModule().context().clusterMarkFile().errorBuffer(),
+                (observations, firstTimestamp, lastTimestamp, encodedException) ->
+                        REPLAY_START.matcher(encodedException).results()
+                                .filter(match -> encodedException.contains(text))
+                                .forEach(match -> starts.add(Long.parseLong(match.group(1)))));
+        return starts;
     }
 
     private static byte[] replayRecording(final AeronArchive archive, final long recordingId) {
