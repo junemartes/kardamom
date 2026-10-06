@@ -8,7 +8,9 @@
 //! `docs/agents/l1-origin-deposit-derivation-spec.md`.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU64, ParseIntError};
 use std::ops::ControlFlow;
+use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -31,6 +33,54 @@ pub struct DaWatcherConfig {
     pub lockbox: Address,
     /// Polling cadence for `finalized_block_number()`.
     pub poll_interval: Duration,
+    /// The last L1 block whose epoch the chain holds. `None` seeds the
+    /// cursor at the finalized tip on the first tick.
+    pub resume_after: Option<L1ResumeAfter>,
+}
+
+/// The last L1 block whose epoch the chain already holds: the L1 origin
+/// of the head that a sealer cluster starts from. The watcher then
+/// publishes every finalized block after it, so no epoch between that
+/// origin and the tip is lost. The value is never 0: a head at origin 0
+/// holds no epoch, and its watcher starts at the finalized tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1ResumeAfter(NonZeroU64);
+
+impl L1ResumeAfter {
+    /// The L1 block number.
+    #[must_use]
+    pub fn block(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Why a resume block does not parse.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResumeAfterError {
+    /// The text is not a `u64`.
+    #[error("not an L1 block number: {0}")]
+    NotANumber(#[from] ParseIntError),
+    /// Block 0: the chain holds no epoch to resume after.
+    #[error(
+        "L1 block 0 holds no epoch; omit the resume block, and the watcher starts at the finalized tip"
+    )]
+    Zero,
+}
+
+impl From<NonZeroU64> for L1ResumeAfter {
+    fn from(block: NonZeroU64) -> Self {
+        Self(block)
+    }
+}
+
+impl FromStr for L1ResumeAfter {
+    type Err = ResumeAfterError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NonZeroU64::new(s.parse()?)
+            .map(Self)
+            .ok_or(ResumeAfterError::Zero)
+    }
 }
 
 /// Handle to a running watcher task. [`WatcherHandle::join`] asks the
@@ -143,9 +193,10 @@ enum PublishStep {
 }
 
 /// The L1 watcher's state: the L1 source, the epoch publisher, the
-/// lockbox address, the poll cadence, and the durable cursor (the last
-/// L1 block whose epoch was published; `None` until the first tick seeds
-/// it at the finalized tip).
+/// lockbox address, the poll cadence, and the cursor (the last L1 block
+/// whose epoch was published). The cursor starts at the configured
+/// resume block, or at `None` until the first tick seeds it at the
+/// finalized tip.
 pub struct L1Watcher<S, P> {
     source: S,
     publisher: P,
@@ -169,17 +220,9 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             publisher,
             lockbox: config.lockbox,
             poll_interval: config.poll_interval,
-            cursor: None,
+            cursor: config.resume_after.map(L1ResumeAfter::block),
             anchor: None,
         }
-    }
-
-    /// Seed the cursor, instead of letting the first tick seed it at the
-    /// finalized tip. Unit tests use this to start a pass mid-chain.
-    #[must_use]
-    pub fn resume_at(mut self, cursor: Option<u64>) -> Self {
-        self.cursor = cursor;
-        self
     }
 
     /// The last L1 block whose epoch was published, or `None` before the

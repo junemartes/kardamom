@@ -158,9 +158,9 @@ with three distinct, tested modes:
   member is left, the pipeline **must stall**. Every node returns with its
   own log and snapshots, the members elect a leader among themselves, and
   the backlog drains.
-  What this does not cover: all three members *wiped*. The failure model
-  owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
-  below.
+  What this does not cover: all three members *wiped*. No in-cluster copy
+  is left; the members start from a seed rebuilt from L1 (the sealer fleet
+  rebuild below).
 
 - **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
   persistence; the executors' state is the truth. The whole redis job
@@ -653,7 +653,8 @@ The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
 which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
-the seed a new sealer cluster starts from at the rebuilt head.
+the seed a new sealer cluster starts from at the rebuilt head (the sealer
+fleet rebuild below).
 
 Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
 absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
@@ -681,6 +682,57 @@ wrong block hash that reaches their anchor halts them until an operator
 restarts the da-watcher and re-indexes the archive, and a swallowed log is
 invisible to one source. The two-source followers remove both; the cases
 name these assertions as deferred until then.
+
+## Sealer fleet rebuild (every sealer wiped)
+
+All three members lose their cluster and archive directories. No member
+holds a log or a snapshot, so the canonical stream cannot continue. The
+chain restarts after H, the `l2BlockEnd` of the last posted batch, and the
+blocks after H are reverted: their receipts are revoked. The procedure is
+`docs/runbooks/sealer-fleet-rebuild.md`:
+
+1. `kardamom-reconstruct --through-block H --lockbox <addr>` writes the
+   sealer seed, the executor image, and, in a second run, a state that keeps
+   the trie for the validator. `--lockbox` puts the L1 deposits into the
+   rebuilt state.
+2. Every member starts from the seed (`-Dkardamom.cluster.seedSnapshot`), with
+   an empty remote-origin allowlist. The cluster opens block H + 1 at index
+   E_H, the canonical end of H.
+3. Every executor and the validator resume on the rebuilt state at
+   `(E_H, H + 1)`.
+4. The sequencers start, and then the da-watcher with `--l1-resume-after M`,
+   where M is the L1 origin of H. A sequencer reads the epochs live, with no
+   replay, so the da-watcher must not publish before the sequencers subscribe.
+
+Every copy of the reverted chain must go, because each one resumes or
+publishes past the new stream:
+
+| Copy | What it does if it stays |
+|---|---|
+| An executor's or the validator's state DB | Its cursor lies past the new head. The sealer answers `REPLAY_AHEAD` and the consumer stops (`ClusterBehindCursor`). A sealer without that answer lets the consumer drop new records below its cursor as duplicates. |
+| A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
+| The batcher's spool | It continues the confirmed cursor, so the batcher posts reverted blocks. |
+| The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
+| A running da-watcher | It continues at its own cursor, past M. The epochs between M and that cursor never reach the new chain, and their deposits are lost. |
+
+The da-watcher seeds its cursor at the finalized tip on every start. That
+skips no epoch on a running chain only when the tip did not move while it was
+down. After a seed, the chain's origin is M, far behind the tip, so the flag is
+required. A da-watcher that restarts later with a stale flag sends epochs at
+or below the sealer's origin; the sealer drops each one as a regression.
+
+The validator resumes on a rebuilt state that keeps the trie, with no step of
+its own. Its cursor comes from the same meta keys as an executor's, and its
+verify floor is H. It needs no other file: the prover spool, the claims and
+the epoch verifier start empty. No test starts a validator on a rebuilt state
+yet, so this rests on the code path alone.
+
+The output attester is not deployed. It posts a root for every block the
+validator commits, not only for posted blocks, so where it runs, L1 can hold
+roots of reverted blocks. The revert rolls them back
+(`revert_to_posted_head.md`, step 4). The attester then resumes after the
+newest output that remains, and the validator resumes at H. The withdrawals
+between the two are not collected again.
 
 ## DA-watcher
 
