@@ -135,10 +135,42 @@ variable "image_ref" {
 # This is a pure JVM image. cluster.Dockerfile launches
 # io.kardamom.sealer.cluster.ClusterNode.
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
+}
+
+# The Aeron timeouts of the Java media driver and its Java clients, all
+# from the one stall tolerance:
+# - aeron.driver.timeout (ms): the clients in this JVM wait this long
+#   for a stalled driver.
+# - aeron.client.liveness.timeout (ns): the driver waits this long for a
+#   stalled client before it evicts the client. A client sends a
+#   keepalive every 500 ms, far below it.
+# - aeron.publication.unblock.timeout (ns): Aeron requires it above the
+#   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+locals {
+  aeron_stall_opts = join(" ", [
+    "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
+    "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
+    "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+  ])
 }
 
 variable "sealer_count" {
@@ -303,7 +335,7 @@ job "cluster" {
         # the same value as the shared driver (aeron.system.nomad.hcl),
         # below the 1400-byte path of a Hetzner vSwitch VLAN.
         env {
-          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
         }
 
         config {

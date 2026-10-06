@@ -196,7 +196,7 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml"):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -217,6 +217,8 @@ class DeployTest(unittest.TestCase):
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
+        env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
@@ -376,6 +378,40 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    def test_every_aeron_party_takes_the_stall_tolerance(self):
+        for tolerance in (10000, 30000):
+            with self.subTest(tolerance=tolerance):
+                environ = {} if tolerance == 10000 else {'AERON_STALL_TOLERANCE_MS': str(tolerance)}
+                self.run_deploy(check=True, environ=environ)
+                self.assert_aeron_parties(self.api.state['plans'], tolerance)
+
+    def assert_aeron_parties(self, plans, tolerance):
+        """Every task that maps the Aeron directory carries the tolerance:
+        a Rust client as its driver timeout, a JVM with a media driver as
+        its driver timeout, client liveness, and a publication unblock
+        timeout above the liveness."""
+        jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
+        parties = [(name, task) for name, job in plans.items() for group in job['TaskGroups']
+                   for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
+        self.assertEqual({name for name, _ in parties}, {
+            'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
+            'state-mirror', 'notifier'})
+        liveness_ns = tolerance * 1_000_000
+        for name, task in parties:
+            if name not in jvm_options:
+                self.assertEqual(task['Env']['AERON_DRIVER_TIMEOUT'], str(tolerance), name)
+                continue
+            options = task['Env'][jvm_options[name]].split()
+            self.assertIn(f'-Daeron.driver.timeout={tolerance}', options, name)
+            self.assertIn(f'-Daeron.client.liveness.timeout={liveness_ns}', options, name)
+            unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
+            self.assertEqual(len(unblock), 1, name)
+            self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A restarted driver waits out the active-driver window of its
+        # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
+        delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
+        self.assertEqual(delay_ns, (tolerance // 1000 + 5) * 1_000_000_000)
 
     @staticmethod
     def sequencer_env(plans):
