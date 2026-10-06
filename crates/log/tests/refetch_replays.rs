@@ -54,7 +54,6 @@ fn plane(cfg: &LogConfig, label: &str, catalog: &MemoryCatalog) -> StreamPlane {
         Catalog::Memory(catalog.clone()),
         Instance {
             id: format!("alloc-{label}"),
-            ports: None,
         },
         Ipv4Addr::LOCALHOST,
     )
