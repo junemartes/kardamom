@@ -207,6 +207,7 @@ fn run_one_batch(batch: u64) {
             },
             start: ResumePoint::GENESIS,
             snap,
+            tx_hook: None,
         },
         HarnessInput {
             tx_data: vec![tx_data],

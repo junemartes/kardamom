@@ -15,10 +15,11 @@ use super::types::{BalHandoff, ExecToCommit, ExecutorConfig, ResumePoint};
 use super::wiring::{ExecPorts, SnapshotDb};
 
 /// The optional role-specific hooks `ExecState` takes: BAL capture,
-/// footprint-shadow capture, a whole-block execution strategy, and the two
-/// epoch observers. Grouped so `ExecInputs` and `ExecState::spawn` pass one value
-/// instead of five loose parameters. [`ExecState::new`] moves the first three
-/// into the [`BlockState`] and the observers into [`ExecObservers`].
+/// footprint-shadow capture, a whole-block execution strategy, the two
+/// epoch observers, and the tx hook. Grouped so `ExecInputs` and
+/// `ExecState::spawn` pass one value instead of six loose parameters.
+/// [`ExecState::new`] moves the first three into the [`BlockState`] and the
+/// rest into [`ExecObservers`].
 pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     /// Footprint shadow handoff (`crate::shadow`), one per block. Only the
@@ -34,6 +35,8 @@ pub(crate) struct ExecHooks<W: ExecPorts> {
     /// marker. `None` everywhere until the destination-validator
     /// `RemoteEpochVerifier` lands.
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
+    /// Hook around each tx record. See [`crate::actor::TxHook`].
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Every input [`ExecState::new`] and [`ExecState::spawn`] need: the config, the
@@ -62,11 +65,13 @@ pub(super) struct ExecIo<W: ExecPorts> {
     pub(super) sw_queue: W::WriterQueue,
 }
 
-/// The role's epoch checks, which the marker arms run. `None` trusts the
-/// ordered stream.
+/// The role's record hooks: the epoch checks, which the marker arms run,
+/// and the tx hook, which `on_tx` runs. An epoch check that is `None`
+/// does not run.
 pub(super) struct ExecObservers<W: ExecPorts> {
     pub(super) epoch_observer: Option<W::Epoch>,
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Pipelined commit, at depth K. At each boundary, the code submits the
@@ -178,6 +183,7 @@ impl<W: ExecPorts> ExecState<W> {
                     block_exec,
                     epoch_observer,
                     remote_epoch_observer,
+                    tx_hook,
                 },
         } = inputs;
         let snapshot = snapshots.snapshot_after(start.block);
@@ -194,6 +200,7 @@ impl<W: ExecPorts> ExecState<W> {
             observers: ExecObservers {
                 epoch_observer,
                 remote_epoch_observer,
+                tx_hook,
             },
             block: BlockState::new(
                 BlockRun::new(block_exec, shadow_tx),

@@ -156,7 +156,8 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
     executor's published artifact all run the same monomorphized exec-core
     functions — the proof attests exactly what the validator validates.
 - **PR 3a.1** — identity checks in the LIVE validator (the forged-sender
-  blind spot): `ExecutorConfig::verify_record_identity` runs
+  blind spot): `ExecutorConfig::verify_record_identity` (now the
+  `VerifyRecordIdentity` tx hook) runs
   `exec_core::stateless::verify_record_identity` at record arrival in the
   engine actor (one seam covering the validator's streaming AND whole-block
   modes); the validator binary enables it unconditionally and classifies

@@ -33,8 +33,9 @@ pub use kardamom_exec_core::{
 
 pub use actor::{
     BlockExecStrategy, Either, EngineWiring, ExecPorts, Executor, ExecutorConfig, Inbound,
-    NoBlockExec, Outbound, ResumePoint, RoleHooks, SnapshotDb, StateWriterQueue, StateWriterSignal,
-    Threads, TxReceiptsPublication, publish_each,
+    NoBlockExec, NoTxHook, Outbound, ResumePoint, RoleHooks, SnapshotDb, StateWriterQueue,
+    StateWriterSignal, Threads, TxContext, TxHook, TxOutcome, TxReceiptsPublication,
+    VerifyRecordIdentity, publish_each,
 };
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};

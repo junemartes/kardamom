@@ -16,6 +16,7 @@ use kardamom_exec_core::executor::XChainDelivery;
 
 use super::exec_block::{BlockRun, Streaming};
 use super::exec_thread::{ExecState, Flow};
+use super::tx_hook::{TxContext, TxHook, TxOutcome};
 use super::types::{BufferedRecord, ExecToCommit};
 use super::wiring::{ExecPorts, SnapshotDb};
 
@@ -75,46 +76,90 @@ impl<W: ExecPorts> ExecState<W> {
         }
     }
 
-    /// Post-execution bookkeeping, shared by the Tx and Deposit arms. It
-    /// does all of the following:
-    /// - updates the ok/error counters
-    /// - surfaces the error, if any
-    /// - advances the cumulative gas and the per-block index
-    /// - folds the write set into the live delta
-    /// - accounts for elapsed time
-    /// - streams the receipt to the commit thread
+    /// Streaming-path bookkeeping, shared by the Tx, Deposit, and `XChain`
+    /// arms: account for the record's elapsed time, then finish it with its
+    /// own write set.
     fn record_applied(
         &mut self,
-        what: &'static str,
+        kind: RecordKind<'_>,
         position: BPosition,
         result: Result<(kardamom_types::Receipt, WriteSet), ExecutorError>,
         apply_start: Instant,
     ) -> Result<Flow, ExecutorError> {
-        if result.is_ok() {
-            self.metrics.applied_ok.increment(1);
-        } else {
-            self.metrics.applied_error.increment(1);
-        }
-        if let Err(ref e) = result {
-            tracing::error!(block = self.cursor.block, ?position, error = ?e, "exec ERROR: {what} failed");
-        }
-        let (receipt, ws) = result?;
+        *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+        self.finish_record(Finished {
+            kind,
+            position,
+            result: result.map(|(receipt, ws)| (receipt, Writes::Record(ws))),
+        })
+    }
+
+    /// The one result path for every executed record, in both execution
+    /// modes. It does all of the following:
+    /// - updates the ok/error counters, and surfaces the error, if any
+    /// - runs the tx hook's `after`, for a tx record
+    /// - advances the cumulative gas and the per-block index
+    /// - folds a streaming write set into the live delta
+    /// - streams the receipt to the commit thread
+    pub(super) fn finish_record(&mut self, finished: Finished<'_>) -> Result<Flow, ExecutorError> {
+        let Finished {
+            kind,
+            position,
+            result,
+        } = finished;
+        self.observe(&kind, position, &result)?;
+        let (receipt, writes) = result?;
         self.block.cumulative_gas_used = receipt.cumulative_gas_used;
         self.block.tx_index += 1;
-        let accounts = ws.account_rows();
-        self.block.delta.apply(ws);
-        *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+        let accounts = match writes {
+            Writes::Record(ws) => {
+                let rows = ws.account_rows();
+                self.block.delta.apply(ws);
+                rows
+            }
+            Writes::Rows(rows) => rows,
+        };
         self.block.receipts.push(receipt.clone());
         let item = kardamom_types::ReceiptRows { receipt, accounts };
-        if self
-            .io
-            .tx
-            .send(ExecToCommit::Receipt(Box::new(item)))
-            .is_err()
-        {
-            return Ok(Flow::Stop);
+        match self.io.tx.send(ExecToCommit::Receipt(Box::new(item))) {
+            Ok(()) => Ok(Flow::Continue),
+            Err(_) => Ok(Flow::Stop),
         }
-        Ok(Flow::Continue)
+    }
+
+    /// Count the record's outcome, log a failure, and run the tx hook's
+    /// `after` for a tx record. The execution error wins over a hook
+    /// error: for a failed record, this returns `Ok`, and the caller
+    /// returns the execution error.
+    fn observe(
+        &mut self,
+        kind: &RecordKind<'_>,
+        position: BPosition,
+        result: &Result<(kardamom_types::Receipt, Writes), ExecutorError>,
+    ) -> Result<(), ExecutorError> {
+        match result {
+            Ok(_) => self.metrics.applied_ok.increment(1),
+            Err(e) => {
+                self.metrics.applied_error.increment(1);
+                tracing::error!(block = self.cursor.block, ?position, error = ?e, "exec ERROR: {} failed", kind.label());
+            }
+        }
+        let RecordKind::Tx(tx) = kind else {
+            return Ok(());
+        };
+        match result {
+            Ok((receipt, writes)) => self.observers.tx_hook.after(
+                tx,
+                TxOutcome::Applied {
+                    receipt,
+                    write_set: writes.write_set(),
+                },
+            ),
+            Err(e) => {
+                let _ = self.observers.tx_hook.after(tx, TxOutcome::Failed(e));
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn on_tx(
@@ -124,20 +169,20 @@ impl<W: ExecPorts> ExecState<W> {
         tx_ref: TxRef,
     ) -> Result<Flow, ExecutorError> {
         let tx_idx = self.next_idx()?;
-        // One check point for both execution modes. The code checks this at
-        // arrival, before the streaming or whole-block branch. So a forged
-        // envelope cannot execute now, and cannot hide in the block buffer.
-        if self.cfg.verify_record_identity
-            && let Err(e) = crate::stateless::verify_record_identity(&envelope)
-        {
-            tracing::error!(block = self.cursor.block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
-            return Err(e);
-        }
+        // The hook runs at arrival, before the streaming or whole-block
+        // branch, so one check point covers both execution modes.
+        let tx = TxContext {
+            block: self.cursor.block,
+            tx_idx,
+            position,
+            envelope: &envelope,
+        };
+        self.observers.tx_hook.before(&tx)?;
         self.block.refs.push(tx_ref);
         let env = self.exec_env(self.cursor.block);
         let Streaming { scope, shadow } = match &mut self.block.run {
             // Whole-block strategy: defer to the boundary, so batches can
-            // execute concurrently.
+            // execute concurrently. The boundary finishes the record.
             BlockRun::Whole(whole) => {
                 return Ok(whole.defer(BufferedRecord::Tx {
                     tx_idx,
@@ -186,7 +231,7 @@ impl<W: ExecPorts> ExecState<W> {
         if let (Some(shadow), Some(touches), Ok((receipt, ws))) = (shadow, touches, &result) {
             shadow.capture(&envelope, touches, receipt, ws);
         }
-        self.record_applied("execute_tx", position, result, apply_start)
+        self.record_applied(RecordKind::Tx(tx), position, result, apply_start)
     }
 
     /// A deposit has no wire position of its own: its slot index is its
@@ -234,7 +279,7 @@ impl<W: ExecPorts> ExecState<W> {
         if let (Some(shadow), Ok(_)) = (shadow, &result) {
             shadow.count_serial();
         }
-        self.record_applied("execute_deposit_tx", position, result, apply_start)
+        self.record_applied(RecordKind::Deposit, position, result, apply_start)
     }
 
     /// A cross-chain message takes its slot index as its position, like a
@@ -292,6 +337,73 @@ impl<W: ExecPorts> ExecState<W> {
             layer.apply(ws.clone());
             sc.seed_layer(&layer)?;
         }
-        self.record_applied("execute_xchain_tx", position, result, apply_start)
+        self.record_applied(RecordKind::XChain, position, result, apply_start)
     }
+}
+
+/// Which kind of record finished: the log label, and the tx hook's
+/// context for a tx record.
+pub(super) enum RecordKind<'a> {
+    Tx(TxContext<'a>),
+    Deposit,
+    XChain,
+}
+
+impl<'a> RecordKind<'a> {
+    /// The kind of a record the whole-block strategy executed, and its
+    /// position.
+    pub(super) fn of_buffered(rec: &'a BufferedRecord, block: u64) -> (Self, BPosition) {
+        match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => (
+                Self::Tx(TxContext {
+                    block,
+                    tx_idx: *tx_idx,
+                    position: *position,
+                    envelope,
+                }),
+                *position,
+            ),
+            BufferedRecord::Deposit { position, .. } => (Self::Deposit, *position),
+            BufferedRecord::XChain { position, .. } => (Self::XChain, *position),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Tx(_) => "execute_tx",
+            Self::Deposit => "execute_deposit_tx",
+            Self::XChain => "execute_xchain_tx",
+        }
+    }
+}
+
+/// Where a finished record's writes go.
+#[allow(clippy::large_enum_variant)] // A short-lived stack value; a box costs one allocation per tx.
+pub(super) enum Writes {
+    /// Streaming: the record's own write set. It folds into the block's
+    /// delta, and its rows ride its receipt.
+    Record(WriteSet),
+    /// Whole-block: the strategy already built the block's delta. These
+    /// rows ride the receipt.
+    Rows(Vec<kardamom_types::AccountRow>),
+}
+
+impl Writes {
+    fn write_set(&self) -> Option<&WriteSet> {
+        match self {
+            Self::Record(ws) => Some(ws),
+            Self::Rows(_) => None,
+        }
+    }
+}
+
+/// One executed record, ready for [`ExecState::finish_record`].
+pub(super) struct Finished<'a> {
+    pub(super) kind: RecordKind<'a>,
+    pub(super) position: BPosition,
+    pub(super) result: Result<(kardamom_types::Receipt, Writes), ExecutorError>,
 }

@@ -7,14 +7,13 @@ use alloy_primitives::{Address, address};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{RecvTimeoutError, bounded, unbounded};
 
-use crate::block_env::ExecEnv;
-use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::reader::ReaderToExec;
 use crate::state::StaticSnapshotSource;
 
+use crate::actor::BalHandoff;
+use crate::actor::test_hooks::EmptyBlockExec;
 use crate::actor::test_support::{ExecRig, ImmediateCommit, boundary_msg, feed, funded, tx_msg};
-use crate::actor::{BalHandoff, BlockExecOutput, BlockExecStrategy, BufferedRecord};
 
 /// This test goes through the actor. With a BAL channel attached, the
 /// handoff at each boundary must carry a populated Bal. Direct
@@ -147,24 +146,4 @@ fn whole_block_mode_drops_the_shadow_sender() {
         spawned
     };
     h.join().expect("no panic").expect("exec ok");
-}
-
-/// A whole-block strategy that executes nothing and returns an empty block.
-struct EmptyBlockExec;
-
-impl<D> BlockExecStrategy<D> for EmptyBlockExec {
-    fn execute_block(
-        &self,
-        _snapshot: &D,
-        _parent: Option<&PendingDelta>,
-        _records: &[BufferedRecord],
-        _env: ExecEnv,
-        _block_number: u64,
-    ) -> Result<BlockExecOutput, ExecutorError> {
-        Ok(BlockExecOutput {
-            receipts: Vec::new(),
-            delta: PendingDelta::new(),
-            bal: None,
-        })
-    }
 }

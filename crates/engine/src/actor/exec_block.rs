@@ -208,21 +208,46 @@ impl<W: ExecPorts> WholeBlock<W> {
         Flow::Continue
     }
 
-    /// Execute every buffered record against `snapshot` and `parent`, then
-    /// empty the buffer for the next block.
+    /// Execute every buffered record against `snapshot` and `parent`, and
+    /// empty the buffer for the next block. Pair each record with its
+    /// receipt. A strategy must return one receipt per record, in record
+    /// order; any other count is an error.
     pub(super) fn execute(
         &mut self,
         snapshot: &SnapshotDb<W>,
         parent: Option<&PendingDelta>,
         env: ExecEnv,
         block_number: u64,
-    ) -> Result<BlockExecOutput, ExecutorError> {
-        let out =
-            self.strategy
-                .execute_block(snapshot, parent, &self.buffered, env, block_number)?;
-        self.buffered.clear();
-        Ok(out)
+    ) -> Result<ExecutedBlock, ExecutorError> {
+        let records = std::mem::take(&mut self.buffered);
+        let BlockExecOutput {
+            receipts,
+            delta,
+            bal,
+        } = self
+            .strategy
+            .execute_block(snapshot, parent, &records, env, block_number)?;
+        if receipts.len() != records.len() {
+            return Err(ExecutorError::State(format!(
+                "block-exec strategy returned {} receipts for {} records in block {block_number}",
+                receipts.len(),
+                records.len()
+            )));
+        }
+        Ok(ExecutedBlock {
+            records: records.into_iter().zip(receipts).collect(),
+            delta,
+            bal,
+        })
     }
+}
+
+/// A whole-block strategy's output, with each record paired to its
+/// receipt in record order.
+pub(super) struct ExecutedBlock {
+    pub(super) records: Vec<(BufferedRecord, kardamom_types::Receipt)>,
+    pub(super) delta: PendingDelta,
+    pub(super) bal: Option<Bal>,
 }
 
 /// Footprint shadow capture: the grader's sender, the block's tx captures,

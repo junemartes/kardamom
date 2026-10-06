@@ -49,6 +49,7 @@
 //!   inputs.
 //! - [`ports`]: outbound trait seams.
 //! - [`types`]: plain data types.
+//! - `tx_hook`: the [`TxHook`] seam around each tx record.
 //! - `exec_state`: the [`ExecState`] struct and its constructor.
 //! - `exec_block`: the per-block state, the execution mode, and the
 //!   optional captures.
@@ -77,6 +78,7 @@ mod exec_settle;
 mod exec_state;
 mod exec_thread;
 mod ports;
+mod tx_hook;
 mod types;
 mod wiring;
 
@@ -100,9 +102,12 @@ mod exec_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
 #[cfg(test)]
+mod test_hooks;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication, publish_each};
+pub use tx_hook::{NoTxHook, TxContext, TxHook, TxOutcome, VerifyRecordIdentity};
 pub use types::{
     BalHandoff, BlockExecOutput, BlockExecStrategy, BufferedRecord, ExecutorConfig, NoBlockExec,
     ResumePoint,
@@ -191,6 +196,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
             block_exec,
             epoch_observer,
             remote_epoch_observer,
+            tx_hook,
         } = hooks;
 
         let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
@@ -210,6 +216,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
                 block_exec,
                 epoch_observer,
                 remote_epoch_observer,
+                tx_hook,
             },
         });
         let commit = CommitLoop::new(tx_receipts, rx_e2c).spawn();
