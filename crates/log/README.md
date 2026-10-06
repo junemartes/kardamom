@@ -32,10 +32,11 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 | `TxDeposits` | DA watcher | Full `Deposit` envelopes. Recorded by the archive of the DA watcher node. |
 | `TxRemoteEpochs` | Interop watcher | One record for each peer-chain origin block with cross-chain messages. RAM only. |
 | `TxBal` | Executor | The block access list (`BlockDelta`) of each block. RAM only. |
+| `ExecTxs` | Executor | One `ExecTxRecord` for each transaction that an executor joins, in canonical order. Typed handles exist. No service publishes or subscribes to it. |
 | Per-recorder fsync watermark | A recorder | Typed handles exist. The ingress subscribes to it for the local-fsync ack policies. |
 
 - `LogConfig` accepts any subset of the keys. A missing key takes the built-in default.
-- An unknown key is an error. The loader (`LogConfig::from_toml_path`) also checks the cross-field rules of `[channels]` and `[discovery]`.
+- An unknown key is an error. The loader (`LogConfig::from_toml_path`) also checks the cross-field rules of `[channels]` and `[discovery]`. Two streams on one stream id are an error.
 - Service binaries use `LogConfig::resolve` behind the `--log-config` flag.
 
 ### Discovery

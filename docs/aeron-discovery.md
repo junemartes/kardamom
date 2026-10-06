@@ -36,6 +36,13 @@ The streams and their publishers:
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
+| `exec_txs` | executor (not published) | validator, batcher, executor archive (none subscribes) |
+
+The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
+
+- The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
+- The runtime knows the topic, the record type and the handles. No service publishes the stream, and no service subscribes to it.
+  The table names the services that the topic is for.
 
 The `events` stream carries the lifecycle state of each service (running, halted, paused, resumed).
 See [failure-modes.md](failure-modes.md#halts-and-service-events).

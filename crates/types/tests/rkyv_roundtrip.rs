@@ -273,6 +273,27 @@ fn tx_ref_roundtrip() {
 }
 
 #[test]
+fn exec_tx_record_roundtrip() {
+    let v = ExecTxRecord {
+        index: u64::MAX - 7,
+        tx_ref: TxRef {
+            tx_hash: B256::repeat_byte(0x22),
+            shard_id: 3,
+            tx_data_position: pos(9, 8192),
+            tx_data_session_id: -41,
+        },
+        envelope: TxEnvelope {
+            correlation_id: 17,
+            raw_tx: Bytes::from_static(b"signed-tx"),
+            sender: Address::repeat_byte(0x11),
+            tx_hash: B256::repeat_byte(0x22),
+            max_inclusion_block: 1_000,
+        },
+    };
+    assert_eq!(roundtrip(&v), v);
+}
+
+#[test]
 fn channel_b_message_tx_ref_roundtrip() {
     let m = TxOrderingMessage::TxRef(TxRef {
         tx_hash: alloy_primitives::B256::ZERO,

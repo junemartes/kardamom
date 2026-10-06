@@ -397,6 +397,14 @@ pub struct ChannelsConfig {
     pub tx_bal_channel: ChannelUri,
     pub tx_bal_stream_id: i32,
 
+    /// `exec_txs`: the executor stream. An executor publishes one
+    /// `ExecTxRecord` for each `TxRef` that it joins, in canonical order.
+    /// A consumer of transaction bytes reads every executor and keeps the
+    /// first record at each canonical index that matches the hash of its
+    /// `TxRef`.
+    pub exec_txs_channel: ChannelUri,
+    pub exec_txs_stream_id: i32,
+
     /// Per-recorder fsync watermark stream, parameterized by
     /// `recorder_id`, for example "aeron:ipc?alias=fsync-wm-{rid}". The
     /// ingress subscribes to it for the local-fsync ack policies.
@@ -437,7 +445,7 @@ impl ChannelsConfig {
     /// for every replica's receipt and boundary port under 65535; or if
     /// `tx_data_stream_id_base` or `tx_receipts_stream_id` sits too close
     /// to `i32::MAX` for its `+ sequencer_id` or `+ 1` derived id to stay
-    /// in range.
+    /// in range; or if two streams share a stream id.
     pub fn validate(&self) -> Result<(), String> {
         if self.tx_receipts_mds_enabled() {
             let Some(base) = self.tx_receipts_endpoint_base_port else {
@@ -475,7 +483,52 @@ impl ChannelsConfig {
                  tx_receipts_boundary_stream_id() would overflow"
                 .to_string());
         }
-        Ok(())
+        self.check_stream_ids()
+    }
+
+    /// The id of every stream except the `tx_data` lanes, with the key
+    /// that sets it.
+    fn single_stream_ids(&self) -> [(&'static str, i32); 10] {
+        [
+            ("tx_receipts_stream_id", self.tx_receipts_stream_id),
+            (
+                "tx_receipts_stream_id + 1",
+                self.tx_receipts_boundary_stream_id(),
+            ),
+            ("tx_errors_stream_id", self.tx_errors_stream_id),
+            ("tx_status_stream_id", self.tx_status_stream_id),
+            ("tx_deposits_stream_id", self.tx_deposits_stream_id),
+            (
+                "tx_remote_epochs_stream_id",
+                self.tx_remote_epochs_stream_id,
+            ),
+            ("events_stream_id", self.events_stream_id),
+            ("tx_bal_stream_id", self.tx_bal_stream_id),
+            ("exec_txs_stream_id", self.exec_txs_stream_id),
+            ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
+        ]
+    }
+
+    /// Two streams on one id deliver the frames of one stream to the
+    /// subscribers of the other, which then decode them as the wrong type.
+    /// Every single stream therefore has its own id, outside the `tx_data`
+    /// lane ids `base..=base + 255`.
+    fn check_stream_ids(&self) -> Result<(), String> {
+        let mut ids = self.single_stream_ids();
+        ids.sort_unstable_by_key(|&(_, id)| id);
+        if let Some([(a, id), (b, _)]) = ids.array_windows().find(|[(_, x), (_, y)]| x == y) {
+            return Err(format!("{a} and {b} share the stream id {id}"));
+        }
+        let lanes = self.tx_data_stream_id(0)..=self.tx_data_stream_id(u8::MAX);
+        ids.iter()
+            .find(|(_, id)| lanes.contains(id))
+            .map_or(Ok(()), |(key, id)| {
+                Err(format!(
+                    "{key} ({id}) is a tx_data lane id: tx_data_stream_id_base \
+                     ({}) + 0..=255",
+                    self.tx_data_stream_id_base
+                ))
+            })
     }
 
     /// The UDP endpoint executor replica `replica_idx` publishes its
@@ -651,6 +704,10 @@ impl Default for ChannelsConfig {
             // another executor output, so it lives near receipts.
             tx_bal_channel: "aeron:ipc?alias=tx-bal".into(),
             tx_bal_stream_id: 1004,
+            // 1005 follows BAL (1004), another executor output, and stays
+            // below the fsync-watermark block (1010).
+            exec_txs_channel: "aeron:ipc?alias=exec-txs".into(),
+            exec_txs_stream_id: 1005,
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
         }
