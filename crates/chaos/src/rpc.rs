@@ -1,9 +1,10 @@
 //! One signed transfer through the ingress JSON-RPC, with a receipt
-//! poll: the mechanic every smoke gate and re-smoke uses. Each caller
-//! owns a dedicated funded account, so every transfer has nonce 0. The
-//! recovery probe of a case reuses the case's account, so it reads the
-//! account's nonce first. The balance probe drives the ingress's
-//! account layers for the Redis cases.
+//! poll: the mechanic every smoke gate and re-smoke uses. The transfer
+//! reads the account's next nonce first, so a smoke runs again on a
+//! chain that already holds the account's earlier transfers. The
+//! recovery probe of a case reads the nonce of the case's account the
+//! same way. The balance probe drives the ingress's account layers for
+//! the Redis cases.
 
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, TxKind, U256, address};
 use anyhow::Context;
 use kardamom_bench::mnemonic::derive_signers;
+use kardamom_bench::signers::DerivedSigner;
 
 /// The mnemonic the genesis accounts derive from.
 pub use kardamom_bench::ANVIL_MNEMONIC;
@@ -157,13 +159,22 @@ impl Rpc {
     ///
     /// Returns an error if the signer cannot derive or the call fails.
     pub async fn nonce_of(&self, account: u32) -> anyhow::Result<u64> {
-        let address = derive_signers(
+        self.nonce_at(Self::genesis_signer(account)?.address).await
+    }
+
+    /// The signer of genesis account `account` of the dev mnemonic.
+    fn genesis_signer(account: u32) -> anyhow::Result<DerivedSigner> {
+        derive_signers(
             ANVIL_MNEMONIC,
             account.checked_add(1).context("account index")?,
         )?
         .pop()
-        .context("derive the account")?
-        .address;
+        .context("derive the genesis account")
+    }
+
+    /// The next nonce of `address`, from the latest block the ingress
+    /// serves.
+    async fn nonce_at(&self, address: Address) -> anyhow::Result<u64> {
         let nonce = self
             .call(
                 "eth_getTransactionCount",
@@ -177,19 +188,23 @@ impl Rpc {
             .with_context(|| format!("parse the nonce {nonce}"))
     }
 
-    /// Sign a one-wei transfer from genesis account `account` at nonce 0,
-    /// submit it, and poll its receipt for up to `budget`.
+    /// Sign a one-wei transfer from genesis account `account` at its next
+    /// nonce, submit it, and poll its receipt for up to `budget`. The
+    /// ingress answers the nonce from the head, so an earlier transfer of
+    /// the account with no receipt yet makes this one a duplicate.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signer cannot derive, the submit fails,
-    /// no receipt arrives in time, or the receipt status is not `0x1`.
+    /// Returns an error if the signer cannot derive, the nonce read or
+    /// the submit fails, no receipt arrives in time, or the receipt
+    /// status is not `0x1`.
     pub async fn transfer_smoke(&self, account: u32, budget: Duration) -> anyhow::Result<()> {
-        self.transfer_at(account, 0, budget).await
+        let nonce = self.nonce_of(account).await?;
+        self.transfer_at(account, nonce, budget).await
     }
 
-    /// [`Self::transfer_smoke`] at `nonce`: the account's next nonce,
-    /// for a sender that already transferred.
+    /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
+    /// itself.
     ///
     /// # Errors
     ///
@@ -223,12 +238,7 @@ impl Rpc {
         account: u32,
         nonce: u64,
     ) -> anyhow::Result<Result<String, RpcError>> {
-        let signer = derive_signers(
-            ANVIL_MNEMONIC,
-            account.checked_add(1).context("account index")?,
-        )?
-        .pop()
-        .context("derive the smoke signer")?;
+        let signer = Self::genesis_signer(account)?;
         let mut tx = TxLegacy {
             chain_id: Some(self.chain_id),
             nonce,
@@ -301,3 +311,6 @@ fn hex(bytes: &[u8]) -> String {
             s
         })
 }
+
+#[cfg(test)]
+mod tests;

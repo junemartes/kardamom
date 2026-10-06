@@ -3871,6 +3871,7 @@ dependencies = [
  "anyhow",
  "clap",
  "humantime",
+ "jsonrpsee",
  "kardamom-bench",
  "kardamom-l1-fault-proxy",
  "kardamom-state",
