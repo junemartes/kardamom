@@ -153,6 +153,13 @@ workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
 # The sealer members' admin port (cluster_ports.admin): the role reads
 # the leader from it for the staged roll.
 workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The bootstrap of a new sealer cluster (KARDAMOM_CLUSTER_BOOTSTRAP=1).
+# Only a blank member that starts while the bootstrap is open starts at
+# log position 0; every other blank member copies a peer's snapshot. The
+# role opens the bootstrap only when Nomad does not know the cluster job,
+# and closes it when the new cluster is up. On a registered job the flag
+# does nothing, so a re-deploy that keeps it set is safe.
+workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | default('0', true) | bool }}"
 # The operator binary that runs the smoke against a canary.
 workloads_cluster_binary: >-
   {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
