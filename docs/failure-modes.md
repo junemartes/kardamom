@@ -25,7 +25,7 @@ The design in one line:
 - Or it is **sharded with retry semantics** (sequencer).
 - Or it is **Raft-replicated with fail-stall on quorum loss** (sealer).
 - Everything off the hot path can die and catch up (batcher, da-watcher).
-- Or it halts with a named cause and stays up (batcher, da-watcher, l1-indexer, validator). See "Halts and service events".
+- Or it halts with a named cause and stays up (batcher, da-watcher, l1-indexer, validator, the epoch lane of the sequencer). See "Halts and service events".
 
 ## Halts and service events
 
@@ -68,9 +68,10 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 | `sealer_no_quorum` | sealer (raised by the ingress) | auto | [`sealer_no_quorum`](runbooks/sealer_no_quorum.md) |
 | `validator_divergence` | validator | operator | [`validator_divergence`](runbooks/validator_divergence.md) |
 | `l1_cursor_unreadable` | da-watcher | operator | [`l1_cursor_unreadable`](runbooks/l1_cursor_unreadable.md) |
+| `origin_gap` | sequencer | auto | [`origin_gap`](runbooks/origin_gap.md) |
 
 - The sealer is a Java service with no Rust exporter. The ingress observes the sealer and raises its halts under `service="sealer"`.
-- The sections for the batcher, the da-watcher and the validator describe how each one reaches its halts.
+- The sections for the sequencer, the batcher, the da-watcher and the validator describe how each one reaches its halts.
 
 **The `revert_to_posted_head` runbook.** It has no cause. The `replay_unavailable` runbook sends the operator to it.
 
@@ -124,6 +125,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
   - For an upstream pause, `root_service` and `cause` name the root.
   - For an operator pause, `cause` is `operator`.
 - Each cause has a critical alert, `KardamomHalt<Cause>`. It fires at once on `kardamom_halt{cause="<id>"} == 1`.
+  - `KardamomHaltOriginGap` waits 1 minute. A twin sequencer fills a gap within milliseconds, so only a gap that no replica fills pages.
 - `KardamomServicePaused` is an info alert on `kardamom_paused == 1` for 1 minute.
 - The inhibit file `deploy/alertmanager-inhibit.yml` mutes `KardamomServicePaused` while a `KardamomHalt*` alert with the same `cause` fires.
   - One incident pages once, with the runbook of the root.
@@ -229,6 +231,17 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Recovery: every member returns with its own log and snapshots. The members elect a leader among themselves. The backlog drains.
   - Proof: `cluster-total-loss-recover`.
   - Not covered in-cluster: three wiped members. No peer holds a snapshot for them. The members start from a seed rebuilt from L1. See "Sealer fleet rebuild (every sealer wiped)". The proof of that path is `sealer-fleet-total-wipe-recover`.
+- **Epoch lost in a leader change**
+  - Trigger: a leader kill or a quorum loss. Cluster ingress is at-most-once across them. An offer that the ingress publication accepted can still be lost. The da-watcher publishes each epoch once.
+  - Effect: once the sealer holds an L1 origin, it accepts only the epoch of L1 block `l1_origin + 1`.
+    - It answers any other epoch with an `ORIGIN_GAP` reject (egress kind 12) that names the expected block. Only the offering session gets the reject.
+    - It logs `cluster ORIGIN-GAP`.
+    - The check reads only replicated state, so every member refuses the same epoch.
+  - Recovery: the sequencer keeps every epoch that it relayed until a boundary carries its L1 block.
+    - On the reject, it offers its epochs again from the expected block, in order. The dedup absorbs the copies.
+    - A lost epoch delays deposits by one round trip. The sealer never seals over it.
+  - The first epoch at genesis, or after a seed with origin 0, can start at any L1 block. After a seed with origin `M`, the next epoch is `M + 1`.
+  - Proof: the in-process test `OriginGapClusterTest`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
@@ -413,6 +426,14 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
 - **Backpressure, not loss**
   - A refused cluster offer maps to `SequencerError::Backpressure` and the rewind and retry path.
   - The failure mode is latency. A record is never dropped.
+- **Epoch relay**
+  - An accepted offer is not an ordered epoch. The epoch lane keeps every epoch until the `l1_origin` of a boundary reaches its L1 block.
+  - The lane keeps at most 4096 epochs (13.6 hours of L1). The gauge is `kardamom_sequencer_epochs_unconfirmed`.
+  - On an `ORIGIN_GAP` reject (`kardamom_sequencer_origin_gap_total`), the lane offers the epochs again from the expected block.
+  - A replica can fail to fill the gap. It does not hold the expected epoch (it restarted after the da-watcher published it), or its queue is full.
+    - The replica stops its epoch lane and raises the `origin_gap` halt. It never skips an epoch.
+    - A twin that holds the epoch fills the gap, and the halt clears.
+    - Transactions continue in the meantime.
 - **Racing duplicates are the design**
   - The first-seen window of the cluster dedups them on the 32-byte `canonical_id`.
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
@@ -728,10 +749,11 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 | A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
 | The spool of the batcher | It continues the confirmed cursor, so the batcher posts reverted blocks. |
 | The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
-| A running da-watcher, or its L1 cursor file | It continues at its own cursor, past `M`. The epochs between `M` and that cursor never reach the new chain, and their deposits are lost. |
+| A running da-watcher, or its L1 cursor file | It continues at its own cursor, past `M`. The seeded sealer expects `M + 1`, so it refuses each epoch as an origin gap. The sequencers halt on `origin_gap`. Deposits stop until the da-watcher restarts with `--l1-resume-after M`. |
 
 - The da-watcher resumes after the block in its L1 cursor file. After a seed, the origin of the chain is `M`, behind that block. So `--l1-resume-after` is required.
   - The flag overrides the file. The first tick writes `M` to the file.
+  - The seeded sealer accepts only the epoch of `M + 1` next.
   - The procedure also removes the file. Then a restart without the flag cannot resume past `M`.
 - A da-watcher that restarts later with a stale `--l1-resume-after` sends epochs at or below the origin of the sealer. The sealer drops each one as a regression.
 - The validator resumes on a rebuilt state that keeps the trie, with no step of its own.
@@ -787,7 +809,17 @@ The da-watcher is tick-based with a durable cursor.
 
 1. `--l1-resume-after M`: the watcher resumes after `M`. The first tick reads the hash of `M` and writes it to the file. The sealer fleet rebuild sets the flag.
 2. A file that parses: the watcher resumes after its block, linked to its hash.
-3. No file: the watcher starts at the finalized tip and logs a warning. Unless this is the first start of the chain, the epochs between the last publish and the tip are lost.
+3. No file: the watcher starts at the finalized tip and logs a warning. Unless this is the first start of the chain, the start skips the epochs between the last publish and the tip.
+   - The sealer refuses the next epoch as an origin gap. The sequencers halt on `origin_gap`.
+   - Deposits stop until an operator restarts the da-watcher with `--l1-resume-after` (see [`origin_gap`](runbooks/origin_gap.md)).
+   - The deposits of the skipped blocks wait in the lockbox. They are not lost.
+
+The file records the publish, not the commit of the sealer.
+
+- A kill of the da-watcher together with the sealer, after a publish and before its commit, loses that epoch. The restart resumes past it.
+- The sequencers then halt on `origin_gap`.
+- The operator runs the da-watcher once with `--l1-resume-after` at the L1 origin of the sealer (`kardamom_sequencer_l1_origin`).
+- Proof: the chaos cases `pipeline-blackout-recover`, `l1-liar` and `two-day-outage` (see [`chaos-suite.md`](chaos-suite.md)).
 
 A file that exists but does not read or parse raises the `l1_cursor_unreadable` halt.
 
@@ -893,6 +925,7 @@ Rollout rule: **ship the binaries first, flip the flag second.** The activation 
 - The L1 cursor file of the watcher closes the restart gap. A watcher that restarts *after* the upgrade L1 block finalized resumes after its last published block. So it publishes that epoch.
 - A watcher without the file, or whose file was removed, seeds at the current tip. It skips that epoch.
 - The same seed-skip affects user deposits.
+- The sealer refuses the next epoch as an origin gap. So the skip stops deposits, and the upgrade is not dropped.
 - Runbook: confirm the L2 receipt before you treat an upgrade as applied. The receipt is keyed by the domain-1 `source_hash` of the L1 log position.
 - The L1 `upgradeNonce` makes a re-send unambiguous.
 

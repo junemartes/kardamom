@@ -143,8 +143,9 @@ restores one of its checkpoints, skips the records of the new chain.
    batch: `(E_H, H + 1)`. Also remove the da-watcher's L1 cursor file. It
    holds the last epoch of the reverted chain, which is past M. The flag in
    step 6 overrides the file, but a restart without the flag would resume
-   after the file's block, and the epochs between M and that block would be
-   lost.
+   after the file's block and skip the epochs between M and that block. The
+   seeded sealer accepts only the epoch of M + 1, so it refuses the later
+   epochs as an origin gap, and every sequencer halts on `origin_gap`.
 
    ```sh
    ssh aux-0 'find /opt/kardamom/state/validator /opt/kardamom/checkpoints -mindepth 1 -delete &&
@@ -235,8 +236,11 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    live, with no replay, so an epoch published before the sequencers
    subscribe never reaches the sealer.
 4. Start the da-watcher after block M. Without the flag, it starts at the
-   finalized tip, and the deposits of the blocks between M and the tip are
-   lost. If M is 0, the chain holds no epoch: leave out the flag. The flag
+   finalized tip and skips the blocks between M and the tip: the seeded
+   sealer refuses the tip's epochs as an origin gap, and every sequencer
+   halts on `origin_gap` until the da-watcher runs with the flag. If M is 0,
+   the chain holds no epoch: leave out the flag. The sealer then accepts
+   any first epoch. The flag
    overrides the da-watcher's L1 cursor file. The first tick writes block M
    to the file, and every later pass writes the last block it published.
 

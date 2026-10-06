@@ -93,7 +93,7 @@ class DaLagGuardTest {
         // A zero-sender record (a deposit reference) is exempt.
         assertTrue(s.onRecord(id(7), payload("deposit")).isPresent());
         // An origin record (an L1 epoch with its deposits) is exempt.
-        assertTrue(s.onOriginRecord(id(8), 100L, 2L, payload("epoch"), 9000L).isPresent());
+        assertTrue(s.onOriginRecord(id(8), 100L, 2L, payload("epoch"), 9000L).advance.isPresent());
         long before = s.blockNumber();
         s.onTick(10_000L);
         assertEquals(before + 1, s.blockNumber(), "boundaries keep sealing");

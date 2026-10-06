@@ -287,6 +287,8 @@ struct ResyncWiring {
     lookup: Option<LookupRequester>,
     /// The fee admission gate, off unless `[fees] priority` is on.
     fees: FeeGate,
+    /// The epoch lane, whose signal sender the egress-watermark feed holds.
+    epoch_lane: kardamom_sequencer::epoch::EpochPump,
     feeds: ResyncFeeds,
 }
 
@@ -361,12 +363,16 @@ impl ResyncWiring {
         )
         .context("build resync channel")?;
 
+        // The epoch lane reads the same egress: the boundaries confirm its
+        // epochs, and an origin-gap reject makes it offer them again.
+        let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
             watermark,
             reject_tx,
             deadline_tx,
+            origins,
         )
         .spawn(cluster_egress, shutdown.clone());
 
@@ -417,6 +423,7 @@ impl ResyncWiring {
             controller,
             lookup,
             fees,
+            epoch_lane,
             feeds: ResyncFeeds {
                 watermark_task,
                 receipts_task,
@@ -644,6 +651,7 @@ async fn main() -> anyhow::Result<()> {
             status: handles.status_pub,
         },
         epochs: handles.deposits_sub,
+        epoch_lane: resync.epoch_lane,
         remote_epochs: handles.remote_epochs_sub,
         resync: Some(resync.controller),
         lookup: resync.lookup,

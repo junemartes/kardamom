@@ -55,8 +55,11 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 - Kind 3: the service handles each entry as a single offered record. A malformed entry drops the rest of the batch.
 - Kind 4: it carries an epoch of L1 deposits.
   - It has no guard header. The service does not parse the payload.
-  - It closes the open block, adopts `l1_origin` for later boundaries, and relays the record.
-  - A non-advancing origin is dropped as malformed.
+  - The service checks it in this order: the dedup lookup, the regression check, the gap check. Only an epoch that passes every check enters the dedup window.
+  - A known id is a duplicate. The service drops it.
+  - A non-advancing origin is a regression. The service drops it as malformed.
+  - Once the sealer holds an origin, it accepts only the epoch of L1 block `l1_origin + 1`. Any other epoch gets an egress kind 12 that names the expected block. The first epoch at origin 0 can start at any block.
+  - An accepted epoch closes the open block, adopts `l1_origin` for later boundaries, and is relayed.
 - Kind 5: it carries a batch of cross-chain messages from a peer chain.
   - It has no guard header.
   - A peer chain id that is not in `remoteOrigins` gets an egress kind 6.
@@ -107,6 +110,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]` (50 bytes) | all sessions |
 | 10 | DA-lag reject | `[kind=10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]` | the offering session |
 | 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
+| 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -120,6 +124,9 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 - Kind 10: the DA-lag guard refused a record. The sequencer drops the record and reports the `da-lag` reason. See [DA-lag guard](#da-lag-guard).
 - Kind 11: the cursor of the requester is past the head of the sealer. See [Replay ahead of the head](#replay-ahead-of-the-head).
   - `head_index` is the canonical count. `head_block` is the block that the next tick stamps.
+- Kind 12: the sealer refused an epoch, because an earlier epoch is missing. The sequencer offers its unconfirmed epochs again from `expected_origin`.
+  - The sealer logs `cluster ORIGIN-GAP` at powers of two.
+  - The check reads only replicated state, so every member refuses the same epoch.
 
 ## Egress back-pressure
 

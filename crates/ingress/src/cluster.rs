@@ -117,7 +117,8 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::RemoteOriginReject { .. }
                 | EgressItem::PastDeadline { .. }
                 | EgressItem::WindowFull { .. }
-                | EgressItem::DaLagReject { .. },
+                | EgressItem::DaLagReject { .. }
+                | EgressItem::OriginGap { .. },
             ) => return ControlFlow::Continue(()),
             Err(e) => {
                 // The cluster stream is authoritative, so this should

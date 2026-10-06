@@ -153,4 +153,35 @@ class SeededStateTest {
         assertEquals(SeedStatus.GENESIS, restored.seedStatus());
         assertEquals(H, restored.postedHead());
     }
+
+    /// A seed carries the L1 origin of its head. The first epoch after the
+    /// seed must be the next L1 block, which is where the da-watcher
+    /// resumes with --l1-resume-after.
+    @Test
+    void the_first_epoch_after_a_seed_is_the_next_l1_block() {
+        final CanonicalSealerState state = seeded(64, seed());
+
+        final OriginOutcome skip = state.onOriginRecord(id(1), ORIGIN + 2, 1L, payload("e"), 0L);
+        assertTrue(skip.gap);
+        assertEquals(ORIGIN + 1, skip.expectedOrigin);
+        assertEquals(E_H, state.canonicalCount(), "the refused epoch takes no slot");
+
+        final OriginOutcome next = state.onOriginRecord(id(2), ORIGIN + 1, 1L, payload("e"), 0L);
+        assertEquals(E_H, next.advance.orElseThrow().relayed().index);
+        assertEquals(ORIGIN + 1, state.l1Origin());
+    }
+
+    /// A seed of a chain that never adopted an epoch holds origin 0, like
+    /// genesis. Its first epoch may start anywhere.
+    @Test
+    void a_seed_with_no_origin_accepts_any_first_epoch() {
+        final byte[] digest = new byte[SealerSeed.HASH_LEN];
+        final SealerSeed noOrigin = new SealerSeed(
+            new SealerSeed.Head(412_346L, H, E_H, HEAD_TIME, 0L),
+            new byte[SealerSeed.HASH_LEN], List.of(), digest);
+        final CanonicalSealerState state = seeded(64, noOrigin);
+
+        assertTrue(state.onOriginRecord(id(1), 5_000L, 1L, payload("e"), 0L).advance.isPresent());
+        assertEquals(5_000L, state.l1Origin());
+    }
 }

@@ -272,11 +272,13 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltSealerNoQuorum` | critical | `kardamom_halt{cause="sealer_no_quorum"} == 1`. |
 | `KardamomHaltL1CursorUnreadable` | critical | `kardamom_halt{cause="l1_cursor_unreadable"} == 1`. |
 | `KardamomHaltValidatorDivergence` | critical | `kardamom_halt{cause="validator_divergence"} == 1`. |
+| `KardamomHaltOriginGap` | critical | `kardamom_halt{cause="origin_gap"} == 1` for 1 minute. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The eight `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`).
+- The nine `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
+  - `KardamomHaltOriginGap` waits 1 minute. A restarted sequencer can miss the epoch that the sealer expects, and its twin offers that epoch again within milliseconds. Only a gap that no replica fills pages.
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
   - The description names the cause, the `/halt` URL of the service, and the runbook.
@@ -381,6 +383,14 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
   Each one gets a `FeeInvalid`, `FeeTooLow`, or `InsufficientFunds` error on `tx_errors`.
   See [priority-fees.md](priority-fees.md).
 
+The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](failure-modes.md).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_sequencer_l1_origin` | The highest L1 origin that a boundary carried: the last L1 block whose epoch the sealer ordered. The sealer accepts the epoch of the next block only. An operator resumes the da-watcher after this block. |
+| `kardamom_sequencer_epochs_unconfirmed` | The epochs that the lane relayed, or took to relay, and that no boundary confirmed yet. The lane holds at most 4096. |
+| `kardamom_sequencer_origin_gap_total` | The `ORIGIN_GAP` rejects that the sealer sent to this replica. Each one makes the lane offer its unconfirmed epochs again from the expected block. |
+
 ### Ingress cluster status
 
 The ingress reads the status frame of the sealer and exports it on port 9006. The frame carries the posted head, the sealed head,
@@ -460,6 +470,7 @@ The state machine runs on each member and on replay, so each member prints the l
 | `cluster WINDOW-FULL memberId=M nonce=N windowSize=S capacity=C totalWindowFull=T` | The dedup window had no room for an offer. The sealer prints it at powers of two. The sequencer republishes the offer. |
 | `cluster REPLAY memberId=M session=S from=(I,B) SKEWED block B spans (L,U)` | The sealer refused a replay request. The index and the block do not name one point of the stream. The consumer takes its repair path. |
 | `cluster VOID-VOTE memberId=M voter=V index=I result=R votes=N/T` | A consumer asked to void an entry. The line shows the vote result and the count of votes against the configured voters. |
+| `cluster ORIGIN-GAP memberId=M offered=O expected=E totalOriginGaps=C` | The sealer refused an epoch for L1 block `O`, because it expects the epoch for block `E`. It prints at powers of two. The offering sequencer offers its epochs again from `E`. |
 | `cluster LAUNCH REPAIR memberId=M attempt=A …` | A launch failed because a hard kill left a torn last fragment in the archive. The sealer truncates it and launches again. |
 
 ### Cluster client

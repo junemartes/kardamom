@@ -182,6 +182,11 @@ mod tests {
     /// contract every `ScriptedQueue<T>`-backed pump shares.
     #[test]
     fn remote_epoch_pump_honors_the_shared_contract() {
-        crate::fakes::pump_contract::run(&record(412_346, 2, 1), &record(412_346, 3, 2));
+        crate::fakes::pump_contract::run(
+            &record(412_346, 2, 1),
+            &record(412_346, 3, 2),
+            Pump::default,
+            Pump::is_held,
+        );
     }
 }

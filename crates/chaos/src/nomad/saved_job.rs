@@ -54,6 +54,21 @@ impl SavedJob {
         self.register(&self.definition).await
     }
 
+    /// Register the saved job with `extra` appended to the args of every
+    /// task named `task`, and wait for it to run. An operator step runs a
+    /// job once with one more flag this way; [`Self::restore`] removes the
+    /// flag again.
+    pub(crate) async fn restore_with_args(
+        &self,
+        task: &str,
+        extra: &[String],
+    ) -> anyhow::Result<()> {
+        let mut definition = self.definition.clone();
+        let appended = with_task_args(&mut definition, task, extra);
+        anyhow::ensure!(appended > 0, "job {} has no task {task} with args", self.id);
+        self.register(&definition).await
+    }
+
     /// Register `definition` under the saved job's id, and wait until the
     /// allocations of that version run.
     pub(crate) async fn register(&self, definition: &Value) -> anyhow::Result<()> {
@@ -81,6 +96,21 @@ impl SavedJob {
         })?;
         Ok(())
     }
+}
+
+/// Append `extra` to the docker args of every task named `task` in the
+/// job `definition`. Returns the number of tasks changed.
+fn with_task_args(definition: &mut Value, task: &str, extra: &[String]) -> usize {
+    definition["TaskGroups"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group["Tasks"].as_array_mut())
+        .flatten()
+        .filter(|t| t["Name"] == task)
+        .filter_map(|t| t["Config"]["args"].as_array_mut())
+        .map(|args| args.extend(extra.iter().cloned().map(Value::String)))
+        .count()
 }
 
 #[cfg(test)]

@@ -26,12 +26,14 @@ parent hash is not the hash the follower indexed.
    The archive writes are idempotent, so a re-index of a range is safe. For
    the da-watcher: its anchor is in its cursor file
    (`/opt/kardamom/da-watcher/l1-cursor`), so a plain restart halts again.
-   Run the job with `--l1-resume-after` at the block in the halt detail
-   minus 1, as `sealer-fleet-rebuild.md` step 6.4 shows. The flag overrides
-   the file, and the first tick reads that block's hash from the sources
-   again and writes the file. Remove the flag at the next deploy. Do not
-   only delete the file: the da-watcher then starts at the finalized tip, and
-   the deposits of the blocks before the tip are lost.
+   Run the job with `--l1-resume-after` at the sealer's L1 origin, as
+   `sealer-fleet-rebuild.md` step 6.4 shows. Read it on any sequencer:
+   `kardamom_sequencer_l1_origin`. It is usually the block in the halt
+   detail minus 1. The flag overrides the file, and the first tick reads that
+   block's hash from the sources again and writes the file. Remove the flag
+   at the next deploy. Do not only delete the file: the da-watcher then starts
+   at the finalized tip, the sealer refuses its epochs as an origin gap, and
+   every sequencer halts on `origin_gap` (`origin_gap.md`).
 3. Check the chain's L1-origin records for the lie. A da-watcher that published
    an epoch with a wrong hash before the halt left it in the canonical log. The
    validator's epoch check catches it on the executor side.

@@ -380,6 +380,14 @@ final class SealerEgress {
     }
 
     /**
+     * Frame and offer an origin-gap reject to the offering session:
+     * {@code [kind:12][offered_origin:u64 LE][expected_origin:u64 LE]}.
+     */
+    void offerOriginGap(final ClientSession session, final long offeredOrigin, final long expectedOrigin) {
+        offerControl(session, SealerWire.EGRESS_KIND_ORIGIN_GAP, offeredOrigin, expectedOrigin);
+    }
+
+    /**
      * Frame and offer a remote-origin reject to the offering session:
      * {@code [kind:6][origin:u64 LE][first_seq:u64 LE][expected:u64 LE][reason:u8]}.
      */

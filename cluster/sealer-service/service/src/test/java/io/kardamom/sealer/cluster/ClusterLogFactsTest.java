@@ -15,6 +15,7 @@ import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
 import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
@@ -160,12 +161,20 @@ class ClusterLogFactsTest {
         return observer;
     }
 
-    /** Assert that the leader refused each catch-up replay from {@code replayStart}. */
-    private static void assertRefusedCatchups(final LogCluster run, final long replayStart, final long logStart) {
-        final String refusal =
-                "requested replay start position=" + replayStart + " " + REPLAY_BELOW_START + logStart;
-        assertTrue(run.leaderProbe.errorObservations(refusal) >= FAILED_CATCHUPS,
-                "the leader must log at least " + FAILED_CATCHUPS + " times: " + refusal);
+    /**
+     * Assert that the leader refused at least {@link #FAILED_CATCHUPS}
+     * catch-up replays, each from a start at or above the follower's
+     * sampled commit position {@code logEnd} and below {@code logStart}.
+     * The follower asks from its own log position, which can be ahead of
+     * the last commit position the test sampled, so the start is a range,
+     * not one value.
+     */
+    private static void assertRefusedCatchups(final LogCluster run, final long logEnd, final long logStart) {
+        final List<Long> starts = run.leaderProbe.refusedReplayStarts(REPLAY_BELOW_START + logStart);
+        assertTrue(starts.size() >= FAILED_CATCHUPS,
+                "the leader must refuse at least " + FAILED_CATCHUPS + " catch-up replays, got " + starts);
+        assertTrue(starts.stream().allMatch(start -> start >= logEnd && start < logStart),
+                "each refused start must be in [" + logEnd + ", " + logStart + "), got " + starts);
     }
 
     /** Records the election states and the highest commit position that one member shows. */
