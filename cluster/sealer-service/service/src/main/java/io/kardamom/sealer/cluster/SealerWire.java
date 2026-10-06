@@ -286,18 +286,18 @@ public final class SealerWire {
     static final int DEFAULT_RETENTION = 65536;
 
     /**
-     * Default first-seen dedup window.
+     * Default capacity of the first-seen dedup window.
      *
-     * <p>Safety invariant: the window must be larger than the worst-case
-     * racing-replica stall multiplied by the peak unique-record throughput.
-     * If the window is too small, a resuming replica can find its own ids
-     * evicted (FIFO). The dedup check then accepts its re-offers as fresh,
-     * and the canonical log orders the same transaction two times.</p>
+     * <p>The window prunes by inclusion deadline: an id stays until the
+     * open block passes its deadline, and the window never evicts an id
+     * to make room. So a stalled replica's re-offer is always a duplicate
+     * while its deadline is open.</p>
      *
-     * <p>At 10k unique tx/s, the previous default of 8192 tolerated a stall
-     * of only about 0.8 seconds (one GC pause or cgroup throttle). The value
-     * 1&lt;&lt;17 tolerates about 13 seconds, for about 20MB of heap and a
-     * 4MB snapshot (snapshot I/O is chunked, see
+     * <p>The capacity is a hard cap that bounds heap and snapshot size.
+     * A fresh record that arrives when the window is full is refused with
+     * back-pressure, and the window forgets nothing. At 10k unique tx/s,
+     * the value 1&lt;&lt;17 holds about 13 seconds of unique records, for
+     * about 20MB of heap and a 4MB snapshot (snapshot I/O is chunked, see
      * {@link SnapshotIo#writeSnapshot}).</p>
      *
      * <p>All members must agree on the window
