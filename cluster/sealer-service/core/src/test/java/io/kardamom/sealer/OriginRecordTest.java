@@ -256,4 +256,40 @@ class OriginRecordTest {
         }
         assertEquals(3L, state.canonicalCount(), "three epochs ordered, not nine");
     }
+
+    /// A full window does not refuse an epoch. A refused epoch is lost, because
+    /// nothing republishes it, and its deposits never enter the chain.
+    @Test
+    void a_full_window_still_relays_an_epoch() {
+        CanonicalSealerState state = new CanonicalSealerState(2);
+        long far = state.blockNumber() + 10;
+        assertTrue(state.onRecord(id(1), sender(1), 0L, far, payload("a")).relayed.isPresent());
+        assertTrue(state.onRecord(id(2), sender(2), 0L, far, payload("b")).relayed.isPresent());
+        assertEquals(
+                CanonicalSealerState.RecordOutcome.Kind.WINDOW_FULL,
+                state.onRecord(id(3), sender(3), 0L, far, payload("c")).kind);
+
+        Optional<OriginAdvance> epoch =
+                state.onOriginRecord(id(4), 100L, 1L, payload("epoch-100"), 1_000L);
+
+        assertTrue(epoch.isPresent(), "the epoch is relayed at a full window");
+        assertEquals(100L, state.l1Origin());
+        assertEquals(3, state.dedupSize(), "the marker is held above the cap");
+        assertFalse(
+                state.onOriginRecord(id(4), 100L, 1L, payload("epoch-100"), 1_000L).isPresent(),
+                "a re-offer of the epoch is a duplicate");
+    }
+
+    /// A snapshot taken with a marker above the cap loads again at the same cap.
+    @Test
+    void a_snapshot_with_a_marker_above_the_cap_loads() {
+        CanonicalSealerState state = new CanonicalSealerState(1);
+        long far = state.blockNumber() + 10;
+        state.onRecord(id(1), sender(1), 0L, far, payload("a"));
+        state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 1_000L);
+
+        CanonicalSealerState restored = CanonicalSealerState.load(state.takeSnapshot(), 1);
+
+        assertEquals(2, restored.dedupSize());
+    }
 }

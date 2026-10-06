@@ -80,4 +80,6 @@ pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
 pub use source::{L1Source, L1SourceError};
 pub use sources::{L1Endpoints, L1Sources, SourceHalt};
-pub use watcher::{DaWatcherConfig, L1Watcher, MonitorError, WatcherHandle};
+pub use watcher::{
+    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError, WatcherHandle,
+};

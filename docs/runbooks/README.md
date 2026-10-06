@@ -37,3 +37,12 @@ resumes it on the service's node:
 curl -s -X POST 'http://127.0.0.1:<port>/pause?note=disk-swap'
 curl -s -X POST http://127.0.0.1:<port>/resume
 ```
+
+## Procedures
+
+A procedure runbook has no `RecoveryId`: no halt names it, and an operator
+starts it. It has the same four sections.
+
+- `sealer-fleet-rebuild.md`: every sealer member lost its state. The chain
+  restarts after the posted head from a state rebuilt from L1, and the blocks
+  after the posted head are reverted.
