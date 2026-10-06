@@ -955,6 +955,41 @@ check would pass against a feature that activated once and stopped.
   segment reader also fail-stops on structural damage (a zeroed or undersized
   frame header with data behind it is `Corruption`, no longer a silent
   truncation that read as a live tail).
+- **Aeron stall tolerance** — one deploy value, `aeron_stall_tolerance_ms`
+  (env `AERON_STALL_TOLERANCE_MS`, workloads role), sets how long every Aeron
+  party waits through a stalled peer:
+  - every Rust client's driver timeout (`AERON_DRIVER_TIMEOUT`, which the C
+    client reads and the service code never overrides);
+  - every Java client's driver timeout (`aeron.driver.timeout`), in the
+    `aeron` job's ArchivingMediaDriver JVM and in each sealer member;
+  - every media driver's client liveness timeout
+    (`aeron.client.liveness.timeout`): the `aeron` job's driver and each
+    sealer member's embedded ClusteredMediaDriver. A client's service
+    interval check uses the same value.
+
+  The jobs derive one more value from it: the publication unblock timeout,
+  3/2 of the tolerance, because Aeron refuses to start a driver whose unblock
+  timeout is not above its client liveness timeout. A client sends its
+  keepalive every 500 ms, far below the tolerance. A new ArchivingMediaDriver
+  refuses to start ("active driver detected") while the CnC heartbeat of a
+  dead predecessor is younger than its driver timeout, so the `aeron` job
+  restarts a failed driver after the tolerance plus 5 s: Nomad's own 15 s
+  default at 10 s. The default is **10000**,
+  Aeron's own default, and staging and production keep it: a longer value
+  delays the detection of a dead client or driver by the same amount. The
+  Raft election and leader heartbeat timeouts are separate and do not change.
+
+  CI raises it to **30000** (the `cluster-e2e` workflow and the container
+  recipes of `deploy/cluster/justfile`), the value of the local e2e harness.
+  A shared CI runner stalls for more than 10 s at times (archive copies,
+  cluster restarts). At 10 s, such a stall kills a healthy party: a client
+  exits on `MediaDriver keepalive: age=10941ms > timeout=10000ms` or on
+  `service interval exceeded`, and a shard fails on a fault it did not inject.
+  The chaos cases that need an eviction read the same value
+  (`StallTolerance` in `crates/chaos/src/knobs.rs`): the `sequencer-lapse` and
+  `validator-lapse` freezes default to the tolerance plus 20 s, the
+  retention-overrun freeze lasts at least that long, and the driver restart
+  and ingress recovery waits after a driver loss grow by the tolerance.
 - **The observation path itself** (issue #76, fixed) — `docker kill` of a
   privileged DinD node stalls host-dockerd `docker exec` runner-wide for
   minutes, blacking out every exec-based probe at once; for three days this
