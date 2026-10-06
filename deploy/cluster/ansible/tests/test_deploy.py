@@ -303,6 +303,7 @@ class DeployTest(unittest.TestCase):
             'workloads_namespace': 'staging',
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
+            'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '2',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -321,6 +322,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         # One value turns priority fees on for every role that has a say.
         self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')

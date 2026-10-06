@@ -60,6 +60,7 @@ class SealerSeedClusterTest {
         final AeronCluster client = cluster.connectClient();
         // No test call takes this snapshot: the seed record's confirmation asks for it.
         cluster.awaitSnapshotCount(1);
+        IntStream.range(0, MEMBER_COUNT).forEach(i -> assertSeededPurgeView(cluster, i));
 
         IntStream.range(0, K).forEach(i -> offerIngress(client, canonicalId(i)));
         awaitCondition(client, () -> egress.relayedIndexes.size() >= K && egress.boundaryCount >= 1);
@@ -86,6 +87,18 @@ class SealerSeedClusterTest {
         IntStream.range(K, 2 * K).forEach(i -> offerIngress(reconnected, canonicalId(i)));
         awaitCondition(reconnected, () -> egress.relayedIndexes.size() >= K);
         assertEquals(indexes(E_H + K, K), egress.relayedIndexes);
+    }
+
+    /**
+     * The seeded member's purge view: the posted head is the seed head, and
+     * the snapshot that the seed confirmation asked for is its one mark.
+     */
+    private static void assertSeededPurgeView(final TestCluster cluster, final int memberId) {
+        final PurgeView view = ((SealerTestService) cluster.node(memberId).service()).delegate().purgeView();
+        assertEquals(H, view.postedHead(), "member " + memberId + " posted head");
+        assertEquals(1, view.marks().size(), "member " + memberId + " marks " + view.marks());
+        assertTrue(view.marks().get(0).blockNumber() > H,
+            "member " + memberId + " marks the seeded snapshot above H, got " + view.marks());
     }
 
     private static List<Long> indexes(final long from, final int count) {

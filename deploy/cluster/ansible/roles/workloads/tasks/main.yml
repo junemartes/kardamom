@@ -51,6 +51,7 @@
       vars:
         cluster_retention: "{{ workloads_cluster_retention }}"
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+        cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
         cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
         cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
