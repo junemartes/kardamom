@@ -224,6 +224,14 @@ public final class SealerWire {
     /** Replay complete: {@code [kind:4][up_to_index:u64][up_to_block:u64]}. */
     public static final byte EGRESS_KIND_REPLAY_DONE = 4;
     /**
+     * Replay refused, because the cursor is past this member's head:
+     * {@code [kind:11][head_index:u64][head_block:u64]}. The head is the
+     * canonical count and the block that the next tick stamps. The consumer
+     * applied records that this member does not hold, so no replay and no
+     * repair from this stream can serve it. The consumer stops.
+     */
+    public static final byte EGRESS_KIND_REPLAY_AHEAD = 11;
+    /**
      * Contiguity reject:
      * {@code [kind:5][sender:20][nonce:u64][expected:u64]}.
      * The service offers this only to the offering session. The sequencer

@@ -5,8 +5,10 @@
 //! starts at nonce 0. In the warm steady state, the `tx_data` tail gives
 //! visibility: every matched envelope advances the sender's nonce. Two
 //! sources recover committed floors out of band: the receipt-floor resync
-//! (`crate::resync`) and the executor nonce lookup (`crate::lookup`). The
-//! sequencer holds no state-DB reader.
+//! (`crate::resync`) and the nonce lookup (`crate::lookup`). The lookup
+//! asks the local account layer, then Redis when `[cache]` is on, then an
+//! executor. Each answer is a lower bound. The sequencer holds no state-DB
+//! reader.
 //!
 //! Topology (see `docs/specs/dynamic-sequencer-sizing.md`):
 //!   - The ingress routes a sender by virtual slot,

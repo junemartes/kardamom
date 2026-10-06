@@ -86,15 +86,17 @@ The genesis is `deploy/cluster/config/genesis/dev.toml`. With
 
 Run the rebuild twice into two new directories. The first run writes the
 executor image and the sealer seed. The second run keeps the trie, which the
-validator needs. Pass `--lockbox "$LOCKBOX"` where the tool has the flag: on a
-chain with deposits, the root is wrong without it.
+validator needs. Both runs take `--lockbox "$LOCKBOX"`: the rebuild derives the
+L1 deposits from the lockbox logs. Without the flag, the rebuild leaves the
+deposits out, and a chain with deposits rebuilds to a wrong root.
 
 ```sh
 kardamom-reconstruct --l1-rpc "$L1_RPC" --settlement "$SETTLEMENT" --da-proxy "$DA_PROXY" \
-  --chain genesis.toml --through-block "$H" --state-dir executor-image \
-  --executor-image --sealer-seed seed.bin
+  --lockbox "$LOCKBOX" --chain genesis.toml --through-block "$H" \
+  --state-dir executor-image --executor-image --sealer-seed seed.bin
 kardamom-reconstruct --l1-rpc "$L1_RPC" --settlement "$SETTLEMENT" --da-proxy "$DA_PROXY" \
-  --chain genesis.toml --through-block "$H" --state-dir validator-db
+  --lockbox "$LOCKBOX" --chain genesis.toml --through-block "$H" \
+  --state-dir validator-db
 ```
 
 Check both report lines (`reconstructed head=...`):

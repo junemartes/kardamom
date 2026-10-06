@@ -125,11 +125,6 @@ job "notifier" {
     task "notifier" {
       driver = "docker"
 
-      env {
-        # The UDP block of the subscriber's discovery sockets.
-        KARDAMOM_MDC_PORTS = "40370-40379"
-      }
-
       config {
         image = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-notifier:dev"
         # force_pull stays on for both paths; see the ingress job's
