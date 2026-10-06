@@ -13,9 +13,13 @@ import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.ShutdownSignalBarrier;
@@ -68,6 +72,15 @@ public final class ClusterNode {
         final long inclusionHorizonBlocks = Long.getLong(
             "kardamom.cluster.inclusionHorizonBlocks",
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS);
+        // The DA-lag budget: how far the sealed head may run past the last
+        // block posted to L1 before the sealer refuses new transactions.
+        // Replicated configuration like the horizon. Zero turns the guard
+        // off. -Dkardamom.cluster.daLagBudgetBlocks wins over the
+        // DA_LAG_BUDGET_BLOCKS env var.
+        final long daLagBudgetBlocks = parseDaLagBudget(
+            System.getProperty("kardamom.cluster.daLagBudgetBlocks", System.getenv("DA_LAG_BUDGET_BLOCKS")));
+        System.out.println("cluster da-lag budget memberId=" + memberId
+            + " blocks=" + (daLagBudgetBlocks == 0 ? "0 <guard off>" : Long.toString(daLagBudgetBlocks)));
         // The ordering window: 20 with priority fees on, 0 for first come,
         // first served. Replicated configuration like the two above: it
         // decides the relay order. The deploy sets it from the same value
@@ -85,6 +98,17 @@ public final class ClusterNode {
             System.getProperty("kardamom.cluster.remoteOrigins", System.getenv("KARDAMOM_REMOTE_ORIGINS")));
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
+        // The seed a cluster with no snapshot starts from, instead of
+        // genesis: the head of a state rebuilt from L1, which
+        // kardamom-reconstruct --sealer-seed writes. Every member of a new
+        // seeded cluster gets the same file. A member that restores a
+        // snapshot ignores it.
+        final Optional<SealerSeed> seed = readSeed(System.getProperty("kardamom.cluster.seedSnapshot"));
+        System.out.println("cluster seed memberId=" + memberId + seed
+            .map(s -> " block=" + s.head().block() + " endTx=" + s.head().endTxIdx()
+                + " chainId=" + s.head().chainId() + " senders=" + s.senders().size()
+                + " digest=" + s.digestHex())
+            .orElse(" <none: a cluster with no snapshot starts at genesis>"));
 
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
@@ -134,7 +158,8 @@ public final class ClusterNode {
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
                     dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                    inclusionHorizonBlocks, orderingWindow);
+                    inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
+                seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, barrier));
                 break;
@@ -579,6 +604,41 @@ public final class ClusterNode {
                 "kardamom.cluster.voidVoters: id " + id + " outside [0, " + VoidLedger.MAX_VOTERS + ")");
         }
         return id;
+    }
+
+    /**
+     * The seed file at {@code path}, or empty when the property is unset.
+     * An unreadable or invalid file is fatal: a member told to start from a
+     * seed must not start at genesis.
+     */
+    static Optional<SealerSeed> readSeed(final String path) {
+        if (path == null || path.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(SealerSeed.read(Path.of(path.trim())));
+        } catch (final IOException | IllegalArgumentException e) {
+            throw new IllegalStateException("kardamom.cluster.seedSnapshot: " + path + ": " + e.getMessage(), e);
+        }
+    }
+
+    /** The DA-lag budget from its property or env value; unset means the default. */
+    static long parseDaLagBudget(final String raw) {
+        if (raw == null || raw.isBlank()) {
+            return CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS;
+        }
+        final long blocks;
+        try {
+            blocks = Long.parseLong(raw.trim());
+        } catch (final NumberFormatException e) {
+            throw new IllegalStateException(
+                "kardamom.cluster.daLagBudgetBlocks: '" + raw + "' is not a block count", e);
+        }
+        if (blocks < 0) {
+            throw new IllegalStateException(
+                "kardamom.cluster.daLagBudgetBlocks: " + blocks + " is negative");
+        }
+        return blocks;
     }
 
     private static ClusteredServiceContainer.Context serviceContext(

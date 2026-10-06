@@ -51,5 +51,6 @@ async fn main() -> Result<()> {
     // adopts it; every other end leaves the loop.
     let mut revolutions = 0u32;
     while wiring::turn(&boot, &mut revolutions).await?.is_continue() {}
+    boot.close().await;
     Ok(())
 }

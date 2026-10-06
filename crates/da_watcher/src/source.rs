@@ -49,6 +49,25 @@ pub enum L1SourceError {
     NotFinalized,
 }
 
+impl L1SourceError {
+    /// The halt cause of a read that failed this way: `l1_unreachable`
+    /// when no source answers, `l1_source_disagreement` when the sources
+    /// disagree and no light client settles it. `None` for an error that
+    /// is not a halt.
+    #[must_use]
+    pub fn halt_cause(&self) -> Option<kardamom_obs::halt::HaltCause> {
+        use crate::sources::SourceHalt;
+        use kardamom_obs::halt::HaltCause;
+        match self {
+            Self::Provider(_) | Self::Halt(SourceHalt::NoQuorum { .. }) => {
+                Some(HaltCause::L1Unreachable)
+            }
+            Self::Halt(SourceHalt::Disagreement { .. }) => Some(HaltCause::L1SourceDisagreement),
+            Self::RateLimited | Self::Decode(_) | Self::NotFinalized => None,
+        }
+    }
+}
+
 /// The L1 view the watcher needs. All methods async and fallible.
 #[async_trait]
 pub trait L1Source: Send + Sync + 'static {

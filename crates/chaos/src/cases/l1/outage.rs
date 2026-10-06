@@ -25,49 +25,120 @@ const REBUILD_BUDGET: Duration = Duration::from_secs(240);
 /// How many times the freeze is retried to land on a non-empty spool.
 const FREEZE_ATTEMPTS: u32 = 10;
 
-/// The spool's block files on the aux node.
-async fn spool_blocks(h: &Harness, aux: &str) -> anyhow::Result<usize> {
-    h.nodes
-        .exec(
-            aux,
-            "ls /opt/kardamom/batcher/spool 2>/dev/null | grep -c '\\.block$' || true",
+/// The spool of the batcher on the aux node.
+const SPOOL_DIR: &str = "/opt/kardamom/batcher/spool";
+
+/// One freeze attempt on the aux node, in one exec: SIGSTOP the batcher,
+/// read its process state from `/proc`, count the spool's block files,
+/// and SIGCONT it again unless it is stopped with a non-empty spool. The
+/// attempt takes about one second. So a retried attempt stays far under
+/// the Aeron client's service interval (10 s), and the thaw does not
+/// restart the batcher. A scrape of the frozen exporter waits for its
+/// timeout, and does not fit.
+struct FreezeAttempt<'a> {
+    aux: &'a str,
+    inner: &'a str,
+}
+
+impl FreezeAttempt<'_> {
+    /// The shell script of the attempt. It prints the process state and
+    /// the count of spooled blocks.
+    fn script(&self) -> String {
+        let inner = self.inner;
+        format!(
+            "docker kill -s STOP {inner} >/dev/null || exit 1
+pid=$(docker inspect -f '{{{{.State.Pid}}}}' {inner})
+state=?
+for _ in $(seq 1 40); do
+  state=$(sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f1)
+  [ \"$state\" = T ] && break
+  sleep 0.05
+done
+blocks=$(ls {SPOOL_DIR} 2>/dev/null | grep -c '\\.block$' || true)
+if [ \"$state\" != T ] || [ \"$blocks\" = 0 ]; then docker kill -s CONT {inner} >/dev/null; fi
+echo \"$state $blocks\""
         )
-        .await?
-        .trim()
-        .parse()
-        .map_err(|e| crate::chaos_fail!("spool listing is not a count: {e}"))
+    }
+
+    /// Run the attempt. `Some(blocks)` when the batcher stays frozen with
+    /// `blocks` spooled blocks; `None` when the spool was empty and the
+    /// batcher runs again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec fails, or if the process is not
+    /// stopped after the signal.
+    async fn run(&self, h: &Harness, ctx: &str) -> anyhow::Result<Option<usize>> {
+        let out = h.nodes.exec(self.aux, &self.script()).await?;
+        let (state, blocks) = out.trim().split_once(' ').ok_or_else(|| {
+            crate::chaos_fail!("{ctx}: the freeze attempt printed no state and count: {out:?}")
+        })?;
+        anyhow::ensure!(
+            state == "T",
+            "{}: {ctx}: freeze did NOT take effect (process state {state:?} after SIGSTOP, not T)",
+            crate::FAIL_PREFIX
+        );
+        let blocks: usize = blocks
+            .parse()
+            .map_err(|e| crate::chaos_fail!("{ctx}: spool listing is not a count: {e}"))?;
+        Ok((blocks > 0).then_some(blocks))
+    }
 }
 
 /// Freeze the batcher with a non-empty spool, so the restart has a group
-/// to recover. The spool empties for an instant after every post, so a
-/// freeze that lands in that instant is thawed and tried again.
+/// to recover. The spool empties for an instant after every post, so an
+/// attempt that lands in that instant thaws the batcher and tries again.
 async fn freeze_with_spool(
     h: &Harness,
     aux: &str,
     inner: &str,
     ctx: &str,
 ) -> anyhow::Result<usize> {
+    let attempt = FreezeAttempt { aux, inner };
+    let attempt = &attempt;
     let target = h.probes.aux_target(BATCHER_PORT);
     let target = &target;
     let outcome = poll::until(
         Budget::new(
-            Duration::from_secs(u64::from(FREEZE_ATTEMPTS) * 4),
+            (Duration::from_secs(4) + h.knobs.restart_slo) * FREEZE_ATTEMPTS,
             Duration::from_secs(1),
         ),
         |_| async move {
-            h.freeze_verified(aux, inner, target, ctx).await?;
-            let blocks = spool_blocks(h, aux).await?;
-            if blocks > 0 {
-                return Ok::<_, anyhow::Error>(Some(blocks));
+            let frozen = attempt.run(h, ctx).await?;
+            if frozen.is_none() {
+                await_answering(h, target, ctx).await?;
             }
-            h.thaw(aux, inner).await?;
-            Ok(None)
+            Ok::<_, anyhow::Error>(frozen)
         },
     )
     .await?;
-    outcome
-        .or_fail(|_| crate::chaos_fail!("{ctx}: the spool was empty on every freeze"))
-        .map(|(blocks, _)| blocks)
+    let (blocks, _) =
+        outcome.or_fail(|_| crate::chaos_fail!("{ctx}: the spool was empty on every freeze"))?;
+    crate::log(format!(
+        "{ctx}: freeze verified (process state T, {blocks} spooled blocks)"
+    ));
+    Ok(blocks)
+}
+
+/// Wait until the batcher's metrics endpoint answers: after a thaw, the
+/// task can restart, and its container is gone until the new one runs.
+async fn await_answering(
+    h: &Harness,
+    target: &crate::metrics::Target,
+    ctx: &str,
+) -> anyhow::Result<()> {
+    let budget = Budget::new(h.knobs.restart_slo, Duration::from_secs(1));
+    poll::until(budget, |_| async move {
+        Ok::<_, anyhow::Error>(h.probes.scrape().answers(target).await.then_some(()))
+    })
+    .await?
+    .or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: the batcher did not answer within {}s after a thaw",
+            t.as_secs()
+        )
+    })
+    .map(|_| ())
 }
 
 /// Hold until the ingress delta passed twice the retention, two minutes
@@ -189,9 +260,12 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         .evidence
         .count_lines(CLUSTER_TASK, SNAPSHOT_LINE, Streams::StdoutOnly)
         .await?;
-    let restored0 = count(h, SPOOL_RESTORED_LINE).await?;
-    let rebuilt0 = count(h, REBUILT_LINE).await?;
     let blocks = freeze_with_spool(h, &aux, &inner, ctx).await?;
+    // The baselines follow the freeze: a restart on a retried freeze
+    // logs its own lines, which must not count for the final thaw.
+    let restored0 = count(h, SPOOL_RESTORED_LINE).await?;
+    let rebuilding0 = count(h, REBUILDING_LINE).await?;
+    let rebuilt0 = count(h, REBUILT_LINE).await?;
     // A post in flight at the freeze still lands: read the covered
     // block once it has.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -204,6 +278,13 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         "{ctx}: the floor passed ({delta} frames in {}s); thawing",
         held.as_secs()
     ));
+    let sealed = h
+        .probes
+        .executor_progress()
+        .await
+        .ok_or_else(|| crate::chaos_fail!("{ctx}: no executor head at the thaw"))?;
+    let sealed = u64::try_from(sealed)
+        .map_err(|e| crate::chaos_fail!("{ctx}: the executor head is not a block: {e}"))?;
     if h.thaw(&aux, &inner).await.is_err() {
         crate::log(format!(
             "{ctx}: SIGCONT failed (the task was replaced mid-freeze); the log asserts own the verdict"
@@ -212,13 +293,68 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     let budget = h.knobs.restart_slo + Duration::from_secs(60);
     await_line(h, SPOOL_RESTORED_LINE, restored0, budget, ctx).await?;
     await_spool_posted(&l1, covered0, ctx).await?;
-    await_line(h, REBUILT_LINE, rebuilt0, budget + REBUILD_BUDGET, ctx).await?;
+    let lines = Baselines {
+        rebuilding: rebuilding0,
+        rebuilt: rebuilt0,
+    };
+    if !await_rebuilt_or_served(h, &l1, lines, sealed, budget + REBUILD_BUDGET, ctx).await? {
+        return l1.assert_contiguous(ctx).await;
+    }
     let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
     let floor = field_in_last(&logs, REBUILDING_LINE, "oldest_block").ok_or_else(|| {
         crate::chaos_fail!("{ctx}: the rebuild line names no oldest_block (the sealers' floor)")
     })?;
     await_covered_through(&l1, floor, ctx).await?;
     l1.assert_contiguous(ctx).await
+}
+
+/// The batcher log counts before the thaw.
+#[derive(Clone, Copy)]
+struct Baselines {
+    rebuilding: usize,
+    rebuilt: usize,
+}
+
+/// Wait for one of the two ends of the outage. The sealers refused the
+/// replay and the batcher rebuilt the gap from references (`true`). Or
+/// the sealers kept every frame above the posted head, served the
+/// replay, and L1 covers through `sealed`, the head at the thaw, with no
+/// refusal on the way (`false`). The retention never prunes below the
+/// posted head, so the second is the expected end; the first stays valid
+/// for a sealer that prunes by the window alone.
+async fn await_rebuilt_or_served(
+    h: &Harness,
+    l1: &L1,
+    base: Baselines,
+    sealed: u64,
+    budget: Duration,
+    ctx: &str,
+) -> anyhow::Result<bool> {
+    let outcome = poll::until(
+        Budget::new(budget, Duration::from_secs(5)),
+        |_| async move {
+            if count(h, REBUILT_LINE).await? > base.rebuilt {
+                return Ok::<_, anyhow::Error>(Some(true));
+            }
+            let served = l1.covered_through().await? >= sealed
+                && count(h, REBUILDING_LINE).await? == base.rebuilding;
+            Ok(served.then_some(false))
+        },
+    )
+    .await?;
+    let (rebuilt, elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: within {}s the batcher neither rebuilt a refused gap nor posted through block {sealed}, the head at the thaw",
+            t.as_secs()
+        )
+    })?;
+    if !rebuilt {
+        crate::log(format!(
+            "{ctx}: the sealers kept the range above the posted head and served the replay: L1 covers through {sealed} with no refusal ({}s)",
+            elapsed.as_secs()
+        ));
+    }
+    Ok(rebuilt)
 }
 
 /// L1 covers through `floor`: the rebuilt gap and the sealers' floor

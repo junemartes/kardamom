@@ -439,6 +439,11 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             have: alloy_primitives::U256::from(*have),
             want: alloy_primitives::U256::from(*want),
         },
+        TxErrorReason::DaLag {
+            sealed_head,
+            posted_head,
+            budget_blocks,
+        } => IngressError::da_lag(*sealed_head, *posted_head, *budget_blocks),
     }
 }
 

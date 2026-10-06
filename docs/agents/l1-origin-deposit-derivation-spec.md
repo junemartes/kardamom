@@ -1,7 +1,7 @@
 # L1-Origin Deposit Derivation — Spec
 
 - **Date:** 2026-07-25
-- **Status:** In progress — phases A, B, C and D landed. Epochs are the ONLY deposit path: the da-watcher emits one per finalized L1 block, `DepositRef` is retired, and 17 e2e scenarios (S10a–e cover the rules directly) run green
+- **Status:** Phases A to E landed. Epochs are the ONLY deposit path: the da-watcher emits one per finalized L1 block, `DepositRef` is retired, and a chain rebuilt from L1 with `kardamom-reconstruct --lockbox` includes its deposits
 - **Motivated by:** the chain-semantics suite's S8 (`docs/agents/chain-semantics-e2e-suite-spec.md`), which must keep its workload **deposit-free** because deposits cannot survive the DA round-trip today
 - **Goal (definition of done):** a chain reconstructed from L1 alone — blobs + L1 logs + genesis — reproduces the validator's state root **including deposits**, and a sequencer cannot omit or reorder a deposit without producing a chain that verifiers reject.
 
@@ -166,7 +166,14 @@ phase D, asserted here against the producer.
 | B | Canonical stream: `TxOrderingMessage::Epoch`, `KIND_ORIGIN_RECORD` framing with `l1_origin` + `slot_count`, `l1_origin` on both boundary types, sealer forced boundary + origin tracking + snapshot v2, executor expansion of an epoch into marker + deposits | **Done** |
 | C | Producer switch-over: da-watcher emits one epoch per finalized L1 block (including empty ones), sequencer forwards them verbatim, executor's `tx_deposits` join retired, `l1_origin` persisted in block headers | **Done** |
 | D | Verification (phase 1): the validator re-derives every epoch from L1 and fail-stops on disagreement — rules 1, 2 and 4 plus exact deposit content | **Done** |
-| E | KAR2 DA payload carries the origin; `kardamom-reconstruct` re-derives deposits from L1 | Not started |
+| E | The DA payload (KAR1 version 3) carries the origin; `kardamom-reconstruct --lockbox` re-derives deposits from L1 | **Done** |
+
+Phase E notes: the payload carries the origin in the KAR1 version 3 block cursor, not in a
+new KAR2 format. When a block's origin moves from M to N, the rebuild derives the epochs
+M+1..N through `derive_epoch` and applies them at the head of the block, through
+`execute_deposit_tx`. The first step from origin 0 takes epoch N only. S8 now runs a
+workload with a deposit. `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md` §5 has the slot
+check and its limits.
 
 Phase C makes this the live path. Notes on what it changed beyond the obvious:
 

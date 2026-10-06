@@ -233,6 +233,88 @@ The DA-lag guard of 3.7 bounds the cost: the sealer halts new transactions at
 budget plus one flush. A chain that turns the guard off accepts unbounded growth while the
 batcher is down, in the open.
 
+### 3.11 Service events
+
+A halt (3.6) tells the operator about one service. The other services must know it too: a
+service that depends on a halted one must stop and say why, and the chain must show one
+root for one incident. The services share their lifecycle state on one Aeron stream.
+
+**The stream.** `events`, stream id 1019, best effort, a multi-destination cast like
+`tx_errors`. RAM only, not recorded. Every service with an Aeron runtime publishes on it
+and any service can subscribe. The record is `ServiceEvent` (the transaction status feed
+also says "events", so the type name is specific):
+
+```
+ServiceEvent { service, instance, seq, state: ServiceState }
+ServiceState = Running | Halted(Halt) | Paused(Pause) | Resumed
+Pause        { reason: PauseReason, since }
+PauseReason  = Upstream(HaltRef) | Operator { note }
+HaltRef      { service, instance, cause }
+```
+
+`service` is the exporter's service name and `instance` is the host id. `seq` increases
+with each record of one process. Aeron delivers the records of one publisher in order, so
+the latest record of a `(service, instance)` is its state; a `seq` lower than the last one
+means the process restarted.
+
+**The states.**
+
+- `Halted`: the service's own fault. It carries the `Halt` record of 3.6 (the cause, the
+  detail, the runbook, the clearing rule). It pages.
+- `Paused`: the service waits on something outside itself. `Upstream` names the root halt
+  it waits on; `Operator` is an operator's pause, for example for maintenance. It does not
+  page. A paused service makes no progress, keeps its state, serves its metrics and its
+  queries, fails its readiness check, and resumes by itself when the root clears or the
+  operator resumes it.
+- `Resumed`: the change back to running. A service publishes it once; the next heartbeat
+  says `Running`.
+- A dependent service pauses on a root halt. It does not halt. One incident has one
+  halted root, so it pages once, with the runbook of the root.
+- A halt has priority over a pause: a paused service that finds its own fault halts.
+
+**The heartbeat.** Every service publishes its current state every 5 s, `Running`
+included, and at once on every change. A service that starts later knows every state
+within 5 s. A record with no heartbeat for 15 s is `gone`: the process died or froze, and
+the orchestrator's restart shows next.
+
+**The sealer's state.** The sealer has no Rust runtime on the stream. The ingress observes
+it on its cluster session and publishes it as `service = "sealer"`, `instance =
+"cluster"`: `Halted(da_lag)` from the status frame of 3.7, and `Halted(sealer_no_quorum)`
+when no boundary arrives for 10 s. Both clear by themselves (`clears = Auto`).
+
+**Who reacts to what.**
+
+| Root | Reaction |
+|---|---|
+| the sealer has no quorum | the ingress pauses submits, with a typed error that names the root; the sequencers pause offering, from their own egress silence |
+| the sealer's DA-lag guard (3.7) | the ingress pauses submits, with the typed error; the guard itself stays in the cluster log |
+| every executor halted | the ingress pauses submits: no receipt can come; one executor halted changes nothing, the others serve |
+| a validator divergence | the output attester pauses: no output root reaches L1 while the chain's state is in doubt |
+| the batcher halted | the chain status shows it; the enforcement stays the sealer's DA-lag guard, through the log |
+| the da-watcher halted | the chain status shows that deposits are delayed; nothing pauses |
+| the l1-indexer halted | the rebuild tool refuses to read from it; nothing else |
+
+The l1-indexer has no Aeron runtime. It serves its state on its own API (`GET /halt`), and
+the rebuild tool reads it there.
+
+**The safety rule.** The events stream is for visibility and for the liveness of the
+services off the log. A decision that changes the canonical order never reads it. Such a
+decision goes through the cluster log, as the DA-lag guard does, so the sealer members stay
+deterministic. A lost or late event can delay a pause or a resume, never change the order.
+
+**The chain status.** The ingress subscribes and keeps the latest state of every service.
+`kardamom_chainStatus` returns every service's state, with the roots of the pauses, the
+posted head, the sealed head and the DA-lag budget. A refused submit carries the root's
+cause and runbook id.
+
+**The operator pause.** `POST /pause?note=<text>` and `POST /resume` on each service's
+exporter, from the loopback only, like `POST /halt/clear`. An upstream resume does not
+end an operator pause.
+
+**The alerts.** Only `Halted` pages: the rules of 3.6, on `kardamom_halt`. A pause exports
+`kardamom_paused{reason, root_service, cause} = 1` and fires an info alert. An
+Alertmanager inhibit rule keyed on `cause` mutes it while the root's halt alert fires.
+
 ## 4. The chaos cases
 
 All run on the container cluster, in a new shard `chaos-l1` (the retention knobs of the
@@ -249,8 +331,8 @@ faults the incident showed: `NullReceipts`, `SwallowLogs` for an address, `RateL
 | `l1-null-receipts` | the proxy answers null receipts and empty logs for the settlement while serving blocks | same as above; in addition the batcher's resume after a restart reads `l2BlockEnd` from the contract and continues, with no wait on the indexer |
 | `batcher-outage-past-retention` | SIGSTOP the batcher; load until the sealer's floor passes its cursor and a snapshot lands; thaw. Then repeat with the spool wiped | the batcher recovers the range from the spool, then from an executor's block refs and the `tx_data` archive; L1's record is contiguous (`l2BlockStart == previous l2BlockEnd + 1` for every batch); the rebuild stage proves root parity through the recovered range |
 | `two-day-outage` | the incident's order: liar at T0; batcher restart at T1; a deploy of the same images at T2; floor passes at T3; fault cleared at T4 | no manual step; the batcher is posting again within one flush after T4; the alert fired before T1; the record is contiguous; rebuild parity holds |
-| `prune-floor` | the batcher frozen; load past the retention window and past a Raft snapshot; thaw | the sealer still replays from the batcher's cursor (no `REPLAY_UNAVAILABLE`); the batcher posts a contiguous record; the egress retention gauge shows the window stretched to the posted head and back |
-| `da-lag-halt` | the batcher frozen with SIGSTOP; load until the sealed head passes `da_lag_budget` past the posted head | the sealer halts new transactions with the typed error; deposits still land; `kardamom_halt{cause="da_lag"}` is 1 with the runbook id; the batcher thaws, posts, and the sealer resumes with no operator step |
+| `prune-floor` | the batcher frozen; load past the retention window and past a Raft snapshot; thaw | the sealer still replays from the batcher's cursor (no `REPLAY_UNAVAILABLE`); the batcher posts a contiguous record; the egress retention gauge shows the window stretched to the posted head and back; the chain status shows the batcher `gone` while frozen and no root halt, and every service `Running` after the thaw |
+| `da-lag-halt` | the batcher frozen with SIGSTOP; load until the sealed head passes `da_lag_budget` past the posted head | the sealer halts new transactions with the typed error; deposits still land; `kardamom_halt{cause="da_lag"}` is 1 with the runbook id; the chain status shows the sealer `Halted(da_lag)` as the root and the ingresses `Paused` on it; the batcher thaws, posts, and every service returns to `Running` with no operator step |
 | `restore-from-snapshot-set` | take a set under load; then wipe every node's state, archives and cluster dirs; restore from the set | the chain continues from the cut with the same images; the executors' roots match the validator's; the batcher posts a contiguous record; the time to restore is reported |
 | `revert-to-posted-head` | the batcher frozen past the retention floor, the spool, every state database's refs and both `tx_data` archives wiped (the unrecoverable case) | the services halt with `replay_unavailable` and the runbook id; the operator procedure of 3.8 (scripted in the case) reverts the chain to the posted head; the rebuilt state matches L1; the chain seals again from there; the revoked receipts are listed |
 
@@ -272,6 +354,7 @@ renders and validates.
 | 6 | the halt contract (3.6): the type, the gauge, the `/halt` route, the runbooks, the rules; every existing fail-stop (validator verdict, batcher resume, indexer chain break, da-watcher) becomes a halt | a test that every `RecoveryId` has a runbook; the chaos cases assert the halt record |
 | 7 | the DA-lag guard (3.7), the posted head as the sealer's retention floor (3.10), and the `safe`/`finalized` tags | `da-lag-halt`, `prune-floor` |
 | 8 | the revert procedure (3.8) scripted and timed | `revert-to-posted-head` |
+| 7b | the service events (3.11): the `events` stream, the reactions of the table, `kardamom_chainStatus`, the operator pause | unit tests per row; `da-lag-halt` and `prune-floor` read the chain status |
 | 9 | the snapshot set (3.9): the backup job with `ClusterBackup`, the archive mirror and the checkpoints; `just restore <env> <set>` | `restore-from-snapshot-set` |
 
 Steps 1 and 2 land first: they turn the incident into a red test. Steps 3 and 4 make it

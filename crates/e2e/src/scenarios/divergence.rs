@@ -4,8 +4,8 @@
 //! `validator_divergence_total == 0`. That check means
 //! something only if a genuinely divergent stream would trip it. This
 //! scenario proves the tripwire: it feeds the validator a corrupt BAL over
-//! the real `tx_bal` channel, and requires the documented fail-stop: the
-//! halting log line and `std::process::exit(2)`.
+//! the real `tx_bal` channel, and requires the documented halt: the
+//! halting log line, and the halt record with the divergence cause.
 //!
 //! For determinism, the executor is `SIGSTOP`ped first, so no genuine BAL
 //! competes with the injected frame for the target blocks (the sealer
@@ -30,8 +30,8 @@ use crate::harness::{LocalStack, inject, l2};
 /// # Errors
 /// Returns an error when a warmup transfer fails to send, when the
 /// validator does not warm up, when it had already diverged, when
-/// injecting the corrupt BAL fails, when the validator does not
-/// fail-stop, or when it exits without a divergence log line.
+/// injecting the corrupt BAL fails, when the validator does not halt,
+/// or when it halts without a divergence log line.
 pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> Result<()> {
     // Send a little genuine traffic first. This proves the halt happens on
     // a validator that was verifying happily until the corruption.
@@ -78,17 +78,17 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
         .await
         .context("publish corrupt BALs")?;
 
-    // The fail-stop: exit code 2 and the halting log line.
-    let code = stack
-        .wait_validator_exit(Duration::from_secs(45))
-        .context("validator did not exit after a corrupt BAL")?;
-    anyhow::ensure!(
-        code == Some(2),
-        "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
-    );
+    // The halt: the record with the divergence cause, and the halting
+    // log line. The process stays up and serves both.
+    t.wait_validator_halted(
+        Duration::from_secs(45),
+        "validator halted on the corrupt BAL",
+    )
+    .await
+    .context("validator did not halt after a corrupt BAL")?;
     let log = stack
         .validator_log()
-        .context("read validator log after the divergence exit")?;
+        .context("read validator log after the divergence halt")?;
     anyhow::ensure!(
         log.contains("divergence"),
         "validator log carries no divergence line; tail:\n{}",
@@ -118,8 +118,8 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
 /// # Errors
 /// Returns an error when the validator does not warm up, when it had
 /// already diverged, when the stack has no DA watcher, when publishing
-/// the forged epoch fails, when the validator does not fail-stop on it, or
-/// when it fail-stops for a reason other than an epoch fault.
+/// the forged epoch fails, when the validator does not halt on it, or
+/// when it halts for a reason other than an epoch fault.
 pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) -> Result<()> {
     super::assert_validator_warm(t, "injection").await?;
     let l1 = stack.l1().context("S11 needs an L1 (l1: true)")?;
@@ -142,18 +142,14 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
     // through.
     l1.mine(12).await?;
 
-    // Check the exit code, not a metric. The fail-stop exits the process
-    // right after it counts the divergence, and its /metrics endpoint goes
-    // with it. A metric poll races that exit: a scrape that lands after it
-    // is refused and fails the scenario while the validator did exactly
-    // the right thing. Exit code 2 is the divergence fail-stop.
-    let code = stack
-        .wait_validator_exit(Duration::from_mins(1))
-        .context("validator must reject an epoch L1 never produced")?;
-    anyhow::ensure!(
-        code == Some(2),
-        "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
-    );
+    // The halt record names the divergence cause. The validator stays up
+    // and serves it, so a scrape never races an exit.
+    t.wait_validator_halted(
+        Duration::from_mins(1),
+        "validator halted on the forged epoch",
+    )
+    .await
+    .context("validator must reject an epoch L1 never produced")?;
 
     // It must also have halted on an epoch fault specifically. A
     // divergence from some unrelated check would pass the line above,
@@ -163,7 +159,7 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
         .context("read validator log for the halt reason")?;
     anyhow::ensure!(
         log.contains("epoch verification failed"),
-        "validator fail-stopped but not on an epoch fault — halted for another reason"
+        "validator halted but not on an epoch fault — halted for another reason"
     );
     Ok(())
 }
@@ -237,7 +233,7 @@ async fn assert_faithful_baseline(stack: &mut LocalStack, t: &Target) -> Result<
 
 /// Arm `fault` starting at the next L1 block, so already-verified epochs
 /// stay verified and the fault lands only on fresh ones, then require the
-/// validator to fail-stop on an epoch fault specifically.
+/// validator to halt on an epoch fault specifically.
 async fn arm_and_assert_fault_detected(
     stack: &mut LocalStack,
     t: &Target,
@@ -287,41 +283,36 @@ async fn arm_and_assert_fault_detected(
     }
     stack.l1().context("l1")?.mine(16).await?;
 
-    // Check the exit code, not a metric. The fail-stop kills the process,
-    // so its /metrics endpoint goes with it. Polling a gauge here would
-    // read the halt as `unwrap_or(0.0)`, meaning "no divergence", and the
-    // scenario would time out while the validator was dead and correct the
-    // whole time. This is the same scrape-failure-as-zero trap the
-    // lag-resync work hit. Exit code 2 is the divergence fail-stop, and the
-    // log line names the reason.
+    // The halt record names the divergence cause; the validator stays up
+    // and serves it. A scrape failure is an error, never read as "no
+    // halt", so a dead validator cannot pass as a halted one.
     let served_since_arm = stack
         .verified_l1()
         .context("mock verified L1")?
         .served()
         .saturating_sub(served_at_arm);
-    let code = stack
-        .wait_validator_exit(Duration::from_secs(90))
-        .with_context(|| {
-            format!(
-                "validator did NOT fail-stop on a lying L1 view ({fault:?}) — armed from L1 \
-                 block {from}; endpoint served {served_since_arm} requests since arming; \
-                 epochs verified was {verified_at_arm} at arming"
-            )
-        })?;
-    anyhow::ensure!(
-        code == Some(2),
-        "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
-    );
+    t.wait_validator_halted(
+        Duration::from_secs(90),
+        "validator halted on the lying L1 view",
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "validator did NOT halt on a lying L1 view ({fault:?}) — armed from L1 \
+             block {from}; endpoint served {served_since_arm} requests since arming; \
+             epochs verified was {verified_at_arm} at arming"
+        )
+    })?;
 
-    // It must also have halted on an epoch fault. Exiting with code 2 for
-    // some unrelated divergence would pass the check above, while proving
+    // It must also have halted on an epoch fault. A halt on some
+    // unrelated divergence would pass the check above, while proving
     // nothing about L1 verification.
     let log = stack
         .validator_log()
         .context("read validator log for the halt reason")?;
     anyhow::ensure!(
         log.contains("epoch verification failed"),
-        "validator fail-stopped but not on an epoch fault — halted for another reason"
+        "validator halted but not on an epoch fault — halted for another reason"
     );
     Ok(())
 }

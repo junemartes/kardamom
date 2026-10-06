@@ -35,7 +35,6 @@ fn config(base: &LogConfig) -> LogConfig {
 fn plane(cfg: &LogConfig, label: &str, catalog: &MemoryCatalog) -> StreamPlane {
     let instance = Instance {
         id: format!("alloc-{label}"),
-        ports: None,
     };
     StreamPlane::with_catalog(
         cfg,

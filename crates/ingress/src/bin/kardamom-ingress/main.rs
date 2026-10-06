@@ -31,11 +31,14 @@ use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscr
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
-use kardamom_log::aeron_live::{AeronRuntime, TxStatusPublisherHandle};
+use kardamom_log::aeron_live::{
+    AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
+};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_log::recorder::RecorderThreads;
 use kardamom_obs::bin::wait_for_shutdown;
+use kardamom_obs::events::{Beacon, Identity};
 
 use kardamom_types::shard_map::{LANE_COUNT, ShardMap, validate_shard_count};
 use recorders::{
@@ -447,9 +450,6 @@ impl IngressService {
         if let Some(endpoints) = ingress_endpoints {
             live.ingress_endpoints = endpoints;
         }
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            live.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
         // This is a dedicated cluster runtime, with its own Aeron thread and
         // the same aeron dir, so the cluster session never contends with the
         // tx_data publish and receipts work.
@@ -463,14 +463,39 @@ impl IngressService {
         // drops, or when the observer ends. The bus is a tokio `broadcast`
         // channel, so the send never blocks. A send with no live receiver
         // is not an error here.
-        let running =
-            watermark::ClusterWatermarkPump::new(observer, subscription.watermark_sender(), status)
-                .spawn(guard)
-                .context("spawn cluster watermark thread")?;
+        let running = watermark::ClusterWatermarkPump::new(
+            observer,
+            subscription.watermark_sender(),
+            subscription.cluster_status_sender(),
+            status,
+        )
+        .spawn(guard)
+        .context("spawn cluster watermark thread")?;
         tracing::info!(
             "kardamom-ingress: on-quorum watermark and tx_status Sealed via Aeron Cluster egress"
         );
         Ok(running)
+    }
+
+    /// Publish this ingress's lifecycle and the sealer's, as this ingress
+    /// observes it, on the `events` stream.
+    async fn spawn_beacons(
+        plane: &mut StreamPlane,
+        rt: &AeronRuntime,
+        proxy: &IngressProxy<LiveIngressPublication, LiveIngressSubscription>,
+    ) -> Result<()> {
+        let events: ServiceEventsPublisherHandle =
+            plane.publisher(rt).await.context("open events")?;
+        events.spawn_process_beacon();
+        let sealer = Beacon::new(
+            Identity {
+                service: kardamom_ingress::chain::SEALER.to_string(),
+                instance: kardamom_ingress::chain::SEALER_INSTANCE.to_string(),
+            },
+            proxy.sealer().subscribe(),
+        );
+        events.spawn_beacon(sealer);
+        Ok(())
     }
 
     /// Open the status publisher and start the egress tap on `opened`.
@@ -488,9 +513,9 @@ impl IngressService {
     }
 
     /// Whether the CLI or the config file names a cluster egress channel.
+    /// The CLI endpoint is in the config from the load on.
     fn has_egress_channel(&self) -> bool {
-        self.args.cluster_egress_endpoint.is_some()
-            || !self.file_cfg.cluster.to_live().egress_channel.is_empty()
+        !self.file_cfg.cluster.egress_channel.is_empty()
     }
 
     /// Builds the config, opens Aeron, starts the cluster egress tap when
@@ -537,6 +562,7 @@ impl IngressService {
 
         let drain_timeout = cfg.pending_receipt_timeout;
         let proxy = IngressProxy::new(cfg, opened.publication, opened.subscription);
+        Self::spawn_beacons(&mut opened.plane, &opened.rt, &proxy).await?;
         let drainer = proxy.clone();
         let handle = proxy.start().await.context("IngressProxy::start")?;
         tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
@@ -620,7 +646,10 @@ async fn main() -> Result<()> {
     // supplies only the optional `[cluster]` section, the Aeron Cluster
     // client connection that the on-quorum watermark observer uses.
     let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
-    let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    let mut file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
+    file_cfg
+        .cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
 
     let running = IngressService::new(args, resolved, file_cfg).run().await?;
