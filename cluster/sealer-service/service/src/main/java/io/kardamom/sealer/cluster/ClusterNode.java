@@ -1,7 +1,5 @@
 package io.kardamom.sealer.cluster;
 
-import io.aeron.archive.Archive;
-import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.archive.ArchiveTool;
 import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ClusterTool;
@@ -10,8 +8,6 @@ import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
-import io.aeron.driver.MediaDriver;
-import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
@@ -121,6 +117,8 @@ public final class ClusterNode {
             + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
+        final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me);
+        prepareState(contexts, clusterMembers, memberId);
 
         // Launch with a retry past the mark-file liveness window. A member
         // that was hard-killed (kill -9 or docker kill) cannot clear its
@@ -151,8 +149,8 @@ public final class ClusterNode {
         for (int attempt = 1; ; attempt++) {
             try {
                 driver = ClusteredMediaDriver.launch(
-                    driverContext(aeronDir),
-                    archiveContext(aeronDir, archiveDir, me),
+                    contexts.driver(),
+                    contexts.archive(),
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 // Aeron contexts are single-use, and so is the service they
                 // launch: a retry gets a fresh instance.
@@ -195,6 +193,21 @@ public final class ClusterNode {
             startSnapshotScheduler(clusterDir, memberId);
             startJoinWatchdog(consensus.electionStateCounter(), memberId);
             barrier.await();
+        }
+    }
+
+    /**
+     * Decide how the member starts, and seed a blank member from a peer
+     * unless this start is the bootstrap of a new cluster. See
+     * {@link StartMode} and {@link PeerSeed}.
+     */
+    private static void prepareState(
+            final MemberContexts contexts, final String clusterMembers, final int memberId) {
+        final StartMode mode = StartMode.decide(contexts.clusterState());
+        System.out.println("cluster START mode=" + mode + " memberId=" + memberId + " — " + mode.note);
+        if (mode == StartMode.SEED_FROM_PEER) {
+            new PeerSeed(memberId, peerConsensusEndpoints(clusterMembers, memberId), contexts,
+                PeerSeed.Timing.DEFAULT).run();
         }
     }
 
@@ -438,37 +451,6 @@ public final class ClusterNode {
         return level;
     }
 
-    private static MediaDriver.Context driverContext(final String aeronDir) {
-        return new MediaDriver.Context()
-            .aeronDirectoryName(aeronDir)
-            .threadingMode(ThreadingMode.SHARED)
-            .dirDeleteOnStart(true)
-            .dirDeleteOnShutdown(false);
-    }
-
-        // Aeron 1.44 requires Archive.Context.replicationChannel to be set;
-        // it has no default. This is the channel this archive uses to
-        // receive replication during cluster catch-up (snapshot and log
-        // transfer between members). The standard ClusteredMediaDriver
-        // pattern uses this node's IP with an OS-assigned (ephemeral) port.
-        // Every entry in me[*] shares this node's IP, the host of the
-        // ingress endpoint.
-    private static Archive.Context archiveContext(
-            final String aeronDir, final String archiveDir, final String[] me) {
-        final String nodeHost = me[0].split(":")[0];
-        return new Archive.Context()
-            .aeronDirectoryName(aeronDir)
-            .archiveDir(new File(archiveDir))
-            .controlChannel("aeron:udp?endpoint=" + me[4])
-            .localControlChannel("aeron:ipc?term-length=64k")
-            .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
-            // The catalog level must be at least the recording level.
-            .fileSyncLevel(fileSyncLevel())
-            .catalogFileSyncLevel(fileSyncLevel())
-            .recordingEventsEnabled(false)
-            .threadingMode(ArchiveThreadingMode.SHARED);
-    }
-
     private static ConsensusModule.Context consensusContext(
             final String aeronDir, final String clusterDir, final String clusterMembers,
             final int memberId, final int ingressStreamId, final String[] me,
@@ -693,6 +675,18 @@ public final class ClusterNode {
             }
         }
         throw new IllegalArgumentException("memberId " + memberId + " not in " + clusterMembers);
+    }
+
+    /**
+     * The consensus endpoints of every member except {@code memberId},
+     * comma separated: the peers that a blank member seeds from.
+     */
+    static String peerConsensusEndpoints(final String clusterMembers, final int memberId) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","))
+            .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
+            .map(f -> f[2].trim())
+            .collect(java.util.stream.Collectors.joining(","));
     }
 
     /**
