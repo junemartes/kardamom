@@ -7,7 +7,9 @@
 //! 3. an archive records a dynamic MDC publisher through its control
 //!    endpoint, and the recording carries the publisher's session id;
 //! 4. one control endpoint carries two stream ids to two manual
-//!    subscriptions.
+//!    subscriptions;
+//! 5. a publication on control port 0 reports the port the driver bound,
+//!    and a manual subscription joins it there.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -25,7 +27,7 @@ use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-/// Stream ids 4501 to 4512 keep this test apart from the other e2e tests.
+/// Stream ids 4501 to 4513 keep this test apart from the other e2e tests.
 const STREAM: i32 = 4501;
 const FRAMES: usize = 20;
 
@@ -177,7 +179,45 @@ async fn manual_subscription_joins_and_leaves_dynamic_mdc_publishers() {
     assert_eq!(count(&late, 0xBB), 0, "b is silent after the remove");
 
     two_streams_share_one_control_endpoint(&rt, &aeron_dir).await;
+    port_zero_publications_report_their_bound_ports(&rt, &aeron_dir).await;
     stop.cancel();
+}
+
+/// Publishers D and E open on control port 0. Each reports a distinct
+/// port the driver bound on the loopback, and a manual subscription that
+/// attaches those ports receives both.
+async fn port_zero_publications_report_their_bound_ports(
+    rt: &AeronRuntime,
+    aeron_dir: &std::path::Path,
+) {
+    let rt_d = AeronRuntime::spawn_with_dir(aeron_dir).expect("publisher runtime");
+    let (pub_d, control_d) = rt_d
+        .open_mdc_publication(&control_uri(0), STREAM + 12)
+        .expect("publisher d");
+    let (pub_e, control_e) = rt_d
+        .open_mdc_publication(&control_uri(0), STREAM + 12)
+        .expect("publisher e");
+    assert!(
+        [control_d, control_e]
+            .iter()
+            .all(|c| c.ip() == std::net::Ipv4Addr::LOCALHOST && c.port() != 0),
+        "bound on the loopback: {control_d}, {control_e}"
+    );
+    assert_ne!(control_d, control_e, "each publication binds its own port");
+    let (sub_id, mut rx) = rt
+        .open_subscription_raw("aeron:udp?control-mode=manual", STREAM + 12)
+        .expect("subscription d and e");
+    rt.add_destination(sub_id, &destination(control_d.port()))
+        .expect("destination d");
+    rt.add_destination(sub_id, &destination(control_e.port()))
+        .expect("destination e");
+    let d = tokio::task::spawn_blocking(move || publish_frames(&pub_d, 0xD0));
+    let e = tokio::task::spawn_blocking(move || publish_frames(&pub_e, 0xE0));
+    d.await.expect("publisher d task");
+    e.await.expect("publisher e task");
+    let got = collect(&mut rx, Duration::from_secs(10), 2 * FRAMES).await;
+    assert_eq!(count(&got, 0xD0), FRAMES, "every frame of d arrives");
+    assert_eq!(count(&got, 0xE0), FRAMES, "every frame of e arrives");
 }
 
 /// Publisher C publishes two stream ids from one control endpoint, and

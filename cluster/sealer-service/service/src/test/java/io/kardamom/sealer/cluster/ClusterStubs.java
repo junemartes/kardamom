@@ -18,8 +18,9 @@ import org.agrona.concurrent.YieldingIdleStrategy;
  * Minimal in-memory {@link Cluster}/{@link ClientSession} stubs shared by the
  * driverless service tests ({@link SealerFanoutTest}, {@link SnapshotRestoreTest}).
  * These stubs implement only what {@code onStart}, session fan-out, and replay
- * touch. Every transport-level operation throws. {@link StubSession#offered}
- * records every egress frame verbatim, so tests can assert on raw frame bytes.
+ * touch. Every other transport-level operation throws. {@link StubSession#offered}
+ * records every egress frame verbatim, and {@link StubCluster#logOffers} every
+ * service message, so tests can assert on raw frame bytes.
  */
 final class ClusterStubs {
 
@@ -34,6 +35,8 @@ final class ClusterStubs {
         int closes;
         /** When set, every offer reports {@link Publication#BACK_PRESSURED}. */
         boolean backPressured;
+        /** How many more offers this session takes before it reports back-pressure. */
+        long credit = Long.MAX_VALUE;
 
         StubSession(final long id) {
             this.id = id;
@@ -65,9 +68,10 @@ final class ClusterStubs {
         }
 
         public long offer(final DirectBuffer buffer, final int offset, final int length) {
-            if (backPressured) {
+            if (backPressured || credit == 0) {
                 return Publication.BACK_PRESSURED;
             }
+            credit--;
             final byte[] copy = new byte[length];
             buffer.getBytes(offset, copy);
             offered.add(copy);
@@ -88,6 +92,10 @@ final class ClusterStubs {
         final IdleStrategy idleStrategy = new YieldingIdleStrategy();
         /** Every timer the service armed, as {@code (correlationId, deadline)} pairs. */
         final List<long[]> scheduledTimers = new ArrayList<>();
+        /** Every message the service offered to the log, verbatim. */
+        final List<byte[]> logOffers = new ArrayList<>();
+        /** The role {@link #role()} reports. */
+        Role role = Role.LEADER;
 
         StubSession addSession(final long id) {
             final StubSession session = new StubSession(id);
@@ -100,7 +108,7 @@ final class ClusterStubs {
         }
 
         public Role role() {
-            return Role.LEADER;
+            return role;
         }
 
         public long logPosition() {
@@ -149,7 +157,10 @@ final class ClusterStubs {
         }
 
         public long offer(final DirectBuffer buffer, final int offset, final int length) {
-            throw new UnsupportedOperationException();
+            final byte[] copy = new byte[length];
+            buffer.getBytes(offset, copy);
+            logOffers.add(copy);
+            return length;
         }
 
         public long offer(final io.aeron.DirectBufferVector[] vectors) {

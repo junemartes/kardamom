@@ -236,6 +236,8 @@ pub struct Sequencer {
     /// The resize warm-up, while one is in progress.
     shadow: Option<ShadowWindow>,
     depth: DepthReport,
+    /// While closed, the loop offers nothing. See [`crate::pause_gate`].
+    pause: crate::pause_gate::PauseGate,
     /// The fee admission gate. Off unless the binary wired the base fee
     /// view and the setting is on.
     fees: FeeGate,
@@ -274,6 +276,7 @@ impl Sequencer {
             vslots,
             shadow,
             depth,
+            pause: crate::pause_gate::PauseGate::default(),
             fees: FeeGate::off(),
         })
     }
@@ -282,6 +285,15 @@ impl Sequencer {
     /// envelope, and the admitted bid rides the offer.
     pub fn enable_fees(&mut self, gate: FeeGate) {
         self.fees = gate;
+    }
+
+    /// Offer nothing while `slots` holds a pause: the process lifecycle
+    /// in the binary.
+    pub fn enable_pause(
+        &mut self,
+        slots: tokio::sync::watch::Receiver<kardamom_obs::lifecycle::Slots>,
+    ) {
+        self.pause = crate::pause_gate::PauseGate::new(slots);
     }
 
     /// The virtual slots this replica serves.
@@ -617,49 +629,45 @@ impl Sequencer {
         }
     }
 
-    /// Apply the past-deadline rejects the sealer answered this shard
-    /// with. Each one is a transaction the chain will never order: drop it
-    /// from the unconfirmed ledger, so it never republishes, and tell the
-    /// client, so it can sign again instead of waiting out its timeout.
+    /// Apply the terminal refusals the sealer answered this shard with: a
+    /// ref past its inclusion deadline, or one the DA-lag guard refused.
+    /// No republish can order either now: drop it from the unconfirmed
+    /// ledger, so it never republishes, and tell the client, so it can
+    /// resubmit instead of waiting out its timeout.
     fn apply_deadline_rejects<P: SequencerPorts>(
         &mut self,
         r: &mut crate::resync::ResyncController,
         ports: &mut P,
     ) {
-        for reject in r.drain_deadline_rejects() {
-            self.report_past_deadline(ports, reject);
+        for refusal in r.drain_deadline_rejects() {
+            self.report_refusal(ports, refusal);
         }
     }
 
-    /// One past-deadline reject `(sender, nonce, max_inclusion_block,
-    /// at_block)`, for [`Self::apply_deadline_rejects`]'s loop. The
-    /// ledger entry carries the transaction's hash, so the `Rejected`
-    /// status goes out with the error. An entry a receipt or a rewind
-    /// already took gets the error only.
-    fn report_past_deadline<P: SequencerPorts>(
+    /// One sealer refusal (past its deadline, or on a DA lag), for
+    /// [`Self::apply_deadline_rejects`]'s loop. The ledger entry carries
+    /// the transaction's hash, so the `Rejected` status goes out with the
+    /// error. An entry a receipt or a rewind already took gets the error
+    /// only.
+    fn report_refusal<P: SequencerPorts>(
         &mut self,
         ports: &mut P,
-        reject: (Address, u64, u64, u64),
+        refusal: crate::resync::SealerRefusal,
     ) {
-        let (sender, nonce, max_inclusion_block, at_block) = reject;
         let tx_hash = self
             .unconfirmed
-            .drop_committed(sender, nonce)
+            .drop_committed(refusal.sender, refusal.nonce)
             .map(|meta| meta.tx_hash);
         warn!(
-            sender = ?sender,
-            nonce,
-            max_inclusion_block,
-            at_block,
-            "the sealer refused the ref past its inclusion deadline; reporting PastDeadline"
+            sender = ?refusal.sender,
+            nonce = refusal.nonce,
+            reason = ?refusal.reason,
+            "the sealer refused the ref; reporting it to the client"
         );
         let err = TxError {
-            sender,
-            nonce,
-            reason: TxErrorReason::PastDeadline {
-                max_inclusion_block,
-                at_block,
-            },
+            sender: refusal.sender,
+            nonce: refusal.nonce,
+            reason: refusal.reason,
         };
         let (_, _, rc) = ports.split();
         match tx_hash {
@@ -874,6 +882,9 @@ impl Sequencer {
         self.resync_tick(ports);
         let (_, _, rc) = ports.split();
         self.expiry_tick(rc);
+        if self.pause.paused() {
+            return Ok(false);
+        }
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {

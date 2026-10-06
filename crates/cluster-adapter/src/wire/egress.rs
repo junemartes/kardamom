@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef, VoidRecord,
+    BPosition, BlockBoundaryStart, ClusterStatus, DepositRef, TxOrderingMessage, TxRef, VoidRecord,
 };
 use rkyv::Archive;
 use rkyv::api::high::{HighDeserializer, HighValidator};
@@ -16,10 +16,11 @@ use rkyv::rancor;
 
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT,
-    EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED, EGRESS_KIND_REMOTE_ORIGIN_REJECT,
-    EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE, EGRESS_KIND_WINDOW_FULL,
-    RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, RT_VOID, RemoteOriginRejectReason,
-    SENDER_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED,
+    EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
+    EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH,
+    RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, WireError, encode_kind_2u64, rd_i32,
+    rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -38,6 +39,8 @@ pub enum EgressItem {
     },
     /// Replay complete up to (exclusive) the given live cursor.
     ReplayDone { up_to_index: u64, up_to_block: u64 },
+    /// Replay refused: the requested cursor is past the sealer's head.
+    ReplayAhead { head_index: u64, head_block: u64 },
     /// Contiguity reject. The service refused to seal `sender`'s ref at
     /// `nonce`, because it expected `expected`. Republish from `expected`:
     /// the unconfirmed ledger holds the missing refs.
@@ -71,6 +74,21 @@ pub enum EgressItem {
         expected_next_seq: u64,
         reason: RemoteOriginRejectReason,
     },
+    /// The chain's data-availability status, broadcast on every boundary
+    /// tick, on every posted cursor, and to a session that announces
+    /// itself.
+    Status(ClusterStatus),
+    /// DA-lag reject. The sealer refused `sender`'s ref at `nonce` because
+    /// the sealed head is more than `budget_blocks` past the posted head.
+    /// The record is not ordered; the sequencer drops it and tells the
+    /// client.
+    DaLagReject {
+        sender: Address,
+        nonce: u64,
+        sealed_head: u64,
+        posted_head: u64,
+        budget_blocks: u64,
+    },
 }
 
 impl EgressItem {
@@ -91,10 +109,16 @@ impl EgressItem {
                 up_to_index: rd_u64(buf, 1)?,
                 up_to_block: rd_u64(buf, 9)?,
             }),
+            super::EGRESS_KIND_REPLAY_AHEAD => Ok(Self::ReplayAhead {
+                head_index: rd_u64(buf, 1)?,
+                head_block: rd_u64(buf, 9)?,
+            }),
             EGRESS_KIND_CONTIGUITY_REJECT => Self::decode_contiguity_reject(buf),
             EGRESS_KIND_PAST_DEADLINE => Self::decode_past_deadline(buf),
             EGRESS_KIND_WINDOW_FULL => Self::decode_window_full(buf),
             EGRESS_KIND_REMOTE_ORIGIN_REJECT => Self::decode_remote_origin_reject(buf),
+            EGRESS_KIND_STATUS => Self::decode_status(buf),
+            EGRESS_KIND_DA_LAG_REJECT => Self::decode_da_lag_reject(buf),
             other => Err(WireError::BadEgressKind(other)),
         }
     }
@@ -150,6 +174,29 @@ impl EgressItem {
         Ok(Self::WindowFull {
             sender: Address::from_slice(sender),
             nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+        })
+    }
+
+    fn decode_status(buf: &[u8]) -> Result<Self, WireError> {
+        Ok(Self::Status(ClusterStatus {
+            posted_head: rd_u64(buf, 1)?,
+            sealed_head: rd_u64(buf, 9)?,
+            budget_blocks: rd_u64(buf, 17)?,
+            halted: rd_u8(buf, 25)? != 0,
+            retained_frames: rd_u64(buf, 26)?,
+            floor_index: rd_u64(buf, 34)?,
+            floor_block: rd_u64(buf, 42)?,
+        }))
+    }
+
+    fn decode_da_lag_reject(buf: &[u8]) -> Result<Self, WireError> {
+        let sender = rd_slice(buf, 1, SENDER_LEN)?;
+        Ok(Self::DaLagReject {
+            sender: Address::from_slice(sender),
+            nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+            sealed_head: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+            posted_head: rd_u64(buf, 1 + SENDER_LEN + 16)?,
+            budget_blocks: rd_u64(buf, 1 + SENDER_LEN + 24)?,
         })
     }
 
@@ -356,6 +403,12 @@ pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_DONE, up_to_index, up_to_block)
 }
 
+/// Frame a replay-ahead refusal exactly as the Java service does.
+#[must_use]
+pub fn encode_replay_ahead(head_index: u64, head_block: u64) -> Vec<u8> {
+    encode_kind_2u64(super::EGRESS_KIND_REPLAY_AHEAD, head_index, head_block)
+}
+
 /// Frame a contiguity reject exactly as the Java service does. The real
 /// encoder is the Java service; this is a test and mock-server helper.
 #[cfg(any(test, feature = "testing"))]
@@ -398,6 +451,38 @@ pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
     b.push(EGRESS_KIND_WINDOW_FULL);
     b.extend_from_slice(sender.as_slice());
     b.extend_from_slice(&nonce.to_le_bytes());
+    b
+}
+
+/// Frame the chain's status exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 8 * 6 + 1);
+    b.push(EGRESS_KIND_STATUS);
+    b.extend_from_slice(&status.posted_head.to_le_bytes());
+    b.extend_from_slice(&status.sealed_head.to_le_bytes());
+    b.extend_from_slice(&status.budget_blocks.to_le_bytes());
+    b.push(u8::from(status.halted));
+    b.extend_from_slice(&status.retained_frames.to_le_bytes());
+    b.extend_from_slice(&status.floor_index.to_le_bytes());
+    b.extend_from_slice(&status.floor_block.to_le_bytes());
+    b
+}
+
+/// Frame a DA-lag reject exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_da_lag_reject(sender: Address, nonce: u64, status: &ClusterStatus) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + SENDER_LEN + 8 * 4);
+    b.push(EGRESS_KIND_DA_LAG_REJECT);
+    b.extend_from_slice(sender.as_slice());
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(&status.sealed_head.to_le_bytes());
+    b.extend_from_slice(&status.posted_head.to_le_bytes());
+    b.extend_from_slice(&status.budget_blocks.to_le_bytes());
     b
 }
 

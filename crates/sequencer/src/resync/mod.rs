@@ -51,69 +51,103 @@ pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
 
 /// One executed-truth observation. Two sources produce it:
 ///
-/// - The `tx_receipts` stream: `sender`'s transaction at `executed_nonce`
-///   produced a receipt, so the sender's floor is at least
-///   `executed_nonce + 1`.
+/// - The `tx_receipts` stream: one update per receipt of this replica's
+///   senders. See [`FloorUpdate::of_receipt`].
 /// - The nonce lookup (`crate::lookup`): an executor reports the committed
 ///   account nonce `c`, so every nonce below `c` executed. The task sends
-///   `executed_nonce = c - 1`, and nothing for `c == 0`. The controller
-///   treats both sources the same: the floor rises to `c`, and published
-///   refs at or below `c - 1` count as confirmed, because the committed
-///   state proves them.
+///   [`Outcome::Executed`] at `c - 1`, and nothing for `c == 0`. The
+///   controller treats both sources the same: the floor rises to `c`, and
+///   published refs at or below `c - 1` count as confirmed, because the
+///   committed state proves them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorUpdate {
     pub sender: Address,
-    pub executed_nonce: u64,
-    /// An L1-originated deposit. It consumes no L2 nonce, so it is
-    /// neither floor evidence nor a publish confirmation. This is
-    /// explicit because a deposit carries `Receipt::tx_type ==
-    /// TX_TYPE_DEPOSIT`. The nonce-0 heuristic this replaces could not
-    /// tell a deposit apart from a genuine nonce-0 transaction.
-    pub deposit: bool,
-    /// A marker receipt: the transaction was ordered (canonical-log
-    /// commitment is proven, so it confirms publishes), but it consumed
-    /// no nonce, so it is not floor evidence. `Some` carries the typed
-    /// cause. The floor logic only asks "is this a skip?" today. Reason
-    /// specific handling (drop on `NonceTooLow`, evict on `NonceTooHigh`)
-    /// is a future step.
-    pub skip_reason: Option<kardamom_types::SkipReason>,
+    pub outcome: Outcome,
+}
+
+/// What one [`FloorUpdate`] proves about its sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The tx at `nonce` executed. It confirms the publish, and it is
+    /// floor evidence: the floor rises to `nonce + 1`.
+    Executed { nonce: u64 },
+    /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
+    /// nonce. Ordering in the canonical log confirms the publish. The
+    /// floor does not rise. The floor logic does not read `reason`.
+    Skipped {
+        nonce: u64,
+        reason: kardamom_types::SkipReason,
+    },
+    /// An L1-originated deposit. It has no L2 nonce, so it is neither a
+    /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
+    /// it, so a genuine nonce-0 tx is never taken for a deposit.
+    Deposit,
+}
+
+impl Outcome {
+    /// The nonce whose publish this confirms. `None` for a deposit.
+    #[must_use]
+    pub(crate) fn confirmed(self) -> Option<u64> {
+        match self {
+            Self::Executed { nonce } | Self::Skipped { nonce, .. } => Some(nonce),
+            Self::Deposit => None,
+        }
+    }
+
+    /// The floor this proves. `Some` only for an executed tx.
+    #[must_use]
+    pub(crate) fn floor(self) -> Option<u64> {
+        match self {
+            Self::Executed { nonce } => Some(nonce.saturating_add(1)),
+            Self::Skipped { .. } | Self::Deposit => None,
+        }
+    }
 }
 
 impl FloorUpdate {
-    /// A non-skip execution receipt for `sender` at `nonce`: confirms the
-    /// publish, and is floor evidence (raises the floor to `nonce + 1`).
+    /// The update for one receipt. A deposit wins over a skip reason.
+    #[must_use]
+    pub fn of_receipt(receipt: &kardamom_types::Receipt) -> Self {
+        let outcome = match (receipt.is_deposit(), receipt.skip_reason) {
+            (true, _) => Outcome::Deposit,
+            (false, Some(reason)) => Outcome::Skipped {
+                nonce: receipt.nonce,
+                reason,
+            },
+            (false, None) => Outcome::Executed {
+                nonce: receipt.nonce,
+            },
+        };
+        Self {
+            sender: receipt.from,
+            outcome,
+        }
+    }
+
+    /// An executed tx of `sender` at `nonce`.
     #[must_use]
     pub fn executed(sender: Address, nonce: u64) -> Self {
         Self {
             sender,
-            executed_nonce: nonce,
-            deposit: false,
-            skip_reason: None,
+            outcome: Outcome::Executed { nonce },
         }
     }
 
-    /// A skip receipt for `sender` at `nonce`: confirms the publish, but
-    /// is not floor evidence (it consumed no nonce).
+    /// A skipped tx of `sender` at `nonce`.
     #[must_use]
     pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
         Self {
             sender,
-            executed_nonce: nonce,
-            deposit: false,
-            skip_reason: Some(reason),
+            outcome: Outcome::Skipped { nonce, reason },
         }
     }
 
-    /// A deposit receipt for `sender`: carries the filler nonce 0, and is
-    /// neither a confirmation nor floor evidence (see the `deposit` field
-    /// doc for why).
+    /// A deposit to `sender`.
     #[must_use]
     pub fn deposit(sender: Address) -> Self {
         Self {
             sender,
-            executed_nonce: 0,
-            deposit: true,
-            skip_reason: None,
+            outcome: Outcome::Deposit,
         }
     }
 }
@@ -333,12 +367,12 @@ pub struct ResyncController {
     /// This confirms by reject, dropping the ledger entry.
     reject_rx: Receiver<(Address, u64, u64)>,
     reject_rx_dead: bool,
-    /// `(sender, nonce, max_inclusion_block, at_block)` past-deadline
-    /// rejects, forwarded by the egress-watermark thread. The sealer
-    /// refused a ref whose inclusion deadline the open block had passed.
-    /// No copy of it can be ordered later, so the publish loop drops the
-    /// ledger entry and tells the client, instead of republishing.
-    deadline_rx: Receiver<(Address, u64, u64, u64)>,
+    /// The sealer's terminal refusals, forwarded by the egress-watermark
+    /// thread: a ref whose inclusion deadline the open block had passed,
+    /// or one the DA-lag guard refused. No republish can order either
+    /// now, so the publish loop drops the ledger entry and tells the
+    /// client, instead of republishing.
+    deadline_rx: Receiver<SealerRefusal>,
     deadline_rx_dead: bool,
     watermark: SharedWatermark,
     last_watermark: u64,
@@ -449,7 +483,7 @@ impl ResyncController {
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
         reject_rx: Receiver<(Address, u64, u64)>,
-        deadline_rx: Receiver<(Address, u64, u64, u64)>,
+        deadline_rx: Receiver<SealerRefusal>,
         watermark: SharedWatermark,
     ) -> Result<Self, ResyncConfigError> {
         let enter_threshold = cfg.enter_threshold()?;
@@ -500,8 +534,8 @@ impl ResyncController {
     ///   commit and only a receipt proves the ref survived into the
     ///   committed stream) and including nonce 0.
     ///
-    ///   A deposit receipt (filler nonce 0) must not confirm a genuine
-    ///   nonce-0 transaction. `Receipt::tx_type` tells the two apart at
+    ///   A deposit receipt must not confirm a genuine nonce-0
+    ///   transaction. `Receipt::tx_type` tells the two apart at
     ///   the source, so the exclusion is exactly "is this a deposit?",
     ///   not "is the nonce 0?".
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
@@ -524,25 +558,21 @@ impl ResyncController {
     }
 
     /// Fold one floor update into `raised`/`confirmations`, for
-    /// [`Self::drain_floor_updates`]'s loop.
-    ///
-    /// A deposit (filler nonce 0) consumes no L2 nonce, so it is neither
-    /// a confirmation (it never corresponds to a published `TxRef`) nor
-    /// floor evidence.
+    /// [`Self::drain_floor_updates`]'s loop. See [`Outcome`] for what each
+    /// case proves.
     fn fold_floor_update(
         &mut self,
         u: FloorUpdate,
         raised: &mut Vec<(Address, u64)>,
         confirmations: &mut Vec<(Address, u64)>,
     ) {
-        if u.deposit {
+        let Some(nonce) = u.outcome.confirmed() else {
             return;
-        }
-        confirmations.push((u.sender, u.executed_nonce));
-        if u.skip_reason.is_some() {
+        };
+        confirmations.push((u.sender, nonce));
+        let Some(floor) = u.outcome.floor() else {
             return;
-        }
-        let floor = u.executed_nonce.saturating_add(1);
+        };
         let e = self.floors.entry(u.sender).or_insert(0);
         if floor > *e {
             *e = floor;
@@ -574,9 +604,9 @@ impl ResyncController {
     ///   vanished, so rewind the unconfirmed ledger and republish.
     ///
     /// Bounded per iteration, like the floor drain.
-    /// Drain the past-deadline rejects the sealer answered this shard
-    /// with. Each one is a transaction that will never be ordered.
-    pub fn drain_deadline_rejects(&mut self) -> Vec<(Address, u64, u64, u64)> {
+    /// Drain the terminal refusals the sealer answered this shard with.
+    /// Each one is a transaction no republish can order now.
+    pub fn drain_deadline_rejects(&mut self) -> Vec<SealerRefusal> {
         drain_bounded(
             &self.deadline_rx,
             &mut self.deadline_rx_dead,
@@ -720,6 +750,17 @@ impl ResyncController {
     }
 }
 
+/// One terminal refusal from the sealer: the ref of `sender` at `nonce`
+/// is not ordered, and `reason` is what the client is told. The past
+/// deadline and the DA lag share this path, because the remedy is the
+/// same: drop the ledger entry and tell the client, who resubmits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealerRefusal {
+    pub sender: Address,
+    pub nonce: u64,
+    pub reason: kardamom_types::TxErrorReason,
+}
+
 /// What [`ResyncChannel::open`] hands back: the controller (publish
 /// loop), the floor-update sender (receipts thread), the `(sender,
 /// nonce, expected)` contiguity-reject sender (egress-watermark thread),
@@ -731,9 +772,9 @@ pub struct ResyncChannel {
     pub controller: ResyncController,
     pub floor_tx: Sender<FloorUpdate>,
     pub reject_tx: Sender<(Address, u64, u64)>,
-    /// `(sender, nonce, max_inclusion_block, at_block)`. The sealer
-    /// refused these for being late, and no copy of them can be ordered.
-    pub deadline_tx: Sender<(Address, u64, u64, u64)>,
+    /// The sealer's terminal refusals: late refs, and refs the DA-lag
+    /// guard refused. No republish can order them now.
+    pub deadline_tx: Sender<SealerRefusal>,
     pub watermark: SharedWatermark,
 }
 

@@ -33,9 +33,9 @@ import org.junit.jupiter.api.Timeout;
  *       reassemble all of them, not stop at the first.</li>
  *   <li>An empty snapshot image must be fatal, never a silent
  *       restart at genesis.</li>
- *   <li>A member restored from a snapshot must answer a
- *       pre-snapshot replay request with REPLAY_UNAVAILABLE, because its
- *       retention is not snapshotted, not with a false REPLAY_DONE.</li>
+ *   <li>A member restored from a state-only snapshot (one without a
+ *       retention section) must answer a pre-snapshot replay request with
+ *       REPLAY_UNAVAILABLE, not with a false REPLAY_DONE.</li>
  * </ul>
  *
  * <p>The channel pins {@code mtu=4096}, so fragmentation always happens,
@@ -134,25 +134,32 @@ class SnapshotRestoreTest {
             final SealerClusteredService service = new SealerClusteredService(64, 250, 0);
             service.onStart(cluster, image);
 
-            // A cursor before the restore point must be refused: the retained
-            // deque is empty, so a DONE here would hide a gap.
+            // A cursor before the restore point must be refused: the snapshot
+            // carries no retention, so a DONE here would hide a gap.
             final StubSession behind = cluster.addSession(7);
             service.onSessionMessage(behind, 0, IngressFrames.replayRequest(0, 1), 0, 17, null);
-            assertEquals(1, behind.offered.size(), "exactly one control frame");
-            assertEquals(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, behind.offered.get(0)[0],
+            final java.util.List<byte[]> behindControl = controlFrames(behind);
+            assertEquals(1, behindControl.size(), "exactly one control frame");
+            assertEquals(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, behindControl.get(0)[0],
                     "pre-snapshot replay must be UNAVAILABLE, not DONE");
-            assertEquals(count, longAt(behind.offered.get(0), 1), "floor index = restored canonicalCount");
-            assertEquals(block, longAt(behind.offered.get(0), 9), "floor block = restored blockNumber");
+            assertEquals(count, longAt(behindControl.get(0), 1), "floor index = restored canonicalCount");
+            assertEquals(block, longAt(behindControl.get(0), 9), "floor block = restored blockNumber");
 
             // A client already at the restore point needs nothing replayed.
             // That request completes with DONE, which proves the floors are
             // exact, not just conservative.
             final StubSession caughtUp = cluster.addSession(8);
             service.onSessionMessage(caughtUp, 0, IngressFrames.replayRequest(count, block), 0, 17, null);
-            assertEquals(1, caughtUp.offered.size(), "exactly one control frame");
-            assertEquals(SealerWire.EGRESS_KIND_REPLAY_DONE, caughtUp.offered.get(0)[0],
+            final java.util.List<byte[]> caughtUpControl = controlFrames(caughtUp);
+            assertEquals(1, caughtUpControl.size(), "exactly one control frame");
+            assertEquals(SealerWire.EGRESS_KIND_REPLAY_DONE, caughtUpControl.get(0)[0],
                     "replay from the restore point itself must complete");
         }
+    }
+
+    /** The frames a session got, without the status every announcement carries. */
+    private static java.util.List<byte[]> controlFrames(final StubSession s) {
+        return s.offered.stream().filter(f -> f[0] != SealerWire.EGRESS_KIND_STATUS).toList();
     }
 
     // Harness helpers.

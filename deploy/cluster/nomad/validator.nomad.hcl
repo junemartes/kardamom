@@ -3,9 +3,10 @@
 # tx_ordering from the Aeron Cluster egress, and tx_deposits. It
 # re-executes every block through the shared engine, advances a
 # canonical Ethereum MPT state root, and cross-checks itself against
-# the executors' tx_receipts and per-block tx_bal (BAL). It fail-stops
-# (exit 2) on a proven divergence. A dead validator alloc is the
-# divergence signal, so the job does not restart on failure.
+# the executors' tx_receipts and per-block tx_bal (BAL). On a proven
+# divergence it holds the validator_divergence halt in process and
+# writes a verdict file beside its state. A restart that finds the file
+# holds again, so the job restarts and reschedules like any other.
 #
 # Placement: one validator runs on the aux node (the da-watcher and
 # batcher tier). It needs only the node-local Aeron media driver and

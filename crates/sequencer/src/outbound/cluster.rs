@@ -116,6 +116,17 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 }
 
+/// The egress kinds a publisher session reads: the boundaries, and every
+/// reject the sealer answers an offer with.
+pub const PUBLISHER_EGRESS_KINDS: [u8; 6] = [
+    wire::EGRESS_KIND_BOUNDARY,
+    wire::EGRESS_KIND_CONTIGUITY_REJECT,
+    wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
+    wire::EGRESS_KIND_PAST_DEADLINE,
+    wire::EGRESS_KIND_WINDOW_FULL,
+    wire::EGRESS_KIND_DA_LAG_REJECT,
+];
+
 /// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
 /// keep the egress receiver. The cluster also broadcasts every relayed
 /// record and boundary to publisher sessions; the caller uses this to
@@ -139,16 +150,14 @@ pub fn cluster_ref_publisher_with_egress(
     // telling this publisher that a known sender's ref would seal a nonce
     // gap; the watermark thread forwards it into the rewind path. A
     // remote-origin reject is the sealer refusing a relayed kind-5 record;
-    // the watermark thread logs and counts it.
+    // the watermark thread logs and counts it. The past-deadline, the
+    // window-full, and the DA-lag rejects go to the offering session
+    // only, and the feed answers each one.
     let (cluster, ingress, egress) = live::connect_with(
         rt,
         cfg,
         live::ConnectOptions {
-            egress_kind_filter: Some(vec![
-                wire::EGRESS_KIND_BOUNDARY,
-                wire::EGRESS_KIND_CONTIGUITY_REJECT,
-                wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
-            ]),
+            egress_kind_filter: Some(PUBLISHER_EGRESS_KINDS.to_vec()),
             // `subscribe` stays at its default (false): no SUBSCRIBE
             // announcement. Boundaries broadcast to every session (see
             // SealerClusteredService.offerBoundary), and contiguity
@@ -164,6 +173,22 @@ pub fn cluster_ref_publisher_with_egress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reject the filter drops never reaches the feed, and the client
+    /// waits out its timeout instead of hearing the sealer's answer.
+    #[test]
+    fn the_publisher_reads_every_reject_the_sealer_answers_an_offer_with() {
+        for kind in [
+            wire::EGRESS_KIND_CONTIGUITY_REJECT,
+            wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
+            wire::EGRESS_KIND_PAST_DEADLINE,
+            wire::EGRESS_KIND_WINDOW_FULL,
+            wire::EGRESS_KIND_DA_LAG_REJECT,
+        ] {
+            assert!(PUBLISHER_EGRESS_KINDS.contains(&kind), "kind {kind}");
+        }
+        assert!(!PUBLISHER_EGRESS_KINDS.contains(&wire::EGRESS_KIND_RELAYED));
+    }
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
     use kardamom_cluster_adapter::wire::{
