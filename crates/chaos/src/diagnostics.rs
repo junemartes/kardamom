@@ -14,6 +14,8 @@ use crate::nodes::Nodes;
 use crate::nomad::{Alloc, Nomad, Streams};
 use crate::stages::{head_lines, matching_lines, tail_lines};
 
+mod exits;
+
 const JOBS: [&str; 16] = [
     "aeron",
     "anvil",
@@ -107,7 +109,9 @@ impl Diagnostics {
 
     /// Print every section to stdout.
     pub async fn dump(&self) {
-        crate::log("FAILURE diagnostics: host bridge, multicast, Nomad jobs and allocation logs");
+        crate::log(
+            "FAILURE diagnostics: host bridge, multicast, Nomad jobs, allocation logs and container exits",
+        );
         self.host_bridge().await;
         self.multicast_groups().await;
         self.multicast_probe().await;
@@ -118,6 +122,7 @@ impl Diagnostics {
         for sealer in self.contract.of_role("sealer") {
             self.sealer_section(sealer).await;
         }
+        self.container_states().await;
     }
 
     fn bridge(&self) -> &str {
@@ -260,6 +265,7 @@ impl Diagnostics {
         for (task, state) in &alloc.task_states {
             println!("  task {task}: {}", task_summary(state));
         }
+        Self::task_records(job, alloc);
         let logs = self
             .nomad
             .alloc_logs(alloc, Streams::Both)

@@ -9,7 +9,9 @@
 //!    its own instance's lanes record;
 //! 3. a publisher that restarts on the same control port, against the
 //!    archive's still-live recording subscription, is recorded as a new
-//!    session before the recorder reports ready.
+//!    session before the recorder reports ready. The plane always binds
+//!    an OS-chosen port, so both incarnations open on one fixed port by
+//!    hand, as when the OS hands the same port out again.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -19,7 +21,7 @@ mod common;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -28,7 +30,8 @@ use kardamom_log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscr
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::memory::MemoryCatalog;
 use kardamom_log::discovery::{
-    Catalog, DiscoveredRecorder, Instance, PortRange, RecorderProgress, StreamPlane, Topic,
+    Catalog, DiscoveredRecorder, Instance, PublisherRecord, RecorderProgress, Registration,
+    RegistrationSpec, StreamPlane, Topic, scope_from_config,
 };
 use kardamom_log::recorder::connect_archive;
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
@@ -45,25 +48,58 @@ fn config(base: &LogConfig) -> LogConfig {
     cfg
 }
 
-fn plane(cfg: &LogConfig, label: &str, catalog: &MemoryCatalog) -> StreamPlane {
-    plane_with_ports(cfg, label, catalog, None)
+fn instance(label: &str) -> Instance {
+    Instance {
+        id: format!("alloc-{label}"),
+    }
 }
 
-fn plane_with_ports(
-    cfg: &LogConfig,
-    label: &str,
-    catalog: &MemoryCatalog,
-    ports: Option<PortRange>,
-) -> StreamPlane {
+fn plane(cfg: &LogConfig, label: &str, catalog: &MemoryCatalog) -> StreamPlane {
     StreamPlane::with_catalog(
         cfg,
         label,
         Catalog::Memory(catalog.clone()),
-        Instance {
-            id: format!("alloc-{label}"),
-            ports,
-        },
+        instance(label),
         Ipv4Addr::LOCALHOST,
+    )
+}
+
+/// Open the lane-0 `tx_data` publication of `ingress-a` on control port
+/// `port`, and register it with the record the plane writes.
+async fn open_on_port(
+    cfg: &LogConfig,
+    catalog: &MemoryCatalog,
+    rt: &AeronRuntime,
+    port: u16,
+) -> (TxDataPublisherHandle, Registration) {
+    let stream_id = cfg.channels.tx_data_stream_id(0);
+    let control = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let publication = rt
+        .open_publication(
+            &format!("aeron:udp?control={control}|control-mode=dynamic"),
+            stream_id,
+        )
+        .expect("publisher on the fixed port");
+    let record = PublisherRecord {
+        id: instance("ingress-a").service_id(Topic::TxData, stream_id),
+        control,
+        topic: Topic::TxData,
+        stream_id,
+        lane: Some(0),
+        publisher_id: "ingress-a".into(),
+        session_id: Some(publication.session_id()),
+    };
+    let spec = RegistrationSpec {
+        entry: record.entry(&scope_from_config(&cfg.discovery)),
+        ttl: cfg.discovery.check_ttl(),
+        deregister_after: cfg.discovery.deregister_after(),
+    };
+    let registration = Registration::register(Catalog::Memory(catalog.clone()), spec)
+        .await
+        .expect("register the publisher on the fixed port");
+    (
+        TxDataPublisherHandle::from_publication(publication),
+        registration,
     )
 }
 
@@ -350,21 +386,17 @@ async fn restart_on_same_port(stream_id_base: i32, port: u16, archive_sub: Archi
     let cfg = config(&cfg);
     let catalog = MemoryCatalog::new();
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
-    let ports: PortRange = format!("{port}-{port}").parse().expect("port range");
     let stream0 = cfg.channels.tx_data_stream_id(0);
     let session = connect_archive(Some(&aeron_dir), &cfg.aeron).expect("archive catalog");
 
     // First incarnation: one lane, recorded and ready.
-    let mut plane_first = plane_with_ports(&cfg, "ingress-a", &catalog, Some(ports));
+    let mut plane_first = plane(&cfg, "ingress-a", &catalog);
     let membership = plane_first
         .watch_topic(Topic::TxData)
         .expect("discovered plane");
     let (stop_first, ready_first, thread_first) = spawn_recorder(&cfg, &aeron_dir, membership, 1);
     let rt_first = AeronRuntime::spawn_with_dir(&aeron_dir).expect("runtime 1");
-    let pub_first = plane_first
-        .tx_data_publisher(&rt_first, 0)
-        .await
-        .expect("publisher 1");
+    let (pub_first, registration_first) = open_on_port(&cfg, &catalog, &rt_first, port).await;
     wait_ready(ready_first, 1).await;
     publish_until_connected(&pub_first, 1).await;
     let first = recordings(&session.archive, stream0);
@@ -379,6 +411,10 @@ async fn restart_on_same_port(stream_id_base: i32, port: u16, archive_sub: Archi
     // its publication closes, and the archive marks the recording stopped.
     stop_first.cancel();
     thread_first.join().expect("recorder thread 1");
+    registration_first
+        .deregister()
+        .await
+        .expect("deregister publisher 1");
     plane_first.shutdown().await;
     drop(pub_first);
     drop(rt_first);
@@ -393,17 +429,14 @@ async fn restart_on_same_port(stream_id_base: i32, port: u16, archive_sub: Archi
     }
 
     // Second incarnation on the same port.
-    let mut plane_second = plane_with_ports(&cfg, "ingress-a", &catalog, Some(ports));
+    let mut plane_second = plane(&cfg, "ingress-a", &catalog);
     let membership = plane_second
         .watch_topic(Topic::TxData)
         .expect("discovered plane");
     let (stop_second, ready_second, thread_second) =
         spawn_recorder(&cfg, &aeron_dir, membership, 1);
     let rt_second = AeronRuntime::spawn_with_dir(&aeron_dir).expect("runtime 2");
-    let pub_second = plane_second
-        .tx_data_publisher(&rt_second, 0)
-        .await
-        .expect("publisher 2");
+    let (pub_second, registration_second) = open_on_port(&cfg, &catalog, &rt_second, port).await;
     wait_ready(ready_second, 1).await;
     let at_ready = recordings(&session.archive, stream0);
     assert_eq!(
@@ -430,6 +463,10 @@ async fn restart_on_same_port(stream_id_base: i32, port: u16, archive_sub: Archi
 
     stop_second.cancel();
     thread_second.join().expect("recorder thread 2");
+    registration_second
+        .deregister()
+        .await
+        .expect("deregister publisher 2");
     plane_second.shutdown().await;
 }
 

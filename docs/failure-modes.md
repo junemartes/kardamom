@@ -691,9 +691,10 @@ chain restarts after H, the `l2BlockEnd` of the last posted batch, and the
 blocks after H are reverted: their receipts are revoked. The procedure is
 `docs/runbooks/sealer-fleet-rebuild.md`:
 
-1. `kardamom-reconstruct --through-block H` writes the sealer seed, the
-   executor image, and, in a second run, a state that keeps the trie for the
-   validator.
+1. `kardamom-reconstruct --through-block H --lockbox <addr>` writes the
+   sealer seed, the executor image, and, in a second run, a state that keeps
+   the trie for the validator. `--lockbox` puts the L1 deposits into the
+   rebuilt state.
 2. Every member starts from the seed (`-Dkardamom.cluster.seedSnapshot`), with
    an empty remote-origin allowlist. The cluster opens block H + 1 at index
    E_H, the canonical end of H.

@@ -500,16 +500,19 @@ are documented in `--help`.
 
 ## Monitoring
 
-The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus and
-Grafana on the aux node. Prometheus scrapes every service's metrics port by
-its Consul node name, rendered from the node-class counts; Grafana
+The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus,
+Alertmanager and Grafana on the aux node. Prometheus scrapes every
+service's metrics port by its Consul node name, rendered from the
+node-class counts, and sends the firing alerts to Alertmanager; Grafana
 provisions the Prometheus datasource by the `prometheus` Consul service and
 the dashboards from `deploy/grafana/provisioning/dashboards-json`, the one
 source for every profile. From the host, read the node contract for the
-aux node's address: Prometheus on port 9090, Grafana on port 3000
-(anonymous viewer; admin `admin` with the `grafana_admin_password` job
-variable, `kardamom` on the local profile). The autoscaler's Prometheus APM
-reads the same service.
+aux node's address: Prometheus on port 9090, Alertmanager on port 9093,
+Grafana on port 3000 (anonymous viewer; admin `admin` with the
+`grafana_admin_password` job variable, `kardamom` on the local profile).
+The autoscaler's Prometheus APM reads the same service. The operator's
+rules and the Alertmanager routing come from the Nomad variable
+`nomad/jobs/monitoring` (`docs/observability.md`, "Alerts").
 
 ## Sustained-load + chaos suite
 

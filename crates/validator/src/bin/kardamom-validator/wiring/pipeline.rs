@@ -123,50 +123,39 @@ pub(crate) struct Written {
 }
 
 impl Written {
-    /// Enable the L1 output attester when all three flags
-    /// (`--l1-rpc-url`, `--output-oracle`, `--attester-key`) are present.
-    /// Without all three, the validator does no automatic attestation. Any
-    /// other combination is a configuration error. The task lives as long
-    /// as a handle clone does; the handle is held for the process
-    /// lifetime.
+    /// Enable the L1 output attester when `--output-oracle` and
+    /// `--attester-key` are present, with `--l1-rpc-url`. Without them,
+    /// the validator does no automatic attestation; `--l1-rpc-url` alone
+    /// serves the epoch check. The task lives as long as a handle clone
+    /// does; the handle is held for the process lifetime.
     ///
     /// # Errors
     ///
-    /// Returns an error if a partial set of the three flags is given, or
-    /// if the attester fails to spawn (a bad key or a bad L1 RPC URL).
+    /// Returns an error if the attester flags are a partial set (see
+    /// [`crate::args::Args::attester`]).
     pub(crate) fn spawn_attester(self) -> Result<Attested> {
         let args = &self.streamed.opened.base.args;
-        let attester_handle = match (
-            args.l1_rpc_url.clone(),
-            args.output_oracle,
-            args.attester_key.clone(),
-        ) {
-            (Some(l1_rpc_url), Some(oracle), Some(key)) => {
-                let attester::SpawnedAttester {
-                    handle,
-                    task: _task,
-                } = attester::spawn_attester(
-                    &AttesterConfig {
-                        l1_rpc_url,
-                        oracle,
-                        signer: key.into_signer(),
-                        post_interval_blocks: args.attester_post_interval.get(),
-                    },
-                    self.streamed.opened.base.attester.clone(),
-                );
-                tracing::info!(
-                    oracle = %oracle,
-                    post_interval_blocks = args.attester_post_interval.get().get(),
-                    "L1 output attester enabled"
-                );
-                Some(handle)
-            }
-            (None, None, None) => None, // Default: no automatic attestation.
-            _ => anyhow::bail!(
-                "attestation needs --l1-rpc-url, --output-oracle and \
-                 --attester-key together (got a partial set)"
-            ),
-        };
+        let attester_handle = args.attester()?.map(|attester| {
+            let oracle = attester.oracle;
+            let attester::SpawnedAttester {
+                handle,
+                task: _task,
+            } = attester::spawn_attester(
+                &AttesterConfig {
+                    l1_rpc_url: attester.l1_rpc_url,
+                    oracle,
+                    signer: attester.key.into_signer(),
+                    post_interval_blocks: args.attester_post_interval.get(),
+                },
+                self.streamed.opened.base.attester.clone(),
+            );
+            tracing::info!(
+                oracle = %oracle,
+                post_interval_blocks = args.attester_post_interval.get().get(),
+                "L1 output attester enabled"
+            );
+            handle
+        });
 
         Ok(Attested {
             written: self,

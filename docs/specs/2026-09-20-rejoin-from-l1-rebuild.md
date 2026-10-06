@@ -81,9 +81,11 @@ replaces the flag day at a new genesis.
 
 **Procedure.**
 
-1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>`. H is
-   the last posted block, or `--through-block`. The tool refuses a head that it did not
-   rebuild from L1, and a head from a version 2 payload.
+1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>
+   --lockbox <addr>`. H is the last posted block, or `--through-block`. The tool refuses
+   a head that it did not rebuild from L1, and a head from a version 2 payload. Without
+   `--lockbox`, the rebuild leaves the deposits out, and a chain with deposits rebuilds to
+   a wrong root (section 5).
 2. Give every member the same file in `-Dkardamom.cluster.seedSnapshot=<file>`. Start the
    members as a new cluster, with empty cluster and archive directories.
 3. Install the rebuilt state on every executor and the validator. A consumer
