@@ -25,7 +25,7 @@ use crate::l1::L1;
 use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
-use crate::stages::rebuild::{Output, Rebuild, Rebuilt};
+use crate::stages::rebuild::{Extras, Output, Rebuild, Rebuilt};
 
 pub(super) const CTX: &str = "sealer-fleet-total-wipe-recover";
 
@@ -287,6 +287,8 @@ impl<'a> FleetWipe<'a> {
 
     /// Rebuild the state at H, the posted head, from L1: the executor
     /// image and the seed in one run, the validator's state in another.
+    /// Both runs derive the L1 deposits from the lockbox that the
+    /// da-watcher reads.
     async fn rebuild(&self, old_head: u64) -> anyhow::Result<Seeded> {
         let head = self.l1.covered_through().await?;
         anyhow::ensure!(
@@ -296,15 +298,23 @@ impl<'a> FleetWipe<'a> {
         );
         let evidence = evidence_dir(CTX, "chaos-sealer-wipe-")?;
         let seed = evidence.join("seed.bin");
+        let lockbox = Some(JobDefinition(self.jobs.da_watcher.definition()).lockbox()?);
         let validator = Rebuild {
             harness: self.h,
             evidence,
             target: unchecked_target(head),
             output: Output::ValidatorState,
-            sealer_seed: None,
+            extras: Extras {
+                lockbox,
+                sealer_seed: None,
+            },
+        };
+        let image = Extras {
+            lockbox,
+            sealer_seed: Some(seed.clone()),
         };
         let (image, validator) = tokio::join!(
-            install_rebuilt_image(self.h, CTX, self.fresh(), head, Some(seed.clone())),
+            install_rebuilt_image(self.h, CTX, self.fresh(), head, image),
             validator.run()
         );
         let seeded = Seeded {

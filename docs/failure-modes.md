@@ -732,8 +732,8 @@ post everything, stops the batcher, and mines L1 blocks until one more epoch
 seals: the blocks after H then hold epochs and no transaction, so the revert
 takes no receipt from the load. Then it stops every job, rebuilds the state
 at H twice (the executor image with the seed, and the validator's state),
-and wipes every copy of the old chain. One executor keeps its old state on
-purpose. The assertions:
+both with the da-watcher's `--lockbox`, and wipes every copy of the old
+chain. One executor keeps its old state on purpose. The assertions:
 
 - all three members log `sealer state SEEDED` at H and E_H, none logs
   `FRESH`, all confirm the seed and take the first snapshot; started again

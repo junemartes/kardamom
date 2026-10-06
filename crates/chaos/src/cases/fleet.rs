@@ -17,7 +17,7 @@ use crate::harness::Harness;
 use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
-use crate::stages::rebuild::{Output, Rebuild, Rebuilt, Target};
+use crate::stages::rebuild::{Extras, Output, Rebuild, Rebuilt, Target};
 
 mod sealer_wipe;
 mod seed_evidence;
@@ -171,7 +171,7 @@ pub(crate) async fn executor_fleet_total_wipe_recover(h: &mut Harness) -> anyhow
     ));
     job.stop().await?;
     // The job starts again even when the rebuild or the install fails.
-    let installed = install_rebuilt_image(h, ctx, &nodes, head, None).await;
+    let installed = install_rebuilt_image(h, ctx, &nodes, head, Extras::default()).await;
     let baseline = ResumeEvidence::read(h).await;
     let restored = job.restore().await;
     installed?;
@@ -186,16 +186,16 @@ pub(crate) async fn executor_fleet_total_wipe_recover(h: &mut Harness) -> anyhow
 }
 
 /// Wipe every executor node in `nodes`, rebuild an executor image
-/// through `head` from L1, and install it on every one of them. With
-/// `sealer_seed`, the same rebuild writes the seed a wiped sealer cluster
-/// starts from. Returns the image, so a caller can install it on another
-/// node later.
+/// through `head` from L1, and install it on every one of them. The same
+/// rebuild reads and writes the `extras`, such as the seed a wiped sealer
+/// cluster starts from. Returns the image, so a caller can install it on
+/// another node later.
 async fn install_rebuilt_image(
     h: &Harness,
     ctx: &str,
     nodes: &[String],
     head: u64,
-    sealer_seed: Option<PathBuf>,
+    extras: Extras,
 ) -> anyhow::Result<Rebuilt> {
     let mut owners = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -206,7 +206,7 @@ async fn install_rebuilt_image(
         evidence: evidence_dir(ctx, "chaos-total-wipe-")?,
         target: unchecked_target(head),
         output: Output::ExecutorImage,
-        sealer_seed,
+        extras,
     }
     .run()
     .await?;

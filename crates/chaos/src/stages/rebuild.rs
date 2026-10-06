@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use anyhow::Context;
 use tokio::process::Command;
 
@@ -112,6 +112,21 @@ impl Output {
     }
 }
 
+/// What a rebuild reads beside the posted batches, and what it writes
+/// beside the state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Extras {
+    /// The lockbox that the da-watcher reads. With it, the tool gives each
+    /// block the L1 epochs its origin step names, with their deposits.
+    /// The derivation counts every epoch from the first origin on, so a
+    /// chain whose da-watcher restarted after L1 moved has fewer epochs
+    /// than the tool derives, and the tool refuses the block.
+    pub(crate) lockbox: Option<Address>,
+    /// Where the tool writes the seed a wiped sealer cluster starts
+    /// from, when the caller wants one.
+    pub(crate) sealer_seed: Option<PathBuf>,
+}
+
 /// One rebuild-from-L1 run against `target`: read the payloads from the
 /// DA proxy, run
 /// `kardamom-reconstruct` through the target block, and require its
@@ -124,9 +139,7 @@ pub(crate) struct Rebuild<'a> {
     pub(crate) evidence: PathBuf,
     pub(crate) target: Target,
     pub(crate) output: Output,
-    /// Where the tool writes the seed a wiped sealer cluster starts
-    /// from, when the caller wants one.
-    pub(crate) sealer_seed: Option<PathBuf>,
+    pub(crate) extras: Extras,
 }
 
 impl Rebuild<'_> {
@@ -270,11 +283,16 @@ impl Rebuild<'_> {
             .root
             .map(|root| vec!["--expect-root".to_string(), format!("{root:#x}")]);
         let output = self.output.flag().map(|flag| vec![flag.to_string()]);
+        let lockbox = self
+            .extras
+            .lockbox
+            .map(|lockbox| vec!["--lockbox".to_string(), lockbox.to_string()]);
         let seed = self
+            .extras
             .sealer_seed
             .as_ref()
             .map(|path| vec!["--sealer-seed".to_string(), path.display().to_string()]);
-        [root, output, seed]
+        [root, output, lockbox, seed]
             .into_iter()
             .flatten()
             .flatten()

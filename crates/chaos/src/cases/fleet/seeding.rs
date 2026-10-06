@@ -2,6 +2,7 @@
 //! names, and the job edits that start the members from the seed and the
 //! da-watcher after the seed's L1 origin.
 
+use alloy_primitives::Address;
 use anyhow::Context;
 use serde_json::Value;
 
@@ -124,6 +125,28 @@ impl JobDefinition<'_> {
             .count();
         anyhow::ensure!(edited > 0, "no task of the job has an argument list");
         Ok(job)
+    }
+
+    /// The lockbox that the da-watcher job reads: the value after its
+    /// `--lockbox` argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no task passes `--lockbox`, or its value is not
+    /// an address.
+    pub(super) fn lockbox(&self) -> anyhow::Result<Address> {
+        let mut job = self.0.clone();
+        Self::tasks(&mut job)
+            .filter_map(|task| task.pointer("/Config/args").and_then(Value::as_array))
+            .find_map(|args| {
+                args.iter()
+                    .skip_while(|arg| arg.as_str() != Some("--lockbox"))
+                    .nth(1)
+            })
+            .and_then(Value::as_str)
+            .context("no task of the job passes --lockbox")?
+            .parse()
+            .context("the job's --lockbox is not an address")
     }
 
     /// Every task of every group of `job`.
