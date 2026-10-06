@@ -81,12 +81,6 @@ job "state-mirror" {
     task "state-mirror" {
       driver = "docker"
 
-      env {
-        # The UDP port block this subscriber's discovery sockets use
-        # on the executor node, distinct from the executor's own.
-        KARDAMOM_MDC_PORTS = "40360-40369"
-      }
-
       config {
         image           = var.image_ref != "" ? var.image_ref : "registry.service.consul:5000/kardamom-state-mirror:dev"
         force_pull      = true

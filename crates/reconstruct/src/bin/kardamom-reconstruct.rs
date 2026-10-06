@@ -8,12 +8,12 @@
 //! trie-aware state DB. This produces the reconstructed head and
 //! canonical state root.
 //!
-//! Scope: L2 transactions. Deposits are re-derivable from L1 events, a
-//! documented follow-up (see `kardamom_engine::replay`). With
-//! `--expect-root` it exits non-zero on any mismatch, so it also works as
-//! a chaos-suite assertion.
+//! Scope: L2 transactions, interop deliveries, and, with `--lockbox`, the
+//! L1 deposits each block's L1 origin names, derived from the lockbox logs.
+//! With `--expect-root` it exits non-zero on any mismatch, so it also works
+//! as a chaos-suite assertion.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256};
@@ -25,9 +25,11 @@ use kardamom_batcher::error::BatcherError;
 use kardamom_batcher::frame::BlockFrame;
 use kardamom_batcher::indexer::IndexerClient;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
-use kardamom_reconstruct::Reconstruction;
+use kardamom_da_watcher::RpcL1Source;
+use kardamom_engine::ReplayBlock;
+use kardamom_reconstruct::{L1Epochs, Reconstruction, block_frame_to_replay};
 use kardamom_state::Durability;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Where the payloads come from: the proxy, or the indexer's archive.
 enum Source {
@@ -75,6 +77,13 @@ struct Cli {
     #[arg(long)]
     chain: PathBuf,
 
+    /// `ETHLockbox` proxy address. The rebuild derives the deposits of
+    /// each L1 epoch a block leads with from this contract's logs. Without
+    /// it, the rebuild leaves deposits out, and a chain with deposits
+    /// rebuilds to a wrong root.
+    #[arg(long)]
+    lockbox: Option<Address>,
+
     /// First L1 block to scan for `BatchPosted` events.
     #[arg(long, default_value_t = 0)]
     from_block: u64,
@@ -110,6 +119,14 @@ struct Cli {
     /// state committed at that block.
     #[arg(long)]
     through_block: Option<u64>,
+
+    /// Write the seed a sealer cluster with no state starts from: the
+    /// rebuilt head, its canonical end, and the next nonce of each
+    /// sender. The sealer reads it at
+    /// `-Dkardamom.cluster.seedSnapshot`. Needs a payload that carries
+    /// the canonical cursor through the last block.
+    #[arg(long)]
+    sealer_seed: Option<PathBuf>,
 }
 
 /// Keep the blocks through `through`, and refuse a batch set that ends
@@ -143,6 +160,28 @@ impl Source {
 }
 
 impl Cli {
+    /// The replay blocks of `frames`, each led by the L1 epochs its origin
+    /// step names, read through `provider` from the `--lockbox` logs.
+    /// Without `--lockbox`, the blocks lead with no epoch.
+    async fn with_l1_epochs<P>(
+        &self,
+        provider: P,
+        frames: &[BlockFrame],
+    ) -> anyhow::Result<Vec<ReplayBlock>>
+    where
+        P: alloy_provider::Provider + Send + Sync + 'static,
+    {
+        let blocks = frames.iter().map(block_frame_to_replay).collect();
+        let Some(lockbox) = self.lockbox else {
+            warn!("no --lockbox: the rebuild leaves L1 deposits out");
+            return Ok(blocks);
+        };
+        L1Epochs::new(RpcL1Source::new(provider), lockbox)
+            .attach(blocks)
+            .await
+            .context("derive the L1 epochs")
+    }
+
     /// The payload source the flags name. clap guarantees one of the two.
     fn payload_source(&self) -> anyhow::Result<Source> {
         match (&self.da_proxy, &self.indexer_url) {
@@ -150,6 +189,39 @@ impl Cli {
             (None, Some(url)) => Ok(Source::Indexer(IndexerClient::new(url))),
             (None, None) => bail!("--da-proxy or --indexer-url is required"),
         }
+    }
+}
+
+/// The seed `--sealer-seed` asks for: where to write it, the rebuilt
+/// state it reads, and the senders of the rebuilt blocks in the order they
+/// last sent.
+struct SeedRequest<'a> {
+    path: &'a Path,
+    state_dir: &'a Path,
+    chain_id: u64,
+    senders: kardamom_reconstruct::SenderOrder,
+}
+
+impl SeedRequest<'_> {
+    /// Build the seed of the state that `outcome` rebuilt, and write it.
+    fn write(&self, outcome: &kardamom_engine::ReplayOutcome) -> anyhow::Result<()> {
+        let seed = kardamom_reconstruct::SeedInput {
+            state_dir: self.state_dir,
+            chain_id: self.chain_id,
+            outcome,
+            senders: &self.senders,
+        }
+        .seed()
+        .context("build the sealer seed")?;
+        seed.write(self.path)?;
+        info!(
+            path = %self.path.display(),
+            block = seed.block,
+            end_tx_idx = seed.end_tx_idx,
+            senders = seed.senders.len(),
+            "sealer seed written"
+        );
+        Ok(())
     }
 }
 
@@ -189,10 +261,23 @@ async fn main() -> anyhow::Result<()> {
     let blocks =
         recover_blocks(&descriptors, &source).context("recover blocks from the DA layer")?;
     let blocks = truncate(blocks, cli.through_block)?;
+    let blocks = cli.with_l1_epochs(provider, &blocks).await?;
     info!(
         blocks = blocks.len(),
+        epochs = blocks.iter().map(|b| b.l1_epochs.len()).sum::<usize>(),
         "recovered blocks from DA; re-executing"
     );
+
+    // The seed needs the senders of the rebuilt blocks, in canonical
+    // order. Read them before the replay.
+    let seed = cli.sealer_seed.as_deref().map(|path| SeedRequest {
+        path,
+        state_dir: &cli.state_dir,
+        chain_id: genesis.chain_id,
+        senders: kardamom_reconstruct::SenderOrder::of(
+            blocks.iter().flat_map(|b| b.txs.iter().map(|t| t.sender)),
+        ),
+    });
 
     let durability = if cli.no_sync {
         Durability::SafeNoSync
@@ -203,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
         state_dir: &cli.state_dir,
         durability,
     }
-    .run(&replay_genesis, &blocks)
+    .run(&replay_genesis, blocks)
     .context("re-execute reconstructed blocks")?;
 
     info!(
@@ -236,6 +321,9 @@ async fn main() -> anyhow::Result<()> {
             outcome.state_root,
             expected
         );
+    }
+    if let Some(seed) = &seed {
+        seed.write(&outcome)?;
     }
     if cli.executor_image {
         if outcome.head_end_tx_idx.is_none() {

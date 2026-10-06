@@ -555,6 +555,22 @@ refusal routes the consumer into its repair path. A cold start sends the
 block end exactly; a reconnect inside an open block sends an index between
 the two ends; a start from genesis has no boundary to check.
 
+**A resume cursor ahead of the head is a refusal.** A sealer that lost its
+stream, for example in a total wipe, can come back behind its consumers. A
+consumer whose index or block is past the sealer's head applied records the
+sealer does not hold. The sealer answers `REPLAY_AHEAD` (egress kind 11),
+which carries its head, and logs `cluster REPLAY ... AHEAD
+head=(index,block)`. A `REPLAY_DONE` would let the consumer drop each new
+record below its cursor as a duplicate and diverge with no signal. The
+consumer checks the same rule on its side: a `REPLAY_DONE` whose head is
+below the delivery cursor also stops it. Both give `ClusterBehindCursor`.
+No repair path takes this error. The replay-unavailable repair fetches a
+peer checkpoint, but after a sealer wipe every peer is ahead of the head
+too, so a repair would only park the local state and loop. The executor,
+the validator and the batcher exit with status 1. The orchestrator restarts
+each one, and each restart stops at the same refusal
+until the sealer serves the stream again.
+
 **A lying or absent L1 endpoint.** The batcher's start reads the settlement
 contract: `lastBatchIndex`, and the `l2BlockEnd` the contract stores with
 that batch. Two `eth_call`s, no event scan, no wait on the inbox indexer.
@@ -629,14 +645,23 @@ trie, the hashed mirror and the stored root removed, after the root check).
 The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
-which also gives the flag-day procedure for a wiped sealer set and the seed
-hook that would replace it.
+which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
+the seed a new sealer cluster starts from at the rebuilt head.
 
-Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
-skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
-events via the `da_watcher` path — interleaving them into the reconstruction is
-a documented follow-up, so a deposit-bearing range currently reconstructs its
-non-deposit state exactly and is flagged rather than silently diverging.
+Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
+absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
+would be an unverifiable claim. With `--lockbox`, the rebuild derives them from
+L1: when a block's L1 origin moves from M to N, the block leads with the epochs
+M+1..N, each derived from that L1 block's lockbox logs through `derive_epoch`,
+the rule the da-watcher and the validator use. Each epoch takes a marker slot
+and one slot per deposit at the head of its block, as on the live stream. The
+first step from origin 0 takes epoch N only: the da-watcher starts at the
+finalized block it first sees. A block whose items need more slots than its
+canonical range holds is refused. A smaller need is accepted, because a vacant
+slot (a voided entry or its void record) never reaches the payload; a missing
+deposit then shows as a root mismatch at `--expect-root`. Without `--lockbox`
+the rebuild leaves deposits out, and a chain with deposits rebuilds to a wrong
+root.
 
 **A gap in the record is loud.** Every case of the chaos-l1 shard ends with
 the persisted-state stage: the state at the validator's drained head is
@@ -837,9 +862,6 @@ check would pass against a feature that activated once and stopped.
   CRC-verify + targeted-heal path (`archive-corruption` chaos case). Still
   open: `tx_ordering` archive re-replication (today it self-heals only via the
   Java cluster's Raft log replication on rejoin).
-- **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
-  transactions; re-deriving L1 deposits from `DepositInitiated` events and
-  interleaving them in canonical order is a follow-up.
 - **L1 outage** — the followers cross-check two L1 sources, and the
   batcher rebuilds a range the sealer no longer retains from the state
   databases' references and the `tx_data` archives (the batcher section).

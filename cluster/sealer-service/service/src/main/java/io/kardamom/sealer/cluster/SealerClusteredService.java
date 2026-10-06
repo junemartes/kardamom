@@ -13,6 +13,7 @@ import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.OrderingWindow;
 import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.RemoteOriginAdvance;
+import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -20,6 +21,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import org.agrona.DirectBuffer;
+import org.agrona.concurrent.AgentTerminationException;
 
 /**
  * Thin Aeron Cluster {@link ClusteredService} that sends all deterministic
@@ -83,9 +85,16 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private final Set<Long> remoteOrigins;
 
+    /**
+     * The seed this member starts from when the cluster has no snapshot.
+     * Empty starts it at genesis. A snapshot, when one exists, wins.
+     */
+    private Optional<SealerSeed> seed = Optional.empty();
+
     private Cluster cluster;
     private CanonicalSealerState state;
     private SealerEgress egress;
+    private SeedRecord seedRecord;
 
     /**
      * The log position of the last entry this service applied. The admin
@@ -232,9 +241,27 @@ public final class SealerClusteredService implements ClusteredService {
         this(SealerWire.DEFAULT_DEDUP_CAPACITY, CanonicalSealerState.TICK_INTERVAL_MS);
     }
 
+    /**
+     * Start from {@code seed} when the cluster has no snapshot, instead of
+     * at genesis. A seed carries no peer anchor, so a member with interop
+     * on refuses it.
+     *
+     * @throws IllegalArgumentException if the remote-origin allowlist is
+     *         not empty
+     */
+    SealerClusteredService seededFrom(final SealerSeed seed) {
+        if (!remoteOrigins.isEmpty()) {
+            throw new IllegalArgumentException("a seed carries no remote-origin anchor, so a seeded cluster"
+                + " runs with interop off; the allowlist is " + remoteOrigins);
+        }
+        this.seed = Optional.of(seed);
+        return this;
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
+        this.seedRecord = new SeedRecord(cluster, memberId);
         if (snapshotImage != null) {
             // Restore canonical state from the cluster snapshot. An unreadable
             // or empty snapshot image is fatal. Restarting silently at genesis
@@ -247,6 +274,8 @@ public final class SealerClusteredService implements ClusteredService {
             System.out.println("sealer snapshot RESTORED memberId=" + memberId
                 + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount()
                 + " retained=" + egress.retainedCount() + " postedHead=" + state.postedHead());
+        } else if (seed.isPresent()) {
+            startSeeded(seed.get());
         } else {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
@@ -288,9 +317,33 @@ public final class SealerClusteredService implements ClusteredService {
         this.state = CanonicalSealerState.load(
             buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
             daLagBudgetBlocks);
-        this.egress = new SealerEgress(
-            cluster, memberId, state.canonicalCount(), state.blockNumber());
-        egress.readSnapshot(buf);
+        openEgress(buf);
+    }
+
+    /**
+     * Start after the seed's head: the state opens block {@code H + 1} at
+     * index {@code E_H}, and the egress floors start there, with the
+     * retention floor at {@code H}. A consumer at the rebuilt head resumes
+     * at {@code (E_H, H + 1)}.
+     */
+    private void startSeeded(final SealerSeed seed) {
+        this.state = CanonicalSealerState.seeded(
+            seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), daLagBudgetBlocks);
+        openEgress(ByteBuffer.allocate(0));
+        System.out.println("sealer state SEEDED memberId=" + memberId
+            + " block=" + seed.head().block() + " endTx=" + seed.head().endTxIdx()
+            + " senders=" + state.trackedSenders() + " stateRoot=" + seed.stateRootHex()
+            + " digest=" + seed.digestHex());
+    }
+
+    /**
+     * Open the egress at the state's head, restore the retained frames
+     * {@code retention} holds, and set the retention floor at the posted
+     * head.
+     */
+    private void openEgress(final ByteBuffer retention) {
+        this.egress = new SealerEgress(cluster, memberId, state.canonicalCount(), state.blockNumber());
+        egress.readSnapshot(retention);
         egress.setPostedHead(state.postedHead());
     }
 
@@ -329,6 +382,9 @@ public final class SealerClusteredService implements ClusteredService {
         // Re-arming with the same correlation id is idempotent: Aeron replaces
         // the pending timer instead of scheduling a second one.
         scheduleBoundaryTimer();
+        if (state.seedStatus() == CanonicalSealerState.SeedStatus.PENDING) {
+            seedRecord.offer(state.seedDigest());
+        }
         // Log-driven, so every member prints it, also on replay. With the
         // role lines it gives the order of the elections: which member led
         // which term, and where in the log the term began.
@@ -361,6 +417,7 @@ public final class SealerClusteredService implements ClusteredService {
         System.out.println("cluster SESSION close memberId=" + memberId
             + " session=" + session.id() + " reason=" + closeReason);
         egress.removeConsumer(session.id());
+        egress.dropBacklog(session.id());
     }
 
     @Override
@@ -371,6 +428,10 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        // Every log-driven callback first sends what the egress backlogs
+        // hold, so a back-pressured session catches up between frames, and
+        // the stall deadline is checked at least once per tick.
+        egress.drainBacklogs();
         dispatchSessionMessage(session, buffer, offset, length);
         recordServicePosition();
     }
@@ -396,6 +457,9 @@ public final class SealerClusteredService implements ClusteredService {
                 return;
             case SealerWire.KIND_POSTED_CURSOR:
                 onPostedCursor(buffer, offset, length);
+                return;
+            case SealerWire.KIND_SEED_EPOCH:
+                onSeedEpoch(session, buffer, offset, length);
                 return;
             case SealerWire.KIND_REPLAY_REQUEST: {
                 if (length < SealerWire.MIN_REPLAY_REQUEST_LEN) {
@@ -736,6 +800,41 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
+     * Handle a {@link SealerWire#KIND_SEED_EPOCH} record. Only the service
+     * writes it, so a frame from a client session is malformed. The first
+     * record confirms the seed, and the leader then asks for a snapshot,
+     * so a member that joins later restores the seeded state from it.
+     *
+     * <p>A member that started at genesis, or from another seed, holds
+     * another history than the cluster. It stops here, before it relays one
+     * record: the throw ends the service agent, and the container's
+     * termination hook stops the node.</p>
+     */
+    private void onSeedEpoch(
+            final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
+        if (session != null || length != SealerWire.SEED_EPOCH_LEN) {
+            onMalformedFrame("seed-epoch", length);
+            return;
+        }
+        final byte[] digest = new byte[SealerSeed.HASH_LEN];
+        buffer.getBytes(offset + SealerWire.SEED_DIGEST_OFFSET, digest);
+        final boolean confirmed;
+        try {
+            confirmed = state.onSeedEpoch(digest);
+        } catch (final IllegalStateException ex) {
+            System.out.println("sealer SEED-EPOCH FATAL memberId=" + memberId + ": " + ex.getMessage());
+            System.out.flush();
+            throw new AgentTerminationException(ex);
+        }
+        if (!confirmed) {
+            return;
+        }
+        System.out.println("sealer seed CONFIRMED memberId=" + memberId + " block=" + state.blockNumber()
+            + " canonicalCount=" + state.canonicalCount());
+        seedRecord.requestSnapshot();
+    }
+
+    /**
      * Answer one offer the DA-lag guard refused. The record is not ordered
      * until the batcher posts again, so the sequencer reports it to the
      * client instead of republishing.
@@ -838,6 +937,7 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
         recordServicePosition();
+        egress.drainBacklogs();
         if (correlationId == WINDOW_TIMER_CORRELATION_ID) {
             flushWindow();
             return;
@@ -886,7 +986,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onRoleChange(Cluster.Role newRole) {
-        // No role-specific behavior: the cluster log is replicated, so every
+        // No role-specific state: the cluster log is replicated, so every
         // member runs the same deterministic state machine. Only the
         // leader's egress offers reach external clients. Log the role change
         // so the chaos suite (deploy/cluster/scripts/chaos.sh) can grep the
@@ -894,6 +994,10 @@ public final class SealerClusteredService implements ClusteredService {
         // on purpose. Do not switch it to slf4j without also updating the
         // chaos suite's leader detection.
         System.out.println("cluster role=" + newRole + " memberId=" + memberId);
+        // The egress backlogs belong to the clients of this member's
+        // leadership. Those clients reconnect to the next leader and replay
+        // from there, and a follower's offers never reach a client.
+        egress.dropBacklogs();
     }
 
     @Override

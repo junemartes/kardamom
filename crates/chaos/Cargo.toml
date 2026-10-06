@@ -35,6 +35,7 @@ kardamom-bench = { path = "../bench" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+humantime = "2"
 tempfile.workspace = true
 tokio.workspace = true
 

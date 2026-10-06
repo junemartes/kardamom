@@ -11,7 +11,7 @@
 //! down when its last owner drops, and the task ends on cancel.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::catalog::{Catalog, Query, QueryResult, RegistrationSpec};
-use super::endpoint::{MANUAL_SUBSCRIPTION_URI, PortAllocator, advertise_ip, publication_uri};
+use super::endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, publication_uri};
 use super::reconcile::{DestinationPort, Reconciler};
 use super::record::{
     ARCHIVE_SERVICE, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, PUBLISHER_SERVICE,
@@ -104,7 +104,6 @@ struct Discovered {
     catalog: Catalog,
     instance: Instance,
     ip: Ipv4Addr,
-    ports: PortAllocator,
     /// The `publisher_id` label of every record this process registers.
     label: String,
     cancel: CancellationToken,
@@ -113,16 +112,17 @@ struct Discovered {
 }
 
 impl Discovered {
-    /// Open a dynamic MDC publication for `key` and register it.
+    /// Open a dynamic MDC publication for `key` and register it. The
+    /// driver binds the control port, and the record carries the address
+    /// the driver bound, so no other socket can take the port between the
+    /// bind and the registration.
     async fn open_publication(
         &mut self,
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<PubHandle, LogError> {
-        let port = self.ports.allocate()?;
-        let control = SocketAddr::new(IpAddr::V4(self.ip), port);
-        let uri = publication_uri(control, &self.cfg.flow_control, key.topic);
-        let publication = rt.open_publication(&uri, key.stream_id)?;
+        let uri = publication_uri(IpAddr::V4(self.ip), &self.cfg.flow_control, key.topic);
+        let (publication, control) = rt.open_mdc_publication(&uri, key.stream_id)?;
         let record = PublisherRecord {
             id: self.instance.service_id(key.topic, key.stream_id),
             control,
@@ -322,8 +322,8 @@ impl StreamPlane {
     ///
     /// # Errors
     ///
-    /// Returns an error if discovery is enabled and the environment, the
-    /// interface, or the Consul client cannot be resolved.
+    /// Returns an error if discovery is enabled and the interface or the
+    /// Consul client cannot be resolved.
     pub fn from_config(cfg: &LogConfig, label: &str) -> Result<Self, LogError> {
         if !cfg.discovery.enabled {
             return Ok(Self::static_only(cfg.channels.clone()));
@@ -332,7 +332,7 @@ impl StreamPlane {
             LogError::Discovery("discovery enabled without an advertise interface".into())
         })?;
         let ip = advertise_ip(selector)?;
-        let instance = Instance::from_env()?;
+        let instance = Instance::from_env();
         let catalog = catalog_from_config(&cfg.discovery)?;
         Ok(Self::with_catalog(cfg, label, catalog, instance, ip))
     }
@@ -348,7 +348,6 @@ impl StreamPlane {
         instance: Instance,
         ip: Ipv4Addr,
     ) -> Self {
-        let ports = PortAllocator::new(ip, instance.ports);
         Self {
             channels: cfg.channels.clone(),
             discovered: Some(Discovered {
@@ -357,7 +356,6 @@ impl StreamPlane {
                 catalog,
                 instance,
                 ip,
-                ports,
                 label: label.to_string(),
                 cancel: CancellationToken::new(),
                 tasks: Vec::new(),
@@ -465,7 +463,8 @@ impl StreamPlane {
     /// # Errors
     ///
     /// Returns an error if the publication fails to open or, when
-    /// discovered, if no port binds or the registration fails.
+    /// discovered, if the driver reports no bound control address or the
+    /// registration fails.
     pub async fn publisher<H: DiscoveredPublisher>(
         &mut self,
         rt: &AeronRuntime,
