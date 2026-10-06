@@ -545,8 +545,8 @@ mod apply_dedup_tests {
     /// the JSON-ABI-derived `IKardamomFactory::applyDeploymentsCall`, and check
     /// that every field survives. This catches an accidental field reshuffle
     /// in `spec_to_abi`. The JSON ABI is the source of truth for layout; the
-    /// bytecode-hash CI gate and the e2e deploy/upgrade tests against anvil
-    /// pin the Rust-to-Solidity layout match.
+    /// e2e deploy/upgrade tests against anvil pin the Rust-to-Solidity
+    /// layout match.
     #[test]
     fn apply_deployments_calldata_roundtrip() {
         use super::IKardamomFactory;

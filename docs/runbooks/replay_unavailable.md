@@ -2,13 +2,13 @@
 
 ## Cause
 
-The sealer refused the batcher's replay from its cursor: the range is below
-the sealer's retention floor, and no copy of the ordering is at hand.
+The sealer refused the replay from the cursor of the batcher. The range is below the floor of the sealer. The batcher could not rebuild the gap.
 
 ## Confirm
 
-1. Read `/halt` on the batcher. The detail names the cursor (record index and
-   block) and the sealer's floor.
+1. Read `/halt` on the batcher. The detail holds the text of the failure.
+   - After a failed rebuild, it is the error of the rebuild.
+   - After a second refusal, it says that the floor of the sealer moved to a block.
 2. Read the batcher's spool directory. The spool holds the blocks the batcher
    consumed and did not post yet. If the spool ends before the floor, the gap
    between the spool's end and the floor is the lost range.
@@ -17,14 +17,11 @@ the sealer's retention floor, and no copy of the ordering is at hand.
 
 ## Steps
 
-1. Do not restart the batcher. A restart loses the detail and gets the same
-   refusal.
+1. Read the `/halt` detail before you do anything else. Record it.
 2. Recover the range from a surviving copy, in this order:
    1. The spool: if it holds every block from the posted head to the floor, the
       batcher continues from it on the clear. Nothing else is needed.
-   2. An executor's or the validator's block payload store
-      (`kardamom_getBlockPayload`), where one exists: copy the missing range
-      into the spool with the recovery tool, then clear.
+   2. The rebuild of the batcher. It reads the block references from the query endpoints of the executors and the validator (`--block-refs-source`). It reads the bytes of the transactions from the `tx_data` archives. Fix what the `/halt` detail names, then clear.
    3. L1 and the DA layer: the range the sealer refused is not on L1 by
       definition, so this source holds nothing new.
 3. If no copy survives, the chain reverts to the posted head. Follow

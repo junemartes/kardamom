@@ -152,8 +152,9 @@ struct Cli {
     spool_dir: Option<PathBuf>,
     /// The inbox indexer's API (`http://host:port`). A batcher without a
     /// cursor file then resumes just past the last posted batch, from the
-    /// batch's own blobs, instead of replaying from genesis; and no start
-    /// scans `BatchPosted` events on L1.
+    /// batch's own blobs, instead of replaying from genesis. Without an
+    /// indexer, or while it is behind the head, the batcher scans
+    /// `BatchPosted` events on L1.
     #[arg(long, env = "KARDAMOM_INDEXER_URL")]
     indexer_url: Option<String>,
     /// The settlement contract's deployment block: where a `BatchPosted`

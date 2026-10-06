@@ -6,7 +6,7 @@
 # each epoch against L1. When L1 does not answer, the epoch commits
 # unverified and only a counter moves. Nothing else in the system
 # notices, and that is exactly where a targeted forgery would sit
-# (issue #163). An alert turns that counter into a signal.
+# An alert turns that counter into a signal.
 #
 # The batcher and follower rules watch the one signal an L1 outage
 # cannot hide: the age of the last post as L1 serves it. A lying
@@ -98,8 +98,9 @@ groups:
 
       - alert: KardamomValidatorEpochFault
         # A chain fault: the epoch on the canonical stream disagrees
-        # with L1. The validator fail-stops on this, so the counter
-        # moves once and the process exits. Page on it.
+        # with L1. The validator records a divergence and holds the
+        # validator_divergence halt. The process stays up and the
+        # counter moves once. Page on it.
         expr: increase(validator_epoch_faults_total[10m]) > 0
         for: 0m
         labels:

@@ -84,16 +84,17 @@ pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Resu
 /// must restore from its local checkpoint and replay the tail. Three
 /// restore lines prove that no executor re-synced from genesis or
 /// waited for a peer.
+///
+/// The job stops after the kills and starts again after the wipe.
+/// Nomad restarts a killed task in seconds, and a task that runs again
+/// before its wipe opens its old state and logs no restore.
 pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "executor-fleet-wipe-recover";
     let nodes = executor_containers(h);
     for node in &nodes {
         wait_peer_checkpoint(h, node, ctx).await?;
     }
-    let baseline = h
-        .evidence
-        .count_lines("executor", RESTORED, Streams::Both)
-        .await?;
+    let job = SavedJob::capture(&h.nomad, "executor").await?;
     crate::log(format!(
         "{ctx}: kill ALL executor tasks ({}) and wipe every state DB (checkpoints kept)",
         nodes.join(" ")
@@ -101,11 +102,14 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
     for node in &nodes {
         h.inject_hard(&[node], "executor").await?;
     }
-    await_exporters_dark(h, ctx).await?;
-    for node in &nodes {
-        wipe_dirs(h, node, ctx, "rm -rf /opt/kardamom/state/*").await?;
-    }
-    h.assert_count("executor", 3, h.knobs.restart_slo).await?;
+    job.stop().await?;
+    // The job starts again even when the wipe fails.
+    let wiped = wipe_stopped_fleet(h, ctx, &nodes).await;
+    let restored = job.restore().await;
+    let baseline = wiped?;
+    restored?;
+    h.assert_count("executor", nodes.len(), h.knobs.reschedule_slo)
+        .await?;
     await_exporter_back(h, ctx).await?;
     h.evidence
         .wait_count_reaches(
@@ -126,6 +130,22 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
         nodes.len()
     ));
     h.assert_executor_progress(Duration::from_mins(3)).await
+}
+
+/// With the executor job stopped, wait until every exporter is dark,
+/// read the restore-line count, and wipe the state database of every
+/// node. No executor runs, so no restore line can land before the
+/// count. Returns the count.
+async fn wipe_stopped_fleet(h: &Harness, ctx: &str, nodes: &[String]) -> anyhow::Result<usize> {
+    await_exporters_dark(h, ctx).await?;
+    let baseline = h
+        .evidence
+        .count_lines("executor", RESTORED, Streams::Both)
+        .await?;
+    for node in nodes {
+        wipe_dirs(h, node, ctx, "rm -rf /opt/kardamom/state/*").await?;
+    }
+    Ok(baseline)
 }
 
 /// The executor's log line of a resume from its own state cursor.
