@@ -66,12 +66,11 @@ variable "datacenter" {
 }
 
 # The L1 endpoint the watcher derives epochs from. The default is the
-# in-cluster anvil by its Consul service record. When the L1 light client
-# is deployed (l1-light-client.nomad.hcl), the workloads role points this
-# at the light client, the same as the validator. The watcher is the
-# epoch SOURCE, so a lying endpoint here produces bad epochs at the
-# source rather than false halts (issue #163). Routing it through a
-# verifying client closes that.
+# in-cluster anvil by its Consul service record. The workloads role sets
+# this to its followers' L1 list (`workloads_followers_rpc`). The watcher
+# is the epoch SOURCE, so a lying endpoint here produces bad epochs at
+# the source rather than false halts. Two or more agreeing endpoints, or
+# a light client that settles the reads, close that.
 variable "l1_rpc" {
   type        = string
   description = "The L1 JSON-RPC endpoints the watcher derives epochs from, comma-separated. With two or more, a block is accepted when two agree. Default: the in-cluster anvil by its Consul service record."
