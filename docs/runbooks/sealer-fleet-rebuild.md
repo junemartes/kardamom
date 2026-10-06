@@ -172,15 +172,16 @@ restores one of its checkpoints, skips the records of the new chain.
    done
    ```
 
-2. Give every member the seed. A seed carries no remote-origin anchor, so a
-   seeded member runs with interop off: its allowlist must be empty.
+2. Give every member the seed. The cluster job mounts `/opt/kardamom/seed` and
+   passes `-Dkardamom.cluster.seedSnapshot`, empty in a normal deploy. A seed
+   carries no remote-origin anchor, so a seeded member runs with interop off:
+   its allowlist must be empty. The job's variable `cluster_seed_snapshot`
+   does both; on the saved job, `jq` does the same:
 
    ```sh
-   jq '.Job.TaskGroups[].Tasks[] |= (
-         .Config.volumes += ["/opt/kardamom/seed:/opt/kardamom/seed:ro"]
-         | .Env.JAVA_TOOL_OPTIONS |= (
-             gsub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins=")
-             + " -Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin"))' \
+   jq '.Job.TaskGroups[].Tasks[].Env.JAVA_TOOL_OPTIONS |= (
+         sub("-Dkardamom.cluster.seedSnapshot=[^ ]*"; "-Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin")
+         | sub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins="))' \
      cluster.json > cluster-seeded.json
    ```
 

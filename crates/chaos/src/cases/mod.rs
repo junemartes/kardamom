@@ -49,6 +49,7 @@ pub enum Case {
     ExecutorFleetLossRecover,
     ExecutorFleetWipeRecover,
     ExecutorFleetTotalWipeRecover,
+    SealerFleetTotalWipeRecover,
     IngressPairLossRecover,
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
@@ -76,7 +77,7 @@ pub enum Case {
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 46] = [
+const ALL: [Case; 47] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -98,6 +99,7 @@ const ALL: [Case; 46] = [
     Case::ExecutorFleetLossRecover,
     Case::ExecutorFleetWipeRecover,
     Case::ExecutorFleetTotalWipeRecover,
+    Case::SealerFleetTotalWipeRecover,
     Case::IngressPairLossRecover,
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
@@ -163,6 +165,7 @@ impl Case {
             Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
             Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
             Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
+            Self::SealerFleetTotalWipeRecover => "sealer-fleet-total-wipe-recover",
             Self::IngressPairLossRecover => "ingress-pair-loss-recover",
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
@@ -255,6 +258,12 @@ impl Case {
             Self::NodeReplaceSealer => {
                 inject + k.reschedule_slo + k.rejoin_slo + Duration::from_mins(5)
             }
+            // The quiet stop, two rebuilds from L1, a seeded election, a
+            // restart without the seed, two executor starts, and the
+            // return of every other job.
+            Self::SealerFleetTotalWipeRecover => {
+                inject + k.reschedule_slo + Duration::from_mins(15)
+            }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -298,8 +307,10 @@ impl Case {
             Self::ResizeScaleOutIn => 60,
             // The chain refuses every submit while it is halted, at once,
             // and the load's retry delay grows with the attempt: 120
-            // attempts cover a halt of about 24 minutes.
-            Self::DaLagHalt => 120,
+            // attempts cover a halt of about 24 minutes. The sealer fleet
+            // wipe stops the ingresses for the whole rebuild, and a refused
+            // submit would leave a nonce hole in the load's sender.
+            Self::DaLagHalt | Self::SealerFleetTotalWipeRecover => 120,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -344,6 +355,7 @@ impl Case {
             Self::ExecutorFleetTotalWipeRecover => {
                 fleet::executor_fleet_total_wipe_recover(h).await
             }
+            Self::SealerFleetTotalWipeRecover => fleet::sealer_fleet_total_wipe_recover(h).await,
             Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,

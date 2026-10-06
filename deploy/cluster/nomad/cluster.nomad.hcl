@@ -132,6 +132,20 @@ variable "cluster_remote_origins" {
   default = "412347,412399"
 }
 
+# The seed a cluster with no snapshot starts from
+# (-Dkardamom.cluster.seedSnapshot): the path of a file that
+# `kardamom-reconstruct --sealer-seed` wrote, inside the seed directory
+# that every member mounts. Empty in every normal deploy: a member then
+# starts at genesis when it has no snapshot. Only the sealer fleet
+# rebuild (docs/runbooks/sealer-fleet-rebuild.md) sets it, on every
+# member, and clears it after the members took their first snapshot. A
+# seed carries no remote-origin anchor, so a seeded member runs with an
+# empty remote-origin allowlist.
+variable "cluster_seed_snapshot" {
+  type    = string
+  default = ""
+}
+
 # Digest-pinned image. ansible/deploy.yml
 # passes the repo:tag@sha256:... reference captured at push time
 # (deploy/cluster/images.digests). The empty default falls back to the
@@ -347,7 +361,7 @@ job "cluster" {
         # the same value as the shared driver (aeron.system.nomad.hcl),
         # below a 1400-byte network path.
         env {
-          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
         }
 
         config {
@@ -369,6 +383,9 @@ job "cluster" {
             "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
             "/opt/kardamom/cluster:/opt/kardamom/cluster",
             "/opt/kardamom/archive:/opt/kardamom/archive",
+            # The seed directory of the sealer fleet rebuild. Read only:
+            # the member reads the seed at the start and never writes it.
+            "/opt/kardamom/seed:/opt/kardamom/seed:ro",
           ]
           # The JVM -D system properties pass through the
           # JAVA_TOOL_OPTIONS env stanza above, not here as docker

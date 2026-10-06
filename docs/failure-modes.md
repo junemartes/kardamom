@@ -230,7 +230,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Effect: no member is left. The pipeline must stall.
   - Recovery: every member returns with its own log and snapshots. The members elect a leader among themselves. The backlog drains.
   - Proof: `cluster-total-loss-recover`.
-  - Not covered in-cluster: three wiped members. No peer holds a snapshot for them. The members start from a seed rebuilt from L1. See "Sealer fleet rebuild (every sealer wiped)".
+  - Not covered in-cluster: three wiped members. No peer holds a snapshot for them. The members start from a seed rebuilt from L1. See "Sealer fleet rebuild (every sealer wiped)". The proof of that path is `sealer-fleet-total-wipe-recover`.
 - **Epoch lost in a leader change**
   - Trigger: a leader kill or a quorum loss. Cluster ingress is at-most-once across them. An offer that the ingress publication accepted can still be lost.
   - Effect: once the sealer holds an L1 origin, it accepts only the epoch of L1 block `l1_origin + 1`.
@@ -694,8 +694,11 @@ This is the backstop at the bottom of the stack. Assume that **every** in-cluste
 - A seed record in the log proves that every member started from the same seed. A member that started at genesis, or from another seed, stops with `sealer SEED-EPOCH FATAL`.
 - The sealer README gives the procedure and the seeded state: [Seeded start](../cluster/sealer-service/README.md#seeded-start).
 - Restart every surviving consumer after the sealer starts. A consumer that is ahead of the rebuilt head stops with `ClusterBehindCursor`.
-- The deploy has no switch for the seed.
-- Proof: the in-process tests `SealerSeedClusterTest` and `SealerSeedServiceTest`, and the Rust tests of `crates/reconstruct`. No chaos case wipes all three sealers (see "Known gaps").
+- The cluster job passes the seed path from its variable `cluster_seed_snapshot`.
+  - The variable is empty in a normal deploy, and the workloads role does not set it. An empty path means no seed.
+  - When the variable is set, the job passes an empty remote-origin allowlist.
+  - Every member mounts `/opt/kardamom/seed` read-only.
+- Proof: the in-process tests `SealerSeedClusterTest` and `SealerSeedServiceTest`, the Rust tests of `crates/reconstruct`, and the chaos case `sealer-fleet-total-wipe-recover` (see "Sealer fleet rebuild (every sealer wiped)").
 
 **Scope.**
 
@@ -760,10 +763,37 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 - The validator resumes on a rebuilt state that keeps the trie, with no step of its own.
   - Its cursor comes from the same meta keys as the cursor of an executor. Its verify floor is `H`.
   - The prover spool, the claims and the epoch verifier start empty.
-  - No test starts a validator on a rebuilt state yet.
 - The output attester is not deployed. Where it runs, it posts a root for every block that the validator commits, not only for posted blocks. So L1 can hold roots of reverted blocks.
   - The revert rolls them back (step 4 of [`revert_to_posted_head`](runbooks/revert_to_posted_head.md)).
   - The attester then resumes after the newest output that remains, and the validator resumes at `H`. The withdrawals between the two are not collected again.
+
+### Proof: `sealer-fleet-total-wipe-recover`
+
+The chaos case `sealer-fleet-total-wipe-recover` proves the procedure end to end. It runs last in the `chaos-fleet` shard. See [`chaos-suite.md`](chaos-suite.md#shards).
+
+The case does these steps:
+
+1. It stops the ingresses. It lets the batcher post every block, then it stops the batcher.
+2. It mines L1 blocks until one more epoch seals. The blocks after `H` then hold epochs and no transaction. So the revert takes no receipt from the load.
+3. It stops every job. It rebuilds the state at `H` two times: the executor image with the seed, and the state of the validator.
+4. It wipes every copy of the old chain. One executor keeps its old state on purpose.
+
+The rebuilds of the case pass no `--lockbox`.
+
+- The suite never deposits.
+- A chain that lost an epoch to an earlier fault fails the slot check of a `--lockbox` rebuild.
+
+The case asserts these results:
+
+- All three members log `sealer state SEEDED` at `H` and `E_H`. No member logs `FRESH`.
+- All three members confirm the seed and take the first snapshot.
+- The members start again without the seed property. All three restore the snapshot.
+- The sealer serves the fresh executors from `(E_H, H + 1)`. It answers the stale executor with `REPLAY_AHEAD`.
+- No executor restores or fetches a checkpoint.
+- The validator commits past `H` on its rebuilt state.
+- The first ticks of the da-watcher publish every finalized L1 block after `M`.
+- The batcher posts again. The L1 record stays contiguous from `H`.
+- The recovery probe passes. The end-of-shard audit compares the executors with the validator and rebuilds the head from L1.
 
 ## DA-watcher
 
@@ -1021,7 +1051,9 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **All-wiped fleets**
   - The persisted-state stage of every shard rebuilds the state at the drained head of the validator from L1 and the DA store alone (`kardamom-reconstruct --through-block --expect-root`). It requires the committed root of the validator.
   - `executor-fleet-total-wipe-recover` covers the executors: it wipes all three with their checkpoints and rejoins them from a rebuilt image.
-  - Open: no chaos case wipes all three sealers and then starts them from a seed. `cluster-total-loss-recover` keeps their logs. The seeded start has in-process tests and no deploy switch (see "Data-availability recovery").
+  - `sealer-fleet-total-wipe-recover` covers the sealers: it wipes all three and starts them from a seed rebuilt from L1 (see "Sealer fleet rebuild (every sealer wiped)").
+  - Open: no chaos rebuild passes `--lockbox`, because the suite never deposits. The e2e scenario `da_parity_batcher_matches_validator` proves a deposit in the rebuild.
+  - Open: the chaos cluster deploys no output attester. No case proves the attester after a rollback.
 - **Archive *data* loss**
   - Total loss has the rebuild from L1 (`reconstruct_l1_e2e`).
   - The loss of the `tx_data` archive of one node has the re-replication from the peer (`archive-tx-data-wipe` and `kardamom-archive-rereplicate`).

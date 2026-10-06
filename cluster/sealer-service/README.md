@@ -342,7 +342,11 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - With no budget (`0`), nothing bounds the stretch.
   - Use the same value on every member, so the replay range does not change after a failover.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
-- The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes`, `joinWatchdogS` or `seedSnapshot`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
+- `seedSnapshot`: the deploy passes the job variable `cluster_seed_snapshot`.
+  - The variable is empty in a normal deploy. An empty path means no seed.
+  - When the variable is set, the deploy passes an empty `remoteOrigins`.
+  - Every member mounts `/opt/kardamom/seed` read-only. The procedure is the runbook [`sealer-fleet-rebuild`](../../docs/runbooks/sealer-fleet-rebuild.md).
+- The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes` or `joinWatchdogS`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
 - The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, and the application version is 0.3.0.
 
 ## Admin server

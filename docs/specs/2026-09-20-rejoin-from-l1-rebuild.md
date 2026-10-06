@@ -147,7 +147,11 @@ transactions) need more slots than `end_tx_idx` minus the previous end is refuse
 is not required: a voided entry and its void record take slots, apply nothing, and never
 reach the payload. So a missing deposit passes the slot check and fails the root check.
 Without `--lockbox` the rebuild leaves deposits out. The chaos suite never deposits and
-does not pass the flag.
+does not pass the flag, also in `sealer-fleet-total-wipe-recover`. With the flag, the slot
+check also refuses a block whose origin step names more epochs than the chain holds. A
+chain that lost an epoch to an earlier fault has fewer, for example after a da-watcher
+restart, which starts at the L1 tip. The e2e scenario `da_parity_batcher_matches_validator`
+proves the deposit path.
 
 ## 6. Proof
 
@@ -164,3 +168,7 @@ does not pass the flag.
   checkpoints, the harness rebuilds an executor image from L1 on the host, installs it on
   each node, and the executors resume from it with no checkpoint restore; the recovery
   probe and the end-of-shard persisted-state audit then prove the result.
+- Chaos, `sealer-fleet-total-wipe-recover`: all three sealer members lose their
+  directories. The members start from the seed at the posted head, the executors and the
+  validator resume on the rebuilt state at `(E_H, H + 1)`, an executor that keeps the old
+  chain gets `REPLAY_AHEAD`, and the da-watcher resumes after the seed's L1 origin.

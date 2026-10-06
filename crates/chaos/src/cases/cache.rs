@@ -581,8 +581,9 @@ pub(crate) async fn mirror_kill_rebuild(h: &mut Harness) -> anyhow::Result<()> {
 /// stays cold until the kill that follows. A kill before the flush
 /// races it: Nomad restarts a mirror after 5 s, and a mirror that starts
 /// before the flush finds the live heads and resumes with no rebuild.
-/// Returns the flushed primary.
-async fn freeze_and_flush(
+/// With the mirror job stopped, `mirrors` is empty and only the flush
+/// runs. Returns the flushed primary.
+pub(crate) async fn freeze_and_flush(
     h: &Harness,
     ctx: &str,
     mirrors: &[(String, String)],

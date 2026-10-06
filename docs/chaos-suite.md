@@ -59,7 +59,7 @@ There are eleven shards. `just container-test` lists their names.
 | `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | `RUN_LOAD=0` |
 | `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout`, `resize-scale-out-in` | `RUN_LOAD=0` |
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
-| `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover` | `RUN_LOAD=0` |
+| `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
@@ -68,7 +68,7 @@ There are eleven shards. `just container-test` lists their names.
 Case order matters in four places.
 
 - `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version.
-- `cluster-total-loss-recover` runs last in `chaos-fleet`. A failure there must not hide the executor cases.
+- `sealer-fleet-total-wipe-recover` runs last in `chaos-fleet`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the other cases.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. It can leave an entry that no archive serves.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 
@@ -125,6 +125,9 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`redis-total-loss-recover`](failure-modes.md#redis-account-cache): the whole Redis job stops. Every state mirror must rebuild.
 - [`cluster-quorum-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): two sealer members die. The pipeline must stall, then recover.
 - [`cluster-total-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): all three sealer members die and return with their logs.
+- [`sealer-fleet-total-wipe-recover`](failure-modes.md#proof-sealer-fleet-total-wipe-recover): all three sealer members lose their directories. The chain restarts after the posted head from a seed and a state rebuilt from L1. The blocks after the posted head are reverted.
+  - The ingresses stay down for the whole rebuild. So the case load gets 120 submit retries, as `da-lag-halt` does.
+  - On a failure, the case deletes the bootstrap variable and registers every saved job again. This is best effort.
 
 **Coordinated shard**
 
@@ -289,6 +292,9 @@ The audit compares the persisted state of every executor with the validator. It 
 6. **Restore the jobs.** The suite restores the sealer, executor and validator jobs on pass and on failure.
 7. **Rebuild from L1.** With the jobs back, the suite runs `kardamom-reconstruct --through-block <head> --expect-root <validator root>`.
    - The batcher posts a block a few seconds after it seals. The suite retries for up to 180 s while the posted batches end before the target.
+   - The 180 s count only the 5 s sleeps between the attempts, not the run time of an attempt.
+   - Any other failure of the tool ends the rebuild at once, because a retry reads the same record. The log shows the error chain of the tool.
+   - The rebuilds of the suite pass no `--lockbox`. The suite never deposits.
    - The rebuilt root must equal the root of the validator.
    - The rebuilt resume cursor must equal the cursor of the validator. A consumer that resumes on the rebuilt state would otherwise skip records or apply them twice.
 
@@ -454,5 +460,6 @@ Other evidence on a failure:
 
 - A divergence halt prints the divergence evidence and the flight-recorder dumps of the validator.
 - A rebuild that misses the target prints the first warnings and errors of the batcher.
+- A rebuild that the tool refuses prints the error chain of the tool.
 - A failed persisted-state audit keeps its evidence directory.
 - When you read a failure, tell "the pipeline stalled" from "the probes went dark" first. [`failure-modes.md`](failure-modes.md#substrate-the-shared-failure-domain) explains the difference.

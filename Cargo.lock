@@ -3874,6 +3874,7 @@ dependencies = [
  "jsonrpsee",
  "kardamom-bench",
  "kardamom-l1-fault-proxy",
+ "kardamom-reconstruct",
  "kardamom-state",
  "kardamom-types",
  "reqwest 0.13.4",
