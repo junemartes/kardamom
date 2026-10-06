@@ -195,16 +195,19 @@ pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> a
 }
 
 /// The operator step a single-source follower needs after a wrong hash
-/// reached its anchor: the da-watcher's anchor is in memory, so a
-/// restart clears it; the indexer's cursor is on disk with the wrong
-/// hash, so its archive is re-indexed from the chain's first block. The
-/// two-source followers never store an unagreed hash, which removes
-/// this step.
+/// reached its anchor. Both cursors are on disk with the wrong hash: the
+/// da-watcher's cursor file is removed before its restart, so it seeds
+/// at the finalized tip, and the indexer's archive is re-indexed from
+/// the chain's first block. The two-source followers never store an
+/// unagreed hash, which removes this step.
 pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
     crate::log(format!(
-        "{ctx}: OPERATOR STEP (removed by the two-source followers): restart the da-watcher, re-index the archive"
+        "{ctx}: OPERATOR STEP (removed by the two-source followers): reset the da-watcher's cursor, re-index the archive"
     ));
     let aux = h.probes.validator.container.clone();
+    // A watcher halted on the wrong hash publishes nothing, so it does not
+    // write the file again before the kill.
+    wipe_dirs(h, &aux, ctx, "rm -f /opt/kardamom/da-watcher/l1-cursor").await?;
     h.inject_hard(&[&aux], "da-watcher").await?;
     h.assert_count("da-watcher", 1, h.knobs.restart_slo).await?;
     let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;

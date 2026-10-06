@@ -153,6 +153,7 @@ paths:
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
+  da_watcher_dir: /opt/kardamom/da-watcher # the da-watcher's L1 cursor file
   l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor
   da_store_dir: /opt/kardamom/da-store     # the DA stand-in's payloads (no EigenDA network)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis

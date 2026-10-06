@@ -203,6 +203,17 @@ groups:
           description: "The sealer emits no block boundary: the cluster has no leader or no quorum. Nothing is ordered; the ingresses and the sequencers pause on it. The ingress observes the sealer and exports this halt. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/sealer_no_quorum.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/sealer_no_quorum.md"
 
+      - alert: KardamomHaltL1CursorUnreadable
+        expr: kardamom_halt{cause="l1_cursor_unreadable"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_cursor_unreadable
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_cursor_unreadable ({{ $labels.host_id }})"
+          description: "The da-watcher's L1 cursor file exists, but it does not read or parse. The da-watcher publishes no epoch, so deposits wait. It never guesses a resume block. Find the last published L1 block, write the file again, then clear the halt. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_cursor_unreadable.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_cursor_unreadable.md"
+
       - alert: KardamomHaltValidatorDivergence
         expr: kardamom_halt{cause="validator_divergence"} == 1
         for: 0m

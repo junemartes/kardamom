@@ -270,12 +270,13 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltReplayUnavailable` | critical | `kardamom_halt{cause="replay_unavailable"} == 1`. |
 | `KardamomHaltDaLag` | critical | `kardamom_halt{cause="da_lag"} == 1`. |
 | `KardamomHaltSealerNoQuorum` | critical | `kardamom_halt{cause="sealer_no_quorum"} == 1`. |
+| `KardamomHaltL1CursorUnreadable` | critical | `kardamom_halt{cause="l1_cursor_unreadable"} == 1`. |
 | `KardamomHaltValidatorDivergence` | critical | `kardamom_halt{cause="validator_divergence"} == 1`. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The seven `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`).
+- The eight `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`).
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
   - The description names the cause, the `/halt` URL of the service, and the runbook.
@@ -353,6 +354,7 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 | `kardamom_da_watcher_epochs_published_total` | Epochs published. One for each finalized L1 block. |
 | `kardamom_da_watcher_deposits_detected_total` | Deposit publishes. A range that is retried after back-pressure counts again. |
 | `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last tick. The readiness rule uses it. |
+| `kardamom_da_watcher_l1_cursor_persist_failures_total` | Failed writes of the L1 cursor file. A failure is not fatal: a restart publishes epochs again, and the sealer drops them. A growing count moves the restart point further back. |
 
 - A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.
 - The interop watcher exports `kardamom_da_watcher_remote_*` counters with the label `origin` (the peer chain id).

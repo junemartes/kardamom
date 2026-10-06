@@ -22,7 +22,8 @@ transaction there was confirmed to its sender and is undone. Run it only after
 ## Steps
 
 1. Stop the ingress replicas. No new transaction enters while the chain
-   reverts.
+   reverts. Stop the da-watcher. It must not publish epochs of the reverted
+   chain to the new sealers.
 2. List the revoked receipts: for every block in `H + 1 ..= sealed head`, read
    the receipts from the state database of an executor. Keep the list. The senders are told from it.
 3. Take a consistent cut. The chain's lane cursors must not deliver a message
@@ -53,15 +54,21 @@ transaction there was confirmed to its sender and is undone. Run it only after
    - The chain keeps its genesis and its settlement contract.
 7. Install the rebuilt state on every executor and the validator, with their
    checkpoints removed, and start them. Each resumes at the cursor of `H`.
-8. Reset the batcher: its cursor file and its spool. Clear its halt. It
+8. Reset the da-watcher. Its L1 cursor file holds an epoch of the reverted
+   chain, past `M`, the L1 origin of `H`.
+   - Read `M` from the seed file, as step 2 of `sealer-fleet-rebuild.md` shows.
+   - Remove the file on the aux node: `rm -f /opt/kardamom/da-watcher/l1-cursor`.
+   - Start the da-watcher with `--l1-resume-after M`, as step 6.4 of
+     `sealer-fleet-rebuild.md` shows. Remove the flag at the next deploy.
+9. Reset the batcher: its cursor file and its spool. Clear its halt. It
    reconciles against L1 at batch `lastBatchIndex` and continues from `H + 1`.
-9. Start the ingress replicas. The chain seals again from `H + 1`.
-10. Verify: the rebuilt state root at `H` equals the validator's root at `H`,
+10. Start the ingress replicas. The chain seals again from `H + 1`.
+11. Verify: the rebuilt state root at `H` equals the validator's root at `H`,
     and the first new batch posts with `l2BlockStart == H + 1`.
-11. Publish the list of revoked receipts to the senders.
+12. Publish the list of revoked receipts to the senders.
 
 ## Clear
 
 The revert clears the `replay_unavailable` halt of the batcher through
-`POST /halt/clear` on its node (step 8). No other halt stands after the chain
+`POST /halt/clear` on its node (step 9). No other halt stands after the chain
 seals again. Record the revert, its range, and the time it took.

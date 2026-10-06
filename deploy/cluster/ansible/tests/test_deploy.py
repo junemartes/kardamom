@@ -346,6 +346,16 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
+        # A restart resumes after the last published L1 block only when the
+        # cursor file outlives the container.
+        self.run_deploy(check=True)
+        task = self.api.state['plans']['da-watcher']['TaskGroups'][0]['Tasks'][0]
+        self.assertIn('/opt/kardamom/da-watcher:/opt/kardamom/da-watcher', task['Config']['volumes'])
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--l1-cursor-file') + 1], '/opt/kardamom/da-watcher/l1-cursor')
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']

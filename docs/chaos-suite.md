@@ -147,6 +147,9 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 **L1 shard**
 
 - [`l1-liar`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
+  - The wrong hash halts the single-source followers. The case then does the operator step.
+  - It removes the L1 cursor file of the da-watcher and restarts the da-watcher. The da-watcher seeds at the finalized tip.
+  - It re-indexes the archive of the indexer from the first block of the chain.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.
