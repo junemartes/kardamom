@@ -58,6 +58,14 @@ throughput**. The default (`1 << 17` = 131072, see
 the window is part of the deterministic state machine, and a snapshot never
 loads into a smaller window than it was taken with.
 
+At a full window the sealer refuses a transaction record with a window-full
+reject, and the sequencer republishes it. The sealer does not refuse an epoch
+record or a remote-origin record. Nothing republishes them, so a refusal would
+lose the deposits. They are few: one per L1 block or peer batch. The window
+holds each for one inclusion horizon, so it grows above `dedupCapacity` by
+only the markers of that horizon. A snapshot loads with up to 4096 ids above
+`dedupCapacity` for the same reason.
+
 ## Build & test
 
 Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on
