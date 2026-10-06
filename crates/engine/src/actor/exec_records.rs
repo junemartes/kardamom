@@ -14,19 +14,12 @@ use crate::executor::execute_xchain_tx;
 use kardamom_exec_core::exec_types::TxSlot;
 use kardamom_exec_core::executor::XChainDelivery;
 
+use super::exec_block::{BlockRun, Streaming};
 use super::exec_thread::{ExecState, Flow};
 use super::types::{BufferedRecord, ExecToCommit};
 use super::wiring::{ExecPorts, SnapshotDb};
 
 impl<W: ExecPorts> ExecState<W> {
-    /// Buffer `rec` for the whole-block strategy to replay at the
-    /// boundary, instead of executing it now. Returns the `Flow::Continue`
-    /// the caller must return immediately, with no further work this call.
-    fn defer(&mut self, rec: BufferedRecord) -> Flow {
-        self.block.buffered.push(rec);
-        Flow::Continue
-    }
-
     /// Allot the next absolute record index. Every arm calls this once per
     /// record, in arrival order, so the counter is the canonical record
     /// count the boundary check compares against.
@@ -59,8 +52,8 @@ impl<W: ExecPorts> ExecState<W> {
     ///
     /// This takes `scope` and the read-side fields as separate borrows,
     /// not `&mut self`, so the caller keeps disjoint access to its other
-    /// fields (for example `bal_tx`, `tx_index_in_block`) while the
-    /// returned scope stays borrowed.
+    /// fields (for example `bal`, `tx_index`) while the returned scope
+    /// stays borrowed.
     fn scope_or_init<'a>(
         scope: &'a mut Option<crate::executor::Executor<SnapshotDb<W>>>,
         snapshots: &W::Snapshots,
@@ -141,19 +134,22 @@ impl<W: ExecPorts> ExecState<W> {
             return Err(e);
         }
         self.block.refs.push(tx_ref);
-        if self.hooks.block_exec.is_some() {
+        let env = self.exec_env(self.cursor.block);
+        let Streaming { scope, shadow } = match &mut self.block.run {
             // Whole-block strategy: defer to the boundary, so batches can
             // execute concurrently.
-            return Ok(self.defer(BufferedRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            }));
-        }
-        let env = self.exec_env(self.cursor.block);
+            BlockRun::Whole(whole) => {
+                return Ok(whole.defer(BufferedRecord::Tx {
+                    tx_idx,
+                    envelope,
+                    position,
+                }));
+            }
+            BlockRun::Streaming(streaming) => &mut **streaming,
+        };
         let apply_start = Instant::now();
         let sc = Self::scope_or_init(
-            &mut self.block.scope,
+            scope,
             &self.io.snapshots,
             self.commits.parent.as_ref(),
             &self.block.delta,
@@ -162,9 +158,7 @@ impl<W: ExecPorts> ExecState<W> {
         )?;
         // Shadow read capture: build a default TouchSet only when the
         // shadow is on. The None path costs nothing.
-        let mut touches = self
-            .hooks
-            .shadow_tx
+        let mut touches = shadow
             .as_ref()
             .map(|_| crate::executor::TouchSet::default());
         let slot = TxSlot {
@@ -176,55 +170,23 @@ impl<W: ExecPorts> ExecState<W> {
         let result = sc.execute_tx(
             slot,
             &envelope,
-            self.hooks
-                .bal_tx
-                .as_ref()
-                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
+            self.block
+                .bal
+                .as_mut()
+                .map(|capture| capture.slot(self.block.tx_index)),
             touches.as_mut(),
         );
-        // This log fires only for a successful tx. On error, the `if let
-        // Ok` guard skips it, and `record_applied` below returns the error.
-        if let Ok((_, ws)) = &result {
-            self.log_bal_progress(ws);
+        // These fire only for a successful tx. On error, the `if let Ok`
+        // guards skip them, and `record_applied` below returns the error.
+        // The shadow capture runs before `record_applied` consumes the
+        // `WriteSet`.
+        if let (Some(capture), Ok((_, ws))) = (&self.block.bal, &result) {
+            capture.log_progress(self.cursor.block, self.block.tx_index, ws);
         }
-        self.capture_shadow(&envelope, touches.take(), &result);
+        if let (Some(shadow), Some(touches), Ok((receipt, ws))) = (shadow, touches, &result) {
+            shadow.capture(&envelope, touches, receipt, ws);
+        }
         self.record_applied("execute_tx", position, result, apply_start)
-    }
-
-    /// Log BAL capture progress every 512 txs, when a BAL publisher is
-    /// attached.
-    fn log_bal_progress(&self, ws: &WriteSet) {
-        if self.hooks.bal_tx.is_some() && self.block.tx_index.is_multiple_of(512) {
-            tracing::debug!(
-                block = self.cursor.block,
-                tx_index_in_block = self.block.tx_index,
-                bal_accounts = self.block.bal.accounts.len(),
-                ws_accounts = ws.accounts.len(),
-                "BAL capture progress"
-            );
-        }
-    }
-
-    /// Capture the shadow data for one tx, when the shadow is on and the
-    /// tx applied. Called before `record_applied` consumes the `WriteSet`.
-    /// Cloning the envelope is just a refcount increment. Cell extraction
-    /// is one pass over the small per-tx sets.
-    fn capture_shadow(
-        &mut self,
-        envelope: &TxEnvelope,
-        touches: Option<crate::executor::TouchSet>,
-        result: &Result<(kardamom_types::Receipt, WriteSet), ExecutorError>,
-    ) {
-        if let (Some(t), Ok((receipt, ws))) = (touches, result) {
-            self.block
-                .shadow_captures
-                .push(crate::shadow::ShadowTxCapture {
-                    envelope: envelope.clone(),
-                    gas_used: receipt.gas_used,
-                    touches: t,
-                    write_cells: crate::shadow::write_cells(ws),
-                });
-        }
     }
 
     /// A deposit has no wire position of its own: its slot index is its
@@ -232,20 +194,23 @@ impl<W: ExecPorts> ExecState<W> {
     pub(super) fn on_deposit(&mut self, deposit: Deposit) -> Result<Flow, ExecutorError> {
         let tx_idx = self.next_idx()?;
         let position = BPosition::from_index(tx_idx.0);
-        if self.hooks.block_exec.is_some() {
-            return Ok(self.defer(BufferedRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            }));
-        }
         let env = self.exec_env(self.cursor.block);
+        let Streaming { scope, shadow } = match &mut self.block.run {
+            BlockRun::Whole(whole) => {
+                return Ok(whole.defer(BufferedRecord::Deposit {
+                    tx_idx,
+                    deposit,
+                    position,
+                }));
+            }
+            BlockRun::Streaming(streaming) => &mut **streaming,
+        };
         let apply_start = Instant::now();
         // Deposits run ON the block scope (same lazy init as `on_tx`): the
         // mint and the inner call commit into the block cache, so later
         // txs observe them with no fold-back layer.
         let sc = Self::scope_or_init(
-            &mut self.block.scope,
+            scope,
             &self.io.snapshots,
             self.commits.parent.as_ref(),
             &self.block.delta,
@@ -261,15 +226,13 @@ impl<W: ExecPorts> ExecState<W> {
         let result = sc.execute_deposit(
             slot,
             &deposit,
-            self.hooks
-                .bal_tx
-                .as_ref()
-                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
+            self.block
+                .bal
+                .as_mut()
+                .map(|capture| capture.slot(self.block.tx_index)),
         );
-        // Shadow: deposits take the serial barrier lane (spec strategy 1).
-        // The code counts them; it does not model them.
-        if self.hooks.shadow_tx.is_some() && result.is_ok() {
-            self.block.shadow_serial += 1;
+        if let (Some(shadow), Ok(_)) = (shadow, &result) {
+            shadow.count_serial();
         }
         self.record_applied("execute_deposit_tx", position, result, apply_start)
     }
@@ -283,19 +246,22 @@ impl<W: ExecPorts> ExecState<W> {
     ) -> Result<Flow, ExecutorError> {
         let tx_idx = self.next_idx()?;
         let position = BPosition::from_index(tx_idx.0);
-        if self.hooks.block_exec.is_some() {
+        let env = self.exec_env(self.cursor.block);
+        let scope = match &mut self.block.run {
             // Whole-block execution (the validator's parallel path): buffer
             // like a deposit — the strategy replays the block's records in
             // canonical order at the boundary, dispatching this arm through
             // the SAME `execute_xchain_tx` the streaming path uses.
-            return Ok(self.defer(BufferedRecord::XChain {
-                tx_idx,
-                origin_chain_id,
-                message,
-                position,
-            }));
-        }
-        let env = self.exec_env(self.cursor.block);
+            BlockRun::Whole(whole) => {
+                return Ok(whole.defer(BufferedRecord::XChain {
+                    tx_idx,
+                    origin_chain_id,
+                    message,
+                    position,
+                }));
+            }
+            BlockRun::Streaming(streaming) => &mut streaming.scope,
+        };
         let apply_start = Instant::now();
         let slot = TxSlot {
             tx_idx,
@@ -313,15 +279,15 @@ impl<W: ExecPorts> ExecState<W> {
                 origin_chain_id,
                 message: &message,
             },
-            self.hooks
-                .bal_tx
-                .as_ref()
-                .map(|_| (&mut self.block.bal, self.block.tx_index + 1)),
+            self.block
+                .bal
+                .as_mut()
+                .map(|capture| capture.slot(self.block.tx_index)),
         );
         // Like deposits, the delivery runs outside the scope (own commit
         // semantics) — fold its writes into the block cache so later txs
         // in this block observe them.
-        if let (Some(sc), Ok((_, ws))) = (self.block.scope.as_mut(), &result) {
+        if let (Some(sc), Ok((_, ws))) = (scope.as_mut(), &result) {
             let mut layer = PendingDelta::new();
             layer.apply(ws.clone());
             sc.seed_layer(&layer)?;
