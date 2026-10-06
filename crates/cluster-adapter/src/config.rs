@@ -68,6 +68,17 @@ impl ClusterConfig {
     pub fn to_live(&self) -> LiveClusterConfig {
         self.clone().into()
     }
+
+    /// Set `egress_channel` to `aeron:udp?endpoint=<endpoint>` when
+    /// `endpoint` is `Some`. The egress channel is the node's own
+    /// reachable address, which differs per replica. So the deploy passes
+    /// it per node as `--cluster-egress-endpoint`, and the static config
+    /// file does not hold it.
+    pub fn set_egress_endpoint(&mut self, endpoint: Option<&str>) {
+        if let Some(ep) = endpoint {
+            self.egress_channel = format!("aeron:udp?endpoint={ep}");
+        }
+    }
 }
 
 impl From<ClusterConfig> for LiveClusterConfig {
@@ -106,6 +117,18 @@ mod tests {
         assert_eq!(c.ingress_stream_id, Some(101));
         assert_eq!(c.egress_stream_id, Some(102));
         assert_eq!(c.keep_alive_interval_ms, NonZeroU64::new(1000));
+    }
+
+    #[test]
+    fn egress_endpoint_sets_the_channel_only_when_given() {
+        let mut c = ClusterConfig {
+            egress_channel: "aeron:udp?endpoint=file:1".into(),
+            ..ClusterConfig::default()
+        };
+        c.set_egress_endpoint(None);
+        assert_eq!(c.egress_channel, "aeron:udp?endpoint=file:1");
+        c.set_egress_endpoint(Some("10.0.0.7:40123"));
+        assert_eq!(c.egress_channel, "aeron:udp?endpoint=10.0.0.7:40123");
     }
 
     #[test]

@@ -68,7 +68,6 @@ is absent or ambiguous on the host fails startup.
 | Variable | Meaning |
 | --- | --- |
 | `NOMAD_ALLOC_ID` | The instance id. Every service id of a process starts with it. Absent in a local run, where a process id and clock stamp replace it. |
-| `KARDAMOM_MDC_PORTS` | The UDP port range `first-last` the process's publications bind. Absent, the OS picks a port per publication. Every port is bind-probed before it is advertised. |
 | `CONSUL_HTTP_TOKEN`, then `CONSUL_TOKEN` | The ACL token, when `consul_token_file` is unset. `CONSUL_TOKEN` is the name Nomad sets on a task with a Consul workload identity. Absent, no token is sent. |
 
 On the ACL profile the token needs `service:write` on
@@ -187,10 +186,13 @@ restarting. `ansible/contract.yml` checks the chain id mirror, the
 placeholders, the role tag, and the node meta the Nomad agent template
 stamps.
 
-The Nomad jobs leave `KARDAMOM_MDC_PORTS` unset. The OS picks the
-control port of each publication, and the publisher record carries it. A
-fixed range sat in the node's ephemeral range, where a port-0 socket of
-the shared media driver could take a port first.
+No job configures a publication control port. Each publication names
+port 0 in its control endpoint, and the media driver binds an OS-chosen
+port. The runtime reads the bound address back from the driver's
+local-sockaddr counter (`aeron_publication_local_sockaddrs`), and the
+publisher record carries that address. The driver holds the socket from
+the bind on, so no other socket can take the port before the record is
+registered.
 
 | Job | Publications |
 | --- | --- |

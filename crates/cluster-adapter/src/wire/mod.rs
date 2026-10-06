@@ -50,16 +50,19 @@ mod tests;
 
 pub use egress::{
     EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
-    encode_replay_done, encode_replay_unavailable,
+    encode_replay_ahead, encode_replay_done, encode_replay_unavailable,
 };
 #[cfg(any(test, feature = "testing"))]
-pub use egress::{encode_contiguity_reject, encode_past_deadline, encode_window_full};
+pub use egress::{
+    encode_contiguity_reject, encode_da_lag_reject, encode_past_deadline, encode_status,
+    encode_window_full,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_remote_epoch,
-    encode_ingress_txref, encode_replay_request, encode_subscribe, encode_void_request,
-    ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
+    GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
+    encode_ingress_remote_epoch, encode_ingress_txref, encode_replay_request, encode_subscribe,
+    encode_void_request, ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
 };
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
@@ -152,6 +155,14 @@ pub const KIND_REMOTE_ORIGIN_RECORD: u8 = 5;
 /// has no identity, so the frame carries the `voter_id`. Kind 6 because 0–5
 /// are taken. Matches Java `KIND_VOID_REQUEST`.
 pub const KIND_VOID_REQUEST: u8 = 6;
+
+/// Ingress kind: the batcher's posted cursor, a system record:
+/// `[kind:u8 = 7][posted_head:u64]`. The last L2 block the batcher
+/// confirmed on L1. The sealer adopts it as the floor of its DA-lag guard
+/// and of its egress retention, and fans the resulting
+/// [`EGRESS_KIND_STATUS`] out to every session. Matches Java
+/// `KIND_POSTED_CURSOR`.
+pub const KIND_POSTED_CURSOR: u8 = 7;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the
@@ -175,6 +186,13 @@ pub const EGRESS_KIND_REPLAY_UNAVAILABLE: u8 = 3;
 /// at completion time. The consumer exits catch-up ordering mode. Matches
 /// Java `EGRESS_KIND_REPLAY_DONE`.
 pub const EGRESS_KIND_REPLAY_DONE: u8 = 4;
+/// Egress kind: replay refused, because the requested cursor is past the
+/// sealer's head: `[kind:u8 = 11][head_index:u64][head_block:u64]`. The
+/// head is the next canonical index and the next block number, as in
+/// [`EGRESS_KIND_REPLAY_DONE`]. The consumer applied records that the
+/// sealer does not hold, so no replay and no repair from this stream can
+/// serve it. The consumer stops. Matches Java `EGRESS_KIND_REPLAY_AHEAD`.
+pub const EGRESS_KIND_REPLAY_AHEAD: u8 = 11;
 /// Egress kind: contiguity reject. A known sender's ingress record
 /// carried a nonce other than the expected next one, so sealing it would
 /// commit a canonical nonce gap:
@@ -208,6 +226,21 @@ pub const EGRESS_KIND_PAST_DEADLINE: u8 = 7;
 /// next tick that passes a deadline, and the sequencer republishes.
 /// Matches Java `EGRESS_KIND_WINDOW_FULL`.
 pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
+
+/// Egress kind: the chain's data-availability status, broadcast to every
+/// session on every boundary tick, on every posted cursor, and to a
+/// session that announces itself:
+/// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`.
+/// The ingress serves `safe` from the posted head and raises its `da_lag`
+/// halt from the flag. Not retained. Matches Java `EGRESS_KIND_STATUS`.
+pub const EGRESS_KIND_STATUS: u8 = 9;
+
+/// Egress kind: the DA-lag guard refused a record:
+/// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.
+/// Offered only to the offering session. The record is not ordered; the
+/// sequencer drops it and tells the client, which resubmits after the
+/// batcher posts again. Matches Java `EGRESS_KIND_DA_LAG_REJECT`.
+pub const EGRESS_KIND_DA_LAG_REJECT: u8 = 10;
 
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
@@ -376,8 +409,9 @@ pub enum WireError {
 
 /// Encode the shared `[kind:u8][a:u64 LE][b:u64 LE]` control frame. The
 /// replay request ([`KIND_REPLAY_REQUEST`]), replay-unavailable
-/// ([`EGRESS_KIND_REPLAY_UNAVAILABLE`]), and replay-done
-/// ([`EGRESS_KIND_REPLAY_DONE`]) messages are byte-identical, apart from
+/// ([`EGRESS_KIND_REPLAY_UNAVAILABLE`]), replay-done
+/// ([`EGRESS_KIND_REPLAY_DONE`]), and replay-ahead
+/// ([`EGRESS_KIND_REPLAY_AHEAD`]) messages are byte-identical, apart from
 /// the kind byte.
 fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 8 + 8);

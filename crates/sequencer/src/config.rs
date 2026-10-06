@@ -70,8 +70,9 @@ pub struct SequencerConfig {
     /// `-Dkardamom.cluster.dedupCapacity`.
     #[serde(default)]
     pub resync: crate::resync::ResyncConfig,
-    /// The nonce lookup from an executor. Off when the endpoint list is
-    /// empty. See `crate::lookup`.
+    /// The nonce lookup for a parked sender: the local account layer, then
+    /// Redis, then an executor. Off, with all three layers, when the
+    /// executor endpoint list is empty. See `crate::lookup`.
     #[serde(default)]
     pub lookup: crate::lookup::LookupConfig,
     /// The `[fees]` section: priority fees on or off.

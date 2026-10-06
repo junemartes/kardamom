@@ -27,10 +27,10 @@ use crate::meta::{
     read_meta_u64,
 };
 use crate::schema::{
-    TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
-    TABLE_TX_HASH_INDEX, decode_account_value, decode_header_value, decode_receipt_value,
-    decode_storage_value, decode_tx_hash_value, encode_account_key, encode_block_key,
-    encode_code_key, encode_storage_key, encode_tx_hash_key,
+    HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
+    TABLE_STORAGE, TABLE_TX_HASH_INDEX, decode_account_value, decode_header_value,
+    decode_receipt_value, decode_storage_value, decode_tx_hash_value, encode_account_key,
+    encode_block_key, encode_code_key, encode_storage_key, encode_tx_hash_key,
 };
 use crate::schema::{for_each_range, for_each_row};
 use kardamom_types::receipt::TX_TYPE_DEPOSIT;
@@ -140,11 +140,7 @@ impl StateSnapshot {
     /// references: this node rebuilt the block from L1, or a transaction
     /// other than a deposit has no reference.
     pub fn block_refs(&self, number: u64) -> Result<Option<BlockRefs>, StateError> {
-        let txn = &self.inner.txn;
-        let headers = txn.open_db(Some(TABLE_HEADERS))?;
-        let Some(header) =
-            get_decoded(txn, headers, &encode_block_key(number), decode_header_value)?
-        else {
+        let Some(header) = self.header(number)? else {
             return Ok(None);
         };
         if self
@@ -160,24 +156,19 @@ impl StateSnapshot {
         // own. The chain's first block starts at position zero.
         let start = match number.checked_sub(1).filter(|n| *n > 0) {
             Some(previous) => {
-                get_decoded(
-                    txn,
-                    headers,
-                    &encode_block_key(previous),
-                    decode_header_value,
-                )?
-                .ok_or_else(|| {
-                    StateError::Recovery(format!(
-                        "block {number} has no predecessor header; its start is unknown"
-                    ))
-                })?
-                .end_tx_idx
+                self.header(previous)?
+                    .ok_or_else(|| {
+                        StateError::Recovery(format!(
+                            "block {number} has no predecessor header; its start is unknown"
+                        ))
+                    })?
+                    .end_tx_idx
             }
             None => BPosition::ZERO,
         };
         let mut refs = Vec::new();
         for_each_range(
-            txn,
+            &self.inner.txn,
             self.inner.receipts_db,
             &encode_b_position(start),
             &encode_b_position(header.end_tx_idx),
@@ -268,9 +259,26 @@ impl StateSnapshot {
         )
     }
 
+    /// The header of block `number`, or `None` for a block this snapshot
+    /// has not committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the table open, the read, or the decode
+    /// fails.
+    pub fn header(&self, number: u64) -> Result<Option<HeaderValue>, StateError> {
+        let txn = &self.inner.txn;
+        let headers = txn.open_db(Some(TABLE_HEADERS))?;
+        get_decoded(txn, headers, &encode_block_key(number), decode_header_value)
+    }
+
     /// The end of the last block this node rebuilt from L1, or `None` when
     /// it rebuilt none. See `meta::KEY_L1_REBUILT_END_TX_POSITION`.
-    fn l1_rebuilt_end(&self) -> Result<Option<BPosition>, StateError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the `meta` table open or read fails.
+    pub fn l1_rebuilt_end(&self) -> Result<Option<BPosition>, StateError> {
         let meta = self.inner.txn.open_db(Some(TABLE_META))?;
         read_meta_b_position(&self.inner.txn, meta, KEY_L1_REBUILT_END_TX_POSITION)
     }

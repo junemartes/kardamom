@@ -149,8 +149,10 @@ pub(crate) struct Args {
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     pub(crate) host_id: String,
 
-    // --- L1 output attestation: all three flags are required to enable it. ---
-    /// L1 JSON-RPC endpoint the attester posts withdrawal outputs to.
+    // --- L1 access: the epoch check and the output attester. ---
+    /// L1 JSON-RPC endpoint. With `--lockbox`, the epoch check reads L1
+    /// here. With `--output-oracle` and `--attester-key`, the attester
+    /// posts withdrawal outputs here.
     #[arg(long, env = "KARDAMOM_L1_RPC_URL", value_parser = parse_l1_rpc_url)]
     pub(crate) l1_rpc_url: Option<reqwest::Url>,
     /// Address of the deployed `WithdrawalOutputOracle` proxy.
@@ -234,6 +236,45 @@ pub(crate) struct Args {
     /// (`host:port` + newline), for harnesses that pass port 0.
     #[arg(long, env = "KARDAMOM_SERVE_FEED_ADDR_FILE")]
     pub(crate) serve_feed_addr_file: Option<PathBuf>,
+}
+
+/// The flags of the L1 output attester, when it is on.
+#[derive(Debug, Clone)]
+pub(crate) struct AttesterArgs {
+    pub(crate) l1_rpc_url: reqwest::Url,
+    pub(crate) oracle: alloy_primitives::Address,
+    pub(crate) key: AttesterKey,
+}
+
+impl Args {
+    /// The attester's flags. `--output-oracle` and `--attester-key` turn
+    /// the attester on together, and it then needs `--l1-rpc-url` too.
+    /// `--l1-rpc-url` alone serves the epoch check and leaves the
+    /// attester off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if only one of `--output-oracle` and
+    /// `--attester-key` is given, or if both are given without
+    /// `--l1-rpc-url`.
+    pub(crate) fn attester(&self) -> Result<Option<AttesterArgs>> {
+        match (self.output_oracle, self.attester_key.clone()) {
+            (None, None) => Ok(None),
+            (Some(oracle), Some(key)) => {
+                let l1_rpc_url = self.l1_rpc_url.clone().context(
+                    "attestation needs --l1-rpc-url with --output-oracle and --attester-key",
+                )?;
+                Ok(Some(AttesterArgs {
+                    l1_rpc_url,
+                    oracle,
+                    key,
+                }))
+            }
+            _ => anyhow::bail!(
+                "attestation needs --output-oracle and --attester-key together (got only one)"
+            ),
+        }
+    }
 }
 
 /// The attester's private key, parsed once at the CLI boundary: `env:VAR`
@@ -349,3 +390,6 @@ impl std::fmt::Display for WorkerCount {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

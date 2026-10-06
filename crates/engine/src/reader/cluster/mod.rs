@@ -18,8 +18,11 @@ use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage, VoidRecor
 use crate::ExecutorError;
 use crate::reader::TxOrderingSubscription;
 
-use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
+use kardamom_cluster_adapter::gateway::{ClusterEgress, ClusterIngress};
 use kardamom_cluster_adapter::wire::{self, EgressItem};
+// The outcome of an ingress offer, public for a binary that publishes the
+// posted cursor without a direct `kardamom-cluster-adapter` dependency.
+pub use kardamom_cluster_adapter::gateway::OfferOutcome;
 
 use kardamom_cluster_adapter::{
     LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, live,
@@ -127,6 +130,37 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
     }
 }
 
+impl<E: ClusterEgress, I: ClusterIngress + Clone> ClusterTxOrderingSubscription<E, I> {
+    /// A publisher of the batcher's posted cursor over this subscription's
+    /// session. The clone shares the session thread, so the batcher's
+    /// feed task publishes while the reader thread polls.
+    #[must_use]
+    pub fn posted_cursor_publisher(&self) -> PostedCursorPublisher<I> {
+        PostedCursorPublisher {
+            ingress: self.ingress.clone(),
+        }
+    }
+}
+
+/// The batcher's confirmed cursor on the cluster ingress: the last L2
+/// block posted to L1, as a system record. The sealer adopts it as the
+/// floor of its DA-lag guard and of its egress retention, and the ingress
+/// serves `safe` from it.
+#[derive(Clone)]
+pub struct PostedCursorPublisher<I: ClusterIngress> {
+    ingress: I,
+}
+
+impl<I: ClusterIngress> PostedCursorPublisher<I> {
+    /// Offer `posted_head` to the sealer. A refused offer is the
+    /// caller's to retry: the next confirmed post publishes again, and
+    /// the sealer sends its status to a session that announces itself.
+    pub fn publish(&mut self, posted_head: u64) -> OfferOutcome {
+        self.ingress
+            .offer(&wire::encode_ingress_posted_cursor(posted_head))
+    }
+}
+
 impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// Disable the `kardamom_sealer_*` re-export (validator role).
     #[must_use]
@@ -208,16 +242,28 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         match item {
             EgressItem::Record { index, msg } => self.ingest_record(index, msg),
             EgressItem::Boundary(b) => self.ingest_boundary(b)?,
-            EgressItem::ReplayDone { .. } => {
-                self.catching_up = false;
+            EgressItem::ReplayDone {
+                up_to_index,
+                up_to_block,
+            } => {
+                self.end_replay(up_to_index, up_to_block)?;
+            }
+            EgressItem::ReplayAhead {
+                head_index,
+                head_block,
+            } => {
+                return Err(self.behind_cursor(head_index, head_block));
             }
             // Every reject is offered only to the offering sequencer
             // session. An executor session cannot receive one. Ignore them
-            // defensively.
+            // defensively. The status is broadcast to every session; the
+            // ingress reads it, a consumer of the ordering does not.
             EgressItem::ContiguityReject { .. }
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::PastDeadline { .. }
-            | EgressItem::WindowFull { .. } => {}
+            | EgressItem::WindowFull { .. }
+            | EgressItem::DaLagReject { .. }
+            | EgressItem::Status(_) => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,
                 oldest_block,
@@ -230,6 +276,39 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             }
         }
         self.check_pending_overflow()
+    }
+
+    /// End the catch-up at a `REPLAY_DONE` marker. The marker carries the
+    /// sealer's head: the next canonical index and the next block number.
+    /// The frames before the marker in the session come from the head or
+    /// below, so a head below the delivery cursor means the sealer lost
+    /// records that this consumer applied. Each new record then falls
+    /// below the cursor and drops as a duplicate, so this fails instead.
+    /// The sealer answers such a cursor with `REPLAY_AHEAD`; this check
+    /// covers a sealer that answers `REPLAY_DONE` instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::ClusterBehindCursor`] when the head lies
+    /// below the delivery cursor.
+    fn end_replay(&mut self, up_to_index: u64, up_to_block: u64) -> Result<(), ExecutorError> {
+        if up_to_index < self.cursor.next_index.load(Ordering::Relaxed)
+            || up_to_block < self.cursor.next_block.load(Ordering::Relaxed)
+        {
+            return Err(self.behind_cursor(up_to_index, up_to_block));
+        }
+        self.catching_up = false;
+        Ok(())
+    }
+
+    /// The error for a sealer head below the delivery cursor.
+    fn behind_cursor(&self, head_index: u64, head_block: u64) -> ExecutorError {
+        ExecutorError::ClusterBehindCursor {
+            next_index: self.cursor.next_index.load(Ordering::Relaxed),
+            next_block: self.cursor.next_block.load(Ordering::Relaxed),
+            head_index,
+            head_block,
+        }
     }
 
     /// Buffer one canonical record. Drops a duplicate below the delivery

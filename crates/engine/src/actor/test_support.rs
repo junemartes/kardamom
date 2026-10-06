@@ -1,18 +1,19 @@
 //! Shared fixtures for the actor's test modules: canonical-position and
 //! legacy-transaction builders (over [`super::fixtures::LegacyTx`]),
-//! remote-epoch fixtures, writer-signal and writer-queue test doubles, and
+//! L1 and remote epoch fixtures, writer-signal and writer-queue test doubles, and
 //! the commit-channel drain helper.
 
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::epoch::{DepositLog, LockboxLog, derive_epoch};
 use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, EpochRecord, SnapshotSource,
     TxEnvelope as KtTxEnvelope, TxRef,
 };
 use revm::primitives::KECCAK_EMPTY;
@@ -99,6 +100,54 @@ pub(crate) fn legacy(
         ..Default::default()
     }
     .sign(signer)
+}
+
+/// A fresh, throwaway state DB that skips the fsync of each commit.
+/// `pub(crate)`: `replay::tests` opens the same kind of DB.
+pub(crate) fn fresh_env() -> (tempfile::TempDir, kardamom_state::StateEnv) {
+    let dir = tempfile::tempdir().unwrap();
+    let env = kardamom_state::StateEnvBuilder::new(dir.path())
+        .durability(kardamom_state::Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    (dir, env)
+}
+
+/// A genesis allocation that funds `from` with 1 ETH. `pub(crate)`:
+/// `replay::tests` replays from the same allocation.
+pub(crate) fn genesis_for(from: Address) -> Vec<kardamom_types::AccountChange> {
+    vec![kardamom_types::AccountChange {
+        address: from,
+        nonce: 0,
+        balance: U256::from(1_000_000_000_000_000_000u128),
+        code_hash: KECCAK_EMPTY,
+    }]
+}
+
+/// An L1 epoch at `l1_number` with one deposit of `mint` wei to each of
+/// `recipients`, in log order. It comes from one lockbox log per recipient
+/// through the producer's own rule, so it has the live deposit shape:
+/// an aliased sender, and `value` equal to `mint`. `pub(crate)`:
+/// `replay::tests` builds the same epochs.
+pub(crate) fn deposit_epoch(l1_number: u64, recipients: &[Address], mint: u128) -> EpochRecord {
+    let l1_hash = keccak256(l1_number.to_be_bytes());
+    let logs: Vec<LockboxLog> = recipients
+        .iter()
+        .zip(0u64..)
+        .map(|(to, log_index)| {
+            LockboxLog::Deposit(DepositLog {
+                block_number: l1_number,
+                block_hash: l1_hash,
+                log_index,
+                from: Address::repeat_byte(0xD0),
+                to: *to,
+                mint,
+                gas_limit: 100_000,
+                data: alloy_primitives::Bytes::new(),
+            })
+        })
+        .collect();
+    derive_epoch(l1_number, l1_hash, &logs).expect("test fixture: one block's logs")
 }
 
 pub(super) struct ImmediateCommit;

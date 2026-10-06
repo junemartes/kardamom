@@ -1,6 +1,6 @@
 # Rejoin the pipeline from a state rebuilt from L1
 
-Status: executor half in implementation. Sealer half and deposits: designed, not built.
+Status: executor half and deposits built. Sealer half: designed, not built.
 
 ## 1. Problem
 
@@ -70,45 +70,84 @@ field or from any other source, is a loud `REPLAY_UNAVAILABLE` and not a silent 
 
 **Limits.** A rebuild through a block of a version 2 blob gives a correct state with no
 cursor; the tool says so and refuses `--executor-image`. A mixed history is fine: the cursor
-comes from block H's own frame. If an L1 epoch and a remote epoch both lead the same block,
-the remote messages' rebuilt positions assume the L1 epoch came first.
+comes from block H's own frame. A block with a vacant slot (a voided entry or its void
+record) rebuilds its items at the tail of its range, so their receipt positions can differ
+from the live chain's; the root does not.
 
-## 4. Sealer half (designed, not built)
+## 4. Sealer half (built)
 
-No continuity path exists today. A fresh cluster starts hard-coded at `canonicalCount = 0`
-and `blockNumber = 1`, and no config key, flag or file seeds it. Three surviving components
-hold values that only move up: the batcher cursor (it would re-post block numbers L1
-already covers), the ingress durability watermark (its on-quorum gate becomes a no-op), and
-the sequencer floors (every earlier sender dead-ends).
+A sealer cluster that lost all its state starts after block H from a seed file. This
+replaces the flag day at a new genesis.
 
-**The only safe procedure today is a flag day at a new genesis:** rebuild the state at
-block H from L1, publish it as the new genesis allocation, deploy a new settlement, and
-start every role with empty volumes, the batcher's cursor file included.
+**Procedure.**
 
-**The smallest product change for continuity** is a seed hook in three files: a
-`kardamom.cluster.seedSnapshot` key in `ClusterNode.java`, read in the fresh branch of
-`SealerClusteredService.onStart`, which calls the existing `CanonicalSealerState.load`. The
-snapshot format already carries every field. The seed needs `canonicalCount = E_H`,
-`blockNumber = H + 1`, `lastBoundaryCount = E_H`, `lastL2Timestamp`, and `l1Origin`. With
-version 3 blobs the rebuilt DB holds all five. The per-sender nonces and the dedup window
-may start empty. Every surviving consumer must still restart. This hook is the next step,
-after the executor half is proven in the chaos suite.
+1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>`. H is
+   the last posted block, or `--through-block`. The tool refuses a head that it did not
+   rebuild from L1, and a head from a version 2 payload.
+2. Give every member the same file in `-Dkardamom.cluster.seedSnapshot=<file>`. Start the
+   members as a new cluster, with empty cluster and archive directories.
+3. Restart every surviving consumer. A consumer at the rebuilt head resumes at
+   `(E_H, H + 1)`.
 
-## 5. Deposits (not started)
+**The seed file** (version 1, big-endian) holds the chain id, H, E_H, the timestamp and
+the L1 origin of H, the state root, and the senders with their next nonces.
+`crates/reconstruct/src/seed.rs` and `SealerSeed.java` hold the layout. The digest is the
+SHA-256 of the file. The sealer logs it in `sealer state SEEDED`.
+
+**The seeded state.** The next block is H + 1, and the next index is E_H. The open block
+is empty. The posted head is H, so the DA-lag guard does not halt the chain at once. The
+dedup window and the void ledger start empty. The nonce guard starts with the senders of
+the rebuilt blocks, in the order they last sent, each at the nonce of its rebuilt
+account. A guard with a smaller capacity keeps the most recent senders. A sender that the
+guard does not hold starts at any nonce, as on the live chain. A member with a non-empty
+remote-origin allowlist refuses a seed, because the seed holds no peer anchor.
+
+**The seed record.** While the seed is not confirmed, every member offers a seed record
+with the digest on each new leadership term. The first record in the log confirms the
+seed, and the leader then asks for a snapshot. A member that started at genesis, or from
+another seed, stops at the record, so a blank member that replays the log from 0 without
+the seed fails loudly. After the snapshot, a blank member restores the seeded state from
+a peer's snapshot and never replays the record. Before the snapshot, a blank member needs
+the seed file.
+
+## 5. Deposits (built)
 
 Deposits ride inside an epoch record, and the batcher skips epochs by design: a deposit is
 unsigned, so a blob-carried deposit would be an unverifiable claim. L1 fixes a deposit's
-identity and its order inside its epoch, and the block's `l1_origin`, which version 3 now
-carries, fixes its L2 placement. Interleaving them in the rebuild is phase E of
-`docs/agents/l1-origin-deposit-derivation-spec.md`. Until then a deposit-bearing range
-rebuilds its non-deposit state only. The chaos suite never deposits.
+identity and its order inside its epoch, and the block's `l1_origin`, which version 3
+carries, fixes its L2 placement.
+
+**The derivation.** `kardamom-reconstruct --lockbox <addr>` walks the blocks in order. When
+a block's origin moves from M to N, the block leads with the epochs M+1..N. Each epoch is
+`derive_epoch` over its L1 block's hash and lockbox logs: the rule the da-watcher and the
+validator use. The first step from origin 0 takes epoch N only, because the da-watcher
+starts at the finalized block it first sees. An origin below the one before is refused. A
+version 2 block carries no origin, leads with no epoch, and leaves the origin unchanged.
+
+**The replay.** Each epoch takes its marker slot, then each deposit takes a slot and runs
+through `execute_deposit_tx` (mint first, nonce check off, gas price 0), before remote
+epochs and transactions. The sealer forces a boundary before any epoch when the open block
+holds a record, so an epoch leads its block and a live block holds at most one epoch. A
+unit test drives the live exec thread and the replay over the same stream, both through
+the real writer with the trie on, and requires the same root and receipt positions.
+
+**The slot check.** A block whose items (epoch markers, deposits, remote records,
+transactions) need more slots than `end_tx_idx` minus the previous end is refused. Equality
+is not required: a voided entry and its void record take slots, apply nothing, and never
+reach the payload. So a missing deposit passes the slot check and fails the root check.
+Without `--lockbox` the rebuild leaves deposits out. The chaos suite never deposits and
+does not pass the flag.
 
 ## 6. Proof
 
 - Unit: the version 3 round trip, the version 2 decode, the mixed-version refusal; the live
   positions and the same root with and without the field; the refused cursor; the stripped
   image; the sealer's cursor check.
-- `reconstruct_l1_e2e`: the state rebuilt from anvil and the DA store carries the cursor.
+- Unit: the live exec thread and the replay give the same root and deposit positions; a
+  block whose epochs need more slots than its range holds is refused; the origin steps.
+- `reconstruct_l1_e2e`: the state rebuilt from anvil and the DA store carries the cursor,
+  and a lockbox deposit on anvil is derived and applied.
+- Chain semantics S8: a workload with a deposit rebuilds to the validator's root.
 - Chaos, every shard: the rebuilt cursor and header equal the validator's at the same block.
 - Chaos, `executor-fleet-total-wipe-recover`: all three executors lose state and
   checkpoints, the harness rebuilds an executor image from L1 on the host, installs it on

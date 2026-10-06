@@ -23,7 +23,6 @@ fn test_plane(catalog: &MemoryCatalog) -> StreamPlane {
         Catalog::Memory(catalog.clone()),
         Instance {
             id: "alloc-1".into(),
-            ports: None,
         },
         Ipv4Addr::LOCALHOST,
     )

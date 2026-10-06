@@ -14,12 +14,13 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
+use kardamom_obs::events::BoardView;
 use kardamom_types::{
-    AccountRow, BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
-    TxError,
+    AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
+    TxEnvelope, TxError,
 };
 
 use crate::error::IngressError;
@@ -68,6 +69,14 @@ pub trait IngressSubscription: Send + Sync + 'static {
     /// fan out on [`Self::subscribe_receipts`]. So a client released by
     /// its receipt sees the new state on its next submit.
     fn live_accounts(&self) -> Arc<LiveAccounts>;
+    /// The latest [`ClusterStatus`] the cluster egress fanned out: the
+    /// posted head behind `safe`, and the DA-lag flag behind the `da_lag`
+    /// halt. The default, before the first status, is nothing posted and
+    /// no halt.
+    fn cluster_status(&self) -> watch::Receiver<ClusterStatus>;
+    /// The latest state of every service on the `events` stream: the
+    /// board the chain status and the submit pause read.
+    fn service_board(&self) -> watch::Receiver<BoardView>;
 }
 
 /// One name for the `(publisher, subscriber)` pair that every proxy
@@ -107,6 +116,11 @@ pub struct MockChannels {
     pub(crate) local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub(crate) block_boundary_bus: broadcast::Sender<BlockBoundary>,
     pub tx_error_bus: broadcast::Sender<TxError>,
+    /// The cluster status a test drives, as the egress observer would.
+    pub cluster_status_bus: watch::Sender<ClusterStatus>,
+    /// The board of service states a test drives, as the events stream
+    /// would.
+    pub service_board_bus: watch::Sender<BoardView>,
     live: Arc<LiveAccounts>,
     /// The local layer's one writer. A mutex is test-only plumbing: the
     /// live adapter's pump owns its writer outright, but a test drives
@@ -137,6 +151,8 @@ impl MockChannels {
         let (local_fsync_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (block_boundary_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (tx_error_bus, _) = broadcast::channel(BUS_CAPACITY);
+        let (cluster_status_bus, _) = watch::channel(ClusterStatus::default());
+        let (service_board_bus, _) = watch::channel(BoardView::default());
         let (live, writer) = LiveAccounts::new(live_cfg);
         (
             Self {
@@ -146,6 +162,8 @@ impl MockChannels {
                 local_fsync_bus,
                 block_boundary_bus,
                 tx_error_bus,
+                cluster_status_bus,
+                service_board_bus,
                 live,
                 live_writer: Arc::new(Mutex::new(writer)),
             },
@@ -208,6 +226,12 @@ impl IngressSubscription for MockChannels {
     }
     fn live_accounts(&self) -> Arc<LiveAccounts> {
         self.live.clone()
+    }
+    fn cluster_status(&self) -> watch::Receiver<ClusterStatus> {
+        self.cluster_status_bus.subscribe()
+    }
+    fn service_board(&self) -> watch::Receiver<BoardView> {
+        self.service_board_bus.subscribe()
     }
 }
 
