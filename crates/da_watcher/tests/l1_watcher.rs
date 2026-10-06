@@ -37,6 +37,7 @@ fn watcher(
             resume_after: cursor
                 .map(|c| L1ResumeAfter::from(NonZeroU64::new(c).expect("a test cursor is not 0"))),
         },
+        None,
     )
 }
 
