@@ -67,6 +67,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 - Kind 6: the void request is a vote, not a command.
   - A consumer with a voter id sends it when the entry at `index` has no data and every archive refuses the range.
   - The service appends a void record only when every configured voter votes for the same `(index, tx_hash)`.
+  - A snapshot restore keeps only the votes of the configured voters. A vote of a voter that the configuration no longer names drops. The next vote of a configured voter then decides an entry that every configured voter voted for.
   - The service refuses a vote from a stranger, with a wrong hash, for a slot that is not a `TxRef`, outside the void window, or for an entry that is already voided.
   - The ledger holds at most 1024 indices with open votes. The voter id must be below 64.
 - Kind 7: the posted cursor is the system record of the batcher. It has no guard header.

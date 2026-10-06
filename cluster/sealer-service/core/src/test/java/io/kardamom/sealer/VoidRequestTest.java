@@ -150,6 +150,57 @@ class VoidRequestTest {
         assertArrayEquals(state.takeSnapshot(), restored.takeSnapshot());
     }
 
+    /** Voters 0 and 1: the voter set of {@link #THREE_VOTERS} with voter 2 removed. */
+    private static final VoidLedger.Config TWO_VOTERS = new VoidLedger.Config(4, 0b011L);
+
+    @Test
+    void a_removed_voter_does_not_block_a_vote_from_a_snapshot() {
+        CanonicalSealerState state = stateWith(THREE_VOTERS);
+        long index = order(state, 5);
+        state.onVoidRequest(0, index, id(5));
+        state.onVoidRequest(2, index, id(5));
+        byte[] snapshot = state.takeSnapshot();
+
+        CanonicalSealerState a = CanonicalSealerState.load(snapshot, 8, Set.of(), TWO_VOTERS);
+        CanonicalSealerState b = CanonicalSealerState.load(snapshot, 8, Set.of(), TWO_VOTERS);
+        assertEquals(1, a.voids().votesFor(index), "the bit of the removed voter is dropped");
+        assertArrayEquals(a.takeSnapshot(), b.takeSnapshot(), "every member restores the same ledger");
+
+        CanonicalSealerState.VoidOutcome last = a.onVoidRequest(1, index, id(5));
+        assertEquals(VoidLedger.Vote.DECIDED, last.vote, "the remaining voters decide the void");
+        assertEquals(VoidLedger.Vote.DECIDED, b.onVoidRequest(1, index, id(5)).vote);
+        assertArrayEquals(a.takeSnapshot(), b.takeSnapshot());
+    }
+
+    @Test
+    void a_vote_from_a_snapshot_that_holds_every_remaining_voter_decides_on_the_next_vote() {
+        CanonicalSealerState state = stateWith(THREE_VOTERS);
+        long index = order(state, 5);
+        state.onVoidRequest(0, index, id(5));
+        state.onVoidRequest(1, index, id(5));
+
+        CanonicalSealerState restored =
+            CanonicalSealerState.load(state.takeSnapshot(), 8, Set.of(), TWO_VOTERS);
+
+        CanonicalSealerState.VoidOutcome again = restored.onVoidRequest(0, index, id(5));
+        assertEquals(VoidLedger.Vote.DECIDED, again.vote, "a repeated vote decides a full mask");
+        assertEquals(1L, again.relayed.orElseThrow().index);
+    }
+
+    @Test
+    void a_vote_from_a_snapshot_with_only_removed_voters_is_no_vote() {
+        CanonicalSealerState state = stateWith(THREE_VOTERS);
+        long index = order(state, 5);
+        state.onVoidRequest(2, index, id(5));
+
+        CanonicalSealerState restored =
+            CanonicalSealerState.load(state.takeSnapshot(), 8, Set.of(), TWO_VOTERS);
+
+        assertEquals(0, restored.voids().votesFor(index));
+        assertEquals(VoidLedger.Vote.COUNTED, restored.onVoidRequest(0, index, id(5)).vote);
+        assertEquals(VoidLedger.Vote.DECIDED, restored.onVoidRequest(1, index, id(5)).vote);
+    }
+
     @Test
     void a_version_5_snapshot_restores_an_empty_ledger() {
         CanonicalSealerState old = new CanonicalSealerState(8);
