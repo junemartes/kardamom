@@ -19,6 +19,11 @@ import org.junit.jupiter.api.Test;
  * member holds the boundaries, so it refuses a pair outside the block it
  * names. A state rebuilt from L1 with a wrong end index is the case this
  * guards: the refusal routes the consumer into its repair path.
+ *
+ * <p>A pair ahead of the head names records that the member does not hold.
+ * A REPLAY_DONE would make the consumer drop every new record below its
+ * cursor as a duplicate. The member answers that pair with REPLAY_AHEAD,
+ * which carries its head, and the consumer stops.</p>
  */
 class SealerReplayCursorTest {
 
@@ -104,6 +109,42 @@ class SealerReplayCursorTest {
         // Block 1 ends at index 3. Index 4 would skip record 3.
         final StubSession consumer = replay(2, 4, 1);
         assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_RELAYED));
+    }
+
+    @Test
+    void aResumeAtTheHeadIsDone() {
+        // The head is index 5 in the open block 3.
+        final StubSession consumer = replay(2, 5, 3);
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_RELAYED));
+        assertEquals(1, count(consumer, SealerWire.EGRESS_KIND_REPLAY_DONE));
+    }
+
+    @Test
+    void anIndexAheadOfTheHeadGetsTheHead() {
+        // Index 6 lies inside the open block 3, but no record 5 exists yet.
+        assertAheadOfHead(replay(2, 6, 3));
+    }
+
+    @Test
+    void aBlockAheadOfTheHeadGetsTheHead() {
+        // Block 3 is open, so no boundary of block 3 or 4 exists yet.
+        assertAheadOfHead(replay(2, 5, 4));
+    }
+
+    /** The only answer is one REPLAY_AHEAD with the head: index 5, block 3. */
+    private static void assertAheadOfHead(final StubSession consumer) {
+        final java.util.List<byte[]> ahead = consumer.offered.stream()
+            .filter(f -> f[0] == SealerWire.EGRESS_KIND_REPLAY_AHEAD)
+            .toList();
+        assertEquals(1, ahead.size());
+        final java.nio.ByteBuffer frame =
+            java.nio.ByteBuffer.wrap(ahead.get(0)).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        assertEquals(5, frame.getLong(1), "head index");
+        assertEquals(3, frame.getLong(1 + Long.BYTES), "head block");
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE));
+        assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_REPLAY_DONE));
         assertEquals(0, count(consumer, SealerWire.EGRESS_KIND_RELAYED));
     }
 

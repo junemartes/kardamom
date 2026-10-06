@@ -252,9 +252,9 @@ impl RunConfig {
         let raw = std::fs::read_to_string(&args.config).context("read batcher config")?;
         let mut file_cfg: BatcherFileConfig =
             toml::from_str(&raw).context("parse batcher config")?;
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
+        file_cfg
+            .cluster
+            .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
         let plane =

@@ -27,7 +27,12 @@ final class SealerTestService extends TestNode.TestService {
     private volatile boolean restoredFromSnapshot;
 
     SealerTestService(final int dedupCapacity, final long tickMs, final int memberId) {
-        this.delegate = new SealerClusteredService(dedupCapacity, tickMs, memberId);
+        this(new SealerClusteredService(dedupCapacity, tickMs, memberId));
+    }
+
+    /** Host {@code delegate}, a service the test configured. */
+    SealerTestService(final SealerClusteredService delegate) {
+        this.delegate = delegate;
     }
 
     @Override

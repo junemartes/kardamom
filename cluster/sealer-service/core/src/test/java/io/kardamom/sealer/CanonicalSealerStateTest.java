@@ -294,9 +294,10 @@ class CanonicalSealerStateTest {
             original.onRecord(id(i), payload("p" + i));
         }
         byte[] snapshot = original.takeSnapshot();
-        // Remove half of the id section to truncate the snapshot.
+        // Remove the seed tail and half of the id section to truncate the snapshot.
         // The load must fail with a clear error message, not a raw BufferUnderflowException.
-        byte[] truncated = java.util.Arrays.copyOf(snapshot, snapshot.length - 2 * CanonicalSealerState.CANONICAL_ID_LEN - 7);
+        byte[] truncated = java.util.Arrays.copyOf(snapshot,
+                snapshot.length - 1 - SealerSeed.HASH_LEN - 2 * CanonicalSealerState.CANONICAL_ID_LEN - 7);
         IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
                 IllegalArgumentException.class, () -> CanonicalSealerState.load(truncated, 8));
         assertTrue(e.getMessage().contains("truncated"), "message says truncated: " + e.getMessage());

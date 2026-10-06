@@ -9,9 +9,13 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.ShutdownSignalBarrier;
@@ -90,6 +94,17 @@ public final class ClusterNode {
             System.getProperty("kardamom.cluster.remoteOrigins", System.getenv("KARDAMOM_REMOTE_ORIGINS")));
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
+        // The seed a cluster with no snapshot starts from, instead of
+        // genesis: the head of a state rebuilt from L1, which
+        // kardamom-reconstruct --sealer-seed writes. Every member of a new
+        // seeded cluster gets the same file. A member that restores a
+        // snapshot ignores it.
+        final Optional<SealerSeed> seed = readSeed(System.getProperty("kardamom.cluster.seedSnapshot"));
+        System.out.println("cluster seed memberId=" + memberId + seed
+            .map(s -> " block=" + s.head().block() + " endTx=" + s.head().endTxIdx()
+                + " chainId=" + s.head().chainId() + " senders=" + s.senders().size()
+                + " digest=" + s.digestHex())
+            .orElse(" <none: a cluster with no snapshot starts at genesis>"));
 
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
@@ -103,7 +118,7 @@ public final class ClusterNode {
 
         // The Raft log purge: how many of the newest snapshots keep their
         // log. Parsed before the launch, so a bad value never starts a member.
-        final java.util.Optional<PurgePlanner> purgePlanner =
+        final Optional<PurgePlanner> purgePlanner =
             PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
@@ -147,6 +162,7 @@ public final class ClusterNode {
                 service = new SealerClusteredService(
                     dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
                     inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
+                seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, barrier));
                 break;
@@ -353,7 +369,7 @@ public final class ClusterNode {
      * {@link LogPurger} for the thread.
      */
     private static void startLogPurger(
-            final java.util.Optional<PurgePlanner> planner,
+            final Optional<PurgePlanner> planner,
             final LogPurger.Member member,
             final ConsensusModule.Context consensus) {
         planner.ifPresentOrElse(
@@ -560,6 +576,22 @@ public final class ClusterNode {
                 "kardamom.cluster.voidVoters: id " + id + " outside [0, " + VoidLedger.MAX_VOTERS + ")");
         }
         return id;
+    }
+
+    /**
+     * The seed file at {@code path}, or empty when the property is unset.
+     * An unreadable or invalid file is fatal: a member told to start from a
+     * seed must not start at genesis.
+     */
+    static Optional<SealerSeed> readSeed(final String path) {
+        if (path == null || path.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(SealerSeed.read(Path.of(path.trim())));
+        } catch (final IOException | IllegalArgumentException e) {
+            throw new IllegalStateException("kardamom.cluster.seedSnapshot: " + path + ": " + e.getMessage(), e);
+        }
     }
 
     /** The DA-lag budget from its property or env value; unset means the default. */
