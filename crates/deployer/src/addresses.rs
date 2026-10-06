@@ -7,12 +7,15 @@
 use alloy_primitives::{Address, B256, Bytes, address, b256, keccak256};
 use alloy_sol_types::{SolCall, SolValue, sol};
 
-// Local binding for the factory's `initialize(address)`. It lives here, not
-// in IKardamomFactory.sol, because it belongs to the concrete impl and is
-// used only to build bootstrap calldata.
-sol! {
-    function initialize(address owner) external;
-}
+// The concrete factory impl, for its `initialize(address)`. That function
+// is not in IKardamomFactory.sol, and only bootstrap calldata uses it.
+sol!(
+    KardamomFactoryV1,
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/abi/KardamomFactoryV1.json"
+    )
+);
 
 /// ERC-7955 permissionless CREATE2 factory.
 /// This is the canonical address on every chain that supports EIP-7702
@@ -37,7 +40,7 @@ pub(crate) fn factory_proxy_salt() -> B256 {
 
 /// Init calldata for the kardamom factory: `initialize(address owner)`.
 pub(crate) fn factory_init_data(owner: Address) -> Bytes {
-    Bytes::from(initializeCall { owner }.abi_encode())
+    Bytes::from(KardamomFactoryV1::initializeCall { owner }.abi_encode())
 }
 
 /// Build the full proxy initcode: `ERC1967Proxy.creationCode` plus

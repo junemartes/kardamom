@@ -69,14 +69,14 @@ archive_dir = "/opt/kardamom/archive"
 # refetch client reads the archive endpoints from the `kardamom-aeron-archive`
 # records the aeron job registers (nomad/aeron.system.nomad.hcl), and these
 # static lists are the fallback. Nomad renders them from the same records at
-# task start: the archives tagged with the ingress role record tx_data (each
+# task start: the archives tagged tx_data record tx_data (each
 # ingress archive records every ingress publisher, so either endpoint serves
-# any range; consumers rotate on failure), and the archive tagged with the
-# aux role records tx_deposits. A change in the archive set re-renders the
+# any range; consumers rotate on failure), and the archive tagged
+# tx_deposits records tx_deposits. A change in the archive set re-renders the
 # file without a restart (the jobs set change_mode noop); the running
 # process follows the catalog through discovery instead.
-tx_data_archive_endpoints = [{{ range service "ingress.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
-tx_deposits_archive_endpoints = [{{ range service "aux.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
+tx_data_archive_endpoints = [{{ range service "tx_data.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
+tx_deposits_archive_endpoints = [{{ range service "tx_deposits.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
 
 [channels]
 # --- TxData: full TxEnvelope bytes, one stream per lane. ----------------------

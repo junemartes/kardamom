@@ -6,6 +6,9 @@ import re
 import unittest
 from pathlib import Path
 
+import jinja2
+import yaml
+
 CLUSTER = Path(__file__).resolve().parents[2]
 
 
@@ -20,6 +23,24 @@ class Channels(unittest.TestCase):
 
     def test_the_events_channel_carries_the_minimum_term_length(self):
         self.assertIn('|term-length=65536', self.channel('events_channel'))
+
+    def archive_topics(self, role, node_roles=None):
+        template = (CLUSTER / 'ansible/roles/nomad/templates/nomad.hcl.j2').read_text()
+        expression = re.search(r'archive_topics = "(\{\{.*?\}\})"', template).group(1)
+        roles = node_roles if node_roles is not None else [role]
+        return jinja2.Template(expression).render(roles_set=roles)
+
+    def test_the_deposits_fallback_selects_the_da_watcher_node_in_both_profiles(self):
+        self.assertIn('service "tx_deposits.kardamom-aeron-archive"', self.channels)
+        self.assertIn('service "tx_data.kardamom-aeron-archive"', self.channels)
+        job = (CLUSTER / 'nomad/aeron.system.nomad.hcl').read_text()
+        self.assertIn('tags = ["${meta.archive_topics}"]', job)
+        local = yaml.safe_load((CLUSTER / 'ansible/group_vars/all.yml').read_text())['node_classes']
+        self.assertEqual(self.archive_topics('aux', ['aux'] + local['aux']['roles']), 'tx_deposits')
+        production = (CLUSTER / 'ansible/inventories/production/hosts.example.ini').read_text()
+        found = re.search(r'^da-watcher-0 .*\brole=(\S+)', production, re.MULTILINE)
+        self.assertEqual(self.archive_topics(found.group(1)), 'tx_deposits')
+        self.assertEqual(self.archive_topics('ingress', ['ingress'] + local['ingress']['roles']), 'tx_data')
 
 
 if __name__ == '__main__':

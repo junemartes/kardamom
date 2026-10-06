@@ -39,6 +39,7 @@ use crate::reader::{
 };
 
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
+use super::tx_hook::TxHook;
 use super::types::{BalHandoff, BlockExecStrategy};
 
 /// The port types the exec thread itself needs, independent of the reader
@@ -68,6 +69,12 @@ pub trait ExecPorts {
     /// per-transaction path. The validator's parallel verifier and the
     /// executor's STM pool each name their own type here.
     type BlockExec: BlockExecStrategy<SnapshotDb<Self>> + 'static;
+    /// Hook around each tx record. Use [`NoTxHook`](super::NoTxHook) for
+    /// roles that wire none. The validator names
+    /// [`VerifyRecordIdentity`](super::VerifyRecordIdentity). A pair
+    /// `(A, B)` stacks two hooks. `Option<H>` turns `H` on or off at
+    /// runtime. [`RoleHooks::none`] uses the `Default` value.
+    type TxHook: TxHook + Default + 'static;
 }
 
 /// The full set of port types one role plugs into [`Executor::run`]:
@@ -85,6 +92,7 @@ pub trait ExecPorts {
 ///     type Epoch = EpochVerifier;
 ///     type RemoteEpoch = RemoteEpochVerifier;
 ///     type BlockExec = ParallelBlockExec;
+///     type TxHook = VerifyRecordIdentity;
 /// }
 /// impl EngineWiring for ValidatorWiring {
 ///     type TxData = ClusterTxDataSubscription;
@@ -142,8 +150,8 @@ pub struct RoleHooks<W: EngineWiring> {
     pub bal_capture: Option<Sender<BalHandoff>>,
     /// Footprint shadow (`crate::shadow`): per-block capture hand-off to
     /// the grader thread (executor role, `KARDAMOM_FOOTPRINT_SHADOW=1`).
-    /// `None` skips capture. Ignored on the whole-block (validator) path,
-    /// since captures ride the streaming arm.
+    /// `None` skips capture. The whole-block path drops it, since captures
+    /// ride the streaming arm.
     pub footprint_shadow: Option<Sender<crate::shadow::ShadowBlock>>,
     /// Whole-block execution strategy (validator parallel path). `None`
     /// keeps the per-transaction streaming path unchanged.
@@ -155,11 +163,16 @@ pub struct RoleHooks<W: EngineWiring> {
     /// messages apply. `None` trusts the pair's origin sequence as sent.
     /// Wired by the destination validator only.
     pub remote_epoch_observer: Option<W::RemoteEpoch>,
+    /// Hook around each tx record, run on the exec thread. The type
+    /// selects the hook, and this value carries its state.
+    pub tx_hook: W::TxHook,
 }
 
 impl<W: EngineWiring> RoleHooks<W> {
     /// No role-specific behavior: streaming execution, no BAL capture, and
-    /// no epoch check. This is the shape the executor and most tests use.
+    /// no epoch check. The tx hook is the wiring's `Default`: off for
+    /// [`NoTxHook`](super::NoTxHook) and for `Option<_>`. This is the
+    /// shape most tests use.
     #[must_use]
     pub fn none() -> Self {
         Self {
@@ -168,6 +181,7 @@ impl<W: EngineWiring> RoleHooks<W> {
             block_exec: None,
             epoch_observer: None,
             remote_epoch_observer: None,
+            tx_hook: W::TxHook::default(),
         }
     }
 }

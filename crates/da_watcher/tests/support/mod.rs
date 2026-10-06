@@ -4,16 +4,18 @@
 
 #![allow(dead_code, reason = "each test binary uses a part of the fixture")]
 
+use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
+use kardamom_da_watcher::publisher::fakes::{InMemoryEpochPublisher, PublisherTap};
 use kardamom_da_watcher::source::fakes::MockL1Source;
 use kardamom_da_watcher::{
     CursorError, CursorFile, DaWatcherConfig, L1Cursor, L1ResumeAfter, L1Watcher,
 };
+use kardamom_types::EpochRecord;
 use tokio::sync::watch;
 
 pub(crate) type Watcher = L1Watcher<MockL1Source, InMemoryEpochPublisher>;
@@ -23,13 +25,19 @@ pub(crate) type Watcher = L1Watcher<MockL1Source, InMemoryEpochPublisher>;
 pub(crate) struct Rig {
     pub(crate) dir: tempfile::TempDir,
     pub(crate) publisher: InMemoryEpochPublisher,
+    tap: PublisherTap,
+    /// Every epoch the tap gave so far: the tap hands each epoch out once.
+    seen: RefCell<Vec<EpochRecord>>,
 }
 
 impl Rig {
     pub(crate) fn new() -> Self {
+        let (publisher, tap) = InMemoryEpochPublisher::new();
         Self {
             dir: tempfile::tempdir().unwrap(),
-            publisher: InMemoryEpochPublisher::default(),
+            publisher,
+            tap,
+            seen: RefCell::new(Vec::new()),
         }
     }
 
@@ -98,14 +106,14 @@ impl Rig {
         std::fs::write(self.path(), contents).unwrap();
     }
 
+    /// Every epoch published across the rig's watcher lifetimes, in order.
+    pub(crate) fn epochs(&self) -> Vec<EpochRecord> {
+        self.seen.borrow_mut().extend(self.tap.epochs());
+        self.seen.borrow().clone()
+    }
+
     pub(crate) fn published(&self) -> Vec<u64> {
-        self.publisher
-            .published
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| e.l1_number)
-            .collect()
+        self.epochs().iter().map(|e| e.l1_number).collect()
     }
 }
 

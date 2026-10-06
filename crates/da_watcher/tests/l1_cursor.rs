@@ -163,7 +163,7 @@ async fn a_stale_file_publishes_identical_epochs_again() {
     let mut w = rig.start(source(&[103]), None).unwrap();
     assert_eq!(w.process_once().await.unwrap(), 3);
 
-    let epochs = rig.publisher.published.lock().unwrap().clone();
+    let epochs = rig.epochs();
     let (first, again) = epochs.split_at(3);
     assert_eq!(first, again);
     assert!(

@@ -181,6 +181,10 @@ job "da-watcher" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "da-watcher-${NOMAD_ALLOC_INDEX}"
         # The Aeron C client reads its driver timeout from this variable,
         # and the service code never overrides it.
         AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms

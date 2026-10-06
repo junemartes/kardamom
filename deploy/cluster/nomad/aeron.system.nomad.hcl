@@ -215,9 +215,9 @@ job "aeron" {
       # (docs/aeron-discovery.md): the consumers' refetch client reads
       # the archive control endpoints from these records, filtered by
       # the topics each node's archive records. `archive_topics` is
-      # node meta the Nomad agent template stamps per node class
+      # node meta the Nomad agent template stamps from the node role set
       # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
-      # record tx_data, the aux node records tx_deposits, every other
+      # record tx_data, the da-watcher node records tx_deposits, every other
       # node records nothing and lists no topic. Nomad owns this record;
       # the runtime never registers an archive. The record outlives every
       # publisher, so retained recordings stay discoverable.
@@ -226,11 +226,12 @@ job "aeron" {
         port     = "archive_control"
         address  = "${meta.node_ip}"
         provider = "consul"
-        # The node role, so a template can select the archives of one
-        # role: config/channels.toml.tpl renders its fallback archive
-        # lists from `ingress.kardamom-aeron-archive` and
-        # `aux.kardamom-aeron-archive`.
-        tags = ["${meta.role}"]
+        # The topic the node records, so a template can select the
+        # archives of one topic: config/channels.toml.tpl renders its
+        # fallback archive lists from `tx_data.kardamom-aeron-archive`
+        # and `tx_deposits.kardamom-aeron-archive`. A node records at
+        # most one topic.
+        tags = ["${meta.archive_topics}"]
         meta {
           discovery_version = "1"
           cluster_id        = "${meta.cluster_id}"

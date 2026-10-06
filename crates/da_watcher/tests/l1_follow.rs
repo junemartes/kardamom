@@ -23,10 +23,7 @@ fn sealer() -> watch::Sender<Option<u64>> {
 /// The published epochs' canonical ids are the same for every copy, so
 /// the sealer's first-seen dedup drops a copy.
 fn ids(rig: &Rig) -> Vec<alloy_primitives::B256> {
-    rig.publisher
-        .published
-        .lock()
-        .unwrap()
+    rig.epochs()
         .iter()
         .map(kardamom_types::EpochRecord::canonical_id)
         .collect()
