@@ -90,6 +90,9 @@ container-up:
     set -euo pipefail
     export REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}"
     export AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}"
+    # New nodes get a new sealer cluster. The deploy opens the bootstrap
+    # only for a cluster job that Nomad does not know.
+    export KARDAMOM_CLUSTER_BOOTSTRAP="${KARDAMOM_CLUSTER_BOOTSTRAP:-1}"
     tofu -chdir="$TF_CONTAINERS" init -input=false
     tofu -chdir="$TF_CONTAINERS" apply -auto-approve -input=false
     tofu -chdir="$TF_CONTAINERS" output -json node_contract > "$NODE_CONTRACT"

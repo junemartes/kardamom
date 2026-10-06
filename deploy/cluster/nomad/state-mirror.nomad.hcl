@@ -100,9 +100,6 @@ job "state-mirror" {
         # The Aeron C client reads its driver timeout from this variable,
         # and the service code never overrides it.
         AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
-        # The UDP port block this subscriber's discovery sockets use
-        # on the executor node, distinct from the executor's own.
-        KARDAMOM_MDC_PORTS = "40360-40369"
       }
 
       config {

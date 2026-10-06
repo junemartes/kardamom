@@ -2,6 +2,8 @@ package io.kardamom.sealer;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -50,6 +52,10 @@ import java.util.TreeMap;
  *       {@code daLagBudgetBlocks} past it. Deposits and boundaries still
  *       enter. The cursor is in the replicated log and the budget is
  *       shared configuration, so every member refuses the same records.</li>
+ *   <li><b>Seed</b> — {@link #seeded} starts a state at the head of a
+ *       state rebuilt from L1, and {@link #onSeedEpoch} checks the seed
+ *       record in the log against it. A state that started at genesis
+ *       refuses that record.</li>
  *   <li><b>Snapshot</b> — {@link #takeSnapshot()} and {@link #load(byte[], int)}
  *       round-trip the full state for cluster snapshots.</li>
  * </ul>
@@ -110,8 +116,10 @@ public final class CanonicalSealerState {
      * own setting against the one the cluster runs. Version 9 adds the
      * posted head (the batcher's confirmed cursor) after the window; an
      * older snapshot restores 0, the value before any cursor was published.
+     * Version 10 adds the seed status and the seed digest after the posted
+     * head; an older snapshot restores a state that started at genesis.
      */
-    private static final int SNAPSHOT_VERSION = 9;
+    private static final int SNAPSHOT_VERSION = 10;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -246,6 +254,25 @@ public final class CanonicalSealerState {
      * until the batcher publishes its first cursor.
      */
     private long postedHead;
+
+    /** Where a state started, and whether the log confirmed its seed. */
+    public enum SeedStatus {
+        /** The state started at genesis. A seed record is fatal to it. */
+        GENESIS,
+        /** The state started from a seed, and no seed record is in the log yet. */
+        PENDING,
+        /** A seed record with the digest of this state's seed is in the log. */
+        CONFIRMED
+    }
+
+    /**
+     * Where this state started. Replicated state: it moves only on a seed
+     * record in the log, and the snapshot carries it.
+     */
+    private SeedStatus seedStatus;
+
+    /** The SHA-256 of the seed file this state started from; zeros at genesis. */
+    private byte[] seedDigest;
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -408,6 +435,90 @@ public final class CanonicalSealerState {
         this.l1Origin = 0L;
         this.lastL2Timestamp = 0L;
         this.lastBoundaryCount = 0L;
+        this.seedStatus = SeedStatus.GENESIS;
+        this.seedDigest = new byte[SealerSeed.HASH_LEN];
+    }
+
+    /**
+     * A state that starts after the seed's head {@code H}: the next block
+     * is {@code H + 1}, the next index is the head's canonical end, the
+     * open block is empty, and every block up to {@code H} counts as
+     * posted, because the seed was rebuilt from what the batcher posted.
+     *
+     * <p>The dedup window and the void ledger start empty: no record at or
+     * below the head can be offered again. The nonce guard starts with the
+     * seed's senders in the seed's order, the eldest first, so the guard
+     * keeps the most recent senders up to {@code dedupCapacity}. The
+     * remote-origin allowlist is empty: the seed carries no peer anchor,
+     * so a seeded state accepts no remote-origin record.</p>
+     *
+     * @param seed the parsed seed
+     * @param dedupCapacity          hard cap on the window
+     * @param voidConfig             the void ledger's configuration
+     * @param inclusionHorizonBlocks the deadline horizon, in blocks
+     * @param orderingWindow         the ordering window size, or 0
+     * @param daLagBudgetBlocks      the DA-lag budget, in blocks
+     * @return the seeded state, with its seed not yet confirmed
+     */
+    public static CanonicalSealerState seeded(
+            SealerSeed seed,
+            int dedupCapacity,
+            VoidLedger.Config voidConfig,
+            long inclusionHorizonBlocks,
+            int orderingWindow,
+            long daLagBudgetBlocks) {
+        final SealerSeed.Head head = seed.head();
+        final CanonicalSealerState state = new CanonicalSealerState(
+            dedupCapacity, head.block() + 1, Set.of(), voidConfig, inclusionHorizonBlocks,
+            orderingWindow, daLagBudgetBlocks);
+        state.canonicalCount = head.endTxIdx();
+        state.lastBoundaryCount = head.endTxIdx();
+        state.lastL2Timestamp = head.l2Timestamp();
+        state.l1Origin = head.l1Origin();
+        state.postedHead = head.block();
+        seed.senders().forEach(sender -> state.expectedNonce.put(
+            ByteBuffer.wrap(sender.address().clone()).asReadOnlyBuffer(), sender.nextNonce()));
+        state.seedStatus = SeedStatus.PENDING;
+        state.seedDigest = seed.digest().clone();
+        return state;
+    }
+
+    /**
+     * Apply a seed record: the log names the digest of the seed the
+     * cluster started from. A seeded state with the same digest confirms
+     * its seed. A state that started at genesis, or from another seed,
+     * holds another history than the cluster, so it must stop.
+     *
+     * @param digest the SHA-256 the seed record carries
+     * @return true when this record confirmed the seed; false when the
+     *         seed was already confirmed
+     * @throws IllegalStateException when this state started at genesis, or
+     *         from a seed with another digest
+     */
+    public boolean onSeedEpoch(byte[] digest) {
+        if (seedStatus == SeedStatus.GENESIS) {
+            throw new IllegalStateException(
+                "the log holds a seed record, but this member started at genesis: start it with the seed"
+                    + " file, or seed it from a peer's snapshot");
+        }
+        if (!Arrays.equals(digest, seedDigest)) {
+            throw new IllegalStateException("the log names seed digest "
+                + HexFormat.of().formatHex(digest) + ", but this member started from seed digest "
+                + HexFormat.of().formatHex(seedDigest));
+        }
+        final boolean confirmed = seedStatus == SeedStatus.PENDING;
+        seedStatus = SeedStatus.CONFIRMED;
+        return confirmed;
+    }
+
+    /** Where this state started, and whether the log confirmed its seed. */
+    public SeedStatus seedStatus() {
+        return seedStatus;
+    }
+
+    /** The SHA-256 of the seed this state started from; zeros at genesis. */
+    public byte[] seedDigest() {
+        return seedDigest.clone();
     }
 
     /** What the window did with an offered id. */
@@ -1152,7 +1263,8 @@ public final class CanonicalSealerState {
      * cursor); a version-4 snapshot is parsed with the 16-byte entry.
      * Version 6 adds the void ledger after the peer map: see
      * {@link VoidLedger#writeTo}. Version 8 adds the posted head (8) after
-     * the void ledger.</p>
+     * the void ledger. Version 10 adds the seed status (1, the
+     * {@link SeedStatus} ordinal) and the seed digest (32) after it.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
@@ -1164,7 +1276,8 @@ public final class CanonicalSealerState {
                 + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
                 + voids.snapshotLen(canonicalCount)
                 + 4
-                + 8;
+                + 8
+                + 1 + SealerSeed.HASH_LEN;
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -1209,6 +1322,9 @@ public final class CanonicalSealerState {
         buf.putInt(orderingWindow);
         // v9 tail: the posted head.
         buf.putLong(postedHead);
+        // v10 tail: the seed status and the seed digest.
+        buf.put((byte) seedStatus.ordinal());
+        buf.put(seedDigest);
         return buf.array();
     }
 
@@ -1418,6 +1534,10 @@ public final class CanonicalSealerState {
         if (version >= 9) {
             state.postedHead = buf.getLong();
         }
+        if (version >= 10) {
+            state.seedStatus = seedStatusOf(buf.get());
+            buf.get(state.seedDigest);
+        }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
         // trust-on-first-sight, and it causes no false rejects. A version-1
@@ -1430,5 +1550,13 @@ public final class CanonicalSealerState {
         // the peer's next record.
         state.canonicalCount = canonicalCount;
         return state;
+    }
+
+    private static SeedStatus seedStatusOf(byte code) {
+        final SeedStatus[] all = SeedStatus.values();
+        if (code < 0 || code >= all.length) {
+            throw new IllegalArgumentException("bad snapshot seed status: " + code);
+        }
+        return all[code];
     }
 }

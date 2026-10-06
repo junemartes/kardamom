@@ -144,8 +144,6 @@ job "notifier" {
         # The Aeron C client reads its driver timeout from this variable,
         # and the service code never overrides it.
         AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
-        # The UDP block of the subscriber's discovery sockets.
-        KARDAMOM_MDC_PORTS = "40370-40379"
       }
 
       config {

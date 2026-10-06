@@ -139,6 +139,9 @@ impl Reconstruction<'_> {
     }
 }
 
+mod seed;
+pub use seed::{SealerSeed, SeedInput, SeedSender, SenderOrder};
+
 /// Shared test fixtures: signed transfers, a funded-EOA genesis, closed-
 /// block builders, and an oracle-replay helper. This crate's own unit
 /// tests (below) and the external `tests/reconstruct_l1_e2e.rs` binary

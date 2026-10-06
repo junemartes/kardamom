@@ -63,6 +63,20 @@ class NomadAPI(BaseHTTPRequestHandler):
         else:
             raise AssertionError(self.path)
 
+    def do_PUT(self):
+        # The bootstrap variable of a new sealer cluster.
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
+        assert body['Path'] == 'nomad/jobs/cluster' and body['Items'] == {'bootstrap': 'true'}, body
+        self.server.state['writes'].append('bootstrap-open')
+        self.respond(body)
+
+    def do_DELETE(self):
+        assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
+        self.server.state['writes'].append('bootstrap-close')
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self):
         parts = self.path.split('?')[0].split('/')
         parts += [''] * (6 - len(parts))
@@ -197,6 +211,7 @@ class DeployTest(unittest.TestCase):
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
             'workloads_sealer_admin_port': self.api.server_port,
+            'workloads_cluster_bootstrap': False,
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
@@ -489,6 +504,24 @@ class DeployTest(unittest.TestCase):
     def test_a_fresh_sealer_registers_in_one_step(self):
         self.run_deploy()
         self.assertEqual(self.api.state['writes'].count('cluster'), 1)
+        self.assertNotIn('bootstrap-open', self.api.state['writes'])
+
+    def test_the_bootstrap_lives_only_while_a_new_cluster_comes_up(self):
+        self.run_deploy({'workloads_cluster_bootstrap': True})
+        writes = self.api.state['writes']
+        cluster = writes.index('cluster')
+        self.assertEqual(writes[cluster - 1:cluster + 2], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+        # A re-deploy of the registered cluster keeps the flag and still
+        # opens no bootstrap.
+        self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
+        self.api.state['writes'] = []
+        self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '4096'})
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+
+    def test_a_failed_bootstrap_closes_the_bootstrap(self):
+        self.api.state['deployments']['cluster'] = Deployment('cluster', ['failed'])
+        self.run_deploy({'workloads_cluster_bootstrap': True}, success=False)
+        self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
 
 
 if __name__ == '__main__':

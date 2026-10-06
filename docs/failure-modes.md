@@ -139,6 +139,13 @@ with three distinct, tested modes:
 - **Follower kill** (`cluster-follower-kill`) — quorum 2/3 holds; **zero
   stall** is asserted and the leader must be unchanged. The member restarts
   and rejoins.
+- **Member state loss** (`cluster-member-rejoin`, `node-replace-sealer`) — a
+  follower comes back with no Raft log. Before it starts, it copies the
+  latest snapshot, and the log after it, from a peer (an Aeron
+  ClusterBackup). It restores the snapshot and catches up from the leader.
+  A blank member starts at log position 0 only on the bootstrap of a new
+  cluster (`KARDAMOM_CLUSTER_BOOTSTRAP=1`). Without a peer, it waits and logs
+  `cluster SEED waiting-for-peer`.
 - **Quorum loss** (`cluster-quorum-loss-recover`) — two nodes killed: the
   pipeline **must stall** (the suite asserts the executor block gauge goes
   *flat* — progress without quorum would be unsafe, unreplicated ordering).
@@ -645,8 +652,8 @@ trie, the hashed mirror and the stored root removed, after the root check).
 The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
-which also gives the flag-day procedure for a wiped sealer set and the seed
-hook that would replace it.
+which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
+the seed a new sealer cluster starts from at the rebuilt head.
 
 Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
 absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
