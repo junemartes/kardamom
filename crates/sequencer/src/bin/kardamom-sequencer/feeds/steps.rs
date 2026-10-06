@@ -45,14 +45,15 @@ impl EgressWatermarkFeed {
         true
     }
 
-    /// Tell the epoch pump that the boundaries reached `l1_origin`, once
-    /// per growth: a boundary arrives every tick, and the origin moves
-    /// once per L1 block.
+    /// Tell the epoch pump, and the `l1_origin` gauge, that the boundaries
+    /// reached `l1_origin`, once per growth: a boundary arrives every
+    /// tick, and the origin moves once per L1 block.
     pub(super) fn confirm_origin(&mut self, l1_origin: u64) {
         if l1_origin <= self.last_origin {
             return;
         }
         self.last_origin = l1_origin;
+        seq_metrics::record_l1_origin(l1_origin);
         self.signal_origin(OriginSignal::Confirmed(l1_origin));
     }
 

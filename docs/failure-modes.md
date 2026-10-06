@@ -786,6 +786,15 @@ precedence at a start:
    da-watcher with `--l1-resume-after` (`docs/runbooks/origin_gap.md`). The
    deposits of the skipped blocks wait in the lockbox; they are not lost.
 
+The file records the publish, not the sealer's commit. A kill of the
+da-watcher together with the sealer, after a publish and before its commit,
+loses that epoch, and the restart resumes past it. The sequencers then halt
+on `origin_gap`, and the operator runs the da-watcher once with
+`--l1-resume-after` at the sealer's L1 origin (`kardamom_sequencer_l1_origin`).
+The chaos case `pipeline-blackout-recover` checks the cursor against that
+origin after the restart and runs the step when they disagree; the `l1-liar`
+and `two-day-outage` heals use the same step, never a removed file.
+
 A file that exists but does not read or parse raises the
 `l1_cursor_unreadable` halt: the watcher stays up, publishes nothing, and
 reads the file again after an operator's clear. It never guesses a start.
