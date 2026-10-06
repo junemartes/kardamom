@@ -54,8 +54,8 @@ pub use egress::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use egress::{
-    encode_contiguity_reject, encode_da_lag_reject, encode_past_deadline, encode_status,
-    encode_window_full,
+    encode_contiguity_reject, encode_da_lag_reject, encode_origin_gap, encode_past_deadline,
+    encode_status, encode_window_full,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
@@ -241,6 +241,14 @@ pub const EGRESS_KIND_STATUS: u8 = 9;
 /// sequencer drops it and tells the client, which resubmits after the
 /// batcher posts again. Matches Java `EGRESS_KIND_DA_LAG_REJECT`.
 pub const EGRESS_KIND_DA_LAG_REJECT: u8 = 10;
+
+/// Egress kind: the sealer refused an origin record that skips an L1
+/// block: `[kind:u8 = 12][offered_origin:u64][expected_origin:u64]`.
+/// Offered only to the offering session. The record is not ordered, and
+/// its id does not enter the dedup window. The sequencer offers its
+/// unconfirmed epochs again, from `expected_origin`, in order. Matches
+/// Java `EGRESS_KIND_ORIGIN_GAP`.
+pub const EGRESS_KIND_ORIGIN_GAP: u8 = 12;
 
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the

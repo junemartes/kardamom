@@ -41,6 +41,11 @@ pub const LAST_TICK_UNIX_SECONDS: &str = "kardamom_da_watcher_last_tick_unix_sec
 /// replays further and further back — an operator alarm, not an error path.
 pub const REMOTE_CURSOR_PERSIST_FAILURES_TOTAL: &str =
     "kardamom_da_watcher_remote_cursor_persist_failures_total";
+/// Failed writes of the L1 cursor file. Not fatal: a stale file makes a
+/// restart publish epochs again, and the sealer drops them. A growing
+/// count means the restart publishes again from further back.
+pub const L1_CURSOR_PERSIST_FAILURES_TOTAL: &str =
+    "kardamom_da_watcher_l1_cursor_persist_failures_total";
 
 pub fn describe() {
     metrics::describe_gauge!(L1_FINALIZED, "latest finalised L1 block number observed");
@@ -92,5 +97,9 @@ pub fn describe() {
     metrics::describe_counter!(
         REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
         "failed durable-cursor writes, labelled by origin chain id; non-fatal (stale resume is absorbed by dedup) but growth widens the restart replay window"
+    );
+    metrics::describe_counter!(
+        L1_CURSOR_PERSIST_FAILURES_TOTAL,
+        "failed writes of the L1 cursor file; not fatal (the sealer drops the epochs a restart publishes again), but growth widens the restart replay window"
     );
 }

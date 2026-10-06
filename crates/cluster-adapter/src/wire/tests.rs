@@ -533,6 +533,20 @@ fn replay_ahead_roundtrip() {
 }
 
 #[test]
+fn origin_gap_roundtrip() {
+    let b = encode_origin_gap(102, 101);
+    assert_eq!(b[0], 12, "kind 12, as Java EGRESS_KIND_ORIGIN_GAP");
+    assert_eq!(b.len(), 17, "kind, offered, expected");
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::OriginGap {
+            offered_origin: 102,
+            expected_origin: 101,
+        }
+    );
+}
+
+#[test]
 fn replay_unavailable_roundtrip() {
     let b = encode_replay_unavailable(100, 7);
     assert_eq!(

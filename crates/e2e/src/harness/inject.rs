@@ -120,8 +120,9 @@ pub async fn publish_corrupt_bal(aeron_dir: &Path, blocks: Vec<u64>) -> Result<(
 ///
 /// The sequencer forwards it verbatim onto the canonical stream (it is
 /// not the sequencer's job to know what L1 said). The sealer accepts it
-/// because the origin advances. The validator, which re-derives every
-/// epoch from L1, must find that the hash does not match, and fail-stop.
+/// when `l1_number` is the next origin after the chain's. The validator,
+/// which re-derives every epoch from L1, must find that the hash does not
+/// match, and fail-stop.
 ///
 /// The bogus hash is what makes the drill deterministic. An epoch's
 /// canonical id is `keccak(l1_hash)`, so a forged hash produces an id the

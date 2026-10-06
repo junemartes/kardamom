@@ -39,7 +39,8 @@ pub(crate) async fn driver_loss(h: &mut Harness) -> anyhow::Result<()> {
     ));
     h.inject_hard(&[&node], DRIVER_TASK).await?;
     h.assert_progress().await?;
-    h.assert_count("aeron", base, h.knobs.restart_slo).await?;
+    h.assert_count("aeron", base, h.knobs.driver_restart_slo())
+        .await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-driver-loss").await
 }
@@ -85,7 +86,8 @@ pub(crate) async fn tx_data_wipe(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .map_err(|e| crate::chaos_fail!("archive-tx-data-wipe: re-replication copy failed: {e}"))?;
     h.assert_progress().await?;
-    h.assert_count("aeron", base, h.knobs.restart_slo).await?;
+    h.assert_count("aeron", base, h.knobs.driver_restart_slo())
+        .await?;
     verify_restored(h, &victim).await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-tx-data-wipe").await
@@ -313,7 +315,8 @@ pub(crate) async fn corruption(h: &mut Harness) -> anyhow::Result<()> {
         .drain(&node_id, false, Duration::ZERO)
         .await
         .map_err(|e| crate::chaos_fail!("archive-corruption: drain disable failed: {e}"))?;
-    h.assert_count("aeron", base, h.knobs.restart_slo).await?;
+    h.assert_count("aeron", base, h.knobs.driver_restart_slo())
+        .await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
     h.assert_ingress_pair_live("archive-corruption").await
 }

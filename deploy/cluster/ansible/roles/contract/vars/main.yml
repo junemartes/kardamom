@@ -84,6 +84,8 @@ contract_mirrors:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-da-watcher:{{ image_tag }}'
       - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
       - --log-config
+      - '"{{ paths.da_watcher_dir }}:{{ paths.da_watcher_dir }}"'
+      - '"--l1-cursor-file", "{{ paths.da_watcher_dir }}/l1-cursor"'
     forbidden: []
   - path: deploy/cluster/nomad/batcher.nomad.hcl
     required:

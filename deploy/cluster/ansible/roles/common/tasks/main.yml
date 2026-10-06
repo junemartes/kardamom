@@ -91,6 +91,7 @@
     - "{{ paths.mirror_dir }}"
     - "{{ paths.notifier_dir }}"
     - "{{ paths.batcher_dir }}"
+    - "{{ paths.da_watcher_dir }}"
     - "{{ paths.l1_indexer_dir }}"
     - "{{ paths.da_store_dir }}"
     - "{{ paths.config_dir }}"

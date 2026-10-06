@@ -26,6 +26,9 @@ pub const DA_WATCHER_PORT: u16 = 9005;
 pub const INDEXER_PORT: u16 = 9009;
 /// Lane 0's metrics port: `9001 + 10 * lane`.
 pub const SEQUENCER_LANE0_PORT: u16 = 9001;
+/// The highest L1 origin a boundary carried, as a sequencer saw it: the
+/// last L1 block whose epoch the sealer ordered.
+pub const SEQUENCER_L1_ORIGIN_METRIC: &str = "kardamom_sequencer_l1_origin";
 /// The Nomad task name inside the `cluster` job.
 pub const CLUSTER_TASK: &str = "cluster";
 /// The sequencer samples a lane report prints; see
@@ -234,6 +237,23 @@ impl Probes {
             best = best.max(self.exec_metric(i, metric).await);
         }
         best
+    }
+
+    /// The last L1 block whose epoch the sealer ordered: the highest
+    /// boundary origin any lane-0 replica reports. Every replica reads
+    /// the same boundaries, so the maximum is the freshest view. `None`
+    /// before a replica saw a boundary with an origin.
+    pub async fn sealer_l1_origin(&self) -> Option<u64> {
+        let mut best = None;
+        for i in 0..self.sequencers.len() {
+            best = best.max(self.sequencer_l1_origin(i).await);
+        }
+        best
+    }
+
+    async fn sequencer_l1_origin(&self, i: usize) -> Option<u64> {
+        let body = self.scrape.fetch(&self.sequencer_lane0_target(i)).await?;
+        u64::try_from(metrics::first(&body, SEQUENCER_L1_ORIGIN_METRIC)?).ok()
     }
 
     /// The pipeline-progress probe: the highest committed block any

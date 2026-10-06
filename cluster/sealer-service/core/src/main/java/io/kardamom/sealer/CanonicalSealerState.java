@@ -23,8 +23,9 @@ import java.util.TreeMap;
  *
  * <p>Responsibilities:</p>
  * <ul>
- *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[], long)}).</li>
+ *   <li><b>Dedup</b> — a first-seen window over 32-byte canonical ids,
+ *       pruned by inclusion deadline and capped at the dedup capacity
+ *       ({@link #firstSeen(byte[], long)}).</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
  *       relays each first-seen record with its 0-based index and increases
  *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
@@ -37,6 +38,11 @@ import java.util.TreeMap;
  *   <li><b>Boundaries</b> — {@link #onTick(long)} stamps a {@link Boundary}
  *       with the current count and a timestamp floored to 250 ms, then
  *       advances the block number.</li>
+ *   <li><b>L1 origin</b> — {@link #onOriginRecord} adopts the L1 origin of
+ *       an epoch record. Once the state holds an origin, it accepts only
+ *       the next L1 block: a record that skips one is answered with an
+ *       origin-gap outcome that names the expected origin, and it never
+ *       enters the dedup window.</li>
  *   <li><b>Remote origins</b> — {@link #onRemoteOriginRecord} tracks a
  *       per-peer anchor and a per-peer lane cursor ({@code nextSeq}). A
  *       record is accepted only if the origin is in the configured
@@ -70,6 +76,13 @@ public final class CanonicalSealerState {
 
     /** Length, in bytes, of a sender address in the contiguity guard. */
     public static final int SENDER_LEN = 20;
+
+    /**
+     * How many ids a window may hold above {@code dedupCapacity}. Marker
+     * ids (epochs and remote batches) skip the cap, and one inclusion
+     * horizon holds far fewer than this many.
+     */
+    static final int MARKER_SLACK = 4096;
 
     /** Default genesis block number. */
     public static final long GENESIS_BLOCK_NUMBER = 1L;
@@ -138,8 +151,8 @@ public final class CanonicalSealerState {
     private static final int REMOTE_ENTRY_LEN_V4 = 8 + 8;
 
     /**
-     * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
-     * id is the first element, and eviction removes it. Keys are 32-byte
+     * The first-seen window. It is insertion-ordered, and a deadline prune
+     * removes the ids that no offer can use again. Keys are 32-byte
      * ids, wrapped in a read-only {@link ByteBuffer} for value-based
      * equality.
      */
@@ -552,9 +565,7 @@ public final class CanonicalSealerState {
      * @param deadline the last block this record may be ordered into
      */
     public Admission firstSeen(byte[] id32, long deadline) {
-        checkId(id32);
-        // Copy the array so the caller cannot change a stored key later.
-        ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
+        ByteBuffer key = idKey(id32);
         if (dedup.containsKey(key)) {
             return Admission.DUPLICATE;
         }
@@ -606,6 +617,15 @@ public final class CanonicalSealerState {
     private static long saturatingAdd(long a, long b) {
         long sum = a + b;
         return ((a ^ sum) & (b ^ sum)) < 0 ? Long.MAX_VALUE : sum;
+    }
+
+    /**
+     * The dedup key of a 32-byte canonical id. The key holds a copy, so the
+     * caller cannot change a stored key later.
+     */
+    private static ByteBuffer idKey(byte[] id32) {
+        checkId(id32);
+        return ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
     }
 
     private static void checkId(byte[] id32) {
@@ -880,6 +900,14 @@ public final class CanonicalSealerState {
      *       sequencer forwards every epoch, so most offers are re-offers of
      *       a record that is already ordered, carrying the origin it
      *       already adopted;</li>
+     *   <li>refuse an origin at or below the current one;</li>
+     *   <li>refuse an origin gap: once the state holds an origin, the next
+     *       origin must be exactly {@code l1Origin + 1}. The outcome names
+     *       that expected origin, so the producer can offer the missing
+     *       epochs again. The id does not enter the dedup window. A state
+     *       at origin 0 (genesis, or a seed with no epoch) accepts any first
+     *       origin, because the producer starts at an L1 block that this
+     *       state cannot know;</li>
      *   <li>close the currently open block, if it holds any records, so the
      *       record leads a block instead of landing mid-block. The forced
      *       boundary still carries the old origin, because it closes a
@@ -898,17 +926,17 @@ public final class CanonicalSealerState {
      * stop on a mismatch.</p>
      *
      * <p>The origin is echoed, never validated against L1, because this
-     * state machine has no L1 access by design. Monotonicity is enforced
-     * locally, since that check needs only the replicated state.</p>
+     * state machine has no L1 access by design. Monotonicity and the
+     * no-skip rule are enforced locally, since both checks need only the
+     * replicated state. So every member refuses a gap the same way.</p>
      *
      * @param newL1Origin the L1 block number for this record's epoch
      * @param slotCount canonical slots claimed; must be at least 1
-     * @return empty if the record was a duplicate; otherwise the forced
-     *         boundary (if any) and the relayed record
+     * @return the outcome: duplicate, relayed, or refused as an origin gap
      * @throws IllegalArgumentException if {@code newL1Origin} does not
      *         advance, or {@code slotCount} is below 1
      */
-    public Optional<OriginAdvance> onOriginRecord(
+    public OriginOutcome onOriginRecord(
             byte[] canonicalId32,
             long newL1Origin,
             long slotCount,
@@ -919,23 +947,38 @@ public final class CanonicalSealerState {
             // index. The consumer's dense cursor keys records by index.
             throw new IllegalArgumentException("slotCount must be >= 1, got " + slotCount);
         }
-        // Check dedup first. Checking monotonicity before dedup would reject
-        // normal re-offers from racing sequencers as regressions.
-        // A marker carries no deadline of its own: it is not a user
-        // submission. The sealer assigns one, for pruning only. A re-offer
-        // of a pruned marker id meets the origin guard below, which is
-        // what refuses it.
-        if (firstSeen(canonicalId32, assignedDeadline()) != Admission.FRESH) {
-            return Optional.empty();
+        // Look up the id first. Checking the origin before the lookup would
+        // reject normal re-offers from racing sequencers as regressions.
+        ByteBuffer key = idKey(canonicalId32);
+        if (dedup.containsKey(key)) {
+            return OriginOutcome.duplicate();
         }
         if (newL1Origin <= l1Origin) {
             // This is not a duplicate, but it claims an origin at or below
             // the current one, so two producers disagree about L1. Reject
             // it to keep l1Origin increasing, which the derivation rules
-            // depend on.
+            // depend on. A re-offer of a pruned marker id also ends here.
             throw new IllegalArgumentException(
                     "l1Origin must advance: have " + l1Origin + ", got " + newL1Origin);
         }
+        if (l1Origin > 0 && newL1Origin != l1Origin + 1) {
+            // The epochs between the two origins are missing. Sealing this
+            // one would drop their deposits for good. The check above
+            // proves l1Origin < newL1Origin, so l1Origin + 1 cannot
+            // overflow.
+            return OriginOutcome.gap(l1Origin + 1);
+        }
+        // Every check passed. Only now does the id enter the window, so a
+        // refused epoch never holds a place in it.
+        //
+        // A marker carries no deadline of its own: it is not a user
+        // submission. The sealer assigns one, for pruning only. A marker
+        // does not meet the window cap, so a window full of transactions
+        // cannot stop the L1 origin. Epochs come at the L1 block rate, so
+        // the markers in the window stay few: at most the epochs that
+        // arrive within one inclusion horizon. Every member takes the same
+        // branch, so the replicated state stays identical.
+        insertFresh(key, assignedDeadline());
         Boundary forced = null;
         if (canonicalCount > lastBoundaryCount) {
             forced = onTick(leaderClockMillis);
@@ -946,7 +989,7 @@ public final class CanonicalSealerState {
         // the range is consumed here, so the next record starts past the
         // deposits.
         canonicalCount += slotCount;
-        return Optional.of(new OriginAdvance(forced, new Relayed(index, payload)));
+        return OriginOutcome.relayed(new OriginAdvance(forced, new Relayed(index, payload)));
     }
 
     /**
@@ -1054,11 +1097,10 @@ public final class CanonicalSealerState {
             long lastSeq,
             byte[] payload,
             long leaderClockMillis) {
-        checkId(canonicalId32);
-        ByteBuffer key = ByteBuffer.wrap(canonicalId32.clone()).asReadOnlyBuffer();
         // Dedup LOOKUP first: the racing watchers' normal re-offers carry
         // the position already adopted and would read as lane regressions
         // if checked before this.
+        ByteBuffer key = idKey(canonicalId32);
         if (dedup.containsKey(key)) {
             return RemoteOriginOutcome.duplicate();
         }
@@ -1436,17 +1478,17 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
-        if (idCount < 0 || idCount > dedupCapacity) {
+        if (idCount < 0 || idCount > (long) dedupCapacity + MARKER_SLACK) {
             // A snapshot taken with a larger configured window than this
-            // member's would silently rebuild an oversized window. firstSeen
-            // only shrinks it by one entry per insert, so dedup behavior
-            // would differ from a fresh state with the same config — a
-            // determinism hazard if members disagree on the capacity. Fail
-            // loudly instead of truncating silently. Shrinking the window
-            // across a restart needs an explicit migration.
+            // member's would rebuild an oversized window, and members that
+            // disagree on the capacity would decide differently. Fail
+            // loudly. Markers do not meet the cap, so a window can hold
+            // MARKER_SLACK ids above it. Shrinking the window across a
+            // restart needs an explicit migration.
             throw new IllegalArgumentException(
                     "snapshot idCount " + idCount + " outside [0, dedupCapacity="
-                            + dedupCapacity + "] — members must agree on the configured window");
+                            + dedupCapacity + " + " + MARKER_SLACK
+                            + "] — members must agree on the configured window");
         }
         int idEntryLen = version >= 7 ? CANONICAL_ID_LEN + 8 : CANONICAL_ID_LEN;
         if ((long) idCount * idEntryLen > buf.remaining()) {

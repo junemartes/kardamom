@@ -271,10 +271,13 @@ class CanonicalSealerStateTest {
 
     @Test
     void load_rejects_id_count_above_capacity() {
-        // The snapshot was taken with a window of 8 ids.
-        CanonicalSealerState original = new CanonicalSealerState(8, 1);
-        for (int i = 1; i <= 8; i++) {
-            original.onRecord(id(i), payload("p" + i));
+        int slack = CanonicalSealerState.MARKER_SLACK;
+        int taken = 4 + slack + 1;
+        CanonicalSealerState original = new CanonicalSealerState(taken, 1);
+        for (int i = 1; i <= taken; i++) {
+            byte[] distinct = id(0);
+            java.nio.ByteBuffer.wrap(distinct).putInt(i);
+            original.onRecord(distinct, payload("p" + i));
         }
         byte[] snapshot = original.takeSnapshot();
         // The state must not silently load into a smaller configured window.
@@ -283,8 +286,8 @@ class CanonicalSealerStateTest {
                 IllegalArgumentException.class, () -> CanonicalSealerState.load(snapshot, 4));
         assertTrue(e.getMessage().contains("idCount"), "message names the field: " + e.getMessage());
         // The same snapshot loads correctly at or above the original capacity.
-        assertEquals(8, CanonicalSealerState.load(snapshot, 8).dedupSize());
-        assertEquals(8, CanonicalSealerState.load(snapshot, 16).dedupSize());
+        assertEquals(taken, CanonicalSealerState.load(snapshot, taken).dedupSize());
+        assertEquals(taken, CanonicalSealerState.load(snapshot, taken * 2).dedupSize());
     }
 
     @Test

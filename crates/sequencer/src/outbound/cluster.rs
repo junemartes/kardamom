@@ -118,13 +118,14 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
 
 /// The egress kinds a publisher session reads: the boundaries, and every
 /// reject the sealer answers an offer with.
-pub const PUBLISHER_EGRESS_KINDS: [u8; 6] = [
+pub const PUBLISHER_EGRESS_KINDS: [u8; 7] = [
     wire::EGRESS_KIND_BOUNDARY,
     wire::EGRESS_KIND_CONTIGUITY_REJECT,
     wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
     wire::EGRESS_KIND_PAST_DEADLINE,
     wire::EGRESS_KIND_WINDOW_FULL,
     wire::EGRESS_KIND_DA_LAG_REJECT,
+    wire::EGRESS_KIND_ORIGIN_GAP,
 ];
 
 /// Connect to the cluster, wrap ingress as a `TxOrderingRefPublisher`, and
@@ -151,8 +152,10 @@ pub fn cluster_ref_publisher_with_egress(
     // gap; the watermark thread forwards it into the rewind path. A
     // remote-origin reject is the sealer refusing a relayed kind-5 record;
     // the watermark thread logs and counts it. The past-deadline, the
-    // window-full, and the DA-lag rejects go to the offering session
-    // only, and the feed answers each one.
+    // window-full, the DA-lag, and the origin-gap rejects go to the
+    // offering session only, and the feed answers each one. The
+    // boundaries' L1 origin and the origin-gap rejects drive the epoch
+    // lane's confirm and its offer again.
     let (cluster, ingress, egress) = live::connect_with(
         rt,
         cfg,
@@ -184,6 +187,7 @@ mod tests {
             wire::EGRESS_KIND_PAST_DEADLINE,
             wire::EGRESS_KIND_WINDOW_FULL,
             wire::EGRESS_KIND_DA_LAG_REJECT,
+            wire::EGRESS_KIND_ORIGIN_GAP,
         ] {
             assert!(PUBLISHER_EGRESS_KINDS.contains(&kind), "kind {kind}");
         }

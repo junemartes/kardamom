@@ -263,6 +263,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             | EgressItem::PastDeadline { .. }
             | EgressItem::WindowFull { .. }
             | EgressItem::DaLagReject { .. }
+            | EgressItem::OriginGap { .. }
             | EgressItem::Status(_) => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,

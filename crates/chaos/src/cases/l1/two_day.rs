@@ -17,6 +17,7 @@ use super::followers::{
 };
 use super::halt::await_followers_halted;
 use super::outage::hold_until_floor_passes;
+use crate::cases::da_watcher::assert_not_past_sealer;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
 use crate::nomad::{SavedJob, Streams};
@@ -79,8 +80,11 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .complete()
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no complete ingress baseline at T1"))?;
-    // T2.
+    // T2. The da-watcher's cursor file survives the stop on the host
+    // mount, so the restart resumes at the sealer's origin, and halts on
+    // the lying anchor again.
     redeploy_followers(h, ctx).await?;
+    assert_not_past_sealer(h, ctx).await?;
     await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx).await?;
     // T3: the floor passes the cursor the batcher resumed at in T1. The
     // batcher kept posting, so its live cursor moved with the chain.

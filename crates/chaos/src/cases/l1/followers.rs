@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::cases::component::wipe_dirs;
+use crate::cases::da_watcher::resume_after_sealer_origin;
 use crate::harness::Harness;
 use crate::l1::L1;
 use crate::nomad::SavedJob;
@@ -195,18 +196,19 @@ pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> a
 }
 
 /// The operator step a single-source follower needs after a wrong hash
-/// reached its anchor: the da-watcher's anchor is in memory, so a
-/// restart clears it; the indexer's cursor is on disk with the wrong
-/// hash, so its archive is re-indexed from the chain's first block. The
-/// two-source followers never store an unagreed hash, which removes
-/// this step.
+/// reached its anchor. Both cursors are on disk with the wrong hash. The
+/// da-watcher runs once with `--l1-resume-after` at the sealer's L1
+/// origin, so it reads that block's hash again and skips no epoch; a
+/// removed cursor file would start it at the finalized tip and halt every
+/// sequencer on `origin_gap`. The indexer's archive is re-indexed from
+/// the chain's first block. The two-source followers never store an
+/// unagreed hash, which removes this step.
 pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
     crate::log(format!(
-        "{ctx}: OPERATOR STEP (removed by the two-source followers): restart the da-watcher, re-index the archive"
+        "{ctx}: OPERATOR STEP (removed by the two-source followers): resume the da-watcher after the sealer's origin, re-index the archive"
     ));
+    resume_after_sealer_origin(h, ctx).await?;
     let aux = h.probes.validator.container.clone();
-    h.inject_hard(&[&aux], "da-watcher").await?;
-    h.assert_count("da-watcher", 1, h.knobs.restart_slo).await?;
     let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
     indexer.stop().await?;
     wipe_dirs(h, &aux, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;

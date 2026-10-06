@@ -14,6 +14,8 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-da-watcher",
     "kardamom-ingress",
     "kardamom-notifier",
+    "kardamom-validator",
+    "kardamom-state-mirror",
 ];
 
 fn dashboards_dir() -> PathBuf {
@@ -52,7 +54,8 @@ fn assert_dashboard_valid(dir: &std::path::Path, stem: &str) {
 
 /// Check one dashboard panel: it has a title, and (unless it is a text
 /// panel, which carries no targets) every `PromQL` target is
-/// kardamom-scoped — either a `kardamom_*` metric or a `kardamom-*` job
+/// kardamom-scoped: a `kardamom_*` metric, a `validator_*` metric (the
+/// validator exports under its own prefix), or a `kardamom-*` job
 /// selector (for example, the overview's `up{job=~"kardamom-.+"}`
 /// liveness panel).
 fn assert_panel_valid(path: &std::path::Path, i: usize, p: &serde_json::Value) {
@@ -68,7 +71,7 @@ fn assert_panel_valid(path: &std::path::Path, i: usize, p: &serde_json::Value) {
     for (j, t) in targets.iter().enumerate() {
         let expr = t["expr"].as_str().unwrap_or("");
         assert!(
-            expr.contains("kardamom"),
+            expr.contains("kardamom") || expr.contains("validator_"),
             "{} panel[{i}] target[{j}] expr is not kardamom-scoped: {expr}",
             path.display()
         );

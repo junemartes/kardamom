@@ -56,10 +56,9 @@ public final class ClusterNode {
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
         final int ingressStreamId = Integer.getInteger("kardamom.cluster.ingressStreamId", 101);
         final long tickMs = Long.getLong("kardamom.cluster.tickMs", 2000L);
-        // Dedup window: this must exceed the worst-case racing-replica stall
-        // multiplied by the peak unique-record throughput, and every member
-        // must use the same value. See SealerWire.DEFAULT_DEDUP_CAPACITY for
-        // the sizing math.
+        // Dedup window capacity: a hard cap on the window. A fresh record
+        // past the cap gets back-pressure. Every member must use the same
+        // value. See SealerWire.DEFAULT_DEDUP_CAPACITY.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
         // Replicated configuration, like the capacity above: it decides
@@ -337,8 +336,7 @@ public final class ClusterNode {
      * launch, with no error and no exit. Aeron 1.44's
      * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
      * module spins in {@code Election.init} forever while the container
-     * reports healthy to Nomad (issue #195). PR #257 removed the known
-     * trigger. This watchdog covers the shape itself: an election that
+     * reports healthy to Nomad. This watchdog covers the shape: an election that
      * stays in INIT past the window is a wedge, never a slow join. See
      * {@link JoinWatchdog} for why INIT is the only state it acts on.</p>
      *
