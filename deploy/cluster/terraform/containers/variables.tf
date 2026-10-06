@@ -1,5 +1,5 @@
 variable "contract_file" {
-  description = "The Ansible group_vars file that declares ip_prefix and node_classes. A relative path is resolved from this root."
+  description = "The Ansible group_vars file that declares node_classes. A relative path is resolved from this root."
   type        = string
   default     = "../../ansible/group_vars/all.yml"
 }

@@ -41,8 +41,8 @@ variable "eigenda_cert_verifier" {
 }
 
 # How the signer pays: from an on-demand deposit in the PaymentVault
-# (the default here; docs/staging-launch.md C1 makes the deposit), or
-# from a reservation EigenDA granted the account.
+# (the default here; the operator makes the deposit before the first
+# dispersal), or from a reservation EigenDA granted the account.
 variable "eigenda_ledger_mode" {
   type        = string
   description = "The payment mode of the signer: on-demand-only, reservation-only, reservation-and-on-demand."
