@@ -108,15 +108,24 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long the rejoin drill waits for the leader's first log purge. The
+/// purge needs four snapshots (the three kept and the purge point), one
+/// archive segment of log below the purge point, and a posted head past
+/// the purge point's block.
+const PURGE_WAIT: Duration = Duration::from_mins(6);
+
 /// The blank-member catch-up drill: a follower's cluster directory and
 /// archive are wiped after its kill, so the restarted member owns
-/// nothing and replays the leader's log from position 0. The proof is
+/// nothing. The drill first waits until the leader has purged its log,
+/// so a replay from position 0 is impossible. The member seeds from a
+/// peer's latest snapshot and catches up from the leader. The proof is
 /// positional: its latest post-wipe snapshot block must reach the head
 /// observed at wipe time. A position that never moves is a join wedge,
 /// not slow replay.
 pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "cluster-member-rejoin";
     let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+    await_log_purge(h, leader, ctx).await?;
     let follower = a_follower(leader);
     let before = Blank::observe(h, follower, ctx).await?;
     let node = sealer(h, follower)?;
@@ -134,6 +143,37 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
     before.await_caught_up(h).await
+}
+
+/// Wait until `leader` logs a purge of its Raft log. The purge lines stay
+/// in the logs of the leader's allocation, so an earlier purge counts.
+async fn await_log_purge(h: &Harness, leader: u32, ctx: &str) -> anyhow::Result<()> {
+    let needle = format!("cluster LOG PURGED memberId={leader} ");
+    let (hs, needle_ref) = (h, &needle);
+    let outcome = poll::until(
+        Budget::new(PURGE_WAIT, Duration::from_secs(10)),
+        |_| async move {
+            Ok(hs
+                .evidence
+                .cluster_logs()
+                .await?
+                .contains(needle_ref.as_str())
+                .then_some(()))
+        },
+    )
+    .await?;
+    let ((), elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: leader memberId={leader} logged no '{}' within {}s — without a purged log the drill cannot prove a rejoin through a peer seed",
+            needle.trim_end(),
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: leader memberId={leader} has purged its Raft log ({}s); a replay from position 0 is impossible",
+        elapsed.as_secs()
+    ));
+    Ok(())
 }
 
 /// The machine-replacement drill for a Raft member: a follower's sealer
@@ -159,7 +199,7 @@ pub(crate) async fn node_replace_sealer(h: &mut Harness) -> anyhow::Result<()> {
 }
 
 /// The state a blank-member proof starts from: the member, the count of
-/// its fresh-at-genesis lines per allocation, and the executor head,
+/// its blank-start lines per allocation, and the executor head,
 /// read before the member loses its state. The count is kept per
 /// allocation because a member restarted in place logs into its own
 /// allocation, while a member on a replaced node logs into a new one and
@@ -167,33 +207,33 @@ pub(crate) async fn node_replace_sealer(h: &mut Harness) -> anyhow::Result<()> {
 struct Blank {
     ctx: &'static str,
     member: u32,
-    fresh: String,
+    start: BlankStart,
     before: HashMap<String, usize>,
     head: i64,
 }
 
 impl Blank {
     async fn observe(h: &Harness, member: u32, ctx: &'static str) -> anyhow::Result<Self> {
-        let fresh = format!("sealer state FRESH at genesis memberId={member}");
-        let (before, _) = Self::fresh_by_alloc(h, &fresh).await?;
+        let start = BlankStart::of(member);
+        let (before, _) = Self::starts_by_alloc(h, &start).await?;
         let head = h.probes.executor_progress().await.filter(|h| *h > 0).ok_or_else(|| {
             crate::chaos_fail!("{ctx}: could not read the executor head before the member lost its state — refusing to run: the catch-up proof needs a real target position or it proves nothing")
         })?;
         Ok(Self {
             ctx,
             member,
-            fresh,
+            start,
             before,
             head,
         })
     }
 
-    /// The count of `needle` in each reachable cluster allocation, and
-    /// those allocations' logs. A lost allocation is skipped: its node is
-    /// gone, and so are its logs.
-    async fn fresh_by_alloc(
+    /// The count of blank-start lines in each reachable cluster
+    /// allocation, and those allocations' logs. A lost allocation is
+    /// skipped: its node is gone, and so are its logs.
+    async fn starts_by_alloc(
         h: &Harness,
-        needle: &str,
+        start: &BlankStart,
     ) -> anyhow::Result<(HashMap<String, usize>, String)> {
         let allocs = h.nomad.allocations(CLUSTER_TASK).await?;
         let mut counts = HashMap::new();
@@ -202,14 +242,14 @@ impl Blank {
             let text = h.nomad.alloc_logs(alloc, Streams::StdoutOnly).await?;
             counts.insert(
                 alloc.id.clone(),
-                text.lines().filter(|l| l.contains(needle)).count(),
+                text.lines().filter(|l| start.matches(l)).count(),
             );
             logs.push_str(&text);
         }
         Ok((counts, logs))
     }
 
-    /// Some allocation logged a fresh-at-genesis line it had not logged
+    /// Some allocation logged a blank-start line it had not logged
     /// before: the member started blank.
     fn started_blank(&self, now: &HashMap<String, usize>) -> bool {
         now.iter()
@@ -223,7 +263,7 @@ impl Blank {
         let budget = Budget::new(h.knobs.rejoin_slo, Duration::from_secs(10));
         let (track_ref, me) = (&track, &self);
         let outcome = poll::until(budget, |_| async move {
-            let (now, logs) = Self::fresh_by_alloc(h, &me.fresh).await?;
+            let (now, logs) = Self::starts_by_alloc(h, &me.start).await?;
             let mut track = track_ref.borrow_mut();
             track.observe(catchup_block(&logs, me.member), me.started_blank(&now));
             Ok((track.blank && track.block >= me.head).then_some(()))
@@ -233,7 +273,7 @@ impl Blank {
         let ((), elapsed) = outcome.or_fail(|t| track.failure(&self, t))?;
         let now = h.evidence.cluster_leader(h.knobs.leader_slo).await.ok();
         crate::log(format!(
-            "{}: memberId={} rejoined blank via full log replay (replayed to block {} >= head {}, {}s); leader now memberId={}",
+            "{}: memberId={} rejoined blank (replayed to block {} >= head {}, {}s); leader now memberId={}",
             self.ctx,
             self.member,
             track.block,
@@ -245,16 +285,42 @@ impl Blank {
     }
 }
 
+/// The log lines that mark a blank start of one member: a start at log
+/// position 0, or a seed from a peer's latest snapshot.
+#[derive(Debug)]
+struct BlankStart([String; 2]);
+
+impl BlankStart {
+    fn of(member: u32) -> Self {
+        Self([
+            format!("sealer state FRESH at genesis memberId={member}"),
+            format!("cluster SEED from-peer memberId={member} "),
+        ])
+    }
+
+    fn matches(&self, line: &str) -> bool {
+        self.0.iter().any(|needle| line.contains(needle.as_str()))
+    }
+
+    /// The logs after the latest blank-start line, or `None` without one.
+    fn after_latest<'a>(&self, logs: &'a str) -> Option<&'a str> {
+        self.0
+            .iter()
+            .filter_map(|needle| logs.rfind(needle.as_str()).map(|at| at + needle.len()))
+            .max()
+            .map(|end| &logs[end..])
+    }
+}
+
 /// The replay position of a wiped member: the block of its latest
-/// `snapshot TAKEN` line after its most recent `FRESH at genesis` line,
-/// so pre-wipe history cannot satisfy the proof.
+/// `snapshot TAKEN` line after its most recent blank-start line, so
+/// pre-wipe history cannot satisfy the proof.
 fn catchup_block(logs: &str, member: u32) -> i64 {
-    let fresh = format!("FRESH at genesis memberId={member}");
     let taken = format!("snapshot TAKEN memberId={member}");
-    let Some((_, after_fresh)) = logs.rsplit_once(&fresh) else {
+    let Some(after_start) = BlankStart::of(member).after_latest(logs) else {
         return 0;
     };
-    after_fresh
+    after_start
         .lines()
         .filter(|l| l.contains(&taken))
         .filter_map(|l| l.split("block=").nth(1))
@@ -293,8 +359,8 @@ impl Catchup {
         let (ctx, head, secs) = (blank.ctx, blank.head, t.as_secs());
         if !self.blank {
             return crate::chaos_fail!(
-                "{ctx}: restarted member did not start blank (no allocation logged a new '{}' line) — the state loss did not take, this run proved nothing about empty-state rejoin",
-                blank.fresh
+                "{ctx}: restarted member did not start blank (no allocation logged a new line of {:?}) — the state loss did not take, this run proved nothing about empty-state rejoin",
+                blank.start.0
             );
         }
         if !self.moved {
@@ -369,11 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn the_catchup_block_counts_only_lines_after_the_last_seed() {
+        let logs = "sealer state FRESH at genesis memberId=1\n\
+            sealer snapshot TAKEN memberId=1 block=90\n\
+            cluster SEED from-peer memberId=1 snapshotPosition=4096 round=1\n\
+            sealer snapshot RESTORED memberId=1 block=80 canonicalCount=7\n\
+            sealer snapshot TAKEN memberId=1 block=95\n";
+        assert_eq!(catchup_block(logs, 1), 95);
+        let start = BlankStart::of(1);
+        assert!(start.matches("cluster SEED from-peer memberId=1 snapshotPosition=-1 round=2"));
+        assert!(!start.matches("cluster SEED from-peer memberId=10 snapshotPosition=-1 round=2"));
+        assert!(!start.matches("cluster SEED waiting-for-peer memberId=1 round=1"));
+    }
+
+    #[test]
     fn a_blank_start_is_a_new_fresh_line_in_any_allocation() {
         let blank = Blank {
             ctx: "test",
             member: 1,
-            fresh: String::new(),
+            start: BlankStart::of(1),
             before: HashMap::from([("old".to_string(), 1), ("peer".to_string(), 0)]),
             head: 1,
         };

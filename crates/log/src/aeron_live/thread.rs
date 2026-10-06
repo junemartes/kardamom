@@ -5,6 +5,7 @@
 //! [`RuntimeCmd`]s.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -12,8 +13,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use tracing::warn;
 
+use super::bound::BoundControl;
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
-use super::runtime::RuntimeCmd;
+use super::runtime::{OpenedPub, RuntimeCmd};
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
 use crate::error::LogError;
 use crate::offer_retry::OFFER_TIMEOUT;
@@ -340,23 +342,41 @@ impl AeronThread {
     }
 
     /// Open a publication and append it to `pubs`, replying with its
-    /// index. Also reads the publication's term layout once (its
+    /// index and its Aeron session id.
+    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<OpenedPub, LogError> {
+        let publication = self.open_pub(uri, stream_id)?;
+        self.push_pub(publication, stream_id)
+    }
+
+    /// Open a dynamic MDC publication whose control endpoint names port
+    /// 0, wait for the control address the driver bound, and append the
+    /// publication to `pubs`. A publication with no bound address drops
+    /// here and never enters the table.
+    fn cmd_open_mdc_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<(OpenedPub, SocketAddr), LogError> {
+        let publication = self.open_pub(uri, stream_id)?;
+        let control = BoundControl::new(&publication, uri).wait()?;
+        Ok((self.push_pub(publication, stream_id)?, control))
+    }
+
+    /// Append `publication` to `pubs` and return its index and its Aeron
+    /// session id. Also reads the publication's term layout once (its
     /// `position_bits_to_shift` and `initial_term_id`), so later offer
     /// decodes never re-derive it.
-    /// Open a publication and append it to `pubs`, replying with its
-    /// index and its Aeron session id.
-    fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<(u32, i32), LogError> {
-        let publication = self.open_pub(uri, stream_id)?;
+    fn push_pub(&mut self, publication: super::Pub, stream_id: i32) -> Result<OpenedPub, LogError> {
         let layout = TermLayout::from_publication(&publication)?;
         let session_id = publication.session_id();
-        let id = u32::try_from(self.pubs.len())
+        let pub_id = u32::try_from(self.pubs.len())
             .map_err(|_| LogError::Aeron("publication table exceeds u32::MAX entries".into()))?;
         self.pubs.push(PubEntry {
             publication,
             layout,
             stream_id,
         });
-        Ok((id, session_id))
+        Ok(OpenedPub { pub_id, session_id })
     }
 
     /// Open a subscription behind a fragment assembler, and append it to
@@ -427,6 +447,13 @@ impl AeronThread {
                 ack,
             } => {
                 let _ = ack.send(self.cmd_open_publication(&uri, stream_id));
+            }
+            RuntimeCmd::OpenMdcPublication {
+                uri,
+                stream_id,
+                ack,
+            } => {
+                let _ = ack.send(self.cmd_open_mdc_publication(&uri, stream_id));
             }
             RuntimeCmd::OpenSubscription {
                 uri,

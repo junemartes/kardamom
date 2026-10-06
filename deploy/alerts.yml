@@ -6,7 +6,7 @@
 # each epoch against L1. When L1 does not answer, the epoch commits
 # unverified and only a counter moves. Nothing else in the system
 # notices, and that is exactly where a targeted forgery would sit
-# (issue #163). An alert turns that counter into a signal.
+# An alert turns that counter into a signal.
 #
 # The batcher and follower rules watch the one signal an L1 outage
 # cannot hide: the age of the last post as L1 serves it. A lying
@@ -98,8 +98,9 @@ groups:
 
       - alert: KardamomValidatorEpochFault
         # A chain fault: the epoch on the canonical stream disagrees
-        # with L1. The validator fail-stops on this, so the counter
-        # moves once and the process exits. Page on it.
+        # with L1. The validator records a divergence and holds the
+        # validator_divergence halt. The process stays up and the
+        # counter moves once. Page on it.
         expr: increase(validator_epoch_faults_total[10m]) > 0
         for: 0m
         labels:
@@ -201,6 +202,17 @@ groups:
           summary: "{{ $labels.service }} halted: sealer_no_quorum (seen by {{ $labels.host_id }})"
           description: "The sealer emits no block boundary: the cluster has no leader or no quorum. Nothing is ordered; the ingresses and the sequencers pause on it. The ingress observes the sealer and exports this halt. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/sealer_no_quorum.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/sealer_no_quorum.md"
+
+      - alert: KardamomHaltL1CursorUnreadable
+        expr: kardamom_halt{cause="l1_cursor_unreadable"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_cursor_unreadable
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_cursor_unreadable ({{ $labels.host_id }})"
+          description: "The da-watcher's L1 cursor file exists, but it does not read or parse. The da-watcher publishes no epoch, so deposits wait. It never guesses a resume block. Find the last published L1 block, write the file again, then clear the halt. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_cursor_unreadable.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_cursor_unreadable.md"
 
       - alert: KardamomHaltValidatorDivergence
         expr: kardamom_halt{cause="validator_divergence"} == 1

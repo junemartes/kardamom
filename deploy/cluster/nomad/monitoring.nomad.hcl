@@ -1,16 +1,27 @@
-# kardamom-monitoring: Prometheus and Grafana on the monitoring node.
+# kardamom-monitoring: Prometheus, Alertmanager and Grafana on the monitoring
+# node.
 #
 # Prometheus scrapes every service's metrics endpoint by its Consul node
 # name, rendered from the node-class counts: no address in this file. It
-# evaluates the alert rules of deploy/alerts.yml. Grafana provisions the
-# Prometheus datasource by the Consul service name and the dashboards
+# evaluates the alert rules of deploy/alerts.yml and sends the firing
+# alerts to the Alertmanager of the same allocation. Grafana provisions
+# the Prometheus datasource by the Consul service name and the dashboards
 # from deploy/grafana/provisioning/dashboards-json. This job is the one
 # monitoring stack of every profile. The autoscaler's Prometheus APM
 # reads the same service.
 #
-# Placement: the aux node, next to the validator and the da-watcher,
-# outside the chaos suite's blast radius. Ports on the aux node:
-# Prometheus 9090, Grafana 3000.
+# The operator of an environment adds rules and the Alertmanager routing
+# through the Nomad variable nomad/jobs/monitoring, with two items:
+#   rules         a Prometheus rule file (groups of alerts and limits)
+#   alertmanager  the complete Alertmanager configuration, receivers
+#                 included
+# The tasks render the two items and reload on a change (SIGHUP). Without
+# the variable, Prometheus evaluates deploy/alerts.yml only and
+# Alertmanager routes every alert to a receiver that notifies nobody.
+#
+# Placement: the node whose role set holds monitoring (the aux node by
+# default), outside the chaos suite's blast radius. Ports on that node:
+# Prometheus 9090, Alertmanager 9093, Grafana 3000.
 #
 # This job uses file() for its dashboards and alert rules, so submit it
 # from deploy/cluster (the workloads role does).
@@ -37,6 +48,24 @@ variable "ingress_count" {
   type        = number
   description = "Ingress nodes (node_classes.ingress.count in group_vars/all.yml)."
   default     = 2
+}
+
+variable "cluster_id" {
+  type        = string
+  description = "The cluster identity. The Nomad agents register <cluster_id>-nomad and <cluster_id>-nomad-client in Consul."
+  default     = "kardamom-dev"
+}
+
+variable "nomad_region" {
+  type        = string
+  description = "The Nomad region. The agent certificate of a client names client.<region>.nomad."
+  default     = "global"
+}
+
+variable "nomad_tls_dir" {
+  type        = string
+  description = "The directory with the agent TLS material on the monitoring node (ca.pem). Empty means the Nomad API speaks plain HTTP."
+  default     = ""
 }
 
 variable "grafana_admin_password" {
@@ -88,6 +117,33 @@ locals {
       - job_name: kardamom-notifier
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-notifier-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
+      # and the metrics of every Nomad agent, discovered through the local
+      # Consul agent. The node label is the Consul node name.
+      - job_name: node
+        consul_sd_configs:
+          - server: 127.0.0.1:8500
+            services: [node-exporter]
+        relabel_configs:
+          - source_labels: [__meta_consul_node]
+            target_label: node
+      - job_name: nomad
+        metrics_path: /v1/metrics
+        params:
+          format: [prometheus]
+        scheme: ${var.nomad_tls_dir != "" ? "https" : "http"}
+        tls_config:
+          ca_file: ${var.nomad_tls_dir != "" ? "/etc/kardamom/nomad-ca.pem" : ""}
+          server_name: ${var.nomad_tls_dir != "" ? "client.${var.nomad_region}.nomad" : ""}
+        consul_sd_configs:
+          - server: 127.0.0.1:8500
+            services: ["${var.cluster_id}-nomad", "${var.cluster_id}-nomad-client"]
+            # A server registers its http, rpc and serf ports under one
+            # name; only the http port serves the metrics.
+            tags: [http]
+        relabel_configs:
+          - source_labels: [__meta_consul_node]
+            target_label: node
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
@@ -129,6 +185,9 @@ job "monitoring" {
       port "prometheus" {
         static = 9090
       }
+      port "alertmanager" {
+        static = 9093
+      }
       port "grafana" {
         static = 3000
       }
@@ -137,6 +196,18 @@ job "monitoring" {
     service {
       name     = "prometheus"
       port     = "prometheus"
+      provider = "consul"
+      check {
+        type     = "http"
+        path     = "/-/ready"
+        interval = "10s"
+        timeout  = "2s"
+      }
+    }
+
+    service {
+      name     = "alertmanager"
+      port     = "alertmanager"
       provider = "consul"
       check {
         type     = "http"
@@ -164,6 +235,9 @@ job "monitoring" {
       config {
         image        = "prom/prometheus:v3.5.1@sha256:38c3b05c3bc744ff1b0b7b4eb82196026442845e62a1e2073795565da506d7a2"
         network_mode = "host"
+        # The CA of the Nomad agents, when the API speaks TLS: the scrape
+        # of the Nomad metrics verifies the agent certificate against it.
+        volumes = var.nomad_tls_dir != "" ? ["${var.nomad_tls_dir}/ca.pem:/etc/kardamom/nomad-ca.pem:ro"] : []
         args = [
           "--config.file=/local/prometheus.yml",
           "--storage.tsdb.path=/alloc/data/prometheus",
@@ -190,11 +264,13 @@ job "monitoring" {
           global:
             scrape_interval: 1s
             evaluation_interval: 5s
-          # Prometheus evaluates the rules and shows firing alerts on its
-          # /alerts page. No Alertmanager is wired; route the alerts there
-          # when a pager exists.
+          alerting:
+            alertmanagers:
+              - static_configs:
+                  - targets: ["127.0.0.1:9093"]
           rule_files:
             - /local/alerts.yml
+            - /local/operator-rules.yml
           ${local.targets_yaml}
         EOT
       }
@@ -208,9 +284,65 @@ job "monitoring" {
         right_delimiter = "]]]"
       }
 
+      # The rules of the operator, from the Nomad variable. The variable
+      # holds the file as one item, so its own {{ }} templates arrive as
+      # data. A change reloads Prometheus in place.
+      template {
+        destination   = "local/operator-rules.yml"
+        change_mode   = "signal"
+        change_signal = "SIGHUP"
+        data          = <<-EOT
+          {{- if nomadVarExists "nomad/jobs/monitoring" -}}
+          {{- with nomadVar "nomad/jobs/monitoring" }}{{ .rules }}{{ end -}}
+          {{- else -}}
+          groups: []
+          {{- end }}
+        EOT
+      }
+
       resources {
         cpu    = 300
         memory = 512
+      }
+    }
+
+    task "alertmanager" {
+      driver = "docker"
+
+      config {
+        image        = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
+        network_mode = "host"
+        args = [
+          "--config.file=/local/alertmanager.yml",
+          "--storage.path=/alloc/data/alertmanager",
+          # One instance: no peer gossip. The default listener takes port
+          # 9094 on every interface of the host, outside the job's ports.
+          "--cluster.listen-address=",
+        ]
+      }
+
+      # The routing of the operator, from the Nomad variable. Without it,
+      # the one receiver notifies nobody, and the alerts show on the
+      # Alertmanager page only. A change reloads Alertmanager in place.
+      template {
+        destination   = "local/alertmanager.yml"
+        change_mode   = "signal"
+        change_signal = "SIGHUP"
+        data          = <<-EOT
+          {{- if nomadVarExists "nomad/jobs/monitoring" -}}
+          {{- with nomadVar "nomad/jobs/monitoring" }}{{ .alertmanager }}{{ end -}}
+          {{- else -}}
+          route:
+            receiver: nobody
+          receivers:
+            - name: nobody
+          {{- end }}
+        EOT
+      }
+
+      resources {
+        cpu    = 100
+        memory = 128
       }
     }
 

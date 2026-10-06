@@ -13,11 +13,15 @@ kardamom-types.workspace = true
 kardamom-batcher = { path = "../batcher" }
 kardamom-engine = { path = "../engine" }
 kardamom-state = { path = "../state" }
+# The L1 read the producer and the validator use: the rebuild derives each
+# epoch's deposits from the lockbox logs through the same source.
+kardamom-da-watcher = { path = "../da_watcher" }
 
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 
 anyhow.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -48,7 +52,9 @@ kardamom-reconstruct = { path = ".", features = ["test-support"] }
 # `test-support` exposes the fake EigenDA proxy the L1 round-trip test
 # posts through.
 kardamom-batcher = { path = "../batcher", features = ["test-support"] }
-kardamom-deployer = { path = "../deployer" }
+kardamom-deployer = { path = "../deployer", features = ["test-support"] }
+# `testing` exposes the in-memory L1 source the epoch tests read.
+kardamom-da-watcher = { path = "../da_watcher", features = ["testing"] }
 alloy-network.workspace = true
 alloy-signer-local.workspace = true
 alloy-node-bindings.workspace = true

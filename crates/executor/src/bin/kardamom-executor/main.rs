@@ -33,7 +33,7 @@ use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
-    MdbxWriterSignal, Outbound, RoleHooks,
+    MdbxWriterSignal, NoTxHook, Outbound, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
@@ -148,17 +148,12 @@ async fn spawn_writer_and_bal(
 /// An empty or comment-only file (the current deployment shape)
 /// deserializes to a disabled cluster, so behavior stays the same
 /// unless `[cluster]` is set.
-///
-/// The cluster client's `egress_channel` is this node's reachable
-/// address (the node IP differs per replica), so the Nomad job injects
-/// it as `--cluster-egress-endpoint`, instead of baking it into the
-/// static config file.
 fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
     let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
     let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
-    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-    }
+    file_cfg
+        .cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
     Ok(file_cfg)
 }
 
@@ -413,11 +408,6 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         _nonce_query: nonce_query,
     } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
-    // `verify_record_identity` stays off here by decision, not omission.
-    // With the validator checking every record, a forged envelope
-    // halts verification with proof. Sequencer-side rejection would only
-    // buy defense-in-depth, at the cost of an ecrecover per tx on the hot
-    // path. See the field's doc for the full trade-off.
     let mut cfg = ExecutorConfig {
         chain_id,
         fees: genesis.as_ref().and_then(|g| g.fees),
@@ -471,6 +461,13 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
                 // No remote-epoch check either: that seam is wired by the
                 // destination validator only.
                 remote_epoch_observer: None,
+                // No `VerifyRecordIdentity` hook, by decision, not
+                // omission. With the validator checking every record, a
+                // forged envelope halts verification with proof.
+                // Sequencer-side rejection would only buy
+                // defense-in-depth, at the cost of an ecrecover per tx on
+                // the hot path. See the hook's doc for the full trade-off.
+                tx_hook: NoTxHook,
             },
         )
         .run()

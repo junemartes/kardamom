@@ -1,7 +1,5 @@
 package io.kardamom.sealer.cluster;
 
-import io.aeron.archive.Archive;
-import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.archive.ArchiveTool;
 import io.aeron.archive.ArchiveTool.VerifyOption;
 import io.aeron.cluster.ClusterTool;
@@ -10,12 +8,14 @@ import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
-import io.aeron.driver.MediaDriver;
-import io.aeron.driver.ThreadingMode;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.agrona.concurrent.ShutdownSignalBarrier;
@@ -56,10 +56,9 @@ public final class ClusterNode {
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
         final int ingressStreamId = Integer.getInteger("kardamom.cluster.ingressStreamId", 101);
         final long tickMs = Long.getLong("kardamom.cluster.tickMs", 2000L);
-        // Dedup window: this must exceed the worst-case racing-replica stall
-        // multiplied by the peak unique-record throughput, and every member
-        // must use the same value. See SealerWire.DEFAULT_DEDUP_CAPACITY for
-        // the sizing math.
+        // Dedup window capacity: a hard cap on the window. A fresh record
+        // past the cap gets back-pressure. Every member must use the same
+        // value. See SealerWire.DEFAULT_DEDUP_CAPACITY.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
         // Replicated configuration, like the capacity above: it decides
@@ -94,6 +93,17 @@ public final class ClusterNode {
             System.getProperty("kardamom.cluster.remoteOrigins", System.getenv("KARDAMOM_REMOTE_ORIGINS")));
         System.out.println("cluster remote-origin allowlist memberId=" + memberId
             + " origins=" + (remoteOrigins.isEmpty() ? "<none: interop disabled>" : remoteOrigins));
+        // The seed a cluster with no snapshot starts from, instead of
+        // genesis: the head of a state rebuilt from L1, which
+        // kardamom-reconstruct --sealer-seed writes. Every member of a new
+        // seeded cluster gets the same file. A member that restores a
+        // snapshot ignores it.
+        final Optional<SealerSeed> seed = readSeed(System.getProperty("kardamom.cluster.seedSnapshot"));
+        System.out.println("cluster seed memberId=" + memberId + seed
+            .map(s -> " block=" + s.head().block() + " endTx=" + s.head().endTxIdx()
+                + " chainId=" + s.head().chainId() + " senders=" + s.senders().size()
+                + " digest=" + s.digestHex())
+            .orElse(" <none: a cluster with no snapshot starts at genesis>"));
 
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
@@ -105,7 +115,14 @@ public final class ClusterNode {
         System.out.println("cluster void voters memberId=" + memberId
             + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
 
+        // The Raft log purge: how many of the newest snapshots keep their
+        // log. Parsed before the launch, so a bad value never starts a member.
+        final Optional<PurgePlanner> purgePlanner =
+            PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
+        final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me);
+        prepareState(contexts, clusterMembers, memberId);
 
         // Launch with a retry past the mark-file liveness window. A member
         // that was hard-killed (kill -9 or docker kill) cannot clear its
@@ -136,14 +153,15 @@ public final class ClusterNode {
         for (int attempt = 1; ; attempt++) {
             try {
                 driver = ClusteredMediaDriver.launch(
-                    driverContext(aeronDir),
-                    archiveContext(aeronDir, archiveDir, me),
+                    contexts.driver(),
+                    contexts.archive(),
                     consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
                 // Aeron contexts are single-use, and so is the service they
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
                     dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
                     inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
+                seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, barrier));
                 break;
@@ -177,8 +195,24 @@ public final class ClusterNode {
              AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
-            startJoinWatchdog(consensus.electionStateCounter(), memberId);
+            startJoinWatchdog(consensus, contexts.clusterState(), memberId);
+            startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             barrier.await();
+        }
+    }
+
+    /**
+     * Decide how the member starts, and seed a blank member from a peer
+     * unless this start is the bootstrap of a new cluster. See
+     * {@link StartMode} and {@link PeerSeed}.
+     */
+    private static void prepareState(
+            final MemberContexts contexts, final String clusterMembers, final int memberId) {
+        final StartMode mode = StartMode.decide(contexts.clusterState());
+        System.out.println("cluster START mode=" + mode + " memberId=" + memberId + " — " + mode.note);
+        if (mode == StartMode.SEED_FROM_PEER) {
+            new PeerSeed(memberId, peerConsensusEndpoints(clusterMembers, memberId), contexts,
+                PeerSeed.Timing.DEFAULT).run();
         }
     }
 
@@ -302,65 +336,49 @@ public final class ClusterNode {
 
     /**
      * Exits the process when the member never joins the cluster
-     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it).
+     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it),
+     * or when its catch-up stalls
+     * ({@code -Dkardamom.cluster.catchupStallS}, default 300, 0 disables
+     * that rule only).
      *
      * <p>A member can wedge inside its first election, after a successful
      * launch, with no error and no exit. Aeron 1.44's
      * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
      * module spins in {@code Election.init} forever while the container
-     * reports healthy to Nomad (issue #195). PR #257 removed the known
-     * trigger. This watchdog covers the shape itself: an election that
-     * stays in INIT past the window is a wedge, never a slow join. See
-     * {@link JoinWatchdog} for why INIT is the only state it acts on.</p>
-     *
-     * <p>The exit is {@link Runtime#halt}, not {@link System#exit}. A
-     * graceful close joins the stuck agent thread and can hang the same
-     * way. The relaunch then goes through the mark-file retry loop above,
-     * which is the expected path after a hard exit. Exit code 3 marks the
-     * cause in the alloc's exit event.</p>
+     * reports healthy to Nomad. A follower whose log ends below the
+     * leader's purge point cycles through its catch-up forever, also while
+     * the container runs. See {@link JoinWatchdog} for the two rules, and
+     * {@link JoinWatchdogThread} for the exits.</p>
      */
-    private static void startJoinWatchdog(final org.agrona.concurrent.status.AtomicCounter electionState,
-        final int memberId) {
+    private static void startJoinWatchdog(
+            final ConsensusModule.Context consensus, final StateDir clusterDir, final int memberId) {
         final long windowS = Long.getLong("kardamom.cluster.joinWatchdogS", 60L);
         if (windowS <= 0) {
             System.out.println("cluster join watchdog DISABLED memberId=" + memberId);
             return;
         }
-        final JoinWatchdog watchdog = new JoinWatchdog(windowS * 1000L);
-        final Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    Thread.sleep(JOIN_WATCHDOG_POLL_MS);
-                } catch (final InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                if (electionState.isClosed()) {
-                    return;
-                }
-                final long nowMs = System.currentTimeMillis();
-                final ElectionState state = ElectionState.get(electionState);
-                if (watchdog.observe(state, nowMs)) {
-                    System.out.println("cluster JOIN WEDGE memberId=" + memberId
-                        + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
-                        + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
-                    System.out.flush();
-                    Runtime.getRuntime().halt(JOIN_WEDGE_EXIT_CODE);
-                }
-            }
-        }, "kardamom-join-watchdog");
-        t.setDaemon(true);
-        t.start();
-        System.out.println("cluster join watchdog up memberId=" + memberId + " windowS=" + windowS);
+        final long stallWindowS = Long.getLong("kardamom.cluster.catchupStallS", JoinWatchdog.DEFAULT_STALL_WINDOW_S);
+        new JoinWatchdogThread(memberId, consensus, clusterDir, windowS, stallWindowS).start();
+    }
+
+    /**
+     * Purge the Raft log behind the snapshots
+     * ({@code -Dkardamom.cluster.logPurgeKeepSnapshots}, default 3, 0
+     * disables it). See {@link PurgePlanner} for the rules, and
+     * {@link LogPurger} for the thread.
+     */
+    private static void startLogPurger(
+            final Optional<PurgePlanner> planner,
+            final LogPurger.Member member,
+            final ConsensusModule.Context consensus) {
+        planner.ifPresentOrElse(
+            p -> new LogPurger(member, p).start(consensus.electionStateCounter()),
+            () -> System.out.println("cluster log purge DISABLED memberId=" + member.memberId()));
     }
 
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
-    /** How often the join watchdog samples the election state. */
-    static final long JOIN_WATCHDOG_POLL_MS = 1_000;
-    /** Process exit code when the join watchdog fires. */
-    static final int JOIN_WEDGE_EXIT_CODE = 3;
     /** The admin endpoint's port when none is given: 0, off. */
     static final int DEFAULT_ADMIN_PORT = 0;
     /** The service lag behind the commit position that still reads as ready. */
@@ -420,37 +438,6 @@ public final class ClusterNode {
                 "kardamom.cluster.fileSyncLevel must be 0, 1 or 2, not " + level);
         }
         return level;
-    }
-
-    private static MediaDriver.Context driverContext(final String aeronDir) {
-        return new MediaDriver.Context()
-            .aeronDirectoryName(aeronDir)
-            .threadingMode(ThreadingMode.SHARED)
-            .dirDeleteOnStart(true)
-            .dirDeleteOnShutdown(false);
-    }
-
-        // Aeron 1.44 requires Archive.Context.replicationChannel to be set;
-        // it has no default. This is the channel this archive uses to
-        // receive replication during cluster catch-up (snapshot and log
-        // transfer between members). The standard ClusteredMediaDriver
-        // pattern uses this node's IP with an OS-assigned (ephemeral) port.
-        // Every entry in me[*] shares this node's IP, the host of the
-        // ingress endpoint.
-    private static Archive.Context archiveContext(
-            final String aeronDir, final String archiveDir, final String[] me) {
-        final String nodeHost = me[0].split(":")[0];
-        return new Archive.Context()
-            .aeronDirectoryName(aeronDir)
-            .archiveDir(new File(archiveDir))
-            .controlChannel("aeron:udp?endpoint=" + me[4])
-            .localControlChannel("aeron:ipc?term-length=64k")
-            .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
-            // The catalog level must be at least the recording level.
-            .fileSyncLevel(fileSyncLevel())
-            .catalogFileSyncLevel(fileSyncLevel())
-            .recordingEventsEnabled(false)
-            .threadingMode(ArchiveThreadingMode.SHARED);
     }
 
     private static ConsensusModule.Context consensusContext(
@@ -590,6 +577,22 @@ public final class ClusterNode {
         return id;
     }
 
+    /**
+     * The seed file at {@code path}, or empty when the property is unset.
+     * An unreadable or invalid file is fatal: a member told to start from a
+     * seed must not start at genesis.
+     */
+    static Optional<SealerSeed> readSeed(final String path) {
+        if (path == null || path.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(SealerSeed.read(Path.of(path.trim())));
+        } catch (final IOException | IllegalArgumentException e) {
+            throw new IllegalStateException("kardamom.cluster.seedSnapshot: " + path + ": " + e.getMessage(), e);
+        }
+    }
+
     /** The DA-lag budget from its property or env value; unset means the default. */
     static long parseDaLagBudget(final String raw) {
         if (raw == null || raw.isBlank()) {
@@ -661,6 +664,18 @@ public final class ClusterNode {
             }
         }
         throw new IllegalArgumentException("memberId " + memberId + " not in " + clusterMembers);
+    }
+
+    /**
+     * The consensus endpoints of every member except {@code memberId},
+     * comma separated: the peers that a blank member seeds from.
+     */
+    static String peerConsensusEndpoints(final String clusterMembers, final int memberId) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","))
+            .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
+            .map(f -> f[2].trim())
+            .collect(java.util.stream.Collectors.joining(","));
     }
 
     /**

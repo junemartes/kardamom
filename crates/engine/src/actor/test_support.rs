@@ -1,18 +1,19 @@
 //! Shared fixtures for the actor's test modules: canonical-position and
 //! legacy-transaction builders (over [`super::fixtures::LegacyTx`]),
-//! remote-epoch fixtures, writer-signal and writer-queue test doubles, and
+//! L1 and remote epoch fixtures, writer-signal and writer-queue test doubles, and
 //! the commit-channel drain helper.
 
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::epoch::{DepositLog, LockboxLog, derive_epoch};
 use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage, remote_source_hash};
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource,
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, EpochRecord, SnapshotSource,
     TxEnvelope as KtTxEnvelope, TxRef,
 };
 use revm::primitives::KECCAK_EMPTY;
@@ -21,6 +22,7 @@ use crate::error::ExecutorError;
 use crate::reader::{NoEpochCheck, NoRemoteEpochCheck, ReaderToExec, RemoteEpochObserver};
 use crate::state::MockStateDatabase;
 
+use super::test_hooks::RecordingTxHook;
 use super::{
     BalHandoff, BlockExecStrategy, ExecHooks, ExecInputs, ExecPorts, ExecState, ExecToCommit,
     ExecutorConfig, NoBlockExec, ResumePoint, StateWriterQueue, StateWriterSignal,
@@ -98,6 +100,54 @@ pub(crate) fn legacy(
         ..Default::default()
     }
     .sign(signer)
+}
+
+/// A fresh, throwaway state DB that skips the fsync of each commit.
+/// `pub(crate)`: `replay::tests` opens the same kind of DB.
+pub(crate) fn fresh_env() -> (tempfile::TempDir, kardamom_state::StateEnv) {
+    let dir = tempfile::tempdir().unwrap();
+    let env = kardamom_state::StateEnvBuilder::new(dir.path())
+        .durability(kardamom_state::Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    (dir, env)
+}
+
+/// A genesis allocation that funds `from` with 1 ETH. `pub(crate)`:
+/// `replay::tests` replays from the same allocation.
+pub(crate) fn genesis_for(from: Address) -> Vec<kardamom_types::AccountChange> {
+    vec![kardamom_types::AccountChange {
+        address: from,
+        nonce: 0,
+        balance: U256::from(1_000_000_000_000_000_000u128),
+        code_hash: KECCAK_EMPTY,
+    }]
+}
+
+/// An L1 epoch at `l1_number` with one deposit of `mint` wei to each of
+/// `recipients`, in log order. It comes from one lockbox log per recipient
+/// through the producer's own rule, so it has the live deposit shape:
+/// an aliased sender, and `value` equal to `mint`. `pub(crate)`:
+/// `replay::tests` builds the same epochs.
+pub(crate) fn deposit_epoch(l1_number: u64, recipients: &[Address], mint: u128) -> EpochRecord {
+    let l1_hash = keccak256(l1_number.to_be_bytes());
+    let logs: Vec<LockboxLog> = recipients
+        .iter()
+        .zip(0u64..)
+        .map(|(to, log_index)| {
+            LockboxLog::Deposit(DepositLog {
+                block_number: l1_number,
+                block_hash: l1_hash,
+                log_index,
+                from: Address::repeat_byte(0xD0),
+                to: *to,
+                mint,
+                gas_limit: 100_000,
+                data: alloy_primitives::Bytes::new(),
+            })
+        })
+        .collect();
+    derive_epoch(l1_number, l1_hash, &logs).expect("test fixture: one block's logs")
 }
 
 pub(super) struct ImmediateCommit;
@@ -286,7 +336,12 @@ where
     type Epoch = NoEpochCheck;
     type RemoteEpoch = R;
     type BlockExec = B;
+    // Off unless a test calls `ExecRig::tx_hook`.
+    type TxHook = Option<RecordingTxHook>;
 }
+
+/// [`ExecRig`]'s inputs for `ExecState`, and the exec-to-commit receiver.
+type RigInputs<S, Q, P, R, B> = (ExecInputs<TestPorts<S, Q, P, R, B>>, Receiver<ExecToCommit>);
 
 /// Builder for `ExecState::spawn`'s test fixtures. Every exec test wires the same
 /// twelve-argument call, with nine of the twelve almost always `None`. This
@@ -306,6 +361,7 @@ pub(super) struct ExecRig<S: SnapshotSource, Q, P, R = NoRemoteEpochCheck, B = N
     shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     block_exec: Option<B>,
     remote_epoch_observer: Option<R>,
+    tx_hook: Option<RecordingTxHook>,
     tx_e2c: Sender<ExecToCommit>,
     rx_e2c: Receiver<ExecToCommit>,
 }
@@ -327,6 +383,7 @@ where
             shadow_tx: None,
             block_exec: None,
             remote_epoch_observer: None,
+            tx_hook: None,
             tx_e2c,
             rx_e2c,
         }
@@ -356,6 +413,7 @@ where
             shadow_tx: self.shadow_tx,
             block_exec: self.block_exec,
             remote_epoch_observer: Some(observer),
+            tx_hook: self.tx_hook,
             tx_e2c: self.tx_e2c,
             rx_e2c: self.rx_e2c,
         }
@@ -385,6 +443,11 @@ where
         self
     }
 
+    pub(super) fn tx_hook(mut self, hook: RecordingTxHook) -> Self {
+        self.tx_hook = Some(hook);
+        self
+    }
+
     /// Swap in a test's own whole-block strategy. Consumes the default
     /// [`NoBlockExec`] rig and returns one typed for `B2`, since a struct
     /// field cannot change type through `&mut self`.
@@ -401,6 +464,7 @@ where
             shadow_tx: self.shadow_tx,
             block_exec: Some(strategy),
             remote_epoch_observer: self.remote_epoch_observer,
+            tx_hook: self.tx_hook,
             tx_e2c: self.tx_e2c,
             rx_e2c: self.rx_e2c,
         }
@@ -423,8 +487,26 @@ where
         JoinHandle<Result<(), ExecutorError>>,
         Receiver<ExecToCommit>,
     ) {
-        let rx_e2c = self.rx_e2c;
-        let h = ExecState::<TestPorts<S, Q, P, R, B>>::spawn(ExecInputs {
+        let (inputs, rx_e2c) = self.into_inputs(rx);
+        (ExecState::spawn(inputs), rx_e2c)
+    }
+
+    /// Run the exec loop on the calling thread, until `rx` closes or the
+    /// loop stops. A thread-local metrics recorder then sees the loop's
+    /// counters. Returns the loop's result and the exec-to-commit
+    /// receiver.
+    pub(super) fn run_here(
+        self,
+        rx: Receiver<ReaderToExec>,
+    ) -> (Result<(), ExecutorError>, Receiver<ExecToCommit>) {
+        let (inputs, rx_e2c) = self.into_inputs(rx);
+        (ExecState::new(inputs).run(), rx_e2c)
+    }
+
+    /// The rig's ports and hooks as `ExecInputs`, and the exec-to-commit
+    /// receiver the caller must keep alive (see [`Self::spawn`]).
+    fn into_inputs(self, rx: Receiver<ReaderToExec>) -> RigInputs<S, Q, P, R, B> {
+        let inputs = ExecInputs {
             cfg: ExecutorConfig::default(),
             rx,
             tx: self.tx_e2c,
@@ -438,9 +520,10 @@ where
                 block_exec: self.block_exec,
                 epoch_observer: None,
                 remote_epoch_observer: self.remote_epoch_observer,
+                tx_hook: self.tx_hook,
             },
-        });
-        (h, rx_e2c)
+        };
+        (inputs, self.rx_e2c)
     }
 }
 

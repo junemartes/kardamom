@@ -6,7 +6,8 @@
 //!   `--poll-interval`): an `da_watcher::L1Sources` set over one alloy
 //!   HTTP provider per endpoint. Each finalized L1 block becomes one
 //!   `EpochRecord` on the `tx_deposits` Aeron channel, through
-//!   [`publishers::LiveTxDepositsPublisher`].
+//!   [`publishers::LiveTxDepositsPublisher`]. `--l1-cursor-file` keeps
+//!   the last published block across a restart.
 //! * Interop (`--interop-feed-url`, `--interop-peer-chain-id`, and
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
 //!   chain. Each origin block that carried messages becomes one
@@ -30,9 +31,9 @@ use anyhow::Context;
 use clap::Parser;
 
 use kardamom_da_watcher::interop::{
-    CursorFile, CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
+    CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
-use kardamom_da_watcher::{DaWatcherConfig, L1Endpoints};
+use kardamom_da_watcher::{CursorFile, DaWatcherConfig, L1Cursor, L1Endpoints, L1ResumeAfter};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsPublisherHandle,
     TxRemoteEpochsPublisherHandle,
@@ -72,6 +73,24 @@ struct Args {
     /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
     #[arg(long)]
     lockbox: Option<String>,
+    /// The last L1 block whose epoch the chain holds: the L1 origin of
+    /// the head that a sealer cluster was seeded at. The first tick then
+    /// publishes every finalized block after it. The flag overrides
+    /// `--l1-cursor-file`, and the first tick overwrites the file with
+    /// this block. Without the flag or a cursor file, the watcher starts
+    /// at the finalized tip and skips the blocks before it, so a restart
+    /// after a seed would lose their deposits.
+    #[arg(long, requires = "l1_rpc")]
+    l1_resume_after: Option<L1ResumeAfter>,
+    /// Durable L1 cursor file: the last published L1 block, by number and
+    /// hash. The watcher saves it, atomically, after each pass that
+    /// published. On a restart it resumes after that block, and the next
+    /// block must name its hash as its parent. A missing file starts at
+    /// the finalized tip (or `--l1-resume-after`), with a warning. A file
+    /// that exists but does not parse halts the watcher
+    /// (`l1_cursor_unreadable`) until an operator clears it.
+    #[arg(long, requires = "l1_rpc")]
+    l1_cursor_file: Option<PathBuf>,
     /// Polling cadence in seconds (default 12). Must be nonzero: 0 reaches
     /// `tokio::time::interval`, which panics on a zero period.
     #[arg(long, default_value = "12")]
@@ -167,6 +186,9 @@ struct Args {
 struct L1Path {
     endpoints: L1Endpoints,
     cfg: DaWatcherConfig,
+    /// The durable cursor, with its lock taken. `None` without
+    /// `--l1-cursor-file`.
+    cursor_file: Option<CursorFile<L1Cursor>>,
 }
 
 /// The interop path, resolved. Present only when the full peer triple
@@ -175,7 +197,7 @@ struct L1Path {
 struct InteropPath {
     peer_chain_id: u64,
     feed_url: String,
-    cursor_file: CursorFile,
+    cursor_file: CursorFile<u64>,
     cfg: InteropWatcherConfig,
     /// How the startup cursor reconcile reaches the destination.
     cursor_reconcile: CursorReconcile,
@@ -201,7 +223,7 @@ impl InteropPath {
             // The file is behind the chain. Persisting the chain's cursor
             // is safe: every seq below it was delivered.
             self.cursor_file
-                .persist(reconciled)
+                .persist(&reconciled)
                 .context("persist the reconciled cursor")?;
             self.cfg.start_seq = reconciled;
         }
@@ -239,6 +261,14 @@ impl Args {
             (rpcs, Some(lockbox)) => {
                 let lockbox = Address::from_str(lockbox)
                     .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
+                // `open` takes the cursor's file lock. A second watcher on
+                // the same file stops here with `CursorError::Locked`.
+                let cursor_file = self
+                    .l1_cursor_file
+                    .as_ref()
+                    .map(CursorFile::open)
+                    .transpose()
+                    .context("open --l1-cursor-file")?;
                 Ok(Some(L1Path {
                     endpoints: L1Endpoints {
                         rpcs: rpcs.to_vec(),
@@ -247,7 +277,9 @@ impl Args {
                     cfg: DaWatcherConfig {
                         lockbox,
                         poll_interval: Duration::from_secs(self.poll_interval_secs.get()),
+                        resume_after: self.l1_resume_after,
                     },
+                    cursor_file,
                 }))
             }
         }
@@ -319,7 +351,7 @@ impl Args {
     /// file already has one (a corrupt file stops the process here,
     /// before anything is derived — see [`CursorFile::load`] for why it
     /// is never treated as 0), or `--interop-start-seq` on first boot.
-    fn interop_start_seq(&self, cursor_file: &CursorFile) -> anyhow::Result<u64> {
+    fn interop_start_seq(&self, cursor_file: &CursorFile<u64>) -> anyhow::Result<u64> {
         match cursor_file.load().context("load --interop-cursor-file")? {
             Some(persisted) => Ok(self.resolve_persisted_start_seq(persisted)),
             None => Ok(self.interop_start_seq),

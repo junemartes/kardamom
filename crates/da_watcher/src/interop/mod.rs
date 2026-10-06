@@ -24,7 +24,6 @@
 //! moves are a later slice; they ADD to the wire contract in
 //! `kardamom_interop_feed` rather than reshaping it.
 
-pub mod cursor;
 pub mod publisher;
 pub mod reconcile;
 pub mod source;
@@ -37,7 +36,7 @@ pub mod watcher;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 
-pub use cursor::{CursorError, CursorFile};
+pub use crate::cursor::{CursorError, CursorFile};
 pub use publisher::RemoteEpochPublisher;
 pub use reconcile::{
     CursorReconcile, DestinationStateReader, MissingCursorReconcile, ReconcileError,

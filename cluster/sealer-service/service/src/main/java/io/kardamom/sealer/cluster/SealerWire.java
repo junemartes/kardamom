@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.SealerSeed;
 
 /**
  * The Java side of the Kardamom cluster wire protocol. It defines app-envelope
@@ -151,6 +152,19 @@ public final class SealerWire {
     /** Exact length of a {@link #KIND_POSTED_CURSOR} frame. */
     static final int MIN_POSTED_CURSOR_LEN = POSTED_HEAD_OFFSET + Long.BYTES;
 
+    /**
+     * Seed record: {@code [kind:8][digest:32]}, the SHA-256 of the seed
+     * file the cluster started from. Only the service writes it, through
+     * {@code Cluster.offer}, so it reaches the log with no client session.
+     * A client frame of this kind is malformed. No Rust producer uses the
+     * number, and none may.
+     */
+    public static final byte KIND_SEED_EPOCH = 8;
+    /** Offset of the digest within a {@link #KIND_SEED_EPOCH} frame. */
+    static final int SEED_DIGEST_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Exact length of a {@link #KIND_SEED_EPOCH} frame. */
+    static final int SEED_EPOCH_LEN = SEED_DIGEST_OFFSET + SealerSeed.HASH_LEN;
+
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 LE canonical index within a {@link #KIND_VOID_REQUEST} frame. */
@@ -210,6 +224,14 @@ public final class SealerWire {
     /** Replay complete: {@code [kind:4][up_to_index:u64][up_to_block:u64]}. */
     public static final byte EGRESS_KIND_REPLAY_DONE = 4;
     /**
+     * Replay refused, because the cursor is past this member's head:
+     * {@code [kind:11][head_index:u64][head_block:u64]}. The head is the
+     * canonical count and the block that the next tick stamps. The consumer
+     * applied records that this member does not hold, so no replay and no
+     * repair from this stream can serve it. The consumer stops.
+     */
+    public static final byte EGRESS_KIND_REPLAY_AHEAD = 11;
+    /**
      * Contiguity reject:
      * {@code [kind:5][sender:20][nonce:u64][expected:u64]}.
      * The service offers this only to the offering session. The sequencer
@@ -264,18 +286,18 @@ public final class SealerWire {
     static final int DEFAULT_RETENTION = 65536;
 
     /**
-     * Default first-seen dedup window.
+     * Default capacity of the first-seen dedup window.
      *
-     * <p>Safety invariant: the window must be larger than the worst-case
-     * racing-replica stall multiplied by the peak unique-record throughput.
-     * If the window is too small, a resuming replica can find its own ids
-     * evicted (FIFO). The dedup check then accepts its re-offers as fresh,
-     * and the canonical log orders the same transaction two times.</p>
+     * <p>The window prunes by inclusion deadline: an id stays until the
+     * open block passes its deadline, and the window never evicts an id
+     * to make room. So a stalled replica's re-offer is always a duplicate
+     * while its deadline is open.</p>
      *
-     * <p>At 10k unique tx/s, the previous default of 8192 tolerated a stall
-     * of only about 0.8 seconds (one GC pause or cgroup throttle). The value
-     * 1&lt;&lt;17 tolerates about 13 seconds, for about 20MB of heap and a
-     * 4MB snapshot (snapshot I/O is chunked, see
+     * <p>The capacity is a hard cap that bounds heap and snapshot size.
+     * A fresh record that arrives when the window is full is refused with
+     * back-pressure, and the window forgets nothing. At 10k unique tx/s,
+     * the value 1&lt;&lt;17 holds about 13 seconds of unique records, for
+     * about 20MB of heap and a 4MB snapshot (snapshot I/O is chunked, see
      * {@link SnapshotIo#writeSnapshot}).</p>
      *
      * <p>All members must agree on the window

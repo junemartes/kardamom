@@ -21,9 +21,9 @@
 //! ## Design note: thread confinement
 //!
 //! `AeronArchive` is `!Send + !Sync` (it wraps `Rc` and raw pointers; the C
-//! client is thread-confined). The recording-position poll and the
-//! durable-watermark publish both run on the Recorder thread. Cross-thread
-//! sharing of the archive handle is not supported.
+//! client is thread-confined). Every call on the archive handle runs on the
+//! Recorder thread. Cross-thread sharing of the archive handle is not
+//! supported.
 
 use std::cell::RefCell;
 use std::ops::ControlFlow;
@@ -409,9 +409,7 @@ impl Recorder {
             return Ok(None); // shutdown before a recording appeared
         };
 
-        // Pull the descriptor once at startup so the term buffer length is
-        // available to decode positions without a control-channel round-trip
-        // on every watermark tick. The fetch also validates that the
+        // Fetch the descriptor once at startup. The fetch validates that the
         // recording is live.
         let _ = Self::fetch_descriptor(&archive, recording_id)?;
 

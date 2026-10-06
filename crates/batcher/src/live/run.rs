@@ -164,8 +164,8 @@ pub struct LiveArgs {
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
     /// references of the gap up to its floor are read from here, and the
-    /// bytes from the `tx_data` archives. Empty: a refused replay is a
-    /// fail-stop.
+    /// bytes from the `tx_data` archives. Empty: a refused replay raises the
+    /// `replay_unavailable` halt.
     pub block_refs_sources: Vec<String>,
 }
 
@@ -252,9 +252,9 @@ impl RunConfig {
         let raw = std::fs::read_to_string(&args.config).context("read batcher config")?;
         let mut file_cfg: BatcherFileConfig =
             toml::from_str(&raw).context("parse batcher config")?;
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
+        file_cfg
+            .cluster
+            .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
         let plane =

@@ -29,6 +29,9 @@ workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, 
 workloads_node_pools: {}
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
+  cluster_id: "{{ cluster_id }}"
+  nomad_region: "{{ nomad_region }}"
+  nomad_tls_dir: "{{ nomad_tls_dir }}"
   partition_count: "{{ partition_count }}"
   tx_ttl_ms: "{{ tx_ttl_ms }}"
   executor_query_port: "{{ ports.executor_nonce_query }}"
@@ -41,6 +44,10 @@ workloads_common_vars:
   # the executor's and validator's fee schedule: "on" or "off". Empty
   # leaves every job at its "off" default.
   priority_fees: "{{ workloads_priority_fees }}"
+  # One value for every Aeron party: each client's driver timeout and
+  # each media driver's client liveness timeout. The jobs derive the
+  # rest from it.
+  aeron_stall_tolerance_ms: "{{ workloads_aeron_stall_tolerance_ms }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -84,10 +91,16 @@ workloads_batcher_eoa: "{{ lookup('env', 'BATCHER_EOA') | default('0x3C44CdDdB6a
 workloads_chain_id: "{{ lookup('env', 'L2_CHAIN_ID') | default(chain_id, true) }}"
 workloads_cluster_retention: "{{ lookup('env', 'KARDAMOM_CLUSTER_RETENTION') }}"
 workloads_cluster_snapshot_s: "{{ lookup('env', 'KARDAMOM_CLUSTER_SNAPSHOT_S') }}"
+workloads_cluster_log_purge_keep: "{{ lookup('env', 'KARDAMOM_CLUSTER_LOG_PURGE_KEEP') }}"
 workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS') }}"
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
+# The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
+# 10000 is Aeron's default, and production keeps it: a longer value delays
+# the detection of a dead process. CI raises it, so a host stall does not
+# kill a healthy client or driver.
+workloads_aeron_stall_tolerance_ms: "{{ lookup('env', 'AERON_STALL_TOLERANCE_MS') | default('10000', true) }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
@@ -153,6 +166,13 @@ workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
 # The sealer members' admin port (cluster_ports.admin): the role reads
 # the leader from it for the staged roll.
 workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The bootstrap of a new sealer cluster (KARDAMOM_CLUSTER_BOOTSTRAP=1).
+# Only a blank member that starts while the bootstrap is open starts at
+# log position 0; every other blank member copies a peer's snapshot. The
+# role opens the bootstrap only when Nomad does not know the cluster job,
+# and closes it when the new cluster is up. On a registered job the flag
+# does nothing, so a re-deploy that keeps it set is safe.
+workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | default('0', true) | bool }}"
 # The operator binary that runs the smoke against a canary.
 workloads_cluster_binary: >-
   {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')

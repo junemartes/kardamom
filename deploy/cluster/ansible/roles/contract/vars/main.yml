@@ -84,6 +84,8 @@ contract_mirrors:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-da-watcher:{{ image_tag }}'
       - default     = "http://anvil.service.consul:{{ ports.anvil_l1 }}"
       - --log-config
+      - '"{{ paths.da_watcher_dir }}:{{ paths.da_watcher_dir }}"'
+      - '"--l1-cursor-file", "{{ paths.da_watcher_dir }}/l1-cursor"'
     forbidden: []
   - path: deploy/cluster/nomad/batcher.nomad.hcl
     required:
@@ -108,7 +110,7 @@ contract_mirrors:
   - path: deploy/cluster/nomad/aeron.system.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-aeron:{{ image_tag }}'
-      - tags = ["${meta.role}"]
+      - tags = ["${meta.archive_topics}"]
       - chain_id          = "{{ chain_id }}"
       - cluster_id        = "${meta.cluster_id}"
     forbidden: []
@@ -151,8 +153,8 @@ contract_mirrors:
       - cluster_id = "{% raw %}{{ env "meta.cluster_id" }}{% endraw %}"
       - datacenter = "{% raw %}{{ env "node.datacenter" }}{% endraw %}"
       - advertise_interface = "{% raw %}{{ env "meta.node_ip" }}{% endraw %}/32"
-      - tx_data_archive_endpoints = [{% raw %}{{ range service "ingress.kardamom-aeron-archive" }}{% endraw %}
-      - tx_deposits_archive_endpoints = [{% raw %}{{ range service "aux.kardamom-aeron-archive" }}{% endraw %}
+      - tx_data_archive_endpoints = [{% raw %}{{ range service "tx_data.kardamom-aeron-archive" }}{% endraw %}
+      - tx_deposits_archive_endpoints = [{% raw %}{{ range service "tx_deposits.kardamom-aeron-archive" }}{% endraw %}
     forbidden: []
   - path: deploy/cluster/nomad/state-mirror.nomad.hcl
     required:

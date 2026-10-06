@@ -23,6 +23,33 @@ pub struct Squeeze {
     pub release: Duration,
 }
 
+/// The Aeron stall tolerance the cluster was deployed with: every
+/// client's driver timeout and every media driver's client liveness
+/// timeout (`AERON_STALL_TOLERANCE_MS` of the deploy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallTolerance(Duration);
+
+impl StallTolerance {
+    /// How far a freeze runs past the tolerance to evict the frozen
+    /// client for certain. The margin covers the driver's 1 s timer
+    /// check and the start of the freeze. At Aeron's 10 s default, the
+    /// evicting freeze is 30 s.
+    const EVICTION_MARGIN: Duration = Duration::from_secs(20);
+
+    /// The tolerance itself.
+    #[must_use]
+    pub fn get(self) -> Duration {
+        self.0
+    }
+
+    /// The shortest freeze after which the media driver evicts a frozen
+    /// Aeron client: the client exits on its thaw, and Nomad restarts it.
+    #[must_use]
+    pub fn evicting_freeze(self) -> Duration {
+        self.0.saturating_add(Self::EVICTION_MARGIN)
+    }
+}
+
 /// The suite settings. See the module doc for the defaults.
 /// One fixed-rate run of the sustained-load stage.
 #[derive(Debug, Clone)]
@@ -86,8 +113,8 @@ pub struct Knobs {
     pub account_base: u32,
     /// The funded account of the smoke gate. No case load spends it, so
     /// the recovery probe uses it as the sender with nothing in flight
-    /// during an outage. A reuse run on a used chain passes another,
-    /// unused, account through `KARDAMOM_CHAOS_GATE_ACCOUNT`.
+    /// during an outage. The smoke gate and the probe read its next
+    /// nonce, so a reuse run on a used chain keeps it.
     pub gate_account: u32,
     /// Which ingress replica the hard kill targets, 0 or 1.
     pub ingress_victim: u32,
@@ -95,9 +122,13 @@ pub struct Knobs {
     pub converge_slo: Duration,
     /// The per-replica lag every executor must be within at case end.
     pub converge_lag: u64,
-    /// The sequencer-lapse freeze window.
+    /// The Aeron stall tolerance of the deployed cluster.
+    pub aeron_stall: StallTolerance,
+    /// The sequencer-lapse freeze window. The default is the evicting
+    /// freeze of the stall tolerance.
     pub seq_lapse: Duration,
-    /// The validator-lapse freeze window.
+    /// The validator-lapse freeze window. The default is the evicting
+    /// freeze of the stall tolerance.
     pub validator_lapse: Duration,
     /// The cluster egress retention the cluster was deployed with, in
     /// frames. The retention cases need it; other cases ignore it.
@@ -227,6 +258,10 @@ impl Knobs {
         let env = Source { shard };
         let retention = env.optional_nonzero_u64("KARDAMOM_CLUSTER_RETENTION")?;
         let da_lag_budget = env.optional_nonzero_u64("KARDAMOM_DA_LAG_BUDGET_BLOCKS")?;
+        let aeron_stall = StallTolerance(Duration::from_millis(
+            env.u64("AERON_STALL_TOLERANCE_MS", 30_000)?,
+        ));
+        let lapse_s = aeron_stall.evicting_freeze().as_secs();
         Ok(Self {
             chain_id: env.u64("CHAIN_ID", 412_346)?,
             tps: env.nonzero_u32("CHAOS_TPS", 200)?,
@@ -245,8 +280,9 @@ impl Knobs {
             ingress_victim: Self::ingress_victim(&env)?,
             converge_slo: env.secs("EXEC_CONVERGE_SLO_S", 150)?,
             converge_lag: env.u64("EXEC_CONVERGE_LAG", 50)?,
-            seq_lapse: env.secs("SEQ_LAPSE_S", 30)?,
-            validator_lapse: env.secs("LAPSE_S", 30)?,
+            aeron_stall,
+            seq_lapse: env.secs("SEQ_LAPSE_S", lapse_s)?,
+            validator_lapse: env.secs("LAPSE_S", lapse_s)?,
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
@@ -262,6 +298,15 @@ impl Knobs {
             run_load: env.or("RUN_LOAD", "1") == "1",
             stages: env.stages()?,
         })
+    }
+
+    /// The restart SLO of a hard-killed media driver. A new driver
+    /// refuses to start until the heartbeat in the `CnC` file of the
+    /// dead one is older than the driver timeout, the stall tolerance,
+    /// so the deploy delays the restart past it.
+    #[must_use]
+    pub fn driver_restart_slo(&self) -> Duration {
+        self.restart_slo.saturating_add(self.aeron_stall.get())
     }
 
     /// The hard-kill ingress victim rotates with the CI run id, so the
@@ -292,6 +337,20 @@ mod tests {
         assert_eq!(knobs.l1_fault, Duration::from_secs(60));
         assert_eq!(knobs.l1_tps.get(), 50);
         assert!(Knobs::read(&[("CHAOS_TPS", "0")]).is_err());
+    }
+
+    #[test]
+    fn the_lapse_freezes_outlast_the_aeron_stall_tolerance() {
+        let ci = Knobs::read(&[]).unwrap();
+        assert_eq!(ci.aeron_stall.get(), Duration::from_secs(30));
+        assert_eq!(ci.seq_lapse, Duration::from_secs(50));
+        assert_eq!(ci.validator_lapse, Duration::from_secs(50));
+        let production = Knobs::read(&[("AERON_STALL_TOLERANCE_MS", "10000")]).unwrap();
+        assert_eq!(production.seq_lapse, Duration::from_secs(30));
+        let explicit =
+            Knobs::read(&[("AERON_STALL_TOLERANCE_MS", "10000"), ("LAPSE_S", "12")]).unwrap();
+        assert_eq!(explicit.validator_lapse, Duration::from_secs(12));
+        assert_eq!(explicit.seq_lapse, Duration::from_secs(30));
     }
 
     #[test]

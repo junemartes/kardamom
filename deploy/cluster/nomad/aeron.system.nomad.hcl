@@ -44,10 +44,47 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The client liveness timeout of the media driver and the driver timeout of its Java clients, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
+}
+
+# The Aeron timeouts of the Java media driver and its Java clients, all
+# from the one stall tolerance:
+# - aeron.driver.timeout (ms): the clients in this JVM wait this long
+#   for a stalled driver.
+# - aeron.client.liveness.timeout (ns): the driver waits this long for a
+#   stalled client before it evicts the client. A client sends a
+#   keepalive every 500 ms, far below it.
+# - aeron.publication.unblock.timeout (ns): Aeron requires it above the
+#   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+locals {
+  aeron_stall_opts = join(" ", [
+    "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
+    "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
+    "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+  ])
+  # A new driver refuses to start ("active driver detected") while the
+  # CnC heartbeat of a dead predecessor is younger than the driver
+  # timeout. So Nomad restarts the driver 5 s after that window. At
+  # Aeron's 10 s default, this is Nomad's own 15 s default delay.
+  driver_restart_delay = "${ceil(var.aeron_stall_tolerance_ms / 1000) + 5}s"
 }
 
 job "aeron" {
@@ -82,6 +119,11 @@ job "aeron" {
   }
 
   group "aeron" {
+    # Only the delay differs from Nomad's defaults; see the locals.
+    restart {
+      delay = local.driver_restart_delay
+    }
+
     # A system job rolls node by node: every pipeline process on a node
     # shares its driver, so two drivers must never restart together. The
     # driver's control channel is UDP, so no port check applies; the
@@ -161,21 +203,21 @@ job "aeron" {
         # MB term buffers) sits off-heap in the tmpfs aeron.dir, so a
         # small heap is plenty. The JVM honors _JAVA_OPTIONS
         # regardless of the image entrypoint.
-        # The Aeron MTU: 1344, below the 1400-byte path of a Hetzner
-        # vSwitch VLAN (1400 - 20 IP - 8 UDP = 1372, then down to a
-        # multiple of 32). The Aeron default is 1408, which fragments or
-        # drops on that path. A datagram of 1344 also fits every other
-        # path (a Docker bridge, a Cloud Network, the loopback).
-        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344"
+        # The Aeron MTU: 1344, below a 1400-byte network path
+        # (1400 - 20 IP - 8 UDP = 1372, then down to a multiple of 32).
+        # The Aeron default is 1408, which fragments or drops on that
+        # path. A datagram of 1344 also fits every other path (a Docker
+        # bridge, a cloud network, the loopback).
+        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts}"
       }
 
       # The archive record of the discovery contract
       # (docs/aeron-discovery.md): the consumers' refetch client reads
       # the archive control endpoints from these records, filtered by
       # the topics each node's archive records. `archive_topics` is
-      # node meta the Nomad agent template stamps per node class
+      # node meta the Nomad agent template stamps from the node role set
       # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
-      # record tx_data, the aux node records tx_deposits, every other
+      # record tx_data, the da-watcher node records tx_deposits, every other
       # node records nothing and lists no topic. Nomad owns this record;
       # the runtime never registers an archive. The record outlives every
       # publisher, so retained recordings stay discoverable.
@@ -184,11 +226,12 @@ job "aeron" {
         port     = "archive_control"
         address  = "${meta.node_ip}"
         provider = "consul"
-        # The node role, so a template can select the archives of one
-        # role: config/channels.toml.tpl renders its fallback archive
-        # lists from `ingress.kardamom-aeron-archive` and
-        # `aux.kardamom-aeron-archive`.
-        tags = ["${meta.role}"]
+        # The topic the node records, so a template can select the
+        # archives of one topic: config/channels.toml.tpl renders its
+        # fallback archive lists from `tx_data.kardamom-aeron-archive`
+        # and `tx_deposits.kardamom-aeron-archive`. A node records at
+        # most one topic.
+        tags = ["${meta.archive_topics}"]
         meta {
           discovery_version = "1"
           cluster_id        = "${meta.cluster_id}"
@@ -204,9 +247,9 @@ job "aeron" {
       # the term buffers in the tmpfs aeron.dir are charged to the cgroup
       # of the driver that creates them: on a recorder node (the ingress
       # and aux nodes, whose archive records a topic) they reach 350 MB,
-      # and the kernel OOM-killed the driver at 384 MB on the staging
-      # launch (2026-09-27). The service containers of the node then
-      # fail on "aeron thread did not signal start".
+      # and the kernel OOM-kills a driver limited to 384 MB. The service
+      # containers of the node then fail on "aeron thread did not signal
+      # start".
       resources {
         cpu    = 400
         memory = 768

@@ -4,10 +4,10 @@
 //! (see `super::thread`). This module only ships commands to it.
 
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, Sender as CbSender};
 use rkyv::util::AlignedVec;
@@ -19,6 +19,13 @@ use super::{ACK_TIMEOUT, AeronClient, FrameSink, RawFrame};
 use crate::codec;
 use crate::error::LogError;
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
+
+mod publication;
+mod start;
+
+pub(super) use publication::OpenedPub;
+pub use publication::PubHandle;
+use start::{StartReport, StartWait};
 
 // ---------------------------------------------------------------------------
 // AeronRuntime: the single Aeron thread + command bus.
@@ -68,7 +75,15 @@ pub(super) enum RuntimeCmd {
     OpenPublication {
         uri: String,
         stream_id: i32,
-        ack: CbSender<Result<(u32, i32), LogError>>,
+        ack: CbSender<Result<OpenedPub, LogError>>,
+    },
+    /// Register a new dynamic MDC publication whose control endpoint
+    /// names port 0. The Aeron thread replies as for `OpenPublication`,
+    /// plus the control address the driver bound.
+    OpenMdcPublication {
+        uri: String,
+        stream_id: i32,
+        ack: CbSender<Result<(OpenedPub, SocketAddr), LogError>>,
     },
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and sends
@@ -129,23 +144,19 @@ fn request<R>(
 }
 
 /// The Aeron thread's whole body, run by [`AeronRuntime::spawn_with`] on
-/// its dedicated OS thread. Builds the client with `make_ctx`, reports the
-/// outcome on `started_tx`, then runs the poll/command loop until it exits.
+/// its dedicated OS thread. Builds the client with `make_ctx`, reports
+/// each start step on `report`, then runs the poll/command loop until it
+/// exits.
 fn aeron_thread_main<F>(
     make_ctx: F,
     cmd_rx: crossbeam_channel::Receiver<RuntimeCmd>,
-    started_tx: &CbSender<Result<(), LogError>>,
+    report: &StartReport,
 ) where
     F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
 {
-    let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = started_tx.send(Err(e));
-            return;
-        }
+    let Some(aeron) = report.start(make_ctx) else {
+        return;
     };
-    let _ = started_tx.send(Ok(()));
     if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
         error!(error = %e, "aeron runtime thread exited with error");
     }
@@ -174,7 +185,7 @@ impl AeronRuntime {
     /// # Errors
     ///
     /// Returns an error if building the default `AeronContext` fails, or
-    /// if the Aeron thread fails to start within 10 s (see
+    /// if the Aeron thread fails to start in time (see
     /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_default() -> Result<Self, LogError> {
         Self::spawn_with(|| {
@@ -210,33 +221,30 @@ impl AeronRuntime {
     /// without crossing the `!Send + !Sync` boundary that `AeronContext`
     /// sits on.
     ///
+    /// The wait for the start follows the driver timeout of the context:
+    /// the Aeron C client waits up to that timeout for a live media
+    /// driver, for example while a restarted driver comes up. The wait is
+    /// the driver timeout plus 5 s, and at least 10 s.
+    ///
     /// # Errors
     ///
     /// Returns an error if `make_ctx` fails, if building the `Aeron`
     /// client from the resulting context fails, if the OS thread spawn
-    /// fails, or if the Aeron thread does not signal a successful start
-    /// within 10 s.
+    /// fails, if `make_ctx` does not return within 10 s, or if the Aeron
+    /// thread does not signal a successful start within the wait above.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
     {
-        let (started_tx, started_rx) = crossbeam_channel::bounded::<Result<(), LogError>>(1);
+        let (report, wait) = StartWait::channel();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RuntimeCmd>();
 
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
-            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &started_tx))
+            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &report))
             .map_err(|e| LogError::Aeron(format!("spawn aeron thread: {e}")))?;
 
-        match started_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(LogError::Aeron(
-                    "aeron thread did not signal start within 10s".into(),
-                ));
-            }
-        }
+        wait.wait()?;
 
         let thread = Arc::new(AeronThread {
             cmd_tx: cmd_tx.clone(),
@@ -245,32 +253,6 @@ impl AeronRuntime {
         Ok(Self {
             cmd_tx,
             _thread: thread,
-        })
-    }
-
-    /// Open a publication on the Aeron thread, returning a `Send + Sync`
-    /// handle that forwards every offer through the command channel.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the Aeron thread fails to add the publication
-    /// (a malformed channel URI, or the driver's `add_publication`
-    /// timeout elapsing), or if the command round trip itself times out.
-    pub fn open_publication(&self, uri: &str, stream_id: i32) -> Result<PubHandle, LogError> {
-        let uri = uri.to_string();
-        let (pub_id, session_id) = request(
-            &self.cmd_tx,
-            |ack| RuntimeCmd::OpenPublication {
-                uri,
-                stream_id,
-                ack,
-            },
-            "open_publication",
-        )?;
-        Ok(PubHandle {
-            cmd_tx: self.cmd_tx.clone(),
-            pub_id,
-            session_id,
         })
     }
 
@@ -812,73 +794,6 @@ impl Destinations {
             |ack| RuntimeCmd::SubRemoveDestination { sub_id, uri, ack },
             "remove_destination",
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Generic Send-able publish handle
-// ---------------------------------------------------------------------------
-
-/// `Send + Sync` publication handle. Forwards each publish through the
-/// Aeron-thread command channel.
-#[derive(Clone)]
-pub struct PubHandle {
-    cmd_tx: CbSender<RuntimeCmd>,
-    pub_id: u32,
-    session_id: i32,
-}
-
-impl PubHandle {
-    /// The Aeron session id the driver assigned this publication. Every
-    /// image and archive recording of it carries the same id.
-    #[must_use]
-    pub fn session_id(&self) -> i32 {
-        self.session_id
-    }
-
-    /// Blocking publish with `BPosition` ack. Waits [`ACK_TIMEOUT`] for the
-    /// Aeron thread's reply. See that constant for why the ack always
-    /// resolves first.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the Aeron offer fails or times out, or if the
-    /// command round trip to the Aeron thread itself times out.
-    pub fn publish_bytes(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
-        let pub_id = self.pub_id;
-        request(
-            &self.cmd_tx,
-            |ack| RuntimeCmd::Publish { pub_id, bytes, ack },
-            "publish_bytes",
-        )
-    }
-
-    /// Fire-and-forget publish. Errors are logged on the Aeron thread.
-    pub fn publish_best_effort(&self, bytes: AlignedVec) {
-        let _ = self.cmd_tx.send(RuntimeCmd::PublishBestEffort {
-            pub_id: self.pub_id,
-            bytes,
-        });
-    }
-
-    /// Encode a typed message and publish blockingly.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `msg` fails to encode, or if the publish
-    /// itself fails (see [`publish_bytes`](Self::publish_bytes)).
-    pub fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
-    where
-        T: for<'a> rkyv::Serialize<
-                rkyv::api::high::HighSerializer<
-                    AlignedVec,
-                    rkyv::ser::allocator::ArenaHandle<'a>,
-                    rkyv::rancor::Error,
-                >,
-            >,
-    {
-        let bytes = codec::encode(msg)?;
-        self.publish_bytes(bytes)
     }
 }
 

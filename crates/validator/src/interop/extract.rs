@@ -30,29 +30,18 @@ use kardamom_types::{Receipt, WireLog};
 
 use crate::parallel::ClaimIndex;
 
-sol! {
-    /// `XChain.Callback` as it appears in the event ABI.
-    struct SolCallback {
-        address target;
-        uint64 gasLimit;
-        bytes32 context;
-    }
+sol!(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "generated from the contract ABI: `MessageSent` carries 10 fields, fixed by \
+                  contracts/src/L2/Outbox.sol"
+    )]
+    IOutbox,
+    concat!(env!("CARGO_WORKSPACE_DIR"), "/contracts/abi/Outbox.json")
+);
 
-    /// `Outbox.MessageSent` — must stay signature-identical to
-    /// `contracts/src/L2/Outbox.sol` (pinned by a topic0 test below).
-    event MessageSent(
-        uint64 indexed destChainId,
-        uint64 indexed seq,
-        address indexed sender,
-        address target,
-        uint256 value,
-        uint64 gasLimit,
-        uint8 hops,
-        bytes data,
-        bytes32 msgHash,
-        SolCallback callback
-    );
-}
+use IOutbox::MessageSent;
+use XChain::Callback as SolCallback;
 
 /// One log's site: which chain observed it, and where. Shared by
 /// [`decode_message_sent`] and [`check_leaf`], and by the errors they

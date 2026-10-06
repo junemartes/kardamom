@@ -23,7 +23,7 @@ Consul is the discovery control plane only. Messages travel between Aeron
 media drivers. Consul never relays a message, answers a per-message
 lookup, or orders anything.
 
-The migrated streams and their publishers:
+The streams and their publishers:
 
 | Topic | Publisher | Consumers |
 | --- | --- | --- |
@@ -35,6 +35,16 @@ The migrated streams and their publishers:
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
+| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
+
+The `events` stream carries the lifecycle state of each service (running, halted, paused, resumed).
+See [failure-modes.md](failure-modes.md#halts-and-service-events).
+
+- The stream id is 1019. The channel and the stream id are the keys `events_channel` and `events_stream_id` of `[channels]`.
+- Delivery is best effort and RAM only. Nothing that changes the canonical order reads it.
+- The publication uses a term length of 64 KiB, the Aeron minimum. The other topics use the driver default.
+  A small term keeps the log buffers small, because each subscriber driver holds three terms for each publisher.
+- The sealer and the L1 indexer are not on the stream. The ingress observes the sealer from its status frame.
 
 The canonical order (`tx_ordering`) rides the Aeron Cluster. Discovery
 resolves the cluster member ingress endpoints; it never changes the
@@ -68,7 +78,6 @@ is absent or ambiguous on the host fails startup.
 | Variable | Meaning |
 | --- | --- |
 | `NOMAD_ALLOC_ID` | The instance id. Every service id of a process starts with it. Absent in a local run, where a process id and clock stamp replace it. |
-| `KARDAMOM_MDC_PORTS` | The UDP port range `first-last` the process's publications bind. Absent, the OS picks a port per publication. Every port is bind-probed before it is advertised. |
 | `CONSUL_HTTP_TOKEN`, then `CONSUL_TOKEN` | The ACL token, when `consul_token_file` is unset. `CONSUL_TOKEN` is the name Nomad sets on a task with a Consul workload identity. Absent, no token is sent. |
 
 On the ACL profile the token needs `service:write` on
@@ -169,28 +178,37 @@ renders the file as a Nomad template on its node:
 | `datacenter` | `{{ env "node.datacenter" }}` | The profile's `datacenter`, the Nomad agent's own. |
 | `advertise_interface` | `{{ env "meta.node_ip" }}/32` | The node's private address, resolved by `roles/netinfo` and stamped as node meta. |
 
-So the local profile (explicit `node_ip` per inventory host) and the
+The local profile (explicit `node_ip` for each inventory host) and the
 production profile (`node_ip` resolved from the vSwitch address or the
-private interface) use one file, and an elastic node that joins from the
+private interface) use one file. An elastic node that joins from the
 image gets its scope from its own agent. The `kardamom-aeron-archive` and
 `kardamom-cluster-member` records read `${meta.cluster_id}` the same way.
 
-The file names no fixed address. The multicast fallback channels pin
-their `interface` to `{{ env "meta.node_ip" }}/32` too, and the fallback
-archive lists render from the archive records: the `kardamom-aeron-archive`
-service carries the node role as a tag, and the template lists
-`ingress.kardamom-aeron-archive` for `tx_data` and
-`aux.kardamom-aeron-archive` for `tx_deposits`. Every job renders the file
-with `change_mode = "noop"`: a change in the archive set rewrites the file,
-and the running process follows the catalog through discovery instead of
-restarting. `ansible/contract.yml` checks the chain id mirror, the
-placeholders, the role tag, and the node meta the Nomad agent template
-stamps.
+The file names no fixed address.
 
-The Nomad jobs leave `KARDAMOM_MDC_PORTS` unset. The OS picks the
-control port of each publication, and the publisher record carries it. A
-fixed range sat in the node's ephemeral range, where a port-0 socket of
-the shared media driver could take a port first.
+- The multicast fallback channels pin their `interface` to
+  `{{ env "meta.node_ip" }}/32` too.
+- The fallback archive lists render from the archive records. The
+  `kardamom-aeron-archive` service carries the topic that the node
+  records (`archive_topics`) as a tag.
+- The template lists `tx_data.kardamom-aeron-archive` for `tx_data` and
+  `tx_deposits.kardamom-aeron-archive` for `tx_deposits`. The selection
+  follows the recording node in both profiles: the ingress nodes for
+  `tx_data`, and the node with the `da-watcher` role for `tx_deposits`.
+- A node records at most one topic. A node that records nothing has an
+  empty tag.
+- Every job renders the file with `change_mode = "noop"`. A change in the
+  archive set rewrites the file. The running process follows the catalog
+  through discovery and does not restart.
+- `ansible/contract.yml` checks the chain id mirror, the placeholders,
+  the role tag, and the node meta that the Nomad agent template stamps.
+
+No job configures a publication control port.
+
+- Each publication names port 0 in its control endpoint. The media driver binds an OS-chosen port.
+- The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
+- The publisher record carries the address that the driver bound.
+- The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
 
 | Job | Publications |
 | --- | --- |
@@ -199,19 +217,25 @@ the shared media driver could take a port first.
 | da-watcher | deposits, remote epochs |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
 
-The aeron system job registers the archive record with the node's
-`archive_topics` meta: `tx_data` on the ingress nodes, `tx_deposits` on
-the aux node, empty elsewhere. The cluster job registers the member
-record with `member_id` equal to the sealer node's index.
+The aeron system job registers the archive record with the `archive_topics`
+meta of the node:
 
-## Cutover
+- `tx_data` on a node with the `ingress` role.
+- `tx_deposits` on a node with the `da-watcher` role.
+- Empty on every other node.
 
-No multicast-to-MDC mixed deployment is assumed compatible. The cutover
-is coordinated: every service reads the same `channels.toml`, and
-`[discovery] enabled` flips the whole cluster at once. Recordings made on
-the multicast channels keep their catalog entries and their original
-channel URIs; a refetch of a range recorded before the cutover resolves it
-by session id as before.
+The `da-watcher` role is on its own node in the production profile. In the
+local profile it is on the `aux` node.
+
+The cluster job registers the member record with `member_id` equal to the
+index of the sealer node.
+
+## Switching a cluster to discovery
+
+- A cluster does not mix multicast and MDC deployments.
+- Every service reads the same `channels.toml`. `[discovery] enabled` switches the whole cluster at once.
+- Recordings made on the multicast channels keep their catalog entries and their original channel URIs.
+- A refetch of a range that was recorded on multicast resolves it by session id.
 
 ## Local runs
 

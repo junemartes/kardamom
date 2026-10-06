@@ -63,6 +63,20 @@ class NomadAPI(BaseHTTPRequestHandler):
         else:
             raise AssertionError(self.path)
 
+    def do_PUT(self):
+        # The bootstrap variable of a new sealer cluster.
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
+        assert body['Path'] == 'nomad/jobs/cluster' and body['Items'] == {'bootstrap': 'true'}, body
+        self.server.state['writes'].append('bootstrap-open')
+        self.respond(body)
+
+    def do_DELETE(self):
+        assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
+        self.server.state['writes'].append('bootstrap-close')
+        self.send_response(204)
+        self.end_headers()
+
     def do_GET(self):
         parts = self.path.split('?')[0].split('/')
         parts += [''] * (6 - len(parts))
@@ -182,7 +196,7 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml"):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -197,11 +211,14 @@ class DeployTest(unittest.TestCase):
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
             'workloads_sealer_admin_port': self.api.server_port,
+            'workloads_cluster_bootstrap': False,
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
+        env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
@@ -212,8 +229,8 @@ class DeployTest(unittest.TestCase):
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
-                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'monitoring', 'da-store',
-                    'batcher']
+                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
+                    'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
@@ -286,6 +303,7 @@ class DeployTest(unittest.TestCase):
             'workloads_namespace': 'staging',
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
+            'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '2',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -304,6 +322,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         # One value turns priority fees on for every role that has a say.
         self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')
@@ -327,6 +346,16 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
+        # A restart resumes after the last published L1 block only when the
+        # cursor file outlives the container.
+        self.run_deploy(check=True)
+        task = self.api.state['plans']['da-watcher']['TaskGroups'][0]['Tasks'][0]
+        self.assertIn('/opt/kardamom/da-watcher:/opt/kardamom/da-watcher', task['Config']['volumes'])
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--l1-cursor-file') + 1], '/opt/kardamom/da-watcher/l1-cursor')
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
@@ -334,6 +363,40 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    def test_every_aeron_party_takes_the_stall_tolerance(self):
+        for tolerance in (10000, 30000):
+            with self.subTest(tolerance=tolerance):
+                environ = {} if tolerance == 10000 else {'AERON_STALL_TOLERANCE_MS': str(tolerance)}
+                self.run_deploy(check=True, environ=environ)
+                self.assert_aeron_parties(self.api.state['plans'], tolerance)
+
+    def assert_aeron_parties(self, plans, tolerance):
+        """Every task that maps the Aeron directory carries the tolerance:
+        a Rust client as its driver timeout, a JVM with a media driver as
+        its driver timeout, client liveness, and a publication unblock
+        timeout above the liveness."""
+        jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
+        parties = [(name, task) for name, job in plans.items() for group in job['TaskGroups']
+                   for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
+        self.assertEqual({name for name, _ in parties}, {
+            'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
+            'state-mirror', 'notifier'})
+        liveness_ns = tolerance * 1_000_000
+        for name, task in parties:
+            if name not in jvm_options:
+                self.assertEqual(task['Env']['AERON_DRIVER_TIMEOUT'], str(tolerance), name)
+                continue
+            options = task['Env'][jvm_options[name]].split()
+            self.assertIn(f'-Daeron.driver.timeout={tolerance}', options, name)
+            self.assertIn(f'-Daeron.client.liveness.timeout={liveness_ns}', options, name)
+            unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
+            self.assertEqual(len(unblock), 1, name)
+            self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A restarted driver waits out the active-driver window of its
+        # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
+        delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
+        self.assertEqual(delay_ns, (tolerance // 1000 + 5) * 1_000_000_000)
 
     @staticmethod
     def sequencer_env(plans):
@@ -453,6 +516,24 @@ class DeployTest(unittest.TestCase):
     def test_a_fresh_sealer_registers_in_one_step(self):
         self.run_deploy()
         self.assertEqual(self.api.state['writes'].count('cluster'), 1)
+        self.assertNotIn('bootstrap-open', self.api.state['writes'])
+
+    def test_the_bootstrap_lives_only_while_a_new_cluster_comes_up(self):
+        self.run_deploy({'workloads_cluster_bootstrap': True})
+        writes = self.api.state['writes']
+        cluster = writes.index('cluster')
+        self.assertEqual(writes[cluster - 1:cluster + 2], ['bootstrap-open', 'cluster', 'bootstrap-close'])
+        # A re-deploy of the registered cluster keeps the flag and still
+        # opens no bootstrap.
+        self.api.state['deployments']['cluster'] = Deployment('cluster', ['successful'])
+        self.api.state['writes'] = []
+        self.run_deploy({'workloads_cluster_bootstrap': True, 'workloads_cluster_retention': '4096'})
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+
+    def test_a_failed_bootstrap_closes_the_bootstrap(self):
+        self.api.state['deployments']['cluster'] = Deployment('cluster', ['failed'])
+        self.run_deploy({'workloads_cluster_bootstrap': True}, success=False)
+        self.assertEqual(self.api.state['writes'][-3:], ['bootstrap-open', 'cluster', 'bootstrap-close'])
 
 
 if __name__ == '__main__':
