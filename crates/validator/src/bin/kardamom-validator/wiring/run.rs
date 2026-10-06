@@ -97,8 +97,9 @@ pub(crate) struct Ready {
     tx_receipts_pub: TxReceiptsChain,
 }
 
-/// The validator role's port types. The epoch check is the L1-re-deriving
-/// [`epoch_verify::EpochVerifier`].
+/// The validator role's port types. The epoch check is
+/// [`epoch_verify::EpochVerifier`]: the origin sequence rules always, and
+/// the L1 content check when L1 is configured.
 ///
 /// `pub(super)` so [`super::startup::Opened::open_streams`] can name it
 /// for [`bin_support::open_inbound`].
@@ -133,8 +134,8 @@ impl Ready {
     /// The executor config and the three role-specific `RoleHooks` ports:
     /// reads only `self`'s own fields, so it takes no argument list.
     ///
-    /// Infallible: the `--l1-rpc-url` parse that could once fail here now
-    /// happens once, at the CLI boundary (see [`build_epoch_observer`]).
+    /// Infallible: `--l1-rpc-url` is parsed once, at the CLI boundary
+    /// (see [`Args::epoch_observer`]).
     fn run_ports(&self) -> RunPorts {
         let args = &self.attested.written.streamed.opened.base.args;
         let chain_id = self.attested.written.streamed.opened.state.chain_id;
@@ -189,12 +190,7 @@ impl Ready {
                 .spawn();
         }
 
-        // Epoch verification. Sequence rules 1-2 are local and always
-        // enforced once an epoch appears. The content check needs L1, so
-        // it is wired only when both the RPC URL and the lockbox address
-        // are given.
-        let epoch_observer =
-            build_epoch_observer(args, divergence.clone(), &tokio::runtime::Handle::current());
+        let epoch_observer = args.epoch_observer(divergence.clone());
 
         // Remote-epoch verification (interop): inline pair-sequence
         // checks on every RemoteEpochRecord, always on — they need no
@@ -359,7 +355,7 @@ impl Ready {
                     // Whole-block exec strategy (the parallel-validation
                     // path).
                     block_exec,
-                    epoch_observer,
+                    epoch_observer: Some(epoch_observer),
                     remote_epoch_observer,
                 },
             )
@@ -522,40 +518,34 @@ fn build_block_exec(
 struct RunPorts {
     cfg: kardamom_engine::ExecutorConfig,
     block_exec: Option<ValidatorBlockExec>,
-    epoch_observer: Option<epoch_verify::EpochVerifier>,
+    epoch_observer: epoch_verify::EpochVerifier,
     remote_epoch_observer: Option<kardamom_validator::interop::RemoteEpochVerifier>,
 }
 
-/// Build the epoch observer: epochs are re-derived from L1 when both
-/// `--l1-rpc-url` and `--lockbox` are given. Without both, only the local
-/// origin sequence rules apply; there is no content check.
-///
-/// Infallible now that `--l1-rpc-url` is parsed into a `reqwest::Url` at
-/// the CLI boundary: this used to also parse the flag's raw string, which
-/// could fail; that parse (and this function's `Result`) is gone with it.
-fn build_epoch_observer(
-    args: &Args,
-    divergence: Arc<Divergence>,
-    rt: &tokio::runtime::Handle,
-) -> Option<epoch_verify::EpochVerifier> {
-    let (Some(l1_rpc_url), Some(lockbox)) = (args.l1_rpc_url.clone(), args.lockbox) else {
+impl Args {
+    /// Build the epoch observer. It always enforces origin sequence rules
+    /// 1 and 2, which need no L1. It also re-derives each epoch from L1
+    /// when both `--l1-rpc-url` and `--lockbox` are given. Only that
+    /// content check needs a runtime, so it reads the current one.
+    fn epoch_observer(&self, divergence: Arc<Divergence>) -> epoch_verify::EpochVerifier {
+        let observer = epoch_verify::EpochVerifier::new(divergence);
+        let (Some(l1_rpc_url), Some(lockbox)) = (self.l1_rpc_url.clone(), self.lockbox) else {
+            tracing::info!(
+                "epoch CONTENT verification disabled (needs --l1-rpc-url and \
+                 --lockbox); origin sequence rules still apply"
+            );
+            return observer;
+        };
+        let provider = alloy_provider::ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(l1_rpc_url);
+        let source = Arc::new(kardamom_da_watcher::RpcL1Source::new(provider));
         tracing::info!(
-            "epoch CONTENT verification disabled (needs --l1-rpc-url and \
-             --lockbox); origin sequence rules still apply"
+            %lockbox,
+            "epoch verification enabled: epochs are re-derived from L1"
         );
-        return None;
-    };
-    let provider = alloy_provider::ProviderBuilder::new()
-        .disable_recommended_fillers()
-        .connect_http(l1_rpc_url);
-    let source = Arc::new(kardamom_da_watcher::RpcL1Source::new(provider));
-    tracing::info!(
-        %lockbox,
-        "epoch verification enabled: epochs are re-derived from L1"
-    );
-    Some(epoch_verify::EpochVerifier::spawn(
-        source, lockbox, divergence, rt,
-    ))
+        observer.with_content_check(source, lockbox, &tokio::runtime::Handle::current())
+    }
 }
 
 /// The four values [`Ready::run`] must hold onto until shutdown, gathered
@@ -653,3 +643,7 @@ fn classify_engine_result(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod tests;

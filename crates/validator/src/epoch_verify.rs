@@ -1,20 +1,20 @@
-//! Epoch verification against L1.
+//! Epoch verification.
 //!
 //! Deriving deposits is only half the guarantee. Without a checker, a buggy
 //! or dishonest sequencer builds a chain nobody can rebuild from L1, and no
-//! one notices until they try. This module is that checker. For every
-//! [`EpochRecord`] on the canonical stream, it re-derives the epoch from
-//! L1, through the same [`derive_epoch`] function the producer used, so a
-//! bug cannot cancel itself out. It treats any disagreement as a
-//! divergence.
+//! one notices until they try. This module is that checker. It treats any
+//! disagreement as a divergence.
 //!
 //! There are two classes of check, split by cost:
 //!
-//! - Sequence rules (1 and 2), synchronous. These check a monotonic origin
-//!   and that no L1 block was skipped. They read only local state, so they
-//!   run inline on the exec thread and reject before the epoch's deposits
-//!   are applied.
-//! - Content checks (the epoch's hash and deposits), asynchronous. These
+//! - Sequence rules (1 and 2), synchronous, always on. These check a
+//!   monotonic origin and that no L1 block was skipped. They read only
+//!   local state, so they run inline on the exec thread and reject before
+//!   the epoch's deposits are applied. They need no L1 connection.
+//! - Content checks (the epoch's hash and deposits), asynchronous, on only
+//!   with an L1 source. For every [`EpochRecord`] on the canonical stream,
+//!   they re-derive the epoch from L1 through the same [`derive_epoch`]
+//!   function the producer uses, so a bug cannot cancel itself out. They
 //!   need an L1 round trip. Running them inline would add RPC latency to
 //!   the execution path and let a slow L1 stall the chain. Instead they run
 //!   on a background task, which records the verdict. The next epoch reads
@@ -242,30 +242,66 @@ pub(crate) struct Anchor {
     pub(crate) hash: B256,
 }
 
-/// Engine-side seam: checks the sequence inline and queues the content check.
+/// Engine-side seam: checks rules 1 and 2 inline on every epoch, and
+/// queues the L1 content check when one is wired.
 pub struct EpochVerifier {
     previous_origin: Option<u64>,
     divergence: Arc<Divergence>,
-    tx: tokio::sync::mpsc::Sender<EpochRecord>,
+    /// The queue to the L1 content-check task. `None` means the validator
+    /// has no L1 source, and rules 1 and 2 are the whole check.
+    content: Option<ContentQueue>,
 }
 
 impl EpochVerifier {
-    /// Wire a verifier onto `rt`, and read L1 through `source`.
-    ///
-    /// The background task owns the L1 reads. The returned value is what
-    /// the engine calls on the exec thread.
-    pub fn spawn<S: L1EpochSource>(
-        source: Arc<S>,
-        lockbox: Address,
-        divergence: Arc<Divergence>,
-        rt: &tokio::runtime::Handle,
-    ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
-        rt.spawn(Verifier::new(source, lockbox, divergence.clone(), rx).run());
+    /// A verifier that checks rules 1 and 2 only. These rules read local
+    /// state, so this needs no L1 connection and no runtime.
+    #[must_use]
+    pub fn new(divergence: Arc<Divergence>) -> Self {
         Self {
             previous_origin: None,
             divergence,
-            tx,
+            content: None,
+        }
+    }
+
+    /// Add the L1 content check. Its task runs on `rt`, owns the L1 reads,
+    /// and reads L1 through `source`. The exec thread only queues epochs.
+    #[must_use]
+    pub fn with_content_check<S: L1EpochSource>(
+        self,
+        source: Arc<S>,
+        lockbox: Address,
+        rt: &tokio::runtime::Handle,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
+        rt.spawn(Verifier::new(source, lockbox, self.divergence.clone(), rx).run());
+        Self {
+            content: Some(ContentQueue(tx)),
+            ..self
+        }
+    }
+}
+
+/// The exec-thread end of the queue to the content-check task.
+struct ContentQueue(tokio::sync::mpsc::Sender<EpochRecord>);
+
+impl ContentQueue {
+    /// Queue `epoch` for the content check. This uses `try_send`: a full
+    /// queue must not block the exec thread. A dropped item only costs
+    /// coverage of that epoch.
+    fn offer(&self, epoch: &EpochRecord) {
+        match self.0.try_send(epoch.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                metrics::counter_epoch_unverified();
+                tracing::warn!(
+                    l1_number = epoch.l1_number,
+                    "epoch verifier queue full; epoch not content-checked"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!("epoch verifier task is gone; content checks stopped");
+            }
         }
     }
 }
@@ -454,7 +490,7 @@ impl<S: L1EpochSource> Verifier<S> {
 /// at most `VERIFY_ATTEMPTS * VERIFY_RETRY_DELAY` (16 s). The queue drains
 /// faster than it fills, unless L1 is down for a long time. 64 entries hold
 /// about 13 minutes of epochs. After that, the exec thread drops the epoch
-/// (see [`EpochObserver::observe`]) and does not block on the outage.
+/// (see [`ContentQueue::offer`]) and does not block on the outage.
 const EPOCH_QUEUE_CAP: usize = 64;
 
 /// How many times a content check is retried before a verdict. This spans a
@@ -485,21 +521,8 @@ impl EpochObserver for EpochVerifier {
             return Err(ExecutorError::State(fault.to_string()));
         }
         self.previous_origin = Some(epoch.l1_number);
-        // The content check uses `try_send`. A full queue must not block
-        // the exec thread. A dropped item only costs coverage of that
-        // epoch.
-        match self.tx.try_send(epoch.clone()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                metrics::counter_epoch_unverified();
-                tracing::warn!(
-                    l1_number = epoch.l1_number,
-                    "epoch verifier queue full; epoch not content-checked"
-                );
-            }
-            Err(TrySendError::Closed(_)) => {
-                tracing::warn!("epoch verifier task is gone; content checks stopped");
-            }
+        if let Some(queue) = &self.content {
+            queue.offer(epoch);
         }
         Ok(())
     }

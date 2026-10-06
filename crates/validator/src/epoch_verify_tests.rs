@@ -422,3 +422,70 @@ fn parent_mismatch_message_names_both_hashes() {
     let m = f.to_string();
     assert!(m.contains('8') && m.contains("not one chain"), "{m}");
 }
+
+fn epoch(l1_number: u64) -> EpochRecord {
+    derive_epoch(l1_number, B256::repeat_byte(0x5A), &[]).unwrap()
+}
+
+/// A plain test with no runtime: a verifier that spawned the content task
+/// or touched L1 would panic here.
+#[test]
+fn the_sequence_rules_run_without_an_l1_source() {
+    let divergence = Divergence::new();
+    let mut verifier = EpochVerifier::new(divergence.clone());
+    assert!(verifier.content.is_none());
+    assert!(verifier.observe(&epoch(100)).is_ok());
+    assert!(verifier.observe(&epoch(101)).is_ok());
+    assert!(!divergence.is_halted());
+}
+
+#[test]
+fn a_skipped_origin_without_an_l1_source_is_a_divergence() {
+    let divergence = Divergence::new();
+    let mut verifier = EpochVerifier::new(divergence.clone());
+    verifier.observe(&epoch(100)).unwrap();
+
+    let skipped = EpochFault::OriginSkipped {
+        previous: 100,
+        got: 102,
+    };
+    assert!(matches!(
+        verifier.observe(&epoch(102)),
+        Err(ExecutorError::State(reason)) if reason == skipped.to_string()
+    ));
+    assert_eq!(
+        divergence.reason(),
+        Some(format!("epoch verification failed: {skipped}"))
+    );
+    // The divergence latches: the missing epoch does not repair it.
+    assert!(verifier.observe(&epoch(101)).is_err());
+}
+
+#[test]
+fn a_regressed_origin_without_an_l1_source_is_a_divergence() {
+    let divergence = Divergence::new();
+    let mut verifier = EpochVerifier::new(divergence.clone());
+    verifier.observe(&epoch(100)).unwrap();
+
+    assert!(verifier.observe(&epoch(100)).is_err());
+    assert!(
+        divergence
+            .reason()
+            .is_some_and(|r| r.contains("l1_origin regressed: 100 -> 100")),
+        "{:?}",
+        divergence.reason()
+    );
+}
+
+#[tokio::test]
+async fn an_l1_source_turns_the_content_check_on() {
+    let l1 = FakeL1 {
+        blocks: std::collections::BTreeMap::new(),
+    };
+    let verifier = EpochVerifier::new(Divergence::new()).with_content_check(
+        std::sync::Arc::new(l1),
+        lockbox(),
+        &tokio::runtime::Handle::current(),
+    );
+    assert!(verifier.content.is_some());
+}
