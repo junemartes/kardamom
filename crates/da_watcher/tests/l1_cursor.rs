@@ -6,31 +6,39 @@
 //! One test here raises the process halt. No other test in this binary
 //! spawns a watcher, so no other test raises or clears it.
 
+use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
-use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
+use kardamom_da_watcher::publisher::fakes::{InMemoryEpochPublisher, PublisherTap};
 use kardamom_da_watcher::source::fakes::MockL1Source;
 use kardamom_da_watcher::{
     CursorError, CursorFile, DaWatcherConfig, L1Cursor, L1CursorError, L1ResumeAfter, L1Watcher,
     MonitorError,
 };
 use kardamom_obs::halt::{self, Clears, HaltCause};
+use kardamom_types::EpochRecord;
 
 /// One test's cursor file in its own directory, and the publisher that
 /// sees every epoch across the test's restarts.
 struct Rig {
     dir: tempfile::TempDir,
     publisher: InMemoryEpochPublisher,
+    tap: PublisherTap,
+    /// Every epoch the tap gave so far: the tap hands each epoch out once.
+    seen: RefCell<Vec<EpochRecord>>,
 }
 
 impl Rig {
     fn new() -> Self {
+        let (publisher, tap) = InMemoryEpochPublisher::new();
         Self {
             dir: tempfile::tempdir().unwrap(),
-            publisher: InMemoryEpochPublisher::default(),
+            publisher,
+            tap,
+            seen: RefCell::new(Vec::new()),
         }
     }
 
@@ -81,14 +89,14 @@ impl Rig {
         std::fs::write(self.path(), contents).unwrap();
     }
 
+    /// Every epoch published across the rig's watcher lifetimes, in order.
+    fn epochs(&self) -> Vec<EpochRecord> {
+        self.seen.borrow_mut().extend(self.tap.epochs());
+        self.seen.borrow().clone()
+    }
+
     fn published(&self) -> Vec<u64> {
-        self.publisher
-            .published
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| e.l1_number)
-            .collect()
+        self.epochs().iter().map(|e| e.l1_number).collect()
     }
 }
 
@@ -257,7 +265,7 @@ async fn a_stale_file_publishes_identical_epochs_again() {
     let mut w = rig.start(source(&[103]), None).unwrap();
     assert_eq!(w.process_once().await.unwrap(), 3);
 
-    let epochs = rig.publisher.published.lock().unwrap().clone();
+    let epochs = rig.epochs();
     let (first, again) = epochs.split_at(3);
     assert_eq!(first, again);
     assert!(
