@@ -15,8 +15,9 @@
 //! against the cluster that is up, for a local iteration loop.
 //! `KARDAMOM_CHAOS_CASES` (space-separated) overrides the shard's case
 //! list, `KARDAMOM_CHAOS_GATE_ACCOUNT` the smoke gate's funded account,
-//! and `CHAOS_ACCT_BASE` the first case account, so a reuse run on a used
-//! chain takes unused accounts. `KARDAMOM_CHAOS_CLUSTER_VARS` passes extra Ansible variables to
+//! and `CHAOS_ACCT_BASE` the first case account. A case load starts its
+//! account at nonce 0, so a reuse run on a used chain takes unused case
+//! accounts. `KARDAMOM_CHAOS_CLUSTER_VARS` passes extra Ansible variables to
 //! the convergence playbook as one JSON object. On a host without
 //! passwordless sudo, set the host sysctls and the bridge's multicast
 //! snooping once by hand and pass `{"ansible_become": false}` in

@@ -1,6 +1,6 @@
 # Rejoin the pipeline from a state rebuilt from L1
 
-Status: executor half and deposits built. Sealer half: designed, not built.
+Status: executor half, sealer half and deposits built.
 
 ## 1. Problem
 
@@ -81,13 +81,24 @@ replaces the flag day at a new genesis.
 
 **Procedure.**
 
-1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>`. H is
-   the last posted block, or `--through-block`. The tool refuses a head that it did not
-   rebuild from L1, and a head from a version 2 payload.
+1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>
+   --lockbox <addr>`. H is the last posted block, or `--through-block`. The tool refuses
+   a head that it did not rebuild from L1, and a head from a version 2 payload. Without
+   `--lockbox`, the rebuild leaves the deposits out, and a chain with deposits rebuilds to
+   a wrong root (section 5).
 2. Give every member the same file in `-Dkardamom.cluster.seedSnapshot=<file>`. Start the
    members as a new cluster, with empty cluster and archive directories.
-3. Restart every surviving consumer. A consumer at the rebuilt head resumes at
-   `(E_H, H + 1)`.
+3. Install the rebuilt state on every executor and the validator. A consumer
+   at the rebuilt head resumes at `(E_H, H + 1)`. A consumer that keeps the
+   state of the old stream lies past the new head and must not resume on it.
+4. Remove every other copy of the old stream: the checkpoints, the batcher's
+   spool, and the account cache.
+5. Start the sequencers, then the da-watcher with `--l1-resume-after M`,
+   where M is the L1 origin of H. A watcher that starts at the finalized tip
+   loses the epochs between M and the tip. A sequencer reads the epochs live,
+   so an epoch published before the sequencers subscribe is lost too.
+
+`docs/runbooks/sealer-fleet-rebuild.md` gives the commands.
 
 **The seed file** (version 1, big-endian) holds the chain id, H, E_H, the timestamp and
 the L1 origin of H, the state root, and the senders with their next nonces.
