@@ -15,7 +15,7 @@ sol!(
     IKardamomL2Settlement,
     concat!(
         env!("CARGO_WORKSPACE_DIR"),
-        "/contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json"
+        "/contracts/abi/KardamomL2Settlement.json"
     )
 );
 

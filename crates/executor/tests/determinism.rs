@@ -54,6 +54,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             cfg,
             start: ResumePoint::GENESIS,
             snap,
+            tx_hook: None,
         },
         HarnessInput {
             tx_data: vec![tx_data],
