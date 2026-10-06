@@ -140,11 +140,16 @@ restores one of its checkpoints, skips the records of the new chain.
    the batcher's spool and cursor file. A spool that holds blocks after H
    continues the batcher's cursor, so the batcher would post reverted blocks.
    Without a cursor file, the batcher reads its cursor from the last posted
-   batch: `(E_H, H + 1)`.
+   batch: `(E_H, H + 1)`. Also remove the da-watcher's L1 cursor file. It
+   holds the last epoch of the reverted chain, which is past M. The flag in
+   step 6 overrides the file, but a restart without the flag would resume
+   after the file's block, and the epochs between M and that block would be
+   lost.
 
    ```sh
    ssh aux-0 'find /opt/kardamom/state/validator /opt/kardamom/checkpoints -mindepth 1 -delete &&
-     rm -rf /opt/kardamom/batcher/spool /opt/kardamom/batcher/cursor.json'
+     rm -rf /opt/kardamom/batcher/spool /opt/kardamom/batcher/cursor.json &&
+     rm -f /opt/kardamom/da-watcher/l1-cursor'
    ```
 
 4. Empty the account cache. Its rows carry positions of the reverted chain,
@@ -231,7 +236,9 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    subscribe never reaches the sealer.
 4. Start the da-watcher after block M. Without the flag, it starts at the
    finalized tip, and the deposits of the blocks between M and the tip are
-   lost. If M is 0, the chain holds no epoch: leave out the flag.
+   lost. If M is 0, the chain holds no epoch: leave out the flag. The flag
+   overrides the da-watcher's L1 cursor file. The first tick writes block M
+   to the file, and every later pass writes the last block it published.
 
    ```sh
    jq --arg m "$M" '.Job.TaskGroups[0].Tasks[0].Config.args += ["--l1-resume-after", $m]' \
@@ -268,7 +275,8 @@ This procedure has no halt to clear. After the members log
 `sealer snapshot TAKEN`, the next `just deploy` registers the cluster job
 without the seed property and the da-watcher job without
 `--l1-resume-after`. The deploy rolls the sealer members one at a time; each
-one restores the snapshot. A da-watcher that restarts with a stale
+one restores the snapshot. The da-watcher then resumes after the block in its
+L1 cursor file. A da-watcher that restarts with a stale
 `--l1-resume-after` sends epochs that the sealer already holds; the sealer
 drops them as a regression.
 

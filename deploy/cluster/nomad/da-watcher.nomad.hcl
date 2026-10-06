@@ -14,6 +14,11 @@
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
+#
+# The L1 cursor file (the last published L1 block, by number and hash)
+# lives under /opt/kardamom/da-watcher, a host directory that the common
+# role creates. A restart resumes after that block, so the epochs between
+# the last publish and the finalized tip are not lost.
 
 variable "lockbox_address" {
   type        = string
@@ -137,13 +142,15 @@ job "da-watcher" {
         # so the pin holds.
         force_pull = true
         # Read-only rootfs. The da-watcher
-        # writes only to the bind-mounted aeron directory, plus
-        # Nomad's alloc, local, and secrets mounts. cluster-e2e
-        # validates this.
+        # writes only to the bind-mounted aeron directory and its cursor
+        # directory, plus Nomad's alloc, local, and secrets mounts.
+        # cluster-e2e validates this.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          # The L1 cursor file lives under the persistent mount.
+          "/opt/kardamom/da-watcher:/opt/kardamom/da-watcher",
         ]
         args = concat(
           [
@@ -152,6 +159,7 @@ job "da-watcher" {
             "--log-config", "/local/channels.toml",
             "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
             "--poll-interval-secs", "1",
+            "--l1-cursor-file", "/opt/kardamom/da-watcher/l1-cursor",
             # Record tx_deposits to the archive, so a restarted
             # executor can replay deposit envelopes (Phase 2 crash
             # recovery).

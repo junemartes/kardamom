@@ -113,7 +113,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 - [`cluster-leader-kill`](failure-modes.md#sealer-the-aeron-cluster-raft): kills the Raft leader. The pipeline must keep committing.
 - [`cluster-follower-kill`](failure-modes.md#sealer-the-aeron-cluster-raft): kills a follower. The restarted member must restore from a snapshot.
-- [`cluster-member-rejoin`](failure-modes.md#sealer-the-aeron-cluster-raft): kills a follower and wipes its cluster and archive directories. The blank member must start blank (a seed from a peer snapshot, or position 0 when the cluster has no snapshot) and reach the head that the executors had at the wipe.
+- [`cluster-member-rejoin`](failure-modes.md#sealer-the-aeron-cluster-raft): waits up to 6 minutes for the `cluster LOG PURGED` line of the leader. A replay from position 0 is then impossible. The case then kills a follower and wipes its cluster and archive directories. The blank member must seed from a peer snapshot and reach the head that the executors had at the wipe.
 - [`node-replace-sealer`](failure-modes.md#sealer-the-aeron-cluster-raft): replaces the node of a follower through the Terraform root. The blank member must start blank and reach the head that the executors had at the replacement.
 - [`cpu-squeeze`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): throttles the CPU of every pipeline node in cycles. The validator may slow down. It must never diverge.
 
@@ -150,6 +150,9 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 **L1 shard**
 
 - [`l1-liar`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
+  - The wrong hash halts the single-source followers. The case then does the operator step.
+  - It removes the L1 cursor file of the da-watcher and restarts the da-watcher. The da-watcher seeds at the finalized tip.
+  - It re-indexes the archive of the indexer from the first block of the chain.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.

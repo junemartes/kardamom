@@ -22,6 +22,7 @@ use crate::error::ExecutorError;
 use crate::reader::{NoEpochCheck, NoRemoteEpochCheck, ReaderToExec, RemoteEpochObserver};
 use crate::state::MockStateDatabase;
 
+use super::test_hooks::RecordingTxHook;
 use super::{
     BalHandoff, BlockExecStrategy, ExecHooks, ExecInputs, ExecPorts, ExecState, ExecToCommit,
     ExecutorConfig, NoBlockExec, ResumePoint, StateWriterQueue, StateWriterSignal,
@@ -335,7 +336,12 @@ where
     type Epoch = NoEpochCheck;
     type RemoteEpoch = R;
     type BlockExec = B;
+    // Off unless a test calls `ExecRig::tx_hook`.
+    type TxHook = Option<RecordingTxHook>;
 }
+
+/// [`ExecRig`]'s inputs for `ExecState`, and the exec-to-commit receiver.
+type RigInputs<S, Q, P, R, B> = (ExecInputs<TestPorts<S, Q, P, R, B>>, Receiver<ExecToCommit>);
 
 /// Builder for `ExecState::spawn`'s test fixtures. Every exec test wires the same
 /// twelve-argument call, with nine of the twelve almost always `None`. This
@@ -355,6 +361,7 @@ pub(super) struct ExecRig<S: SnapshotSource, Q, P, R = NoRemoteEpochCheck, B = N
     shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     block_exec: Option<B>,
     remote_epoch_observer: Option<R>,
+    tx_hook: Option<RecordingTxHook>,
     tx_e2c: Sender<ExecToCommit>,
     rx_e2c: Receiver<ExecToCommit>,
 }
@@ -376,6 +383,7 @@ where
             shadow_tx: None,
             block_exec: None,
             remote_epoch_observer: None,
+            tx_hook: None,
             tx_e2c,
             rx_e2c,
         }
@@ -405,6 +413,7 @@ where
             shadow_tx: self.shadow_tx,
             block_exec: self.block_exec,
             remote_epoch_observer: Some(observer),
+            tx_hook: self.tx_hook,
             tx_e2c: self.tx_e2c,
             rx_e2c: self.rx_e2c,
         }
@@ -434,6 +443,11 @@ where
         self
     }
 
+    pub(super) fn tx_hook(mut self, hook: RecordingTxHook) -> Self {
+        self.tx_hook = Some(hook);
+        self
+    }
+
     /// Swap in a test's own whole-block strategy. Consumes the default
     /// [`NoBlockExec`] rig and returns one typed for `B2`, since a struct
     /// field cannot change type through `&mut self`.
@@ -450,6 +464,7 @@ where
             shadow_tx: self.shadow_tx,
             block_exec: Some(strategy),
             remote_epoch_observer: self.remote_epoch_observer,
+            tx_hook: self.tx_hook,
             tx_e2c: self.tx_e2c,
             rx_e2c: self.rx_e2c,
         }
@@ -472,8 +487,26 @@ where
         JoinHandle<Result<(), ExecutorError>>,
         Receiver<ExecToCommit>,
     ) {
-        let rx_e2c = self.rx_e2c;
-        let h = ExecState::<TestPorts<S, Q, P, R, B>>::spawn(ExecInputs {
+        let (inputs, rx_e2c) = self.into_inputs(rx);
+        (ExecState::spawn(inputs), rx_e2c)
+    }
+
+    /// Run the exec loop on the calling thread, until `rx` closes or the
+    /// loop stops. A thread-local metrics recorder then sees the loop's
+    /// counters. Returns the loop's result and the exec-to-commit
+    /// receiver.
+    pub(super) fn run_here(
+        self,
+        rx: Receiver<ReaderToExec>,
+    ) -> (Result<(), ExecutorError>, Receiver<ExecToCommit>) {
+        let (inputs, rx_e2c) = self.into_inputs(rx);
+        (ExecState::new(inputs).run(), rx_e2c)
+    }
+
+    /// The rig's ports and hooks as `ExecInputs`, and the exec-to-commit
+    /// receiver the caller must keep alive (see [`Self::spawn`]).
+    fn into_inputs(self, rx: Receiver<ReaderToExec>) -> RigInputs<S, Q, P, R, B> {
+        let inputs = ExecInputs {
             cfg: ExecutorConfig::default(),
             rx,
             tx: self.tx_e2c,
@@ -487,9 +520,10 @@ where
                 block_exec: self.block_exec,
                 epoch_observer: None,
                 remote_epoch_observer: self.remote_epoch_observer,
+                tx_hook: self.tx_hook,
             },
-        });
-        (h, rx_e2c)
+        };
+        (inputs, self.rx_e2c)
     }
 }
 

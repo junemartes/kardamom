@@ -140,7 +140,7 @@ impl<W: ExecPorts> ExecState<W> {
     /// probe must never park.
     pub(super) fn on_idle_probe(&mut self) -> Result<Flow, ExecutorError> {
         // Settle only at a block edge. With a block open (the scope is
-        // materialized, or records are buffered), the live ExecScope's
+        // materialized, or records are buffered), the live scope's
         // cache is seeded against the current snapshot and parent.
         // Swapping the snapshot and rebuilding the parent mid-block would
         // mix read bases and cause execution to diverge.
@@ -148,7 +148,7 @@ impl<W: ExecPorts> ExecState<W> {
         // Between blocks, both are empty. This is the idle-tail case this
         // probe exists for. A mid-block gap simply defers to the next
         // boundary's sweep.
-        if self.block.scope.is_some() || !self.block.buffered.is_empty() {
+        if self.block.run.is_open() {
             return Ok(Flow::Continue);
         }
         let durable = self.io.sw_signal.committed()?;

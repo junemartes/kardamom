@@ -62,6 +62,7 @@ impl Watchers {
                 lockbox = ?l1.cfg.lockbox,
                 poll_interval = ?l1.cfg.poll_interval,
                 resume_after = ?l1.cfg.resume_after.map(L1ResumeAfter::block),
+                cursor_file = ?l1.cursor_file.as_ref().map(|f| f.path().display().to_string()),
                 "kardamom-da-watcher: publishing L1 epochs onto tx_deposits"
             );
             let sources = l1
@@ -75,6 +76,7 @@ impl Watchers {
                     LiveTxDepositsPublisher::new(tx_deposits_pub),
                     sources,
                     l1.cfg,
+                    l1.cursor_file,
                 ),
             ));
         }
