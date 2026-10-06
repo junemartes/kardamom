@@ -13,7 +13,7 @@
 //! With `--expect-root` it exits non-zero on any mismatch, so it also works
 //! as a chaos-suite assertion.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256};
@@ -119,6 +119,14 @@ struct Cli {
     /// state committed at that block.
     #[arg(long)]
     through_block: Option<u64>,
+
+    /// Write the seed a sealer cluster with no state starts from: the
+    /// rebuilt head, its canonical end, and the next nonce of each
+    /// sender. The sealer reads it at
+    /// `-Dkardamom.cluster.seedSnapshot`. Needs a payload that carries
+    /// the canonical cursor through the last block.
+    #[arg(long)]
+    sealer_seed: Option<PathBuf>,
 }
 
 /// Keep the blocks through `through`, and refuse a batch set that ends
@@ -184,6 +192,39 @@ impl Cli {
     }
 }
 
+/// The seed `--sealer-seed` asks for: where to write it, the rebuilt
+/// state it reads, and the senders of the rebuilt blocks in the order they
+/// last sent.
+struct SeedRequest<'a> {
+    path: &'a Path,
+    state_dir: &'a Path,
+    chain_id: u64,
+    senders: kardamom_reconstruct::SenderOrder,
+}
+
+impl SeedRequest<'_> {
+    /// Build the seed of the state that `outcome` rebuilt, and write it.
+    fn write(&self, outcome: &kardamom_engine::ReplayOutcome) -> anyhow::Result<()> {
+        let seed = kardamom_reconstruct::SeedInput {
+            state_dir: self.state_dir,
+            chain_id: self.chain_id,
+            outcome,
+            senders: &self.senders,
+        }
+        .seed()
+        .context("build the sealer seed")?;
+        seed.write(self.path)?;
+        info!(
+            path = %self.path.display(),
+            block = seed.block,
+            end_tx_idx = seed.end_tx_idx,
+            senders = seed.senders.len(),
+            "sealer seed written"
+        );
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
@@ -227,6 +268,17 @@ async fn main() -> anyhow::Result<()> {
         "recovered blocks from DA; re-executing"
     );
 
+    // The seed needs the senders of the rebuilt blocks, in canonical
+    // order. Read them before the replay.
+    let seed = cli.sealer_seed.as_deref().map(|path| SeedRequest {
+        path,
+        state_dir: &cli.state_dir,
+        chain_id: genesis.chain_id,
+        senders: kardamom_reconstruct::SenderOrder::of(
+            blocks.iter().flat_map(|b| b.txs.iter().map(|t| t.sender)),
+        ),
+    });
+
     let durability = if cli.no_sync {
         Durability::SafeNoSync
     } else {
@@ -269,6 +321,9 @@ async fn main() -> anyhow::Result<()> {
             outcome.state_root,
             expected
         );
+    }
+    if let Some(seed) = &seed {
+        seed.write(&outcome)?;
     }
     if cli.executor_image {
         if outcome.head_end_tx_idx.is_none() {

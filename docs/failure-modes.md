@@ -645,8 +645,8 @@ trie, the hashed mirror and the stored root removed, after the root check).
 The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
-which also gives the flag-day procedure for a wiped sealer set and the seed
-hook that would replace it.
+which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
+the seed a new sealer cluster starts from at the rebuilt head.
 
 Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
 absent from the DA payload: a deposit is unsigned, so a payload-carried deposit

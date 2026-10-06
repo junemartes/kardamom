@@ -74,26 +74,41 @@ comes from block H's own frame. A block with a vacant slot (a voided entry or it
 record) rebuilds its items at the tail of its range, so their receipt positions can differ
 from the live chain's; the root does not.
 
-## 4. Sealer half (designed, not built)
+## 4. Sealer half (built)
 
-No continuity path exists today. A fresh cluster starts hard-coded at `canonicalCount = 0`
-and `blockNumber = 1`, and no config key, flag or file seeds it. Three surviving components
-hold values that only move up: the batcher cursor (it would re-post block numbers L1
-already covers), the ingress durability watermark (its on-quorum gate becomes a no-op), and
-the sequencer floors (every earlier sender dead-ends).
+A sealer cluster that lost all its state starts after block H from a seed file. This
+replaces the flag day at a new genesis.
 
-**The only safe procedure today is a flag day at a new genesis:** rebuild the state at
-block H from L1, publish it as the new genesis allocation, deploy a new settlement, and
-start every role with empty volumes, the batcher's cursor file included.
+**Procedure.**
 
-**The smallest product change for continuity** is a seed hook in three files: a
-`kardamom.cluster.seedSnapshot` key in `ClusterNode.java`, read in the fresh branch of
-`SealerClusteredService.onStart`, which calls the existing `CanonicalSealerState.load`. The
-snapshot format already carries every field. The seed needs `canonicalCount = E_H`,
-`blockNumber = H + 1`, `lastBoundaryCount = E_H`, `lastL2Timestamp`, and `l1Origin`. With
-version 3 blobs the rebuilt DB holds all five. The per-sender nonces and the dedup window
-may start empty. Every surviving consumer must still restart. This hook is the next step,
-after the executor half is proven in the chaos suite.
+1. Rebuild the state at H from L1 with `kardamom-reconstruct --sealer-seed <file>`. H is
+   the last posted block, or `--through-block`. The tool refuses a head that it did not
+   rebuild from L1, and a head from a version 2 payload.
+2. Give every member the same file in `-Dkardamom.cluster.seedSnapshot=<file>`. Start the
+   members as a new cluster, with empty cluster and archive directories.
+3. Restart every surviving consumer. A consumer at the rebuilt head resumes at
+   `(E_H, H + 1)`.
+
+**The seed file** (version 1, big-endian) holds the chain id, H, E_H, the timestamp and
+the L1 origin of H, the state root, and the senders with their next nonces.
+`crates/reconstruct/src/seed.rs` and `SealerSeed.java` hold the layout. The digest is the
+SHA-256 of the file. The sealer logs it in `sealer state SEEDED`.
+
+**The seeded state.** The next block is H + 1, and the next index is E_H. The open block
+is empty. The posted head is H, so the DA-lag guard does not halt the chain at once. The
+dedup window and the void ledger start empty. The nonce guard starts with the senders of
+the rebuilt blocks, in the order they last sent, each at the nonce of its rebuilt
+account. A guard with a smaller capacity keeps the most recent senders. A sender that the
+guard does not hold starts at any nonce, as on the live chain. A member with a non-empty
+remote-origin allowlist refuses a seed, because the seed holds no peer anchor.
+
+**The seed record.** While the seed is not confirmed, every member offers a seed record
+with the digest on each new leadership term. The first record in the log confirms the
+seed, and the leader then asks for a snapshot. A member that started at genesis, or from
+another seed, stops at the record, so a blank member that replays the log from 0 without
+the seed fails loudly. After the snapshot, a blank member restores the seeded state from
+a peer's snapshot and never replays the record. Before the snapshot, a blank member needs
+the seed file.
 
 ## 5. Deposits (built)
 
