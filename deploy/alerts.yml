@@ -235,7 +235,7 @@ groups:
           cause: origin_gap
         annotations:
           summary: "{{ $labels.service }} halted: origin_gap ({{ $labels.host_id }})"
-          description: "The sealer refuses the next L1 epoch because an earlier one is missing, and this sequencer does not hold the missing epoch; or the sequencer holds the most relayed epochs that no boundary confirms. Deposits stop; transactions continue. The detail names the L1 block. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/origin_gap.md (recovery id {{ $labels.recovery }})."
+          description: "The sealer refuses the next L1 epoch because an earlier one is missing, and this sequencer did not get the missing epoch for 90 s, so the da-watcher does not publish it again; or the sequencer holds the most relayed epochs that no boundary confirms. Deposits stop; transactions continue. The detail names the L1 block. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/origin_gap.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/origin_gap.md"
 
   # A pause is not a fault of the paused service: it waits on a root halt

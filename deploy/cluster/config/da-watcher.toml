@@ -1,0 +1,16 @@
+# kardamom-da-watcher config (--config).
+#
+# The binary reads only the [cluster] section below. It connects a
+# boundary-only session to the Aeron Cluster (Raft) sealer. The session
+# never offers. The watcher follows the boundaries' L1 origin: the origin
+# confirms the published epochs, the epochs that no boundary confirms are
+# published again, and a start resumes after the sealer's origin.
+# Rendered into the alloc by nomad/da-watcher.nomad.hcl via file().
+
+[cluster]
+ingress_endpoints = "0=sealer-0.node.consul:40200,1=sealer-1.node.consul:40200,2=sealer-2.node.consul:40200"
+initial_leader_member_id = 0
+ingress_stream_id = 101
+egress_stream_id = 102
+keep_alive_interval_ms = 1000
+# egress_channel is set per-node by --cluster-egress-endpoint (the node IP differs).

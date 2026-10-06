@@ -15,10 +15,14 @@
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
 #
-# The L1 cursor file (the last published L1 block, by number and hash)
-# lives under /opt/kardamom/da-watcher, a host directory that the common
-# role creates. A restart resumes after that block, so the epochs between
-# the last publish and the finalized tip are not lost.
+# The watcher follows the sealer's commit through a boundary-only cluster
+# session (config/da-watcher.toml, --config): the boundaries' L1 origin
+# confirms the published epochs, the epochs that no boundary confirms are
+# published again, and a start resumes after the sealer's origin.
+#
+# The L1 cursor file (the sealer's confirmed L1 origin, by number and
+# hash) lives under /opt/kardamom/da-watcher, a host directory that the
+# common role creates. A start with no boundary resumes after that block.
 
 variable "lockbox_address" {
   type        = string
@@ -115,6 +119,8 @@ job "da-watcher" {
       port "metrics" {
         static = 9005
       }
+      # The cluster-egress (response) endpoint of the boundary session.
+      port "egress" {}
     }
 
     task "da-watcher" {
@@ -146,6 +152,11 @@ job "da-watcher" {
             "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
             "--poll-interval-secs", "1",
             "--l1-cursor-file", "/opt/kardamom/da-watcher/l1-cursor",
+            # Follow the sealer's boundaries. The egress channel is per
+            # allocation (the node IP and the dynamic port are known only
+            # at placement), so it is injected here.
+            "--config", "/local/da-watcher.toml",
+            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
             # Record tx_deposits to the archive, so a restarted
             # executor can replay deposit envelopes (Phase 2 crash
             # recovery).
@@ -170,6 +181,12 @@ job "da-watcher" {
         # there re-renders the file; the process reads it once at start
         # and follows the catalog through discovery, so never restart.
         change_mode = "noop"
+      }
+
+      # The [cluster] section of the boundary session.
+      template {
+        destination = "local/da-watcher.toml"
+        data        = file("config/da-watcher.toml")
       }
 
       service {

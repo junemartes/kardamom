@@ -6,108 +6,14 @@
 //! One test here raises the process halt. No other test in this binary
 //! spawns a watcher, so no other test raises or clears it.
 
-use std::num::NonZeroU64;
-use std::path::PathBuf;
-use std::time::Duration;
+mod support;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
 use kardamom_da_watcher::source::fakes::MockL1Source;
-use kardamom_da_watcher::{
-    CursorError, CursorFile, DaWatcherConfig, L1Cursor, L1CursorError, L1ResumeAfter, L1Watcher,
-    MonitorError,
-};
+use kardamom_da_watcher::{CursorError, L1Cursor, L1CursorError, L1Watcher, MonitorError};
 use kardamom_obs::halt::{self, Clears, HaltCause};
-
-/// One test's cursor file in its own directory, and the publisher that
-/// sees every epoch across the test's restarts.
-struct Rig {
-    dir: tempfile::TempDir,
-    publisher: InMemoryEpochPublisher,
-}
-
-impl Rig {
-    fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().unwrap(),
-            publisher: InMemoryEpochPublisher::default(),
-        }
-    }
-
-    fn path(&self) -> PathBuf {
-        self.dir.path().join("l1-cursor")
-    }
-
-    fn file(&self) -> CursorFile<L1Cursor> {
-        CursorFile::open(self.path()).unwrap()
-    }
-
-    fn config(resume_after: Option<u64>) -> DaWatcherConfig {
-        DaWatcherConfig {
-            lockbox: Address::repeat_byte(0xC0),
-            poll_interval: Duration::from_millis(5),
-            resume_after: resume_after
-                .map(|b| L1ResumeAfter::from(NonZeroU64::new(b).expect("a test block is not 0"))),
-        }
-    }
-
-    /// A watcher over `src` with this rig's cursor file, after its
-    /// `load_cursor`. Dropping the watcher releases the file's lock: that
-    /// is a restart.
-    fn start(
-        &self,
-        src: MockL1Source,
-        resume_after: Option<u64>,
-    ) -> Result<L1Watcher<MockL1Source, InMemoryEpochPublisher>, CursorError> {
-        let mut w = L1Watcher::new(
-            self.publisher.clone(),
-            src,
-            Self::config(resume_after),
-            Some(self.file()),
-        );
-        w.load_cursor()?;
-        Ok(w)
-    }
-
-    /// The stored cursor, read from the file itself: a live watcher
-    /// holds the file's lock, so a second handle cannot open it.
-    fn stored(&self) -> Option<L1Cursor> {
-        std::fs::read_to_string(self.path())
-            .ok()
-            .map(|line| line.trim().parse().unwrap())
-    }
-
-    fn write(&self, contents: &str) {
-        std::fs::write(self.path(), contents).unwrap();
-    }
-
-    fn published(&self) -> Vec<u64> {
-        self.publisher
-            .published
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| e.l1_number)
-            .collect()
-    }
-}
-
-/// A source whose finalized tip reads `tips`, in order, one per tick.
-fn source(tips: &[u64]) -> MockL1Source {
-    let src = MockL1Source::new();
-    for tip in tips {
-        src.push_tip(Ok(*tip));
-    }
-    src
-}
-
-/// The cursor at block `number` of the mock's chain.
-fn at(number: u64) -> L1Cursor {
-    L1Cursor {
-        number,
-        hash: MockL1Source::filler_hash(number),
-    }
-}
+use support::{Rig, at, source, wait};
 
 #[test]
 fn a_cursor_line_round_trips_and_a_bad_line_is_refused() {
@@ -297,15 +203,4 @@ async fn a_spawned_watcher_holds_the_halt_until_the_operator_clears_it() {
     assert!(halt::current().is_none());
     handle.join().await.unwrap();
     assert_eq!(rig.stored(), Some(at(52)));
-}
-
-async fn wait(what: &str, mut cond: impl FnMut() -> bool) {
-    kardamom_obs::testkit::poll_until(
-        what,
-        Duration::from_secs(10),
-        Duration::from_millis(5),
-        async || Ok(cond().then_some(())),
-    )
-    .await
-    .unwrap();
 }

@@ -352,6 +352,23 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(args[args.index('--l1-cursor-file') + 1], '/opt/kardamom/da-watcher/l1-cursor')
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_the_da_watcher_follows_the_sealer_boundaries(self):
+        # The watcher confirms its epochs by the sealer's boundaries, so it
+        # needs a cluster session: the [cluster] config and its own egress.
+        self.run_deploy(check=True)
+        group = self.api.state['plans']['da-watcher']['TaskGroups'][0]
+        task = group['Tasks'][0]
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--config') + 1], '/local/da-watcher.toml')
+        self.assertEqual(args[args.index('--cluster-egress-endpoint') + 1],
+                         '${meta.node_ip}:${NOMAD_HOST_PORT_egress}')
+        templates = {t['DestPath']: t['EmbeddedTmpl'] for t in task['Templates']}
+        self.assertIn('[cluster]', templates['local/da-watcher.toml'])
+        self.assertIn('sealer-0.node.consul', templates['local/da-watcher.toml'])
+        ports = [p['Label'] for n in group['Networks'] for p in n.get('DynamicPorts') or []]
+        self.assertIn('egress', ports)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
