@@ -27,7 +27,17 @@ final class ClusterTestHarness {
             final int memberCount,
             final int dedupCapacity,
             final long tickMs) {
-        final TestCluster cluster = TestCluster.aCluster()
+        return start(watcher, builder(memberCount, dedupCapacity, tickMs));
+    }
+
+    /**
+     * A TestCluster builder for {@code memberCount} static members that host
+     * {@link SealerTestService}. The caller can set more options before
+     * {@link #start}.
+     */
+    static TestCluster.Builder builder(
+            final int memberCount, final int dedupCapacity, final long tickMs) {
+        return TestCluster.aCluster()
                 .withStaticNodes(memberCount)
                 .withServiceSupplier(memberId ->
                         new TestNode.TestService[] {
@@ -36,8 +46,12 @@ final class ClusterTestHarness {
                             // services[0].index(). The default supplier sets it too.
                             (TestNode.TestService) new SealerTestService(
                                     dedupCapacity, tickMs, memberId).index(memberId)
-                        })
-                .start();
+                        });
+    }
+
+    /** Start the cluster from {@code builder} and register it with {@code watcher}. */
+    static TestCluster start(final SystemTestWatcher watcher, final TestCluster.Builder builder) {
+        final TestCluster cluster = builder.start();
         watcher.cluster(cluster);
         return cluster;
     }
