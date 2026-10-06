@@ -1,22 +1,18 @@
 use super::*;
 use alloy_sol_types::{SolCall, sol};
 
-sol! {
-    struct SolCb {
-        address target;
-        uint64 gasLimit;
-        bytes32 context;
-    }
+sol!(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "generated from the contract ABI: `MessageSent` carries 10 fields, fixed by \
+                  contracts/src/L2/Outbox.sol"
+    )]
+    IOutbox,
+    concat!(env!("CARGO_WORKSPACE_DIR"), "/contracts/abi/Outbox.json")
+);
 
-    function sendMessage(
-        uint64 destChainId,
-        address target,
-        uint64 gasLimit,
-        uint8 hops,
-        bytes data,
-        SolCb cb
-    );
-}
+use IOutbox::sendMessageCall;
+use XChain::Callback as SolCb;
 
 /// The hand-rolled `sendMessage` calldata must match `alloy-sol-types`
 /// byte for byte. Empty, sub-word, and word+1 payloads exercise the

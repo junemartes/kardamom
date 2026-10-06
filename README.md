@@ -203,6 +203,12 @@ The Solidity sources are in `contracts/`. Foundry (`forge`) builds them. See `co
 - CI compiles, tests and lints the contracts.
 - The Rust build scripts run `forge build` to embed or locate the artifacts.
 
+Rust `sol!` bindings read the committed ABIs in `contracts/abi/`, not a
+hand-written copy. After you change a contract's interface, run `just abi` and
+commit the result. CI runs `just abi-check`, which fails when the committed
+ABIs differ from a fresh build. Bytecode still comes from `contracts/out/`,
+which the deployer's build script fills.
+
 ## Testing
 
 Beyond `cargo test`, two suites answer different questions.

@@ -3,25 +3,13 @@ use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256};
 use alloy_sol_types::{SolCall, sol};
 use bytes::Bytes;
 
-sol! {
-    struct SolCb {
-        address target;
-        uint64 gasLimit;
-        bytes32 context;
-    }
+sol!(
+    IInbox,
+    concat!(env!("CARGO_WORKSPACE_DIR"), "/contracts/abi/Inbox.json")
+);
 
-    function deliver(
-        uint64 originChainId,
-        uint64 seq,
-        address originSender,
-        address target,
-        uint256 value,
-        uint64 gasLimit,
-        uint8 hops,
-        bytes data,
-        SolCb cb
-    );
-}
+use IInbox::deliverCall;
+use XChain::Callback as SolCb;
 
 const ORIGIN: u64 = 412_346;
 
