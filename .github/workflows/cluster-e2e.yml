@@ -151,8 +151,10 @@ jobs:
     # left five minutes of margin, and a slow runner cancelled a green
     # shard in its last stage. The chaos-l1 shard ends every case with
     # that audit and holds two adaptive freezes, so it runs about 65
-    # minutes. 90 keeps a real hang bounded.
-    timeout-minutes: 90
+    # minutes. The chaos-fleet shard ends with the sealer fleet wipe, two
+    # rebuilds from L1 and a seeded restart, and it runs about 92 minutes
+    # on a slow runner. 120 keeps a real hang bounded.
+    timeout-minutes: 120
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
