@@ -64,6 +64,18 @@ runs on a dedicated thread inside every service (`kardamom_obs::init`), so
 "wedged but alive" reads as `kardamom_service_up == 1` with stale gauges,
 not as node loss.
 
+Beside `/metrics`, the exporter serves `/ready` (the service's readiness
+rule over its own gauges) and `/halt` (the service's standing halt as JSON:
+the cause, the detail, the runbook, and whether it clears by itself). A
+halted service exports `kardamom_halt{cause, recovery} == 1`, and
+`POST /halt/clear` from the service's own node ends an operator halt. A
+paused service exports `kardamom_paused{reason, root_service, cause} == 1`;
+`POST /pause?note=<text>` and `POST /resume` from the service's own node
+pause and resume it. Every service also publishes its lifecycle on the
+`events` Aeron stream, and `kardamom_chainStatus` on an ingress returns all of
+them with their roots. See the "Halts" section of `docs/failure-modes.md` and
+`docs/runbooks/`.
+
 Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
 `local`). It's
 stamped on every emitted metric as the `host_id` label, alongside an automatic
@@ -95,8 +107,29 @@ its targets on the next deploy. Every metric is already labelled with
 ### Alerts
 
 `deploy/alerts.yml` holds the Prometheus alert rules. The monitoring job loads
-them as `rule_files`; firing alerts show on Prometheus's `/alerts` page. Check
-the rules with `promtool check rules deploy/alerts.yml`.
+them as `rule_files` and sends the firing alerts to the Alertmanager of the
+same allocation (port 9093 on the aux node, the `alertmanager` Consul
+service). Check the rules with `promtool check rules deploy/alerts.yml`.
+
+The rules of this file are the neutral ones: a fault the code reports as a
+counter. The operator of an environment keeps the tuned rules, the limits
+and the routing outside this repository, and gives them to the job through
+the Nomad variable `nomad/jobs/monitoring`:
+
+| Item | Content |
+| --- | --- |
+| `rules` | one Prometheus rule file, loaded next to `deploy/alerts.yml` |
+| `alertmanager` | the complete Alertmanager configuration, receivers included |
+
+```sh
+nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.yml
+```
+
+The job reads the variable with its workload identity, renders the two files
+and reloads Prometheus and Alertmanager in place (SIGHUP). Without the
+variable, Prometheus evaluates `deploy/alerts.yml` only, and Alertmanager
+routes every alert to a receiver that notifies nobody: the alerts show on
+its page and nowhere else.
 
 ### Rename map (historical — the metrics-namespace migration)
 

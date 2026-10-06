@@ -22,6 +22,105 @@ shared-nothing** (ingress, executor), **sharded with retry semantics**
 everything off the hot path is allowed to die and catch up (batcher,
 da-watcher) or die loudly (validator).
 
+## Halts
+
+A service that cannot continue safely **halts**: it stays up, keeps its state,
+serves its metrics and its query endpoints, makes no progress, fails its
+readiness check, and says why and what to do. It does not exit: an exit loses
+the cause and invites a restart against the same fault, which is how the
+staging incident of 2026-10 ran for two days. The halt is one shared type,
+`kardamom_obs::halt::Halt`:
+
+| field | meaning |
+|---|---|
+| `cause` | a stable id: the `cause` label of the gauge and the alert |
+| `detail` | the numbers: the block, the two hashes, the cursor and the floor |
+| `recovery` | the runbook id, `docs/runbooks/<id>.md`: the steps, in order |
+| `since` | when the halt was raised |
+| `clears` | `auto`: the service retries its cause on a backoff and resumes when it goes; `operator`: the service waits for `POST /halt/clear` after the runbook |
+
+What it drives: the gauge `kardamom_halt{service, cause, recovery}` is 1 while
+the halt stands; the `/halt` route beside `/metrics` and `/ready` serves the
+whole record as JSON; `/ready` answers 503 while halted, so a rolling deploy
+stops at a halted service; one Alertmanager rule per cause
+(`deploy/alerts.yml`), whose annotation names the cause, the `/halt` route of
+the instance, and the runbook. An operator halt clears with
+`curl -X POST http://127.0.0.1:<port>/halt/clear` on the service's node: the
+route accepts a loopback peer only, which is how the repository guards every
+admin action (there is no credential; placement is the guard). A unit test in
+`crates/obs` asserts every recovery id has a runbook and every cause an alert
+rule.
+
+| cause | service | clears | runbook |
+|---|---|---|---|
+| `l1_source_disagreement` | indexer, da-watcher (with two L1 sources) | auto | `docs/runbooks/l1_source_disagreement.md` |
+| `l1_chain_break` | indexer, da-watcher | auto | `docs/runbooks/l1_chain_break.md` |
+| `l1_unreachable` | batcher, indexer, da-watcher | auto | `docs/runbooks/l1_unreachable.md` |
+| `replay_unavailable` | batcher | operator | `docs/runbooks/replay_unavailable.md` |
+| `da_lag` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/da_lag.md` |
+| `sealer_no_quorum` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/sealer_no_quorum.md` |
+| `validator_divergence` | validator | operator | `docs/runbooks/validator_divergence.md` |
+
+`docs/runbooks/revert_to_posted_head.md` is the last resort the
+`replay_unavailable` runbook sends the operator to: no cause names it directly.
+The metrics ports of the deploy: batcher 9002, da-watcher 9005, ingress and
+validator 9006, l1-indexer 9009. The chaos cases assert the halt record, not
+only the log line (`da-lag-halt`, and the chain-semantics divergence drills).
+
+**Service events: halted, paused, resumed.** The services share their
+lifecycle state on the `events` Aeron stream (id 1019, best effort, RAM only;
+`kardamom_types::service::ServiceEvent`). `Halted` is the service's own fault
+and pages. `Paused` means the service waits on something outside itself: a
+root halt upstream, or an operator's pause (`POST /pause?note=...` and
+`POST /resume` on its exporter, loopback only). A paused service makes no
+progress, keeps its state, serves its metrics and queries, fails `/ready`, and
+resumes by itself when the root clears; it never pages. `Resumed` is published
+once on the way back. Every service publishes its state at once on a change
+and every 5 s; a record with no heartbeat for 15 s is `gone`. The sealer has
+no Rust runtime on the stream, so the ingress observes it on its cluster
+session and publishes it as `sealer/cluster`: `da_lag` from the status frame,
+`sealer_no_quorum` after 10 s without one.
+
+| root | reaction |
+|---|---|
+| the sealer has no quorum | the ingresses pause submits (typed error naming the root); the sequencers pause offering, from their own egress silence |
+| the sealer's DA-lag guard | the ingresses pause submits; the guard itself stays in the cluster log |
+| every executor halted | the ingresses pause submits; one executor halted changes nothing |
+| a validator divergence | the output attester pauses: no output root reaches L1 |
+| the batcher halted | the chain status shows it; the DA-lag guard enforces |
+| the da-watcher halted | the chain status shows deposits delayed |
+| the l1-indexer halted | `kardamom-reconstruct` refuses it (`indexer_halt` on its API; the indexer is not on the stream) |
+
+Nothing that changes the canonical order reads the stream: a lost event can
+delay a pause or a resume, never change the order. `kardamom_chainStatus` on an
+ingress returns the posted and sealed heads, the roots, the sealer, the
+ingress, and every service's latest state. A pause exports
+`kardamom_paused{reason, root_service, cause}` and fires the info alert
+`KardamomServicePaused`; the inhibit rule in `deploy/alertmanager-inhibit.yml`
+mutes it while the root's halt alert fires, so one incident pages once, with
+the root's runbook.
+
+**The DA-lag guard and the posted head.** The batcher publishes its confirmed
+cursor (the last L2 block on L1) on the cluster ingress as a system record
+(`KIND_POSTED_CURSOR`) at start and after every confirmed post. The sealer
+keeps it in its replicated state and refuses user records while
+`sealed_head - posted_head > DA_LAG_BUDGET_BLOCKS` (default 10,000; zero turns
+the guard off, in the open). Deposits and boundaries still enter. Every member
+takes the same decision: the cursor is in the log and the budget is shared
+configuration. The ingress halts the sealer's observed lifecycle on `da_lag`
+from the status frame the sealer fans out on every tick
+(`kardamom_halt{service="sealer", cause="da_lag"}`), pauses its own submits on
+that root, answers a refused submit with the typed JSON-RPC error
+`chain halted: da_lag at sealer (...)` (code -32010, `data.cause = "da_lag"`,
+`data.runbook`), and serves `safe` and `finalized` from the posted head
+(`kardamom_blockNumberByTag`; the batcher does not observe L1 finality today,
+so `finalized` is the posted head too). The same posted head is the floor of the
+sealer's egress retention: the window of `kardamom.cluster.retention` frames is
+a minimum, and a frame past it leaves only when its block is posted, so the
+batcher always replays from its cursor. The frames above the posted head ride
+the Raft snapshot, so a restored member keeps the floor. The guard bounds the
+stretched window to the budget's blocks plus one flush, in heap.
+
 ## Sealer — the Aeron Cluster (Raft)
 
 The ordering authority, and historically the hard SPOF: the old standalone
@@ -40,6 +139,13 @@ with three distinct, tested modes:
 - **Follower kill** (`cluster-follower-kill`) — quorum 2/3 holds; **zero
   stall** is asserted and the leader must be unchanged. The member restarts
   and rejoins.
+- **Member state loss** (`cluster-member-rejoin`, `node-replace-sealer`) — a
+  follower comes back with no Raft log. Before it starts, it copies the
+  latest snapshot, and the log after it, from a peer (an Aeron
+  ClusterBackup). It restores the snapshot and catches up from the leader.
+  A blank member starts at log position 0 only on the bootstrap of a new
+  cluster (`KARDAMOM_CLUSTER_BOOTSTRAP=1`). Without a peer, it waits and logs
+  `cluster SEED waiting-for-peer`.
 - **Quorum loss** (`cluster-quorum-loss-recover`) — two nodes killed: the
   pipeline **must stall** (the suite asserts the executor block gauge goes
   *flat* — progress without quorum would be unsafe, unreplicated ordering).
@@ -314,22 +420,20 @@ an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
 
-A divergence is a state, not a dead process. The validator writes its verdict
-to a `verdict` file beside its state before it exits, and mirrors it in the
-`validator_verdict_standing` gauge. A restart (a crash, a node loss, a deploy)
-that finds a standing verdict runs halted: the exporter serves, the gauge
-stays at 1, `/ready` fails, and the pipeline does not start. So a deploy never
-passes over a divergence, and the alert stays loud until an operator clears
-the file (`kardamom-validator --state-dir <dir> --clear-verdict`); the halted
-validator notices within seconds and resumes from its cursor.
-
-Exit codes keep the two halt classes distinguishable: **exit 2 is reserved
-for a proven divergence** (the latch records the reason before the engine
-surfaces it) — the page-the-humans signal. Every other engine failure — a
-stream error, or a replay-window overrun (`REPLAY_UNAVAILABLE`, the validator
-cursor aged out of the cluster's bounded retention) — exits 1: an
-availability problem, restartable, never to be confused with an integrity
-one.
+A divergence is a state, not a dead process. **A proven divergence is the
+`validator_divergence` halt** (the latch records the reason before the engine
+surfaces it). The validator writes its verdict to a `verdict` file beside its
+state and mirrors it in the `validator_verdict_standing` gauge. The process
+stays up, serves its metrics and the `/halt` record, fails `/ready`, and waits
+for the operator's clear after `docs/runbooks/validator_divergence.md`. A
+restart (a crash, a node loss, a deploy) that finds a standing verdict raises
+the same halt and waits again, so a deploy never passes over a divergence.
+Either clear ends both the halt and the file: `POST /halt/clear` on the node,
+or `kardamom-validator --state-dir <dir> --clear-verdict`. Then the validator
+runs the pipeline again from its cursor. Every other engine failure — a stream
+error, or a replay-window overrun (`REPLAY_UNAVAILABLE`, the validator cursor
+aged out of the cluster's bounded retention) — exits 1: an availability
+problem, restartable, never to be confused with an integrity one.
 
 A replay-window overrun self-repairs like the executor's recovery-D loop
 (#143): fetch a peer checkpoint at/above the retention floor from an
@@ -383,8 +487,16 @@ packed batch to L1 as it closes. A restart replays the canonical stream from
 its durable cursor — written only after a confirmed post — and skips blocks
 L1 already covers, so the failure mode is a growing L1-posting lag, not data
 loss and never a double post (the contract CAS rejects those loudly). Its
-real dependencies are one surviving state database and L1 gas/RPC health.
-See `docs/agents/batcher-live-l1-spec.md`.
+real dependencies are one surviving state database and L1 gas/RPC health,
+and both are halts, not exits. An L1 that does not answer at start or on
+every attempt of a post is the `l1_unreachable` halt (the batcher starts
+again after a backoff). A refused replay is first answered by the rebuild
+below. When the rebuild cannot fill the gap, the batcher holds the
+`replay_unavailable` halt (operator: recover the range from the spool or a
+surviving copy, or revert the chain). The sealer's retention never prunes
+below the batcher's published cursor (see Halts), so a refused replay means
+the range is below the posted head, never that the window passed. See
+`docs/agents/batcher-live-l1-spec.md`.
 
 **Retention is a latency, not a loss, while one state database and one
 archive survive.** The resume has three sources, in order:
@@ -413,8 +525,8 @@ archive survive.** The resume has three sources, in order:
    spool and the pending group, and resumes at the sealer's floor. The
    rebuilt range packs to the bytes the live path posts.
 
-A second refusal after the rebuild is a fail-stop, and so is a refusal
-without a query endpoint or without the refetch endpoints. A block that
+A second refusal after the rebuild is the `replay_unavailable` halt, and so
+is a refusal without a query endpoint or without the refetch endpoints. A block that
 carried a cross-chain message cannot be rebuilt this way: its remote-epoch
 record is in no archive, and the query endpoint refuses the block instead
 of answering a shorter list. Nothing is pruned below the posted head: the
@@ -449,6 +561,22 @@ end of the named block, where it retains them, and answers
 refusal routes the consumer into its repair path. A cold start sends the
 block end exactly; a reconnect inside an open block sends an index between
 the two ends; a start from genesis has no boundary to check.
+
+**A resume cursor ahead of the head is a refusal.** A sealer that lost its
+stream, for example in a total wipe, can come back behind its consumers. A
+consumer whose index or block is past the sealer's head applied records the
+sealer does not hold. The sealer answers `REPLAY_AHEAD` (egress kind 11),
+which carries its head, and logs `cluster REPLAY ... AHEAD
+head=(index,block)`. A `REPLAY_DONE` would let the consumer drop each new
+record below its cursor as a duplicate and diverge with no signal. The
+consumer checks the same rule on its side: a `REPLAY_DONE` whose head is
+below the delivery cursor also stops it. Both give `ClusterBehindCursor`.
+No repair path takes this error. The replay-unavailable repair fetches a
+peer checkpoint, but after a sealer wipe every peer is ahead of the head
+too, so a repair would only park the local state and loop. The executor,
+the validator and the batcher exit with status 1. The orchestrator restarts
+each one, and each restart stops at the same refusal
+until the sealer serves the stream again.
 
 **A lying or absent L1 endpoint.** The batcher's start reads the settlement
 contract: `lastBatchIndex`, and the `l2BlockEnd` the contract stores with
@@ -524,14 +652,23 @@ trie, the hashed mirror and the stored root removed, after the root check).
 The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
-which also gives the flag-day procedure for a wiped sealer set and the seed
-hook that would replace it.
+which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
+the seed a new sealer cluster starts from at the rebuilt head.
 
-Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
-skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
-events via the `da_watcher` path — interleaving them into the reconstruction is
-a documented follow-up, so a deposit-bearing range currently reconstructs its
-non-deposit state exactly and is flagged rather than silently diverging.
+Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
+absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
+would be an unverifiable claim. With `--lockbox`, the rebuild derives them from
+L1: when a block's L1 origin moves from M to N, the block leads with the epochs
+M+1..N, each derived from that L1 block's lockbox logs through `derive_epoch`,
+the rule the da-watcher and the validator use. Each epoch takes a marker slot
+and one slot per deposit at the head of its block, as on the live stream. The
+first step from origin 0 takes epoch N only: the da-watcher starts at the
+finalized block it first sees. A block whose items need more slots than its
+canonical range holds is refused. A smaller need is accepted, because a vacant
+slot (a voided entry or its void record) never reaches the payload; a missing
+deposit then shows as a root mismatch at `--expect-root`. Without `--lockbox`
+the rebuild leaves deposits out, and a chain with deposits rebuilds to a wrong
+root.
 
 **A gap in the record is loud.** Every case of the chaos-l1 shard ends with
 the persisted-state stage: the state at the validator's drained head is
@@ -549,7 +686,10 @@ name these assertions as deferred until then.
 
 Tick-based with an in-memory cursor: any RPC or publish error leaves the
 cursor unadvanced and the next tick retries the same `(cursor, tip]` range —
-at-least-once within a run. Duplicates after a retry or restart are absorbed
+at-least-once within a run. A block that does not descend from the published
+one raises the `l1_chain_break` halt, and an L1 that does not answer the
+`l1_unreachable` halt; both clear on the next good tick. The l1-indexer's
+follower halts the same way on its chain check. Duplicates after a retry or restart are absorbed
 downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
 deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
 by construction.
@@ -729,9 +869,6 @@ check would pass against a feature that activated once and stopped.
   CRC-verify + targeted-heal path (`archive-corruption` chaos case). Still
   open: `tx_ordering` archive re-replication (today it self-heals only via the
   Java cluster's Raft log replication on rejoin).
-- **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
-  transactions; re-deriving L1 deposits from `DepositInitiated` events and
-  interleaving them in canonical order is a follow-up.
 - **L1 outage** — the followers cross-check two L1 sources, and the
   batcher rebuilds a range the sealer no longer retains from the state
   databases' references and the `tx_data` archives (the batcher section).
@@ -747,7 +884,8 @@ check would pass against a feature that activated once and stopped.
 - ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
   suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
   onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
-  and asserts the documented fail-stop — the halting log line and exit 2.
+  and asserts the documented halt — the halting log line and the
+  `validator_divergence` halt record.
   (Lapse recovery is covered by `validator-lapse`.)
 - ~~**Withdrawals could never be attested**~~ — **FIXED** (found by the
   chain-semantics suite's S2 bridge round-trip). The validator's attester

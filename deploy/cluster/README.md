@@ -211,6 +211,17 @@ role smokes the ingress canary by its node address, promotes it, and only then
 replaces the old instances. `auto_revert` is on for those two stateless
 classes only.
 
+A new sealer cluster needs one bootstrap. A blank sealer member (no Raft
+recording log) starts at log position 0 only during the bootstrap. Every
+other blank member copies the latest snapshot from a peer before it starts,
+and it waits while no peer answers. Set `KARDAMOM_CLUSTER_BOOTSTRAP=1` for
+the first deploy of a new cluster. The role then writes the Nomad variable
+`nomad/jobs/cluster` while it registers the new cluster job, and deletes it
+when the deployment ends. The role ignores the flag when Nomad knows the
+job, so a re-deploy with the flag is safe. `just container-up` and the
+chaos bring-up set the flag. Do not set it when you register a purged job
+again for a cluster that holds state.
+
 A successful deploy records its manifest under `deployed/<env>/` (`KARDAMOM_ENV`,
 default `local`): `images.digests` is what runs, `images.digests.previous` is
 what it replaced. `just rollback <env>` deploys the previous one; it is a
@@ -489,16 +500,19 @@ are documented in `--help`.
 
 ## Monitoring
 
-The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus and
-Grafana on the aux node. Prometheus scrapes every service's metrics port by
-its Consul node name, rendered from the node-class counts; Grafana
+The `monitoring` job (`nomad/monitoring.nomad.hcl`) runs Prometheus,
+Alertmanager and Grafana on the aux node. Prometheus scrapes every
+service's metrics port by its Consul node name, rendered from the
+node-class counts, and sends the firing alerts to Alertmanager; Grafana
 provisions the Prometheus datasource by the `prometheus` Consul service and
 the dashboards from `deploy/grafana/provisioning/dashboards-json`, the one
 source for every profile. From the host, read the node contract for the
-aux node's address: Prometheus on port 9090, Grafana on port 3000
-(anonymous viewer; admin `admin` with the `grafana_admin_password` job
-variable, `kardamom` on the local profile). The autoscaler's Prometheus APM
-reads the same service.
+aux node's address: Prometheus on port 9090, Alertmanager on port 9093,
+Grafana on port 3000 (anonymous viewer; admin `admin` with the
+`grafana_admin_password` job variable, `kardamom` on the local profile).
+The autoscaler's Prometheus APM reads the same service. The operator's
+rules and the Alertmanager routing come from the Nomad variable
+`nomad/jobs/monitoring` (`docs/observability.md`, "Alerts").
 
 ## Sustained-load + chaos suite
 

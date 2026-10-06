@@ -42,8 +42,9 @@
 //!   receipts plus slim boundaries (not recorded). The executor
 //!   publishes; the ingress, sequencers, and validators subscribe.
 //! - `TxErrors`, `TxStatus`, `TxDeposits`, `TxRemoteEpochs`,
-//!   `FsyncWatermark` publisher/subscriber pairs: one stream each (see
-//!   `handles::simple`).
+//!   `ServiceEvents`, `FsyncWatermark` publisher/subscriber pairs: one
+//!   stream each (see `handles::simple`). The `ServiceEvents` pair also
+//!   spawns the beacon and the board of `kardamom_obs::events`.
 //!
 //! This module has an unconditional dependency on rusteron.
 //!
@@ -53,6 +54,8 @@
 //!   [`PubHandle`].
 //! - `thread`: the dedicated Aeron thread's poll loop and its
 //!   publication/subscription tables.
+//! - `bound`: the read of the control address the driver bound for a
+//!   dynamic MDC publication on port 0.
 //! - `pending`: the parked-publish retry scheduler ([`IdleBackoff`],
 //!   `drain_pending`) and its unit tests.
 //! - `handles`: the typed per-channel publisher/subscriber handle pairs.
@@ -60,16 +63,17 @@
 //! Everything public is re-exported here. Downstream imports are always
 //! `kardamom_log::aeron_live::<Name>`.
 
+mod bound;
 mod handles;
 mod pending;
 mod runtime;
 mod thread;
 
 pub use handles::simple::{
-    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, TxDepositsPublisherHandle,
-    TxDepositsSubscriberHandle, TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
-    TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
-    TxStatusSubscriberHandle,
+    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, ServiceEventsPublisherHandle,
+    ServiceEventsSubscriberHandle, TxDepositsPublisherHandle, TxDepositsSubscriberHandle,
+    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{
@@ -150,6 +154,17 @@ impl FrameSink {
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the Aeron thread waits for the control address the driver
+/// bound, after a dynamic MDC publication opens. The open and this wait
+/// together stay below [`ACK_TIMEOUT`], so the open ack always arrives
+/// before the caller gives up.
+const BIND_TIMEOUT: Duration = Duration::from_secs(2);
+
+const _: () = assert!(
+    ADD_PUB_TIMEOUT.as_millis() + BIND_TIMEOUT.as_millis() < ACK_TIMEOUT.as_millis(),
+    "an MDC publication open must finish before its ack times out"
+);
 
 /// How long a command round trip ([`runtime`]'s `request`) waits for the
 /// Aeron thread's ack. This covers control-plane opens and

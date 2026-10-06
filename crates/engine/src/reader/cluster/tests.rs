@@ -106,6 +106,82 @@ fn replay_unavailable_is_fatal() {
     ));
 }
 
+/// A head below the delivery cursor means the sealer lost records that
+/// this consumer applied. The consumer stops, instead of dropping each new
+/// record below its cursor.
+#[test]
+fn replay_done_below_the_cursor_is_fatal() {
+    let behind = |up_to_index, up_to_block| {
+        let egress = FakeEgress::new();
+        egress.push(wire::encode_replay_done(up_to_index, up_to_block));
+        egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
+        egress.close();
+        ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3)).next()
+    };
+    assert!(matches!(
+        behind(0, 1),
+        Err(ExecutorError::ClusterBehindCursor {
+            next_index: 5,
+            next_block: 3,
+            head_index: 0,
+            head_block: 1,
+        })
+    ));
+    assert!(matches!(
+        behind(5, 2),
+        Err(ExecutorError::ClusterBehindCursor { head_block: 2, .. })
+    ));
+}
+
+/// The sealer's `REPLAY_AHEAD` refusal stops the consumer with the head
+/// in the error. No repair starts: the replay-refused fallback does not
+/// take this error, so it fetches no checkpoint and parks no state.
+#[test]
+fn replay_ahead_is_fatal_and_starts_no_repair() {
+    let egress = FakeEgress::new();
+    egress.push(wire::encode_replay_ahead(0, 1));
+    egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
+    egress.close();
+    let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3));
+    let err = sub.next().unwrap_err();
+    assert!(matches!(
+        err,
+        ExecutorError::ClusterBehindCursor {
+            next_index: 5,
+            next_block: 3,
+            head_index: 0,
+            head_block: 1,
+        }
+    ));
+
+    let state_dir = tempfile::tempdir().unwrap();
+    std::fs::write(state_dir.path().join("mdbx.dat"), b"state").unwrap();
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let repaired = crate::bin_support::replay_unavailable_fallback(
+        Some(&err),
+        Some(checkpoint_dir.path()),
+        &["127.0.0.1:1".to_string()],
+        state_dir.path(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(repaired, None, "no resync outcome");
+    assert!(!state_dir.path().join("stale").exists(), "no state parked");
+    assert!(state_dir.path().join("mdbx.dat").exists());
+}
+
+/// A head at the delivery cursor ends the replay with nothing to deliver.
+#[test]
+fn replay_done_at_the_cursor_ends_the_catch_up() {
+    let egress = FakeEgress::new();
+    egress.push(wire::encode_replay_done(5, 3));
+    egress.push(encode_egress_record(5, &relayed_txref(1, 5)).unwrap());
+    egress.close();
+    let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3));
+    assert_eq!(label(sub.next().unwrap()), "r5");
+}
+
 #[test]
 fn resume_cursor_skips_already_applied_range() {
     // Consumer resumes at (records=3, next block=2). Replayed frames below
@@ -205,4 +281,43 @@ fn malformed_frame_is_skipped_not_fatal() {
     // The malformed frame is skipped. The next good frame is returned.
     let (_pos, msg) = sub.next().unwrap();
     assert!(matches!(msg, TxOrderingMessage::BoundaryStart(_)));
+}
+
+/// The batcher's cursor is one system record on the session's ingress:
+/// kind 7, then the posted head. The sealer reads it by fixed offsets.
+#[test]
+fn the_posted_cursor_publisher_offers_the_kind_7_record() {
+    use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
+
+    let ingress = FakeIngress::new();
+    let sub = ClusterTxOrderingSubscription::new(FakeEgress::new()).with_ingress(ingress.clone());
+    let mut publisher = sub.posted_cursor_publisher();
+    assert_eq!(publisher.publish(0x0102), OfferOutcome::Accepted);
+    assert_eq!(
+        ingress.accepted(),
+        vec![vec![7u8, 0x02, 0x01, 0, 0, 0, 0, 0, 0]],
+        "kind 7, then the head as u64 LE"
+    );
+    ingress.set_outcome(OfferOutcome::NotConnected);
+    assert_eq!(publisher.publish(3), OfferOutcome::NotConnected);
+}
+
+/// The status and the DA-lag reject are not records of the ordering: a
+/// consumer skips them and delivers the stream around them.
+#[test]
+fn status_and_da_lag_frames_are_skipped() {
+    use kardamom_cluster_adapter::wire::{encode_da_lag_reject, encode_status};
+
+    let egress = FakeEgress::new();
+    egress.push(encode_status(&kardamom_types::ClusterStatus::default()));
+    egress.push(encode_da_lag_reject(
+        alloy_primitives::Address::ZERO,
+        0,
+        &kardamom_types::ClusterStatus::default(),
+    ));
+    egress.push(encode_egress_record(0, &relayed_txref(0, 1)).unwrap());
+    egress.push(encode_egress_boundary(1, 1, 250, 0));
+    let mut sub = ClusterTxOrderingSubscription::new(egress);
+    assert_eq!(label(sub.next().unwrap()), "r0");
+    assert_eq!(label(sub.next().unwrap()), "b1");
 }

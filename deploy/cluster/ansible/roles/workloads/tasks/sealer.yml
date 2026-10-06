@@ -16,6 +16,17 @@
     workloads_sealer_new: "{{ workloads_job_definition }}"
     workloads_sealer_diff: "{{ workloads_plan.json.Diff.Type }}"
 
+# The bootstrap opens only for a job that Nomad does not know: the blank
+# members of a registered cluster seed from their peers. Nomad does not
+# know a purged job either, so a purged cluster is re-registered without
+# the flag.
+- name: Decide the cluster bootstrap
+  ansible.builtin.set_fact:
+    workloads_sealer_bootstrap: >-
+      {{ workloads_cluster_bootstrap | bool
+         and workloads_sealer_diff == 'Added'
+         and not ansible_check_mode }}
+
 - name: Read the registered sealer
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/cluster?namespace={{ workloads_namespace | urlencode }}"
@@ -31,13 +42,42 @@
          and (workloads_sealer_current.json.TaskGroups | map(attribute='Name')
               | select('match', '^cluster-') | list | length > 0) }}
 
+# The bootstrap variable lives only while the new cluster comes up: the
+# job renders it into each member's bootstrap file (cluster.nomad.hcl).
+# The role deletes it after the deployment, also when the deployment
+# fails, so no later start of a blank member reads it.
 - name: Register the sealer in one step
-  ansible.builtin.include_tasks: job.yml
-  vars:
-    workloads_job: "{{ workloads_sealer_job }}"
   when:
     - workloads_sealer_diff != 'None'
     - not workloads_sealer_staged | bool
+  block:
+    - name: Open the cluster bootstrap
+      ansible.builtin.uri:
+        url: "{{ workloads_nomad_addr }}/v1/var/nomad/jobs/cluster?namespace={{ workloads_namespace | urlencode }}"
+        method: PUT
+        headers:
+          X-Nomad-Token: "{{ workloads_nomad_token }}"
+        body_format: json
+        body:
+          Namespace: "{{ workloads_namespace }}"
+          Path: nomad/jobs/cluster
+          Items:
+            bootstrap: "true"
+      when: workloads_sealer_bootstrap | bool
+
+    - name: Register the sealer
+      ansible.builtin.include_tasks: job.yml
+      vars:
+        workloads_job: "{{ workloads_sealer_job }}"
+  always:
+    - name: Close the cluster bootstrap
+      ansible.builtin.uri:
+        url: "{{ workloads_nomad_addr }}/v1/var/nomad/jobs/cluster?namespace={{ workloads_namespace | urlencode }}"
+        method: DELETE
+        headers:
+          X-Nomad-Token: "{{ workloads_nomad_token }}"
+        status_code: [200, 204]
+      when: workloads_sealer_bootstrap | bool
 
 - name: Order the members for the staged roll
   ansible.builtin.include_tasks: sealer_order.yml

@@ -57,6 +57,18 @@ variable "cluster_inclusion_horizon_blocks" {
   default = "64"
 }
 
+# The DA-lag budget (-Dkardamom.cluster.daLagBudgetBlocks): how far the
+# sealed head may run past the last block the batcher posted to L1 before
+# the sealer refuses new transactions, and the bound of the egress
+# retention above the posted head. Every member must agree. Zero turns
+# the guard off: a chain that would rather stay live and risk the loss of
+# the unposted blocks sets it here, in the open. Ansible deployment
+# passes -var from KARDAMOM_DA_LAG_BUDGET_BLOCKS.
+variable "cluster_da_lag_budget_blocks" {
+  type    = string
+  default = "10000"
+}
+
 # Priority fees, "on" or "off" (-Dkardamom.cluster.orderingWindow). The deploy sets every job's
 # fee setting from one value, PRIORITY_FEES, so the sequencer's tip, the
 # sealer's ordering window, and the executor's fee schedule cannot
@@ -257,6 +269,26 @@ job "cluster" {
           }
         }
 
+        # The bootstrap flag of a new cluster. A blank member (no recording
+        # log) starts at log position 0 only when this file reads "true";
+        # every other blank member copies the latest snapshot from a peer
+        # first (ClusterNode, StartMode). The file is "true" while the Nomad
+        # variable nomad/jobs/cluster exists. Only the bootstrap deploy of
+        # the workloads role (KARDAMOM_CLUSTER_BOOTSTRAP=1 on a job that
+        # Nomad does not know yet) writes that variable, and the role
+        # deletes it when the new cluster is up. The member reads the file
+        # at each start, not an env var: Nomad keeps the env of a task
+        # across a restart in place, but it renders this file again when
+        # the variable goes. The change mode is noop: the deletion must not
+        # restart a running member.
+        template {
+          destination = "local/bootstrap"
+          change_mode = "noop"
+          data        = <<-EOT
+          {{- range nomadVarList "nomad/jobs/cluster" }}{{ if eq .Path "nomad/jobs/cluster" }}true{{ end }}{{ end }}
+          EOT
+        }
+
         # These are JVM options for the image ENTRYPOINT
         # (java -Xmx384m -cp ... ClusterNode). They must go through env,
         # not docker `args`. docker `args` land after the main class, so
@@ -271,7 +303,7 @@ job "cluster" {
         # the same value as the shared driver (aeron.system.nomad.hcl),
         # below the 1400-byte path of a Hetzner vSwitch VLAN.
         env {
-          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_remote_origins} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
         }
 
         config {

@@ -76,4 +76,14 @@ pub enum TxErrorReason {
     /// worst case the transaction can be charged: the fee cap on every
     /// gas unit plus the value.
     InsufficientFunds { have: u128, want: u128 },
+    /// The sealer refused the offer because the chain is halted on a DA
+    /// lag: the sealed head is more than `budget_blocks` past the last
+    /// block posted to L1. The transaction is not ordered. The client
+    /// resubmits once the batcher posts again; the ingress `/halt` route
+    /// names the cause and the runbook.
+    DaLag {
+        sealed_head: u64,
+        posted_head: u64,
+        budget_blocks: u64,
+    },
 }

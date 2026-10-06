@@ -12,7 +12,7 @@
 //! - [`registration`]: bind, register, heartbeat, deregister.
 //! - [`watch`]: the blocking-query loop and its membership snapshots.
 //! - [`reconcile`]: membership snapshots to attach and detach calls.
-//! - [`endpoint`]: the advertised address, ports, and URIs.
+//! - [`endpoint`]: the advertised address and the URIs.
 
 mod absence;
 pub mod catalog;
@@ -27,10 +27,7 @@ pub mod registration;
 pub mod watch;
 
 pub use catalog::{Catalog, Query, QueryResult, RegistrationSpec};
-pub use endpoint::{
-    MANUAL_SUBSCRIPTION_URI, PortAllocator, PortRange, advertise_ip, destination_uri,
-    publication_uri,
-};
+pub use endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, destination_uri, publication_uri};
 pub use plane::{DiscoveredPublisher, DiscoveredSubscriber, StreamPlane};
 pub use reconcile::{DestinationPort, Plan, Reconciler};
 pub use record::{
@@ -45,34 +42,23 @@ use crate::config::DiscoveryConfig;
 use crate::error::LogError;
 
 /// The allocation-scoped identity Nomad supplies: the instance id that
-/// makes every service id unique per process incarnation, and the UDP
-/// port range the publications bind.
+/// makes every service id unique per process incarnation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Instance {
     pub id: String,
-    pub ports: Option<PortRange>,
 }
 
 impl Instance {
-    /// Read `NOMAD_ALLOC_ID` and `KARDAMOM_MDC_PORTS`. Without an
-    /// allocation id (a local run), the id derives from the process id and
-    /// the clock, which is unique enough for one host.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `KARDAMOM_MDC_PORTS` is set and malformed.
-    pub fn from_env() -> Result<Self, LogError> {
+    /// Read `NOMAD_ALLOC_ID`. Without an allocation id (a local run), the
+    /// id derives from the process id and the clock, which is unique
+    /// enough for one host.
+    #[must_use]
+    pub fn from_env() -> Self {
         let id = std::env::var("NOMAD_ALLOC_ID")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(Self::local_id);
-        let ports = std::env::var("KARDAMOM_MDC_PORTS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<PortRange>())
-            .transpose()
-            .map_err(|e| LogError::Discovery(format!("KARDAMOM_MDC_PORTS: {e}")))?;
-        Ok(Self { id, ports })
+        Self { id }
     }
 
     fn local_id() -> String {

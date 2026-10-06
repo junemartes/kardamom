@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import static io.kardamom.sealer.cluster.ClusterTestHarness.awaitCondition;
 import static io.kardamom.sealer.cluster.IngressFrames.canonicalId;
 import static io.kardamom.sealer.cluster.IngressFrames.offerIngress;
+import static io.kardamom.sealer.cluster.IngressFrames.offerPostedCursor;
 import static io.kardamom.sealer.cluster.IngressFrames.offerReplayRequest;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -170,7 +171,9 @@ class SealerReplayTest {
     @Test
     @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
     void evictedRangeIsRefusedHonestly() {
-        // Use a tiny retention: after K records and boundaries, genesis is evicted.
+        // Use a tiny retention: after K records and boundaries, genesis is
+        // evicted once the batcher posts past it. A frame of an unposted
+        // block never leaves the window, so the cursor comes first.
         System.setProperty("kardamom.cluster.retention", "3");
         try (TestCluster cluster = startCluster()) {
         cluster.awaitLeader();
@@ -181,7 +184,9 @@ class SealerReplayTest {
         for (int i = 0; i < K; i++) {
             offerIngress(client, canonicalId(i));
         }
-        awaitCondition(client, () -> liveEgress.relayedIndexes.size() >= K);
+        awaitCondition(client, () ->
+                liveEgress.relayedIndexes.size() >= K && liveEgress.boundaryCount > 0);
+        offerPostedCursor(client, liveEgress.maxBoundaryBlockNumber);
 
         final AeronCluster reconnected = cluster.reconnectClient();
 
