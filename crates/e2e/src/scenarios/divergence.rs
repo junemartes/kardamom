@@ -125,16 +125,20 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
     let l1 = stack.l1().context("S11 needs an L1 (l1: true)")?;
 
     // Freeze the honest producer, so its epoch for this L1 block cannot race
-    // the forgery. Then forge one origin past where the chain has reached
-    // (the sealer only accepts an advancing origin).
+    // the forgery. Then forge the next origin after the one the chain holds:
+    // the sealer accepts only the epoch of `l1_origin + 1`, and refuses any
+    // other as an origin gap.
     anyhow::ensure!(
         stack.suspend_da_watcher(),
         "S11 needs a DA watcher (l1: true)"
     );
-    let tip = l1.finalized_block_number().await?;
-    let forged_at = tip
-        .checked_add(50)
-        .context("L1 finalized block number is implausibly close to u64::MAX")?;
+    let state_dir = stack
+        .executor_state_dir()
+        .context("S11 reads the chain's origin from the executor's state")?;
+    let forged_at = settled_origin(&state_dir)
+        .await?
+        .checked_add(1)
+        .context("the chain's L1 origin is implausibly close to u64::MAX")?;
     crate::harness::inject::publish_forged_epoch(&stack.aeron_dir(), forged_at).await?;
 
     // The verdict is deferred by one epoch on purpose, because the L1 read
@@ -162,6 +166,33 @@ pub async fn forged_epoch_halts_validator(stack: &mut LocalStack, t: &Target) ->
         "validator halted but not on an epoch fault — halted for another reason"
     );
     Ok(())
+}
+
+/// The chain's L1 origin once it holds still for two reads, two seconds
+/// apart: the sealer ordered every epoch the suspended watcher published.
+///
+/// # Errors
+/// Returns an error when the headers cannot be read, or when the origin
+/// still moves after 30 seconds.
+async fn settled_origin(state_dir: &std::path::Path) -> Result<u64> {
+    let origin = || -> Result<u64> {
+        Ok(super::derivation::read_block_origins(state_dir)?
+            .last()
+            .map_or(0, |b| b.l1_origin))
+    };
+    let mut last = origin()?;
+    poll_until(
+        "the chain's L1 origin holds still",
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+        async || {
+            let now = origin()?;
+            let settled = (now == last).then_some(now);
+            last = now;
+            Ok(settled)
+        },
+    )
+    .await
 }
 
 /// The validator reads L1 through an interposed endpoint, and

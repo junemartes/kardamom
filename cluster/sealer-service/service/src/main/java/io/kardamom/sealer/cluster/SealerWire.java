@@ -281,6 +281,15 @@ public final class SealerWire {
      * batcher posts again.
      */
     public static final byte EGRESS_KIND_DA_LAG_REJECT = 10;
+    /**
+     * The sealer refused an origin record that skips an L1 block:
+     * {@code [kind:12][offered_origin:u64 LE][expected_origin:u64 LE]}.
+     * Offered only to the offering session. The record is not ordered, and
+     * its id does not enter the dedup window. The sequencer offers its
+     * unconfirmed epochs again, from {@code expected_origin}, in order.
+     * Matches Rust {@code EGRESS_KIND_ORIGIN_GAP}.
+     */
+    public static final byte EGRESS_KIND_ORIGIN_GAP = 12;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

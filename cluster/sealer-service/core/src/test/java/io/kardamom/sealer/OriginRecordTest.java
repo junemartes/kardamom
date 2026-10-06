@@ -26,7 +26,7 @@ class OriginRecordTest {
         state.onRecord(id(1), payload("tx"));
 
         Optional<OriginAdvance> advance =
-                state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 1_000L);
+                state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 1_000L).advance;
 
         assertTrue(advance.isPresent());
         Boundary forced = advance.get().forcedBoundary().orElseThrow();
@@ -47,7 +47,7 @@ class OriginRecordTest {
         CanonicalSealerState state = new CanonicalSealerState(8);
 
         Optional<OriginAdvance> advance =
-                state.onOriginRecord(id(1), 100L, 1L, payload("epoch-100"), 1_000L);
+                state.onOriginRecord(id(1), 100L, 1L, payload("epoch-100"), 1_000L).advance;
 
         assertTrue(advance.isPresent());
         assertTrue(
@@ -62,9 +62,9 @@ class OriginRecordTest {
         CanonicalSealerState state = new CanonicalSealerState(8);
 
         // This is a catch-up burst: three epochs with no L2 traffic between them.
-        Optional<OriginAdvance> a = state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
-        Optional<OriginAdvance> b = state.onOriginRecord(id(2), 101L, 1L, payload("e101"), 1_000L);
-        Optional<OriginAdvance> c = state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L);
+        Optional<OriginAdvance> a = state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L).advance;
+        Optional<OriginAdvance> b = state.onOriginRecord(id(2), 101L, 1L, payload("e101"), 1_000L).advance;
+        Optional<OriginAdvance> c = state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L).advance;
 
         assertTrue(a.orElseThrow().forcedBoundary().isEmpty(), "nothing open yet");
         // b and c each close the block that its predecessor opened.
@@ -89,7 +89,7 @@ class OriginRecordTest {
         // If a non-advancing origin were treated as a fault, the state would
         // reject every sequencer except the first.
         Optional<OriginAdvance> dup =
-                state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 2_000L);
+                state.onOriginRecord(id(2), 100L, 1L, payload("epoch-100"), 2_000L).advance;
 
         assertTrue(dup.isEmpty(), "duplicate epoch is dropped");
         assertEquals(blockAfterFirst, state.blockNumber(), "no block sealed");
@@ -120,7 +120,7 @@ class OriginRecordTest {
         Boundary tick = state.onTick(1_000L);
         state.onRecord(id(1), payload("tx"));
         Boundary forced =
-                state.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_010L)
+                state.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_010L).advance
                         .orElseThrow()
                         .forcedBoundary()
                         .orElseThrow();
@@ -200,8 +200,8 @@ class OriginRecordTest {
         assertEquals(block, fromV2.blockNumber());
 
         // Both states adopt an origin normally from there.
-        assertTrue(fromV1.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).isPresent());
-        assertTrue(fromV2.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).isPresent());
+        assertTrue(fromV1.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).advance.isPresent());
+        assertTrue(fromV2.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_500L).advance.isPresent());
     }
 
     @Test
@@ -211,7 +211,7 @@ class OriginRecordTest {
 
         // The marker plus 3 deposits use 4 slots. The relay uses the first slot.
         Optional<OriginAdvance> advance =
-                state.onOriginRecord(id(2), 100L, 4L, payload("e100"), 1_000L);
+                state.onOriginRecord(id(2), 100L, 4L, payload("e100"), 1_000L).advance;
 
         assertEquals(1L, advance.orElseThrow().relayed().index);
         assertEquals(5L, state.canonicalCount(), "range is consumed, not just the marker");
@@ -246,7 +246,7 @@ class OriginRecordTest {
             for (int sequencer = 0; sequencer < 3; sequencer++) {
                 // Three sequencers send the same epoch id with the same declared origin.
                 Optional<OriginAdvance> r =
-                        state.onOriginRecord(id(epoch), origin, 1L, payload("e" + epoch), 1_000L);
+                        state.onOriginRecord(id(epoch), origin, 1L, payload("e" + epoch), 1_000L).advance;
                 assertEquals(
                         sequencer == 0,
                         r.isPresent(),
@@ -255,5 +255,86 @@ class OriginRecordTest {
             assertEquals(origin, state.l1Origin());
         }
         assertEquals(3L, state.canonicalCount(), "three epochs ordered, not nine");
+    }
+
+    /// An epoch that skips an L1 block would drop the deposits of the
+    /// skipped block for good. The state refuses it, names the origin it
+    /// expects, and moves nothing.
+    @Test
+    void an_origin_gap_is_refused_with_the_expected_origin() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onRecord(id(1), payload("tx"));
+        state.onOriginRecord(id(2), 100L, 1L, payload("e100"), 1_000L);
+        long block = state.blockNumber();
+        long count = state.canonicalCount();
+
+        OriginOutcome gap = state.onOriginRecord(id(4), 102L, 3L, payload("e102"), 1_100L);
+
+        assertTrue(gap.gap, "N + 2 after N is a gap");
+        assertEquals(101L, gap.expectedOrigin);
+        assertTrue(gap.advance.isEmpty(), "nothing is relayed");
+        assertEquals(100L, state.l1Origin(), "origin unmoved");
+        assertEquals(count, state.canonicalCount(), "no slot consumed");
+        assertEquals(block, state.blockNumber(), "no block sealed");
+    }
+
+    /// The refused id stays out of the dedup window. Otherwise the offer
+    /// again after the missing epoch would be absorbed as a duplicate, and
+    /// the gap would only move one block on.
+    @Test
+    void the_refused_epoch_is_accepted_after_the_missing_one() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
+        assertTrue(state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L).gap);
+        assertTrue(state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L).gap,
+                "a second offer of the gap is refused the same way");
+
+        assertTrue(state.onOriginRecord(id(2), 101L, 1L, payload("e101"), 1_000L).advance.isPresent());
+        OriginOutcome late = state.onOriginRecord(id(3), 102L, 1L, payload("e102"), 1_000L);
+
+        assertFalse(late.gap);
+        assertTrue(late.advance.isPresent(), "the refused id was never deduped");
+        assertEquals(102L, state.l1Origin());
+        assertEquals(3L, state.canonicalCount());
+    }
+
+    /// At genesis the state holds no origin, and the producer starts at the
+    /// L1 block it first sees. So any first origin is accepted.
+    @Test
+    void the_first_epoch_after_genesis_may_start_anywhere() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+
+        OriginOutcome first = state.onOriginRecord(id(1), 9_000L, 1L, payload("e9000"), 1_000L);
+
+        assertFalse(first.gap);
+        assertTrue(first.advance.isPresent());
+        assertEquals(9_000L, state.l1Origin());
+    }
+
+    /// A duplicate is absorbed before the gap check. A racing sequencer's
+    /// late copy of an ordered epoch is not a gap.
+    @Test
+    void a_duplicate_is_not_read_as_a_gap() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
+        state.onOriginRecord(id(2), 101L, 1L, payload("e101"), 1_000L);
+
+        OriginOutcome dup = state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
+
+        assertFalse(dup.gap);
+        assertTrue(dup.advance.isEmpty());
+    }
+
+    /// The gap check reads only the origin, which the snapshot carries. So
+    /// a restored member refuses the same gap as the member it copies.
+    @Test
+    void a_restored_state_refuses_the_same_gap() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onOriginRecord(id(1), 100L, 1L, payload("e100"), 1_000L);
+
+        CanonicalSealerState restored = CanonicalSealerState.load(state.takeSnapshot(), 8);
+
+        assertEquals(101L, restored.onOriginRecord(id(3), 105L, 1L, payload("e105"), 2_000L).expectedOrigin);
+        assertTrue(restored.onOriginRecord(id(3), 105L, 1L, payload("e105"), 2_000L).gap);
     }
 }

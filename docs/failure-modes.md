@@ -60,11 +60,12 @@ rule.
 | `da_lag` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/da_lag.md` |
 | `sealer_no_quorum` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/sealer_no_quorum.md` |
 | `validator_divergence` | validator | operator | `docs/runbooks/validator_divergence.md` |
+| `origin_gap` | sequencer | auto | `docs/runbooks/origin_gap.md` |
 
 `docs/runbooks/revert_to_posted_head.md` is the last resort the
 `replay_unavailable` runbook sends the operator to: no cause names it directly.
 The metrics ports of the deploy: batcher 9002, da-watcher 9005, ingress and
-validator 9006, l1-indexer 9009. The chaos cases assert the halt record, not
+validator 9006, l1-indexer 9009, sequencer 9001 + 10 × lane. The chaos cases assert the halt record, not
 only the log line (`da-lag-halt`, and the chain-semantics divergence drills).
 
 **Service events: halted, paused, resumed.** The services share their
@@ -161,6 +162,20 @@ with three distinct, tested modes:
   What this does not cover: all three members *wiped*. No in-cluster copy
   is left; the members start from a seed rebuilt from L1 (the sealer fleet
   rebuild below).
+- **An epoch lost in a leader change** (`OriginGapClusterTest`) — cluster
+  ingress is at-most-once across a leader kill or a quorum loss: an offer
+  that the ingress publication accepted can still be lost, and the
+  da-watcher publishes each epoch once. Once the sealer holds an L1 origin,
+  it accepts only the epoch of L1 block `l1_origin + 1`. It answers any other
+  epoch with an `ORIGIN_GAP` reject (egress kind 12) that names the expected
+  block, to the offering session only, and logs `cluster ORIGIN-GAP`. The
+  check reads only replicated state, so every member refuses the same epoch.
+  The sequencer keeps every epoch it relayed until a boundary carries its L1
+  block, and on the reject it offers its epochs again from the expected
+  block, in order; the dedup absorbs the copies. A lost epoch delays deposits
+  by one round trip, and it is never sealed over. The first epoch at genesis,
+  or after a seed with origin 0, may start at any L1 block; after a seed with
+  origin M, the next epoch is M + 1.
 
 - **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
   persistence; the executors' state is the truth. The whole redis job
@@ -405,6 +420,16 @@ first-seen dedup keeps one.
 - **Backpressure, not loss** — a refused cluster offer maps to
   `SequencerError::Backpressure` and the rewind/retry path; the failure mode
   is latency, never a dropped record.
+- **Epoch relay** — an accepted offer is not an ordered epoch. The epoch lane
+  keeps every epoch until a boundary's `l1_origin` reaches its L1 block, at
+  most 4096 epochs (13.6 hours of L1; the gauge
+  `kardamom_sequencer_epochs_unconfirmed`). On an `ORIGIN_GAP` reject
+  (`kardamom_sequencer_origin_gap_total`) it offers the epochs again from the
+  expected block. A replica that does not hold the expected epoch (it
+  restarted after the da-watcher published it), or whose queue is full,
+  stops its epoch lane, never skips, and raises the `origin_gap` halt; a twin
+  that holds the epoch fills the gap, and the halt clears. Transactions
+  continue meanwhile.
 - **Racing duplicates are the design** — deduped by the cluster's first-seen
   window on the 32-byte `canonical_id`, with per-sender nonce order preserved
   (per-session order + identical per-replica streams); pinned by
@@ -713,12 +738,12 @@ publishes past the new stream:
 | A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
 | The batcher's spool | It continues the confirmed cursor, so the batcher posts reverted blocks. |
 | The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
-| A running da-watcher | It continues at its own cursor, past M. The epochs between M and that cursor never reach the new chain, and their deposits are lost. |
+| A running da-watcher | It continues at its own cursor, past M. The sealer refuses its epochs as an origin gap, and deposits stop until it restarts with `--l1-resume-after M`. |
 
 The da-watcher seeds its cursor at the finalized tip on every start. That
 skips no epoch on a running chain only when the tip did not move while it was
 down. After a seed, the chain's origin is M, far behind the tip, so the flag is
-required. A da-watcher that restarts later with a stale flag sends epochs at
+required: the seeded sealer accepts only the epoch of M + 1 next. A da-watcher that restarts later with a stale flag sends epochs at
 or below the sealer's origin; the sealer drops each one as a regression.
 
 The validator resumes on a rebuilt state that keeps the trie, with no step of
@@ -738,7 +763,12 @@ between the two are not collected again.
 
 Tick-based with an in-memory cursor: any RPC or publish error leaves the
 cursor unadvanced and the next tick retries the same `(cursor, tip]` range —
-at-least-once within a run. A block that does not descend from the published
+at-least-once within a run. A restart seeds the cursor at the finalized tip,
+so it skips the blocks that finalized while the da-watcher was down. The
+sealer refuses the next epoch as an origin gap, the sequencers halt on
+`origin_gap`, and deposits stop until an operator restarts the da-watcher
+with `--l1-resume-after` (`docs/runbooks/origin_gap.md`). The deposits of the
+skipped blocks wait in the lockbox; they are never lost. A block that does not descend from the published
 one raises the `l1_chain_break` halt, and an L1 that does not answer the
 `l1_unreachable` halt; both clear on the next good tick. The l1-indexer's
 follower halts the same way on its chain check. Duplicates after a retry or restart are absorbed
@@ -819,7 +849,8 @@ activation timestamp exists to give operators that window.
 The one liveness gap is inherited from the watcher's in-memory cursor: a
 watcher that restarts *after* the upgrade's L1 block finalized but before
 observing it re-seeds at the current tip and skips that epoch — the same
-seed-skip that affects user deposits. The runbook is therefore to confirm the
+seed-skip that affects user deposits. The sealer refuses the next epoch as an
+origin gap, so the skip stops deposits instead of dropping the upgrade. The runbook is therefore to confirm the
 L2 receipt (keyed by the domain-1 `source_hash` of the L1 log position) before
 treating an upgrade as applied; the L1 `upgradeNonce` makes a re-send
 unambiguous.

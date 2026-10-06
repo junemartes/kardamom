@@ -39,11 +39,15 @@ pub enum HaltCause {
     /// The sealer emits no boundary: the cluster has no leader, or no
     /// quorum to commit one.
     SealerNoQuorum,
+    /// The sealer refuses the next L1 epoch, because an earlier one is
+    /// missing, and the sequencer does not hold the missing epoch. Or the
+    /// sequencer holds too many relayed epochs that no boundary confirms.
+    OriginGap,
 }
 
 impl HaltCause {
     /// Every cause, for the tests that check the rules and the runbooks.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -51,6 +55,7 @@ impl HaltCause {
         Self::DaLag,
         Self::ValidatorDivergence,
         Self::SealerNoQuorum,
+        Self::OriginGap,
     ];
 
     /// The stable id: the `cause` label of the gauge and the alert.
@@ -71,13 +76,15 @@ impl HaltCause {
             Self::DaLag => RecoveryId::DaLag,
             Self::ValidatorDivergence => RecoveryId::ValidatorDivergence,
             Self::SealerNoQuorum => RecoveryId::SealerNoQuorum,
+            Self::OriginGap => RecoveryId::OriginGap,
         }
     }
 
     /// Whether the service resumes by itself when the cause goes. A lie
     /// of an L1 source, an L1 outage, a DA lag, and a lost quorum all
     /// clear on their own: the source agrees again, L1 answers, the
-    /// batcher posts, a leader commits. A refused replay and a divergence
+    /// batcher posts, a leader commits. An origin gap clears when a
+    /// boundary confirms the missing epoch. A refused replay and a divergence
     /// need an operator: a range must be recovered or the chain reverted,
     /// or a verdict must be examined.
     #[must_use]
@@ -87,7 +94,8 @@ impl HaltCause {
             | Self::L1ChainBreak
             | Self::L1Unreachable
             | Self::DaLag
-            | Self::SealerNoQuorum => Clears::Auto,
+            | Self::SealerNoQuorum
+            | Self::OriginGap => Clears::Auto,
             Self::ReplayUnavailable | Self::ValidatorDivergence => Clears::Operator,
         }
     }
@@ -109,11 +117,15 @@ pub enum RecoveryId {
     /// chain reverts to the posted head. No cause names it directly; the
     /// `replay_unavailable` runbook sends the operator here.
     RevertToPostedHead,
+    /// The sequencer's origin gap. It is the last variant, so the archived
+    /// discriminants of the other variants stay the same on the `events`
+    /// stream.
+    OriginGap,
 }
 
 impl RecoveryId {
     /// Every runbook, for the test that checks each file exists.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -121,6 +133,7 @@ impl RecoveryId {
         Self::DaLag,
         Self::ValidatorDivergence,
         Self::SealerNoQuorum,
+        Self::OriginGap,
         Self::RevertToPostedHead,
     ];
 
@@ -136,6 +149,7 @@ impl RecoveryId {
             Self::DaLag => "da_lag",
             Self::ValidatorDivergence => "validator_divergence",
             Self::SealerNoQuorum => "sealer_no_quorum",
+            Self::OriginGap => "origin_gap",
             Self::RevertToPostedHead => "revert_to_posted_head",
         }
     }

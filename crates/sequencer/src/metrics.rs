@@ -84,6 +84,13 @@ pub(crate) const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_mess
 /// `unknown_origin`, `bad_range`). A nonzero `seq_mismatch` rate means a
 /// watcher's cursor disagrees with the sealer's lane cursor.
 pub const REMOTE_ORIGIN_REJECT_TOTAL: &str = "kardamom_sequencer_remote_origin_reject_total";
+/// Origin-gap rejects the sealer answered this replica's epochs with. Each
+/// one makes the epoch pump offer its unconfirmed epochs again from the
+/// origin the sealer expects.
+pub const ORIGIN_GAP_TOTAL: &str = "kardamom_sequencer_origin_gap_total";
+/// The epochs the pump relayed, or took to relay, that no boundary
+/// confirmed yet.
+pub(crate) const EPOCHS_UNCONFIRMED: &str = "kardamom_sequencer_epochs_unconfirmed";
 
 /// Pre-registered per-partition metric handles for the hot loop.
 ///
@@ -245,6 +252,14 @@ pub fn record_remote_origin_reject(origin_chain_id: u64, reason: &'static str) {
     .increment(1);
 }
 
+pub fn record_origin_gap() {
+    counter!(ORIGIN_GAP_TOTAL).increment(1);
+}
+
+pub(crate) fn record_epochs_unconfirmed(held: usize) {
+    gauge!(EPOCHS_UNCONFIRMED).set(gauge_value(held));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +288,7 @@ mod tests {
         record_lag_suspected(0);
         record_remote_epoch_relayed(0, 0);
         record_remote_origin_reject(0, "seq_mismatch");
+        record_origin_gap();
+        record_epochs_unconfirmed(0);
     }
 }
