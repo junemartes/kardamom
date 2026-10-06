@@ -20,12 +20,11 @@ quorum of members to commit one. Nothing is ordered while it lasts.
 
 1. Count the live members. A cluster of three needs two for a quorum.
 2. Start a member that is gone (`nomad job status cluster`). A member whose
-   disk is lost rejoins through a snapshot: follow the cluster member rejoin
-   procedure in `docs/failure-modes.md`.
+   disk is lost replays the log from the leader. See the section "Sealer: the Aeron Cluster (Raft)" in
+   [`failure-modes.md`](../failure-modes.md#sealer-the-aeron-cluster-raft). The case `cluster-member-rejoin` tests this.
 3. If every member runs but none leads, read the members' logs for a clock or
    network fault between the sealer nodes, and fix it.
 
 ## Clear
 
-This halt clears by itself (`auto`). The ingress clears it on the first
-boundary it receives, and the paused ingresses and sequencers resume with it.
+This halt clears by itself (`auto`). The ingress clears it on the first status frame it receives from the sealer. The paused ingresses resume with it. A sequencer clears its own pause on the next boundary on its egress.

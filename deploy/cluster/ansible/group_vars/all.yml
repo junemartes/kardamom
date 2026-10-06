@@ -17,7 +17,7 @@ cosign_pinned_sha256: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9
 # One playbook, two profiles. `local` is the container path (CI and a
 # developer host): one control node, a plain-HTTP registry, and an
 # explicit node_ip on every inventory host. `production` is the dedicated core
-# and cloud profile: three voting Consul and Nomad servers on the dedicated core, a
+# and cloud profile: one or three voting Consul and Nomad servers on the dedicated core, a
 # private interface selector in place of fixed addresses, gossip
 # encryption, ACLs, agent TLS and the host firewall.
 # inventories/production/group_vars/production/profile.yml sets the production values, and
@@ -72,8 +72,8 @@ private_interface: ""
 private_cidrs: []
 # The ranges that may reach SSH on the public interface.
 ssh_allowed_cidrs: ["0.0.0.0/0"]
-# Public TCP ports open on a production host. The RPC edge reaches the
-# proxies over the private network, so the list is empty by default.
+# Public TCP ports open on a production host. Traffic reaches a
+# production host over the private network, so the list is empty by default.
 public_tcp_ports: []
 
 # --- image registry -------------------------------------------------------
@@ -152,7 +152,7 @@ paths:
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
-  batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
+  batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
   l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor
   da_store_dir: /opt/kardamom/da-store     # the DA stand-in's payloads (no EigenDA network)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
@@ -200,7 +200,8 @@ aeron_tmpfs_size: "2g"
 #   executor    3    state-machine replica appliers      (tier: worker)
 #   sealer      3    3-member Aeron Cluster (Raft) sealer — ordering +
 #                    durability fold into the Raft log + archive
-#   aux         1    validator + da_watcher + batcher    (tier: worker)
+#   aux         1    service classes: redis, batcher, monitoring, validator,
+#                    da-watcher, indexer                 (tier: worker)
 #
 # Placement by a role set. A node's class is its `role` (one value: the
 # node name and the index derive from it). A node also carries a role
