@@ -165,6 +165,9 @@ impl<'a> SealerLaunch<'a> {
             "-Dkardamom.archive.dir={}",
             node_root.join("archive").display()
         ))
+        // Every member starts in a new temporary directory, so this is
+        // always the first start of a new cluster.
+        .arg("-Dkardamom.cluster.bootstrap=true")
         .arg("-Dkardamom.cluster.ingressStreamId=101")
         .arg(format!("-Dkardamom.cluster.tickMs={}", self.tick_ms))
         .arg(format!(

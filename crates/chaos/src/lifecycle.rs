@@ -160,9 +160,13 @@ impl Lifecycle {
         self.write_contract().await?;
         let contract = self.contract()?;
         let nomad_addr = contract.nomad_addr(NOMAD_HTTP_PORT)?;
+        // Bring-up starts a new sealer cluster. The deploy opens the
+        // bootstrap only while it registers a job that Nomad does not know,
+        // so a bring-up over a running cluster opens none.
         let mut env = vec![
             ("NOMAD_ADDR", nomad_addr),
             ("REGISTRY_PUSH_NODE", REGISTRY_PUSH_NODE.to_string()),
+            ("KARDAMOM_CLUSTER_BOOTSTRAP", "1".to_string()),
         ];
         env.extend(vars.env());
         let mut cmd = self.command("ansible-playbook", &env);
