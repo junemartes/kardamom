@@ -18,7 +18,8 @@ import org.agrona.DirectBuffer;
  * an external {@code ClusteredService} by composition: the harness drives
  * this object, which forwards every call verbatim to the production
  * service. Every callback, the snapshot write included, runs the production
- * code. The only addition is the {@link #restoredFromSnapshot()} probe.
+ * code. The only additions are the {@link #restoredFromSnapshot()} probe
+ * and the {@link #delegate()} accessor.
  */
 final class SealerTestService extends TestNode.TestService {
     private final SealerClusteredService delegate;
@@ -44,6 +45,11 @@ final class SealerTestService extends TestNode.TestService {
         super.onStart(cluster, null);
         restoredFromSnapshot = snapshotImage != null;
         delegate.onStart(cluster, snapshotImage);
+    }
+
+    /** The production service that every callback runs. */
+    SealerClusteredService delegate() {
+        return delegate;
     }
 
     /** True when this service started from a snapshot image, not at genesis. */

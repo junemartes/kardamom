@@ -281,6 +281,7 @@ fn actor_receipts_match_naive_reference() {
             cfg,
             start: ResumePoint::GENESIS,
             snap: fixture.snap_actor,
+            tx_hook: None,
         },
         HarnessInput {
             tx_data: vec![tx_data],

@@ -189,12 +189,14 @@ The file names no fixed address.
 - The multicast fallback channels pin their `interface` to
   `{{ env "meta.node_ip" }}/32` too.
 - The fallback archive lists render from the archive records. The
-  `kardamom-aeron-archive` service carries the node role as a tag.
-- The template lists `ingress.kardamom-aeron-archive` for `tx_data` and
-  `aux.kardamom-aeron-archive` for `tx_deposits`. The `aux` tag matches
-  the local profile only. A production `da-watcher` node has the role
-  `da-watcher`, so its fallback list is empty. Discovery still finds its
-  archive through the record.
+  `kardamom-aeron-archive` service carries the topic that the node
+  records (`archive_topics`) as a tag.
+- The template lists `tx_data.kardamom-aeron-archive` for `tx_data` and
+  `tx_deposits.kardamom-aeron-archive` for `tx_deposits`. The selection
+  follows the recording node in both profiles: the ingress nodes for
+  `tx_data`, and the node with the `da-watcher` role for `tx_deposits`.
+- A node records at most one topic. A node that records nothing has an
+  empty tag.
 - Every job renders the file with `change_mode = "noop"`. A change in the
   archive set rewrites the file. The running process follows the catalog
   through discovery and does not restart.

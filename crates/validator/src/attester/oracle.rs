@@ -6,20 +6,14 @@ use alloy_primitives::{B256, TxHash, U256};
 use alloy_provider::Provider;
 use alloy_sol_types::sol;
 
-sol! {
+sol!(
     #[sol(rpc)]
-    contract IWithdrawalOutputOracle {
-        struct Output {
-            bytes32 outputRoot;
-            uint64 l2BlockNumber;
-            uint64 timestamp;
-            bool deleted;
-        }
-        function proposeOutput(bytes32 outputRoot, uint64 l2BlockNumber) external returns (uint256);
-        function outputCount() external view returns (uint256);
-        function getOutput(uint256 index) external view returns (Output memory);
-    }
-}
+    IWithdrawalOutputOracle,
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/abi/WithdrawalOutputOracle.json"
+    )
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AttesterError {

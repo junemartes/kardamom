@@ -26,7 +26,7 @@ sol!(
     IKardamomFactory,
     concat!(
         env!("CARGO_WORKSPACE_DIR"),
-        "/contracts/out/IKardamomFactory.sol/IKardamomFactory.json"
+        "/contracts/abi/IKardamomFactory.json"
     )
 );
 

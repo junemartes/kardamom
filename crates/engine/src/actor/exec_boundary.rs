@@ -1,19 +1,19 @@
 //! The `BoundaryStart` arm: alignment check, the optional whole-block
 //! strategy, block-close protocol actions, and the commit handoff.
 
-use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta};
+use revm::state::bal::Bal;
 
-use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 
-use super::exec_state::{BlockState, CommitPipeline};
+use super::exec_block::{BlockRun, BlockState, ExecutedBlock};
+use super::exec_records::{Finished, RecordKind, Writes};
+use super::exec_state::CommitPipeline;
 use super::exec_thread::{ExecState, Flow};
 use super::ports::StateWriterQueue;
-use super::types::{BalHandoff, BlockExecStrategy, ExecToCommit};
+use super::types::BufferedRecord;
 use super::wiring::ExecPorts;
 
 impl<W: ExecPorts> ExecState<W> {
@@ -96,132 +96,83 @@ impl<W: ExecPorts> ExecState<W> {
         Ok(())
     }
 
-    /// Run the whole-block execution strategy, when one is wired (the
+    /// Run the whole-block execution strategy, in the whole-block mode (the
     /// validator's parallel path): execute everything buffered for this
     /// block, with the validator's batches running concurrently inside this
     /// call, then feed the receipts and delta into the same boundary path
     /// the streaming executor uses. Commit ordering, durability gating, and
-    /// the write-set cross-check stay the same. A `None` `block_exec`
-    /// leaves the buffer and delta untouched: the streaming arms already
-    /// built them.
+    /// the write-set cross-check stay the same. Each record then finishes
+    /// through [`Self::finish_record`], like a streaming record. The
+    /// streaming mode leaves the delta untouched: the streaming arms
+    /// already built it.
     fn run_block_exec(&mut self, block_number: u64) -> Result<Flow, ExecutorError> {
-        let Some(exec_block) = self.hooks.block_exec.as_ref() else {
+        let env = self.exec_env(block_number);
+        let BlockRun::Whole(whole) = &mut self.block.run else {
             return Ok(Flow::Continue);
         };
-        let env = self.exec_env(block_number);
         let apply_start = Instant::now();
-        let out = exec_block.execute_block(
+        let ExecutedBlock {
+            records,
+            delta,
+            bal,
+        } = whole.execute(
             &self.commits.snapshot,
             self.commits.parent.as_ref(),
-            &self.block.buffered,
             env,
             block_number,
         )?;
         *self.block.apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-        self.block.buffered.clear();
-        self.block.delta = out.delta;
-        // BAL parity across strategies: a capturing strategy hands its
-        // folded per-block Bal here, so the boundary handoff below
-        // publishes it the same way the streaming capture would. If a
-        // publishing role's strategy captured nothing, it would otherwise
-        // emit an empty BAL with no warning, and every validator would
-        // degrade to the sequential fallback with no signal. So this
-        // combination logs a warning.
-        match out.bal {
-            Some(b) => self.block.bal = b,
-            None if self.hooks.bal_tx.is_some() => {
+        self.block.delta = delta;
+        self.adopt_strategy_bal(block_number, bal);
+        // The parallel path has no per-tx write sets. The block's merged
+        // rows ride the last receipt, so no row is tagged with a position
+        // before the writes it carries. The other receipts carry none. An
+        // empty block has no receipts, so the subtraction saturates at 0.
+        let rows = std::iter::repeat_with(Vec::new)
+            .take(records.len().saturating_sub(1))
+            .chain(std::iter::once(self.block.delta.account_rows()));
+        for ((rec, receipt), rows) in records.into_iter().zip(rows) {
+            if let Flow::Stop = self.finish_buffered(&rec, receipt, rows)? {
+                return Ok(Flow::Stop);
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// BAL parity across strategies: a capturing strategy hands its folded
+    /// per-block Bal here, so the boundary handoff publishes it the same
+    /// way the streaming capture would. If a publishing role's strategy
+    /// captured nothing, it would otherwise emit an empty BAL with no
+    /// warning, and every validator would degrade to the sequential
+    /// fallback with no signal. So this combination logs a warning.
+    fn adopt_strategy_bal(&mut self, block_number: u64, bal: Option<Bal>) {
+        match (self.block.bal.as_mut(), bal) {
+            (Some(capture), Some(b)) => capture.bal = b,
+            (Some(_), None) => {
                 tracing::warn!(
                     block = block_number,
                     "block-exec strategy returned no BAL while BAL \
                      publication is on; publishing an empty capture"
                 );
             }
-            None => {}
-        }
-        // The parallel path has no per-tx write sets. The block's merged
-        // rows ride the last receipt, so no row is tagged with a position
-        // before the writes it carries. The other receipts carry none.
-        let mut receipts = out.receipts;
-        let last = receipts.pop();
-        let head = receipts
-            .into_iter()
-            .try_for_each(|r| self.send_receipt(r, Vec::new()));
-        let flow = match (head, last) {
-            (ControlFlow::Continue(()), Some(r)) => {
-                let rows = self.block.delta.account_rows();
-                self.send_receipt(r, rows)
-            }
-            (flow, _) => flow,
-        };
-        match flow {
-            ControlFlow::Continue(()) => Ok(Flow::Continue),
-            ControlFlow::Break(()) => Ok(Flow::Stop),
+            (None, _) => {}
         }
     }
 
-    /// Record one block-exec receipt and stream it, with `accounts`, to the
-    /// commit thread. `Break` means the commit thread is gone.
-    fn send_receipt(
+    /// Finish one record the whole-block strategy executed, through the
+    /// same result path as a streaming record.
+    fn finish_buffered(
         &mut self,
+        rec: &BufferedRecord,
         receipt: kardamom_types::Receipt,
-        accounts: Vec<kardamom_types::AccountRow>,
-    ) -> ControlFlow<()> {
-        self.block.receipts.push(receipt.clone());
-        let item = kardamom_types::ReceiptRows { receipt, accounts };
-        match self.io.tx.send(ExecToCommit::Receipt(Box::new(item))) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
-    }
-
-    /// EIP-7928 handoff: move the block's Bal, and a receipts-free copy of
-    /// the merged delta, to the publisher thread. Encoding and reliable
-    /// delivery happen entirely off this thread. `try_send` keeps the BAL
-    /// handoff off the critical path: a dropped frame costs one block of
-    /// BAL retention, which verifies as `bal_missing`, a tolerated path. A
-    /// dropped send also means the publisher is gone mid-shutdown; this is
-    /// not fatal.
-    fn handoff_bal(&mut self, boundary: &BlockBoundary, pending: &PendingDelta) {
-        let Some(btx) = self.hooks.bal_tx.as_ref() else {
-            return;
-        };
-        let block_number = boundary.block_number;
-        let bal_delta = pending.clone().finalize(block_number, Vec::new());
-        btx.try_handoff(
-            BalHandoff {
-                boundary: boundary.clone(),
-                delta: bal_delta,
-                bal: std::mem::take(&mut self.block.bal),
-            },
-            block_number,
-            BAL_HANDOFF,
-            || {},
-        );
-    }
-
-    /// Footprint-shadow handoff: the same never-block discipline as the BAL
-    /// handoff. A dropped block costs one block of measurement, which is
-    /// counted, not the chain. Skips empty blocks; there is nothing to
-    /// grade.
-    fn handoff_shadow(&mut self, block_number: u64) {
-        let Some(stx) = self.hooks.shadow_tx.as_ref() else {
-            return;
-        };
-        if self.block.shadow_captures.is_empty() && self.block.shadow_serial == 0 {
-            return;
-        }
-        let blk = crate::shadow::ShadowBlock {
-            block_number,
-            captures: std::mem::take(&mut self.block.shadow_captures),
-            serial_records: std::mem::take(&mut self.block.shadow_serial),
-        };
-        stx.try_handoff(blk, block_number, SHADOW_HANDOFF, || {
-            metrics::counter!(
-                crate::metrics::FOOTPRINT_BLOCKS_TOTAL,
-                "outcome" => "dropped"
-            )
-            .increment(1);
-        });
+        rows: Vec<kardamom_types::AccountRow>,
+    ) -> Result<Flow, ExecutorError> {
+        let (kind, position) = RecordKind::of_buffered(rec, self.cursor.block);
+        self.finish_record(Finished {
+            kind,
+            position,
+            result: Ok((receipt, Writes::Rows(rows))),
+        })
     }
 
     pub(super) fn on_boundary(
@@ -300,13 +251,10 @@ impl<W: ExecPorts> ExecState<W> {
         // byte-identical receipts. So tx_receipts is at-least-once, and
         // every consumer must dedup on `tx_idx` (ingress already does).
         let pending = std::mem::take(&mut self.block.delta);
-        // The block's execution scope dies with the block. The next block
-        // gets a new parent layer and block env, and, once commits settle, a
-        // fresh snapshot. This drop is unconditional: a scope reused across a
-        // boundary would execute against the previous block's parent and env.
-        self.block.scope = None;
-        self.handoff_bal(&boundary, &pending);
-        self.handoff_shadow(block_number);
+        self.block.run.seal(block_number);
+        if let Some(capture) = self.block.bal.as_mut() {
+            capture.handoff(&boundary, &pending);
+        }
         match self.commits.parent.as_mut() {
             Some(m) => m.merge_from(&pending),
             None => self.commits.parent = Some(pending.clone()),
@@ -337,61 +285,3 @@ impl<W: ExecPorts> ExecState<W> {
         Ok(Flow::Continue)
     }
 }
-
-/// Never-block handoff to a bounded auxiliary channel (the BAL publisher,
-/// the footprint-shadow grader): `try_send`, then ignore a disconnected
-/// receiver (the consumer is gone mid-shutdown, not fatal), or run
-/// `on_full` (any extra bookkeeping, for example a dropped-block metric)
-/// and warn when the channel is full.
-///
-/// An extension trait: `Sender` is foreign to this crate, so this cannot
-/// be an inherent method.
-trait SenderHandoff<T> {
-    fn try_handoff(
-        &self,
-        item: T,
-        block_number: u64,
-        labels: HandoffLabels,
-        on_full: impl FnOnce(),
-    );
-}
-
-impl<T> SenderHandoff<T> for Sender<T> {
-    fn try_handoff(
-        &self,
-        item: T,
-        block_number: u64,
-        labels: HandoffLabels,
-        on_full: impl FnOnce(),
-    ) {
-        match self.try_send(item) {
-            Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                on_full();
-                tracing::warn!(
-                    block = block_number,
-                    "{} handoff full; dropping this block's {}",
-                    labels.what,
-                    labels.dropped
-                );
-            }
-        }
-    }
-}
-
-/// One [`SenderHandoff::try_handoff`] call site's log wording: the name
-/// used in the warn line, and the noun for what gets dropped.
-struct HandoffLabels {
-    what: &'static str,
-    dropped: &'static str,
-}
-
-const BAL_HANDOFF: HandoffLabels = HandoffLabels {
-    what: "BAL",
-    dropped: "frame (publisher pump stalled?)",
-};
-
-const SHADOW_HANDOFF: HandoffLabels = HandoffLabels {
-    what: "footprint-shadow",
-    dropped: "capture",
-};

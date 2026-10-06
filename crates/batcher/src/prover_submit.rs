@@ -29,7 +29,7 @@ sol!(
     IKardamomProofOracle,
     concat!(
         env!("CARGO_WORKSPACE_DIR"),
-        "/contracts/out/KardamomProofOracle.sol/KardamomProofOracle.json"
+        "/contracts/abi/KardamomProofOracle.json"
     )
 );
 

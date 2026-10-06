@@ -75,6 +75,9 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "sealer state",
     "cluster node up",
     "cluster JOIN WEDGE",
+    "cluster CATCHUP STALL",
+    "cluster LOG PURGE",
+    "cluster SEED",
 ];
 const CONSENSUS_EVENTS: usize = 120;
 const AERON_ERRORS: &str = "for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\"; }; done";

@@ -13,19 +13,9 @@ pub use kardamom_deployer::dev_keys::{
     CHALLENGER_KEY as DEPOSITOR_KEY, DEV_OWNER, L2_MINTER,
 };
 
-sol! {
+sol!(
     /// The L2 predeploy at `kardamom_types::withdrawals::MESSAGE_PASSER`.
-    /// No Rust binding for it exists in the workspace, so this declares
-    /// one here.
     #[sol(rpc)]
-    contract L2ToL1MessagePasser {
-        function initiateWithdrawal(address target) external payable;
-        event MessagePassed(
-            uint256 indexed nonce,
-            address indexed sender,
-            address indexed target,
-            uint256 value,
-            bytes32 withdrawalHash
-        );
-    }
-}
+    L2ToL1MessagePasser,
+    concat!(env!("CARGO_WORKSPACE_DIR"), "/contracts/abi/L2ToL1MessagePasser.json")
+);
