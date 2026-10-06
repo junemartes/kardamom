@@ -269,3 +269,26 @@ fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
     assert!(!rig.step(&mut seq).unwrap());
     assert_eq!(rig.refs().len(), 1);
 }
+
+/// A sealer without a quorum pauses the replica: it offers nothing and
+/// reads no envelope, and the envelope publishes once the pause ends.
+#[test]
+fn a_paused_sequencer_offers_nothing_until_it_resumes() {
+    use kardamom_obs::halt::{HaltCause, HaltRef};
+    use kardamom_obs::lifecycle::Lifecycle;
+
+    let s = signer(11);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 1100));
+    let mut seq = Sequencer::new(one_partition_cfg()).unwrap();
+    let life = Lifecycle::new(Some("sequencer"));
+    seq.enable_pause(life.subscribe());
+
+    life.follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
+    assert!(!rig.step(&mut seq).unwrap(), "a paused turn does no work");
+    assert!(rig.refs().is_empty());
+
+    life.follow(None);
+    assert!(rig.step(&mut seq).unwrap());
+    assert_eq!(rig.refs().len(), 1, "the envelope waited in the stream");
+}

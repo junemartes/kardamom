@@ -93,6 +93,33 @@ impl IndexerClient {
         self.call("indexer_batch", serde_json::json!([index])).await
     }
 
+    /// Refuse an indexer that is not running: a halted follower may hold
+    /// a lie of its L1 source, and a paused one makes no progress. The
+    /// error names the state, the cause, and the runbook.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails, or when the indexer is
+    /// halted or paused.
+    pub async fn require_running(&self) -> Result<(), BatcherError> {
+        let record: serde_json::Value = self.call("indexer_halt", serde_json::json!([])).await?;
+        match Self::refusal(&record) {
+            Some(why) => Err(BatcherError::L1(format!("indexer at {}: {why}", self.url))),
+            None => Ok(()),
+        }
+    }
+
+    /// Why a lifecycle record refuses its indexer, `None` while it runs.
+    fn refusal(record: &serde_json::Value) -> Option<String> {
+        let state = record["state"].as_str().unwrap_or("unknown");
+        (state != "running").then(|| {
+            format!(
+                "the indexer is {state} (cause {}, runbook {}); refuse to rebuild from it",
+                record["cause"].as_str().unwrap_or("none"),
+                record["runbook"].as_str().unwrap_or("none"),
+            )
+        })
+    }
+
     async fn payload(&self, da_cert: &Bytes) -> Result<Vec<u8>, BatcherError> {
         let bytes: Bytes = self
             .call("indexer_payload", serde_json::json!([da_cert]))
@@ -115,6 +142,20 @@ impl PayloadSource for IndexerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_halted_indexer_is_refused_with_its_runbook() {
+        let halted = serde_json::json!({
+            "state": "halted",
+            "cause": "l1_chain_break",
+            "runbook": "docs/runbooks/l1_chain_break.md",
+        });
+        let why = IndexerClient::refusal(&halted).unwrap();
+        assert!(why.contains("halted"), "{why}");
+        assert!(why.contains("docs/runbooks/l1_chain_break.md"), "{why}");
+        let running = serde_json::json!({"state": "running", "halted": false});
+        assert_eq!(IndexerClient::refusal(&running), None);
+    }
 
     #[test]
     fn a_result_and_an_error_parse() {

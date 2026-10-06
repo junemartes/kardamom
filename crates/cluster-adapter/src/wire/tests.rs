@@ -282,6 +282,65 @@ fn past_deadline_roundtrip() {
     );
 }
 
+/// The Java service reads the cursor at a fixed offset and fans the
+/// status out by fixed offsets, so the offsets are the contract.
+#[test]
+fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
+    let cursor = encode_ingress_posted_cursor(0x0102);
+    assert_eq!(
+        cursor,
+        [7, 0x02, 0x01, 0, 0, 0, 0, 0, 0],
+        "kind 7, then the head as u64 LE"
+    );
+
+    let status = kardamom_types::ClusterStatus {
+        posted_head: 100,
+        sealed_head: 160,
+        budget_blocks: 50,
+        halted: true,
+        retained_frames: 7000,
+        floor_index: 90_000,
+        floor_block: 95,
+    };
+    let b = encode_status(&status);
+    assert_eq!(b.len(), 50);
+    assert_eq!(b[0], 9, "kind 9 is the Java EGRESS_KIND_STATUS");
+    assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 100);
+    assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 160);
+    assert_eq!(u64::from_le_bytes(b[17..25].try_into().unwrap()), 50);
+    assert_eq!(b[25], 1, "the halted flag at offset 25");
+    assert_eq!(u64::from_le_bytes(b[26..34].try_into().unwrap()), 7000);
+    assert_eq!(u64::from_le_bytes(b[34..42].try_into().unwrap()), 90_000);
+    assert_eq!(u64::from_le_bytes(b[42..50].try_into().unwrap()), 95);
+    assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+    assert_eq!(status.lag(), 60);
+}
+
+#[test]
+fn da_lag_reject_roundtrip() {
+    let sender = Address::repeat_byte(0x99);
+    let status = kardamom_types::ClusterStatus {
+        posted_head: 100,
+        sealed_head: 160,
+        budget_blocks: 50,
+        halted: true,
+        ..Default::default()
+    };
+    let b = encode_da_lag_reject(sender, 12, &status);
+    assert_eq!(b.len(), 1 + 20 + 32);
+    assert_eq!(b[0], 10, "kind 10 is the Java EGRESS_KIND_DA_LAG_REJECT");
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::DaLagReject {
+            sender,
+            nonce: 12,
+            sealed_head: 160,
+            posted_head: 100,
+            budget_blocks: 50,
+        }
+    );
+}
+
 #[test]
 fn window_full_roundtrip() {
     let sender = Address::repeat_byte(0x99);
@@ -461,6 +520,19 @@ fn a_void_record_with_no_index_is_too_short() {
 }
 
 #[test]
+fn replay_ahead_roundtrip() {
+    let b = encode_replay_ahead(5, 3);
+    assert_eq!(b[0], 11, "kind 11, as Java EGRESS_KIND_REPLAY_AHEAD");
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::ReplayAhead {
+            head_index: 5,
+            head_block: 3,
+        }
+    );
+}
+
+#[test]
 fn replay_unavailable_roundtrip() {
     let b = encode_replay_unavailable(100, 7);
     assert_eq!(
@@ -475,8 +547,8 @@ fn replay_unavailable_roundtrip() {
 #[test]
 fn bad_kind_and_record_type_error() {
     assert_eq!(
-        EgressItem::decode(&[9, 0, 0]),
-        Err(WireError::BadEgressKind(9))
+        EgressItem::decode(&[200, 0, 0]),
+        Err(WireError::BadEgressKind(200))
     );
     // A relayed payload with an unknown record type.
     let mut payload = vec![0u8; 32];

@@ -1,0 +1,17 @@
+# Alertmanager inhibit rules for the kardamom alerts (deploy/alerts.yml).
+# Merge them into the monitoring job's Alertmanager config, beside its
+# routes and receivers.
+#
+# One incident pages once. A root halt fires its KardamomHalt* alert with
+# the label `cause`. Every service that pauses on that root exports
+# kardamom_paused with the same `cause` label, and its info alert
+# KardamomServicePaused is muted while the root's alert fires. An
+# operator's pause carries cause="operator", which no halt alert carries,
+# so it is never muted.
+inhibit_rules:
+  - source_matchers:
+      - 'alertname =~ "KardamomHalt.*"'
+    target_matchers:
+      - 'alertname = "KardamomServicePaused"'
+    equal:
+      - cause

@@ -13,7 +13,9 @@ use kardamom_log::aeron_live::{AeronRuntime, IdleBackoff, PubHandle, RawFrame};
 use super::endpoints::{now_ms, now_ms_i64, open_leader_pub, open_next_member_pub, to_aligned};
 use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
 use crate::gateway::OfferOutcome;
-use crate::wire::{EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE};
+use crate::wire::{
+    EGRESS_KIND_REPLAY_AHEAD, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
+};
 
 // Replay-request resend state. The request is published on the cluster
 // ingress, which is often still not connected right after a (re)connect.
@@ -107,7 +109,7 @@ impl Resend {
 }
 
 /// The replay request's resend gate. The leader answers every request it
-/// receives: `REPLAY_DONE` after the retained frames, or
+/// receives: `REPLAY_DONE` after the retained frames, `REPLAY_AHEAD`, or
 /// `REPLAY_UNAVAILABLE`. So the request is resent on the
 /// [`REPLAY_RESEND_MS`] cadence until one of those markers arrives on
 /// this session's egress, and never after. The consumer's delivery
@@ -138,9 +140,15 @@ impl ReplayAsk {
     }
 
     /// Note the kind byte of one egress payload for this session. The
-    /// two replay markers close the ask; live frames do not.
+    /// three replay answers close the ask; live frames do not.
     fn on_payload(&mut self, kind: u8) {
-        if kind == EGRESS_KIND_REPLAY_DONE || kind == EGRESS_KIND_REPLAY_UNAVAILABLE {
+        if [
+            EGRESS_KIND_REPLAY_DONE,
+            EGRESS_KIND_REPLAY_AHEAD,
+            EGRESS_KIND_REPLAY_UNAVAILABLE,
+        ]
+        .contains(&kind)
+        {
             self.answered = true;
         }
     }
@@ -416,9 +424,9 @@ impl SessionLoop {
     /// direction.
     fn on_app_message(&mut self, payload: Vec<u8>) {
         self.subscribe_confirmed = true;
-        // The replay gate reads the kind byte before the egress filter:
-        // a REPLAY_DONE or REPLAY_UNAVAILABLE marker ends the resends
-        // even when the consumer does not want the frame.
+        // The replay gate reads the kind byte before the egress filter: a
+        // replay answer (REPLAY_DONE, REPLAY_AHEAD or REPLAY_UNAVAILABLE)
+        // ends the resends even when the consumer does not want the frame.
         if let Some(&kind) = payload.first() {
             self.replay_ask.on_payload(kind);
         }
@@ -747,5 +755,8 @@ mod tests {
         );
         ask.on_payload(EGRESS_KIND_REPLAY_UNAVAILABLE);
         assert!(!ask.due(1_000 + 20 * REPLAY_RESEND_MS));
+        ask.rearm();
+        ask.on_payload(EGRESS_KIND_REPLAY_AHEAD);
+        assert!(!ask.due(1_000 + 30 * REPLAY_RESEND_MS));
     }
 }

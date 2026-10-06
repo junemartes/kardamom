@@ -1,6 +1,7 @@
 //! Live service wiring: CLI args, the reader stack, and the feed-loop task.
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::FallbackLayer;
 use alloy_transport_http::Http;
 use anyhow::{Context, Result, bail};
+use kardamom_obs::halt::{self, Clears, Halt, HaltCause};
 use metrics::gauge;
 use tokio::sync::mpsc::Receiver;
 use tower::Layer;
@@ -31,12 +33,14 @@ use kardamom_log::discovery::StreamPlane;
 use crate::da::DaProxy;
 
 use super::cursor::{BatchCursor, L1Truth, reconcile};
+use super::events::EventsBeacon;
 use super::feed::{FeedConfig, FeedLoop};
 use super::live_metric_names;
 use super::post_age::PostAge;
+use super::posted_cursor::PostedCursor;
 use super::rebuild::{ArchiveRebuilder, Rebuilder};
 use super::refs_store::RefsStore;
-use super::sender::LiveSender;
+use super::sender::{LiveSender, PostExhausted};
 use super::spool::{Restored, Spool};
 
 /// How often the post-age probe asks L1 for the last `BatchPosted` log.
@@ -44,6 +48,11 @@ use super::spool::{Restored, Spool};
 /// one block read per probe, which a public endpoint tolerates at this
 /// rate and not at the feed's one-second tick.
 const POST_AGE_EVERY: Duration = Duration::from_secs(10);
+
+/// How long an `l1_unreachable` halt waits before the batcher starts
+/// again: long enough for a rate limit to lift, short enough that a post
+/// follows an L1 recovery within a flush.
+const HALT_RETRY: Duration = Duration::from_secs(30);
 
 /// Top-level config the batcher reads from `--config` in live mode. It uses
 /// the same `[cluster]` section shape as the executor and the validator.
@@ -160,6 +169,25 @@ pub struct LiveArgs {
     pub block_refs_sources: Vec<String>,
 }
 
+/// Why a start did not reach a running feed: L1 (or the indexer in front
+/// of it) did not answer, or the resume was refused. The first clears by
+/// itself when L1 answers; the second waits for an operator, who recovers
+/// the range or reverts the chain.
+enum StartError {
+    L1(anyhow::Error),
+    Resume(anyhow::Error),
+}
+
+impl StartError {
+    /// The halt this start failure puts the batcher in.
+    fn halt(&self) -> Halt {
+        match self {
+            Self::L1(e) => Halt::new(HaltCause::L1Unreachable, format!("{e:#}")),
+            Self::Resume(e) => Halt::new(HaltCause::ReplayUnavailable, format!("{e:#}")),
+        }
+    }
+}
+
 /// [`start_l1_side`]'s resolved view: the provider, the blob store, L1's
 /// truth, the cursor to replay from, and the block to skip through
 /// (already covered by L1).
@@ -173,17 +201,19 @@ struct L1Side<P> {
 
 impl LiveArgs {
     /// Connect to L1 and reconcile the durable cursor against it. The L1
-    /// reads retry until L1 answers; the reconcile of a cursor file that
-    /// is ahead of L1 is a refusal, decided once.
-    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + Clone + 'static>> {
-        let provider = connect_l1(&self.rpcs, &self.key)?;
-        let da = DaProxy::new(&self.da_proxy)?;
-        let loaded = BatchCursor::load(&self.cursor_file)?;
+    /// reads retry until L1 answers, under the `l1_unreachable` halt; the
+    /// reconcile of a cursor file that is ahead of L1 is a refusal,
+    /// decided once. The failure classes are typed at this boundary, so
+    /// the service holds the right halt for each.
+    async fn start_l1_side(&self) -> Result<L1Side<impl Provider + Clone + 'static>, StartError> {
+        let provider = connect_l1(&self.rpcs, &self.key).map_err(StartError::L1)?;
+        let da = DaProxy::new(&self.da_proxy).map_err(|e| StartError::Resume(e.into()))?;
+        let loaded = BatchCursor::load(&self.cursor_file).map_err(StartError::Resume)?;
         let resumed = self.resume_until_l1_answers(&provider, &da, loaded).await;
         let l1_truth = resumed.l1_truth;
         let (cursor, skip_through_block) = match resumed.rebuilt {
             Some(rebuilt) => rebuilt,
-            None => reconcile(loaded, l1_truth)?,
+            None => reconcile(loaded, l1_truth).map_err(StartError::Resume)?,
         };
         info!(
             settlement = %self.settlement,
@@ -222,9 +252,9 @@ impl RunConfig {
         let raw = std::fs::read_to_string(&args.config).context("read batcher config")?;
         let mut file_cfg: BatcherFileConfig =
             toml::from_str(&raw).context("parse batcher config")?;
-        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-            file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-        }
+        file_cfg
+            .cluster
+            .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
         let log_cfg =
             LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
         let plane =
@@ -286,6 +316,7 @@ impl RunConfig {
         )?;
         // The kardamom_sealer_* re-export is the executor's job.
         let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
+        let posted_cursor = PostedCursor::new(tx_ordering_sub.posted_cursor_publisher());
         info!("kardamom-batcher: tx_ordering via Aeron Cluster");
 
         let join_buffer = JoinBuffer::new();
@@ -325,15 +356,18 @@ impl RunConfig {
                 ordering_handle,
             },
             feed_rx,
+            posted_cursor,
         })
     }
 }
 
 /// The engine reader stack: the `tx_data` join-buffer readers, the cluster
-/// ordering subscription, and the channel the feed loop reads from.
+/// ordering subscription, the channel the feed loop reads from, and the
+/// posted-cursor publisher over the same cluster session.
 struct ReaderStack<G> {
     handles: ReaderHandles<G>,
     feed_rx: Receiver<ReaderToExec>,
+    posted_cursor: PostedCursor,
 }
 
 /// The reader-thread handles, kept for post-failure diagnosis. The cluster
@@ -370,6 +404,8 @@ enum ReaderEnd {
     /// The sealer refused the replay: the cursor is below its retention
     /// floor, and `oldest_block` is the oldest block it still holds.
     ReplayRefused { oldest_block: u64 },
+    /// A post failed on every attempt: the `l1_unreachable` halt.
+    Halted(Halt),
     /// Every other failure, with the reader thread's error for context.
     Failed(anyhow::Error),
 }
@@ -377,9 +413,10 @@ enum ReaderEnd {
 impl<G> ReaderHandles<G> {
     /// The feed loop returns only on failure (channel closed, or a post
     /// that stopped it). Classify the end from the reader threads'
-    /// errors: the channel-closed case's root cause lives there. The
-    /// handles drop here, so the cluster session and the runtime close
-    /// before a new stack opens.
+    /// errors: the channel-closed case's root cause lives there. A post
+    /// that failed on every attempt is a halt, not an end. The handles
+    /// drop here, so the cluster session and the runtime close before a
+    /// new stack opens.
     fn end(self, feed_err: anyhow::Error) -> ReaderEnd {
         warn!(error = %format!("{feed_err:#}"), "feed loop exited");
         if self.ordering_handle.is_finished()
@@ -391,6 +428,12 @@ impl<G> ReaderHandles<G> {
             return ReaderEnd::Failed(anyhow::anyhow!(
                 "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
             ));
+        }
+        if feed_err
+            .chain()
+            .any(|c| c.downcast_ref::<PostExhausted>().is_some())
+        {
+            return ReaderEnd::Halted(Halt::new(HaltCause::L1Unreachable, format!("{feed_err:#}")));
         }
         ReaderEnd::Failed(
             self.join_handles
@@ -473,17 +516,79 @@ fn continue_from_spool(
 /// cursor, and a rebuild from the state databases' references and the
 /// `tx_data` archives for a gap the sealer no longer retains. A refused
 /// replay is answered once: the rebuild fills the gap up to the sealer's
-/// floor, and the stack starts again at the floor. A second refusal is a
-/// fail-stop.
+/// floor, and the stack starts again at the floor.
+///
+/// A failure the batcher can wait out is a halt, not an end: the process
+/// stays up, serves its metrics and the `/halt` record, and starts again
+/// when the halt clears. An `l1_unreachable` halt retries on a backoff.
+/// A `replay_unavailable` halt (a refused resume, a gap the rebuild cannot
+/// fill, or a second refusal after the rebuild) waits for the operator's
+/// clear, after the range is recovered or the chain reverted.
 ///
 /// # Errors
-/// Returns an error when L1 setup, cursor reconcile, config parsing, or the
-/// reader stack fails to start, or when the feed loop exits with a failure.
+/// Returns an error when config parsing or the reader stack fails to
+/// start, or when the feed loop exits with a failure no halt names.
 pub async fn run(args: LiveArgs) -> Result<()> {
-    let l1 = args.start_l1_side().await?;
+    let events = EventsBeacon::open(&args).await?;
+    let ended = run_until_shutdown(&args).await;
+    events.close().await;
+    ended
+}
+
+/// Start, hold each halt, and start again, until the shutdown signal or
+/// a failure no halt names.
+async fn run_until_shutdown(args: &LiveArgs) -> Result<()> {
+    loop {
+        match run_once(args).await? {
+            RunEnd::Shutdown => return Ok(()),
+            RunEnd::Halted(halt) => {
+                if hold(halt).await.is_break() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// How one run ended: the shutdown signal, or a halt to hold.
+enum RunEnd {
+    Shutdown,
+    Halted(Halt),
+}
+
+/// Hold `halt` until the batcher may start again: one backoff for a halt
+/// that clears by itself, the operator's clear for the other. `Break` is
+/// the shutdown signal during the hold.
+async fn hold(halt: Halt) -> ControlFlow<()> {
+    let clears = halt.clears;
+    halt::raise(halt);
+    tokio::select! {
+        () = bin_support::wait_for_shutdown() => {
+            info!("shutdown signal received while halted; stopping live batcher");
+            ControlFlow::Break(())
+        }
+        () = wait_to_retry(clears) => ControlFlow::Continue(()),
+    }
+}
+
+/// When a held halt is tried again.
+async fn wait_to_retry(clears: Clears) {
+    match clears {
+        Clears::Auto => tokio::time::sleep(HALT_RETRY).await,
+        Clears::Operator => halt::cleared().await,
+    }
+}
+
+/// One start of the service: L1, the spool, the reader stacks, and the
+/// feed loop, until the shutdown signal or a halt.
+async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
+    let l1 = match args.start_l1_side().await {
+        Ok(l1) => l1,
+        Err(e) => return Ok(RunEnd::Halted(e.halt())),
+    };
     let spool = Spool::open(&args.spool_dir)?;
     let (restored, resume) = continue_from_spool(&spool, l1.cursor, l1.skip_through_block)?;
-    let mut run_cfg = RunConfig::resolve(&args)?;
+    let mut run_cfg = RunConfig::resolve(args)?;
     run_cfg.resolve_cluster_ingress().await?;
 
     gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
@@ -514,38 +619,32 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         target_payload_bytes: args.target_payload_bytes,
         skip_through_block: resume.skip_through(l1.skip_through_block),
     };
-    let feed = FeedLoop::new(sender, feed_cfg, spool, restored);
-    let store = RefsStore::new(args.block_refs_sources.clone());
+    // The sealer and the ingress learn the confirmed cursor before the
+    // first post: each reader stack publishes the current value first.
+    let feed = FeedLoop::new(
+        sender,
+        feed_cfg,
+        spool,
+        restored,
+        l1.l1_truth.covered_through_block,
+    );
     let mut service = Service { args, run_cfg };
-    let served = match service.serve(feed, resume).await? {
-        Served::Done => Served::Done,
-        Served::Refused {
-            mut feed,
-            oldest_block,
-        } => {
-            let factory = service.run_cfg.join_recovery(&service.args).context(
-                "the sealer refused the replay, and the rebuild from references needs the \
-                 tx_data archives: --replay-destination-endpoint, \
-                 --archive-control-response-endpoint and the archive endpoints of channels.toml",
-            )?;
-            let rebuilder = ArchiveRebuilder { factory };
-            let resume =
-                recover_from_refs(&store, rebuilder, &mut feed, resume, oldest_block).await?;
-            service.serve(*feed, resume).await?
+    let end = match service.serve(feed, resume).await? {
+        Served::Refused { feed, oldest_block } => {
+            service
+                .recover_and_serve(feed, resume, oldest_block)
+                .await?
         }
+        served => served.into_end(),
     };
-    if let Served::Refused { oldest_block, .. } = served {
-        bail!(
-            "the sealer refused the replay again after the rebuild filled the gap: its floor \
-             moved to block {oldest_block}; a restart rebuilds the new gap"
-        );
-    }
-    // Exit cleanly. The cursor is reconciled against L1 truth on every
-    // restart, so tearing down mid-batch loses nothing.
-    info!("shutdown signal received; stopping live batcher");
     age_probe.abort();
     service.run_cfg.plane.shutdown().await;
-    Ok(())
+    if matches!(end, RunEnd::Shutdown) {
+        // The cursor is reconciled against L1 truth on every restart, so
+        // tearing down mid-batch loses nothing.
+        info!("shutdown signal received; stopping live batcher");
+    }
+    Ok(end)
 }
 
 /// Rebuild the gap between the cursor and the sealer's floor into the
@@ -590,53 +689,128 @@ async fn recover_from_refs<P: Provider, R: Rebuilder>(
     Ok(resumed)
 }
 
-/// What one reader stack did: ran until shutdown, or ended on a refused
-/// replay with the feed loop handed back for the recovery. The loop is
-/// boxed: it is the one large value, and `Done` carries none.
+/// What one reader stack did: ran until shutdown, ended on a halt, or
+/// ended on a refused replay with the feed loop handed back for the
+/// recovery. The loop is boxed: it is the one large value, and the other
+/// variants carry none.
 enum Served<P> {
     Done,
+    Halted(Halt),
     Refused {
         feed: Box<FeedLoop<P>>,
         oldest_block: u64,
     },
 }
 
+impl<P> Served<P> {
+    /// How the run ends after this stack, when no recovery follows. A
+    /// refusal here is the second one: the rebuild already ran, so the
+    /// operator decides.
+    fn into_end(self) -> RunEnd {
+        match self {
+            Self::Done => RunEnd::Shutdown,
+            Self::Halted(halt) => RunEnd::Halted(halt),
+            Self::Refused { oldest_block, .. } => RunEnd::Halted(Halt::new(
+                HaltCause::ReplayUnavailable,
+                format!(
+                    "the sealer refused the replay again after the rebuild filled the gap: its \
+                     floor moved to block {oldest_block}; a restart rebuilds the new gap"
+                ),
+            )),
+        }
+    }
+}
+
 /// The live service's fixed parts across reader stacks: the arguments
 /// and the resolved config.
-struct Service {
-    args: LiveArgs,
+struct Service<'a> {
+    args: &'a LiveArgs,
     run_cfg: RunConfig,
 }
 
-impl Service {
+impl Service<'_> {
     /// Run `feed` on a reader stack that resumes at `resume`, until
     /// shutdown or a failure. A refused replay hands the feed loop back;
-    /// every other failure is the error. The caller ends the plane after
-    /// a shutdown.
+    /// a post that failed on every attempt is a halt; every other failure
+    /// is the error. The caller ends the plane.
     async fn serve<P: Provider + 'static>(
         &mut self,
         feed: FeedLoop<P>,
         resume: BatchCursor,
     ) -> Result<Served<P>> {
-        let ReaderStack { handles, feed_rx } =
-            self.run_cfg.spawn_reader_stack(&self.args, resume)?;
+        let ReaderStack {
+            handles,
+            feed_rx,
+            posted_cursor,
+        } = self.run_cfg.spawn_reader_stack(self.args, resume)?;
+        // The start reached the stream: a held halt is over.
+        halt::clear();
+        let follower = posted_cursor.follow(feed.posted());
         let mut task = tokio::spawn(async move {
             let mut feed = feed;
             let why = feed.run(feed_rx).await;
             (feed, why)
         });
         metrics::gauge!(super::live_metric_names::FEED_RUNNING).set(1.0);
-        let (feed, why) = tokio::select! {
-            r = &mut task => r.context("feed task panicked")?,
-            () = bin_support::wait_for_shutdown() => return Ok(Served::Done),
+        let ended = tokio::select! {
+            r = &mut task => r.context("feed task panicked"),
+            () = bin_support::wait_for_shutdown() => {
+                follower.abort();
+                return Ok(Served::Done);
+            }
         };
+        follower.abort();
+        let (feed, why) = ended?;
         match handles.end(why) {
             ReaderEnd::ReplayRefused { oldest_block } => Ok(Served::Refused {
                 feed: Box::new(feed),
                 oldest_block,
             }),
+            ReaderEnd::Halted(halt) => Ok(Served::Halted(halt)),
             ReaderEnd::Failed(e) => Err(e),
         }
+    }
+
+    /// Answer a refused replay: rebuild the gap from the references and
+    /// the archives, then serve again from the sealer's floor. A gap the
+    /// rebuild cannot fill is the `replay_unavailable` halt.
+    async fn recover_and_serve<P: Provider + 'static>(
+        &mut self,
+        mut feed: Box<FeedLoop<P>>,
+        resume: BatchCursor,
+        oldest_block: u64,
+    ) -> Result<RunEnd> {
+        match self.rebuild(&mut feed, resume, oldest_block).await {
+            Ok(resume) => Ok(self.serve(*feed, resume).await?.into_end()),
+            Err(e) => Ok(RunEnd::Halted(Halt::new(
+                HaltCause::ReplayUnavailable,
+                format!("{e:#}"),
+            ))),
+        }
+    }
+
+    /// The rebuild of [`Self::recover_and_serve`]: the archive client,
+    /// then [`recover_from_refs`].
+    async fn rebuild<P: Provider>(
+        &mut self,
+        feed: &mut FeedLoop<P>,
+        resume: BatchCursor,
+        oldest_block: u64,
+    ) -> Result<BatchCursor> {
+        let factory = self.run_cfg.join_recovery(self.args).context(
+            "the sealer refused the replay, and the rebuild from references needs the \
+             tx_data archives: --replay-destination-endpoint, \
+             --archive-control-response-endpoint and the archive endpoints of channels.toml",
+        )?;
+        let store = RefsStore::new(self.args.block_refs_sources.clone());
+        recover_from_refs(
+            &store,
+            ArchiveRebuilder { factory },
+            feed,
+            resume,
+            oldest_block,
+        )
+        .await
     }
 }
 

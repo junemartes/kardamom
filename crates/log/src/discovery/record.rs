@@ -29,6 +29,7 @@ pub enum Topic {
     TxDeposits,
     TxRemoteEpochs,
     TxBal,
+    ServiceEvents,
 }
 
 impl Topic {
@@ -43,6 +44,28 @@ impl Topic {
             Self::TxDeposits => "tx_deposits",
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
+            Self::ServiceEvents => "events",
+        }
+    }
+
+    /// The term length of the topic's publication, in bytes, when it is
+    /// not the media driver's default. The `events` stream carries a few
+    /// small records per service every 5 s. A small term keeps its log
+    /// buffers small: every subscriber driver holds one image of three
+    /// terms per publisher. 64 KiB is the Aeron minimum, and it carries
+    /// a message of up to 8 KiB.
+    #[must_use]
+    pub fn term_length(self) -> Option<u32> {
+        match self {
+            Self::ServiceEvents => Some(64 * 1024),
+            Self::TxData
+            | Self::TxReceipts
+            | Self::TxReceiptBoundaries
+            | Self::TxErrors
+            | Self::TxStatus
+            | Self::TxDeposits
+            | Self::TxRemoteEpochs
+            | Self::TxBal => None,
         }
     }
 
@@ -56,6 +79,7 @@ impl Topic {
             "tx_deposits" => Some(Self::TxDeposits),
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),
+            "events" => Some(Self::ServiceEvents),
             _ => None,
         }
     }

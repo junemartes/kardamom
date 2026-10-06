@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_cluster_adapter::LiveCluster;
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
+    AeronRuntime, ServiceEventsPublisherHandle, TxDepositsSubscriberHandle,
+    TxErrorsPublisherHandle, TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
@@ -146,19 +146,11 @@ struct Args {
     priority_fees: Option<bool>,
 }
 
-/// Fold the CLI and env overrides into the TOML-loaded config:
-/// partition index and count, the lane and vslot layout, the transaction
-/// lifetime, the lookup endpoints, the replica-group shard rotation,
-/// sequencer id fallback, core pin, per-node cluster egress endpoint, and
-/// the resync contract settings.
+/// Fold the CLI and env overrides into the TOML-loaded config: the
+/// plain overrides first, then the replica-group shard rotation and the
+/// sequencer id fallback, which read the overridden partition index.
 fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
-    if let Some(i) = args.partition_index {
-        cfg.partition_index = i;
-    }
-    if let Some(m) = args.partition_count {
-        cfg.partition_count = kardamom_sequencer::partition::PartitionCount::new(m);
-    }
-    apply_layout_overrides(args, cfg);
+    apply_plain_overrides(args, cfg);
     if args.partition_offset != 0 {
         // An explicit --sequencer-id combined with rotation would
         // subscribe to tx_data stream `sequencer_id`, while the
@@ -190,57 +182,40 @@ fn apply_cli_overrides(args: &Args, cfg: &mut SequencerConfig) -> Result<()> {
         cfg.sequencer_id = u8::try_from(cfg.partition_index)
             .context("partition_index does not fit in sequencer_id (u8)")?;
     }
-    if let Some(c) = args.core_id {
-        cfg.core_id = Some(c);
-    }
-    // Per-node cluster egress endpoint. The cluster client's
-    // egress_channel is this node's reachable address (the node IP
-    // differs per replica). So the Nomad job injects it, instead of
-    // baking it into the static config template.
-    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-        cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-    }
-    if let Some(cap) = args.cluster_dedup_capacity {
-        cfg.resync.dedup_capacity = cap;
-    }
-    if let Some(p) = args.resync_enter_percent {
-        cfg.resync.enter_percent = p;
-    }
-    if let Some(ms) = args.resync_boundary_silence_ms {
-        cfg.resync.boundary_silence_ms = ms;
-    }
-    if let Some(on) = args.priority_fees {
-        cfg.fees.priority = on;
-    }
     Ok(())
 }
 
-/// The lane, vslot, shadow, lifetime, and lookup overrides of
-/// [`apply_cli_overrides`]. A flag left unset keeps the TOML value.
-fn apply_layout_overrides(args: &Args, cfg: &mut SequencerConfig) {
-    if let Some(ttl) = args.tx_ttl_ms {
-        cfg.tx_ttl_ms = ttl;
-    }
+/// The overrides that copy a set flag over the TOML value. A flag left
+/// unset, or an empty list, keeps the TOML value.
+fn apply_plain_overrides(args: &Args, cfg: &mut SequencerConfig) {
+    cfg.partition_index = args.partition_index.unwrap_or(cfg.partition_index);
+    cfg.partition_count = args.partition_count.map_or(
+        cfg.partition_count,
+        kardamom_sequencer::partition::PartitionCount::new,
+    );
+    cfg.tx_ttl_ms = args.tx_ttl_ms.unwrap_or(cfg.tx_ttl_ms);
     if !args.executor_query_endpoints.is_empty() {
         cfg.lookup
             .executor_endpoints
             .clone_from(&args.executor_query_endpoints);
     }
-    if let Some(lane) = args.lane {
-        cfg.lane = Some(lane);
-    }
-    if let Some(set) = args.vslots {
-        cfg.vslots = Some(set);
-    }
+    cfg.lane = args.lane.or(cfg.lane);
+    cfg.vslots = args.vslots.or(cfg.vslots);
     if !args.extra_lanes.is_empty() {
         cfg.extra_lanes.clone_from(&args.extra_lanes);
     }
-    if let Some(set) = args.shadow_vslots {
-        cfg.shadow_vslots = set;
-    }
-    if let Some(warm) = args.shadow_warm_ms {
-        cfg.shadow_warm_ms = Some(warm);
-    }
+    cfg.shadow_vslots = args.shadow_vslots.unwrap_or(cfg.shadow_vslots);
+    cfg.shadow_warm_ms = args.shadow_warm_ms.or(cfg.shadow_warm_ms);
+    cfg.core_id = args.core_id.or(cfg.core_id);
+    cfg.cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
+    let resync = &mut cfg.resync;
+    resync.dedup_capacity = args.cluster_dedup_capacity.unwrap_or(resync.dedup_capacity);
+    resync.enter_percent = args.resync_enter_percent.unwrap_or(resync.enter_percent);
+    resync.boundary_silence_ms = args
+        .resync_boundary_silence_ms
+        .unwrap_or(resync.boundary_silence_ms);
+    cfg.fees.priority = args.priority_fees.unwrap_or(cfg.fees.priority);
 }
 
 /// The Aeron subscriptions and publisher this sequencer needs, all opened
@@ -548,6 +523,17 @@ fn log_nonce_floor_sources(cfg: &SequencerConfig) {
     }
 }
 
+/// Publish this replica's lifecycle on the `events` stream: it pauses
+/// while the sealer emits no boundary.
+async fn spawn_events_beacon(plane: &mut StreamPlane, rt: &AeronRuntime) -> Result<()> {
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(rt)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
@@ -598,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
         .context("build the stream plane")?;
 
     let handles = Handles::open(&rt, &mut plane, &cfg).await?;
+    spawn_events_beacon(&mut plane, &rt).await?;
 
     let shutdown = Shutdown::new();
 

@@ -36,7 +36,7 @@ use kardamom_engine::{
     MdbxWriterSignal, Outbound, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
-use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
@@ -148,17 +148,12 @@ async fn spawn_writer_and_bal(
 /// An empty or comment-only file (the current deployment shape)
 /// deserializes to a disabled cluster, so behavior stays the same
 /// unless `[cluster]` is set.
-///
-/// The cluster client's `egress_channel` is this node's reachable
-/// address (the node IP differs per replica), so the Nomad job injects
-/// it as `--cluster-egress-endpoint`, instead of baking it into the
-/// static config file.
 fn load_file_config(args: &Args) -> Result<ExecutorFileConfig> {
     let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
     let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
-    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
-        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
-    }
+    file_cfg
+        .cluster
+        .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
     Ok(file_cfg)
 }
 
@@ -394,6 +389,13 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
 
     let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, args).await?;
+    // This replica's lifecycle on the `events` stream: the ingress pauses
+    // submits once every executor is halted.
+    plane
+        .publisher::<ServiceEventsPublisherHandle>(&rt_pub)
+        .await
+        .context("open events")?
+        .spawn_process_beacon();
 
     let WriterAdapters {
         mut writer,

@@ -1,19 +1,25 @@
-//! The nonce lookup from an executor.
+//! The nonce lookup for a parked sender.
 //!
-//! A cold sender seeds at nonce 0. A restarted replica therefore parks
-//! every transaction of an established sender until a receipt raises the
-//! floor. When the twin is stopped too, no receipt comes, and the sender
-//! stays parked until expiry. This is the open issue F02.1.
+//! A cold sender seeds at nonce 0. Without the lookup, a restarted replica
+//! parks every transaction of an established sender until a receipt raises
+//! the floor. When the twin is stopped too, no receipt comes, and the
+//! sender stays parked until expiry.
 //!
-//! The lookup closes it. When a transaction parks for a sender with no
-//! known floor, the core asks for a lookup through [`LookupRequester`]. The
-//! binary's lookup task queries an executor for the committed nonce and
-//! delivers the answer as a `FloorUpdate`. The floor rises through
+//! When a transaction parks for a sender with no known floor, the core asks
+//! for a lookup through [`LookupRequester`]. The binary's lookup task asks
+//! three layers for the committed nonce, in this order, and stops at the
+//! first answer:
+//!
+//! 1. The local account layer, which the `tx_receipts` rows fill.
+//! 2. Redis, when `[cache]` names an address.
+//! 3. An executor.
+//!
+//! The task delivers the answer as a `FloorUpdate`. The floor rises through
 //! `advance_floor`, with a max merge. It never seeds the state machine.
 //!
-//! The answer is a lower bound. An executor at any height gives a valid
+//! Every answer is a lower bound. A layer at any height gives a valid
 //! answer: a floor that lags the truth only parks a transaction a little
-//! longer. See `docs/specs/dynamic-sequencer-sizing.md`, section 3.4.
+//! longer. So a Redis miss or outage only sends the lookup to an executor.
 //!
 //! The core does not own the in-flight set or the timeout. The task does.
 //! The core sends one request per park, and the task drops the duplicates.
