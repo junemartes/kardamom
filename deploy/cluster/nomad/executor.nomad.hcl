@@ -38,6 +38,21 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The driver timeout of the Aeron clients of the job, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -145,6 +160,9 @@ job "executor" {
       # chosen from data. This stays unset in normal operation, and is
       # harmless (log-only) when set.
       env {
+        # The Aeron C client reads its driver timeout from this variable,
+        # and the service code never overrides it.
+        AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
         # BAL attribution granularity. K=20 measured a 31% reduction
         # in frame bytes on contract workloads
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi

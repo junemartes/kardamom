@@ -22,43 +22,53 @@ transaction there was confirmed to its sender and is undone. Run it only after
 ## Steps
 
 1. Stop the ingress replicas. No new transaction enters while the chain
-   reverts.
+   reverts. Stop the da-watcher. It must not publish epochs of the reverted
+   chain to the new sealers.
 2. List the revoked receipts: for every block in `H + 1 ..= sealed head`, read
-   the receipts from an executor's state database (`kardamom-reconstruct
-   --list-receipts` where available, or the executor query endpoint). Keep the
-   list; the senders are told from it.
+   the receipts from the state database of an executor. Keep the list. The senders are told from it.
 3. Take a consistent cut. The chain's lane cursors must not deliver a message
    the restored history did not send. For every outbound lane, read `sent` at
    block `H` and `delivered` on the peer. If a peer delivered a message sent
-   after `H`, the peer reverts too, to its own cut of the same round. The
-   checkpoint markers of the recovery lines define the round.
-4. Roll back the L1 outputs past the cut: `rollbackOutputs(fromIndex)` on the
-   `WithdrawalOutputOracle`, from the recovery principal, for every output
-   whose L2 block is above `H`. Pause the oracle first and unpause it after,
-   so no withdrawal finalizes during the revert. An output past its
-   finalization window cannot roll back; a problem below that floor is handled
-   forward, with a new cut.
+   after `H`, the peer reverts too, to its own cut of the same round. Each chain
+   records its block of a round in the `CheckpointMarker` predeploy. Read it
+   with `roundBlock(round)`.
+4. Roll back the L1 outputs past the cut.
+   - Call `rollbackOutputs(fromIndex)` on the `WithdrawalOutputOracle`. Use the `recovery` account. Do it for every output whose L2 block is above `H`.
+   - Call `pause()` first and `unpause()` after. No withdrawal then finalizes during the revert.
+   - An output past its finalization window cannot roll back. Handle a problem below that floor forward, with a new cut.
 5. Rebuild the state at `H` from L1 and the DA layer:
    `kardamom-reconstruct --through-block H --expect-root <root at H>`, with
-   `--executor-image`. The rebuilt database carries the resume cursor of block
-   `H` from the posted payload.
-6. Reset the sealers: stop the cluster job, clear the cluster and archive
-   directories of every member, and seed the fresh cluster at `H + 1` with the
-   rebuilt cursor (`kardamom.cluster.seedSnapshot`, where the sealer build has
-   it; else the flag day: a new genesis allocation at `H`, a new settlement,
-   and every role from empty volumes).
+   `--executor-image`, `--sealer-seed <seed file>` and, for a chain with
+   bridge deposits, `--lockbox <address>`. The rebuilt database carries the
+   resume cursor of block `H` from the posted payload. The seed file holds
+   the same head for the sealers.
+6. Reset the sealers: stop the cluster job and clear the cluster and archive
+   directories of every member. Start the fresh cluster from the seed file.
+   - Give every member the same file in `-Dkardamom.cluster.seedSnapshot`.
+     The deploy has no switch for it. Add the property to the JVM options of
+     the members, and make the file readable in the container.
+   - Open the bootstrap for this start: a deploy with
+     `KARDAMOM_CLUSTER_BOOTSTRAP=1` of a job that Nomad does not know.
+   - The sealers log `sealer state SEEDED` with the digest of the file, then
+     `sealer seed CONFIRMED`. The sealers open block `H + 1`.
+   - The chain keeps its genesis and its settlement contract.
 7. Install the rebuilt state on every executor and the validator, with their
    checkpoints removed, and start them. Each resumes at the cursor of `H`.
-8. Reset the batcher: its cursor file and its spool. Clear its halt. It
+8. Reset the da-watcher. Its L1 cursor file holds an epoch of the reverted
+   chain, past `M`, the L1 origin of `H`.
+   - Read `M` from the seed file, as step 2 of `sealer-fleet-rebuild.md` shows.
+   - Remove the file on the aux node: `rm -f /opt/kardamom/da-watcher/l1-cursor`.
+   - Start the da-watcher with `--l1-resume-after M`, as step 6.4 of
+     `sealer-fleet-rebuild.md` shows. Remove the flag at the next deploy.
+9. Reset the batcher: its cursor file and its spool. Clear its halt. It
    reconciles against L1 at batch `lastBatchIndex` and continues from `H + 1`.
-9. Start the ingress replicas. The chain seals again from `H + 1`.
-10. Verify: the rebuilt state root at `H` equals the validator's root at `H`,
+10. Start the ingress replicas. The chain seals again from `H + 1`.
+11. Verify: the rebuilt state root at `H` equals the validator's root at `H`,
     and the first new batch posts with `l2BlockStart == H + 1`.
-11. Publish the list of revoked receipts to the senders.
+12. Publish the list of revoked receipts to the senders.
 
 ## Clear
 
 The revert clears the `replay_unavailable` halt of the batcher through
-`POST /halt/clear` on its node (step 8). No other halt stands after the chain
-seals again. Record the revert, its range, and the time it took: the
-`revert-to-posted-head` chaos case proves and times this procedure.
+`POST /halt/clear` on its node (step 9). No other halt stands after the chain
+seals again. Record the revert, its range, and the time it took.

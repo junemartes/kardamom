@@ -15,6 +15,11 @@ export TF_CONTAINERS := env('TF_CONTAINERS', 'terraform/containers')
 export KARDAMOM_STAGED := env('KARDAMOM_STAGED', '')
 export CLUSTER_BIN := env('CLUSTER_BIN', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-cluster' } else { 'cargo run --release -p kardamom-chaos --locked --bin kardamom-cluster --' })
 export RUN_SHARDS := env('RUN_SHARDS', if KARDAMOM_STAGED != '' { '../../target/release/kardamom-chaos-shards' } else { 'cargo test -p kardamom-chaos --release --features cluster-e2e --locked --test shards --' })
+# The Aeron stall tolerance of a container cluster, in milliseconds: the
+# value of the cluster-e2e workflow and the local e2e harness. A shared
+# CI or developer host stalls past Aeron's 10 s default at times. Only the
+# container recipes set it; `deploy` keeps the 10 s production default.
+container_stall_ms := env('AERON_STALL_TOLERANCE_MS', '30000')
 
 _default:
     @just --list
@@ -84,6 +89,7 @@ container-up:
     #!/usr/bin/env bash
     set -euo pipefail
     export REGISTRY_PUSH_NODE="${REGISTRY_PUSH_NODE:-control-0}"
+    export AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}"
     # New nodes get a new sealer cluster. The deploy opens the bootstrap
     # only for a cluster job that Nomad does not know.
     export KARDAMOM_CLUSTER_BOOTSTRAP="${KARDAMOM_CLUSTER_BOOTSTRAP:-1}"
@@ -101,11 +107,11 @@ container-up:
 # chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache,
 # chaos-l1.
 container-test $shard=env('SHARD', 'load'):
-    KARDAMOM_CHAOS_REUSE=1 $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+    KARDAMOM_CHAOS_REUSE=1 AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Run a shard end to end, including its cluster lifecycle, as CI does.
 shard $shard=env('SHARD', 'load'):
-    $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
+    AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 
 # Collect node and job state after a failure.
 container-diagnostics:

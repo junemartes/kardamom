@@ -23,8 +23,9 @@ import java.util.TreeMap;
  *
  * <p>Responsibilities:</p>
  * <ul>
- *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[], long)}).</li>
+ *   <li><b>Dedup</b> — a first-seen window over 32-byte canonical ids,
+ *       pruned by inclusion deadline and capped at the dedup capacity
+ *       ({@link #firstSeen(byte[], long)}).</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
  *       relays each first-seen record with its 0-based index and increases
  *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
@@ -70,6 +71,13 @@ public final class CanonicalSealerState {
 
     /** Length, in bytes, of a sender address in the contiguity guard. */
     public static final int SENDER_LEN = 20;
+
+    /**
+     * How many ids a window may hold above {@code dedupCapacity}. Marker
+     * ids (epochs and remote batches) skip the cap, and one inclusion
+     * horizon holds far fewer than this many.
+     */
+    static final int MARKER_SLACK = 4096;
 
     /** Default genesis block number. */
     public static final long GENESIS_BLOCK_NUMBER = 1L;
@@ -138,8 +146,8 @@ public final class CanonicalSealerState {
     private static final int REMOTE_ENTRY_LEN_V4 = 8 + 8;
 
     /**
-     * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
-     * id is the first element, and eviction removes it. Keys are 32-byte
+     * The first-seen window. It is insertion-ordered, and a deadline prune
+     * removes the ids that no offer can use again. Keys are 32-byte
      * ids, wrapped in a read-only {@link ByteBuffer} for value-based
      * equality.
      */
@@ -569,6 +577,26 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * Record a marker id in the window, and report whether it was new.
+     *
+     * <p>A marker does not meet the capacity cap. A refused epoch is lost:
+     * the offering sequencers do not republish it, and the da-watcher has
+     * moved its cursor past it. Epochs come at the L1 block rate, so the
+     * markers in the window stay few: at most the epochs that arrive within
+     * one inclusion horizon. Every member takes the same branch, so the
+     * replicated state stays identical.</p>
+     */
+    private boolean admitMarker(byte[] id32) {
+        checkId(id32);
+        ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
+        if (dedup.containsKey(key)) {
+            return false;
+        }
+        insertFresh(key, assignedDeadline());
+        return true;
+    }
+
+    /**
      * Drop every id whose deadline is below the open block. No offer
      * carrying one of them can be accepted again, so forgetting them is
      * safe by construction, and the window is bounded by the horizon
@@ -925,7 +953,7 @@ public final class CanonicalSealerState {
         // submission. The sealer assigns one, for pruning only. A re-offer
         // of a pruned marker id meets the origin guard below, which is
         // what refuses it.
-        if (firstSeen(canonicalId32, assignedDeadline()) != Admission.FRESH) {
+        if (!admitMarker(canonicalId32)) {
             return Optional.empty();
         }
         if (newL1Origin <= l1Origin) {
@@ -1436,17 +1464,17 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
-        if (idCount < 0 || idCount > dedupCapacity) {
+        if (idCount < 0 || idCount > (long) dedupCapacity + MARKER_SLACK) {
             // A snapshot taken with a larger configured window than this
-            // member's would silently rebuild an oversized window. firstSeen
-            // only shrinks it by one entry per insert, so dedup behavior
-            // would differ from a fresh state with the same config — a
-            // determinism hazard if members disagree on the capacity. Fail
-            // loudly instead of truncating silently. Shrinking the window
-            // across a restart needs an explicit migration.
+            // member's would rebuild an oversized window, and members that
+            // disagree on the capacity would decide differently. Fail
+            // loudly. Markers do not meet the cap, so a window can hold
+            // MARKER_SLACK ids above it. Shrinking the window across a
+            // restart needs an explicit migration.
             throw new IllegalArgumentException(
                     "snapshot idCount " + idCount + " outside [0, dedupCapacity="
-                            + dedupCapacity + "] — members must agree on the configured window");
+                            + dedupCapacity + " + " + MARKER_SLACK
+                            + "] — members must agree on the configured window");
         }
         int idEntryLen = version >= 7 ? CANONICAL_ID_LEN + 8 : CANONICAL_ID_LEN;
         if ((long) idCount * idEntryLen > buf.remaining()) {

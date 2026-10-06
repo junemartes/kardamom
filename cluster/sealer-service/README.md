@@ -1,85 +1,445 @@
-# kardamom sealer cluster service (Java)
+# Kardamom sealer cluster service (Java)
 
-The canonical-ordering state machine that runs inside an **Aeron Cluster**
-(Raft) — the fault-tolerant replacement for the single `kardamom-sealer`
-process. It dedups racing sequencer records, assigns the canonical record index,
-and stamps 250 ms block boundaries; the Raft Consensus Module replicates it
-across the cluster and fails the leader over automatically.
+The sealer is the canonical-ordering state machine. It runs inside an Aeron Cluster (Raft).
 
-Aeron's Consensus Module is JVM-only, so this logic lives in Java. The Rust
-pipeline talks to the cluster through `crates/cluster-adapter` (in-process trait
-adapters over a Rust-native cluster client) — see
-`docs/agents/sealer-aeron-cluster-failover-spec.md`.
+- It dedups the records that racing sequencer replicas offer.
+- It gives each record a canonical index.
+- It stamps a block boundary on each tick.
+- The Raft Consensus Module replicates the state and moves the leader on a failure.
+
+The Aeron Consensus Module is JVM-only, so this logic is in Java. The Rust pipeline talks to the
+cluster through `crates/cluster-adapter`. For the design, see
+[`docs/agents/sealer-aeron-cluster-failover-spec.md`](../../docs/agents/sealer-aeron-cluster-failover-spec.md) (further reading).
 
 ## Layout
 
-- **`core/`** — `CanonicalSealerState`: the pure, deterministic state machine
-  (dedup window + canonical count + boundary timer + snapshot). **No Aeron
-  dependency**, so its JUnit tests run with only JUnit on the classpath. This is
-  the one dedup point of the pipeline: the executor trusts its relayed
-  stream and keeps no window of its own.
-- **`service/`** — `SealerClusteredService implements
-  io.aeron.cluster.service.ClusteredService`: the thin Aeron plumbing
-  (ingress decode, egress framing, boundary timer, snapshot I/O) that delegates
-  all logic to `core`. Depends on `io.aeron:aeron-cluster:1.44.0`.
+- `core/`: `CanonicalSealerState`, the pure and deterministic state machine.
+  - It holds the dedup window, the canonical count, the boundary stamp, the void ledger and the snapshot.
+  - It has no Aeron dependency. Its JUnit tests need only JUnit on the classpath.
+  - It is the one dedup point of the pipeline. The executor trusts the relayed stream and keeps no window.
+- `service/`: `SealerClusteredService`, which implements `io.aeron.cluster.service.ClusteredService`.
+  - It is the thin Aeron layer: ingress decode, egress framing, timers, snapshot I/O, the admin server.
+  - It delegates all logic to `core`.
+  - It depends on `io.aeron:aeron-cluster:1.44.0`.
 
-## App envelope (kept in lockstep with the Rust `cluster-adapter::wire`)
+## App envelope
 
-```
-ingress  [kind:u8=0][sender:20][nonce:u64][deadline:u64][tip:u128][canonical_id:32][record_type:u8][fields…]
-         (the guard header feeds the contiguity guard, the deadline check, and the
-          ordering window; the payload from the canonical id on is relayed)
-egress   relayed:  [kind:u8=1][index:u64-LE][payload_len:u32-LE][relayed payload]
-         boundary: [kind:u8=2][block_number:u64-LE][end_tx_idx:u64-LE][l2_timestamp:u64-LE]
-```
+The Java side (`SealerWire.java`) and the Rust side (`crates/cluster-adapter/src/wire`) use the
+same layouts. All integers are little-endian. A frame starts with a one-byte kind.
 
-## Ordering window (`-Dkardamom.cluster.orderingWindow`)
+### Ingress kinds (client to cluster)
 
-With priority fees on (`20`), a window of records in front of the record path
-flushes in `(tip descending, arrival ascending)` order, one sender's records in
-nonce order. It closes on log events only: the entry count, a 5 ms cluster
-timer, a boundary tick, an origin record, or a snapshot, so every member relays
-the same order. `0` passes every record through at once. Every member must use
-the SAME value: the snapshot carries it, and a member that restores a snapshot
-taken with another value halts. The deploy sets it with the sequencer's
-`[fees] priority` from one value, `PRIORITY_FEES`.
+| Kind | Name | Layout |
+|---|---|---|
+| 0 | Record | `[kind=0][sender:20][nonce:u64][deadline:u64][tip:u128][canonical_id:32][record_type:u8][fields…]` |
+| 1 | Replay request | `[kind=1][from_index:u64][from_block:u64]` |
+| 2 | Subscribe | `[kind=2]` |
+| 3 | Batch | `[kind=3][count:u16]` then, for each entry, `[len:u32][one complete kind-0 frame]` |
+| 4 | Origin record | `[kind=4][canonical_id:32][l1_origin:u64][slot_count:u32][record_type:u8][fields…]` |
+| 5 | Remote-origin record | `[kind=5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][first_seq:u64][last_seq:u64][record_type:u8][fields…]` |
+| 6 | Void request | `[kind=6][voter_id:u8][index:u64][tx_hash:32]` |
+| 7 | Posted cursor | `[kind=7][posted_head:u64]` |
+| 8 | Seed record | `[kind=8][digest:32]` |
 
-## Dedup window sizing (`-Dkardamom.cluster.dedupCapacity`)
+- Kind 0: the guard header is `sender`, `nonce`, `deadline` and `tip`.
+  - The service reads the header for the contiguity guard, the deadline check and the ordering window.
+  - The service relays the payload from `canonical_id` on. The executor never sees the header.
+  - An all-zero `sender` is exempt from the contiguity guard.
+  - A frame shorter than 85 bytes is malformed.
+- Kind 1: a consumer sends it to resume. The sealer checks the cursor `(from_index, from_block)` in this order:
+  1. A cursor past the head of the sealer gets `REPLAY_AHEAD` (egress kind 11). The cursor is past the head when `from_index` is above the canonical count, or `from_block` is above the block that the next tick stamps.
+  2. A pair that does not name one point of the stream gets `REPLAY_UNAVAILABLE`. The log line ends with `SKEWED`.
+  3. A cursor below the retention floor gets `REPLAY_UNAVAILABLE`. The log line ends with `UNAVAILABLE`.
+  4. Any other cursor gets the retained frames from the cursor, then `REPLAY_DONE`. A consumer exactly at the head gets `REPLAY_DONE` and no frame.
+- Kind 2: the session is a canonical-stream consumer. A publisher-only session (a sequencer) never sends it.
+- Kind 3: the service handles each entry as a single offered record. A malformed entry drops the rest of the batch.
+- Kind 4: it carries an epoch of L1 deposits.
+  - It has no guard header. The service does not parse the payload.
+  - It closes the open block, adopts `l1_origin` for later boundaries, and relays the record.
+  - A non-advancing origin is dropped as malformed.
+- Kind 5: it carries a batch of cross-chain messages from a peer chain.
+  - It has no guard header.
+  - A peer chain id that is not in `remoteOrigins` gets an egress kind 6.
+  - The service checks `slot_count == 2 + last_seq - first_seq`, the `first_seq` lane cursor and the anchor.
+- Kind 6: the void request is a vote, not a command.
+  - A consumer with a voter id sends it when the entry at `index` has no data and every archive refuses the range.
+  - The service appends a void record only when every configured voter votes for the same `(index, tx_hash)`.
+  - The service refuses a vote from a stranger, with a wrong hash, for a slot that is not a `TxRef`, outside the void window, or for an entry that is already voided.
+  - The ledger holds at most 1024 indices with open votes. The voter id must be below 64.
+- Kind 7: the posted cursor is the system record of the batcher. It has no guard header.
+  - `posted_head` is the last L2 block that the batcher confirmed on L1. The batcher sends it at start and after each change.
+  - The sealer keeps the head in the replicated state. It never lets the head move down.
+  - A head above the sealed head is malformed. The service drops it.
+  - After a head that moves up, the sealer prints `cluster POSTED-CURSOR` and sends an egress kind 9 to every session.
+- Kind 8: the seed record is a system record of the sealer. See [Seeded start](#seeded-start).
+  - Only the service offers it. A frame from a client session, or a frame that is not 33 bytes, is malformed and the service drops it.
+  - It carries the SHA-256 of the seed file.
 
-The first-seen window is the ONLY thing preventing a lagging racing replica's
-re-offers from being ordered twice: a replica that stalls (GC pause, SIGSTOP,
-cgroup throttle, receive backlog) and resumes after its twin pushed more than
-`dedupCapacity` *unique* ids through the sealer re-offers records whose ids
-were FIFO-evicted — and they are accepted as fresh. The invariant is
-quantitative: **`dedupCapacity` > worst-case replica stall × peak unique-record
-throughput**. The default (`1 << 17` = 131072, see
-`SealerClusteredService.DEFAULT_DEDUP_CAPACITY`) tolerates a ~13 s stall at
-10k tx/s (~20 MB heap, ~4 MB snapshot). Every member must use the SAME value —
-the window is part of the deterministic state machine, and a snapshot never
-loads into a smaller window than it was taken with.
+### Relayed record types
 
-## Build & test
+The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 
-Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on
-first run.
+| `record_type` | Name | Fields |
+|---|---|---|
+| 0 | `TxRef` | `[shard_id:u8][term_id:i32][term_offset:i32][tx_data_session_id:i32]` |
+| 1 | `DepositRef` | `[term_id:i32][term_offset:i32]` |
+| 2 | Epoch | an rkyv `EpochRecord` |
+| 3 | Remote epoch | an rkyv `RemoteEpochRecord` |
+| 4 | Void record | `[index:u64]` |
+
+- The void record is the payload `[tx_hash:32][record_type=4][index:u64]`.
+  - The service generates it. It never relays one from a session.
+  - It takes one canonical slot.
+  - Every consumer drops the `TxRef` at `index`. The service removes the hash from the dedup window and sets the sender nonce back.
+
+### Egress kinds (cluster to client)
+
+| Kind | Name | Layout | Sent to |
+|---|---|---|---|
+| 1 | Relayed record | `[kind=1][index:u64][payload_len:u32][relayed payload]` | consumers |
+| 2 | Boundary | `[kind=2][block_number:u64][end_tx_idx:u64][l2_timestamp:u64][l1_origin:u64]` | all sessions |
+| 3 | Replay unavailable | `[kind=3][oldest_index:u64][oldest_block:u64]` | the requester |
+| 4 | Replay done | `[kind=4][up_to_index:u64][up_to_block:u64]` | the requester |
+| 5 | Contiguity reject | `[kind=5][sender:20][nonce:u64][expected:u64]` | the offering session |
+| 6 | Remote-origin reject | `[kind=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]` | the offering session |
+| 7 | Past deadline | `[kind=7][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]` | the offering session |
+| 8 | Window full | `[kind=8][sender:20][nonce:u64]` | the offering session |
+| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]` (50 bytes) | all sessions |
+| 10 | DA-lag reject | `[kind=10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]` | the offering session |
+| 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
+
+- `index` is the 0-based canonical record index.
+- Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
+- Kind 5: the sequencer rewinds its unconfirmed ledger to `expected` and republishes.
+- Kind 6: `reason` is 1 `seq_mismatch`, 2 `anchor_regressed`, 3 `slot_count_mismatch`, 4 `unknown_origin` or 5 `bad_range`.
+  - This egress kind 6 is not the ingress kind 6 (the void request). The two numbers are on different sides of the wire.
+- Kind 7 and kind 8: see the next section.
+- Kind 9: the status of the chain. `halted` is `1` when the DA-lag guard refuses user records.
+  - The service sends it on each boundary tick, on each posted cursor that moves up, and to a session that announces itself with a kind 1 or a kind 2.
+  - It is not retained. A session that announces itself gets the current status.
+- Kind 10: the DA-lag guard refused a record. The sequencer drops the record and reports the `da-lag` reason. See [DA-lag guard](#da-lag-guard).
+- Kind 11: the cursor of the requester is past the head of the sealer. See [Replay ahead of the head](#replay-ahead-of-the-head).
+  - `head_index` is the canonical count. `head_block` is the block that the next tick stamps.
+
+## Egress back-pressure
+
+An offer to a session never waits. The service thread also runs the boundary tick and relays records for every session, so a wedged client must not stop it.
+
+- The first offer of a frame is one attempt. A back-pressure result (`BACK_PRESSURED`, `ADMIN_ACTION` or `NOT_CONNECTED`) puts the frame in the backlog of that session. `ADMIN_ACTION` gets one immediate retry first.
+- While a session has a backlog, every new frame for it goes to the backlog. The session gets its frames in emission order: a replay, then `REPLAY_DONE`, then the live stream.
+- The service drains the backlogs at the start of each ingress message and each timer event. The boundary timer makes a drain run at least once for each tick.
+- The service closes a session once, when one of these limits is reached. It then prints `cluster EGRESS-CLOSE` with the reason.
+
+| Limit | Value | Reason text |
+|---|---|---|
+| No frame leaves the backlog | 1 second. The clock restarts each time a frame leaves. | `offer deadline exhausted (back-pressure)` |
+| The backlog holds more bytes | 64 MiB. A replay of the default retention fits well below it. | `egress backlog over <n> bytes` |
+| A terminal offer result (not `CLOSED`) | at once | `terminal offer result <n>` |
+
+- A session that is closing gets no more frames. The client reconnects, replays and recovers.
+- A role change drops all backlogs. The clients of a leader that steps down reconnect to the new leader and replay.
+- A follower never builds a backlog. Only the leader offers to clients.
+- The backlogs are member-local. They do not change the replicated state, the log or the snapshot.
+- A drain runs on a log callback. On an idle cluster a back-pressured session gets one egress window for each tick. A large replay to a slow client then takes longer. It does not block other sessions.
+
+## Replay ahead of the head
+
+A consumer can resume past the head of the sealer. This happens after a sealer wipe, when the sealer starts again behind its consumers.
+
+- The consumer applied records that the sealer does not hold.
+- The sealer answers `REPLAY_AHEAD` (egress kind 11) with its head. It logs `cluster REPLAY ... AHEAD head=(index,block)`.
+- A `REPLAY_DONE` would make the consumer drop each new record below its cursor as a duplicate. The consumer would diverge with no signal.
+- The consumer stops with the error `ClusterBehindCursor`. It also stops on a `REPLAY_DONE` whose head is below its cursor.
+- See [the failure model](../../docs/failure-modes.md#sealer-the-aeron-cluster-raft) for the effect on each consumer.
+
+## Dedup window and inclusion deadline
+
+The first-seen window is the one thing that stops a lagging racing replica from getting its
+re-offer ordered twice. It never evicts an id. It prunes by deadline.
+
+- Each ingress record carries a `deadline`: the last block the sealer may order it into.
+  - The ingress proxy stamps it as the newest block boundary it saw plus `--inclusion-horizon-blocks`.
+  - A proxy that has seen no boundary stamps `i64::MAX`. The sealer reads the field as a signed 64-bit integer.
+- The sealer checks a record in this order:
+  1. The dedup lookup. An id that is in the window is a duplicate. The sealer drops it.
+  2. The deadline. If the open block number is above the deadline, the result is `PAST_DEADLINE`.
+  3. The capacity. If the window holds `dedupCapacity` ids, the result is `WINDOW_FULL`.
+  4. The contiguity guard.
+- The sealer stores the deadline clamped to `blockNumber + inclusionHorizonBlocks`.
+  - The clamp only shortens the deadline. It bounds the window even if a proxy stamps a far deadline.
+  - A record with no deadline of its own (an epoch or a remote-origin record) is held until `blockNumber + inclusionHorizonBlocks`.
+  - An epoch record and a remote-origin record do not meet the capacity check.
+    - Nothing republishes them, so a refusal would lose the deposits or the messages.
+    - They are few: one per L1 block or peer batch. The window holds each for one inclusion horizon.
+    - So the window grows above `dedupCapacity` by only the markers of that horizon.
+- On each boundary tick the sealer drops every id whose deadline is below the new block number.
+  - No copy of a pruned id can be accepted again. So a late re-offer is refused, not read as fresh.
+
+| Result | Egress frame | What the sequencer does |
+|---|---|---|
+| `PAST_DEADLINE` | kind 7 | It drops the ledger entry. It reports the error to the client. The client resubmits. |
+| `WINDOW_FULL` | kind 8 | It republishes the record later. The next tick that passes a deadline frees space. |
+
+- `PAST_DEADLINE` reaches a client as the `past-deadline` reason and as a JSON-RPC error. See [the client JSON-RPC API](../../docs/json-rpc.md) and [the status events](../../docs/tx-status-events.md).
+- `WINDOW_FULL` is back-pressure. The sealer takes no decision on the record.
+- `dedupCapacity` is a hard cap. The default is `1 << 17` (131072 ids), about 20 MB of heap and 4 MB of snapshot.
+  - An id stays in the window for at most `inclusionHorizonBlocks + 1` blocks.
+  - So the window size is about the unique-record rate times the horizon times the block interval.
+  - With the deploy values (64 blocks, 2000 ms), the default capacity covers about 1000 unique records each second.
+  - The same capacity bounds the per-sender expected-nonce map (LRU) in the contiguity guard.
+- The sealer horizon must equal the ingress horizon.
+  - The sealer property is `-Dkardamom.cluster.inclusionHorizonBlocks`. The ingress flag is `--inclusion-horizon-blocks`, with env `KARDAMOM_INCLUSION_HORIZON_BLOCKS`. Both default to 64.
+  - The deploy variables are `cluster_inclusion_horizon_blocks` and `inclusion_horizon_blocks`. The contract check (`just check-contract`, `just validate` and CI) fails if they differ.
+- Every member must use the same `dedupCapacity` and the same horizon. They decide accept or reject inside the replicated state machine.
+  - A snapshot that holds more ids than `dedupCapacity` plus 4096 (the marker slack), or more senders than the capacity, does not load.
+
+## DA-lag guard
+
+The DA-lag guard stops the chain from sealing far ahead of the data that the batcher posted to L1.
+
+- The sealer refuses a user record when `budget > 0` and `sealed_head - posted_head > budget`.
+  - The default budget is 10000 blocks. `0` turns the guard off.
+  - The refused record is not ordered. The sealer sends an egress kind 10 to the offering session.
+  - A refused record moves nothing. The nonce of the sender does not change, so a new submission is accepted as fresh.
+- The guard runs after the dedup check and the deadline check, and before the capacity check and the contiguity guard.
+- These inputs still enter while the guard refuses:
+  - a record with an all-zero `sender` (deposits)
+  - an origin record and a remote-origin record
+  - the boundary tick
+- The posted head comes from the ingress kind 7. The sealer replicates it, so every member decides the same way.
+- The sealer sends the status (egress kind 9) to all sessions. The ingress raises a `da_lag` halt from the `halted` flag and clears it when the flag is `0`.
+- The ingress `da_lag` halt pauses the submits of the ingress. See [the client JSON-RPC API](../../docs/json-rpc.md) and [the failure model](../../docs/failure-modes.md#halts-and-service-events).
+- Every member must use the same budget. See `kardamom.cluster.daLagBudgetBlocks` in [Settings](#settings).
+
+## Ordering window
+
+With priority fees on, a window of records sits in front of the record path.
+
+- The window holds up to `orderingWindow` records (the deploy uses 20).
+- It flushes in `(tip descending, arrival ascending)` order. One sender's records stay in nonce order.
+- It closes on log events only, so every member relays the same order:
+  - the entry count reaches the window size
+  - a 5 ms cluster timer expires
+  - a boundary tick
+  - an origin record or a remote-origin record
+  - a snapshot
+- Dedup, the deadline check, the capacity check, the contiguity guard and the index assignment run at the flush, in the flush order.
+- `0` passes every record through at once.
+- Every member must use the same value. The snapshot carries it. A member that restores a snapshot taken with another value halts.
+- The deploy sets the window and the sequencer `[fees] priority` from one value, `PRIORITY_FEES`. See [priority fees](../../docs/priority-fees.md).
+- The node sets the Aeron timer wheel tick to 1 ms, so the 5 ms timer fires on time.
+
+## Start modes
+
+The member decides how it starts once, before it launches. The line `cluster START mode=<mode>` shows the mode.
+
+| Mode | When | What the member does |
+|---|---|---|
+| `RESUME` | The cluster directory holds a recording log with at least one entry. | It starts from its own recording log. |
+| `GENESIS` | The directory is blank and the bootstrap is on. | It starts at log position 0. |
+| `SEED_FROM_PEER` | The directory is blank and the bootstrap is off. | It copies the latest snapshot from a peer, then starts from it. |
+
+- A blank member has no recording log entry.
+- The bootstrap is on when either input says `true`. An unset or empty input is off. Any other text stops the start.
+  - The property `-Dkardamom.cluster.bootstrap=true`. Use it for a launcher that always starts a new cluster, such as a local test stack.
+  - The file `bootstrap` in the Nomad task directory (`$NOMAD_TASK_DIR`). The member reads it at each start. The deploy writes `true` into it only during the first deploy of a new cluster. See [the deploy README](../../deploy/cluster/README.md#sealer-bootstrap).
+- A blank member must not start at position 0 in a running cluster. It cannot catch up after the leader purges its log. Blank members that elect each other start a second history.
+
+### Peer seed
+
+A blank member without the bootstrap copies state from a running peer before it launches.
+
+- Each round clears the cluster directory and the archive directory. It then runs an Aeron ClusterBackup with `LATEST_SNAPSHOT` against the consensus endpoints of the other members.
+- The backup writes the snapshot and the recording log into the own directories of the member. The recording log keeps the real log position, so the member joins at the snapshot position, not at 0.
+- The round ends when the backup reaches `BACKING_UP`. The member then launches. It restores the snapshot and catches up from the leader.
+- A round ends with no result when no peer answers for 20 s. The next round starts after a backoff of 1 s that doubles up to 30 s.
+- A blank member never falls back to position 0. It waits and prints `cluster SEED waiting-for-peer`.
+- If the cluster has no snapshot yet, the member holds the whole log. The line `cluster SEED from-peer` shows `snapshotPosition=-1`.
+
+## Seeded start
+
+A sealer cluster that lost all its state can start after a block `H` that `kardamom-reconstruct` rebuilt from L1. The consumers resume at `H`, so a start at genesis would put the sealer behind them. See [Replay ahead of the head](#replay-ahead-of-the-head).
+
+1. Run `kardamom-reconstruct --sealer-seed <file>` (see [the L1 data path](../../docs/l1-data-path.md#kardamom-reconstruct)).
+2. Give the same file to every member in `-Dkardamom.cluster.seedSnapshot=<path>`.
+3. Start the members as a new cluster, with empty cluster and archive directories and the bootstrap on.
+
+- The seed file is versioned and big-endian. It holds:
+  - the magic `KSED` and the version (1)
+  - the chain id, `H`, the canonical end `E_H` of `H`, the timestamp of `H` and its L1 origin
+  - the state root
+  - the senders and the next nonce of each
+- The digest is the SHA-256 of the file. `sha256sum` of the file equals the `digest=` in the log.
+- A member that restores a snapshot ignores the seed.
+- An unreadable or invalid seed stops the start.
+- A member with a non-empty `remoteOrigins` refuses a seed and does not start. The seed holds no peer anchor, so a seeded cluster runs with interop off.
+
+The seeded state:
+
+- The next block is `H + 1`. The next canonical index is `E_H`. The open block is empty.
+- The timestamp and the L1 origin come from the seed.
+- The posted head is `H`, so the DA-lag guard does not halt the chain at once.
+- The dedup window and the void ledger are empty.
+- The nonce guard holds the seeded senders, the eldest first. A guard with a smaller capacity keeps the most recent senders.
+- The egress opens at `(E_H, H + 1)`. A consumer at the rebuilt head resumes there.
+
+The seed record (ingress kind 8) proves that every member started from the same seed:
+
+- While the seed is not confirmed, every member offers the record in each new leadership term. Aeron needs every member to offer the same service message at the same log point.
+- The first record in the log confirms the seed. A second record changes nothing.
+- The leader then asks for a Raft snapshot. A member that joins later restores the seeded state from it and never replays the record.
+- A member that started at genesis, or from another seed, prints `sealer SEED-EPOCH FATAL` and stops before it relays a record. A blank member that replays the log from position 0 without the seed fails this way.
+
+## Settings
+
+The service reads these JVM system properties. The deploy passes them in `JAVA_TOOL_OPTIONS`.
+
+| Property | Code default | Every member must match | Meaning |
+|---|---|---|---|
+| `kardamom.cluster.members` | none (required) | yes | The member list: `id,ingress,consensus,log,catchup,archive` for each member, separated by `\|`. |
+| `kardamom.cluster.memberId` | `-1` | no | This member id. A value below 0 means: find the member whose ingress host equals `nodeIp`. |
+| `kardamom.cluster.nodeIp` | none | no | This node IP. It is required when `memberId` is not set. |
+| `aeron.dir` | `/opt/kardamom/aeron-mount/dir` | no | The Aeron media-driver directory. |
+| `kardamom.cluster.dir` | `/opt/kardamom/cluster` | no | The cluster (Raft log and mark file) directory. |
+| `kardamom.archive.dir` | `/opt/kardamom/archive` | no | The Aeron archive directory. |
+| `kardamom.cluster.ingressStreamId` | `101` | yes | The ingress stream id that clients offer to. |
+| `kardamom.cluster.tickMs` | `2000` | recommended | The block interval in ms. The leader arms the boundary timer with it. |
+| `kardamom.cluster.dedupCapacity` | `131072` | yes | The hard cap of the dedup window. |
+| `kardamom.cluster.inclusionHorizonBlocks` | `64` | yes | The deadline clamp. It must equal the ingress horizon. |
+| `kardamom.cluster.orderingWindow` | `0` | yes | The ordering window size. `0` is off. |
+| `kardamom.cluster.remoteOrigins` | empty (env `KARDAMOM_REMOTE_ORIGINS`) | yes | The peer chain ids that the sealer accepts kind-5 records from. Empty turns interop off. The property wins over the env var. A bad entry stops the start. |
+| `kardamom.cluster.voidVoters` | empty (env `KARDAMOM_VOID_VOTERS`) | yes | The voter ids, for example `0,1,2,3,4`. Empty refuses every void request. Each id must be below 64. |
+| `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
+| `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
+| `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
+| `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
+| `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
+| `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. `0` turns it off. |
+| `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
+| `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
+| `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
+
+- Block interval: the code default `tickMs` is 2000 ms. The deploy also passes `2000`.
+  - The state machine floors the `l2_timestamp` of each boundary to a multiple of 250 ms.
+  - The constant `TICK_INTERVAL_MS` (250) is that floor. It is also the interval of the test constructors.
+- `voidVoters`: the deploy sets the list to `0` to `executor_count + 1`. Executor `i` has voter id `i`. The validator has `executor_count`. The batcher has `executor_count + 1`.
+- `remoteOrigins`, `voidVoters` and `voidWindow` are not in the snapshot. A different value on one member makes it decide differently from the others.
+- `fileSyncLevel`: `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs the data and the file metadata.
+  - At level 0 an entry that a quorum acknowledged can exist only in page caches. A power loss that takes the members together drops it.
+  - The deploy passes `1` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+- `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
+  - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
+  - The stretch has a bound: the budget plus one flush of blocks, in heap.
+  - The snapshot carries the retained frames. A member that restores a snapshot keeps the floor at the posted head. It answers older ranges with `REPLAY_UNAVAILABLE`.
+  - With no budget (`0`), nothing bounds the stretch.
+  - Use the same value on every member, so the replay range does not change after a failover.
+- `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
+- The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes`, `joinWatchdogS` or `seedSnapshot`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
+- The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, and the application version is 0.3.0.
+
+## Admin server
+
+The admin server reports the member status over HTTP. It is off when `adminPort` is `0`. The deploy uses port `40205`.
+
+| Request | Answer |
+|---|---|
+| `GET /status` | Always 200 with the status JSON. |
+| `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
+| any other path | 404 |
+
+- The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition` and `ready`.
+- A member is ready when all of these are true:
+  - the role is `LEADER` or `FOLLOWER`
+  - the election state is `CLOSED`
+  - `commitPosition - servicePosition` is at most `readyLagBytes`
+- A member in an election, or a follower that still catches up, is not ready. A closing member reads `CLOSED` for the role and is never ready.
+- If the status cannot be read, `/ready` and `/status` answer 503 with an `error` field.
+- The Nomad job registers a Consul check of the path `/ready`. A rolling deploy waits for it before it stops the next member.
+
+## Log lines
+
+The service prints on stdout. Each line starts with a UTC instant, then the text in the table.
+The chaos suite and operators read these lines. The sealer has no other observability surface.
+
+| Line starts with | Meaning |
+|---|---|
+| `cluster role=<role> memberId=` | The member role changed. |
+| `cluster TERM` | A leadership term began (`leadershipTermId`, `leaderMemberId`, `logPosition`, `role`, `block`). All members print it, also on replay. |
+| `cluster boundary-clock TICK` | A heartbeat. It prints once for each 30 boundary ticks. It shows that the boundary clock runs. |
+| `cluster boundary-clock REVIVE` | The leader found no tick for three tick intervals and armed the timer again. |
+| `cluster SESSION open` / `cluster SESSION close` | A client session opened or closed. The close line has the reason. |
+| `cluster CONTIGUITY-REJECT` | The guard refused a record with a nonce gap. |
+| `cluster PAST-DEADLINE` | The sealer refused a record past its deadline. |
+| `cluster DA-LAG-REJECT` | The DA-lag guard refused a record (`nonce`, `sealedHead`, `postedHead`, `budget`, `totalDaLagRejected`). |
+| `cluster POSTED-CURSOR` | The posted head moved up (`postedHead`, `sealedHead`, `retained`, `halted`). |
+| `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
+| `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
+| `cluster VOID-VOTE` | A void vote changed the count (`voter`, `index`, `result`, `votes` as `n/total`). A repeated vote prints nothing. |
+| `cluster DROPPED malformed` | The service dropped a malformed frame. The line names the frame type. A non-zero count means that the Java and Rust layouts differ. |
+| `cluster REPLAY` | A replay request. A served replay ends with `served=`, `queued=` and `dropped=`. A refusal ends with `AHEAD head=(index,block)`, `SKEWED` or `UNAVAILABLE`. `AHEAD` means that the cursor is past the head. `SKEWED` means that `from_index` is outside the block that `from_block` names. |
+| `cluster EGRESS-CLOSE` | The service closed a client session because it could not take its frames. The line has the reason. See [Egress back-pressure](#egress-back-pressure). |
+| `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`). A member that replays old log entries also prints it. |
+| `sealer snapshot RESTORED` | The member started from a snapshot. The line shows `block`, `canonicalCount`, `retained` and `postedHead`. |
+| `sealer state FRESH at genesis` | The member started with no snapshot and no seed. |
+| `sealer state SEEDED` | The member started from a seed (`block`, `endTx`, `senders`, `stateRoot`, `digest`). |
+| `sealer seed CONFIRMED` | The first seed record is in the log (`block`, `canonicalCount`). |
+| `sealer seed SNAPSHOT` | The seeded leader asked for a snapshot (`requested=true` or `false`). A refused request leaves the periodic snapshot to take one. |
+| `sealer SEED-EPOCH FATAL` | The log holds a seed record, but this member started at genesis or from another seed. The member stops. |
+| `sealer SEED-EPOCH offer FAILED` | The offer of the seed record failed. The next leadership term offers it again. |
+| `cluster START mode=` | The start mode of the member (`RESUME`, `GENESIS` or `SEED_FROM_PEER`). |
+| `cluster SEED start` / `cluster SEED from-peer` | A blank member starts to copy a snapshot from a peer, and then ends the copy (`snapshotPosition`, `round`). |
+| `cluster SEED waiting-for-peer` | A round of the peer seed ended with no result (`outcome`, `backupState`, `retryInMs`). The member waits and does not start at genesis. |
+| `cluster SEED backup error` | The ClusterBackup of the peer seed reported an error. |
+| `cluster SNAPSHOT triggered` / `cluster SNAPSHOT attempt failed` | The scheduler asked for a cluster snapshot, or the attempt failed. The next tick tries again. |
+| `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
+| `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
+| `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
+| `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
+| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+
+- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
+- There is no Prometheus counter for these events.
+
+## Snapshot
+
+- The snapshot format is version 10. A member also loads older versions. An older snapshot restores a posted head of `0` and a state that started at genesis.
+- The state section holds:
+  - the dedup window with the deadline of each id
+  - the per-sender nonces
+  - the remote-origin state
+  - the void ledger
+  - the ordering window size
+  - the posted head, after the ordering window size
+  - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
+- The retained egress frames follow the state section. See `retention` in [Settings](#settings).
+- A snapshot that was taken with another `orderingWindow` does not load. The member halts.
+- The Raft snapshot interval is `snapshotIntervalS`. The leader triggers it. The action is a log entry, so all members snapshot at the same position.
+
+## Build and test
+
+Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on first run.
 
 ```sh
 # Deterministic state-machine tests (no Aeron jars needed):
 ./gradlew :core:test
 
-# Compile the Aeron ClusteredService adapter too:
+# Compile the Aeron ClusteredService adapter and run its tests:
 ./gradlew build
 ```
 
-The deterministic `:core` suite (10 tests) is the Java half of the feature's
-test matrix (groups B/C in the spec). Cluster failover (Aeron `TestCluster`
-harness) and the docker e2e leader-kill test are the gated, real-cluster layers.
+- The `:core` tests cover the state machine without Aeron.
+- The `:service` tests run an in-process Aeron `TestCluster` (failover, replay, fan-out, snapshot restore, the admin server).
+- The docker e2e leader-kill test is the gated, real-cluster layer.
 
-## Running in a cluster (deploy target)
+## Running in a cluster
 
-Each of the 3 cluster nodes (r1–r3, co-located with the existing Aeron Archive)
-runs a JVM hosting the `ConsensusModule` + a `ClusteredServiceContainer`
-wrapping `SealerClusteredService`, with member endpoints
-(`ingress/consensus/log/catchup/archive`) from the cluster config. The Rust
-sequencers/executors connect via `cluster-adapter` (cluster mode). See the spec
-for the full topology and the Nomad job sketch.
+Each of the three cluster nodes runs one JVM. The JVM hosts the `ConsensusModule` and a
+`ClusteredServiceContainer` that wraps `SealerClusteredService`. The main class is
+`io.kardamom.sealer.cluster.ClusterNode`.
+
+- The member endpoints (`ingress`, `consensus`, `log`, `catchup`, `archive`) come from `kardamom.cluster.members`.
+- The deploy uses ports 40200 to 40204 for these endpoints, and 40205 for the admin server.
+- The Rust sequencers and executors connect through `cluster-adapter` in cluster mode.
+- The Nomad job is `deploy/cluster/nomad/cluster.nomad.hcl`. See [the deploy README](../../deploy/cluster/README.md).
