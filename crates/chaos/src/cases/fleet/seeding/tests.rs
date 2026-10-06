@@ -130,19 +130,3 @@ fn the_da_watcher_resumes_after_the_seed_origin() {
     let no_args = json!({ "TaskGroups": [{ "Tasks": [{ "Config": {} }] }] });
     assert!(JobDefinition(&no_args).resumed_after(1).is_err());
 }
-
-#[test]
-fn the_rebuild_reads_the_lockbox_of_the_da_watcher() {
-    let job = json!({ "TaskGroups": [{ "Tasks": [{ "Config": {
-        "args": ["--l1-rpc", "http://l1", "--lockbox", "0x1010101010101010101010101010101010101010"]
-    } }] }] });
-    assert_eq!(
-        JobDefinition(&job).lockbox().unwrap(),
-        Address::repeat_byte(0x10)
-    );
-    let no_lockbox = json!({ "TaskGroups": [{ "Tasks": [{ "Config": { "args": ["--l1-rpc", "http://l1"] } }] }] });
-    assert!(JobDefinition(&no_lockbox).lockbox().is_err());
-    let not_an_address =
-        json!({ "TaskGroups": [{ "Tasks": [{ "Config": { "args": ["--lockbox", "0x12"] } }] }] });
-    assert!(JobDefinition(&not_an_address).lockbox().is_err());
-}

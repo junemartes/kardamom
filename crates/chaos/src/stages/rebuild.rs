@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use anyhow::Context;
 use tokio::process::Command;
 
@@ -32,14 +32,59 @@ const BATCHER_FAILURE_MARKERS: &[&str] = &["WARN", "ERROR", "Error:", "panicked"
 /// The genesis the cluster's services start from, in the checkout.
 const GENESIS: &str = "deploy/cluster/config/genesis/dev.toml";
 
-/// The report line of a successful attempt, or `None` with the failed
-/// attempt's reason kept in `last` for the final message.
-fn note_attempt(last: &RefCell<String>, attempt: Result<Rebuilt, String>) -> Option<Rebuilt> {
-    match attempt {
-        Ok(rebuilt) => Some(rebuilt),
-        Err(why) => {
-            *last.borrow_mut() = why;
-            None
+/// What the tool prints when L1 does not cover the target block yet: the
+/// posted batches end before it, or no batch is posted. Every other
+/// failure is final for the L1 record it read.
+const NOT_POSTED_YET: &[&str] = &["posted batches end at block", "no BatchPosted events found"];
+
+/// How one run of the tool ended.
+#[derive(Debug)]
+enum Attempt {
+    Rebuilt(Rebuilt),
+    /// L1 does not cover the target block yet. The batcher posts it
+    /// within a few seconds of its seal, so a later attempt can pass.
+    NotPosted(String),
+    /// The tool refused the posted record: a block that needs more slots
+    /// than its canonical range holds, a root mismatch, a payload that
+    /// does not decode. L1 and the DA layer hold the same record on the
+    /// next attempt, so the answer does not change.
+    Refused(String),
+}
+
+impl Attempt {
+    /// Classify a failed run by the tool's report line and its error
+    /// chain on stderr.
+    fn failed(report: &str, stderr: &str) -> Self {
+        let chain = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let why = format!("{report} {chain}").trim().to_string();
+        if NOT_POSTED_YET.iter().any(|marker| stderr.contains(marker)) {
+            Self::NotPosted(why)
+        } else {
+            Self::Refused(why)
+        }
+    }
+
+    /// The rebuilt state, or `None` to retry with the reason kept in
+    /// `last`. A refusal ends the wait at once with the tool's reason.
+    fn settle(self, last: &RefCell<String>, block: u64) -> anyhow::Result<Option<Rebuilt>> {
+        match self {
+            Self::Rebuilt(rebuilt) => Ok(Some(rebuilt)),
+            Self::NotPosted(why) => {
+                *last.borrow_mut() = why;
+                Ok(None)
+            }
+            Self::Refused(why) => {
+                let message = format!(
+                    "rebuild-from-l1: the tool refused block {block}, and a retry reads the same record: {why}"
+                );
+                crate::log(&message);
+                Err(crate::chaos_fail!("{message}"))
+            }
         }
     }
 }
@@ -112,26 +157,18 @@ impl Output {
     }
 }
 
-/// What a rebuild reads beside the posted batches, and what it writes
-/// beside the state.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Extras {
-    /// The lockbox that the da-watcher reads. With it, the tool gives each
-    /// block the L1 epochs its origin step names, with their deposits.
-    /// The derivation counts every epoch from the first origin on, so a
-    /// chain whose da-watcher restarted after L1 moved has fewer epochs
-    /// than the tool derives, and the tool refuses the block.
-    pub(crate) lockbox: Option<Address>,
-    /// Where the tool writes the seed a wiped sealer cluster starts
-    /// from, when the caller wants one.
-    pub(crate) sealer_seed: Option<PathBuf>,
-}
-
 /// One rebuild-from-L1 run against `target`: read the payloads from the
 /// DA proxy, run
 /// `kardamom-reconstruct` through the target block, and require its
 /// root. The batcher posts the target block within a few seconds of
 /// the drain, so the run retries while the batches end before it.
+///
+/// The run passes no `--lockbox`. The suite never deposits, so the L1
+/// epochs add no state, and the e2e scenario
+/// `da_parity_batcher_matches_validator` proves the deposit path. With
+/// the flag, the tool also refuses a block whose L1 origin step names
+/// more epochs than the chain holds. A chain that lost an epoch to an
+/// earlier fault, such as a da-watcher restart, has fewer.
 pub(crate) struct Rebuild<'a> {
     pub(crate) harness: &'a Harness,
     /// The evidence directory; the DA copy and the rebuilt state land
@@ -139,7 +176,9 @@ pub(crate) struct Rebuild<'a> {
     pub(crate) evidence: PathBuf,
     pub(crate) target: Target,
     pub(crate) output: Output,
-    pub(crate) extras: Extras,
+    /// Where the tool writes the seed a wiped sealer cluster starts
+    /// from, when the caller wants one.
+    pub(crate) sealer_seed: Option<PathBuf>,
 }
 
 impl Rebuild<'_> {
@@ -171,12 +210,14 @@ impl Rebuild<'_> {
 
     /// Rebuild through the target block, within the budget. The batcher
     /// posts a block within a few seconds of its seal, so the run retries
-    /// while the posted batches end before the target.
+    /// while the posted batches end before the target. It does not retry
+    /// any other failure.
     ///
     /// # Errors
     ///
-    /// Returns an error if no attempt reached the target block, or a
-    /// known root did not match.
+    /// Returns an error if no attempt reached the target block within the
+    /// budget, or the tool refused the posted record, for example because
+    /// a known root did not match.
     pub(crate) async fn run(&self) -> anyhow::Result<Rebuilt> {
         crate::log(format!(
             "rebuild-from-l1: target block {} root {}",
@@ -189,8 +230,9 @@ impl Rebuild<'_> {
         let settlement = self.harness.settlement_address().await?;
         let last = RefCell::new(String::new());
         let (bin, settlement, last_ref) = (&bin, &settlement, &last);
+        let block = self.target.block;
         let outcome = poll::until(Budget::secs(180, 5), |_| async move {
-            Ok(note_attempt(last_ref, self.attempt(bin, settlement).await?))
+            self.attempt(bin, settlement).await?.settle(last_ref, block)
         })
         .await?;
         if matches!(outcome, Outcome::TimedOut { .. }) {
@@ -229,14 +271,8 @@ impl Rebuild<'_> {
     }
 
     /// One attempt: a fresh state directory, the payloads read from the
-    /// DA proxy. The inner `Err` is the tool's report of an attempt that
-    /// did not reach the target or did not match; the outer `Err` is a
-    /// harness failure.
-    async fn attempt(
-        &self,
-        bin: &Path,
-        settlement: &str,
-    ) -> anyhow::Result<Result<Rebuilt, String>> {
+    /// DA proxy. The `Err` is a harness failure.
+    async fn attempt(&self, bin: &Path, settlement: &str) -> anyhow::Result<Attempt> {
         let state = tempfile::Builder::new()
             .prefix("rebuild-")
             .tempdir_in(&self.evidence)?
@@ -262,18 +298,15 @@ impl Rebuild<'_> {
             .unwrap_or("")
             .to_string();
         if out.status.success() {
-            return Ok(Ok(Rebuilt {
+            return Ok(Attempt::Rebuilt(Rebuilt {
                 state_dir: state,
                 report,
             }));
         }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let why = stderr
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
-        Ok(Err(format!("{report} {why}").trim().to_string()))
+        Ok(Attempt::failed(
+            &report,
+            &String::from_utf8_lossy(&out.stderr),
+        ))
     }
 
     /// The arguments that depend on what the caller knows and wants.
@@ -283,16 +316,11 @@ impl Rebuild<'_> {
             .root
             .map(|root| vec!["--expect-root".to_string(), format!("{root:#x}")]);
         let output = self.output.flag().map(|flag| vec![flag.to_string()]);
-        let lockbox = self
-            .extras
-            .lockbox
-            .map(|lockbox| vec!["--lockbox".to_string(), lockbox.to_string()]);
         let seed = self
-            .extras
             .sealer_seed
             .as_ref()
             .map(|path| vec!["--sealer-seed".to_string(), path.display().to_string()]);
-        [root, output, lockbox, seed]
+        [root, output, seed]
             .into_iter()
             .flatten()
             .flatten()
@@ -307,3 +335,6 @@ impl Rebuild<'_> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

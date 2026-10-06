@@ -146,11 +146,12 @@ the real writer with the trie on, and requires the same root and receipt positio
 transactions) need more slots than `end_tx_idx` minus the previous end is refused. Equality
 is not required: a voided entry and its void record take slots, apply nothing, and never
 reach the payload. So a missing deposit passes the slot check and fails the root check.
-Without `--lockbox` the rebuild leaves deposits out. The chaos suite never deposits.
-`sealer-fleet-total-wipe-recover` passes the da-watcher's lockbox, so its rebuild also
-checks the epoch slots. The end-of-shard rebuild does not pass the flag. A case can restart
-the da-watcher, which then starts at the L1 tip and skips the epochs before it, and the
-derivation refuses a block that skipped epochs.
+Without `--lockbox` the rebuild leaves deposits out. The chaos suite never deposits and
+does not pass the flag, also in `sealer-fleet-total-wipe-recover`. With the flag, the slot
+check also refuses a block whose origin step names more epochs than the chain holds. A
+chain that lost an epoch to an earlier fault has fewer, for example after a da-watcher
+restart, which starts at the L1 tip. The e2e scenario `da_parity_batcher_matches_validator`
+proves the deposit path.
 
 ## 6. Proof
 

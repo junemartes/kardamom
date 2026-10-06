@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use kardamom_state::{StateEnvBuilder, deep_compare_to, sweep};
 
-use super::rebuild::{Extras, Output, Rebuild, Target};
+use super::rebuild::{Output, Rebuild, Target};
 
 use crate::harness::Harness;
 use crate::nomad::SavedJob;
@@ -105,9 +105,7 @@ impl<'a> StateAudit<'a> {
             evidence: directory,
             target,
             output: Output::Check,
-            // No `--lockbox`: a case may restart the da-watcher, which
-            // starts at the L1 tip and skips the epochs before it.
-            extras: Extras::default(),
+            sealer_seed: None,
         })
     }
 
