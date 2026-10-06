@@ -47,16 +47,15 @@ taken with another value halts. The deploy sets it with the sequencer's
 ## Dedup window sizing (`-Dkardamom.cluster.dedupCapacity`)
 
 The first-seen window is the ONLY thing preventing a lagging racing replica's
-re-offers from being ordered twice: a replica that stalls (GC pause, SIGSTOP,
-cgroup throttle, receive backlog) and resumes after its twin pushed more than
-`dedupCapacity` *unique* ids through the sealer re-offers records whose ids
-were FIFO-evicted — and they are accepted as fresh. The invariant is
-quantitative: **`dedupCapacity` > worst-case replica stall × peak unique-record
-throughput**. The default (`1 << 17` = 131072, see
-`SealerClusteredService.DEFAULT_DEDUP_CAPACITY`) tolerates a ~13 s stall at
-10k tx/s (~20 MB heap, ~4 MB snapshot). Every member must use the SAME value —
-the window is part of the deterministic state machine, and a snapshot never
-loads into a smaller window than it was taken with.
+re-offers from being ordered twice. The window prunes by inclusion deadline: an
+id stays until the open block passes its deadline, and the window never evicts
+an id to make room. `dedupCapacity` is a hard cap that bounds heap and snapshot
+size. A fresh record that arrives when the window is full is refused with
+back-pressure, and nothing is forgotten. The default (`1 << 17` = 131072, see
+`SealerWire.DEFAULT_DEDUP_CAPACITY`) holds ~13 s of unique records at 10k tx/s
+(~20 MB heap, ~4 MB snapshot). Every member must use the SAME value — the
+window is part of the deterministic state machine, and a snapshot never loads
+into a smaller window than it was taken with.
 
 At a full window the sealer refuses a transaction record with a window-full
 reject, and the sequencer republishes it. The sealer does not refuse an epoch

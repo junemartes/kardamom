@@ -1,13 +1,10 @@
 //! Creation bytecode embedded at build time from `contracts/out/`.
 //!
 //! `build.rs` generates this file with `foundry-compilers` and
-//! `include_bytes!`. The CI `bytecode-hash` job pins it against drift. That
-//! job rebuilds `KardamomFactoryV1` with `forge build` and checks that the
-//! runtime bytecode sha256 matches `contracts/expected_bytecode_hash.txt`.
-//! Forge and the cargo-side `foundry-compilers` both compile with
-//! `bytecode_hash = "none"` (set in `contracts/foundry.toml`), so they
-//! produce byte-identical output. This means the gate that pins forge's
-//! output also pins what this module embeds.
+//! `include_bytes!`. Forge and the cargo-side `foundry-compilers` both
+//! compile with `bytecode_hash = "none"` (set in `contracts/foundry.toml`),
+//! so they produce byte-identical output. This module embeds what forge
+//! builds.
 
 use alloy_primitives::Bytes;
 

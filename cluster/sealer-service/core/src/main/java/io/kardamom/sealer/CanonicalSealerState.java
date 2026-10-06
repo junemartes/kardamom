@@ -23,8 +23,9 @@ import java.util.TreeMap;
  *
  * <p>Responsibilities:</p>
  * <ul>
- *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
- *       canonical ids ({@link #firstSeen(byte[], long)}).</li>
+ *   <li><b>Dedup</b> — a first-seen window over 32-byte canonical ids,
+ *       pruned by inclusion deadline and capped at the dedup capacity
+ *       ({@link #firstSeen(byte[], long)}).</li>
  *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
  *       relays each first-seen record with its 0-based index and increases
  *       {@code canonicalCount}. Duplicates are dropped and never counted.</li>
@@ -145,8 +146,8 @@ public final class CanonicalSealerState {
     private static final int REMOTE_ENTRY_LEN_V4 = 8 + 8;
 
     /**
-     * FIFO first-seen window. It is insertion-ordered, so the oldest inserted
-     * id is the first element, and eviction removes it. Keys are 32-byte
+     * The first-seen window. It is insertion-ordered, and a deadline prune
+     * removes the ids that no offer can use again. Keys are 32-byte
      * ids, wrapped in a read-only {@link ByteBuffer} for value-based
      * equality.
      */
