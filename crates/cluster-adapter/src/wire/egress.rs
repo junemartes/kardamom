@@ -78,6 +78,13 @@ pub enum EgressItem {
     /// tick, on every posted cursor, and to a session that announces
     /// itself.
     Status(ClusterStatus),
+    /// Origin-gap reject. The sealer refused an epoch at
+    /// `offered_origin`, because the next L1 origin it accepts is
+    /// `expected_origin`. Offer the epochs again from `expected_origin`.
+    OriginGap {
+        offered_origin: u64,
+        expected_origin: u64,
+    },
     /// DA-lag reject. The sealer refused `sender`'s ref at `nonce` because
     /// the sealed head is more than `budget_blocks` past the posted head.
     /// The record is not ordered; the sequencer drops it and tells the
@@ -119,6 +126,10 @@ impl EgressItem {
             EGRESS_KIND_REMOTE_ORIGIN_REJECT => Self::decode_remote_origin_reject(buf),
             EGRESS_KIND_STATUS => Self::decode_status(buf),
             EGRESS_KIND_DA_LAG_REJECT => Self::decode_da_lag_reject(buf),
+            super::EGRESS_KIND_ORIGIN_GAP => Ok(Self::OriginGap {
+                offered_origin: rd_u64(buf, 1)?,
+                expected_origin: rd_u64(buf, 9)?,
+            }),
             other => Err(WireError::BadEgressKind(other)),
         }
     }
@@ -407,6 +418,18 @@ pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
 #[must_use]
 pub fn encode_replay_ahead(head_index: u64, head_block: u64) -> Vec<u8> {
     encode_kind_2u64(super::EGRESS_KIND_REPLAY_AHEAD, head_index, head_block)
+}
+
+/// Frame an origin-gap reject exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_origin_gap(offered_origin: u64, expected_origin: u64) -> Vec<u8> {
+    encode_kind_2u64(
+        super::EGRESS_KIND_ORIGIN_GAP,
+        offered_origin,
+        expected_origin,
+    )
 }
 
 /// Frame a contiguity reject exactly as the Java service does. The real

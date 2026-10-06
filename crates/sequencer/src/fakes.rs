@@ -1,5 +1,5 @@
 //! Generic in-memory scripted-queue fake, shared by every single-record-type
-//! poll surface (today: [`crate::epoch::EpochSubscriber`] and
+//! poll surface ([`crate::epoch::EpochSubscriber`] and
 //! [`crate::remote_epoch::RemoteEpochSubscriber`]).
 //!
 //! Push test inputs with [`ScriptedQueue::push`], close with
@@ -92,32 +92,36 @@ pub(crate) mod pump_contract {
     use super::ScriptedQueue;
     use crate::error::SequencerError;
     use crate::outbound::fakes::InMemoryTxOrderingRefPublisher;
-    use crate::pump::{OriginLane, Pump};
+    use crate::pump::OriginLane;
 
     /// Run the shared assertions for one origin lane. `first` and `second`
-    /// stand in for two well-formed, distinct records; the lane is the
-    /// [`OriginLane`] impl on `Pump<T>`, over its own subscriber type via
-    /// `T`.
+    /// stand in for two well-formed, distinct records. `new_lane` builds a
+    /// fresh lane, and `is_held` says whether it holds a record that waits
+    /// for its first accepted offer.
     ///
     /// # Panics
     ///
     /// Panics (via the assertions) when a pump under test does not honor
     /// the shared idle/closed/backpressure/retry contract.
-    pub(crate) fn run<T: Clone>(first: &T, second: &T)
-    where
-        Pump<T>: OriginLane<ScriptedQueue<T>, InMemoryTxOrderingRefPublisher>,
+    pub(crate) fn run<T: Clone, L>(
+        first: &T,
+        second: &T,
+        new_lane: impl Fn() -> L,
+        is_held: impl Fn(&L) -> bool,
+    ) where
+        L: OriginLane<ScriptedQueue<T>, InMemoryTxOrderingRefPublisher>,
     {
         // Idle subscription reports no work.
         let mut sub = ScriptedQueue::<T>::default();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        let mut pump = Pump::default();
+        let mut pump = new_lane();
         assert!(!pump.relay(&mut sub, &mut pubr).unwrap());
 
         // Closed subscription surfaces disconnect.
         let mut sub = ScriptedQueue::<T>::default();
         sub.close();
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        let mut pump = Pump::default();
+        let mut pump = new_lane();
         assert!(matches!(
             pump.relay(&mut sub, &mut pubr),
             Err(SequencerError::IngressDisconnected)
@@ -130,13 +134,13 @@ pub(crate) mod pump_contract {
         sub.push(kardamom_types::BPosition::default(), first.clone());
         sub.push(kardamom_types::BPosition::default(), second.clone());
         let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        let mut pump = Pump::default();
+        let mut pump = new_lane();
         *pubr.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
             pump.relay(&mut sub, &mut pubr),
             Err(SequencerError::Backpressure)
         ));
-        assert!(pump.is_held(), "the popped record is held, not dropped");
+        assert!(is_held(&pump), "the popped record is held, not dropped");
         assert_eq!(
             sub.len(),
             1,
@@ -152,7 +156,7 @@ pub(crate) mod pump_contract {
         // once, then the queue resumes with the second record.
         *pubr.fail_with_backpressure.lock().unwrap() = false;
         assert!(pump.relay(&mut sub, &mut pubr).unwrap());
-        assert!(!pump.is_held(), "the slot empties on success");
+        assert!(!is_held(&pump), "the slot empties on success");
         assert!(pump.relay(&mut sub, &mut pubr).unwrap());
         assert!(!pump.relay(&mut sub, &mut pubr).unwrap());
     }

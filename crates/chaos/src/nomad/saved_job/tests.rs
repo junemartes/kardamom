@@ -70,3 +70,27 @@ async fn stopped_jobs_restore_their_definition_and_allocations() {
     agent.kill().await.unwrap();
     agent.wait().await.unwrap();
 }
+
+#[test]
+fn extra_args_reach_only_the_named_task() {
+    let mut job = serde_json::json!({
+        "TaskGroups": [{
+            "Tasks": [
+                {"Name": "da-watcher", "Config": {"args": ["--l1-rpc", "x"]}},
+                {"Name": "sidecar", "Config": {"args": ["--a"]}},
+            ],
+        }],
+    });
+    let extra = ["--l1-resume-after".to_string(), "41".to_string()];
+
+    assert_eq!(with_task_args(&mut job, "da-watcher", &extra), 1);
+    assert_eq!(
+        job["TaskGroups"][0]["Tasks"][0]["Config"]["args"],
+        serde_json::json!(["--l1-rpc", "x", "--l1-resume-after", "41"])
+    );
+    assert_eq!(
+        job["TaskGroups"][0]["Tasks"][1]["Config"]["args"],
+        serde_json::json!(["--a"])
+    );
+    assert_eq!(with_task_args(&mut job, "absent", &extra), 0);
+}

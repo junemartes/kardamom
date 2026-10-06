@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use crate::cases::da_watcher::assert_not_past_sealer;
 use crate::cases::fleet::{await_exporter_back, await_exporters_dark};
 use crate::harness::Harness;
 use crate::probes::CLUSTER_TASK;
@@ -134,6 +135,9 @@ pub(crate) async fn pipeline_blackout_recover(h: &mut Harness) -> anyhow::Result
     await_exporter_back(h, ctx).await?;
     h.assert_ingress_pair_live(ctx).await?;
     h.assert_executor_progress(Duration::from_mins(3)).await?;
+    // The da-watcher died with the sealers: an epoch it published but the
+    // sealers never committed leaves its cursor file past the sealer.
+    assert_not_past_sealer(h, ctx).await?;
     let voided = h
         .evidence
         .count_lines(

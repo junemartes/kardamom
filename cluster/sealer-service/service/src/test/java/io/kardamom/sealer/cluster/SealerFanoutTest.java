@@ -277,4 +277,27 @@ class SealerFanoutTest {
         id[31] = 0x5A;
         deliver(from, IngressFrames.originRecordFrame(id, origin, slots, new byte[] {(byte) n}));
     }
+
+    /**
+     * An epoch that skips an L1 block is not relayed. Only the offering
+     * session hears the reject, as {@code [kind:12][offered:u64][expected:u64]}.
+     */
+    @Test
+    void an_origin_gap_is_answered_to_the_offering_session_only() {
+        subscribe(consumerA);
+        originRecord(publisher, 1, 100L, 1);
+        originRecord(publisher, 3, 102L, 1);
+
+        final List<byte[]> gaps = publisher.offered.stream()
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_ORIGIN_GAP)
+                .toList();
+        assertEquals(1, gaps.size());
+        assertEquals(1 + 2 * Long.BYTES, gaps.get(0).length);
+        final org.agrona.concurrent.UnsafeBuffer frame = new org.agrona.concurrent.UnsafeBuffer(gaps.get(0));
+        assertEquals(102L, frame.getLong(1, ByteOrder.LITTLE_ENDIAN), "offered");
+        assertEquals(101L, frame.getLong(1 + Long.BYTES, ByteOrder.LITTLE_ENDIAN), "expected");
+        assertEquals(0, consumerA.offered.stream()
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_ORIGIN_GAP).count());
+        assertEquals(1, relayedCount(consumerA), "the epoch past the gap is not relayed");
+    }
 }

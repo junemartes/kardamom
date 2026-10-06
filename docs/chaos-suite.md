@@ -131,6 +131,8 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`ingress-pair-loss-recover`](failure-modes.md#coordinated-failures-chaos-coordinated-shard): both ingresses die.
 - [`sequencer-lane-loss-recover`](failure-modes.md#coordinated-failures-chaos-coordinated-shard): both replicas of lane 0 die.
 - [`pipeline-blackout-recover`](failure-modes.md#coordinated-failures-chaos-coordinated-shard): every node except the control node dies at once. The case prints the number of void decisions and does not assert it.
+  - The da-watcher dies with the sealers. After the recovery, the case checks that the cursor file of the da-watcher is at or before the L1 origin of the sealer.
+  - If the cursor stays past the origin for 60 s, an epoch was lost in the kill. The case then does the `l1-liar` operator step.
 
 **Retention shard**
 
@@ -148,10 +150,12 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 - [`l1-liar`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
   - The wrong hash halts the single-source followers. The case then does the operator step.
-  - It removes the L1 cursor file of the da-watcher and restarts the da-watcher. The da-watcher seeds at the finalized tip.
+  - It runs the da-watcher once with `--l1-resume-after` at the L1 origin of the sealer (`kardamom_sequencer_l1_origin`). It waits until the first tick writes the cursor file again, then restores the registered job. It never removes the cursor file.
   - It re-indexes the archive of the indexer from the first block of the chain.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
+  - The cursor file of the da-watcher survives the redeploy of the followers. The case checks the cursor against the L1 origin of the sealer, as `pipeline-blackout-recover` does.
+  - The heal of the followers is the `l1-liar` operator step.
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.

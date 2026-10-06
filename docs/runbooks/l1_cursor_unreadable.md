@@ -18,12 +18,15 @@ publishes nothing.
 
 ## Steps
 
-1. Find N, the last L1 block whose epoch the chain holds. Read the highest
-   value of the da-watcher's origin gauge before the halt in Prometheus:
+1. Find N, the last L1 block whose epoch the chain holds: the sealer's L1
+   origin. Read it on any sequencer: `kardamom_sequencer_l1_origin`. If no
+   sequencer answers, read the highest value of the da-watcher's origin gauge
+   before the halt in Prometheus:
    `max_over_time(kardamom_da_watcher_epoch_origin_block_number[7d])`. If you
    are not sure, use a lower block. A lower N publishes epochs that the sealer
-   already holds, and the sealer drops them. A higher N loses the deposits of
-   the blocks between the true value and N.
+   already holds, and the sealer drops them. A higher N skips the epochs
+   between the true value and N: the sealer refuses the next epoch as an
+   origin gap, and every sequencer halts on `origin_gap` (`origin_gap.md`).
 2. Do one of these:
    - Write the file again, and clear the halt. Use the hash that L1 holds for
      N. The da-watcher runs as user 10001.
@@ -41,8 +44,9 @@ publishes nothing.
      and the first tick writes the file again. Remove the flag at the next
      deploy.
 3. Do not only delete the file. Without a file, the da-watcher starts at the
-   finalized tip, and the deposits of the blocks between N and the tip are
-   lost.
+   finalized tip and skips the blocks between N and the tip. The sealer
+   refuses its epochs as an origin gap, and deposits stop until the
+   da-watcher runs with `--l1-resume-after N`.
 4. Find why the file broke: a full disk, a manual edit, or a failed volume.
    Read `kardamom_da_watcher_l1_cursor_persist_failures_total`. A count above
    0 means that the writes fail.

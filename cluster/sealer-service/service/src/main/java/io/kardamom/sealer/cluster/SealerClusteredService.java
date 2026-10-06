@@ -11,7 +11,7 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.OrderingWindow;
-import io.kardamom.sealer.OriginAdvance;
+import io.kardamom.sealer.OriginOutcome;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
@@ -143,6 +143,9 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
+
+    /** Origin-gap rejects emitted (logged at power-of-two counts). */
+    private long originGapCount = 0;
 
     private final VoidLedger.Config voidConfig;
     /**
@@ -500,7 +503,7 @@ public final class SealerClusteredService implements ClusteredService {
                 onVoidRequest(buffer, offset, length);
                 return;
             case SealerWire.KIND_ORIGIN_RECORD:
-                onOriginRecord(buffer, offset, length);
+                onOriginRecord(session, buffer, offset, length);
                 maybeReviveBoundaryClock();
                 return;
             case SealerWire.KIND_REMOTE_ORIGIN_RECORD:
@@ -569,8 +572,14 @@ public final class SealerClusteredService implements ClusteredService {
      * Strip the origin and slot count, relay the remaining payload as is, and
      * offer the forced boundary first, so the record leads the block it opens
      * instead of trailing the block it closes.
+     *
+     * <p>A record that skips an L1 block is answered with an
+     * {@link SealerWire#EGRESS_KIND_ORIGIN_GAP} frame to the offering
+     * session, and is never relayed. Every member refuses it the same way,
+     * because the check reads only replicated state.</p>
      */
-    private void onOriginRecord(final DirectBuffer buffer, final int offset, final int length) {
+    private void onOriginRecord(
+            final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
         if (length < SealerWire.MIN_ORIGIN_RECORD_LEN) {
             onMalformedFrame("origin-record", length);
             return;
@@ -600,9 +609,9 @@ public final class SealerClusteredService implements ClusteredService {
         // The record closes the open block, so the window closes with it:
         // a reorder never crosses a block.
         flushWindow();
-        final Optional<OriginAdvance> advance;
+        final OriginOutcome outcome;
         try {
-            advance =
+            outcome =
                 state.onOriginRecord(canonicalIdScratch, l1Origin, slotCount, payload, cluster.time());
         } catch (final IllegalArgumentException ex) {
             // A non-advancing origin is a producer bug. Every member rejects
@@ -613,11 +622,34 @@ public final class SealerClusteredService implements ClusteredService {
             onMalformedFrame("origin-record-regression", length);
             return;
         }
-        if (advance.isEmpty()) {
+        if (outcome.gap) {
+            onOriginGap(session, l1Origin, outcome.expectedOrigin);
+            return;
+        }
+        if (outcome.advance.isEmpty()) {
             return; // Duplicate epoch from a racing sequencer.
         }
-        advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
-        egress.offerRelayed(advance.get().relayed());
+        outcome.advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
+        egress.offerRelayed(outcome.advance.get().relayed());
+    }
+
+    /**
+     * Answer an origin-gap reject to the offering session. Member-local
+     * egress IO, exactly like {@link #onRemoteOriginReject}: the refusal
+     * moved no replicated state, and every member computed it the same way.
+     */
+    private void onOriginGap(final ClientSession session, final long offeredOrigin, final long expectedOrigin) {
+        originGapCount++;
+        if (Long.bitCount(originGapCount) == 1) {
+            // Log to stdout like the other operational signals, so the e2e
+            // and chaos suites can grep it. Count at powers of two so a
+            // storm cannot flood the log.
+            System.out.println("cluster ORIGIN-GAP memberId=" + memberId
+                + " offered=" + offeredOrigin
+                + " expected=" + expectedOrigin
+                + " totalOriginGaps=" + originGapCount);
+        }
+        egress.offerOriginGap(session, offeredOrigin, expectedOrigin);
     }
 
     /**

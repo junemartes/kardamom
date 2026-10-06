@@ -17,6 +17,7 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+mod origin_pump;
 mod steps;
 
 use std::collections::{HashMap, HashSet};
@@ -32,26 +33,28 @@ use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
-    IdleBackoff, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
+    TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
+    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_obs::events::SEALER_SILENCE;
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
 use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
-use kardamom_sequencer::pump::{OriginLane, Pump};
+use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
     FloorUpdate, ResyncController, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{AccountRow, ReceiptBatch};
+use origin_pump::OriginPump;
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -123,6 +126,11 @@ pub(crate) struct EgressWatermarkFeed {
     /// the client.
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+    /// The epoch pump's signals: each growth of the boundaries' L1
+    /// origin, and each origin-gap reject.
+    origins: OriginSignalTx,
+    /// The highest L1 origin a boundary carried. Zero is no origin.
+    last_origin: u64,
     /// Anchored at feed start, not `None`. The cluster emits a boundary
     /// every tick, so "never seen a boundary" past the silence window is
     /// itself the lag state. A restarted replica whose session never
@@ -143,6 +151,7 @@ impl EgressWatermarkFeed {
         watermark: SharedWatermark,
         reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
+        origins: OriginSignalTx,
     ) -> Self {
         Self {
             silence_ms,
@@ -150,6 +159,8 @@ impl EgressWatermarkFeed {
             watermark,
             deadline_tx,
             reject_tx,
+            origins,
+            last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             last_boundary_seen: Instant::now(),
         }
@@ -207,6 +218,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_da_lag_frame(frame) {
+            return;
+        }
+        if self.on_origin_gap_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -396,6 +410,7 @@ impl EgressWatermarkFeed {
             process().follow(None);
             kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
             self.watermark.store(b.end_tx_idx.as_index());
+            self.confirm_origin(b.l1_origin);
         }
     }
 
@@ -799,6 +814,8 @@ pub(crate) struct PublishLoops<P> {
     /// The fee admission gate for the canonical loop.
     pub(crate) fees: FeeGate,
     pub(crate) epochs: TxDepositsSubscriberHandle,
+    /// The epoch lane, whose signal sender the egress feed holds.
+    pub(crate) epoch_lane: EpochPump,
     pub(crate) remote_epochs: TxRemoteEpochsSubscriberHandle,
     pub(crate) resync: Option<ResyncController>,
     /// `None` when the binary has no executor endpoints.
@@ -830,6 +847,7 @@ where
             mut side,
             fees,
             epochs: epoch_subscription,
+            epoch_lane,
             remote_epochs: remote_epoch_subscription,
             resync,
             lookup,
@@ -863,90 +881,35 @@ where
         // loop that runs alongside the canonical TxData-to-TxRef path. It
         // stays on spawn_blocking. The epoch lane does a sync Aeron poll
         // and a sync cluster offer. So the loop polls `is_signaled`
-        // between backoff sleeps. `OriginPump`'s one-slot `pending` holds
-        // a popped epoch across a backpressured offer, and the next tick
-        // retries it before it polls again, so a backpressured epoch is
-        // never dropped.
+        // between backoff sleeps. The lane keeps every epoch until a
+        // boundary confirms it, and offers the epochs again on an
+        // origin-gap reject, so an epoch the cluster lost is never
+        // dropped.
         let shutdown_for_deposits = shutdown.clone();
         let join_deposits = tokio::task::spawn_blocking(move || {
-            OriginPump::<_, _, Pump<kardamom_types::EpochRecord>>::new(
+            OriginPump::new(
                 shutdown_for_deposits,
                 epoch_subscription,
                 epoch_pub,
+                epoch_lane,
             )
             .run()
         });
 
         // Independent pump for tx_remote_epochs to a remote-origin record
         // on tx_ordering, on the same terms as the deposit pump above,
-        // with the same one-slot retry.
+        // with a one-slot retry.
         let shutdown_for_remote_epochs = shutdown.clone();
         let join_remote_epochs = tokio::task::spawn_blocking(move || {
-            OriginPump::<_, _, Pump<kardamom_types::xchain::RemoteEpochRecord>>::new(
+            OriginPump::new(
                 shutdown_for_remote_epochs,
                 remote_epoch_subscription,
                 remote_epoch_pub,
+                Pump::<kardamom_types::xchain::RemoteEpochRecord>::default(),
             )
             .run()
         });
 
         (join_main, join_deposits, join_remote_epochs)
-    }
-}
-
-/// One origin-advancing pump: poll `sub`, publish through `publ`, and
-/// idle-backoff, until `shutdown` fires or the source disconnects.
-///
-/// `Pending` is `kardamom_sequencer::pump::Pump<EpochRecord>` or
-/// `Pump<RemoteEpochRecord>` — the one-slot retry state that holds a
-/// popped record across a `Backpressure` result and retries it before it
-/// polls again, so a backpressured record is never dropped.
-struct OriginPump<S, P, Pending> {
-    shutdown: Shutdown,
-    sub: S,
-    publ: P,
-    pending: Pending,
-}
-
-impl<S, P, Pending> OriginPump<S, P, Pending>
-where
-    Pending: OriginLane<S, P> + Default,
-{
-    fn new(shutdown: Shutdown, sub: S, publ: P) -> Self {
-        Self {
-            shutdown,
-            sub,
-            publ,
-            pending: Pending::default(),
-        }
-    }
-
-    /// Run until `shutdown` fires or the source disconnects.
-    fn run(mut self) -> Result<(), SequencerError> {
-        let mut idle = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1);
-        while !self.shutdown.is_signaled() && self.tick(&mut idle)? {}
-        Ok(())
-    }
-
-    /// One [`Self::run`] iteration: dispatch on the lane's relay outcome.
-    /// Returns whether the loop should keep going; `false` only on a
-    /// clean `IngressDisconnected` exit.
-    fn tick(&mut self, idle: &mut IdleBackoff) -> Result<bool, SequencerError> {
-        match self.pending.relay(&mut self.sub, &mut self.publ) {
-            Ok(true) => {
-                idle.reset();
-                Ok(true)
-            }
-            Ok(false) => {
-                std::thread::sleep(idle.idle_wait());
-                Ok(true)
-            }
-            Err(SequencerError::Backpressure) => {
-                std::thread::sleep(Duration::from_micros(10));
-                Ok(true)
-            }
-            Err(SequencerError::IngressDisconnected) => Ok(false),
-            Err(e) => Err(e),
-        }
     }
 }

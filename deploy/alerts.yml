@@ -225,6 +225,20 @@ groups:
           description: "The validator's re-execution disagreed with the executor's published result. The validator holds, serves its metrics, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/validator_divergence.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/validator_divergence.md"
 
+      # A restarted sequencer can miss the epoch the sealer expects while
+      # its twin offers it again within milliseconds. The rule waits one
+      # minute, so only a gap that no replica fills pages.
+      - alert: KardamomHaltOriginGap
+        expr: kardamom_halt{cause="origin_gap"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          cause: origin_gap
+        annotations:
+          summary: "{{ $labels.service }} halted: origin_gap ({{ $labels.host_id }})"
+          description: "The sealer refuses the next L1 epoch because an earlier one is missing, and this sequencer does not hold the missing epoch; or the sequencer holds the most relayed epochs that no boundary confirms. Deposits stop; transactions continue. The detail names the L1 block. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/origin_gap.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/origin_gap.md"
+
   # A pause is not a fault of the paused service: it waits on a root halt
   # upstream, or on an operator. It never pages. The root's halt rule
   # above pages once, with the root's runbook; the inhibit rule in

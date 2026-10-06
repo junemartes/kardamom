@@ -16,16 +16,64 @@
 //! `tx_deposits` fragment cannot strand a deposit.
 //!
 //! Epochs are not nonce-gated. They carry OP `source_hash` values and have
-//! no state-machine interaction in the sequencer. The code path is a
-//! simple poll-and-publish pump. It runs independently of the nonce-gated
-//! tx_data-to-TxRef path in [`crate::sequencer`].
+//! no state-machine interaction in the sequencer. The epoch pump runs
+//! independently of the nonce-gated tx_data-to-TxRef path in
+//! [`crate::sequencer`].
+//!
+//! An accepted offer is not an ordered epoch. "Accepted" means only that
+//! the frame entered the ingress publication buffer, and cluster ingress
+//! is at-most-once across a leader kill or a quorum loss. The da-watcher
+//! publishes each epoch once, and `tx_deposits` is live-only. So the pump
+//! keeps every epoch it took until a boundary confirms it:
+//!
+//! * a boundary whose `l1_origin` is at or past the epoch's L1 block
+//!   confirms the epoch, and the pump forgets it;
+//! * the sealer refuses an epoch that skips an L1 block, and answers the
+//!   offering session with the origin it expects. The pump offers its
+//!   unconfirmed epochs again from that origin, in order. The sealer's
+//!   dedup absorbs a copy it already ordered;
+//! * when the pump does not hold the expected epoch, or holds
+//!   [`MAX_UNCONFIRMED_EPOCHS`] that no boundary confirms, it stops and
+//!   reports an error that raises the `origin_gap` halt. It never skips
+//!   an epoch.
 
+use std::collections::VecDeque;
+
+use crossbeam_channel::{Receiver, Sender};
 use kardamom_log::aeron_live::TxDepositsSubscriberHandle;
 use kardamom_types::{BPosition, EpochRecord};
 
 use crate::error::SequencerError;
 use crate::outbound::TxOrderingRefPublisher;
-use crate::pump::{OriginLane, Pump};
+use crate::pump::OriginLane;
+
+/// The most epochs the pump keeps without a boundary that confirms them.
+///
+/// A live sealer confirms an epoch within one boundary tick (seconds), and
+/// the next epoch's forced boundary confirms the one before it, so a
+/// burst of L1 catch-up stays within one ingress round trip. While the
+/// cluster has no leader, the offers back-pressure, and the pump takes no
+/// new epoch. So the queue grows only while the sealer takes the offers
+/// and orders none of them. 4096 L1 blocks are 13.6 hours of L1 at
+/// 12 seconds a block: an overflow is a fault, not load. An epoch is a
+/// few hundred bytes plus its deposits, so the bound also caps the memory.
+pub const MAX_UNCONFIRMED_EPOCHS: usize = 4096;
+
+/// What the cluster egress tells the epoch pump about the L1 origin. The
+/// egress feed sends these in egress order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginSignal {
+    /// A boundary carries this L1 origin, so the sealer ordered every
+    /// epoch up to it. The feed sends it only when the origin grows.
+    Confirmed(u64),
+    /// The sealer refused an epoch of this session: the next L1 origin it
+    /// accepts is `expected`.
+    Gap { expected: u64 },
+}
+
+/// The sending half of the pump's signal channel. The egress feed holds
+/// it.
+pub type OriginSignalTx = Sender<OriginSignal>;
 
 /// Subscription surface that the epoch pump reads from. Production wiring
 /// binds this to the real `log::TxDepositsSubscriber`. Tests use the
@@ -50,27 +98,162 @@ impl EpochSubscriber for TxDepositsSubscriberHandle {
     }
 }
 
-/// The epoch lane. Takes the held epoch if there is one, else pulls one
-/// epoch off the subscription, and forwards it on `tx_ordering`.
+/// The epoch lane: the epochs it took off `tx_deposits` and that no
+/// boundary confirmed yet, and the cursor of the next one to offer.
+pub struct EpochPump {
+    /// Ascending by L1 block, one epoch per block.
+    unconfirmed: VecDeque<EpochRecord>,
+    /// The index in `unconfirmed` of the next epoch to offer. The pump
+    /// offered every epoch before it at least once.
+    next: usize,
+    /// The highest L1 origin a boundary carried.
+    confirmed: Option<u64>,
+    /// The origin the sealer expects that this pump does not hold.
+    missing: Option<u64>,
+    signals: Receiver<OriginSignal>,
+}
+
+impl EpochPump {
+    /// A pump, and the sender the egress feed signals it through.
+    #[must_use]
+    pub fn new() -> (OriginSignalTx, Self) {
+        let (tx, signals) = crossbeam_channel::unbounded();
+        let pump = Self {
+            unconfirmed: VecDeque::new(),
+            next: 0,
+            confirmed: None,
+            missing: None,
+            signals,
+        };
+        (tx, pump)
+    }
+
+    /// Apply every signal the egress feed sent since the last call.
+    fn take_signals(&mut self) {
+        while let Ok(signal) = self.signals.try_recv() {
+            self.apply(signal);
+        }
+    }
+
+    fn apply(&mut self, signal: OriginSignal) {
+        match signal {
+            OriginSignal::Confirmed(origin) => self.confirm(origin),
+            OriginSignal::Gap { expected } => self.rewind(expected),
+        }
+    }
+
+    /// Forget every epoch at or below `origin`.
+    fn confirm(&mut self, origin: u64) {
+        let done = self.unconfirmed.partition_point(|e| e.l1_number <= origin);
+        self.unconfirmed.drain(..done);
+        // An epoch that a twin's offer ordered before this pump offered it
+        // needs no offer, so the cursor stops at the first epoch left.
+        self.next = self.next.saturating_sub(done);
+        self.confirmed = Some(origin);
+        self.missing = self.missing.filter(|expected| *expected > origin);
+        crate::metrics::record_epochs_unconfirmed(self.unconfirmed.len());
+    }
+
+    /// Offer again from `expected`: the sealer refused every epoch above
+    /// it. When the pump does not hold `expected`, the gap stands until a
+    /// boundary confirms it or the epoch arrives. An origin the boundaries
+    /// confirmed already is not missing.
+    fn rewind(&mut self, expected: u64) {
+        let at = self.unconfirmed.partition_point(|e| e.l1_number < expected);
+        self.next = self.next.min(at);
+        let held = self
+            .unconfirmed
+            .get(at)
+            .is_some_and(|e| e.l1_number == expected);
+        self.missing = Some(expected).filter(|e| !held && Some(*e) > self.confirmed);
+    }
+
+    /// Keep `epoch` in L1 order. An epoch the sealer ordered already, or
+    /// one the pump holds, is a copy. An epoch that lands before the
+    /// cursor (a da-watcher that publishes again from an older block) is
+    /// offered next.
+    fn insert(&mut self, epoch: EpochRecord) {
+        if self.confirmed.is_some_and(|c| epoch.l1_number <= c) {
+            return;
+        }
+        let Err(at) = self
+            .unconfirmed
+            .binary_search_by_key(&epoch.l1_number, |e| e.l1_number)
+        else {
+            return;
+        };
+        self.unconfirmed.insert(at, epoch);
+        self.next = self.next.min(at);
+        crate::metrics::record_epochs_unconfirmed(self.unconfirmed.len());
+        if let Some(expected) = self.missing {
+            self.rewind(expected);
+        }
+    }
+
+    /// The next epoch to offer: none while the gap stands.
+    fn to_offer(&self) -> Option<&EpochRecord> {
+        if self.missing.is_some() {
+            return None;
+        }
+        self.unconfirmed.get(self.next)
+    }
+
+    /// Poll one epoch when the pump has none left to offer. Returns
+    /// whether it took one.
+    ///
+    /// # Errors
+    ///
+    /// [`SequencerError::EpochQueueFull`] when the queue is full, before
+    /// it polls; [`SequencerError::OriginGapUnfilled`] while the gap
+    /// stands, after it polls; and the subscription's error.
+    fn fill<S: EpochSubscriber>(&mut self, sub: &mut S) -> Result<bool, SequencerError> {
+        if self.to_offer().is_some() {
+            return Ok(false);
+        }
+        if self.unconfirmed.len() >= MAX_UNCONFIRMED_EPOCHS {
+            return Err(SequencerError::EpochQueueFull {
+                held: self.unconfirmed.len(),
+                oldest: self.unconfirmed.front().map_or(0, |e| e.l1_number),
+            });
+        }
+        let took = sub.poll()?.map(|(_, epoch)| self.insert(epoch)).is_some();
+        match self.missing {
+            Some(expected) => Err(SequencerError::OriginGapUnfilled { expected }),
+            None => Ok(took),
+        }
+    }
+
+    /// Whether an epoch waits for its first offer, mid-retry after a
+    /// `Backpressure` result. Test-only.
+    #[cfg(test)]
+    pub(crate) fn is_held(&self) -> bool {
+        self.next < self.unconfirmed.len()
+    }
+}
+
+/// The epoch lane: apply the egress signals, take one epoch off the
+/// subscription when nothing is left to offer, and offer the next epoch.
 ///
-/// On `SequencerError::Backpressure` the epoch goes into the held slot,
-/// and the next call retries the SAME epoch before it polls for a new
-/// one. The poll is destructive (`try_recv`), so without this slot a
-/// backpressured epoch would be lost, and the L1 origin sequence would
-/// have a permanent hole. `Backpressure` includes "not connected", so a
-/// leader election would otherwise drain every sequencer's backlog at
-/// once.
-///
-/// Epochs carry no metric to bump on relay (unlike remote epochs, see
-/// [`crate::remote_epoch`]), so this is [`Pump::step`] with a no-op
-/// `on_relayed` hook.
-impl<S, P> OriginLane<S, P> for Pump<EpochRecord>
+/// On `SequencerError::Backpressure` the cursor stays, and the next call
+/// offers the SAME epoch again before it polls a new one. `Backpressure`
+/// includes "not connected", so a leader election does not drain the
+/// backlog.
+impl<S, P> OriginLane<S, P> for EpochPump
 where
     S: EpochSubscriber,
     P: TxOrderingRefPublisher,
 {
     fn relay(&mut self, sub: &mut S, publ: &mut P) -> Result<bool, SequencerError> {
-        self.step(|| sub.poll(), |epoch| publ.try_publish_epoch(epoch), |_| {})
+        self.take_signals();
+        let took = self.fill(sub)?;
+        let Some(epoch) = self.to_offer() else {
+            return Ok(took);
+        };
+        publ.try_publish_epoch(epoch)?;
+        // `next` indexes the queue, which holds at most
+        // `MAX_UNCONFIRMED_EPOCHS`.
+        self.next += 1;
+        Ok(true)
     }
 }
 
@@ -92,61 +275,5 @@ pub mod fakes {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloy_primitives::B256;
-
-    use super::fakes::ScriptedEpochs;
-    use super::*;
-    use crate::outbound::fakes::InMemoryTxOrderingRefPublisher;
-
-    fn epoch(n: u64, deposits: usize) -> EpochRecord {
-        EpochRecord {
-            l1_number: n,
-            l1_hash: B256::repeat_byte(u8::try_from(n).unwrap()),
-            deposits: (0..deposits)
-                .map(|i| kardamom_types::Deposit {
-                    source_hash: B256::repeat_byte(0xD0 + u8::try_from(i).unwrap()),
-                    mint: 100 + u128::try_from(i).unwrap(),
-                    ..Default::default()
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn forwards_the_epoch_verbatim() {
-        // The sequencer must not re-derive or reorder anything. It orders
-        // exactly what the watcher derived from L1. Otherwise the producer
-        // and verifier could disagree.
-        let mut sub = ScriptedEpochs::default();
-        let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        let e = epoch(100, 3);
-        sub.push(BPosition::default(), e.clone());
-
-        assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
-
-        let got = pubr.epochs.lock().unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0], e);
-    }
-
-    #[test]
-    fn empty_epochs_are_forwarded_too() {
-        // A depositless epoch is the one most tempting to drop. Without
-        // testing it, the no-skipping rule is not enforced.
-        let mut sub = ScriptedEpochs::default();
-        let mut pubr = InMemoryTxOrderingRefPublisher::default();
-        sub.push(BPosition::default(), epoch(101, 0));
-
-        assert!(Pump::default().relay(&mut sub, &mut pubr).unwrap());
-        assert_eq!(pubr.epochs.lock().unwrap().len(), 1);
-    }
-
-    /// Idle, closed, backpressure-holds-the-record, retry-does-not-poll-
-    /// past-the-held-record, and relay-after-backpressure-clears: the
-    /// contract every `ScriptedQueue<T>`-backed pump shares.
-    #[test]
-    fn epoch_pump_honors_the_shared_contract() {
-        crate::fakes::pump_contract::run(&epoch(102, 1), &epoch(103, 0));
-    }
-}
+#[path = "epoch_tests.rs"]
+mod tests;
