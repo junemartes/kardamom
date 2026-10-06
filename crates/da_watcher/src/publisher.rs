@@ -51,9 +51,13 @@ pub mod fakes {
     /// order, to the [`PublisherTap`] that [`Self::new`] returns. Its
     /// synthetic `BPosition` advances by `64` per record, so a test can
     /// check positions without depending on Aeron framing.
+    ///
+    /// A clone sends to the same tap and shares the position counter, so a
+    /// test can hand one stream of epochs to several watcher lifetimes.
+    #[derive(Clone)]
     pub struct InMemoryEpochPublisher {
         published: Sender<EpochRecord>,
-        count: AtomicI32,
+        count: Arc<AtomicI32>,
         backpressure: Arc<AtomicBool>,
     }
 
@@ -73,7 +77,7 @@ pub mod fakes {
             let backpressure = Arc::new(AtomicBool::new(false));
             let publisher = Self {
                 published: tx,
-                count: AtomicI32::new(0),
+                count: Arc::new(AtomicI32::new(0)),
                 backpressure: Arc::clone(&backpressure),
             };
             let tap = PublisherTap {
