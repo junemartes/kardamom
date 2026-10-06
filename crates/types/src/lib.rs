@@ -31,6 +31,7 @@ pub mod delta;
 pub mod deposit;
 pub mod envelope;
 pub mod epoch;
+pub mod epoch_delivery;
 pub mod fees;
 pub mod genesis;
 pub mod limits;

@@ -80,9 +80,9 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
         .await
         .complete()
         .ok_or_else(|| crate::chaos_fail!("{ctx}: no complete ingress baseline at T1"))?;
-    // T2. The da-watcher's cursor file survives the stop on the host
-    // mount, so the restart resumes at the sealer's origin, and halts on
-    // the lying anchor again.
+    // T2. The da-watcher's restart resumes after the sealer's origin, and
+    // halts on the lying anchor again. Its cursor file holds the confirmed
+    // origin, so it never stands past the sealer.
     redeploy_followers(h, ctx).await?;
     assert_not_past_sealer(h, ctx).await?;
     await_posting(h, 0, h.knobs.restart_slo + Duration::from_secs(30), ctx).await?;

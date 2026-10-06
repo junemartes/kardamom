@@ -356,6 +356,9 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 | `kardamom_da_watcher_epochs_published_total` | Epochs published. One for each finalized L1 block. |
 | `kardamom_da_watcher_deposits_detected_total` | Deposit publishes. A range that is retried after back-pressure counts again. |
 | `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last tick. The readiness rule uses it. |
+| `kardamom_da_watcher_l1_confirmed_origin` | The L1 origin of the sealer, as the boundaries carry it: the last epoch that the sealer committed. The cursor file holds it. |
+| `kardamom_da_watcher_epochs_unconfirmed` | Published epochs that no boundary confirmed yet. It stays near 0 while the sealer commits. At 2048, the watcher publishes no new epoch. |
+| `kardamom_da_watcher_epochs_republished_total` | Epochs published again, because no boundary confirmed them within 30 s. |
 | `kardamom_da_watcher_l1_cursor_persist_failures_total` | Failed writes of the L1 cursor file. A failure is not fatal: a restart publishes epochs again, and the sealer drops them. A growing count moves the restart point further back. |
 
 - A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.

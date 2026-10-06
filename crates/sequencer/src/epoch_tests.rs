@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use alloy_primitives::B256;
 use kardamom_cluster_adapter::gateway::OfferOutcome;
 use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
+use kardamom_types::epoch_delivery::PUBLISH_WINDOW;
 
 use super::fakes::ScriptedEpochs;
 use super::*;
@@ -230,11 +233,13 @@ fn an_overflow_halts_and_polls_nothing() {
 }
 
 /// After a restart, the pump does not hold the epoch the sealer expects.
-/// It stops offering and reports the gap until a twin's offer fills it:
-/// the boundary that confirms the missing epoch ends the stall.
+/// It stops offering and, past the grace, reports the gap until a twin's
+/// offer fills it: the boundary that confirms the missing epoch ends the
+/// stall.
 #[test]
 fn a_missing_epoch_stalls_until_a_boundary_confirms_it() {
-    let (tx, mut pump) = EpochPump::new();
+    let (tx, pump) = EpochPump::new();
+    let mut pump = pump.with_gap_grace(Duration::ZERO);
     let mut publ = InMemoryTxOrderingRefPublisher::default();
     let mut sub = feed([105, 106]);
     assert!(pump.relay(&mut sub, &mut publ).unwrap());
@@ -265,7 +270,8 @@ fn a_missing_epoch_stalls_until_a_boundary_confirms_it() {
 /// from it. An epoch the sealer ordered already is dropped.
 #[test]
 fn a_missing_epoch_that_arrives_again_is_offered_in_order() {
-    let (tx, mut pump) = EpochPump::new();
+    let (tx, pump) = EpochPump::new();
+    let mut pump = pump.with_gap_grace(Duration::ZERO);
     let mut publ = InMemoryTxOrderingRefPublisher::default();
     let mut sub = feed([105]);
     tx.send(OriginSignal::Confirmed(102)).unwrap();
@@ -294,6 +300,44 @@ fn a_missing_epoch_that_arrives_again_is_offered_in_order() {
         .map(|e| e.l1_number)
         .collect();
     assert_eq!(origins, [105, 103, 104, 105]);
+}
+
+/// A sequencer restarts and loses the unconfirmed epoch 104 from its
+/// queue. Within the grace, the gap is a wait, not a halt: the pump
+/// offers nothing and reports no error. The da-watcher publishes its
+/// unconfirmed epochs 104 and 105 again, and the pump offers them in
+/// order.
+#[test]
+fn within_the_grace_a_missing_epoch_waits_for_the_republish() {
+    let (tx, mut pump) = EpochPump::new();
+    let mut publ = InMemoryTxOrderingRefPublisher::default();
+    tx.send(OriginSignal::Confirmed(103)).unwrap();
+    let mut sub = feed([105]);
+    drain(&mut pump, &mut sub, &mut publ);
+    tx.send(OriginSignal::Gap { expected: 104 }).unwrap();
+
+    assert!(!pump.relay(&mut sub, &mut publ).unwrap(), "a wait, no halt");
+    assert!(!pump.relay(&mut sub, &mut publ).unwrap(), "still a wait");
+
+    sub.push(BPosition::default(), epoch(104, 0));
+    sub.push(BPosition::default(), epoch(105, 0));
+    drain(&mut pump, &mut sub, &mut publ);
+    let origins: Vec<u64> = publ
+        .epochs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.l1_number)
+        .collect();
+    assert_eq!(origins, [105, 104, 105]);
+    assert!(pump.missing.is_none());
+}
+
+/// One da-watcher window of unconfirmed epochs fits in the queue, so the
+/// da-watcher's re-publish never fills it.
+#[test]
+fn a_publish_window_fits_in_the_queue() {
+    assert!(PUBLISH_WINDOW.get() < MAX_UNCONFIRMED_EPOCHS);
 }
 
 #[test]

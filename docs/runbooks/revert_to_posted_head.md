@@ -54,12 +54,15 @@ transaction there was confirmed to its sender and is undone. Run it only after
    - The chain keeps its genesis and its settlement contract.
 7. Install the rebuilt state on every executor and the validator, with their
    checkpoints removed, and start them. Each resumes at the cursor of `H`.
-8. Reset the da-watcher. Its L1 cursor file holds an epoch of the reverted
+8. Reset the da-watcher. Its L1 cursor file holds an origin of the reverted
    chain, past `M`, the L1 origin of `H`.
-   - Read `M` from the seed file, as step 2 of `sealer-fleet-rebuild.md` shows.
    - Remove the file on the aux node: `rm -f /opt/kardamom/da-watcher/l1-cursor`.
-   - Start the da-watcher with `--l1-resume-after M`, as step 6.4 of
-     `sealer-fleet-rebuild.md` shows. Remove the flag at the next deploy.
+   - Start the da-watcher, as step 6.4 of `sealer-fleet-rebuild.md` shows. It
+     waits for the first boundary of the sealers and resumes after `M`.
+   - Fallback, when it logs `no boundary from the sealer within the start
+     wait`: read `M` from the seed file, as step 2 of
+     `sealer-fleet-rebuild.md` shows. Run the da-watcher once with
+     `--l1-resume-after M`. Remove the flag at the next deploy.
 9. Reset the batcher: its cursor file and its spool. Clear its halt. It
    reconciles against L1 at batch `lastBatchIndex` and continues from `H + 1`.
 10. Start the ingress replicas. The chain seals again from `H + 1`.

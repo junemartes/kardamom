@@ -212,17 +212,26 @@ pub struct L1Wiring {
 
 /// Spawn `kardamom-da-watcher` against the anvil L1.
 /// `--poll-interval-secs 1` (the production default is 12 s) keeps
-/// deposit latency inside a test's patience.
+/// deposit latency inside a test's patience. The watcher follows the
+/// sealer's boundaries through the stack's cluster, as in the deploy.
 ///
 /// # Errors
-/// Returns an error when the binary is not built or the process fails to
-/// spawn.
+/// Returns an error when the binary is not built, when writing the config
+/// file fails, or when the process fails to spawn.
 pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned> {
     let metrics_port = free_port().port();
+    let egress_port = free_udp_port().port();
+    let cfg_path = spec.write_cluster_config("da-watcher", "")?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
     cmd.args(["--l1-rpc", &l1.rpc_url])
         .args(["--lockbox", &l1.lockbox])
         .args(["--poll-interval-secs", "1"])
+        .arg("--config")
+        .arg(&cfg_path)
+        .args([
+            "--cluster-egress-endpoint",
+            &format!("127.0.0.1:{egress_port}"),
+        ])
         .arg("--aeron-dir")
         .arg(spec.aeron_dir);
     with_log_config(&mut cmd, spec);
