@@ -518,7 +518,9 @@ Grafana on port 3000 (anonymous viewer; admin `admin` with the
 `grafana_admin_password` job variable, `kardamom` on the local profile).
 The autoscaler's Prometheus APM reads the same service. The operator's
 rules and the Alertmanager routing come from the Nomad variable
-`nomad/jobs/monitoring` (`docs/observability.md`, "Alerts").
+`nomad/jobs/monitoring` (`docs/observability.md`, "Alerts"). The
+`node-exporter` system job gives the host metrics of every node, and every
+Nomad agent publishes its own; Prometheus discovers both through Consul.
 
 ## Sustained-load + chaos suite
 

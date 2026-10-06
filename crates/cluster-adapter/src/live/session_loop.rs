@@ -402,6 +402,7 @@ impl SessionLoop {
             } => self.on_reconnect(leader_member_id, ingress_endpoints),
             DriverEvent::Connected { cluster_session_id } => {
                 tracing::info!(cluster_session_id, "cluster session opened");
+                crate::metrics::record_connected(self.target_member);
                 // Canonical-stream consumers request replay from their
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
@@ -412,6 +413,7 @@ impl SessionLoop {
             }
             DriverEvent::Failed(reason) => {
                 tracing::error!(%reason, "cluster session failed");
+                crate::metrics::record_failed();
             }
         }
     }
@@ -461,6 +463,7 @@ impl SessionLoop {
         self.ingress = p;
         self.endpoints = ingress_endpoints;
         self.target_member = leader_member_id;
+        crate::metrics::record_leader(leader_member_id);
     }
 
     /// Duty 1a: egress-liveness watchdog (every session, see

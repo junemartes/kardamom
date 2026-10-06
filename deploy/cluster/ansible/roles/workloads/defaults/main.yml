@@ -29,6 +29,9 @@ workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, 
 workloads_node_pools: {}
 workloads_common_vars:
   datacenter: "{{ datacenter }}"
+  cluster_id: "{{ cluster_id }}"
+  nomad_region: "{{ nomad_region }}"
+  nomad_tls_dir: "{{ nomad_tls_dir }}"
   partition_count: "{{ partition_count }}"
   tx_ttl_ms: "{{ tx_ttl_ms }}"
   executor_query_port: "{{ ports.executor_nonce_query }}"
@@ -41,6 +44,10 @@ workloads_common_vars:
   # the executor's and validator's fee schedule: "on" or "off". Empty
   # leaves every job at its "off" default.
   priority_fees: "{{ workloads_priority_fees }}"
+  # One value for every Aeron party: each client's driver timeout and
+  # each media driver's client liveness timeout. The jobs derive the
+  # rest from it.
+  aeron_stall_tolerance_ms: "{{ workloads_aeron_stall_tolerance_ms }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -89,6 +96,11 @@ workloads_da_lag_budget_blocks: "{{ lookup('env', 'KARDAMOM_DA_LAG_BUDGET_BLOCKS
 workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
+# The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
+# 10000 is Aeron's default, and production keeps it: a longer value delays
+# the detection of a dead process. CI raises it, so a host stall does not
+# kill a healthy client or driver.
+workloads_aeron_stall_tolerance_ms: "{{ lookup('env', 'AERON_STALL_TOLERANCE_MS') | default('10000', true) }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"

@@ -176,9 +176,9 @@ with three distinct, tested modes:
   member is left, the pipeline **must stall**. Every node returns with its
   own log and snapshots, the members elect a leader among themselves, and
   the backlog drains.
-  What this does not cover: all three members *wiped*. The failure model
-  owns no in-cluster recovery for that; it is the rebuild-from-L1 backstop
-  below.
+  What this does not cover: all three members *wiped*. No in-cluster copy
+  is left; the members start from a seed rebuilt from L1 (the sealer fleet
+  rebuild below).
 
 - **Redis total loss** (`redis-total-loss-recover`) — Redis is a cache with no
   persistence; the executors' state is the truth. The whole redis job
@@ -671,7 +671,8 @@ The sealer refuses a resume whose index lies outside the block it names, so
 a wrong cursor is loud. A state rebuilt through a version 2 payload is correct
 and not resumable. See `docs/specs/2026-09-20-rejoin-from-l1-rebuild.md`,
 which also gives the procedure for a wiped sealer set: `--sealer-seed` writes
-the seed a new sealer cluster starts from at the rebuilt head.
+the seed a new sealer cluster starts from at the rebuilt head (the sealer
+fleet rebuild below).
 
 Scope: L2 transactions, interop deliveries and L1 deposits. Deposits are
 absent from the DA payload: a deposit is unsigned, so a payload-carried deposit
@@ -699,6 +700,57 @@ wrong block hash that reaches their anchor halts them until an operator
 restarts the da-watcher and re-indexes the archive, and a swallowed log is
 invisible to one source. The two-source followers remove both; the cases
 name these assertions as deferred until then.
+
+## Sealer fleet rebuild (every sealer wiped)
+
+All three members lose their cluster and archive directories. No member
+holds a log or a snapshot, so the canonical stream cannot continue. The
+chain restarts after H, the `l2BlockEnd` of the last posted batch, and the
+blocks after H are reverted: their receipts are revoked. The procedure is
+`docs/runbooks/sealer-fleet-rebuild.md`:
+
+1. `kardamom-reconstruct --through-block H --lockbox <addr>` writes the
+   sealer seed, the executor image, and, in a second run, a state that keeps
+   the trie for the validator. `--lockbox` puts the L1 deposits into the
+   rebuilt state.
+2. Every member starts from the seed (`-Dkardamom.cluster.seedSnapshot`), with
+   an empty remote-origin allowlist. The cluster opens block H + 1 at index
+   E_H, the canonical end of H.
+3. Every executor and the validator resume on the rebuilt state at
+   `(E_H, H + 1)`.
+4. The sequencers start, and then the da-watcher with `--l1-resume-after M`,
+   where M is the L1 origin of H. A sequencer reads the epochs live, with no
+   replay, so the da-watcher must not publish before the sequencers subscribe.
+
+Every copy of the reverted chain must go, because each one resumes or
+publishes past the new stream:
+
+| Copy | What it does if it stays |
+|---|---|
+| An executor's or the validator's state DB | Its cursor lies past the new head. The sealer answers `REPLAY_AHEAD` and the consumer stops (`ClusterBehindCursor`). A sealer without that answer lets the consumer drop new records below its cursor as duplicates. |
+| A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
+| The batcher's spool | It continues the confirmed cursor, so the batcher posts reverted blocks. |
+| The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
+| A running da-watcher | It continues at its own cursor, past M. The epochs between M and that cursor never reach the new chain, and their deposits are lost. |
+
+The da-watcher seeds its cursor at the finalized tip on every start. That
+skips no epoch on a running chain only when the tip did not move while it was
+down. After a seed, the chain's origin is M, far behind the tip, so the flag is
+required. A da-watcher that restarts later with a stale flag sends epochs at
+or below the sealer's origin; the sealer drops each one as a regression.
+
+The validator resumes on a rebuilt state that keeps the trie, with no step of
+its own. Its cursor comes from the same meta keys as an executor's, and its
+verify floor is H. It needs no other file: the prover spool, the claims and
+the epoch verifier start empty. No test starts a validator on a rebuilt state
+yet, so this rests on the code path alone.
+
+The output attester is not deployed. It posts a root for every block the
+validator commits, not only for posted blocks, so where it runs, L1 can hold
+roots of reverted blocks. The revert rolls them back
+(`revert_to_posted_head.md`, step 4). The attester then resumes after the
+newest output that remains, and the validator resumes at H. The withdrawals
+between the two are not collected again.
 
 ## DA-watcher
 
@@ -860,6 +912,41 @@ check would pass against a feature that activated once and stopped.
   segment reader also fail-stops on structural damage (a zeroed or undersized
   frame header with data behind it is `Corruption`, no longer a silent
   truncation that read as a live tail).
+- **Aeron stall tolerance** — one deploy value, `aeron_stall_tolerance_ms`
+  (env `AERON_STALL_TOLERANCE_MS`, workloads role), sets how long every Aeron
+  party waits through a stalled peer:
+  - every Rust client's driver timeout (`AERON_DRIVER_TIMEOUT`, which the C
+    client reads and the service code never overrides);
+  - every Java client's driver timeout (`aeron.driver.timeout`), in the
+    `aeron` job's ArchivingMediaDriver JVM and in each sealer member;
+  - every media driver's client liveness timeout
+    (`aeron.client.liveness.timeout`): the `aeron` job's driver and each
+    sealer member's embedded ClusteredMediaDriver. A client's service
+    interval check uses the same value.
+
+  The jobs derive one more value from it: the publication unblock timeout,
+  3/2 of the tolerance, because Aeron refuses to start a driver whose unblock
+  timeout is not above its client liveness timeout. A client sends its
+  keepalive every 500 ms, far below the tolerance. A new ArchivingMediaDriver
+  refuses to start ("active driver detected") while the CnC heartbeat of a
+  dead predecessor is younger than its driver timeout, so the `aeron` job
+  restarts a failed driver after the tolerance plus 5 s: Nomad's own 15 s
+  default at 10 s. The default is **10000**,
+  Aeron's own default, and staging and production keep it: a longer value
+  delays the detection of a dead client or driver by the same amount. The
+  Raft election and leader heartbeat timeouts are separate and do not change.
+
+  CI raises it to **30000** (the `cluster-e2e` workflow and the container
+  recipes of `deploy/cluster/justfile`), the value of the local e2e harness.
+  A shared CI runner stalls for more than 10 s at times (archive copies,
+  cluster restarts). At 10 s, such a stall kills a healthy party: a client
+  exits on `MediaDriver keepalive: age=10941ms > timeout=10000ms` or on
+  `service interval exceeded`, and a shard fails on a fault it did not inject.
+  The chaos cases that need an eviction read the same value
+  (`StallTolerance` in `crates/chaos/src/knobs.rs`): the `sequencer-lapse` and
+  `validator-lapse` freezes default to the tolerance plus 20 s, the
+  retention-overrun freeze lasts at least that long, and the driver restart
+  and ingress recovery waits after a driver loss grow by the tolerance.
 - **The observation path itself** (issue #76, fixed) — `docker kill` of a
   privileged DinD node stalls host-dockerd `docker exec` runner-wide for
   minutes, blacking out every exec-based probe at once; for three days this
