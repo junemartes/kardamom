@@ -84,7 +84,8 @@ impl LapseSample {
 /// the lapse and engage resync, on the survivor path (counters move
 /// past their baselines or resync mode is active) or on the newborn
 /// path (the freeze got its Aeron client evicted, Nomad restarted it,
-/// and the fresh process entered startup resync).
+/// and the fresh process entered startup resync). The default window is
+/// the evicting freeze of the deployed Aeron stall tolerance.
 pub(crate) async fn sequencer_lapse(h: &mut Harness) -> anyhow::Result<()> {
     let node = h.probes.sequencers[0].container.clone();
     let inner = h
@@ -280,7 +281,9 @@ impl Victim {
 /// refusal is the one that logs the restore. The freeze itself does
 /// cost one restart, before the refusal: a SIGSTOP longer than the Aeron
 /// client's service interval makes the client exit on resume, and Nomad
-/// restarts the task. The freeze also crosses the cluster session
+/// restarts the task. The freeze lasts at least the evicting freeze of
+/// the deployed Aeron stall tolerance, so the restart happens at any
+/// tolerance. The freeze also crosses the cluster session
 /// timeout, so the resume goes through a fresh session.
 pub(crate) async fn retention_overrun(h: &mut Harness, victim: Victim) -> anyhow::Result<()> {
     let kind = victim.kind();
@@ -369,13 +372,14 @@ async fn overrun_window(
     inner: &str,
 ) -> anyhow::Result<(i64, Duration)> {
     let budget = Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(15));
+    let shortest = Duration::from_mins(2).max(h.knobs.aeron_stall.evicting_freeze());
     let delta = Cell::new(0_i64);
     let delta_ref = &delta;
     let outcome = poll::after_sleep(budget, |elapsed| async move {
         let rx_now = h.probes.ingress_received().await.unwrap_or(rx_freeze);
         let d = rx_now.saturating_sub(rx_freeze);
         delta_ref.set(d);
-        let overrun = d >= need && elapsed >= Duration::from_mins(2);
+        let overrun = d >= need && elapsed >= shortest;
         Ok::<_, anyhow::Error>(overrun.then_some(d))
     })
     .await?;
