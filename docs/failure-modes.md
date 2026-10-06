@@ -232,16 +232,17 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Proof: `cluster-total-loss-recover`.
   - Not covered in-cluster: three wiped members. No peer holds a snapshot for them. The members start from a seed rebuilt from L1. See "Sealer fleet rebuild (every sealer wiped)". The proof of that path is `sealer-fleet-total-wipe-recover`.
 - **Epoch lost in a leader change**
-  - Trigger: a leader kill or a quorum loss. Cluster ingress is at-most-once across them. An offer that the ingress publication accepted can still be lost. The da-watcher publishes each epoch once.
+  - Trigger: a leader kill or a quorum loss. Cluster ingress is at-most-once across them. An offer that the ingress publication accepted can still be lost.
   - Effect: once the sealer holds an L1 origin, it accepts only the epoch of L1 block `l1_origin + 1`.
     - It answers any other epoch with an `ORIGIN_GAP` reject (egress kind 12) that names the expected block. Only the offering session gets the reject.
     - It logs `cluster ORIGIN-GAP`.
     - The check reads only replicated state, so every member refuses the same epoch.
   - Recovery: the sequencer keeps every epoch that it relayed until a boundary carries its L1 block.
     - On the reject, it offers its epochs again from the expected block, in order. The dedup absorbs the copies.
-    - A lost epoch delays deposits by one round trip. The sealer never seals over it.
+    - The da-watcher follows the boundaries too. When no boundary confirms its published epochs for 30 s, it publishes them again. This fills a sequencer that restarted and lost its queue.
+    - A lost epoch delays deposits by one round trip, or by one re-publish period. The sealer never seals over it.
   - The first epoch at genesis, or after a seed with origin 0, can start at any L1 block. After a seed with origin `M`, the next epoch is `M + 1`.
-  - Proof: the in-process test `OriginGapClusterTest`.
+  - Proof: the in-process test `OriginGapClusterTest`, with `a_republish_from_the_boundary_origin_refills_a_lost_epoch_in_either_order`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
@@ -430,10 +431,11 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - An accepted offer is not an ordered epoch. The epoch lane keeps every epoch until the `l1_origin` of a boundary reaches its L1 block.
   - The lane keeps at most 4096 epochs (13.6 hours of L1). The gauge is `kardamom_sequencer_epochs_unconfirmed`.
   - On an `ORIGIN_GAP` reject (`kardamom_sequencer_origin_gap_total`), the lane offers the epochs again from the expected block.
-  - A replica can fail to fill the gap. It does not hold the expected epoch (it restarted after the da-watcher published it), or its queue is full.
-    - The replica stops its epoch lane and raises the `origin_gap` halt. It never skips an epoch.
-    - A twin that holds the epoch fills the gap, and the halt clears.
-    - Transactions continue in the meantime.
+  - A replica that does not hold the expected epoch (it restarted after the da-watcher published it) stops its epoch lane and waits. It never skips an epoch.
+    - The da-watcher publishes the unconfirmed epochs again after 30 s. A twin that holds the epoch fills the gap.
+    - Only a gap that stands for 90 s (three re-publish periods) raises the `origin_gap` halt.
+  - A full queue raises the `origin_gap` halt at once.
+  - The halt clears when the lane moves again. Transactions continue in the meantime.
 - **Racing duplicates are the design**
   - The first-seen window of the cluster dedups them on the 32-byte `canonical_id`.
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
@@ -721,7 +723,7 @@ This is the backstop at the bottom of the stack. Assume that **every** in-cluste
 - The harness checks that every posted batch starts at the block after the end of the previous batch.
 - A batcher that could not post a range, for any fault of the shard, fails the shard at this stage.
 - The code reads two L1 sources in the followers (the inbox indexer and the da-watcher). Only the wiring of the `chaos-l1` shard gives the followers one URL: the fault proxy `kardamom-l1-fault-proxy`.
-  - With one source, a wrong block hash that reaches the anchor halts the follower. It stays halted until an operator resets the cursor of the da-watcher and re-indexes the archive.
+  - With one source, a wrong block hash that reaches the anchor halts the follower. It stays halted until an operator restarts the da-watcher and re-indexes the archive. The start of the da-watcher reads the hash of the origin of the sealer again.
   - With one source, a swallowed log is invisible.
   - The cases therefore name the two-source assertions as deferred in this shard.
 
@@ -738,8 +740,9 @@ The steps, in order:
 1. `kardamom-reconstruct --through-block H --lockbox <addr>` writes the sealer seed and the executor image. A second run writes a state that keeps the trie, for the validator. `--lockbox` puts the L1 deposits into the rebuilt state.
 2. Every member starts from the seed (`-Dkardamom.cluster.seedSnapshot`), with an empty remote-origin allowlist. The cluster opens block `H + 1` at index `E_H`, the canonical end of `H`.
 3. Every executor and the validator resume on the rebuilt state at `(E_H, H + 1)`.
-4. The sequencers start. Then the da-watcher starts with `--l1-resume-after M`, where `M` is the L1 origin of `H`.
-   - A sequencer reads the epochs live, with no replay. The da-watcher must not publish before the sequencers subscribe.
+4. The sequencers start. Then the da-watcher starts. It follows the seeded sealer: it resumes after the L1 origin `M` of the sealer, the L1 origin of `H`.
+   - `--l1-resume-after M` is the fallback when the da-watcher cannot reach the sealer.
+   - A sequencer reads the epochs live, with no replay. The da-watcher publishes an epoch again 30 s later if it was published before the sequencers subscribed.
 
 Remove every copy of the reverted chain. Each copy that stays resumes or publishes past the new stream.
 
@@ -749,13 +752,14 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 | A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
 | The spool of the batcher | It continues the confirmed cursor, so the batcher posts reverted blocks. |
 | The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
-| A running da-watcher, or its L1 cursor file | It continues at its own cursor, past `M`. The seeded sealer expects `M + 1`, so it refuses each epoch as an origin gap. The sequencers halt on `origin_gap`. Deposits stop until the da-watcher restarts with `--l1-resume-after M`. |
+| A running da-watcher, or its L1 cursor file | It continues at its own position, past `M`, until the first boundary of the seeded sealer arrives. The sealer refuses those epochs as an origin gap. The origin `M` of the boundary is below the confirmed block of the da-watcher, so the da-watcher anchors at `M` and publishes `M + 1` onward. The procedure removes the file anyway. |
 
-- The da-watcher resumes after the block in its L1 cursor file. After a seed, the origin of the chain is `M`, behind that block. So `--l1-resume-after` is required.
-  - The flag overrides the file. The first tick writes `M` to the file.
+- The da-watcher follows the origin of the sealer. After a seed, the origin of the chain is `M`, behind the block in the file.
+  - A start waits for the first boundary and resumes after `M`.
+  - A running da-watcher anchors at `M` when the first boundary arrives.
   - The seeded sealer accepts only the epoch of `M + 1` next.
-  - The procedure also removes the file. Then a restart without the flag cannot resume past `M`.
-- A da-watcher that restarts later with a stale `--l1-resume-after` sends epochs at or below the origin of the sealer. The sealer drops each one as a regression.
+- `--l1-resume-after` is a fallback for a da-watcher that cannot reach the sealer. The flag overrides the file and the wait. The first tick writes `M` to the file.
+- A da-watcher that restarts later with a stale `--l1-resume-after` sends epochs at or below the origin of the sealer. The sealer drops each one as a regression. The first boundary moves the da-watcher to the origin of the sealer.
 - The validator resumes on a rebuilt state that keeps the trie, with no step of its own.
   - Its cursor comes from the same meta keys as the cursor of an executor. Its verify floor is `H`.
   - The prover spool, the claims and the epoch verifier start empty.
@@ -793,33 +797,69 @@ The case asserts these results:
 
 ## DA-watcher
 
-The da-watcher is tick-based with a durable cursor.
+The da-watcher is tick-based, and it follows the commit of the sealer.
 
-- The cursor is the last published L1 block, by number and hash. It is in the file that `--l1-cursor-file` names (`/opt/kardamom/da-watcher/l1-cursor` in the deploy).
-- Any RPC or publish error leaves the cursor unadvanced. The next tick retries the same `(cursor, tip]` range.
-- After each pass that published, the watcher writes the cursor to the file atomically (temp file, fsync, rename).
-- The write follows the publish. A crash between the two makes the restart publish the last pass again. Delivery is at-least-once across restarts.
-  - The repeats are byte-identical. The sealer drops them by canonical id.
-  - Past the dedup window, the origin guard of the sealer drops them.
-- A restart resumes after the stored block. The next block must name the stored hash as its parent.
+- With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
+- The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.
+- A boundary that carries an origin in the window confirms the epochs up to it. The gauge is `kardamom_da_watcher_l1_confirmed_origin`.
 - A dead watcher stalls deposits only.
 - It reads *finalized* L1 blocks, so reorgs are out of scope by construction.
 
+**Re-publish.**
+
+- When `C` does not move for 30 s while epochs wait, the watcher publishes them again, in order, from `C + 1`. It does this at most once in each 30 s. The counter is `kardamom_da_watcher_epochs_republished_total`.
+- This heals, with no operator: a sequencer that restarted and lost its queue, a leader kill, a quorum loss, and a dropped session.
+- 30 s is longer than a leader election (10 s) plus one L1 block and the resend of the sequencer. So in a leader kill, the sequencer heals first.
+- A copy of a committed epoch is byte-identical.
+  - The sequencer drops it at or below its confirmed origin.
+  - The sealer drops it by canonical id. Past the dedup window, the origin guard of the sealer drops it.
+
+**Full window.** At 2048 unconfirmed epochs, the watcher publishes no new epoch until a boundary confirms one.
+
+- It never drops an epoch.
+- The bound is below the queue bound of the sequencer (4096).
+
+**Origin outside the window.** The watcher anchors at the origin in two cases:
+
+- The origin is below the base of the window: a sealer fleet seeded at an older origin.
+- The origin is past the head of the window: another da-watcher published the epochs.
+
+The watcher then reads the hash of the origin through its L1 source set. The next block must descend from it. The watcher never publishes the confirmed epochs again.
+
+**The durable cursor.**
+
+- The cursor holds `C`, by number and hash. It is in the file that `--l1-cursor-file` names (`/opt/kardamom/da-watcher/l1-cursor` in the deploy).
+- After a pass in which `C` moved, the watcher writes `C` to the file atomically (temp file, fsync, rename).
+- Any RPC or publish error leaves the position unadvanced. The next tick retries the same range.
+
 **The start.** The watcher picks its start in this order of precedence:
 
-1. `--l1-resume-after M`: the watcher resumes after `M`. The first tick reads the hash of `M` and writes it to the file. The sealer fleet rebuild sets the flag.
-2. A file that parses: the watcher resumes after its block, linked to its hash.
-3. No file: the watcher starts at the finalized tip and logs a warning. Unless this is the first start of the chain, the start skips the epochs between the last publish and the tip.
-   - The sealer refuses the next epoch as an origin gap. The sequencers halt on `origin_gap`.
-   - Deposits stop until an operator restarts the da-watcher with `--l1-resume-after` (see [`origin_gap`](runbooks/origin_gap.md)).
-   - The deposits of the skipped blocks wait in the lockbox. They are not lost.
+1. `--l1-resume-after M`: the watcher resumes after `M`, with no wait for a boundary.
+   - The first tick reads the hash of `M` and writes it to the file.
+   - It is the fallback for a da-watcher that cannot reach the sealer.
+   - A later boundary outside the published range moves the watcher to the origin of the sealer. So a wrong flag cannot leave a gap.
+2. The first boundary of the sealer, within 20 s: the watcher resumes after its origin `S`. It reads the hash of `S` through the L1 source set.
+   - The watcher does not use a file ahead of `S` (a seed) or behind `S` (another da-watcher published).
+   - The watcher replaces a wrong hash in the file.
+   - Origin 0 means that the sealer holds no epoch. The watcher then goes on to 3 or 4.
+3. A file that parses: the watcher resumes after its block, linked to its hash.
+   - This also applies when no boundary arrives within 20 s (the sealer cluster is down).
+   - The file holds an origin that the sealer confirmed, so it is at or behind the origin of the sealer. The first boundary that arrives later corrects it in both directions.
+4. No file: the watcher starts at the finalized tip and logs a warning.
+   - With a sealer feed, the first boundary moves the watcher back to the origin of the sealer.
+   - Without a sealer feed, and unless this is the first start of the chain, the start skips the epochs between the last publish and the tip.
 
-The file records the publish, not the commit of the sealer.
+A kill of the da-watcher together with the sealer, after a publish and before its commit, loses no epoch.
 
-- A kill of the da-watcher together with the sealer, after a publish and before its commit, loses that epoch. The restart resumes past it.
-- The sequencers then halt on `origin_gap`.
-- The operator runs the da-watcher once with `--l1-resume-after` at the L1 origin of the sealer (`kardamom_sequencer_l1_origin`).
-- Proof: the chaos cases `pipeline-blackout-recover`, `l1-liar` and `two-day-outage` (see [`chaos-suite.md`](chaos-suite.md)).
+- The file holds the commit. The restart publishes the uncommitted epochs again.
+- Proof: the chaos case `pipeline-blackout-recover` asserts that the origin of the sealer then reaches the last publish of the da-watcher. The heals of `l1-liar` and `two-day-outage` restart the da-watcher with no flag. See [`chaos-suite.md`](chaos-suite.md).
+
+Without `--config`, a publish confirms its epoch, and the file holds the last published block.
+
+- An epoch lost between the publish and the commit is not published again.
+- The sealer refuses the next epoch as an origin gap. The sequencers halt on `origin_gap`.
+- An operator runs the da-watcher once with `--l1-resume-after` at the L1 origin of the sealer (`kardamom_sequencer_l1_origin`). See [`origin_gap`](runbooks/origin_gap.md).
+- The deposits of the skipped blocks wait in the lockbox. They are not lost.
 
 A file that exists but does not read or parse raises the `l1_cursor_unreadable` halt.
 
@@ -922,8 +962,8 @@ Rollout rule: **ship the binaries first, flip the flag second.** The activation 
 
 **The restart gap.**
 
-- The L1 cursor file of the watcher closes the restart gap. A watcher that restarts *after* the upgrade L1 block finalized resumes after its last published block. So it publishes that epoch.
-- A watcher without the file, or whose file was removed, seeds at the current tip. It skips that epoch.
+- The start of the watcher closes the restart gap. A watcher that restarts *after* the upgrade L1 block finalized resumes after the L1 origin of the sealer, or after the confirmed block in its L1 cursor file. So it publishes that epoch.
+- A watcher with no sealer feed and no file seeds at the current tip. It skips that epoch.
 - The same seed-skip affects user deposits.
 - The sealer refuses the next epoch as an origin gap. So the skip stops deposits, and the upgrade is not dropped.
 - Runbook: confirm the L2 receipt before you treat an upgrade as applied. The receipt is keyed by the domain-1 `source_hash` of the L1 log position.

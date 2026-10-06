@@ -60,6 +60,8 @@ class OriginGapClusterTest {
         final List<Long> relayed = new ArrayList<>();
         final List<Gap> gaps = new ArrayList<>();
         long replayDone = 0;
+        /** The L1 origin of the last boundary: the origin the sealer confirmed. */
+        long boundaryOrigin = -1;
 
         @Override
         public void onMessage(
@@ -80,6 +82,9 @@ class OriginGapClusterTest {
                     buffer.getLong(offset + 9, ByteOrder.LITTLE_ENDIAN)));
             } else if (kind == SealerWire.EGRESS_KIND_REPLAY_DONE) {
                 replayDone++;
+            } else if (kind == SealerWire.EGRESS_KIND_BOUNDARY) {
+                // kind(1) | block(8) | end_tx_idx(8) | l2_timestamp(8) | l1_origin(8)
+                boundaryOrigin = buffer.getLong(offset + 25, ByteOrder.LITTLE_ENDIAN);
             }
         }
     }
@@ -160,6 +165,54 @@ class OriginGapClusterTest {
 
         cluster.awaitLeader(leader.index());
         offerAfterTheLossAndRepair(cluster.reconnectClient(), o);
+    }
+
+    /**
+     * The leader dies with 101 in flight, and the producer that offered it
+     * restarts with an empty queue. Nothing offers 101 again, except the
+     * da-watcher: the boundaries still carry origin 100, so it publishes
+     * again from 101. A copy of an epoch can then reach the sealer before
+     * or after the re-publish:
+     * <ul>
+     *   <li>the re-published 101 first, then a late copy of 101: the copy
+     *       is a duplicate, absorbed with no reject;</li>
+     *   <li>a later epoch 103 first, then the re-published 102: 103 is
+     *       refused as a gap that names 102, and 102 then 103 are
+     *       ordered.</li>
+     * </ul>
+     * A copy of the confirmed 100 is absorbed too. The canonical origins
+     * have no gap and no duplicate.
+     */
+    @Test
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
+    void a_republish_from_the_boundary_origin_refills_a_lost_epoch_in_either_order() {
+        final TestCluster cluster = ClusterTestHarness.startCluster(
+            systemTestWatcher, MEMBER_COUNT, DEDUP_CAPACITY, TICK_MS);
+        cluster.awaitLeader();
+        final Origins o = new Origins();
+        final AeronCluster client = connectAndOrder100(cluster, o);
+
+        final TestNode leader = cluster.findLeader();
+        cluster.stopNode(leader);
+        assertTrue(offerOnce(client, 101) > 0, "the publication accepts the offer it then loses");
+
+        cluster.awaitLeader(leader.index());
+        final AeronCluster again = cluster.reconnectClient();
+        o.boundaryOrigin = -1;
+        awaitCondition(again, () -> o.boundaryOrigin >= 0);
+        assertEquals(100L, o.boundaryOrigin, "the boundaries confirm 100, not the lost 101");
+
+        offerUntilAccepted(again, 101);
+        offerUntilAccepted(again, 101);
+        offerUntilAccepted(again, 100);
+        offerUntilAccepted(again, 103);
+        awaitCondition(again, () -> !o.gaps.isEmpty());
+        assertEquals(List.of(new Gap(103, 102)), o.gaps, "only the early 103 is refused");
+
+        offerUntilAccepted(again, 102);
+        offerUntilAccepted(again, 103);
+        awaitCondition(again, () -> o.boundaryOrigin == 103);
+        assertEquals(List.of(100L, 101L, 102L, 103L), canonicalOrigins(again, o));
     }
 
     @Test

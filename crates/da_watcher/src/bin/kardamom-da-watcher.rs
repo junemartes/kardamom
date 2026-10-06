@@ -6,8 +6,11 @@
 //!   `--poll-interval`): an `da_watcher::L1Sources` set over one alloy
 //!   HTTP provider per endpoint. Each finalized L1 block becomes one
 //!   `EpochRecord` on the `tx_deposits` Aeron channel, through
-//!   [`publishers::LiveTxDepositsPublisher`]. `--l1-cursor-file` keeps
-//!   the last published block across a restart.
+//!   [`publishers::LiveTxDepositsPublisher`]. With `--config`, a
+//!   boundary-only cluster session follows the sealer's L1 origin: the
+//!   epochs no boundary confirms are published again, and a start
+//!   resumes after the sealer's origin. `--l1-cursor-file` keeps the
+//!   confirmed origin across a restart.
 //! * Interop (`--interop-feed-url`, `--interop-peer-chain-id`, and
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
 //!   chain. Each origin block that carried messages becomes one
@@ -33,7 +36,7 @@ use clap::Parser;
 use kardamom_da_watcher::interop::{
     CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
-use kardamom_da_watcher::{CursorFile, DaWatcherConfig, L1Cursor, L1Endpoints, L1ResumeAfter};
+use kardamom_da_watcher::{CursorFile, DaWatcherConfig, L1Endpoints, L1ResumeAfter};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsPublisherHandle,
     TxRemoteEpochsPublisherHandle,
@@ -46,9 +49,12 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "kardamom-da-watcher/publishers.rs"]
 mod publishers;
+#[path = "kardamom-da-watcher/sealer.rs"]
+mod sealer;
 #[path = "kardamom-da-watcher/watchers.rs"]
 mod watchers;
 
+use sealer::{L1Path, SealerSession};
 use watchers::Watchers;
 
 #[derive(Debug, Parser)]
@@ -76,21 +82,36 @@ struct Args {
     /// The last L1 block whose epoch the chain holds: the L1 origin of
     /// the head that a sealer cluster was seeded at. The first tick then
     /// publishes every finalized block after it. The flag overrides
-    /// `--l1-cursor-file`, and the first tick overwrites the file with
-    /// this block. Without the flag or a cursor file, the watcher starts
-    /// at the finalized tip and skips the blocks before it, so a restart
-    /// after a seed would lose their deposits.
+    /// `--l1-cursor-file` and the start's wait for the sealer's first
+    /// boundary, and the first tick overwrites the file with this block.
+    /// A fallback: with `--config`, a start resumes after the sealer's
+    /// origin by itself.
     #[arg(long, requires = "l1_rpc")]
     l1_resume_after: Option<L1ResumeAfter>,
-    /// Durable L1 cursor file: the last published L1 block, by number and
-    /// hash. The watcher saves it, atomically, after each pass that
-    /// published. On a restart it resumes after that block, and the next
-    /// block must name its hash as its parent. A missing file starts at
-    /// the finalized tip (or `--l1-resume-after`), with a warning. A file
-    /// that exists but does not parse halts the watcher
+    /// Durable L1 cursor file: the sealer's confirmed L1 origin (with
+    /// `--config`), or the last published L1 block (without it), by
+    /// number and hash. The watcher saves it, atomically, after a pass
+    /// that moved it. On a restart it resumes after that block, and the
+    /// next block must name its hash as its parent. A missing file starts
+    /// at the finalized tip (or `--l1-resume-after`), with a warning. A
+    /// file that exists but does not parse halts the watcher
     /// (`l1_cursor_unreadable`) until an operator clears it.
     #[arg(long, requires = "l1_rpc")]
     l1_cursor_file: Option<PathBuf>,
+    /// The da-watcher config file. Its `[cluster]` section connects a
+    /// boundary-only session to the sealer cluster. The watcher then
+    /// follows the sealer's commit: the boundaries' L1 origin confirms
+    /// the published epochs, the epochs no boundary confirms are
+    /// published again, and a start resumes after the sealer's origin.
+    /// Without it, a publish confirms its epoch.
+    #[arg(long, requires = "l1_rpc")]
+    config: Option<PathBuf>,
+    /// This node's cluster-egress endpoint `ip:port`, for `--config`. It
+    /// sets the `[cluster] egress_channel` as
+    /// `aeron:udp?endpoint=<ip:port>`. The Nomad job injects it per node.
+    /// Without `--config` it is not used.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// Polling cadence in seconds (default 12). Must be nonzero: 0 reaches
     /// `tokio::time::interval`, which panics on a zero period.
     #[arg(long, default_value = "12")]
@@ -181,16 +202,6 @@ struct Args {
     host_id: kardamom_obs::HostId,
 }
 
-/// The L1 deposit path, resolved. Present only when both `--l1-rpc` and
-/// `--lockbox` were given.
-struct L1Path {
-    endpoints: L1Endpoints,
-    cfg: DaWatcherConfig,
-    /// The durable cursor, with its lock taken. `None` without
-    /// `--l1-cursor-file`.
-    cursor_file: Option<CursorFile<L1Cursor>>,
-}
-
 /// The interop path, resolved. Present only when the full peer triple
 /// (`--interop-peer-chain-id`, `--interop-feed-url`, `--self-chain-id`) plus
 /// `--interop-cursor-file` were given.
@@ -269,6 +280,11 @@ impl Args {
                     .map(CursorFile::open)
                     .transpose()
                     .context("open --l1-cursor-file")?;
+                let sealer = self
+                    .config
+                    .as_deref()
+                    .map(|path| SealerSession::load(path, self.cluster_egress_endpoint.as_deref()))
+                    .transpose()?;
                 Ok(Some(L1Path {
                     endpoints: L1Endpoints {
                         rpcs: rpcs.to_vec(),
@@ -280,6 +296,8 @@ impl Args {
                         resume_after: self.l1_resume_after,
                     },
                     cursor_file,
+                    sealer,
+                    origins: None,
                 }))
             }
         }
@@ -409,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
 /// thread have stopped, with no explicit `drop` needed.
 async fn serve(
     args: Args,
-    l1: Option<L1Path>,
+    mut l1: Option<L1Path>,
     interop: Option<InteropPath>,
     log_cfg: LogConfig,
 ) -> anyhow::Result<()> {
@@ -446,6 +464,12 @@ async fn serve(
         service.start_deposits_recorder().await?
     } else {
         RecorderThreads::new()
+    };
+    // The session stays up until `serve` returns, after the watchers
+    // stopped; its end closes the boundary thread.
+    let _sealer_session = match l1.as_mut() {
+        Some(l1) => l1.follow_sealer(&service.aeron_rt, &service.plane).await?,
+        None => None,
     };
 
     let watchers = Watchers::spawn(

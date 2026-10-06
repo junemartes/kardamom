@@ -32,15 +32,23 @@
 //!   offering session with the origin it expects. The pump offers its
 //!   unconfirmed epochs again from that origin, in order. The sealer's
 //!   dedup absorbs a copy it already ordered;
-//! * when the pump does not hold the expected epoch, or holds
-//!   [`MAX_UNCONFIRMED_EPOCHS`] that no boundary confirms, it stops and
-//!   reports an error that raises the `origin_gap` halt. It never skips
-//!   an epoch.
+//! * when the pump does not hold the expected epoch (it restarted, and
+//!   lost its queue), it stops offering and waits. The da-watcher
+//!   publishes every epoch that no boundary confirms again, and a twin
+//!   can order the epoch too. When the gap stays for
+//!   [`ORIGIN_GAP_GRACE`], the pump reports an error that raises the
+//!   `origin_gap` halt;
+//! * when the pump holds [`MAX_UNCONFIRMED_EPOCHS`] that no boundary
+//!   confirms, it stops and reports that error at once.
+//!
+//! The pump never skips an epoch.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use kardamom_log::aeron_live::TxDepositsSubscriberHandle;
+use kardamom_types::epoch_delivery::ORIGIN_GAP_GRACE;
 use kardamom_types::{BPosition, EpochRecord};
 
 use crate::error::SequencerError;
@@ -98,6 +106,14 @@ impl EpochSubscriber for TxDepositsSubscriberHandle {
     }
 }
 
+/// An origin the sealer expects that the pump does not hold, and when the
+/// pump first lacked an expected origin.
+#[derive(Debug, Clone, Copy)]
+struct Gap {
+    expected: u64,
+    since: Instant,
+}
+
 /// The epoch lane: the epochs it took off `tx_deposits` and that no
 /// boundary confirmed yet, and the cursor of the next one to offer.
 pub struct EpochPump {
@@ -109,7 +125,9 @@ pub struct EpochPump {
     /// The highest L1 origin a boundary carried.
     confirmed: Option<u64>,
     /// The origin the sealer expects that this pump does not hold.
-    missing: Option<u64>,
+    missing: Option<Gap>,
+    /// How long a gap may stand before the pump reports it.
+    grace: Duration,
     signals: Receiver<OriginSignal>,
 }
 
@@ -123,9 +141,17 @@ impl EpochPump {
             next: 0,
             confirmed: None,
             missing: None,
+            grace: ORIGIN_GAP_GRACE,
             signals,
         };
         (tx, pump)
+    }
+
+    /// The same pump with another gap grace. Tests use a zero grace to
+    /// see the halt at once.
+    #[must_use]
+    pub fn with_gap_grace(self, grace: Duration) -> Self {
+        Self { grace, ..self }
     }
 
     /// Apply every signal the egress feed sent since the last call.
@@ -150,14 +176,15 @@ impl EpochPump {
         // needs no offer, so the cursor stops at the first epoch left.
         self.next = self.next.saturating_sub(done);
         self.confirmed = Some(origin);
-        self.missing = self.missing.filter(|expected| *expected > origin);
+        self.missing = self.missing.filter(|gap| gap.expected > origin);
         crate::metrics::record_epochs_unconfirmed(self.unconfirmed.len());
     }
 
     /// Offer again from `expected`: the sealer refused every epoch above
     /// it. When the pump does not hold `expected`, the gap stands until a
     /// boundary confirms it or the epoch arrives. An origin the boundaries
-    /// confirmed already is not missing.
+    /// confirmed already is not missing. A gap that moves to another
+    /// origin keeps its start time: the lane stalls from the first one.
     fn rewind(&mut self, expected: u64) {
         let at = self.unconfirmed.partition_point(|e| e.l1_number < expected);
         self.next = self.next.min(at);
@@ -165,7 +192,9 @@ impl EpochPump {
             .unconfirmed
             .get(at)
             .is_some_and(|e| e.l1_number == expected);
-        self.missing = Some(expected).filter(|e| !held && Some(*e) > self.confirmed);
+        let since = self.missing.map_or_else(Instant::now, |gap| gap.since);
+        self.missing = Some(Gap { expected, since })
+            .filter(|gap| !held && Some(gap.expected) > self.confirmed);
     }
 
     /// Keep `epoch` in L1 order. An epoch the sealer ordered already, or
@@ -185,8 +214,8 @@ impl EpochPump {
         self.unconfirmed.insert(at, epoch);
         self.next = self.next.min(at);
         crate::metrics::record_epochs_unconfirmed(self.unconfirmed.len());
-        if let Some(expected) = self.missing {
-            self.rewind(expected);
+        if let Some(gap) = self.missing {
+            self.rewind(gap.expected);
         }
     }
 
@@ -199,13 +228,14 @@ impl EpochPump {
     }
 
     /// Poll one epoch when the pump has none left to offer. Returns
-    /// whether it took one.
+    /// whether it took one. While a gap stands for less than the grace,
+    /// the pump waits: it polls, and it offers nothing.
     ///
     /// # Errors
     ///
     /// [`SequencerError::EpochQueueFull`] when the queue is full, before
-    /// it polls; [`SequencerError::OriginGapUnfilled`] while the gap
-    /// stands, after it polls; and the subscription's error.
+    /// it polls; [`SequencerError::OriginGapUnfilled`] when the gap stood
+    /// for the grace, after it polls; and the subscription's error.
     fn fill<S: EpochSubscriber>(&mut self, sub: &mut S) -> Result<bool, SequencerError> {
         if self.to_offer().is_some() {
             return Ok(false);
@@ -218,8 +248,12 @@ impl EpochPump {
         }
         let took = sub.poll()?.map(|(_, epoch)| self.insert(epoch)).is_some();
         match self.missing {
-            Some(expected) => Err(SequencerError::OriginGapUnfilled { expected }),
-            None => Ok(took),
+            Some(gap) if gap.since.elapsed() >= self.grace => {
+                Err(SequencerError::OriginGapUnfilled {
+                    expected: gap.expected,
+                })
+            }
+            _ => Ok(took),
         }
     }
 

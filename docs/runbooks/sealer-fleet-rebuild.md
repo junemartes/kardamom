@@ -141,11 +141,11 @@ restores one of its checkpoints, skips the records of the new chain.
    continues the batcher's cursor, so the batcher would post reverted blocks.
    Without a cursor file, the batcher reads its cursor from the last posted
    batch: `(E_H, H + 1)`. Also remove the da-watcher's L1 cursor file. It
-   holds the last epoch of the reverted chain, which is past M. The flag in
-   step 6 overrides the file, but a restart without the flag would resume
-   after the file's block and skip the epochs between M and that block. The
-   seeded sealer accepts only the epoch of M + 1, so it refuses the later
-   epochs as an origin gap, and every sequencer halts on `origin_gap`.
+   holds an origin of the reverted chain, past M. The da-watcher follows the
+   seeded sealer's origin M at its start (step 6), so the file matters only
+   when no boundary arrives within the start wait. An empty file then starts
+   the da-watcher at the finalized tip, and it follows M back as soon as a
+   boundary arrives.
 
    ```sh
    ssh aux-0 'find /opt/kardamom/state/validator /opt/kardamom/checkpoints -mindepth 1 -delete &&
@@ -231,18 +231,21 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    checkpoint of the old chain survived: stop, and do step 3 again.
 2. Start the state mirrors: `nomad job run -json state-mirror.json`. They find
    the cache empty and rebuild it from an executor's newest checkpoint.
-3. Start the sequencers: `nomad job run -json sequencer.json`. They must run
-   before the da-watcher starts. A sequencer reads the da-watcher's epochs
-   live, with no replay, so an epoch published before the sequencers
-   subscribe never reaches the sealer.
-4. Start the da-watcher after block M. Without the flag, it starts at the
-   finalized tip and skips the blocks between M and the tip: the seeded
-   sealer refuses the tip's epochs as an origin gap, and every sequencer
-   halts on `origin_gap` until the da-watcher runs with the flag. If M is 0,
-   the chain holds no epoch: leave out the flag. The sealer then accepts
-   any first epoch. The flag
-   overrides the da-watcher's L1 cursor file. The first tick writes block M
-   to the file, and every later pass writes the last block it published.
+3. Start the sequencers: `nomad job run -json sequencer.json`. Start them
+   before the da-watcher. A sequencer reads the da-watcher's epochs live,
+   with no replay. An epoch published before the sequencers subscribe does
+   not reach the sealer at first; the da-watcher publishes it again 30 s
+   later, when no boundary confirms it.
+4. Start the da-watcher: `nomad job run -json da-watcher.json`. It waits for
+   the sealer's first boundary and resumes after the sealer's L1 origin M. Its
+   log shows `resuming after the sealer's L1 origin` with `sealer_origin=M`,
+   and the first tick writes block M to its L1 cursor file. If M is 0, the
+   chain holds no epoch: the da-watcher logs `the sealer holds no epoch yet`
+   and starts at the finalized tip, and the sealer accepts any first epoch.
+
+   Fallback, when the da-watcher logs `no boundary from the sealer within the
+   start wait` and the sealer cannot be repaired first: run it once with
+   `--l1-resume-after M`. The flag overrides the cursor file and the wait.
 
    ```sh
    jq --arg m "$M" '.Job.TaskGroups[0].Tasks[0].Config.args += ["--l1-resume-after", $m]' \
@@ -252,7 +255,8 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
 
    Read the da-watcher's metrics on the aux node:
    `kardamom_da_watcher_epochs_published_total` equals
-   `kardamom_da_watcher_l1_finalized_block_number` minus M.
+   `kardamom_da_watcher_l1_finalized_block_number` minus M, and
+   `kardamom_da_watcher_l1_confirmed_origin` grows past M.
 5. Start the ingresses and the batcher:
 
    ```sh
@@ -277,12 +281,12 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
 
 This procedure has no halt to clear. After the members log
 `sealer snapshot TAKEN`, the next `just deploy` registers the cluster job
-without the seed property and the da-watcher job without
+without the seed property, and the da-watcher job without the fallback
 `--l1-resume-after`. The deploy rolls the sealer members one at a time; each
-one restores the snapshot. The da-watcher then resumes after the block in its
-L1 cursor file. A da-watcher that restarts with a stale
-`--l1-resume-after` sends epochs that the sealer already holds; the sealer
-drops them as a regression.
+one restores the snapshot. A da-watcher restart resumes after the sealer's L1
+origin. A da-watcher that restarts with a stale `--l1-resume-after` sends
+epochs that the sealer already holds; the sealer drops them as a regression,
+and the first boundary moves the da-watcher to the sealer's origin.
 
 The output attester is off in the deploy. Where it runs, L1 can hold output
 roots for the reverted blocks: roll them back as `revert_to_posted_head.md`
