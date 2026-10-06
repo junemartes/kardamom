@@ -1,9 +1,14 @@
 //! Integration tests for the L1 watcher's `process_once` pass, driven
 //! through the crate's public API with the `testing`-feature fakes.
 
+use std::num::NonZeroU64;
+
 use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
 use kardamom_da_watcher::source::fakes::MockL1Source;
-use kardamom_da_watcher::{DaWatcherConfig, L1SourceError, L1Watcher, LockboxLog, MonitorError};
+use kardamom_da_watcher::{
+    DaWatcherConfig, L1ResumeAfter, L1SourceError, L1Watcher, LockboxLog, MonitorError,
+    ResumeAfterError,
+};
 
 use alloy_primitives::U256;
 use alloy_primitives::{Address, B256, address};
@@ -15,8 +20,8 @@ fn lockbox() -> Address {
     address!("0000000000000000000000000000000000C0DE01")
 }
 
-/// A watcher over the scripted source, resumed at `cursor`. The test
-/// keeps the publisher's tap, to read the published records.
+/// A watcher over the scripted source, resumed after L1 block `cursor`.
+/// The test keeps the publisher's tap, to read the published records.
 fn watcher(
     pub_: InMemoryEpochPublisher,
     src: MockL1Source,
@@ -28,9 +33,10 @@ fn watcher(
         DaWatcherConfig {
             lockbox: lockbox(),
             poll_interval: std::time::Duration::from_secs(1),
+            resume_after: cursor
+                .map(|c| L1ResumeAfter::from(NonZeroU64::new(c).expect("a test cursor is not 0"))),
         },
     )
-    .resume_at(cursor)
 }
 
 /// A log in L1 block `number`, whose hash is the mock's filler for that
@@ -69,6 +75,47 @@ async fn seed_call_returns_zero_and_advances_cursor() {
     assert_eq!(n, 0);
     assert_eq!(w.cursor(), Some(100));
     assert!(tap.epochs().is_empty());
+}
+
+/// The resume block is parsed once, at the flag. Block 0 names no epoch,
+/// so it is refused, and the operator omits the flag instead.
+#[test]
+fn a_resume_block_is_a_nonzero_l1_block_number() {
+    let parsed: L1ResumeAfter = "41".parse().unwrap();
+    assert_eq!(parsed.block(), 41);
+    assert_eq!("0".parse::<L1ResumeAfter>(), Err(ResumeAfterError::Zero));
+    assert!(matches!(
+        "-1".parse::<L1ResumeAfter>(),
+        Err(ResumeAfterError::NotANumber(_))
+    ));
+    assert!(matches!(
+        "0x29".parse::<L1ResumeAfter>(),
+        Err(ResumeAfterError::NotANumber(_))
+    ));
+}
+
+/// A watcher that starts after a sealer seed publishes every block after
+/// the seed's L1 origin on its first tick. It does not seed its cursor at
+/// the tip, which would lose the deposits of the blocks in between.
+#[tokio::test]
+async fn a_resumed_watcher_publishes_every_block_after_the_resume_block() {
+    let (pub_, tap) = InMemoryEpochPublisher::new();
+    let src = MockL1Source::new();
+    src.push_tip(Ok(45));
+    src.push_logs(Ok(vec![dep_log(43, 0, 700)]));
+    let mut w = watcher(pub_, src, Some(41));
+    assert_eq!(w.cursor(), Some(41));
+
+    let n = w.process_once().await.unwrap();
+
+    assert_eq!(n, 4);
+    assert_eq!(w.cursor(), Some(45));
+    let v = tap.epochs();
+    assert_eq!(
+        v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
+        vec![42, 43, 44, 45]
+    );
+    assert_eq!(v[1].deposits.len(), 1, "the deposit of block 43 is kept");
 }
 
 /// The upgrade transaction rides the deposit path end to end: the same
