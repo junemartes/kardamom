@@ -60,6 +60,7 @@ rule.
 | `da_lag` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/da_lag.md` |
 | `sealer_no_quorum` | the sealer, as the ingress observes it (`service="sealer"`) | auto | `docs/runbooks/sealer_no_quorum.md` |
 | `validator_divergence` | validator | operator | `docs/runbooks/validator_divergence.md` |
+| `l1_cursor_unreadable` | da-watcher | operator | `docs/runbooks/l1_cursor_unreadable.md` |
 
 `docs/runbooks/revert_to_posted_head.md` is the last resort the
 `replay_unavailable` runbook sends the operator to: no cause names it directly.
@@ -679,7 +680,7 @@ the previous one's end. A batcher that could not post a range, for any of
 the faults the shard serves, fails the shard there. The followers of the
 rebuild (the inbox indexer, the da-watcher) read one L1 source today: a
 wrong block hash that reaches their anchor halts them until an operator
-restarts the da-watcher and re-indexes the archive, and a swallowed log is
+resets the da-watcher's cursor and re-indexes the archive, and a swallowed log is
 invisible to one source. The two-source followers remove both; the cases
 name these assertions as deferred until then.
 
@@ -713,13 +714,14 @@ publishes past the new stream:
 | A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
 | The batcher's spool | It continues the confirmed cursor, so the batcher posts reverted blocks. |
 | The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |
-| A running da-watcher | It continues at its own cursor, past M. The epochs between M and that cursor never reach the new chain, and their deposits are lost. |
+| A running da-watcher, or its L1 cursor file | It continues at its own cursor, past M. The epochs between M and that cursor never reach the new chain, and their deposits are lost. |
 
-The da-watcher seeds its cursor at the finalized tip on every start. That
-skips no epoch on a running chain only when the tip did not move while it was
-down. After a seed, the chain's origin is M, far behind the tip, so the flag is
-required. A da-watcher that restarts later with a stale flag sends epochs at
-or below the sealer's origin; the sealer drops each one as a regression.
+The da-watcher resumes after the block in its L1 cursor file. After a seed,
+the chain's origin is M, behind that block, so the flag is required: it
+overrides the file, and the first tick writes M to the file. The procedure
+also removes the file, so a restart without the flag cannot resume past M. A
+da-watcher that restarts later with a stale flag sends epochs at or below the
+sealer's origin; the sealer drops each one as a regression.
 
 The validator resumes on a rebuilt state that keeps the trie, with no step of
 its own. Its cursor comes from the same meta keys as an executor's, and its
@@ -736,15 +738,33 @@ between the two are not collected again.
 
 ## DA-watcher
 
-Tick-based with an in-memory cursor: any RPC or publish error leaves the
-cursor unadvanced and the next tick retries the same `(cursor, tip]` range —
-at-least-once within a run. A block that does not descend from the published
-one raises the `l1_chain_break` halt, and an L1 that does not answer the
-`l1_unreachable` halt; both clear on the next good tick. The l1-indexer's
-follower halts the same way on its chain check. Duplicates after a retry or restart are absorbed
-downstream by the first-seen dedup on `source_hash`. A dead watcher stalls
-deposits only, and it reads *finalized* L1 blocks, so reorgs are out of scope
-by construction.
+Tick-based with a durable cursor: the last published L1 block, by number and
+hash, in `--l1-cursor-file` (`/opt/kardamom/da-watcher/l1-cursor` in the
+deploy). Any RPC or publish error leaves the cursor unadvanced and the next
+tick retries the same `(cursor, tip]` range. After each pass that published,
+the file receives the cursor atomically (temp file, fsync, rename). The write
+follows the publish, so a crash between the two makes the restart publish
+the last pass again: at-least-once across restarts. The repeats are
+byte-identical, and the sealer drops them by canonical id, or, past the dedup
+window, by its origin guard. A restart resumes after the stored block, and
+the next block must name the stored hash as its parent. The order of
+precedence at a start:
+
+1. `--l1-resume-after M` wins: resume after M. The first tick reads M's hash
+   and writes it to the file. The sealer fleet rebuild sets the flag.
+2. A file that parses: resume after its block, linked to its hash.
+3. No file: the finalized tip, with a warning. Unless this is the chain's
+   first start, the epochs between the last publish and the tip are lost.
+
+A file that exists but does not read or parse raises the
+`l1_cursor_unreadable` halt: the watcher stays up, publishes nothing, and
+reads the file again after an operator's clear. It never guesses a start.
+
+A block that does not descend from the published one raises the
+`l1_chain_break` halt, and an L1 that does not answer the `l1_unreachable`
+halt; both clear on the next good tick. The l1-indexer's follower halts the
+same way on its chain check. A dead watcher stalls deposits only, and it
+reads *finalized* L1 blocks, so reorgs are out of scope by construction.
 
 **Two L1 sources.** The followers (the da-watcher and the indexer) read L1
 through a set of endpoints (`--l1-rpc`, a list; `--l1-light-client-rpc`,
@@ -767,8 +787,8 @@ parent hashes. A broken parent chain halts it at the first lying block
 (`kardamom_da_watcher_tick_total{outcome="chain_break"}` moves every tick),
 and it resumes by itself when the endpoint serves the chain again. A wrong
 block hash is caught one block late: the lying hash is already its anchor,
-and already in the epoch it published, so the halt lasts until a restart
-seeds the cursor at the tip. A swallowed log is invisible to one source; two sources see it (above).
+and already in the epoch it published and in its cursor file, so the halt
+lasts until an operator resets the cursor (`l1_chain_break.md`). A swallowed log is invisible to one source; two sources see it (above).
 `KardamomDaWatcherTickErrors` pages on a sustained error rate. The
 chaos-l1 cases `l1-liar` and `two-day-outage` serve each lie and check the
 halt and the resume; the inbox indexer, which chains blocks the same way
@@ -816,13 +836,13 @@ fork**, in two distinct places:
 Hence the rollout rule: **ship the binaries first, flip the flag second.** The
 activation timestamp exists to give operators that window.
 
-The one liveness gap is inherited from the watcher's in-memory cursor: a
-watcher that restarts *after* the upgrade's L1 block finalized but before
-observing it re-seeds at the current tip and skips that epoch — the same
-seed-skip that affects user deposits. The runbook is therefore to confirm the
-L2 receipt (keyed by the domain-1 `source_hash` of the L1 log position) before
-treating an upgrade as applied; the L1 `upgradeNonce` makes a re-send
-unambiguous.
+The watcher's L1 cursor file closes the restart gap: a watcher that restarts
+after the upgrade's L1 block finalized resumes after its last published block,
+so it publishes that epoch. A watcher without the file, or whose file was
+removed, seeds at the current tip and skips that epoch, the same seed-skip that
+affects user deposits. The runbook is therefore to confirm the L2 receipt
+(keyed by the domain-1 `source_hash` of the L1 log position) before treating
+an upgrade as applied; the L1 `upgradeNonce` makes a re-send unambiguous.
 
 Covered by the chain-semantics suite's S13a/b/c (immediate activation,
 scheduled activation, and both authority gates), which assert an EXACT beacon

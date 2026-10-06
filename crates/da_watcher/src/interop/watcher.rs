@@ -34,7 +34,7 @@ use tracing::{debug, error, info, warn};
 
 use kardamom_types::xchain::{XChainError, derive_remote_epoch};
 
-use crate::interop::cursor::CursorFile;
+use crate::cursor::CursorFile;
 use crate::interop::publisher::{PublishError, RemoteEpochPublisher};
 use crate::interop::source::{RemoteChainSource, RemoteSourceError};
 use crate::metrics;
@@ -88,7 +88,7 @@ pub enum InteropError {
 /// publisher, the source, our chain id, and the per-pair cursor (the
 /// first seq not yet canonicalised).
 pub struct InteropWatcher<S, P> {
-    cursor_file: Option<CursorFile>,
+    cursor_file: Option<CursorFile<u64>>,
     origin: u64,
     origin_label: String,
     retry_interval: Duration,
@@ -120,7 +120,7 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropWatcher<S, P> {
         publisher: P,
         source: S,
         config: InteropWatcherConfig,
-        cursor_file: Option<CursorFile>,
+        cursor_file: Option<CursorFile<u64>>,
     ) -> Self {
         let origin = source.origin_chain_id();
         Self {
@@ -168,7 +168,7 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropWatcher<S, P> {
         publisher: P,
         source: S,
         config: InteropWatcherConfig,
-        cursor_file: Option<CursorFile>,
+        cursor_file: Option<CursorFile<u64>>,
     ) -> WatcherHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(Self::new(publisher, source, config, cursor_file).run(shutdown_rx));
@@ -327,7 +327,7 @@ impl<S: RemoteChainSource, P: RemoteEpochPublisher> InteropWatcher<S, P> {
         let Some(cf) = self.cursor_file.as_ref() else {
             return;
         };
-        if let Err(e) = cf.persist(cursor) {
+        if let Err(e) = cf.persist(&cursor) {
             ::metrics::counter!(
                 metrics::REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
                 "origin" => self.origin_label.clone()

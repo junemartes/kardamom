@@ -39,11 +39,14 @@ pub enum HaltCause {
     /// The sealer emits no boundary: the cluster has no leader, or no
     /// quorum to commit one.
     SealerNoQuorum,
+    /// The da-watcher's L1 cursor file exists, but it cannot be read or
+    /// parsed.
+    L1CursorUnreadable,
 }
 
 impl HaltCause {
     /// Every cause, for the tests that check the rules and the runbooks.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -51,6 +54,7 @@ impl HaltCause {
         Self::DaLag,
         Self::ValidatorDivergence,
         Self::SealerNoQuorum,
+        Self::L1CursorUnreadable,
     ];
 
     /// The stable id: the `cause` label of the gauge and the alert.
@@ -71,15 +75,17 @@ impl HaltCause {
             Self::DaLag => RecoveryId::DaLag,
             Self::ValidatorDivergence => RecoveryId::ValidatorDivergence,
             Self::SealerNoQuorum => RecoveryId::SealerNoQuorum,
+            Self::L1CursorUnreadable => RecoveryId::L1CursorUnreadable,
         }
     }
 
     /// Whether the service resumes by itself when the cause goes. A lie
     /// of an L1 source, an L1 outage, a DA lag, and a lost quorum all
     /// clear on their own: the source agrees again, L1 answers, the
-    /// batcher posts, a leader commits. A refused replay and a divergence
-    /// need an operator: a range must be recovered or the chain reverted,
-    /// or a verdict must be examined.
+    /// batcher posts, a leader commits. A refused replay, a divergence,
+    /// and an unreadable cursor need an operator: a range must be
+    /// recovered or the chain reverted, a verdict must be examined, or a
+    /// resume block must be chosen.
     #[must_use]
     pub fn clears(self) -> Clears {
         match self {
@@ -88,7 +94,9 @@ impl HaltCause {
             | Self::L1Unreachable
             | Self::DaLag
             | Self::SealerNoQuorum => Clears::Auto,
-            Self::ReplayUnavailable | Self::ValidatorDivergence => Clears::Operator,
+            Self::ReplayUnavailable | Self::ValidatorDivergence | Self::L1CursorUnreadable => {
+                Clears::Operator
+            }
         }
     }
 }
@@ -109,11 +117,14 @@ pub enum RecoveryId {
     /// chain reverts to the posted head. No cause names it directly; the
     /// `replay_unavailable` runbook sends the operator here.
     RevertToPostedHead,
+    /// A new variant goes last: the `events` stream carries the archived
+    /// discriminant, and a reader of an older build must decode the rest.
+    L1CursorUnreadable,
 }
 
 impl RecoveryId {
     /// Every runbook, for the test that checks each file exists.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -121,6 +132,7 @@ impl RecoveryId {
         Self::DaLag,
         Self::ValidatorDivergence,
         Self::SealerNoQuorum,
+        Self::L1CursorUnreadable,
         Self::RevertToPostedHead,
     ];
 
@@ -136,6 +148,7 @@ impl RecoveryId {
             Self::DaLag => "da_lag",
             Self::ValidatorDivergence => "validator_divergence",
             Self::SealerNoQuorum => "sealer_no_quorum",
+            Self::L1CursorUnreadable => "l1_cursor_unreadable",
             Self::RevertToPostedHead => "revert_to_posted_head",
         }
     }
