@@ -103,6 +103,13 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private volatile long servicePosition;
 
+    /**
+     * The snapshot marks and the posted head, for the log purge thread.
+     * The service thread replaces the value after a snapshot and after the
+     * posted head moves; the purge thread reads it.
+     */
+    private volatile PurgeView purgeView = PurgeView.EMPTY;
+
     /** Malformed ingress frames dropped (logged at power-of-two counts). */
     private long droppedFrameCount = 0;
 
@@ -268,6 +275,10 @@ public final class SealerClusteredService implements ClusteredService {
             // would diverge from the rest of the cluster, which assumes the
             // snapshotted state (and the log replayed after it) is correct.
             restore(SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy()));
+            // The log position of a start from a snapshot is the snapshot's position.
+            purgeView = PurgeView.EMPTY
+                .withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()))
+                .withPostedHead(state.postedHead());
             // Log to stdout so the cluster-member-rejoin chaos case can check
             // that a wiped member came back through a snapshot restore, not
             // silently at genesis.
@@ -330,6 +341,9 @@ public final class SealerClusteredService implements ClusteredService {
         this.state = CanonicalSealerState.seeded(
             seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), daLagBudgetBlocks);
         openEgress(ByteBuffer.allocate(0));
+        // The seed head is on L1, so the purge floor starts there. The first
+        // snapshot after the seed confirmation is the first purge mark.
+        purgeView = PurgeView.EMPTY.withPostedHead(state.postedHead());
         System.out.println("sealer state SEEDED memberId=" + memberId
             + " block=" + seed.head().block() + " endTx=" + seed.head().endTxIdx()
             + " senders=" + state.trackedSenders() + " stateRoot=" + seed.stateRootHex()
@@ -792,6 +806,7 @@ public final class SealerClusteredService implements ClusteredService {
             return;
         }
         egress.setPostedHead(postedHead);
+        purgeView = purgeView.withPostedHead(postedHead);
         System.out.println("cluster POSTED-CURSOR memberId=" + memberId
             + " postedHead=" + postedHead + " sealedHead=" + state.sealedHead()
             + " retained=" + egress.retainedCount()
@@ -971,6 +986,7 @@ public final class SealerClusteredService implements ClusteredService {
         // window here, and the snapshot never has to carry held records.
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
+        purgeView = purgeView.withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()));
         // Log to stdout, like the role line below. The block= value is the
         // proof of catch-up. The SNAPSHOT action is itself a replicated-log
         // entry, so a blank member re-executes historical snapshots (and logs
@@ -1008,6 +1024,11 @@ public final class SealerClusteredService implements ClusteredService {
     /** The log position of the last applied entry; 0 before the first. */
     long servicePosition() {
         return servicePosition;
+    }
+
+    /** The snapshot marks and the posted head that the log purge plans with. */
+    PurgeView purgeView() {
+        return purgeView;
     }
 
     // --- helpers ------------------------------------------------------------

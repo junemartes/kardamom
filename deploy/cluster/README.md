@@ -233,6 +233,15 @@ A new sealer cluster needs one bootstrap. The bootstrap decides which blank memb
   Nomad does not know a purged job, so the role would open the bootstrap.
 - A cluster that lost all its state can start from a seed that `kardamom-reconstruct --sealer-seed` writes. The deploy has no switch for the seed. See the [sealer README](../../cluster/sealer-service/README.md#seeded-start).
 
+### Sealer log purge
+
+Each sealer member purges its own Raft log behind its snapshots.
+
+- The log of the 3 newest snapshots stays. Set `KARDAMOM_CLUSTER_LOG_PURGE_KEEP` to change the count. The value 0 turns the purge off.
+- The log of every block that the batcher has not posted also stays.
+- A member that stops for longer than this margin seeds from a peer when it comes back.
+- See "Raft log purge" and "Follower below the purge point" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#sealer-the-aeron-cluster-raft).
+
 ### Settlement
 
 A deployment needs a settlement address or a built `kardamom-deploy` binary (`DEPLOY_BIN`).
@@ -298,6 +307,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Sealer | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` (job variable `cluster_da_lag_budget_blocks`) | empty (`10000` in the job) | The DA-lag budget, in blocks. The sealer refuses user transactions when the sealed head is more than this far past the posted head. `0` turns the guard off. Every member must use the same value. |
 | Sealer | `KARDAMOM_CLUSTER_BOOTSTRAP` | `0` (`1` in `just container-up`) | `1` opens the sealer bootstrap while the role registers a cluster job that Nomad does not know. See [Sealer bootstrap](#sealer-bootstrap). |
 | Sealer | `KARDAMOM_CLUSTER_SNAPSHOT_S` | empty (`300` in the job) | The interval of the Raft snapshot, in seconds. `0` disables it. |
+| Sealer | `KARDAMOM_CLUSTER_LOG_PURGE_KEEP` | empty (`3` in the job) | How many of the newest Raft snapshots keep their log. `0` turns the log purge off. See [Sealer log purge](#sealer-log-purge). |
 | Sealer | `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the Raft log and the archive. `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs data and metadata. At `0`, a power loss that takes the members together can drop an entry that a quorum acknowledged. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |

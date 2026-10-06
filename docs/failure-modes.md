@@ -200,6 +200,23 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - Without a peer, the member waits and logs `cluster SEED waiting-for-peer`. It never falls back to position 0.
     - See [Start modes](../cluster/sealer-service/README.md#start-modes).
   - Proof: `cluster-member-rejoin` and `node-replace-sealer`. Each case checks that the member starts blank, then reaches the head that the executors had at the wipe.
+- **Raft log purge**
+  - Rule: each member purges its own Raft log below a purge point. The purge point is the newest snapshot that obeys two rules:
+    - It is older than the 3 newest snapshots (`kardamom.cluster.logPurgeKeepSnapshots`, env `KARDAMOM_CLUSTER_LOG_PURGE_KEEP`). The value 0 turns the purge off.
+    - The batcher has posted its block.
+  - Effect: the log keeps every block that the batcher has not posted. At the 300 s snapshot interval, the log keeps 15 minutes or more.
+  - Recovery: a follower that stops for a shorter time rejoins from its own log. A blank member seeds from a peer.
+  - The purge logs `cluster LOG PURGED memberId=.. position=.. block=.. postedHead=..`.
+  - Proof: the in-JVM tests `ClusterLogPurgeTest`.
+- **Follower below the purge point**
+  - Trigger: a follower stops for longer than the purge margin. It restarts with a log that ends below the purge point of the leader.
+  - Effect: the archive of the leader refuses the catch-up of the follower. The election of the follower cycles, while Nomad sees a live container.
+  - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off).
+    - It logs `cluster CATCHUP STALL`.
+    - It deletes the recording log of the member and exits with code 4.
+    - The relaunch finds no recording log. So the member seeds from a peer and rejoins.
+    - The member holds no committed entry that the leader does not have, because it was behind the leader.
+  - Proof: the in-JVM tests `ClusterLogPurgeTest` and `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.
   - Effect: the pipeline must stall. Progress without a quorum would be unreplicated ordering, which is unsafe. Client cluster sessions die, because the outage is longer than the session timeout.

@@ -1,7 +1,28 @@
 # Cluster log purge and blank-member seed
 
-Status: design, not implemented. Issue #195, leg 3. Audit follow-up item 4
-in `docs/reviews/2026-08-03-chaos-coverage-audit.md`.
+Status: implemented, with two changes to option B below (see "As built").
+Issue #195, leg 3. Audit follow-up item 4 in
+`docs/reviews/2026-08-03-chaos-coverage-audit.md`.
+
+## As built
+
+- The seed: step B.2 (`ClusterTool.seedRecordingLogFromSnapshot`) does not
+  work on a live cluster. A blank member instead runs an Aeron
+  ClusterBackup with `LATEST_SNAPSHOT` into its own directories before it
+  launches (`PeerSeed`). Only the bootstrap of a new cluster starts a blank
+  member at log position 0.
+- The purge: each member purges its own log (`LogPurger`, on its own
+  thread). The purge point is the newest snapshot that is older than the
+  `kardamom.cluster.logPurgeKeepSnapshots` newest ones (default 3) and
+  whose block number is at or below the posted head (`PurgePlanner`). The
+  floor is the rule of `docs/specs/2026-10-03-l1-outage-recovery-chaos.md`
+  §3.10. Fact 2 holds: `ClusterLogFactsTest` shows that a wiped follower
+  cannot replay from position 0 after a purge.
+- A follower whose log ends below the leader's purge point cannot catch
+  up, and a restart does not help. The join watchdog detects the stall,
+  deletes the recording log, and exits, so the relaunch seeds from a peer.
+- The archive segment of a new recording is one log term (8 MiB), so a
+  purge keeps little log below the purge point.
 
 ## Problem
 

@@ -113,7 +113,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 - [`cluster-leader-kill`](failure-modes.md#sealer-the-aeron-cluster-raft): kills the Raft leader. The pipeline must keep committing.
 - [`cluster-follower-kill`](failure-modes.md#sealer-the-aeron-cluster-raft): kills a follower. The restarted member must restore from a snapshot.
-- [`cluster-member-rejoin`](failure-modes.md#sealer-the-aeron-cluster-raft): kills a follower and wipes its cluster and archive directories. The blank member must start blank (a seed from a peer snapshot, or position 0 when the cluster has no snapshot) and reach the head that the executors had at the wipe.
+- [`cluster-member-rejoin`](failure-modes.md#sealer-the-aeron-cluster-raft): waits up to 6 minutes for the `cluster LOG PURGED` line of the leader. A replay from position 0 is then impossible. The case then kills a follower and wipes its cluster and archive directories. The blank member must seed from a peer snapshot and reach the head that the executors had at the wipe.
 - [`node-replace-sealer`](failure-modes.md#sealer-the-aeron-cluster-raft): replaces the node of a follower through the Terraform root. The blank member must start blank and reach the head that the executors had at the replacement.
 - [`cpu-squeeze`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): throttles the CPU of every pipeline node in cycles. The validator may slow down. It must never diverge.
 
