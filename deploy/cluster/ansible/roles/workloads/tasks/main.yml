@@ -9,7 +9,12 @@
 - name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml
   vars:
-    workloads_job: {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
+    workloads_job:
+      name: aeron
+      file: aeron.system.nomad.hcl
+      retries: 200
+      vars:
+        archive_file_sync_level: "{{ workloads_archive_file_sync_level }}"
 
 # The development L1: anvil runs only when no real L1 is given (L1_RPC).
 # Behind the fault proxy, the followers walk finalized blocks, so anvil

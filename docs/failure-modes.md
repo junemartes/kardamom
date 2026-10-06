@@ -1001,6 +1001,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **Archives**
   - The `tx_ordering` archive is folded into the Raft log and a per-member archive. Each sequencer has a `tx_data` archive. They underpin the resume of the executor and the batcher.
   - `tx_data` is **2x node-redundant**. It is a UDP-multicast stream. Both ingress replicas run an archive recorder that joins the group. The archive of each ingress node captures *every* publisher shard stream.
+  - The archive daemon syncs each recorded write batch to disk (`archive_file_sync_level`, default 1, env `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL`). At level 0 a recording that the executors would refetch from can exist only in the page cache.
   - The two archives are byte-identical (same recording ids, verified by a content compare). The peer is therefore an exact restore source.
   - The path back to full redundancy after a loss is `kardamom-archive-rereplicate`.
     - A wiped node restores its archive by file-mirroring the segments and the catalog of the surviving peer. The `rusteron-archive` crate does not expose the network `replicate()` of Aeron.
