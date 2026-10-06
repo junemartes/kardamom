@@ -203,11 +203,11 @@ job "aeron" {
         # MB term buffers) sits off-heap in the tmpfs aeron.dir, so a
         # small heap is plenty. The JVM honors _JAVA_OPTIONS
         # regardless of the image entrypoint.
-        # The Aeron MTU: 1344, below the 1400-byte path of a Hetzner
-        # vSwitch VLAN (1400 - 20 IP - 8 UDP = 1372, then down to a
-        # multiple of 32). The Aeron default is 1408, which fragments or
-        # drops on that path. A datagram of 1344 also fits every other
-        # path (a Docker bridge, a Cloud Network, the loopback).
+        # The Aeron MTU: 1344, below a 1400-byte network path
+        # (1400 - 20 IP - 8 UDP = 1372, then down to a multiple of 32).
+        # The Aeron default is 1408, which fragments or drops on that
+        # path. A datagram of 1344 also fits every other path (a Docker
+        # bridge, a cloud network, the loopback).
         _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts}"
       }
 
@@ -246,9 +246,9 @@ job "aeron" {
       # the term buffers in the tmpfs aeron.dir are charged to the cgroup
       # of the driver that creates them: on a recorder node (the ingress
       # and aux nodes, whose archive records a topic) they reach 350 MB,
-      # and the kernel OOM-killed the driver at 384 MB on the staging
-      # launch (2026-09-27). The service containers of the node then
-      # fail on "aeron thread did not signal start".
+      # and the kernel OOM-kills a driver limited to 384 MB. The service
+      # containers of the node then fail on "aeron thread did not signal
+      # start".
       resources {
         cpu    = 400
         memory = 768
