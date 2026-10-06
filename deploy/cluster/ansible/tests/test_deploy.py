@@ -227,8 +227,8 @@ class DeployTest(unittest.TestCase):
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
-                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'monitoring', 'da-store',
-                    'batcher']
+                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
+                    'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]

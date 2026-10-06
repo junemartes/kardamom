@@ -8,7 +8,10 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::poll::Budget;
+
 mod job;
+mod log;
 mod saved_job;
 pub(crate) use job::Job;
 pub(crate) use saved_job::SavedJob;
@@ -33,22 +36,6 @@ impl Streams {
 }
 
 /// One allocation of a job, as the listing returns it.
-/// How many transient (5xx) answers one task-log read absorbs before it
-/// fails, and the pause between the attempts. A Nomad client answered 500
-/// for longer than six seconds while a task's log rotated under load, and
-/// three attempts two seconds apart failed a case that had not injected
-/// anything yet. Six attempts five seconds apart cover half a minute.
-const LOG_READ_RETRIES: usize = 6;
-const LOG_READ_RETRY_DELAY: Duration = Duration::from_secs(5);
-
-/// The outcome of one task-log read.
-enum LogRead {
-    /// The log text; empty for a log Nomad no longer has.
-    Text(String),
-    /// A 5xx answer from the client's fs endpoint.
-    Transient(reqwest::StatusCode),
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Alloc {
     #[serde(rename = "JobVersion")]
@@ -116,6 +103,8 @@ pub struct NomadNode {
 pub struct Nomad {
     http: reqwest::Client,
     base: String,
+    /// The retry budget of one task-log read.
+    log_budget: Budget,
 }
 
 impl Nomad {
@@ -132,6 +121,7 @@ impl Nomad {
         Ok(Self {
             http,
             base: addr.trim_end_matches('/').to_string(),
+            log_budget: log::LOG_READ_BUDGET,
         })
     }
 
@@ -283,72 +273,6 @@ impl Nomad {
         Ok(())
     }
 
-    /// One task's log stream of one allocation, from the start. Nomad's
-    /// own log files persist across in-place restarts of the same
-    /// allocation, so lines from a dead task generation are still here
-    /// after the docker driver garbage-collected its container. An
-    /// allocation the client has not started yet yields an empty string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails for a reason other than a
-    /// missing log.
-    pub async fn task_log(
-        &self,
-        alloc_id: &str,
-        task: &str,
-        stream: &str,
-    ) -> anyhow::Result<String> {
-        let url = self.url(&format!(
-            "/v1/client/fs/logs/{alloc_id}?task={task}&type={stream}&plain=true&origin=start"
-        ));
-        // The client's fs endpoint answers 5xx for a moment while the
-        // task's log file rotates. Evidence readers poll, so a read that
-        // fails once must not end the case; a read that keeps failing
-        // must, with the status in the error.
-        for _ in 0..LOG_READ_RETRIES {
-            match self.read_log_once(&url).await? {
-                LogRead::Text(text) => return Ok(text),
-                LogRead::Transient(status) => Self::retry_pause(&url, status).await,
-            }
-        }
-        match self.read_log_once(&url).await? {
-            LogRead::Text(text) => Ok(text),
-            LogRead::Transient(status) => anyhow::bail!("GET {url}: {status} after retries"),
-        }
-    }
-
-    /// Log a transient answer and wait before the next attempt.
-    async fn retry_pause(url: &str, status: reqwest::StatusCode) {
-        crate::log(format!("log read {url} answered {status}; retrying"));
-        tokio::time::sleep(LOG_READ_RETRY_DELAY).await;
-    }
-
-    /// One read of a task log. A missing log reads as empty text; a 5xx
-    /// answer is transient and left to the caller.
-    async fn read_log_once(&self, url: &str) -> anyhow::Result<LogRead> {
-        let response = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(LogRead::Text(String::new()));
-        }
-        if status.is_server_error() {
-            return Ok(LogRead::Transient(status));
-        }
-        let text = response
-            .error_for_status()
-            .with_context(|| format!("GET {url}"))?
-            .text()
-            .await
-            .with_context(|| format!("read {url}"))?;
-        Ok(LogRead::Text(text))
-    }
-
     /// The concatenated logs of every allocation of `job` on a ready node,
     /// running or not, every task, in the streams asked for. This is the
     /// evidence source for lines that straddle a task restart.
@@ -377,8 +301,7 @@ impl Nomad {
             .keys()
             .flat_map(|task| streams.names().iter().map(move |s| (task, *s)));
         for (task, stream) in reads {
-            self.append_task_log(&mut out, &alloc.id, task, stream)
-                .await?;
+            self.append_task_log(&mut out, alloc, task, stream).await?;
         }
         Ok(out)
     }
@@ -386,11 +309,11 @@ impl Nomad {
     async fn append_task_log(
         &self,
         out: &mut String,
-        alloc_id: &str,
+        alloc: &Alloc,
         task: &str,
         stream: &str,
     ) -> anyhow::Result<()> {
-        out.push_str(&self.task_log(alloc_id, task, stream).await?);
+        out.push_str(&self.task_log(alloc, task, stream).await?);
         out.push('\n');
         Ok(())
     }
