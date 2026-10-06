@@ -347,7 +347,7 @@ job "cluster" {
         # interpolates in env exactly as it would in args.
         # aeron.mtu.length=1344 applies to the embedded ClusteredMediaDriver:
         # the same value as the shared driver (aeron.system.nomad.hcl),
-        # below the 1400-byte path of a Hetzner vSwitch VLAN.
+        # below a 1400-byte network path.
         env {
           JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
         }

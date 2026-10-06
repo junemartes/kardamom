@@ -23,15 +23,16 @@ to L1, so the sealer refuses new transactions until the batcher posts again.
    `l1_unreachable` or `replay_unavailable`. Follow that runbook.
 2. If the batcher process is gone, start it. It resumes from its cursor and the
    spool.
-3. Do not set the budget to zero to make the chain live again. Zero turns the
-   guard off, and the chain then seals blocks nobody can post. That is the
-   loss the guard exists to prevent. A chain that accepts the risk sets zero in
-   the open, in its deploy, before an incident.
+3. Do not set the budget to zero to make the chain live again.
+   - Zero turns the guard off. The chain then seals blocks that nobody can post.
+   - The guard exists to prevent that loss.
+   - A chain that accepts the risk sets zero in its deploy, before a halt.
 
 ## Clear
 
-This halt clears by itself (`auto`). The batcher publishes its confirmed cursor
-on every post. When the cursor comes within the budget of the sealed head, the
-sealer accepts transactions again, the ingress clears the sealer's halt on the
-next status it reads from the cluster, and the ingresses resume submits with
-it. No pause needs an operator.
+This halt clears by itself (`auto`).
+
+- The batcher publishes its confirmed cursor on every post.
+- When the cursor comes within the budget of the sealed head, the sealer accepts transactions again.
+- The ingress clears the sealer halt on the next status frame from the cluster.
+- The ingresses then resume submits. No pause needs an operator.
