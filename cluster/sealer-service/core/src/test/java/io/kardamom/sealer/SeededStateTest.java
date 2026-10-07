@@ -147,9 +147,7 @@ class SeededStateTest {
     @Test
     void a_version_9_snapshot_restores_a_state_started_at_genesis() {
         final byte[] current = seeded(64, seed()).takeSnapshot();
-        // Cut the version-11 cursor count (1), the seed status (1) and the
-        // seed digest.
-        final byte[] v9 = Arrays.copyOf(current, current.length - 1 - 1 - SealerSeed.HASH_LEN);
+        final byte[] v9 = Arrays.copyOf(current, current.length - 1 - SealerSeed.HASH_LEN);
         ByteBuffer.wrap(v9).putInt(4, 9);
         final CanonicalSealerState restored = CanonicalSealerState.load(v9, 64);
         assertEquals(SeedStatus.GENESIS, restored.seedStatus());

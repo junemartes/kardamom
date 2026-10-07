@@ -147,8 +147,28 @@ public final class CanonicalSealerState {
      * Version 11 adds the recorded cursors after the seed digest; an older
      * snapshot restores no cursor, and the record-lag guard refuses
      * nothing until the first cursor.
+     *
+     * <p>This is the newest version that {@link #load} reads. The writer
+     * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
-    private static final int SNAPSHOT_VERSION = 11;
+    private static final int SNAPSHOT_READ_VERSION = 11;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes. It stays one step
+     * behind {@link #SNAPSHOT_READ_VERSION}, so a member of the previous
+     * release, which reads up to version 10, can still restore every
+     * snapshot that this release writes. A rollback then does not stop the
+     * old members on the first new snapshot.
+     *
+     * <p>A version-10 snapshot holds no recorded cursor, so a member that
+     * restores one has no cursor until the next cursor record. With the
+     * record-lag guard off (budget 0) that changes no decision: the guard
+     * refuses nothing, and the cursors reach only the status frame. With a
+     * budget above 0, a restored member could refuse less than its peers.
+     * So the release that turns the cursor publisher and the guard on also
+     * sets this value to 11, after every member reads version 11.</p>
+     */
+    private static final int SNAPSHOT_WRITE_VERSION = 10;
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -1388,8 +1408,22 @@ public final class CanonicalSealerState {
      * {@link SeedStatus} ordinal) and the seed digest (32) after it.
      * Version 11 adds the recorded cursors after the seed digest: see
      * {@link RecordedCursors#writeTo}.</p>
+     *
+     * <p>The writer writes {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
     public byte[] takeSnapshot() {
+        return takeSnapshot(SNAPSHOT_WRITE_VERSION);
+    }
+
+    /**
+     * {@link #takeSnapshot()} in the layout of {@code version}: 10 has no
+     * recorded-cursor section, 11 has it. A version-10 snapshot is the same
+     * bytes that the previous release writes for the same state.
+     *
+     * @param version 10 or 11
+     */
+    byte[] takeSnapshot(int version) {
+        boolean withCursors = version >= 11;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1401,10 +1435,10 @@ public final class CanonicalSealerState {
                 + 4
                 + 8
                 + 1 + SealerSeed.HASH_LEN
-                + recorded.snapshotLen();
+                + (withCursors ? recorded.snapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
-        buf.putInt(SNAPSHOT_VERSION);
+        buf.putInt(version);
         buf.putLong(canonicalCount);
         buf.putLong(blockNumber);
         buf.putInt(idCount);
@@ -1450,7 +1484,9 @@ public final class CanonicalSealerState {
         buf.put((byte) seedStatus.ordinal());
         buf.put(seedDigest);
         // v11 tail: the recorded cursors, in executor-id order.
-        recorded.writeTo(buf);
+        if (withCursors) {
+            recorded.writeTo(buf);
+        }
         return buf.array();
     }
 
@@ -1556,7 +1592,7 @@ public final class CanonicalSealerState {
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version < 1 || version > SNAPSHOT_VERSION) {
+        if (version < 1 || version > SNAPSHOT_READ_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();

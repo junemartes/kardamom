@@ -2,6 +2,7 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.LagBudgets;
@@ -76,6 +77,9 @@ class SealerRecordLagTest {
         assertEquals(9, SealerWire.KIND_RECORDED_CURSOR);
         assertEquals(13, SealerWire.EGRESS_KIND_RECORD_LAG_REJECT);
         assertEquals(10, SealerWire.RECORDED_CURSOR_LEN);
+        assertEquals(85, SealerWire.MIN_INGRESS_LEN);
+        assertTrue(SealerWire.RECORDED_CURSOR_LEN < SealerWire.MIN_INGRESS_LEN,
+            "a member that does not know kind 9 drops the frame as a short record");
         assertArrayEquals(
             new byte[] {9, 3, 0x02, 0x01, 0, 0, 0, 0, 0, 0},
             IngressFrames.recordedCursorFrame(3, 0x0102L));
@@ -145,12 +149,17 @@ class SealerRecordLagTest {
         assertEquals(5, ofKind(executor, SealerWire.EGRESS_KIND_RELAYED).size(), "the resubmit is ordered");
     }
 
+    /**
+     * The service writes a version-10 state section, so a member of the
+     * previous release restores it. The cursors do not survive the restore.
+     */
     @Test
-    void a_restored_member_keeps_the_cursors() {
+    void a_snapshot_is_version_10_and_a_restore_writes_the_same_bytes() {
         start(BUDGET);
         users(0, 3);
         deliver(executor, IngressFrames.recordedCursorFrame(1, 2L));
         final byte[] snapshot = service.snapshot();
+        assertEquals(10, ByteBuffer.wrap(snapshot).getInt(4), "the state section is version 10");
 
         final SealerClusteredService restored = new SealerClusteredService(
             64, 250, 0, Set.of(), VOTERS,

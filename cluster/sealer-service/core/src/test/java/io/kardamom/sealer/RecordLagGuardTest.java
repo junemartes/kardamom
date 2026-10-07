@@ -12,7 +12,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState.RecordOutcome;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -154,49 +153,70 @@ class RecordLagGuardTest {
         assertEquals(RecordedCursors.NONE, s.bestRecorded(), "a refused cursor moves nothing");
     }
 
+    /** The version field of a snapshot. */
+    private static int versionOf(byte[] snapshot) {
+        return ByteBuffer.wrap(snapshot).getInt(4);
+    }
+
     @Test
-    void the_cursors_survive_a_snapshot() {
+    void the_writer_writes_the_version_10_bytes_with_no_cursor_section() {
+        CanonicalSealerState with = state(BUDGET);
+        CanonicalSealerState without = state(BUDGET);
+        users(with, 0, 6);
+        users(without, 0, 6);
+        with.onRecordedCursor(0, 3L);
+        with.onRecordedCursor(2, 1L);
+
+        byte[] written = with.takeSnapshot();
+        assertEquals(10, versionOf(written), "the writer stays at version 10");
+        assertArrayEquals(without.takeSnapshot(), written, "the cursors are not in a version-10 snapshot");
+        assertEquals(with.takeSnapshot(11).length - 1 - 2 * 9, written.length,
+            "a version-10 snapshot is the version-11 one without the cursor section");
+    }
+
+    @Test
+    void a_version_11_snapshot_loads_with_its_cursors() {
         CanonicalSealerState s = state(BUDGET);
         users(s, 0, 6);
         s.onRecordedCursor(2, 1L);
         s.onRecordedCursor(0, 3L);
+        byte[] v11 = s.takeSnapshot(11);
+        assertEquals(11, versionOf(v11));
 
-        CanonicalSealerState restored = reload(s, s.takeSnapshot(), VOTERS);
+        CanonicalSealerState restored = reload(s, v11, VOTERS);
         assertEquals(3L, restored.bestRecorded());
-        assertArrayEquals(s.takeSnapshot(), restored.takeSnapshot(), "every member writes the same bytes");
+        assertArrayEquals(v11, restored.takeSnapshot(11), "every member writes the same bytes");
         assertFalse(restored.onRecordedCursor(0, 2L), "the restored cursor of executor 0 is 3");
         assertTrue(restored.onRecordedCursor(2, 4L), "the restored cursor of executor 2 is 1");
     }
 
     @Test
-    void a_restore_drops_the_cursor_of_a_removed_executor() {
+    void a_version_11_restore_drops_the_cursor_of_a_removed_executor() {
         CanonicalSealerState s = state(BUDGET);
         users(s, 0, 6);
         s.onRecordedCursor(0, 1L);
         s.onRecordedCursor(2, 5L);
+        byte[] v11 = s.takeSnapshot(11);
 
-        CanonicalSealerState a = reload(s, s.takeSnapshot(), TWO_VOTERS);
-        CanonicalSealerState b = reload(s, s.takeSnapshot(), TWO_VOTERS);
+        CanonicalSealerState a = reload(s, v11, TWO_VOTERS);
+        CanonicalSealerState b = reload(s, v11, TWO_VOTERS);
         assertEquals(1L, a.bestRecorded(), "the best is over the configured executors only");
         assertTrue(a.recordLagHalted(), "lag 4 > 2");
-        assertArrayEquals(a.takeSnapshot(), b.takeSnapshot());
+        assertArrayEquals(a.takeSnapshot(11), b.takeSnapshot(11));
     }
 
     @Test
     void a_version_10_snapshot_restores_no_cursor() {
         CanonicalSealerState s = state(BUDGET);
         users(s, 0, 6);
-        // A state with no cursor writes one zero count. Cut it and set the
-        // version back, which is the exact version-10 byte layout.
-        byte[] v11 = s.takeSnapshot();
-        byte[] v10 = Arrays.copyOf(v11, v11.length - 1);
-        ByteBuffer.wrap(v10).putInt(4, 10);
+        s.onRecordedCursor(0, 3L);
+        byte[] v10 = s.takeSnapshot();
 
         CanonicalSealerState restored = reload(s, v10, VOTERS);
         assertEquals(6L, restored.canonicalCount());
         assertEquals(RecordedCursors.NONE, restored.bestRecorded());
         assertFalse(restored.recordLagHalted(), "no cursor: the guard refuses nothing");
-        assertArrayEquals(v11, restored.takeSnapshot(), "the restored state writes version 11");
+        assertArrayEquals(v10, restored.takeSnapshot(), "the restored state writes the same bytes");
     }
 
     @Test
@@ -212,6 +232,6 @@ class RecordLagGuardTest {
         user(s, 4);
         s.onRecordedCursor(0, 1L);
         user(s, 3);
-        return s.takeSnapshot();
+        return s.takeSnapshot(11);
     }
 }

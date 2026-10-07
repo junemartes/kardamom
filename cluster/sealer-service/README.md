@@ -379,6 +379,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
 - `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
   - The deploy does not pass it yet, so the guard is off.
+  - Keep it at `0` while the member writes snapshot version 10. See [Snapshot](#snapshot).
   - The budget and `daLagBudgetBlocks` are not in the snapshot.
 - `seedSnapshot`: the deploy passes the job variable `cluster_seed_snapshot`.
   - The variable is empty in a normal deploy. An empty path means no seed.
@@ -454,7 +455,10 @@ The chaos suite and operators read these lines. The sealer has no other observab
 
 ## Snapshot
 
-- The snapshot format is version 11. A member also loads older versions.
+- The member reads snapshot versions 1 to 11. It writes version 10.
+  - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
+  - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
+  - The release that turns on the cursor publisher and the record-lag guard writes version 11. Do not set `recordLagBudget` above `0` before that release.
   - A snapshot before version 9 restores a posted head of `0`. A snapshot before version 10 restores a state that started at genesis.
   - A snapshot before version 11 restores no recorded cursor. The record-lag guard then refuses nothing until the first cursor.
 - The state section holds:
@@ -465,7 +469,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
   - the ordering window size
   - the posted head, after the ordering window size
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
-  - the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
+  - from version 11 only, the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
     - A restore drops the cursor of an executor that is not a configured voter.
 - The retained egress frames follow the state section. See `retention` in [Settings](#settings).
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
