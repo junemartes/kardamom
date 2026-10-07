@@ -149,6 +149,7 @@ locals {
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
     "kardamom-validator", "kardamom-state-mirror", "kardamom-notifier",
+    "kardamom-l1-follower",
   ]
 }
 

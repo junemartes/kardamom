@@ -300,7 +300,10 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Light client | `L1_LIGHT_CLIENT_HOST`, `L1_LIGHT_CLIENT_PORT` | `kardamom-l1-light-client.service.<datacenter>.consul`, `8548` | Where the validator and the followers reach the light client. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the da-watcher and the indexer walk. A comma-separated list. With two or more entries, a block counts only when two agree. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
-| Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | The poll period, in seconds. |
+| Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
+| Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |
+| Indexer | `L1_MAX_LOG_RANGE` | empty (`10` in the binary) | The most blocks one log query spans: the provider's cap. |
+| Indexer | `L1_INDEXER_COUNT` | empty (`2` in the job) | Follower instances, each on its own node with the `indexer` role. |
 | Indexer | `L1_INDEXER_HOST`, `L1_INDEXER_PORT` | `kardamom-l1-indexer.service.<datacenter>.consul`, `8549` | Where the batcher reaches the indexer. |
 | Fault proxy | `KARDAMOM_L1_FAULT_PROXY` | `0` | `1` deploys the lying L1 of the `chaos-l1` shard in front of the in-cluster anvil. All followers read L1 through it. |
 | Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames. It is a minimum. The sealer keeps a frame above the posted head even past this window. See the [sealer README](../../cluster/sealer-service/README.md). |

@@ -46,11 +46,19 @@ pub enum HaltCause {
     /// missing, and the sequencer does not hold the missing epoch. Or the
     /// sequencer holds too many relayed epochs that no boundary confirms.
     OriginGap,
+    /// The last header of the L1 follower's finality step is not the
+    /// light client's finalized header for that number. A new variant
+    /// goes last, for the reason [`RecoveryId`] gives.
+    L1LightClientMismatch,
+    /// A consumer of the `l1_blocks` stream received two records of one
+    /// L1 block number with different hashes: one follower instance read
+    /// a lie that its cross-check did not catch.
+    L1FollowerDisagreement,
 }
 
 impl HaltCause {
     /// Every cause, for the tests that check the rules and the runbooks.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -60,6 +68,8 @@ impl HaltCause {
         Self::SealerNoQuorum,
         Self::L1CursorUnreadable,
         Self::OriginGap,
+        Self::L1LightClientMismatch,
+        Self::L1FollowerDisagreement,
     ];
 
     /// The stable id: the `cause` label of the gauge and the alert.
@@ -82,6 +92,8 @@ impl HaltCause {
             Self::SealerNoQuorum => RecoveryId::SealerNoQuorum,
             Self::L1CursorUnreadable => RecoveryId::L1CursorUnreadable,
             Self::OriginGap => RecoveryId::OriginGap,
+            Self::L1LightClientMismatch => RecoveryId::L1LightClientMismatch,
+            Self::L1FollowerDisagreement => RecoveryId::L1FollowerDisagreement,
         }
     }
 
@@ -92,7 +104,9 @@ impl HaltCause {
     /// boundary confirms the missing epoch. A refused replay, a
     /// divergence, and an unreadable cursor need an operator: a range must
     /// be recovered or the chain reverted, a verdict must be examined, or a
-    /// resume block must be chosen.
+    /// resume block must be chosen. A light client that disagrees with
+    /// two agreeing sources, and two follower instances that disagree,
+    /// need an operator to decide which side lies.
     #[must_use]
     pub fn clears(self) -> Clears {
         match self {
@@ -102,9 +116,11 @@ impl HaltCause {
             | Self::DaLag
             | Self::SealerNoQuorum
             | Self::OriginGap => Clears::Auto,
-            Self::ReplayUnavailable | Self::ValidatorDivergence | Self::L1CursorUnreadable => {
-                Clears::Operator
-            }
+            Self::ReplayUnavailable
+            | Self::ValidatorDivergence
+            | Self::L1CursorUnreadable
+            | Self::L1LightClientMismatch
+            | Self::L1FollowerDisagreement => Clears::Operator,
         }
     }
 }
@@ -131,11 +147,15 @@ pub enum RecoveryId {
     /// The sequencer's origin gap. It goes after every older variant, for
     /// the same reason.
     OriginGap,
+    /// The L1 follower's light client anchor failed.
+    L1LightClientMismatch,
+    /// Two follower instances published different hashes for one block.
+    L1FollowerDisagreement,
 }
 
 impl RecoveryId {
     /// Every runbook, for the test that checks each file exists.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -145,6 +165,8 @@ impl RecoveryId {
         Self::SealerNoQuorum,
         Self::L1CursorUnreadable,
         Self::OriginGap,
+        Self::L1LightClientMismatch,
+        Self::L1FollowerDisagreement,
         Self::RevertToPostedHead,
     ];
 
@@ -162,6 +184,8 @@ impl RecoveryId {
             Self::SealerNoQuorum => "sealer_no_quorum",
             Self::L1CursorUnreadable => "l1_cursor_unreadable",
             Self::OriginGap => "origin_gap",
+            Self::L1LightClientMismatch => "l1_light_client_mismatch",
+            Self::L1FollowerDisagreement => "l1_follower_disagreement",
             Self::RevertToPostedHead => "revert_to_posted_head",
         }
     }

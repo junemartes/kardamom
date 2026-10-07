@@ -9,6 +9,7 @@ kardamom-batcher = { path = "../batcher" }
 kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-types = { workspace = true }
 kardamom-obs = { path = "../obs" }
+kardamom-log = { workspace = true }
 
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rpc-types-eth.workspace = true
@@ -19,6 +20,7 @@ async-trait = "0.1"
 clap.workspace = true
 jsonrpsee = { workspace = true }
 metrics = { workspace = true }
+reqwest = { workspace = true }
 rkyv.workspace = true
 serde.workspace = true
 serde_json = { workspace = true }
@@ -26,5 +28,12 @@ thiserror.workspace = true
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+# Exposes the recording block sink to other crates' tests.
+testing = []
+
 [dev-dependencies]
+kardamom-da-watcher = { path = "../da_watcher", features = ["testing"] }
+kardamom-batcher = { path = "../batcher", features = ["test-support"] }
 tempfile = { workspace = true }

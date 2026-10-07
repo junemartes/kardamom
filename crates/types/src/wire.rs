@@ -116,6 +116,15 @@ wire_adapter!(
 );
 
 wire_adapter!(
+    PrimitiveBytesVec,
+    alloy_primitives::Bytes,
+    Vec<u8>,
+    "rkyv `with` adapter that archives `alloy_primitives::Bytes` as a `Vec<u8>`, like [`BytesVec`].",
+    |f| f.to_vec(),
+    |v| alloy_primitives::Bytes::from(v),
+);
+
+wire_adapter!(
     VecB256,
     Vec<B256>,
     Vec<[u8; 32]>,

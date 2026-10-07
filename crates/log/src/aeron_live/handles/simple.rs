@@ -1,6 +1,6 @@
 //! The structurally identical single-stream handle pairs: `TxErrors`,
 //! `TxStatus`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
-//! `FsyncWatermark`. Each is a publisher
+//! `L1Blocks`, `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
 //! publish surface. [`declare_channel_handles!`] stamps out the
@@ -15,7 +15,9 @@ use crate::discovery::plane::{DiscoveredPublisher, DiscoveredSubscriber};
 use crate::error::LogError;
 use kardamom_types::service::ServiceEvent;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, TxError, TxStatus};
+use kardamom_types::{
+    BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, L1Block, TxError, TxStatus,
+};
 
 /// Name the discovery topic and stream of one single-stream handle pair,
 /// so [`crate::discovery::StreamPlane`] can open it either way.
@@ -336,6 +338,22 @@ declare_channel_handles! {
 }
 
 declare_channel_handles! {
+    /// `l1_blocks` publisher (L1 follower → da-watcher, batcher, follower archives).
+    publisher L1BlocksPublisherHandle {
+        /// # Errors
+        ///
+        /// Returns an error if the underlying Aeron offer fails or times
+        /// out (see `PubHandle::publish`).
+        pub fn publish(&self, b: &L1Block) -> Result<BPosition, LogError> {
+            self.inner.publish(b)
+        }
+    }
+    /// `l1_blocks` subscriber (L1 follower → da-watcher, batcher, follower archives).
+    subscriber L1BlocksSubscriberHandle(L1Block);
+    open(ch) = (ch.l1_blocks_channel, ch.l1_blocks_stream_id);
+}
+
+declare_channel_handles! {
     /// Per-recorder fsync watermark publisher.
     publisher FsyncWatermarkPublisherHandle {
         /// # Errors
@@ -395,4 +413,11 @@ discoverable!(
     ExecTxRecord,
     Topic::ExecTxs,
     exec_txs_stream_id
+);
+discoverable!(
+    L1BlocksPublisherHandle,
+    L1BlocksSubscriberHandle,
+    L1Block,
+    Topic::L1Blocks,
+    l1_blocks_stream_id
 );

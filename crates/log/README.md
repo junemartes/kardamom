@@ -33,6 +33,7 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 | `TxRemoteEpochs` | Interop watcher | One record for each peer-chain origin block with cross-chain messages. RAM only. |
 | `TxBal` | Executor | The block access list (`BlockDelta`) of each block. RAM only. |
 | `ExecTxs` | Executor | One `ExecTxRecord` for each transaction that an executor joins, in canonical order. Typed handles exist. No service publishes or subscribes to it. |
+| `L1Blocks` | L1 follower (`kardamom-l1-indexer`) | One `L1Block` for each finalized L1 block. Two follower instances publish every block; a consumer keeps the first record of each number (`kardamom_types::L1BlockDedup`). Recorded by the archive of each follower node. |
 | Per-recorder fsync watermark | A recorder | Typed handles exist. The ingress subscribes to it for the local-fsync ack policies. |
 
 - `LogConfig` accepts any subset of the keys. A missing key takes the built-in default.

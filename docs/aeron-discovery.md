@@ -37,12 +37,19 @@ The streams and their publishers:
 | `tx_bal` | executor | validator |
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
 | `exec_txs` | executor (not published) | validator, batcher, executor archive (none subscribes) |
+| `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
 
 - The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
 - The runtime knows the topic, the record type and the handles. No service publishes the stream, and no service subscribes to it.
   The table names the services that the topic is for.
+
+The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
+
+- The stream id is 1020. The keys are `l1_blocks_channel` and `l1_blocks_stream_id` of `[channels]`, and `l1_blocks_archive_endpoints` of `[aeron]`.
+- Both follower instances publish every block. A consumer keeps the first record of each block number and drops a copy with the same hash.
+- The archive of each follower node records every follower publication, so each one is a full mirror. A follower publishes nothing before its own publication records.
 
 The `events` stream carries the lifecycle state of each service (running, halted, paused, resumed).
 See [failure-modes.md](failure-modes.md#halts-and-service-events).
@@ -51,7 +58,7 @@ See [failure-modes.md](failure-modes.md#halts-and-service-events).
 - Delivery is best effort and RAM only. Nothing that changes the canonical order reads it.
 - The publication uses a term length of 64 KiB, the Aeron minimum. The other topics use the driver default.
   A small term keeps the log buffers small, because each subscriber driver holds three terms for each publisher.
-- The sealer and the L1 indexer are not on the stream. The ingress observes the sealer from its status frame.
+- The sealer is not on the stream. The ingress observes the sealer from its status frame.
 
 The canonical order (`tx_ordering`) rides the Aeron Cluster. Discovery
 resolves the cluster member ingress endpoints; it never changes the
@@ -171,7 +178,8 @@ endpoint and matched by its advertised session id. After a restart on the
 same port, the earlier incarnation's finished recording is never adopted:
 readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
-records its own `tx_deposits` publication the same way.
+records its own `tx_deposits` publication the same way, and the L1 follower
+its `l1_blocks` publication, through `StreamPlane::record_own`.
 
 ## Deployment profiles
 
@@ -196,14 +204,16 @@ The file names no fixed address.
 - The multicast fallback channels pin their `interface` to
   `{{ env "meta.node_ip" }}/32` too.
 - The fallback archive lists render from the archive records. The
-  `kardamom-aeron-archive` service carries the topic that the node
-  records (`archive_topics`) as a tag.
-- The template lists `tx_data.kardamom-aeron-archive` for `tx_data` and
-  `tx_deposits.kardamom-aeron-archive` for `tx_deposits`. The selection
+  `kardamom-aeron-archive` service carries each topic that the node
+  records (`archive_topics`, `archive_topics_follower`) as a tag.
+- The template lists `tx_data.kardamom-aeron-archive` for `tx_data`,
+  `tx_deposits.kardamom-aeron-archive` for `tx_deposits` and
+  `l1_blocks.kardamom-aeron-archive` for `l1_blocks`. The selection
   follows the recording node in both profiles: the ingress nodes for
-  `tx_data`, and the node with the `da-watcher` role for `tx_deposits`.
-- A node records at most one topic. A node that records nothing has an
-  empty tag.
+  `tx_data`, the node with the `da-watcher` role for `tx_deposits`, and
+  the nodes with the `indexer` role for `l1_blocks`.
+- A node records at most one topic beside `l1_blocks`. A node that
+  records nothing has empty tags.
 - Every job renders the file with `change_mode = "noop"`. A change in the
   archive set rewrites the file. The running process follows the catalog
   through discovery and does not restart.
@@ -222,6 +232,7 @@ No job configures a publication control port.
 | ingress | 8 `tx_data` lanes, `tx_status` |
 | executor | receipts, boundaries, BAL |
 | da-watcher | deposits, remote epochs |
+| l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
 
 The aeron system job registers the archive record with the `archive_topics`
@@ -230,6 +241,10 @@ meta of the node:
 - `tx_data` on a node with the `ingress` role.
 - `tx_deposits` on a node with the `da-watcher` role.
 - Empty on every other node.
+
+The `archive_topics_follower` meta is `l1_blocks` on a node with the
+`indexer` role, and empty elsewhere. The record's `topics` meta lists both
+values.
 
 The `da-watcher` role is on its own node in the production profile. In the
 local profile it is on the `aux` node.

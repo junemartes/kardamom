@@ -27,6 +27,7 @@ contract_mirrors:
       - '    cluster_id '
       - '    node_ip '
       - '    archive_topics '
+      - '    archive_topics_follower '
     forbidden:
       - "\n  servers"
   - path: deploy/cluster/terraform/containers/main.tf
@@ -113,7 +114,7 @@ contract_mirrors:
   - path: deploy/cluster/nomad/aeron.system.nomad.hcl
     required:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-aeron:{{ image_tag }}'
-      - tags = ["${meta.archive_topics}"]
+      - tags = ["${meta.archive_topics}", "${meta.archive_topics_follower}"]
       - chain_id          = "{{ chain_id }}"
       - cluster_id        = "${meta.cluster_id}"
     forbidden: []

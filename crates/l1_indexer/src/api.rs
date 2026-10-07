@@ -7,10 +7,12 @@
 //! - `indexer_batch(index) -> BatchEntry | null`
 //! - `indexer_payload(daCert) -> 0x-hex payload | null`
 //! - `indexer_epoch(l1Block) -> 0x-hex rkyv EpochRecord | null`
+//! - `indexer_l1_block(l1Block) -> 0x-hex rkyv L1Block | null`: the
+//!   block's `l1_blocks` record, for a consumer whose start block is
+//!   below what the stream's archive holds.
 //! - `indexer_halt() -> the process's lifecycle record`: its state, its
-//!   halt, its pause. The indexer has no Aeron runtime on the `events`
-//!   stream, so a tool that reads from it asks here, and refuses a
-//!   halted indexer.
+//!   halt, its pause. A tool without an Aeron runtime on the `events`
+//!   stream asks here, and refuses a halted indexer.
 
 use std::net::SocketAddr;
 
@@ -91,6 +93,18 @@ impl Api {
                     let number: u64 = params.one()?;
                     store
                         .epoch_bytes(number)
+                        .map(|bytes| bytes.map(Bytes::from))
+                        .map_err(|e| rpc_error(&e))
+                },
+            )
+            .map_err(api_error)?;
+        module
+            .register_method(
+                "indexer_l1_block",
+                |params, store, _| -> Result<Option<Bytes>, ErrorObjectOwned> {
+                    let number: u64 = params.one()?;
+                    store
+                        .block_bytes(number)
                         .map(|bytes| bytes.map(Bytes::from))
                         .map_err(|e| rpc_error(&e))
                 },

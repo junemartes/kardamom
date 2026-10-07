@@ -273,6 +273,37 @@ fn tx_ref_roundtrip() {
 }
 
 #[test]
+fn l1_block_roundtrip() {
+    let v = L1Block {
+        number: 9_000_001,
+        hash: B256::repeat_byte(0x31),
+        parent_hash: B256::repeat_byte(0x30),
+        timestamp: 1_760_000_000,
+        epoch: EpochRecord {
+            l1_number: 9_000_001,
+            l1_hash: B256::repeat_byte(0x31),
+            deposits: vec![Deposit {
+                source_hash: B256::repeat_byte(0x44),
+                mint: 5,
+                gas_limit: 21_000,
+                input: Bytes::from_static(b"call"),
+                ..Deposit::default()
+            }],
+        },
+        batches: vec![BatchEntry {
+            index: 7,
+            da_cert: alloy_primitives::Bytes::from_static(&[0x03, 0xAA, 0xBB]),
+            l2_block_start: 100,
+            l2_block_end: 140,
+            records_commitment: B256::repeat_byte(0x55),
+            l1_block: 9_000_001,
+            l1_tx: B256::repeat_byte(0x66),
+        }],
+    };
+    assert_eq!(roundtrip(&v), v);
+}
+
+#[test]
 fn exec_tx_record_roundtrip() {
     let v = ExecTxRecord {
         index: u64::MAX - 7,

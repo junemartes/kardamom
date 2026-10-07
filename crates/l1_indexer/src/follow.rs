@@ -1,41 +1,51 @@
-//! The follower: each tick indexes the finalized L1 blocks after the
-//! cursor, a bounded range at a time.
+//! The follower: each tick reads the finalized L1 blocks after the
+//! cursor, a bounded range at a time, archives them, and publishes one
+//! record per block on the `l1_blocks` stream.
 //!
-//! For a range `[from, to]` the order is fixed: the batches of the range
-//! (event logs, then each batch's payload from the DA proxy), then the
-//! epoch of each block, then the cursor. A crash before the cursor write
-//! re-indexes the range; every write is idempotent, so nothing is lost or
-//! doubled.
+//! For a range `[from, to]` the order is fixed:
 //!
-//! Each block's parent hash is checked against the indexed block's hash
-//! (through the cursor, so the check survives a restart). A break means
-//! the L1 view changed under a finalized block, which finality forbids.
-//! The follower halts on it (`l1_chain_break`), retries the same range
-//! on every tick, and resumes by itself when the source serves a block
-//! that descends from the indexed one. An L1 source that does not
-//! answer halts it the same way (`l1_unreachable`).
+//! 1. the finalized tip (one read);
+//! 2. the header of every block of the range (one batch request);
+//! 3. the chain check: each header names the one before it as its
+//!    parent, and the first names the cursor's block;
+//! 4. the light client anchor, where a light client runs: the last header
+//!    of a range that ends at the finalized tip is the light client's
+//!    finalized header for that number;
+//! 5. the logs of the settlement and the lockbox (one query with both
+//!    addresses per chunk of `max_log_range` blocks);
+//! 6. the archive: each batch's payload from the DA proxy, the batches,
+//!    the epochs and the records;
+//! 7. the records on the stream, in block order;
+//! 8. the cursor.
 //!
-//! Every L1 read, the `BatchPosted` logs included, goes through the
-//! [`L1Source`], so a source set cross-checks it between endpoints.
+//! A crash or a failure before the cursor write reads the range again;
+//! every write is idempotent, and the consumers drop the copies of a
+//! record, so nothing is lost or doubled.
+//!
+//! Every read goes through the [`L1Source`] set, so two sources must
+//! agree on it. A break of the chain means the L1 view changed under a
+//! finalized block, which finality forbids: the follower halts
+//! (`l1_chain_break`) and reads the range again every slot.
 
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
-use alloy_rpc_types_eth::{Filter, Log};
-use alloy_sol_types::SolEvent;
+use alloy_primitives::Address;
 use kardamom_batcher::da::DaProxy;
-use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_da_watcher::{L1Source, L1SourceError};
-use kardamom_obs::halt;
-use kardamom_types::epoch::derive_epoch;
 use metrics::{counter, gauge};
 
 use crate::metrics::{
-    BATCHES_TOTAL, INDEXED_BLOCK, L1_FINALIZED, PAYLOAD_BYTES_TOTAL, TICK_TOTAL, gauge_value,
+    BATCHES_TOTAL, INDEXED_BLOCK, L1_FINALIZED, L1_READS_TOTAL, PAYLOAD_BYTES_TOTAL,
+    PUBLISHED_BLOCK, gauge_value,
 };
+use crate::schedule::FinalitySchedule;
+use crate::sink::BlockSink;
 use crate::store::Store;
-use crate::{BatchEntry, BlockId, Cursor, IndexerError};
+use crate::{BatchEntry, BlockId, Cursor, IndexerError, L1Block};
+
+mod range;
+mod run;
 
 /// What to follow, and how fast.
 #[derive(Clone, Debug)]
@@ -46,27 +56,40 @@ pub struct FollowConfig {
     /// contract deploy, or later. `None` starts at the finalized block of
     /// the first tick.
     pub start_block: Option<u64>,
+    /// One slot: the read cadence while the tip does not move, and the
+    /// whole cadence on a chain without a schedule.
     pub poll_interval: Duration,
-    /// The most blocks one tick indexes; bounds the log query and the
+    /// The most blocks one tick indexes; bounds the header batch and the
     /// time between cursor writes while catching up.
     pub blocks_per_tick: NonZeroU64,
+    /// The most blocks one log query spans. A provider caps the span of
+    /// one query (Alchemy's free plan: 10 blocks).
+    pub max_log_range: NonZeroU64,
+    /// The beacon chain's finality schedule. `None` reads at the fixed
+    /// poll interval.
+    pub schedule: Option<FinalitySchedule>,
 }
 
 /// The pieces a [`Follower`] is built from.
-pub struct FollowerParts<S> {
+pub struct FollowerParts<S, K> {
     pub source: S,
+    pub sink: K,
     pub da: DaProxy,
     pub store: Store,
     pub cfg: FollowConfig,
 }
 
 /// The follower.
-pub struct Follower<S> {
+pub struct Follower<S, K> {
     source: S,
+    sink: K,
     da: DaProxy,
     store: Store,
     cfg: FollowConfig,
     cursor: Cursor,
+    /// The epoch boundary the follower waits for, in Unix seconds, once a
+    /// range reached the finalized tip.
+    next_step: Option<u64>,
 }
 
 /// What one tick did.
@@ -74,45 +97,51 @@ pub struct Follower<S> {
 pub enum Tick {
     /// Nothing new is finalized.
     Idle,
-    /// The range up to `to` is indexed.
-    Advanced { to: u64, batches: usize },
+    /// The range up to `to` is indexed and published. `caught_up` says
+    /// the range ended at the finalized tip.
+    Advanced {
+        to: u64,
+        batches: usize,
+        caught_up: bool,
+    },
 }
 
-impl BatchEntry {
-    fn from_log(log: &Log) -> Result<Self, IndexerError> {
-        let ev = IKardamomL2Settlement::BatchPosted::decode_log(&log.inner)
-            .map_err(|e| IndexerError::Provider(format!("decode BatchPosted: {e}")))?;
-        let l1_block = log.block_number.ok_or_else(|| {
-            IndexerError::Provider("BatchPosted log without a block number".into())
-        })?;
-        let l1_tx = log
-            .transaction_hash
-            .ok_or_else(|| IndexerError::Provider("BatchPosted log without a tx hash".into()))?;
-        Ok(Self {
-            index: ev.data.batchIndex,
-            da_cert: ev.data.daCert.clone(),
-            l2_block_start: ev.data.l2BlockStart,
-            l2_block_end: ev.data.l2BlockEnd,
-            records_commitment: ev.data.recordsCommitment,
-            l1_block,
-            l1_tx,
-        })
+/// The kind of one L1 read, as the reads counter labels it.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    Tip,
+    Headers,
+    Logs,
+    LightClient,
+}
+
+impl Read {
+    fn count(self) {
+        let read = match self {
+            Self::Tip => "tip",
+            Self::Headers => "headers",
+            Self::Logs => "logs",
+            Self::LightClient => "light_client",
+        };
+        counter!(L1_READS_TOTAL, "read" => read).increment(1);
     }
 }
 
-impl<S: L1Source> Follower<S> {
+impl<S: L1Source, K: BlockSink> Follower<S, K> {
     /// Build a follower on an opened store; resume from its cursor.
     ///
     /// # Errors
     /// Returns an error when the cursor does not parse.
-    pub fn open(parts: FollowerParts<S>) -> Result<Self, IndexerError> {
+    pub fn open(parts: FollowerParts<S, K>) -> Result<Self, IndexerError> {
         let cursor = parts.store.cursor()?;
         Ok(Self {
             source: parts.source,
+            sink: parts.sink,
             da: parts.da,
             store: parts.store,
             cfg: parts.cfg,
             cursor,
+            next_step: None,
         })
     }
 
@@ -122,46 +151,14 @@ impl<S: L1Source> Follower<S> {
         self.cursor
     }
 
-    /// Tick forever at the poll interval. An error is logged and counted,
-    /// and a chain break or an unreachable L1 raises the follower's halt;
-    /// the next tick retries, and a good tick clears the halt.
-    pub async fn run(mut self) {
-        let mut interval = tokio::time::interval(self.cfg.poll_interval);
-        loop {
-            self.step(&mut interval).await;
-        }
-    }
-
-    async fn step(&mut self, interval: &mut tokio::time::Interval) {
-        interval.tick().await;
-        let outcome = self.tick().await;
-        kardamom_obs::ready::mark_now(crate::metrics::LAST_TICK_UNIX_SECONDS);
-        match outcome {
-            Ok(Tick::Idle) => {
-                counter!(TICK_TOTAL, "outcome" => "idle").increment(1);
-                halt::clear();
-            }
-            Ok(Tick::Advanced { to, batches }) => {
-                tracing::info!(to, batches, "indexed");
-                counter!(TICK_TOTAL, "outcome" => "advanced").increment(1);
-                halt::clear();
-            }
-            Err(error) => {
-                tracing::error!(%error, "tick failed");
-                counter!(TICK_TOTAL, "outcome" => "error").increment(1);
-                if let Some(halt) = error.halt() {
-                    halt::raise(halt);
-                }
-            }
-        }
-    }
-
-    /// Index the next range of finalized blocks, if any.
+    /// Index and publish the next range of finalized blocks, if any.
     ///
     /// # Errors
-    /// Returns an error when L1, the DA proxy, or the store fails, or
-    /// when a block does not descend from the indexed one.
+    /// Returns an error when L1, the DA proxy, the store, or the stream
+    /// fails, when a block does not descend from the indexed one, or when
+    /// the range's last header is not the light client's.
     pub async fn tick(&mut self) -> Result<Tick, IndexerError> {
+        Read::Tip.count();
         let finalized = match self.source.finalized_block_number().await {
             Err(L1SourceError::NotFinalized) => return Ok(Tick::Idle),
             other => other?,
@@ -176,17 +173,14 @@ impl<S: L1Source> Follower<S> {
             from.checked_add(span)
                 .ok_or(IndexerError::Overflow("range end"))?,
         );
-        let batches = self.batches_in(from, to).await?;
-        for entry in &batches {
-            self.archive_batch(entry).await?;
-        }
-        for number in from..=to {
-            self.archive_epoch(number).await?;
-        }
-        self.advance(batches.last().map(|b| b.index))?;
+        let blocks = self.read_range(from, to, to == finalized).await?;
+        let batches = self.archive(&blocks).await?;
+        blocks.iter().try_for_each(|block| self.publish(block))?;
+        self.advance(&blocks)?;
         Ok(Tick::Advanced {
             to,
-            batches: batches.len(),
+            batches,
+            caught_up: to == finalized,
         })
     }
 
@@ -200,14 +194,18 @@ impl<S: L1Source> Follower<S> {
             })
     }
 
-    async fn batches_in(&self, from: u64, to: u64) -> Result<Vec<BatchEntry>, IndexerError> {
-        let filter = Filter::new()
-            .address(self.cfg.settlement)
-            .event_signature(IKardamomL2Settlement::BatchPosted::SIGNATURE_HASH)
-            .from_block(from)
-            .to_block(to);
-        let logs = self.source.logs(&filter).await?;
-        logs.iter().map(BatchEntry::from_log).collect()
+    /// Archive a range: each batch with its payload, then each block's
+    /// epoch and record. Returns how many batches the range holds.
+    async fn archive(&self, blocks: &[L1Block]) -> Result<usize, IndexerError> {
+        let batches: Vec<&BatchEntry> = blocks.iter().flat_map(|b| &b.batches).collect();
+        for entry in &batches {
+            self.archive_batch(entry).await?;
+        }
+        blocks.iter().try_for_each(|block| {
+            self.store.put_epoch(&block.epoch)?;
+            self.store.put_block(block)
+        })?;
+        Ok(batches.len())
     }
 
     async fn archive_batch(&self, entry: &BatchEntry) -> Result<(), IndexerError> {
@@ -225,37 +223,27 @@ impl<S: L1Source> Follower<S> {
         Ok(())
     }
 
-    async fn archive_epoch(&mut self, number: u64) -> Result<(), IndexerError> {
-        let (hash, parent) = self.source.block_ids(number).await?;
-        self.check_chain(number, parent)?;
-        let logs = self
-            .source
-            .lockbox_logs(self.cfg.lockbox, number, number)
-            .await?;
-        let epoch = derive_epoch(number, hash, &logs).map_err(|e| IndexerError::Derive {
-            number,
-            error: e.to_string(),
-        })?;
-        self.store.put_epoch(&epoch)?;
-        self.cursor.l1_block = Some(BlockId { number, hash });
+    fn publish(&self, block: &L1Block) -> Result<(), IndexerError> {
+        self.sink.publish(block)?;
+        gauge!(PUBLISHED_BLOCK).set(gauge_value(block.number));
         Ok(())
     }
 
-    fn check_chain(&self, number: u64, parent: B256) -> Result<(), IndexerError> {
-        match self.cursor.l1_block {
-            Some(BlockId { hash: expected, .. }) if parent != expected => {
-                Err(IndexerError::ChainBreak {
-                    number,
-                    expected,
-                    parent,
-                })
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn advance(&mut self, last_batch: Option<u64>) -> Result<(), IndexerError> {
+    /// Write the cursor after the last block of a range.
+    fn advance(&mut self, blocks: &[L1Block]) -> Result<(), IndexerError> {
+        let last_batch = blocks
+            .iter()
+            .flat_map(|b| &b.batches)
+            .map(|b| b.index)
+            .next_back();
         self.cursor.last_batch = last_batch.or(self.cursor.last_batch);
+        self.cursor.l1_block = blocks
+            .last()
+            .map(|b| BlockId {
+                number: b.number,
+                hash: b.hash,
+            })
+            .or(self.cursor.l1_block);
         self.store.set_cursor(&self.cursor)?;
         if let Some(block) = self.cursor.l1_block {
             gauge!(INDEXED_BLOCK).set(gauge_value(block.number));
@@ -266,3 +254,7 @@ impl<S: L1Source> Follower<S> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "follow_tests.rs"]
+mod tests;

@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod consul;
 pub mod endpoint;
 pub mod memory;
+pub mod own_recording;
 pub mod plane;
 pub mod reconcile;
 pub mod record;
@@ -28,6 +29,7 @@ pub mod watch;
 
 pub use catalog::{Catalog, Query, QueryResult, RegistrationSpec};
 pub use endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, destination_uri, publication_uri};
+pub use own_recording::OwnRecording;
 pub use plane::{DiscoveredPublisher, DiscoveredSubscriber, StreamPlane};
 pub use reconcile::{DestinationPort, Plan, Reconciler};
 pub use record::{

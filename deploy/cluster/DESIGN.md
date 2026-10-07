@@ -142,7 +142,7 @@ deploy/cluster/
     da-proxy.nomad             # the EigenDA proxy, on an EigenDA network
     da-store.nomad             # the file-backed stand-in for it (local profile)
     batcher.nomad
-    l1-indexer.nomad          # real L1 only: the inbox archive (batches, payloads, epochs)
+    l1-indexer.nomad          # real L1 only: the L1 follower (l1_blocks) and the inbox archive
   config/
     channels.tpl               # Aeron UDP channel template (Consul-templated)
     <svc>.toml.tpl             # per-service config templates

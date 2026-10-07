@@ -77,6 +77,9 @@ archive_dir = "/opt/kardamom/archive"
 # process follows the catalog through discovery instead.
 tx_data_archive_endpoints = [{{ range service "tx_data.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
 tx_deposits_archive_endpoints = [{{ range service "tx_deposits.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
+# The archives of the L1 follower's nodes record l1_blocks: each records
+# every follower instance, so either endpoint serves any range.
+l1_blocks_archive_endpoints = [{{ range service "l1_blocks.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
 
 [channels]
 # --- TxData: full TxEnvelope bytes, one stream per lane. ----------------------
@@ -155,3 +158,11 @@ tx_bal_stream_id = 1004
 # Own group .33:40110. Stream 1005 (next to BAL, another executor output).
 exec_txs_channel = "aeron:udp?endpoint=239.192.56.33:40110|interface={{ env "meta.node_ip" }}/32|ttl=1"
 exec_txs_stream_id = 1005
+
+# --- l1_blocks: the L1 follower publishes one record for each finalized L1
+# block, in block order; the da-watcher and the batcher subscribe. Both
+# follower instances publish every block, and a consumer keeps the first
+# record of each number. The archive of each follower node records it.
+# Own group .35:40120. Stream 1020 (after the events stream, 1019).
+l1_blocks_channel = "aeron:udp?endpoint=239.192.56.35:40120|interface={{ env "meta.node_ip" }}/32|ttl=1"
+l1_blocks_stream_id = 1020

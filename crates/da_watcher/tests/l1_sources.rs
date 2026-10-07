@@ -290,3 +290,22 @@ fn a_source_halt_names_its_halt_cause() {
     );
     assert_eq!(L1SourceError::NotFinalized.halt_cause(), None);
 }
+
+/// A header batch is one read of the set: two sources that agree serve it,
+/// and one that lies about any block of it halts it, with no majority.
+#[tokio::test]
+async fn a_header_batch_needs_two_agreeing_sources() {
+    let set = honest(2);
+    let headers = set.headers(3, 6).await.unwrap();
+    assert_eq!(headers.len(), 4);
+    assert_eq!(headers[3].parent_hash, headers[2].hash);
+    let lying = L1Sources::new(vec![
+        ("a".into(), MockL1Source::new()),
+        ("b".into(), lying_at(5)),
+    ]);
+    assert!(matches!(
+        lying.headers(3, 6).await,
+        Err(L1SourceError::Halt(SourceHalt::Disagreement { .. }))
+    ));
+    assert_eq!(set.light_client_hash(3).await.unwrap(), None);
+}
