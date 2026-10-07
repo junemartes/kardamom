@@ -4,6 +4,8 @@
 
 use std::net::Ipv4Addr;
 
+use kardamom_bench::load::{MetricsTarget, MetricsTargets};
+
 use crate::contract::NodeContract;
 use crate::harness::INGRESS_RPC_PORT;
 use crate::metrics::{self, Scrape, Target};
@@ -55,6 +57,12 @@ pub struct Probed {
 }
 
 impl Probed {
+    /// The load harness target of the exporter on `port` of this node,
+    /// read over the bridge.
+    fn metrics_target(&self, port: u16) -> MetricsTarget {
+        MetricsTarget::at(&self.container, self.ip, port)
+    }
+
     /// The JSON-RPC URL of this node, when it is an ingress node.
     #[must_use]
     pub fn rpc_url(&self) -> String {
@@ -105,6 +113,24 @@ impl Probes {
             validator,
             sequencers: probed(contract, "sequencer"),
         })
+    }
+
+    /// The exporters a load reads over the bridge: every executor, the
+    /// `ingress` it submits through, and the lane-0 replica of every
+    /// sequencer.
+    #[must_use]
+    pub fn load_metrics(&self, ingress: &Probed) -> MetricsTargets {
+        let at = |nodes: &[Probed], port| {
+            nodes
+                .iter()
+                .map(|n| n.metrics_target(port))
+                .collect::<Vec<_>>()
+        };
+        MetricsTargets {
+            executors: at(&self.executors, EXECUTOR_PORT),
+            ingress: ingress.metrics_target(INGRESS_PORT),
+            sequencers: at(&self.sequencers, SEQUENCER_LANE0_PORT),
+        }
     }
 
     /// The scraper, for probes a case builds itself.

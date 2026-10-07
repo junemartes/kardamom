@@ -21,7 +21,6 @@ pub mod plan;
 pub(crate) mod scrape;
 mod tracker;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,12 +35,13 @@ use crate::load::engine::{
 };
 use crate::load::feed::receipt_feed_task;
 use crate::load::plan::{PlannedTx, TxPlanParams};
-use crate::load::scrape::{MetricsSnapshot, Scraper};
+use crate::load::scrape::{MetricsSnapshot, ScrapeSet, Scraper};
 use crate::signers::{DerivedSigner, SignerSet};
 
 pub use config::{
     ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, SenderRange, Workload,
 };
+pub use scrape::{MetricsTarget, MetricsTargets};
 
 /// Parse a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
 pub(crate) fn hex_u64(s: &str) -> Option<u64> {
@@ -54,20 +54,6 @@ pub(crate) fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_str().and_then(hex_u64)
 }
 
-fn build_scraper(cfg: &LoadConfig) -> Scraper {
-    Scraper {
-        via_docker: cfg.metrics_via_docker,
-        scrape: cfg
-            .scrape
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect::<BTreeSet<_>>(),
-        executor_nodes: cfg.executor_nodes.clone(),
-        ingress_node: cfg.ingress_node.clone(),
-        sequencer_nodes: cfg.sequencer_nodes.clone(),
-    }
-}
-
 /// [`LoadConfig::build_queues`]'s result: the presigned per-sender
 /// submit queues, plus any `DeFi` deployment transactions to land
 /// first.
@@ -77,6 +63,15 @@ struct BuiltQueues {
 }
 
 impl LoadConfig {
+    /// The scraper of the exporters this run reads.
+    fn scraper(&self) -> anyhow::Result<Scraper> {
+        Scraper::new(ScrapeSet {
+            via_docker: self.metrics_via_docker,
+            scrape: self.scrape.iter().map(|s| s.to_lowercase()).collect(),
+            targets: self.metrics.clone(),
+        })
+    }
+
     /// The clients a drain asks for a receipt: `primary` first, then one
     /// per `receipt_rpcs` entry.
     fn receipt_clients(&self, primary: &Arc<HttpClient>) -> anyhow::Result<Vec<Arc<HttpClient>>> {
@@ -160,6 +155,18 @@ struct ReceiptFeed {
 struct Settled {
     fin: MetricsSnapshot,
     recheck: Option<MetricsSnapshot>,
+}
+
+impl Settled {
+    /// The `docker exec` fallbacks of the snapshots the verdict reads:
+    /// `base`, the final one, and the recheck.
+    fn scrape_fallbacks(&self, base: &MetricsSnapshot) -> u64 {
+        [Some(base), Some(&self.fin), self.recheck.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|snap| snap.fallbacks)
+            .fold(0, u64::saturating_add)
+    }
 }
 
 /// One run's config, handles, and tracker: the settle, report-building,
@@ -291,6 +298,7 @@ impl LoadRun<'_> {
         ramp: Vec<RampStep>,
         discovered_max: u32,
         soak_rate: u32,
+        scrape_fallbacks: u64,
     ) -> LoadReport {
         let lat = self.tracker.latency_us();
         LoadReport {
@@ -313,6 +321,7 @@ impl LoadRun<'_> {
             lat_max_us: lat.max,
             total_gas: self.tracker.total_gas(),
             workload: self.cfg.workload.to_string(),
+            scrape_fallbacks,
             verdict,
         }
     }
@@ -463,7 +472,7 @@ impl Prepared {
                 },
         } = self;
 
-        let scraper = build_scraper(&cfg);
+        let scraper = cfg.scraper()?;
         let mut tracker = Tracker::new()?;
         tracker.expect(&signers, queues.planned());
         let tracker = Arc::new(tracker);
@@ -552,7 +561,13 @@ impl Prepared {
         let settled = run.settle_and_snapshot(&mut tasks, feed, sweeper).await;
 
         let verdict = run.build_verdict(&base, &settled.fin, settled.recheck.as_ref());
-        let report = run.build_report(verdict, ramp, discovered_max.get(), soak_rate.get());
+        let report = run.build_report(
+            verdict,
+            ramp,
+            discovered_max.get(),
+            soak_rate.get(),
+            settled.scrape_fallbacks(&base),
+        );
 
         print_report(&report);
         run.write_report_json(&report)?;

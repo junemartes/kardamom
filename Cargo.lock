@@ -3829,6 +3829,7 @@ dependencies = [
  "kardamom-validator",
  "pprof",
  "rand 0.8.6",
+ "reqwest 0.13.4",
  "revm",
  "serde",
  "serde_json",

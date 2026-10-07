@@ -9,6 +9,7 @@ use alloy_primitives::{Address, U256, address};
 use serde::Serialize;
 
 use crate::load::accounting::Verdict;
+use crate::load::scrape::MetricsTargets;
 
 /// [`LoadConfig::default`]'s `target_tps`.
 const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
@@ -176,7 +177,8 @@ pub struct LoadConfig {
     pub fixed_rate: bool,
     /// The services to scrape.
     pub scrape: Vec<String>,
-    /// Scrape through `docker exec`, instead of a direct scrape.
+    /// Read every exporter through `docker exec` only. When false, a
+    /// read goes to the target URL first and falls back to `docker exec`.
     pub metrics_via_docker: bool,
     /// Submit through `kardamom_sendRawTransactionAsync`, and receive
     /// receipts on a `kardamom_subscribeReceipts` WebSocket feed, instead
@@ -193,12 +195,8 @@ pub struct LoadConfig {
     /// by the drain, or counted as `missing`. This setting has no effect
     /// in subscribe mode, which is already feed-driven.
     pub feed_confirm: bool,
-    /// The executor node container names.
-    pub executor_nodes: Vec<String>,
-    /// The ingress node container name.
-    pub ingress_node: String,
-    /// The sequencer node container names.
-    pub sequencer_nodes: Vec<String>,
+    /// The exporters the load reads.
+    pub metrics: MetricsTargets,
     /// An optional JSON report path.
     pub output: Option<PathBuf>,
 }
@@ -259,13 +257,16 @@ impl Default for LoadConfig {
             metrics_via_docker: true,
             subscribe: false,
             feed_confirm: false,
-            executor_nodes: vec![
-                "kardamom-executor-0".into(),
-                "kardamom-executor-1".into(),
-                "kardamom-executor-2".into(),
-            ],
-            ingress_node: "kardamom-ingress-0".into(),
-            sequencer_nodes: vec!["kardamom-sequencer-0".into(), "kardamom-sequencer-1".into()],
+            metrics: MetricsTargets::named(
+                &[
+                    "kardamom-executor-0".into(),
+                    "kardamom-executor-1".into(),
+                    "kardamom-executor-2".into(),
+                ],
+                "kardamom-ingress-0",
+                &["kardamom-sequencer-0".into(), "kardamom-sequencer-1".into()],
+            )
+            .expect("the default container names are valid host names"),
             output: None,
         }
     }
@@ -366,6 +367,11 @@ pub struct LoadReport {
     /// The workload the run drove: `transfers` or `defi`.
     #[serde(default)]
     pub workload: String,
+    /// The reads of the verdict's metric snapshots whose direct read
+    /// failed and that fell back to `docker exec`. Absent from a report
+    /// of an older harness.
+    #[serde(default)]
+    pub scrape_fallbacks: u64,
     /// The completeness, drop accounting, and keep-pace verdict.
     pub verdict: Verdict,
 }

@@ -1,20 +1,28 @@
 //! This module scrapes cluster metrics for the load harness.
 //!
-//! Each service's Prometheus exporter binds to loopback inside its own
-//! container, which runs on host-net inside the `DinD` node container.
-//! So the only way to reach an exporter from the orchestrator or host
-//! is `docker exec <node> curl 127.0.0.1:<port>/metrics`. A `direct`
-//! mode, plain `curl http://<node>:<port>`, is a fallback for a setup
-//! that rebinds the exporters to a routable address.
+//! Each target names one exporter: the node container, and the URL of
+//! its `/metrics`. A direct read of that URL comes first. When it fails,
+//! `docker exec <node> curl 127.0.0.1:<port>/metrics` reads the same
+//! exporter from inside the node. A snapshot counts each such fallback,
+//! because a runner-wide stall of `docker exec` hides every exec-based
+//! read at once. With `via_docker`, every read goes through the node and
+//! no read counts as a fallback.
 
 use std::collections::BTreeSet;
+use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use tokio::process::Command;
 
-// The default metrics ports. These match each service's --metrics-addr default.
-const PORT_EXECUTOR: u16 = 9004;
-const PORT_INGRESS: u16 = 9006;
-const PORT_SEQUENCER: u16 = 9001;
+/// The default metrics port of the executor (`--metrics-addr`).
+const EXECUTOR_METRICS_PORT: u16 = 9004;
+/// The default metrics port of the ingress.
+const INGRESS_METRICS_PORT: u16 = 9006;
+/// The default metrics port of the lane-0 sequencer replica.
+const SEQUENCER_METRICS_PORT: u16 = 9001;
+
+/// The time budget of one read, direct or through the node.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The exact Prometheus metric names each service exposes.
 const M_EXECUTOR_BLOCK: &str = "kardamom_executor_block_number";
@@ -67,50 +75,219 @@ pub(crate) struct MetricsSnapshot {
     /// missing from this list was never scraped, because it was not in
     /// the scrape set.
     pub service_up: Vec<(String, Option<u64>)>,
+    /// The reads of this snapshot whose direct read failed and that fell
+    /// back to `docker exec`.
+    pub fallbacks: u64,
 }
 
-/// The services to scrape, and the node-container names for each.
+/// One exporter the load reads: the node container, for the
+/// `docker exec` fallback, and the URL of its `/metrics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTarget {
+    /// The node container name.
+    pub(crate) name: String,
+    /// The URL of the direct read.
+    url: reqwest::Url,
+    /// The port of the exporter, for the read inside the node.
+    port: u16,
+}
+
+impl MetricsTarget {
+    /// The exporter on `port` of `host`, in the node container `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `host` and `port` do not form a valid URL.
+    fn new(name: &str, host: &str, port: u16) -> anyhow::Result<Self> {
+        let url = reqwest::Url::parse(&format!("http://{host}:{port}/metrics"))?;
+        Ok(Self {
+            name: name.to_string(),
+            url,
+            port,
+        })
+    }
+
+    /// The exporter on `port` of the node container `name`, with the
+    /// container name as the host of the direct read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a valid host name.
+    fn named(name: &str, port: u16) -> anyhow::Result<Self> {
+        Self::new(name, name, port)
+    }
+
+    /// The exporter on `port` of the bridge address `ip`, in the node
+    /// container `name`.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: an IPv4 address and a port always form a valid
+    /// URL.
+    #[must_use]
+    pub fn at(name: &str, ip: Ipv4Addr, port: u16) -> Self {
+        Self::new(name, &ip.to_string(), port).expect("an IPv4 address and a port form a URL")
+    }
+
+    /// The URL that the node reads inside its own network: the same
+    /// port on loopback.
+    fn loopback_url(&self) -> String {
+        format!("http://127.0.0.1:{}/metrics", self.port)
+    }
+}
+
+/// The exporters one load reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsTargets {
+    /// The executor exporters.
+    pub executors: Vec<MetricsTarget>,
+    /// The exporter of the ingress the load submits through.
+    pub ingress: MetricsTarget,
+    /// The lane-0 sequencer exporters.
+    pub sequencers: Vec<MetricsTarget>,
+}
+
+impl MetricsTargets {
+    /// The exporters on the default ports, with the container names as
+    /// the hosts of the direct reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a name is not a valid host name.
+    pub fn named(
+        executors: &[String],
+        ingress: &str,
+        sequencers: &[String],
+    ) -> anyhow::Result<Self> {
+        let named = |names: &[String], port| {
+            names
+                .iter()
+                .map(|n| MetricsTarget::named(n, port))
+                .collect::<anyhow::Result<Vec<_>>>()
+        };
+        Ok(Self {
+            executors: named(executors, EXECUTOR_METRICS_PORT)?,
+            ingress: MetricsTarget::named(ingress, INGRESS_METRICS_PORT)?,
+            sequencers: named(sequencers, SEQUENCER_METRICS_PORT)?,
+        })
+    }
+}
+
+/// The result of one read: the body, and whether the read fell back to
+/// `docker exec`.
+struct Read {
+    body: Option<String>,
+    fell_back: bool,
+}
+
+/// The services to scrape, and the exporter targets of each.
 #[derive(Debug, Clone)]
 pub(crate) struct Scraper {
-    /// When true, use `docker exec <node> curl 127.0.0.1:<port>`.
-    /// When false, use a direct `curl http://<node>:<port>`.
-    pub via_docker: bool,
+    /// When true, read every target through `docker exec` only.
+    via_docker: bool,
     /// The lowercased service names to scrape: any of executor, ingress,
     /// or sequencer. The sealer values ride along with the executor
     /// scrape, since the clustered sealer has no endpoint of its own.
+    scrape: BTreeSet<String>,
+    targets: MetricsTargets,
+    http: reqwest::Client,
+    /// The program of the fallback read: `docker`. It runs as
+    /// `<program> exec <node> curl ... <loopback url>`.
+    exec_program: &'static str,
+}
+
+/// The inputs of [`Scraper::new`].
+pub(crate) struct ScrapeSet {
+    pub via_docker: bool,
     pub scrape: BTreeSet<String>,
-    /// The executor node-container names.
-    pub executor_nodes: Vec<String>,
-    /// The ingress node-container name.
-    pub ingress_node: String,
-    /// The sequencer node-container names.
-    pub sequencer_nodes: Vec<String>,
+    pub targets: MetricsTargets,
 }
 
 impl Scraper {
+    /// A scraper over `set`, with the `docker exec` fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be built.
+    pub(crate) fn new(set: ScrapeSet) -> anyhow::Result<Self> {
+        Self::with_exec_program(set, "docker")
+    }
+
+    fn with_exec_program(set: ScrapeSet, exec_program: &'static str) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder().timeout(READ_TIMEOUT).build()?;
+        Ok(Self {
+            via_docker: set.via_docker,
+            scrape: set.scrape,
+            targets: set.targets,
+            http,
+            exec_program,
+        })
+    }
+
     fn wants(&self, svc: &str) -> bool {
         self.scrape.contains(svc)
     }
 
-    /// Fetch one node's `/metrics` body. Returns `None` if unreachable.
-    async fn fetch(&self, node: &str, port: u16) -> Option<String> {
-        let url = format!("http://127.0.0.1:{port}/metrics");
-        let out = if self.via_docker {
-            Command::new("docker")
-                .args(["exec", node, "curl", "-fsS", "--max-time", "5", &url])
-                .output()
-                .await
-        } else {
-            let direct = format!("http://{node}:{port}/metrics");
-            Command::new("curl")
-                .args(["-fsS", "--max-time", "5", &direct])
-                .output()
-                .await
-        };
-        match out {
-            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-            _ => None,
+    /// Read one target's `/metrics` body into `snap`'s fallback count.
+    /// Returns `None` if no read answers.
+    async fn fetch(&self, snap: &mut MetricsSnapshot, target: &MetricsTarget) -> Option<String> {
+        let read = self.read(target).await;
+        snap.fallbacks = snap.fallbacks.saturating_add(u64::from(read.fell_back));
+        read.body
+    }
+
+    /// Read `target` directly, then through the node when the direct
+    /// read fails. With `via_docker`, read through the node only.
+    async fn read(&self, target: &MetricsTarget) -> Read {
+        if self.via_docker {
+            return Read {
+                body: self.read_via_node(target).await,
+                fell_back: false,
+            };
         }
+        match self.read_direct(target).await {
+            Some(body) => Read {
+                body: Some(body),
+                fell_back: false,
+            },
+            None => Read {
+                body: self.read_via_node(target).await,
+                fell_back: true,
+            },
+        }
+    }
+
+    async fn read_direct(&self, target: &MetricsTarget) -> Option<String> {
+        self.http
+            .get(target.url.clone())
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .text()
+            .await
+            .ok()
+    }
+
+    async fn read_via_node(&self, target: &MetricsTarget) -> Option<String> {
+        let url = target.loopback_url();
+        let out = Command::new(self.exec_program)
+            .args([
+                "exec",
+                &target.name,
+                "curl",
+                "-fsS",
+                "--max-time",
+                "5",
+                &url,
+            ])
+            .output()
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Take a full snapshot of the configured services.
@@ -131,8 +308,8 @@ impl Scraper {
     /// Scrape every executor node into `snap`: block number, the
     /// re-exported sealer boundary stream, and liveness.
     async fn scrape_executors(&self, snap: &mut MetricsSnapshot) {
-        for node in &self.executor_nodes {
-            self.scrape_one_executor(snap, node).await;
+        for target in &self.targets.executors {
+            self.scrape_one_executor(snap, target).await;
         }
     }
 
@@ -140,15 +317,16 @@ impl Scraper {
     /// most advanced sealer boundary observation seen across executors
     /// so far (a single stalled executor should not hide sealer
     /// progress), plus liveness.
-    async fn scrape_one_executor(&self, snap: &mut MetricsSnapshot, node: &str) {
-        let body = self.fetch(node, PORT_EXECUTOR).await;
+    async fn scrape_one_executor(&self, snap: &mut MetricsSnapshot, target: &MetricsTarget) {
+        let body = self.fetch(snap, target).await;
+        let node = &target.name;
         let g = |m: &str| {
             body.as_deref()
                 .and_then(|b| sum_metric(b, m))
                 .map(|v| gauge_u64(v, m))
         };
         snap.executor_blocks
-            .push((node.to_string(), g(M_EXECUTOR_BLOCK)));
+            .push((node.clone(), g(M_EXECUTOR_BLOCK)));
         // This is sealer output, re-exported by this executor from
         // cluster egress.
         snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
@@ -159,7 +337,7 @@ impl Scraper {
     /// Scrape ingress into `snap`: submission counts, queue depth, and
     /// liveness.
     async fn scrape_ingress(&self, snap: &mut MetricsSnapshot) {
-        let body = self.fetch(&self.ingress_node, PORT_INGRESS).await;
+        let body = self.fetch(snap, &self.targets.ingress).await;
         // An absent counter on a scraped body means zero. The metrics-rs
         // library emits a counter only after its first increment. `None`
         // means the scrape itself failed. This is the same distinction
@@ -174,7 +352,7 @@ impl Scraper {
         snap.ingress_queue_depth = g(M_INGRESS_QUEUE);
         push_up(
             snap,
-            format!("ingress@{}", self.ingress_node),
+            format!("ingress@{}", self.targets.ingress.name),
             body.as_deref(),
         );
     }
@@ -183,9 +361,9 @@ impl Scraper {
     /// counters across nodes.
     async fn scrape_sequencers(&self, snap: &mut MetricsSnapshot) {
         let mut totals = SeqTotals::default();
-        for node in &self.sequencer_nodes {
-            let body = self.fetch(node, PORT_SEQUENCER).await;
-            totals.fold_node(snap, node, body.as_deref());
+        for target in &self.targets.sequencers {
+            let body = self.fetch(snap, target).await;
+            totals.fold_node(snap, &target.name, body.as_deref());
         }
         snap.seq_dropped_past = totals.scraped_any.then_some(totals.dropped_past);
         snap.seq_evictions = totals.scraped_any.then_some(totals.evictions);
@@ -368,6 +546,111 @@ kardamom_executor_block_apply_duration_seconds_count 7
         let mut snap = MetricsSnapshot::default();
         push_up(&mut snap, "executor@n0".to_string(), Some(SAMPLE));
         assert_eq!(snap.service_up, vec![("executor@n0".to_string(), None)]);
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A scraper over the one ingress `target`, whose fallback runs
+    /// `exec_program` in place of `docker`.
+    fn scraper(via_docker: bool, exec_program: &'static str, target: MetricsTarget) -> Scraper {
+        let set = ScrapeSet {
+            via_docker,
+            scrape: BTreeSet::new(),
+            targets: MetricsTargets {
+                executors: Vec::new(),
+                ingress: target,
+                sequencers: Vec::new(),
+            },
+        };
+        Scraper::with_exec_program(set, exec_program).unwrap()
+    }
+
+    /// Serve `body` as one HTTP response on a loopback port; the port.
+    async fn serve_once(body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = sock.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        port
+    }
+
+    /// A loopback port that no listener holds.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn a_target_reads_inside_its_node_on_loopback_at_the_same_port() {
+        let target = MetricsTarget::at("executor-0", Ipv4Addr::new(10, 0, 0, 5), 9004);
+        assert_eq!(target.url.as_str(), "http://10.0.0.5:9004/metrics");
+        assert_eq!(target.loopback_url(), "http://127.0.0.1:9004/metrics");
+        let named = MetricsTarget::named("kardamom-ingress-0", INGRESS_METRICS_PORT).unwrap();
+        assert_eq!(named.url.as_str(), "http://kardamom-ingress-0:9006/metrics");
+        assert!(MetricsTarget::named("not a host", 9006).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_direct_read_needs_no_fallback() {
+        let port = serve_once("kardamom_service_up 1\n").await;
+        let target = MetricsTarget::at("ingress-0", Ipv4Addr::LOCALHOST, port);
+        let scraper = scraper(false, "false", target.clone());
+        let mut snap = MetricsSnapshot::default();
+        let body = scraper.fetch(&mut snap, &target).await;
+        assert_eq!(body.as_deref(), Some("kardamom_service_up 1\n"));
+        assert_eq!(snap.fallbacks, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_direct_read_falls_back_through_the_node_and_counts() {
+        let port = closed_port();
+        let target = MetricsTarget::at("ingress-0", Ipv4Addr::LOCALHOST, port);
+        // `echo` prints the fallback command line as its body.
+        let echo = scraper(false, "echo", target.clone());
+        let mut snap = MetricsSnapshot::default();
+        let body = echo.fetch(&mut snap, &target).await.unwrap();
+        assert_eq!(
+            body.trim(),
+            format!("exec ingress-0 curl -fsS --max-time 5 http://127.0.0.1:{port}/metrics")
+        );
+        assert_eq!(snap.fallbacks, 1);
+        let failed = scraper(false, "false", target.clone());
+        assert_eq!(failed.fetch(&mut snap, &target).await, None);
+        assert_eq!(snap.fallbacks, 2);
+    }
+
+    #[tokio::test]
+    async fn via_docker_reads_through_the_node_with_no_fallback_count() {
+        let port = serve_once("kardamom_service_up 1\n").await;
+        let target = MetricsTarget::at("ingress-0", Ipv4Addr::LOCALHOST, port);
+        let scraper = scraper(true, "echo", target.clone());
+        let mut snap = MetricsSnapshot::default();
+        let body = scraper.fetch(&mut snap, &target).await.unwrap();
+        assert!(body.starts_with("exec ingress-0 curl"), "{body}");
+        assert_eq!(snap.fallbacks, 0);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_counts_the_fallbacks_of_every_target() {
+        let target = MetricsTarget::at("ingress-0", Ipv4Addr::LOCALHOST, closed_port());
+        let mut scraper = scraper(false, "false", target.clone());
+        scraper.scrape = ["executor", "ingress"].map(String::from).into();
+        scraper.targets.executors = vec![target.clone(), target];
+        let snap = scraper.snapshot().await;
+        assert_eq!(snap.fallbacks, 3);
+        assert_eq!(snap.executor_blocks.len(), 2);
+        assert_eq!(snap.ingress_received, None);
     }
 
     #[test]

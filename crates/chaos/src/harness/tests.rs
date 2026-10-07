@@ -1,3 +1,7 @@
+use std::net::Ipv4Addr;
+
+use kardamom_bench::load::{MetricsTarget, MetricsTargets};
+
 use super::*;
 
 #[test]
@@ -36,9 +40,11 @@ fn spec() -> LoadSpec {
         max_gap: 0,
         drain_timeout: Duration::ZERO,
         report_path: PathBuf::new(),
-        executor_nodes: Vec::new(),
-        ingress_node: String::new(),
-        sequencer_nodes: Vec::new(),
+        metrics: MetricsTargets {
+            executors: Vec::new(),
+            ingress: MetricsTarget::at("ingress-1", Ipv4Addr::LOCALHOST, 9006),
+            sequencers: Vec::new(),
+        },
     }
 }
 

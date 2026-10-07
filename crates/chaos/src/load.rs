@@ -10,7 +10,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, U256, address};
 use anyhow::Context;
 use kardamom_bench::ANVIL_MNEMONIC;
-use kardamom_bench::load::{self, Completeness, LoadConfig, SenderRange, Workload};
+use kardamom_bench::load::{self, Completeness, LoadConfig, MetricsTargets, SenderRange, Workload};
 use serde::Deserialize;
 
 /// The burn address of every load transfer.
@@ -61,10 +61,8 @@ pub struct LoadSpec {
     pub max_gap: u64,
     pub drain_timeout: Duration,
     pub report_path: PathBuf,
-    /// The node container names the harness scrapes.
-    pub executor_nodes: Vec<String>,
-    pub ingress_node: String,
-    pub sequencer_nodes: Vec<String>,
+    /// The exporters the harness scrapes, over the bridge.
+    pub metrics: MetricsTargets,
 }
 
 impl LoadSpec {
@@ -98,12 +96,10 @@ impl LoadSpec {
             chaos_mode: true,
             fixed_rate: self.fixed_rate,
             scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
-            metrics_via_docker: true,
+            metrics_via_docker: false,
             subscribe: false,
             feed_confirm: false,
-            executor_nodes: self.executor_nodes.clone(),
-            ingress_node: self.ingress_node.clone(),
-            sequencer_nodes: self.sequencer_nodes.clone(),
+            metrics: self.metrics.clone(),
             output: Some(self.report_path.clone()),
         })
     }

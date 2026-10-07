@@ -451,6 +451,7 @@ pub(crate) fn print_report(r: &LoadReport) {
     print_gas(r);
     print_counts(r);
     print_keep_pace(&r.verdict.keep_pace);
+    println!("scrape_fallbacks={}", r.scrape_fallbacks);
     if r.verdict.pass {
         println!("RESULT: PASS");
     } else {
