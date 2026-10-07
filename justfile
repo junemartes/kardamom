@@ -203,6 +203,34 @@ style:
     fi
     echo "style check passed."
 
+# BASE is a git revision in a git checkout, for example
+# `$(git merge-base HEAD origin/main)`. In a jj workspace it is a jj
+# revision, for example `'fork_point(@ | main@origin)'`. When the base has
+# no formats.toml, only the head file is checked.
+
+# Compare formats.toml with the file at a base revision (docs/formats.md).
+check-formats $base:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    base_file="$(mktemp)"
+    trap 'rm -f "$base_file"' EXIT
+    base_arg=()
+    if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+        jj log --no-graph -r "$base" -T 'commit_id ++ "\n"' >/dev/null
+        if [ -n "$(jj file list -r "$base" formats.toml 2>/dev/null)" ]; then
+            jj file show -r "$base" formats.toml >"$base_file"
+            base_arg=(--base "$base_file")
+        fi
+    else
+        git rev-parse --verify --quiet "$base^{commit}" >/dev/null \
+            || { echo "unknown base revision: $base" >&2; exit 1; }
+        if git cat-file -e "$base:formats.toml" 2>/dev/null; then
+            git show "$base:formats.toml" >"$base_file"
+            base_arg=(--base "$base_file")
+        fi
+    fi
+    cargo run --quiet --locked -p kardamom-formats -- --head formats.toml "${base_arg[@]}"
+
 # Run the test suite across all features.
 test:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked

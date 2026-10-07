@@ -131,3 +131,14 @@ fn a_payload_with_and_without_cursors_is_refused() {
     let err = encode(&payload).unwrap_err().to_string();
     assert!(err.contains("one version"), "{err}");
 }
+
+#[test]
+fn kar1_versions_match_the_registry() {
+    let registry = kardamom_formats::Registry::workspace().unwrap();
+    let versions = kardamom_formats::Versions {
+        writes: VERSION.into(),
+        reads_min: VERSION_NO_CURSOR.into(),
+        reads_max: VERSION.into(),
+    };
+    assert_eq!(registry.versions("kar1-batch"), Some(versions));
+}

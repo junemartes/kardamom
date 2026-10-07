@@ -1,0 +1,17 @@
+[package]
+name = "kardamom-formats"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+publish = false
+
+# The format registry (`formats.toml` at the workspace root) and its
+# release check. The crates that own a format version use the library in
+# their tests. The `kardamom-formats` binary compares the registry with the
+# registry of a base revision.
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true

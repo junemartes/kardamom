@@ -44,6 +44,8 @@ use kardamom_types::epoch::EpochRecord;
 use thiserror::Error;
 
 mod egress;
+#[cfg(test)]
+mod format_tests;
 mod ingress;
 #[cfg(test)]
 mod tests;

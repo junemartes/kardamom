@@ -3780,6 +3780,7 @@ dependencies = [
  "kardamom-batcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-formats",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
@@ -3895,6 +3896,7 @@ dependencies = [
  "kardamom-cluster-adapter",
  "kardamom-cluster-client",
  "kardamom-engine",
+ "kardamom-formats",
  "kardamom-log",
  "kardamom-sequencer",
  "kardamom-types",
@@ -3910,6 +3912,7 @@ dependencies = [
 name = "kardamom-cluster-client"
 version = "0.1.0"
 dependencies = [
+ "kardamom-formats",
  "num_enum",
  "thiserror 2.0.18",
 ]
@@ -4070,6 +4073,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-formats"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "kardamom-ingress"
 version = "0.1.0"
 dependencies = [
@@ -4172,6 +4185,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "if-addrs",
+ "kardamom-formats",
  "kardamom-obs",
  "kardamom-types",
  "metrics",
@@ -4253,6 +4267,7 @@ dependencies = [
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-engine",
+ "kardamom-formats",
  "kardamom-reconstruct",
  "kardamom-state",
  "kardamom-test-support",
@@ -4311,6 +4326,7 @@ dependencies = [
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
+ "kardamom-formats",
  "kardamom-log",
  "kardamom-types",
  "metrics",

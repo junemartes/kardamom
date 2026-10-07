@@ -1,0 +1,204 @@
+# The format registry. docs/formats.md has the rules.
+#
+# Each [format.<id>] entry is one stored or wire format that a release of
+# one version writes and a release of another version reads:
+#
+#   writes     the version this release writes with its default configuration
+#   reads_min  the oldest version this release reads
+#   reads_max  the newest version this release reads
+#   code       "path#symbol": a file that defines the format, and a name in
+#              that file. A test checks that each file holds its symbol.
+#   activation optional { flag = "...", writes = N }: the version the writer
+#              writes when an operator switches the flag on
+#
+# For a set of message kinds, the version is the highest kind number.
+# A format with no version constant has a frozen layout. It has version 1.
+#
+# Tests in the crates that own a constant, and a test in the sealer, check
+# that the code constants equal this file. `just check-formats BASE`
+# compares this file with the file at the base revision:
+#
+#   writes > base reads_max     a rollback to the base is not safe. Add
+#                               [one_way.<id>] with version = writes.
+#   reads_min > base writes     a rolling deploy is not safe. Add
+#                               [coordinated.<id>] with version = reads_min.
+
+# The sealer's Aeron Cluster snapshot. The loader refuses a version above
+# the read maximum, so a member that rolls back cannot load a newer
+# snapshot.
+[format.sealer-snapshot]
+writes = 10
+reads_min = 1
+reads_max = 10
+code = [
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_VERSION",
+]
+
+# The ingress message kinds of the sealer. The Rust writers send kinds 0
+# to 7. The sealer itself writes kind 8 into its log. The sealer orders an
+# unknown kind of 85 bytes or more as a user record, and drops a shorter
+# one. Thus a new kind that changes the replicated state can fork members
+# that run different versions.
+[format.sealer-ingress-kinds]
+writes = 8
+reads_min = 0
+reads_max = 8
+code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_SEED_EPOCH",
+    "crates/cluster-adapter/src/wire/mod.rs#KIND_POSTED_CURSOR",
+]
+
+# The egress message kinds of the sealer. The Rust reader drops an unknown
+# kind with a warning.
+[format.sealer-egress-kinds]
+writes = 12
+reads_min = 1
+reads_max = 12
+code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_ORIGIN_GAP",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_ORIGIN_GAP",
+]
+
+# The record type inside a relayed egress frame. The Rust writers send
+# types 0 to 3, and the sealer writes type 4 (void). The Rust reader drops
+# a frame with an unknown type, so an old executor misses a canonical
+# record.
+[format.sealer-record-types]
+writes = 4
+reads_min = 0
+reads_max = 4
+code = [
+    "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
+]
+
+# The seed file that kardamom-reconstruct writes and an empty sealer
+# cluster starts from. The sealer refuses any other version.
+[format.sealer-seed]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = [
+    "crates/reconstruct/src/seed.rs#const VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int VERSION",
+]
+
+# The major part of the Aeron Cluster app version. Aeron refuses a session
+# or a log whose major differs from the member's major.
+[format.cluster-app-version]
+writes = 0
+reads_min = 0
+reads_max = 0
+code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/ClusterNode.java#APP_VERSION",
+    "crates/cluster-client/src/session/mod.rs#APP_SEMANTIC_VERSION",
+]
+
+# The executor and validator state database. The database refuses a
+# version other than its own, and there is no migration. A change is
+# one-way and coordinated.
+[format.state-db]
+writes = 3
+reads_min = 3
+reads_max = 3
+code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
+
+# The checkpoint manifest. The reader ignores the version key and unknown
+# keys. The image inside the checkpoint is a state database, so the
+# state-db entry also applies to a checkpoint.
+[format.checkpoint-manifest]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/state/src/checkpoint/manifest.rs#MANIFEST_VERSION"]
+
+# The KAR1 batch on DA and L1. The batch stays there for all time. The
+# batcher decodes its own last post at start, and the indexer and
+# kardamom-reconstruct decode every post.
+[format.kar1-batch]
+writes = 5
+reads_min = 4
+reads_max = 5
+code = ["crates/batcher/src/frame.rs#VERSION_NO_CURSOR"]
+
+# Frozen layout. The batcher spool: one rkyv ClosedBlock per file. A spool
+# that does not decode stops the batcher at start.
+[format.batcher-spool]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = [
+    "crates/batcher/src/live/spool.rs#ClosedBlock",
+    "crates/batcher/src/batch.rs#pub struct ClosedBlock",
+]
+
+# Frozen layout. The batcher cursor, as serde JSON. An old reader ignores
+# a new field. A new field has a serde default, so a new reader reads an
+# old cursor.
+[format.batcher-cursor]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/batcher/src/live/cursor.rs#pub struct BatchCursor"]
+
+# Frozen layout. The da-watcher L1 cursor: exactly two fields on one line.
+# Any other line is an operator halt (L1CursorUnreadable).
+[format.l1-cursor]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/da_watcher/src/l1_cursor.rs#pub struct L1Cursor"]
+
+# Frozen layout. The rkyv records on the Aeron streams and in the tx_data
+# archives: receipts, block deltas, boundaries, service events, transaction
+# status, transaction errors, and transaction envelopes. An enum adds a
+# variant only at the end.
+[format.aeron-stream-records]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = [
+    "crates/types/src/receipt.rs#pub struct Receipt",
+    "crates/types/src/delta.rs#pub struct BlockDelta",
+    "crates/types/src/boundary.rs#pub struct BlockBoundary",
+    "crates/types/src/service.rs#pub struct ServiceEvent",
+    "crates/types/src/tx_status.rs#pub struct TxStatus",
+    "crates/types/src/tx_error.rs#pub struct TxError",
+    "crates/types/src/envelope.rs#pub struct TxEnvelope",
+]
+
+# Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
+# stage code reads as no stage.
+[format.notifier-outbox]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
+
+# Frozen layout. The Redis cache keys and values. Redis keeps no data on
+# disk, and the cache is advisory. A new layout uses a new key prefix.
+[format.redis-cache]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/cache/src/keys.rs#pub fn receipt"]
+
+# The service discovery records in Consul. A runtime ignores a record of
+# another version, so a mixed fleet does not find its peers.
+[format.discovery-record]
+writes = 1
+reads_min = 1
+reads_max = 1
+code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
+
+# Releases that break a rule on purpose. Each entry covers one version of
+# one format: `version` is the head `writes` under one_way, and the head
+# `reads_min` under coordinated. A later change to the same format needs a
+# new entry.
+#
+# [one_way.sealer-snapshot]
+# version = 11
+# reason = "The members write snapshot v11. A member of the base release cannot load it."
+[one_way]
+
+[coordinated]
