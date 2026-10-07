@@ -1,5 +1,5 @@
-//! The batcher's evidence: its confirmed-post counter, its start line,
-//! and the lines a start on the old resume path would print.
+//! The batcher's evidence: the waits on its confirmed-post counter, its
+//! start line, and the lines a start on the old resume path would print.
 
 use std::time::Duration;
 
@@ -7,9 +7,7 @@ use crate::harness::Harness;
 use crate::l1::L1;
 use crate::nomad::Streams;
 use crate::poll::{self, Budget};
-use crate::probes::BATCHER_PORT;
 
-const POSTED: &str = "kardamom_batcher_batches_posted_total";
 /// The start line of the live batcher, with its resolved cursor.
 pub(super) const START_LINE: &str = "live batcher starting";
 /// The lines of a start that waits on the indexer, or scans the logs
@@ -23,12 +21,6 @@ pub(super) const REBUILDING_LINE: &str = "sealer replay refused; rebuilding the 
 /// The line of a rebuilt gap: the reader resumes at the sealers' floor.
 pub(super) const REBUILT_LINE: &str = "gap rebuilt; resuming at the sealer's floor";
 
-/// The confirmed posts of the running batcher: zero when the exporter
-/// answers before its first post, `None` when it does not answer.
-pub(super) async fn posted(h: &Harness) -> Option<i64> {
-    h.probes.aux_metric_where(BATCHER_PORT, POSTED, "").await
-}
-
 /// The post counter moves past `base` within `budget`; the new value.
 pub(super) async fn await_posting(
     h: &Harness,
@@ -36,11 +28,14 @@ pub(super) async fn await_posting(
     budget: Duration,
     ctx: &str,
 ) -> anyhow::Result<i64> {
-    let outcome = poll::until(
-        Budget::new(budget, Duration::from_secs(3)),
-        |_| async move { Ok::<_, anyhow::Error>(posted(h).await.filter(|p| *p > base)) },
-    )
-    .await?;
+    let outcome =
+        poll::until(
+            Budget::new(budget, Duration::from_secs(3)),
+            |_| async move {
+                Ok::<_, anyhow::Error>(h.probes.batcher_posts().await.filter(|p| *p > base))
+            },
+        )
+        .await?;
     let (now, elapsed) = outcome.or_fail(|t| {
         crate::chaos_fail!(
             "{ctx}: the batcher confirmed no post within {}s (counter at {base})",
@@ -56,7 +51,7 @@ pub(super) async fn await_posting(
 
 /// The batcher is live: it confirms a post within a minute.
 pub(super) async fn require_posting(h: &Harness, ctx: &str) -> anyhow::Result<i64> {
-    let base = posted(h).await.unwrap_or(0);
+    let base = h.probes.batcher_posts().await.unwrap_or(0);
     await_posting(h, base, Duration::from_secs(60), ctx).await
 }
 
@@ -68,7 +63,9 @@ pub(super) async fn assert_posted_through(
     min: i64,
     ctx: &str,
 ) -> anyhow::Result<()> {
-    let now = posted(h)
+    let now = h
+        .probes
+        .batcher_posts()
         .await
         .ok_or_else(|| crate::chaos_fail!("{ctx}: the batcher exporter does not answer"))?;
     anyhow::ensure!(

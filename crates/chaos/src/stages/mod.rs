@@ -5,6 +5,7 @@
 
 mod churn;
 pub(crate) mod rebuild;
+mod recovery;
 mod semantics;
 mod soak;
 mod state;

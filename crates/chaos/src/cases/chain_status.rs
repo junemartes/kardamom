@@ -20,8 +20,12 @@ pub(crate) struct ChainView(Value);
 impl ChainView {
     /// Read the chain status from the first ingress.
     pub(crate) async fn read(h: &Harness) -> anyhow::Result<Self> {
-        let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
-        Ok(Self(rpc.chain_status().await?))
+        Self::read_at(&h.rpc_url, h.knobs.chain_id).await
+    }
+
+    /// Read the chain status from the ingress at `url`.
+    pub(crate) async fn read_at(url: &str, chain_id: u64) -> anyhow::Result<Self> {
+        Ok(Self(Rpc::new(url, chain_id)?.chain_status().await?))
     }
 
     /// Read the chain status until `holds` accepts it, within `budget`.
@@ -86,6 +90,37 @@ impl ChainView {
         !states.is_empty() && states.iter().all(|s| s == "running")
     }
 
+    /// Why this ingress refuses a submit: the sealer's halt first, then
+    /// the ingress's own halt or pause. `None` while it takes submits.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        let sealer = &self.0["sealer"];
+        let ingress = &self.0["ingress"];
+        let halted = (sealer["halted"] == true)
+            .then(|| format!("the sealer is halted on {}", Self::text(&sealer["cause"])));
+        halted.or_else(|| {
+            (ingress["state"] != "running").then(|| {
+                format!(
+                    "the ingress is {} on {}",
+                    Self::text(&ingress["state"]),
+                    Self::cause(ingress)
+                )
+            })
+        })
+    }
+
+    /// The cause of a halted or paused process record.
+    fn cause(record: &Value) -> String {
+        [
+            &record["cause"],
+            &record["pause"]["root"]["cause"],
+            &record["pause"]["reason"],
+        ]
+        .into_iter()
+        .find_map(Value::as_str)
+        .unwrap_or("no named cause")
+        .to_string()
+    }
+
     fn services(&self) -> impl Iterator<Item = &Value> {
         self.0["services"].as_array().into_iter().flatten()
     }
@@ -128,5 +163,34 @@ mod tests {
             "services": [{"service": "batcher", "state": "gone"}],
         }));
         assert!(calm.settled(), "a gone record is not a pause");
+    }
+
+    #[test]
+    fn a_refusal_names_the_sealer_halt_first_then_the_ingress_pause() {
+        let silent = ChainView(serde_json::json!({
+            "sealer": {"halted": true, "state": "halted", "cause": "sealer_no_quorum"},
+            "ingress": {"halted": false, "state": "paused",
+                "pause": {"reason": "upstream", "root": {"cause": "sealer_no_quorum"}}},
+        }));
+        assert_eq!(
+            silent.refusal().as_deref(),
+            Some("the sealer is halted on sealer_no_quorum")
+        );
+
+        let paused = ChainView(serde_json::json!({
+            "sealer": {"halted": false, "state": "running", "pause": null},
+            "ingress": {"halted": false, "state": "paused",
+                "pause": {"reason": "upstream", "root": {"cause": "replay_unavailable"}}},
+        }));
+        assert_eq!(
+            paused.refusal().as_deref(),
+            Some("the ingress is paused on replay_unavailable")
+        );
+
+        let open = ChainView(serde_json::json!({
+            "sealer": {"halted": false, "state": "running", "pause": null},
+            "ingress": {"halted": false, "state": "running", "pause": null},
+        }));
+        assert_eq!(open.refusal(), None);
     }
 }

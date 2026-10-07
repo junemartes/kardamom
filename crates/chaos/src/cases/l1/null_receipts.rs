@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use kardamom_l1_fault_proxy::Fault;
 
 use super::batcher::{
-    BeforeRestart, assert_resumed_from_contract, await_posting, posted, require_posting, restart,
+    BeforeRestart, assert_resumed_from_contract, await_posting, require_posting, restart,
 };
 use super::deferred;
 use super::followers::{Followers, await_archive_complete, await_resume};
@@ -47,7 +47,7 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     restart(h, ctx).await?;
     assert_resumed_from_contract(h, &l1, before, ctx).await?;
     tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
-    let stalled = posted(h).await.unwrap_or(0);
+    let stalled = h.probes.batcher_posts().await.unwrap_or(0);
     let stuck = Followers::at_clear(h, &l1, base).await?;
     // The receipt of the post in flight arrives; the batcher continues.
     await_posting(

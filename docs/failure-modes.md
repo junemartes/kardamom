@@ -643,7 +643,7 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - The batcher posts the pending group of the spool first. It does this even when a refusal stops the reader before the group is due. The spool is the only copy of those blocks.
 - Proof: `batcher-outage-past-retention`.
   - The case freezes the batcher with a non-empty spool. It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
-  - It asserts that the spool posted.
+  - It asserts that the frozen group lands right after the covered block. A batcher that restarts after the thaw must restore the group from its spool. A batcher that keeps running posts the group from memory.
   - It then accepts one of two ends. The sealers serve the replay, and L1 covers the head at the thaw with no refusal. This is the expected end. Or the sealers refuse, and the batcher rebuilds the gap and posts past the floor.
   - It asserts that the record on L1 is contiguous.
   - The persisted-state stage of the shard then proves the rebuild from L1 through the recovered range.
