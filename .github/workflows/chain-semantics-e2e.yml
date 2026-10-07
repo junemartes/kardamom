@@ -77,7 +77,7 @@ jobs:
         run: |
           cargo build --locked --bins \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-            -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
+            -p kardamom-validator -p kardamom-state -p kardamom-da-watcher -p kardamom-l1-indexer \
             -p kardamom-batcher -p kardamom-reconstruct -p kardamom-notifier
 
       # Each test brings up its own stack (2 JVMs + 4 service processes), and

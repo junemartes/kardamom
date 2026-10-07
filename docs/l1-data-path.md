@@ -315,7 +315,8 @@ The cluster job binds the metrics listener to `0.0.0.0:9009`.
 
 ## Two L1 sources for the followers
 
-The da-watcher and the indexer are the followers. Each one reads through a set of sources.
+The indexer (the L1 follower) and the validator's check read L1 through a set of sources. The da-watcher has no L1
+access: it reads the follower's `l1_blocks` stream.
 
 - `--l1-rpc` is a list of public endpoints. `--l1-light-client-rpc` is the light client.
 - The set accepts the ids of a block, or the result of a log query, in these cases:
@@ -352,7 +353,7 @@ The log line, the error, the `/halt` record, and the `kardamom_halt` gauge carry
 - The counter `kardamom_l1_source_disagreement_total` counts each disagreement.
   A disagreement that the light client settles also counts. The liar rotates out, and the follower does not halt.
 - The alert `KardamomL1SourceDisagreement` fires on any increase. One alert for each cause (`KardamomHalt*`) fires on the halt.
-- A `chain_break` is also a tick outcome of the da-watcher.
+- The da-watcher pauses with the follower as its root while every follower instance is halted.
   See [failure-modes.md](failure-modes.md) for the effect.
 
 ### Why the followers do not walk the light client alone

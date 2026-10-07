@@ -115,6 +115,8 @@ impl Shard {
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",
+                "follower-instance-loss",
+                "follower-total-loss",
                 "two-day-outage",
                 "batcher-outage-past-retention",
             ],
@@ -149,6 +151,7 @@ impl Shard {
                 cluster_retention: Some(6144),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
+                da_watcher_silence_s: Some(30),
                 ..DeployVars::default()
             },
             Self::Executor
@@ -218,7 +221,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 45);
+        assert_eq!(all.len(), 47);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")

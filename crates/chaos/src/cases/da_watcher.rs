@@ -43,8 +43,8 @@ fn cursor_number(line: &str) -> Option<u64> {
 }
 
 /// Restart the da-watcher from its registered job, with no extra flag.
-/// The start resumes after the sealer's L1 origin, and reads that block's
-/// hash again through its L1 sources. This replaces a wrong hash in the
+/// The start resumes after the sealer's L1 origin, and takes that block's
+/// hash from its `l1_blocks` record. This replaces a wrong hash in the
 /// cursor file. Then assert that it stands at or before the sealer.
 ///
 /// # Errors

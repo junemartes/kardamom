@@ -1,7 +1,11 @@
-//! The followers' evidence: the da-watcher's and the indexer's tick
-//! outcomes and progress gauges, the resume they prove, and the operator
-//! step a poisoned single-source follower needs. The halt judgment lives
-//! in `halt`.
+//! The followers' evidence: the L1 follower's (the indexer's) tick
+//! outcomes and progress gauges, the da-watcher's pause on it and its
+//! progress, the resume they prove, and the operator step a poisoned
+//! single-source follower needs. The halt judgment lives in `halt`.
+//!
+//! The L1 follower is the one reader of L1: a lie halts it, and the
+//! da-watcher, which reads the follower's stream, pauses with the
+//! follower as its root.
 
 use std::time::Duration;
 
@@ -13,7 +17,10 @@ use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::probes::{DA_WATCHER_PORT, INDEXER_PORT};
 
-const WATCHER_TICKS: &str = "kardamom_da_watcher_tick_total";
+/// The pause gauge; the da-watcher's pause on the follower carries
+/// `root_service="l1-indexer"`.
+const PAUSED: &str = "kardamom_paused";
+const ON_FOLLOWER: &str = "root_service=\"l1-indexer\"";
 /// The L1 block of the last published epoch: a block number, so it
 /// keeps its meaning across a restart, where a counter starts at zero.
 const WATCHER_EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
@@ -31,7 +38,7 @@ const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
 /// evidence, not zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Followers {
-    watcher_breaks: Option<i64>,
+    watcher_paused: Option<i64>,
     watcher_origin: Option<i64>,
     indexer_errors: Option<i64>,
     indexer_block: Option<i64>,
@@ -42,8 +49,8 @@ impl Followers {
     pub(super) async fn read(h: &Harness) -> Self {
         let p = &h.probes;
         Self {
-            watcher_breaks: p
-                .aux_metric_where(DA_WATCHER_PORT, WATCHER_TICKS, "outcome=\"chain_break\"")
+            watcher_paused: p
+                .aux_metric_where(DA_WATCHER_PORT, PAUSED, ON_FOLLOWER)
                 .await,
             watcher_origin: p.aux_metric(DA_WATCHER_PORT, WATCHER_EPOCH_ORIGIN).await,
             indexer_errors: p
@@ -100,7 +107,7 @@ impl Followers {
     /// Each absent field of `self` taken from `earlier`.
     fn or(self, earlier: Self) -> Self {
         Self {
-            watcher_breaks: self.watcher_breaks.or(earlier.watcher_breaks),
+            watcher_paused: self.watcher_paused.or(earlier.watcher_paused),
             watcher_origin: self.watcher_origin.or(earlier.watcher_origin),
             indexer_errors: self.indexer_errors.or(earlier.indexer_errors),
             indexer_block: self.indexer_block.or(earlier.indexer_block),
@@ -108,10 +115,20 @@ impl Followers {
         }
     }
 
-    /// Both followers counted a chain break since `base`.
-    pub(super) fn chain_broke_since(self, base: Self) -> bool {
-        rose(self.watcher_breaks, base.watcher_breaks)
-            && rose(self.indexer_errors, base.indexer_errors)
+    /// The L1 follower failed ticks since `base`, and the da-watcher is
+    /// paused with the follower as its root.
+    pub(super) fn halted_since(self, base: Self) -> bool {
+        self.watcher_paused == Some(1) && rose(self.indexer_errors, base.indexer_errors)
+    }
+
+    /// The da-watcher is paused with the follower as its root.
+    pub(super) fn watcher_paused(self) -> bool {
+        self.watcher_paused == Some(1)
+    }
+
+    /// The da-watcher's last published L1 block, when it exported one.
+    pub(super) fn watcher_origin(self) -> Option<i64> {
+        self.watcher_origin
     }
 
     /// Both followers moved since `base`: the da-watcher published an
@@ -124,8 +141,8 @@ impl Followers {
     pub(super) fn show(self) -> String {
         let s = |v: Option<i64>| v.map_or("?".to_string(), |x| x.to_string());
         format!(
-            "watcher chain_breaks={} epoch_origin={} indexer errors={} block={} last_batch={}",
-            s(self.watcher_breaks),
+            "watcher paused_on_follower={} epoch_origin={} indexer errors={} block={} last_batch={}",
+            s(self.watcher_paused),
             s(self.watcher_origin),
             s(self.indexer_errors),
             s(self.indexer_block),
@@ -209,7 +226,13 @@ pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> 
     restart_and_follow_sealer(h, ctx).await?;
     let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
     indexer.stop().await?;
-    for node in h.probes.follower_containers() {
+    let nodes: Vec<String> = h
+        .probes
+        .follower_nodes()
+        .iter()
+        .map(|node| node.container.clone())
+        .collect();
+    for node in nodes {
         wipe_dirs(h, &node, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;
     }
     indexer.restore().await
@@ -220,24 +243,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_halt_and_a_resume_need_both_followers() {
+    fn a_halt_needs_the_follower_s_errors_and_the_watcher_s_pause() {
         let base = Followers {
-            watcher_breaks: Some(0),
+            watcher_paused: Some(0),
             watcher_origin: Some(10),
             indexer_errors: Some(0),
             indexer_block: Some(20),
             indexer_last_batch: Some(3),
         };
         let one = Followers {
-            watcher_breaks: Some(1),
+            watcher_paused: Some(1),
             ..base
         };
-        assert!(!one.chain_broke_since(base));
+        assert!(!one.halted_since(base));
         let both = Followers {
             indexer_errors: Some(2),
             ..one
         };
-        assert!(both.chain_broke_since(base));
+        assert!(both.halted_since(base));
         assert!(!both.advanced_since(base));
         let moved = Followers {
             watcher_origin: Some(11),
@@ -249,7 +272,7 @@ mod tests {
             watcher_origin: None,
             ..base
         };
-        assert!(!dark.chain_broke_since(base) && !dark.is_ready());
+        assert!(!dark.halted_since(base) && !dark.is_ready());
         assert!(base.is_ready());
         let restarted = Followers {
             indexer_block: None,

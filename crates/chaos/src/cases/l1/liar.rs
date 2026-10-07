@@ -165,11 +165,11 @@ impl Phase {
     }
 }
 
-/// The three lies in order. Through each, the followers halt where one
-/// source can see the lie, the batcher keeps posting, and the stale-post
-/// alert fires on the swallowed logs; after each, the followers resume
-/// and the archive catches up with L1; at the end, the DA record is
-/// contiguous.
+/// The three lies in order. Through each, the follower halts where one
+/// source can see the lie and the da-watcher pauses on it, the batcher
+/// keeps posting, and the stale-post alert fires on the swallowed logs;
+/// after each, the follower and the da-watcher resume and the archive
+/// catches up with L1; at the end, the DA record is contiguous.
 pub(crate) async fn liar(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "l1-liar";
     let l1 = L1::new(h).await?;

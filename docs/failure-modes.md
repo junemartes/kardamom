@@ -60,9 +60,9 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 
 | Cause | Service | Clears | Runbook |
 |---|---|---|---|
-| `l1_source_disagreement` | da-watcher, l1-indexer | auto | [`l1_source_disagreement`](runbooks/l1_source_disagreement.md) |
+| `l1_source_disagreement` | l1-indexer | auto | [`l1_source_disagreement`](runbooks/l1_source_disagreement.md) |
 | `l1_chain_break` | da-watcher, l1-indexer | auto | [`l1_chain_break`](runbooks/l1_chain_break.md) |
-| `l1_unreachable` | batcher, da-watcher, l1-indexer | auto | [`l1_unreachable`](runbooks/l1_unreachable.md) |
+| `l1_unreachable` | batcher, l1-indexer | auto | [`l1_unreachable`](runbooks/l1_unreachable.md) |
 | `replay_unavailable` | batcher | operator | [`replay_unavailable`](runbooks/replay_unavailable.md) |
 | `da_lag` | sealer (raised by the ingress) | auto | [`da_lag`](runbooks/da_lag.md) |
 | `sealer_no_quorum` | sealer (raised by the ingress) | auto | [`sealer_no_quorum`](runbooks/sealer_no_quorum.md) |
@@ -106,7 +106,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
   - A cluster session that sees no boundary for 10 s calls the sealer halted on a lost quorum.
 - **Publishers.** The ingress, the sequencer, the executor, the validator, the batcher, the da-watcher, the l1-indexer and the state-mirror.
   - The validator also publishes the attester as `service="attester"`.
-- **Subscribers.** The ingress and the validator. Other services do not subscribe.
+- **Subscribers.** The ingress, the validator and the da-watcher. Other services do not subscribe.
 - **The sealer is not on the stream.** The ingress observes it from the status frame (see "DA-lag guard") and from silence. It publishes the sealer as `sealer/cluster`.
 - **The l1-indexer is on the stream** as `l1-indexer/l1-indexer-<n>`. Its halt is also on its own `/halt` route and on the `indexer_halt` JSON-RPC method.
 
@@ -119,6 +119,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |
 | da-watcher halted | The chain status shows `deposits_delayed`. |
+| Every l1-indexer instance halted, or `l1_blocks` silent | The da-watcher pauses with the follower as its root. |
 | l1-indexer halted | `kardamom-reconstruct` refuses to rebuild from that indexer. |
 
 - No executor raises a halt yet. The executor publishes only its lifecycle. The row "every executor halted" has a reaction in the ingress and a unit test, and it has no producer.
@@ -864,13 +865,19 @@ The l1-indexer is the L1 follower: the one service that reads L1 data. It publis
 
 ## DA-watcher
 
-The da-watcher is tick-based, and it follows the commit of the sealer.
+The da-watcher takes the records of the L1 follower's `l1_blocks` stream, and it follows the commit of the sealer. It has no L1 access.
+
+- Each record carries the block's epoch, which the follower derived. The watcher publishes it on `tx_deposits`.
+- The watcher checks only the record's parent link against its head. Two follower instances publish every block: the watcher drops a copy with the same hash, and halts on a second hash for one number (`l1_follower_disagreement`, cleared by an operator).
+- A record that does not descend from the head is the halt `l1_chain_break`. The watcher reads the block again from the archives every tick, and resumes by itself on a record that descends.
+- A record past the next block is a gap on the subscription. The watcher reads the missing records from the archives of the follower nodes, and the follower's archive (`indexer_l1_block`) serves what they do not hold.
+- The loop selects on the next record, the sealer's origin, the re-publish deadline, and a housekeeping tick (`--poll-interval-secs`, 1 s in the deploy).
 
 - With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
 - The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.
 - A boundary that carries an origin in the window confirms the epochs up to it. The gauge is `kardamom_da_watcher_l1_confirmed_origin`.
 - A dead watcher stalls deposits only.
-- It reads *finalized* L1 blocks, so reorgs are out of scope by construction.
+- The stream carries *finalized* L1 blocks only, so reorgs are out of scope by construction.
 
 **Re-publish.**
 
@@ -891,13 +898,13 @@ The da-watcher is tick-based, and it follows the commit of the sealer.
 - The origin is below the base of the window: a sealer fleet seeded at an older origin.
 - The origin is past the head of the window: another da-watcher published the epochs.
 
-The watcher then reads the hash of the origin through its L1 source set. The next block must descend from it. The watcher never publishes the confirmed epochs again.
+The watcher then takes the hash of the origin from its `l1_blocks` record, and replays the stream from the block after it. The next block must descend from it. The watcher never publishes the confirmed epochs again.
 
 **The durable cursor.**
 
 - The cursor holds `C`, by number and hash. It is in the file that `--l1-cursor-file` names (`/opt/kardamom/da-watcher/l1-cursor` in the deploy).
 - After a pass in which `C` moved, the watcher writes `C` to the file atomically (temp file, fsync, rename).
-- Any RPC or publish error leaves the position unadvanced. The next tick retries the same range.
+- A publish error holds the record. The watcher publishes it again after a tick, and never skips it.
 
 **The start.** The watcher picks its start in this order of precedence:
 
@@ -905,14 +912,15 @@ The watcher then reads the hash of the origin through its L1 source set. The nex
    - The first tick reads the hash of `M` and writes it to the file.
    - It is the fallback for a da-watcher that cannot reach the sealer.
    - A later boundary outside the published range moves the watcher to the origin of the sealer. So a wrong flag cannot leave a gap.
-2. The first boundary of the sealer, within 20 s: the watcher resumes after its origin `S`. It reads the hash of `S` through the L1 source set.
+2. The first boundary of the sealer, within 20 s: the watcher resumes after its origin `S`. It takes the hash of `S` from the `l1_blocks` record of `S`, and replays the stream from `S + 1`.
+   - With no record of `S` (the follower is down, or no archive holds `S` yet), the watcher waits. It logs once a minute, sets `kardamom_da_watcher_waiting_for_l1_block{number}`, and is paused with the follower as its root. It never publishes without the parent check.
    - The watcher does not use a file ahead of `S` (a seed) or behind `S` (another da-watcher published).
    - The watcher replaces a wrong hash in the file.
    - Origin 0 means that the sealer holds no epoch. The watcher then goes on to 3 or 4.
 3. A file that parses: the watcher resumes after its block, linked to its hash.
    - This also applies when no boundary arrives within 20 s (the sealer cluster is down).
    - The file holds an origin that the sealer confirmed, so it is at or behind the origin of the sealer. The first boundary that arrives later corrects it in both directions.
-4. No file: the watcher starts at the finalized tip and logs a warning.
+4. No file: the watcher anchors at the first record of the stream and logs a warning.
    - With a sealer feed, the first boundary moves the watcher back to the origin of the sealer.
    - Without a sealer feed, and unless this is the first start of the chain, the start skips the epochs between the last publish and the tip.
 
@@ -934,7 +942,13 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - It reads the file again after an operator clears the halt.
 - It never guesses a start.
 
-**Two L1 sources.** The followers (the da-watcher and the indexer) read L1 through a set of endpoints. The flags are `--l1-rpc` (a list) and `--l1-light-client-rpc` (the light client).
+**The pause on the follower.** The da-watcher subscribes to the `events` stream. It is paused with the follower as its root (`kardamom_paused{root_service="l1-indexer"}`) in three cases, and resumes by itself:
+
+- every live follower instance is halted: the root is that halt;
+- `l1_blocks` carried no record for `--l1-silence-secs` (three finality steps, 1152 s, by default): the root is `l1-indexer/l1_blocks` with the cause `l1_unreachable`;
+- the watcher waits for a record no archive holds, for more than one tick: the same root.
+
+**Two L1 sources.** The L1 follower (the indexer) reads L1 through a set of endpoints, and so does the validator's check. The flags are `--l1-rpc` (a list) and `--l1-light-client-rpc` (the light client).
 
 - A block id or a log query is accepted when two sources agree, or when the light client serves it.
 - The finalized tip is the lowest tip that the agreeing sources report.
@@ -947,19 +961,17 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
   - With a light client, the source that disagrees with it is the liar. That source rotates out.
 - The error type `SourceHalt` has two values: `l1_source_disagreement` and `l1_sources_out`. The error, the log line and the counter carry that label.
 - The halt record and the `kardamom_halt` gauge use the halt causes of "Halts and service events". `l1_sources_out` is the cause `l1_unreachable` there.
-- The da-watcher and the indexer raise the halts `l1_source_disagreement`, `l1_chain_break` and `l1_unreachable`. All three clear by themselves, because the follower retries the same range on every tick.
+- The indexer raises the halts `l1_source_disagreement`, `l1_chain_break` and `l1_unreachable`. All three clear by themselves, because the follower retries the same range every slot.
 - Rotations count in `kardamom_l1_source_rotations_total{source,reason}`. The reasons are `error`, `rate_limited` and `disagreement`.
 - The alert is `KardamomL1SourceDisagreement`.
 - The details of the sources are in [`l1-data-path.md`](l1-data-path.md).
 
 **A lying L1 endpoint.**
 
-- The watcher chains consecutive blocks by their parent hashes.
-- A broken parent chain halts it at the first lying block. This is the `l1_chain_break` halt. `kardamom_da_watcher_tick_total{outcome="chain_break"}` moves on every tick. The watcher resumes by itself when the endpoint serves the chain again.
-- A wrong block hash is caught one block late. The lying hash is already the anchor. It is already in the epoch that the watcher published, and in its cursor file. The halt lasts until an operator resets the cursor (see [`l1_chain_break`](runbooks/l1_chain_break.md)).
+- The follower is the one reader of L1. It chains every header of a range by the parent hashes, to its cursor, and halts on a break (`l1_chain_break`). The da-watcher pauses on it.
+- A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores its hash; the next range then breaks against the cursor, and the follower stays halted until an operator re-indexes it (see [`l1_chain_break`](runbooks/l1_chain_break.md)). A light client anchor closes this case at the finalized tip.
 - A swallowed log is invisible to one source. Two sources see it.
-- `KardamomDaWatcherTickErrors` pages on a sustained error rate.
-- Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie. They check the halt and the resume. The inbox indexer chains blocks the same way through a persisted cursor. The cases check it beside the watcher.
+- Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 
 ## Notifier
 

@@ -35,7 +35,7 @@ The streams and their publishers:
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
-| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
+| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
@@ -244,7 +244,7 @@ No job configures a publication control port.
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
 | executor | receipts, boundaries, BAL, the live `exec_txs` publication |
-| da-watcher | deposits, remote epochs |
+| da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
 

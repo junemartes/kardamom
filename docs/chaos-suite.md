@@ -63,7 +63,7 @@ There are eleven shards. `just container-test` lists their names.
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 
 Case order matters in four places.
 
@@ -153,12 +153,15 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 **L1 shard**
 
-- [`l1-liar`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
-  - The wrong hash halts the single-source followers. The case then does the operator step.
-  - It restarts the da-watcher from its registered job, with no flag. The start resumes after the L1 origin of the sealer and reads the hash of that block again. It never removes the cursor file.
+- [`l1-liar`](failure-modes.md#l1-follower): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
+  - A hash lie halts the L1 follower, the one reader of L1, and the da-watcher pauses with the follower as its root (`kardamom_paused{root_service="l1-indexer"}`). Both resume when the lie stops.
+  - A wrong hash can reach the follower's cursor when a range ends at the lying block. The case then does the operator step.
+  - It restarts the da-watcher from its registered job, with no flag. The start resumes after the L1 origin of the sealer and takes the hash of that block from its `l1_blocks` record. It never removes the cursor file.
   - The cursor file of the da-watcher must then stand at or before the L1 origin of the sealer, within 60 s.
   - It re-indexes the archive of each follower instance (the aux node and `ingress-0`) from the first block of the chain.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
+- [`follower-instance-loss`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0` for the fault window, during load. The da-watcher must not pause or wait, must publish past its start, and must publish one epoch for each block. The batcher must post, and no origin gap may remain.
+- [`follower-total-loss`](failure-modes.md#l1-follower): stops the `l1-indexer` job for 75 s, past the da-watcher's silence window. The da-watcher must pause with the follower as its root. After the restart, it must resume with one epoch for each block since the start, and no origin gap may remain.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.
   - The heal of the followers is the `l1-liar` operator step.
@@ -367,8 +370,8 @@ Several faults can be active at once. They model one bad endpoint.
 **`KARDAMOM_L1_FAULT_PROXY=1`.** This switch of the deploy changes the cluster in these ways.
 
 - It deploys the `l1-fault-proxy` job (`deploy/cluster/nomad/l1-fault-proxy.nomad.hcl`) before its consumers.
-- The da-watcher, the indexer and the batcher read L1 through the proxy.
-- The followers therefore read one source, the proxy.
+- The indexer (the L1 follower) and the batcher read L1 through the proxy. The da-watcher reads the follower's stream.
+- The follower therefore reads one source, the proxy.
 - The in-cluster anvil finalizes two blocks behind its head (one slot in each epoch). The followers walk finalized blocks.
 - The inbox indexer starts at block 1, so its archive holds every batch.
 - The `chaos-l1` shard sets the switch itself. The default is `0`.

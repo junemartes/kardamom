@@ -3944,6 +3944,7 @@ dependencies = [
  "kardamom-obs",
  "kardamom-types",
  "metrics",
+ "rkyv",
  "serde",
  "serde_json",
  "tempfile",

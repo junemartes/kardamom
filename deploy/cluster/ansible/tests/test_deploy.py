@@ -257,20 +257,22 @@ class DeployTest(unittest.TestCase):
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
-                    'da-store', 'batcher']
+                    'da-store', 'l1-indexer', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
-        # Without a real L1, the batcher and the da-watcher get the
-        # in-cluster anvil, and the batcher the anvil dev key.
+        # Without a real L1, the batcher and the L1 follower get the
+        # in-cluster anvil, and the batcher the anvil dev key. The
+        # da-watcher reads no L1, so it has no secret.
         variables = self.api.state['variables']
-        self.assertEqual(variables['nomad/jobs/da-watcher'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
+        self.assertEqual(variables['nomad/jobs/l1-indexer'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
+        self.assertNotIn('nomad/jobs/da-watcher', variables)
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
-        self.assertEqual(sorted(self.api.state['variable_writes']), ['nomad/jobs/batcher', 'nomad/jobs/da-watcher'])
+        self.assertEqual(sorted(self.api.state['variable_writes']), ['nomad/jobs/batcher', 'nomad/jobs/l1-indexer'])
         self.run_deploy()
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
         self.assertEqual(len(self.api.state['variable_writes']), 2, 'unchanged redeploy must not write secrets')
@@ -304,7 +306,6 @@ class DeployTest(unittest.TestCase):
             'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
                                     'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
-            'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},
             'nomad/jobs/l1-indexer': {'KARDAMOM_L1_RPC': followers},
         })
         # Each job renders its own variable into the task environment.
@@ -423,7 +424,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
-        for job in ('batcher', 'da-watcher', 'l1-indexer'):
+        for job in ('batcher', 'l1-indexer'):
             self.assertEqual(self.api.state['variables'][f'nomad/jobs/{job}']['KARDAMOM_L1_RPC'], proxy, job)
         indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
@@ -455,6 +456,27 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(group['Count'], 1)
         args = group['Tasks'][0]['Config']['args']
         self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
+
+    def test_the_da_watcher_reads_the_follower_stream_with_no_l1_access(self):
+        # The watcher has no L1 endpoint; its history reads replay the
+        # follower archives onto its own ports and fall back to the
+        # follower's API.
+        self.run_deploy({'workloads_l1_fault_proxy': True}, check=True)
+        plans = self.api.state['plans']
+        task = plans['da-watcher']['TaskGroups'][0]['Tasks'][0]
+        args = task['Config']['args']
+        self.assertIn('--l1-blocks', args)
+        self.assertNotIn('--l1-rpc', args)
+        self.assertNotIn('kardamom-l1-fault-proxy', json.dumps(plans['da-watcher']))
+        self.assertEqual(args[args.index('--indexer-url') + 1], 'http://kardamom-l1-indexer.service.consul:8549')
+        self.assertIn('--replay-destination-endpoint', args)
+        self.assertIn('--archive-control-response-endpoint', args)
+        self.assertIn('l1-indexer', plans)
+
+    def test_every_deployment_runs_the_follower_and_anvil_reads_every_second(self):
+        self.run_deploy(check=True)
+        follower = self.api.state['plans']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
 
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the
@@ -508,7 +530,7 @@ class DeployTest(unittest.TestCase):
                    for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
         self.assertEqual({name for name, _ in parties}, {
             'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
-            'state-mirror', 'notifier'})
+            'state-mirror', 'notifier', 'l1-indexer'})
         liveness_ns = tolerance * 1_000_000
         for name, task in parties:
             if name not in jvm_options:

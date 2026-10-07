@@ -50,6 +50,9 @@ pub struct DeployVars {
     pub l1_fault_proxy: bool,
     /// The indexer's poll cadence, in seconds.
     pub indexer_poll_s: Option<u64>,
+    /// How long `l1_blocks` may carry no record before the da-watcher
+    /// pauses on the follower, in seconds.
+    pub da_watcher_silence_s: Option<u64>,
 }
 
 impl DeployVars {
@@ -69,12 +72,16 @@ impl DeployVars {
         let poll = self
             .indexer_poll_s
             .map(|v| ("L1_INDEXER_POLL_S", v.to_string()));
+        let silence = self
+            .da_watcher_silence_s
+            .map(|v| ("L1_SILENCE_S", v.to_string()));
         snapshot
             .into_iter()
             .chain(retention)
             .chain(budget)
             .chain(proxy)
             .chain(poll)
+            .chain(silence)
             .collect()
     }
 }

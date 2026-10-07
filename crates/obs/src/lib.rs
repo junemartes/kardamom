@@ -20,6 +20,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
 
 pub mod bin;
 pub mod events;
+pub mod follower;
 pub mod halt;
 pub mod lifecycle;
 pub mod ready;

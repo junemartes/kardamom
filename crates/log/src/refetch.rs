@@ -742,5 +742,7 @@ fn recv_timeout<S: PollRecv>(
     }
 }
 
+mod whole;
+
 #[cfg(test)]
 mod tests;

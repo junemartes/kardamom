@@ -133,14 +133,13 @@ impl Probes {
         }
     }
 
-    /// The containers of the nodes that run the L1 follower: the aux node
-    /// and the first ingress node, the nodes with the `indexer` role in the
-    /// container profile (`group_vars/all.yml`).
+    /// The nodes that run the L1 follower: the aux node and the first
+    /// ingress node, the nodes with the `indexer` role in the container
+    /// profile (`group_vars/all.yml`).
     #[must_use]
-    pub fn follower_containers(&self) -> Vec<String> {
+    pub fn follower_nodes(&self) -> Vec<&Probed> {
         std::iter::once(&self.validator)
             .chain(self.ingresses.first())
-            .map(|node| node.container.clone())
             .collect()
     }
 
