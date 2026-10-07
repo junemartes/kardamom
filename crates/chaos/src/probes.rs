@@ -5,6 +5,7 @@
 use std::net::Ipv4Addr;
 
 use crate::contract::NodeContract;
+use crate::harness::INGRESS_RPC_PORT;
 use crate::metrics::{self, Scrape, Target};
 
 /// The executor gauge that only goes up: the pipeline-progress signal.
@@ -23,6 +24,8 @@ pub const VALIDATOR_PORT: u16 = 9006;
 /// node beyond loopback, so the monitoring job scrapes them.
 pub const BATCHER_PORT: u16 = 9002;
 pub const DA_WATCHER_PORT: u16 = 9005;
+/// The batcher's count of the posts it confirmed on L1.
+pub const BATCHER_POSTED_METRIC: &str = "kardamom_batcher_batches_posted_total";
 pub const INDEXER_PORT: u16 = 9009;
 /// Lane 0's metrics port: `9001 + 10 * lane`.
 pub const SEQUENCER_LANE0_PORT: u16 = 9001;
@@ -49,6 +52,14 @@ pub struct Probed {
     /// The host container name.
     pub container: String,
     pub ip: Ipv4Addr,
+}
+
+impl Probed {
+    /// The JSON-RPC URL of this node, when it is an ingress node.
+    #[must_use]
+    pub fn rpc_url(&self) -> String {
+        format!("http://{}:{INGRESS_RPC_PORT}", self.ip)
+    }
 }
 
 /// The probe set of one cluster.
@@ -254,6 +265,14 @@ impl Probes {
     async fn sequencer_l1_origin(&self, i: usize) -> Option<u64> {
         let body = self.scrape.fetch(&self.sequencer_lane0_target(i)).await?;
         u64::try_from(metrics::first(&body, SEQUENCER_L1_ORIGIN_METRIC)?).ok()
+    }
+
+    /// The confirmed posts of the running batcher: zero when the
+    /// exporter answers before its first post, `None` when it does not
+    /// answer.
+    pub async fn batcher_posts(&self) -> Option<i64> {
+        self.aux_metric_where(BATCHER_PORT, BATCHER_POSTED_METRIC, "")
+            .await
     }
 
     /// The pipeline-progress probe: the highest committed block any

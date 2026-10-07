@@ -74,6 +74,8 @@ Case order matters in four places.
 
 `chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in.
 
+After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
+
 `KARDAMOM_CHAOS_CASES` narrows a run to a space-separated list of case names. An unknown name fails before any load starts.
 
 ### Cases
@@ -161,6 +163,9 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.
   - The heal of the followers is the `l1-liar` operator step.
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.
+  - Each freeze attempt finds the batcher container again. A restart between two attempts can replace the container.
+  - The frozen group must land on L1 right after the covered block. The case finds the first batch that ends past the covered block, and that batch must start at the next block. More batches can land before the poll reads L1, so the case does not read the last batch.
+  - The thaw has two valid ends. The batcher restarts and logs `pending group restored from the spool`. Or the batcher keeps running and posts the group from memory. A batcher that restarts and does not log the restore fails the case.
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.
   - In both cases the L1 record must be contiguous.
@@ -303,6 +308,19 @@ The suite prints `persisted-state evidence: <directory>`. The directory is a `ch
 - It holds the state copies and the rebuilt state.
 - A pass removes it. A failure keeps it.
 - Each directory is large (about 1.4 GB per audit), so a run that keeps every directory fills a runner disk.
+
+### Recovery after an audit
+
+The audit restores the jobs when their allocations run, not when the chain runs. The batcher and the ingresses do not restart. They connect again. The first boundary tick of a restored leader can come minutes later. Until an ingress sees a status frame, it refuses every submit with `sealer_no_quorum`. A refused nonce leaves a gap that fails the load of the next case.
+
+So, in a shard that audits each case, the next case starts only after these steps, in this order:
+
+1. A sealer leader ticks the boundary clock. The count of `cluster boundary-clock TICK` lines with `role=LEADER` rises.
+2. Every ingress takes submits. Its `kardamom_chainStatus` shows no sealer halt, and the ingress is `running`.
+3. The batcher confirms a new post. `kardamom_batcher_batches_posted_total` rises.
+4. The executors advance. The highest executor block rises.
+
+The steps share one budget of 300 s. A failure names the first step that did not hold, the time, and the last reading: `the chain did not recover after the persisted-state audit: <step> after <n> s (<reading>)`.
 
 ## The L1 fault proxy
 

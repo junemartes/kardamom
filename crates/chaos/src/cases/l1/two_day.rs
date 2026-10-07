@@ -9,7 +9,7 @@ use std::time::Duration;
 use kardamom_l1_fault_proxy::Fault;
 
 use super::batcher::{
-    BeforeRestart, assert_resumed_from_contract, await_posting, posted, require_posting, restart,
+    BeforeRestart, assert_resumed_from_contract, await_posting, require_posting, restart,
 };
 use super::deferred;
 use super::followers::{
@@ -96,7 +96,7 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
     let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, ctx).await?;
-    let at_t3 = posted(h).await.unwrap_or(0);
+    let at_t3 = h.probes.batcher_posts().await.unwrap_or(0);
     anyhow::ensure!(
         at_t3 > after_t1,
         "{}: {ctx}: the batcher confirmed no post between T1 and T3 ({delta} frames in {}s) — the floor passed its live cursor",

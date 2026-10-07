@@ -82,10 +82,13 @@ fn case_list(shard: Shard) -> Vec<String> {
 /// last case of a shard has no stage of its own: the shard's tail runs
 /// one after the validator verdict, and a stage before the verdict
 /// restarts the validator and clears the evidence the verdict reads.
+/// The stage restores the jobs it stopped, so the next case waits until
+/// the chain runs again.
 async fn run_audited(harness: &mut Harness, case: &str, audit: bool) -> anyhow::Result<()> {
     harness.run_case(case).await?;
     if audit {
         harness.assert_persisted_state().await?;
+        harness.await_chain_recovered().await?;
     }
     Ok(())
 }
