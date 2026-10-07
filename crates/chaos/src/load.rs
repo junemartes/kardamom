@@ -96,7 +96,6 @@ impl LoadSpec {
             chaos_mode: true,
             fixed_rate: self.fixed_rate,
             scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
-            metrics_via_docker: false,
             subscribe: false,
             feed_confirm: false,
             metrics: self.metrics.clone(),

@@ -42,7 +42,7 @@ fn spec() -> LoadSpec {
         report_path: PathBuf::new(),
         metrics: MetricsTargets {
             executors: Vec::new(),
-            ingress: MetricsTarget::at("ingress-1", Ipv4Addr::LOCALHOST, 9006),
+            ingress: MetricsTarget::bridged(Ipv4Addr::LOCALHOST, "ingress-1", 9006),
             sequencers: Vec::new(),
         },
     }

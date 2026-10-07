@@ -127,7 +127,6 @@ impl Harness {
             chaos_mode: false,
             fixed_rate: true,
             scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
-            metrics_via_docker: false,
             subscribe: false,
             feed_confirm: false,
             metrics: self.probes.load_metrics(&self.probes.ingresses[0]),

@@ -243,7 +243,8 @@ Every run has these checks.
 **Metric reads.** The checks read the exporters of the executors, the ingress and the lane-0 sequencer replicas.
 
 - The suite gives the load the bridge address of each node from the node contract. The load reads each exporter directly over the bridge.
-- When a direct read fails, the load reads the same exporter through `docker exec <node> curl 127.0.0.1:<port>/metrics`.
+- When a direct read fails, the load reads the same exporter through `docker exec <node> curl 127.0.0.1:<port>/metrics`. That read ends after 10 s, so a stalled `docker exec` cannot hold the final snapshot.
+- The chaos probes use the same reader (`ExporterReader` in `kardamom-bench`). They reach the ingress exporter over the bridge too.
 - The report field `scrape_fallbacks` counts these fallbacks in the snapshots that the verdict reads. A high count means that the bridge reads failed. A runner-wide exec stall then degrades the verdict.
 - `kardamom-load --metrics-via-docker true` (the CLI default) reads every exporter through `docker exec` only. `false` reads `http://<node>:<port>/metrics` first.
 

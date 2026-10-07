@@ -16,6 +16,7 @@ pub mod accounting;
 pub mod config;
 pub mod defi;
 pub(crate) mod engine;
+mod exporter;
 mod feed;
 pub mod plan;
 pub(crate) mod scrape;
@@ -41,7 +42,7 @@ use crate::signers::{DerivedSigner, SignerSet};
 pub use config::{
     ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, SenderRange, Workload,
 };
-pub use scrape::{MetricsTarget, MetricsTargets};
+pub use exporter::{ExporterRead, ExporterReader, MetricsTarget, MetricsTargets};
 
 /// Parse a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
 pub(crate) fn hex_u64(s: &str) -> Option<u64> {
@@ -66,7 +67,6 @@ impl LoadConfig {
     /// The scraper of the exporters this run reads.
     fn scraper(&self) -> anyhow::Result<Scraper> {
         Scraper::new(ScrapeSet {
-            via_docker: self.metrics_via_docker,
             scrape: self.scrape.iter().map(|s| s.to_lowercase()).collect(),
             targets: self.metrics.clone(),
         })

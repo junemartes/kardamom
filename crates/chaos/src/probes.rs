@@ -4,7 +4,7 @@
 
 use std::net::Ipv4Addr;
 
-use kardamom_bench::load::{MetricsTarget, MetricsTargets};
+use kardamom_bench::load::MetricsTargets;
 
 use crate::contract::NodeContract;
 use crate::harness::INGRESS_RPC_PORT;
@@ -59,8 +59,8 @@ pub struct Probed {
 impl Probed {
     /// The load harness target of the exporter on `port` of this node,
     /// read over the bridge.
-    fn metrics_target(&self, port: u16) -> MetricsTarget {
-        MetricsTarget::at(&self.container, self.ip, port)
+    fn metrics_target(&self, port: u16) -> Target {
+        Target::bridged(self.ip, &self.container, port)
     }
 
     /// The JSON-RPC URL of this node, when it is an ingress node.
@@ -76,7 +76,7 @@ pub struct Probes {
     scrape: Scrape,
     /// The executor nodes, by index.
     pub executors: Vec<Probed>,
-    /// The ingress nodes, by index. Their exporter binds loopback.
+    /// The ingress nodes, by index.
     pub ingresses: Vec<Probed>,
     /// The aux node that runs the validator.
     pub validator: Probed,
@@ -196,10 +196,11 @@ impl Probes {
         metrics::sum_where(&body, metric, label)
     }
 
-    /// One ingress node's loopback target.
+    /// One ingress node's exporter, reached over the bridge. The ingress
+    /// binds its exporter on every address of the host network.
     #[must_use]
     pub fn ingress_target(&self, node: &Probed) -> Target {
-        Target::loopback(&node.container, INGRESS_PORT)
+        Target::bridged(node.ip, &node.container, INGRESS_PORT)
     }
 
     /// The lane-0 replica target on sequencer node `i`.

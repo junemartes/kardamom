@@ -9,7 +9,7 @@ use alloy_primitives::{Address, U256, address};
 use serde::Serialize;
 
 use crate::load::accounting::Verdict;
-use crate::load::scrape::MetricsTargets;
+use crate::load::exporter::MetricsTargets;
 
 /// [`LoadConfig::default`]'s `target_tps`.
 const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
@@ -177,9 +177,6 @@ pub struct LoadConfig {
     pub fixed_rate: bool,
     /// The services to scrape.
     pub scrape: Vec<String>,
-    /// Read every exporter through `docker exec` only. When false, a
-    /// read goes to the target URL first and falls back to `docker exec`.
-    pub metrics_via_docker: bool,
     /// Submit through `kardamom_sendRawTransactionAsync`, and receive
     /// receipts on a `kardamom_subscribeReceipts` WebSocket feed, instead
     /// of the parked `eth_sendRawTransaction`. An in-flight transaction
@@ -254,7 +251,6 @@ impl Default for LoadConfig {
             chaos_mode: false,
             fixed_rate: false,
             scrape: vec!["executor".into(), "ingress".into()],
-            metrics_via_docker: true,
             subscribe: false,
             feed_confirm: false,
             metrics: MetricsTargets::named(
@@ -265,6 +261,7 @@ impl Default for LoadConfig {
                 ],
                 "kardamom-ingress-0",
                 &["kardamom-sequencer-0".into(), "kardamom-sequencer-1".into()],
+                true,
             )
             .expect("the default container names are valid host names"),
             output: None,

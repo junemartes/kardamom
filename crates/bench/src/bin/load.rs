@@ -247,13 +247,13 @@ async fn main() -> anyhow::Result<()> {
         chaos_mode: args.chaos_mode,
         fixed_rate: args.fixed_rate,
         scrape: csv(&args.scrape),
-        metrics_via_docker: args.metrics_via_docker,
         subscribe: args.subscribe,
         feed_confirm: args.feed_confirm,
         metrics: MetricsTargets::named(
             &csv(&args.executor_nodes),
             &args.ingress_node,
             &csv(&args.sequencer_nodes),
+            args.metrics_via_docker,
         )?,
         output: args.output,
     };
