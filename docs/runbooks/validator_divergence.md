@@ -35,6 +35,12 @@ receipts, block access list, or state root.
    - Every session differs, and the reason ends with `the replicas agree
      with each other, so the validator is the suspect`: suspect the
      validator's binary or state first (step 4).
+   - Only one session reported (`1 of 1`): the counts decide nothing. The
+     validator halts on the first result that differs and does not wait for
+     the other replicas. So a wrong validator binary, ahead of the
+     executors, also gives `1 of 1`. Before you rebuild that executor,
+     compare its result with the other replicas' results for the same block.
+     If they agree with it, suspect the validator (step 4).
    - Every session differs, and the replicas also differ from each other:
      no side is clear from the counts. Compare the binaries of every side.
    - A session can name two processes: two replicas that share one media
