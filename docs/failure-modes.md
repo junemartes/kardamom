@@ -228,6 +228,14 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - The relaunch finds no recording log. So the member seeds from a peer and rejoins.
     - The member holds no committed entry that the leader does not have, because it was behind the leader.
   - Proof: the in-JVM tests `ClusterLogPurgeTest` and `JoinWatchdogTest`.
+- **Component fails in its start**
+  - Trigger: the consensus module or the service container throws while it starts. The usual cause is a slow host at a full restart: the snapshot load waits for the archive past an Aeron timeout.
+  - Effect: the component records the error in its error log and closes. Aeron calls no termination hook, and the media driver and the archive keep the process alive. The member never joins and takes no snapshot. At the next restart it restores an old snapshot, and its log can end below the purge point of the leader.
+  - Recovery: the join watchdog sees the closed component within 1 s.
+    - It logs `cluster COMPONENT CLOSED`.
+    - It exits with code 5. The relaunch starts from the member's own state.
+  - Prevention: the archive waits of a snapshot load scale with the Aeron stall tolerance. The message timeout is the tolerance, and the replay connect timeout is half of it.
+  - Proof: the in-JVM test `ComponentCloseTest`.
 - **Quorum loss**
   - Trigger: two members die.
   - Effect: the pipeline must stall. Progress without a quorum would be unreplicated ordering, which is unsafe. Client cluster sessions die, because the outage is longer than the session timeout.

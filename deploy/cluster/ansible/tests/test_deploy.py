@@ -520,6 +520,11 @@ class DeployTest(unittest.TestCase):
             unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
             self.assertEqual(len(unblock), 1, name)
             self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A sealer member loads its snapshots at a start through the
+        # archive waits, so they scale with the tolerance too.
+        cluster_options = dict(parties)['cluster']['Env']['JAVA_TOOL_OPTIONS'].split()
+        self.assertIn(f'-Daeron.archive.message.timeout={tolerance}ms', cluster_options)
+        self.assertIn(f'-Daeron.archive.connect.timeout={tolerance // 2}ms', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
