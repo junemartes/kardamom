@@ -1,11 +1,13 @@
 //! Kardamom canonical log: the Aeron-backed application channels, the
 //! archive recorders, and the archive refetch client.
 //!
-//! Durability model: the Aeron Archive daemon uses `fileSyncLevel=1`, so it
-//! runs fdatasync on each recorded frame inline. The ingress archives
+//! Durability model: the cluster deploy starts the Aeron Archive with
+//! `aeron.archive.file.sync.level=1` (the `archive_file_sync_level` variable
+//! of the `aeron` job), so it runs fdatasync on each recorded write batch
+//! inline. At level 0 a recording sits in the page cache. The ingress archives
 //! record the `tx_data` lanes and the DA watcher's archive records
-//! `tx_deposits`. `get_recording_position()` returns a position that is
-//! byte-durable on local storage. The canonical order itself is durable in
+//! `tx_deposits`. At level 1, `get_recording_position()` returns a position
+//! that is byte-durable on local storage. The canonical order itself is durable in
 //! the Aeron Cluster; the ingress gates its ack on cluster egress progress.
 //!
 //! This crate owns the transport implementation only. Wire data types live

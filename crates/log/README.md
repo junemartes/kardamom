@@ -66,9 +66,10 @@ The multicast side streams (`tx_data`, `tx_deposits`) are lossy for a subscriber
 
 The recording position of the Aeron Archive is byte-durable only when the archive syncs each frame.
 
-1. The archive daemon must run with `aeron.archive.file.sync.level=1`. It then runs `fdatasync` on each recorded frame before the recording position advances past it.
-   - The crate does not start the archive daemon. A deployment sets the level.
-   - `AeronConfig::file_sync_level` and `catalog_file_sync_level` hold the intended levels. Both default to 1. Level 0 is no sync. Level 2 is `fsync` per frame.
+1. The cluster deploy runs the archive daemon with `aeron.archive.file.sync.level` and `aeron.archive.catalog.file.sync.level` at 1. At level 1 the daemon runs `fdatasync` on each recorded write batch before the recording position advances past it.
+   - The crate does not start the archive daemon. The `aeron` Nomad job sets both levels from its variable `archive_file_sync_level` (default 1). The operator sets it with `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL`.
+   - Level 0 leaves a recording in the page cache. Level 2 also syncs the metadata.
+   - `AeronConfig::file_sync_level` and `catalog_file_sync_level` hold the intended levels. Both default to 1. No code reads them to start a daemon.
 2. The ingress archives record `tx_data`. The DA watcher archive records `tx_deposits`. The executors use these recordings to rebuild a missed range (see Archive refetch).
 
 For survival of a correlated power loss, point `archive_dir` at enterprise NVMe with power-loss protection (PLP). Without PLP, `fdatasync` only flushes to the cache of the device.

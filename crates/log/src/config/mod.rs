@@ -239,15 +239,15 @@ pub struct AeronConfig {
     pub archive_cmd: Vec<String>,
 
     /// Aeron Archive `fileSyncLevel` for segment data files.
-    /// 0 means no fsync (page cache only), 1 means fdatasync per frame,
-    /// 2 means fsync per frame. Default 1: per-frame fdatasync gives
-    /// byte-durable recording positions on PLP `NVMe`, at the cost of a
-    /// per-frame fdatasync round trip.
+    /// 0 means no fsync (page cache only), 1 means fdatasync per write
+    /// batch, 2 means fsync per write batch. No code reads this field. The
+    /// cluster deploy sets the level with the `archive_file_sync_level`
+    /// variable of the `aeron` Nomad job.
     pub file_sync_level: u8,
 
     /// Aeron Archive `catalog.fileSyncLevel` for the recording catalog
-    /// metadata file. Default 1: the catalog is tiny and updated rarely,
-    /// so fsync is cheap.
+    /// metadata file. No code reads this field. The `aeron` Nomad job sets
+    /// the level together with `file_sync_level`.
     pub catalog_file_sync_level: u8,
 
     /// Archive control request channel: where a client (for example

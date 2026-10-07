@@ -228,6 +228,7 @@ class DeployTest(unittest.TestCase):
 
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
+        self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'batcher']
@@ -305,6 +306,7 @@ class DeployTest(unittest.TestCase):
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '2',
+            'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
         }, check=True)
@@ -323,6 +325,8 @@ class DeployTest(unittest.TestCase):
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
+        self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
+        self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
         # One value turns priority fees on for every role that has a say.
         self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')

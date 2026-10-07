@@ -87,6 +87,25 @@ locals {
   driver_restart_delay = "${ceil(var.aeron_stall_tolerance_ms / 1000) + 5}s"
 }
 
+# File sync level of the archive recordings and of the archive catalog
+# (-Daeron.archive.file.sync.level and
+# -Daeron.archive.catalog.file.sync.level): 0 leaves a write in the page
+# cache until the kernel flushes it, 1 syncs the data of every write
+# batch, 2 syncs data and metadata. At 1 the recording position of a
+# tx_data or tx_deposits recording is durable on disk. Level 1 costs
+# throughput on the recording path. Ansible deployment passes -var from
+# KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL.
+variable "archive_file_sync_level" {
+  type        = string
+  description = "The archive file sync level, 0, 1 or 2."
+  default     = "1"
+
+  validation {
+    condition     = contains(["0", "1", "2"], var.archive_file_sync_level)
+    error_message = "The archive_file_sync_level value must be 0, 1 or 2."
+  }
+}
+
 job "aeron" {
   datacenters = [var.datacenter]
   type        = "system"
@@ -208,7 +227,10 @@ job "aeron" {
         # The Aeron default is 1408, which fragments or drops on that
         # path. A datagram of 1344 also fits every other path (a Docker
         # bridge, a cloud network, the loopback).
-        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts}"
+        #
+        # The archive sync levels go in the same way: the image
+        # entrypoint has no setting for them, and the Aeron default is 0.
+        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Daeron.archive.file.sync.level=${var.archive_file_sync_level} -Daeron.archive.catalog.file.sync.level=${var.archive_file_sync_level}"
       }
 
       # The archive record of the discovery contract

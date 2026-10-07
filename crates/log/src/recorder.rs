@@ -11,9 +11,10 @@
 //!
 //! ## Durability model
 //!
-//! The Aeron Archive daemon starts with `fileSyncLevel=1` (see
-//! [`crate::config::AeronConfig::file_sync_level`]). This makes it call
-//! `fdatasync` on the segment file after every recorded frame. As a result,
+//! The cluster deploy starts the Aeron Archive with
+//! `aeron.archive.file.sync.level=1` (the `archive_file_sync_level`
+//! variable of the `aeron` job). This makes it call `fdatasync` on the
+//! segment file after every recorded write batch. At level 1,
 //! [`rusteron_archive::AeronArchive::get_recording_position`] returns a
 //! position that is byte-durable on local storage. No separate fsync
 //! sidecar is needed.
