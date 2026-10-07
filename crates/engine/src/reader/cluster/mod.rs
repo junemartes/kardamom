@@ -142,6 +142,42 @@ impl<E: ClusterEgress, I: ClusterIngress + Clone> ClusterTxOrderingSubscription<
     }
 }
 
+impl<E: ClusterEgress, I: ClusterIngress + Clone> ClusterTxOrderingSubscription<E, I> {
+    /// A publisher of this executor's recorded cursor over this
+    /// subscription's session. `executor_id` is the executor's void voter
+    /// id. The clone shares the session thread, so the executor's stream
+    /// task publishes while the reader thread polls.
+    #[must_use]
+    pub fn recorded_cursor_publisher(&self, executor_id: u8) -> RecordedCursorPublisher<I> {
+        RecordedCursorPublisher {
+            ingress: self.ingress.clone(),
+            executor_id,
+        }
+    }
+}
+
+/// An executor's recorded cursor on the cluster ingress, as a system
+/// record: every canonical index at or below the cursor is joined and
+/// recorded by this executor, or voided. The sealer keeps the best cursor
+/// over the executors as the floor of its record-lag guard.
+#[derive(Clone)]
+pub struct RecordedCursorPublisher<I: ClusterIngress> {
+    ingress: I,
+    executor_id: u8,
+}
+
+impl<I: ClusterIngress> RecordedCursorPublisher<I> {
+    /// Offer `recorded_through` to the sealer. A refused offer is the
+    /// caller's to retry: the next cursor publishes again, and the sealer
+    /// keeps the highest cursor it saw.
+    pub fn publish(&mut self, recorded_through: u64) -> OfferOutcome {
+        self.ingress.offer(&wire::encode_ingress_recorded_cursor(
+            self.executor_id,
+            recorded_through,
+        ))
+    }
+}
+
 /// The batcher's confirmed cursor on the cluster ingress: the last L2
 /// block posted to L1, as a system record. The sealer adopts it as the
 /// floor of its DA-lag guard and of its egress retention, and the ingress
@@ -263,6 +299,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             | EgressItem::PastDeadline { .. }
             | EgressItem::WindowFull { .. }
             | EgressItem::DaLagReject { .. }
+            | EgressItem::RecordLagReject { .. }
             | EgressItem::OriginGap { .. }
             | EgressItem::Status(_) => {}
             EgressItem::ReplayUnavailable {

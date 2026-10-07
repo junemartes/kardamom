@@ -302,11 +302,33 @@ fn the_posted_cursor_publisher_offers_the_kind_7_record() {
     assert_eq!(publisher.publish(3), OfferOutcome::NotConnected);
 }
 
-/// The status and the DA-lag reject are not records of the ordering: a
+/// An executor's recorded cursor is one system record on the session's
+/// ingress: kind 9, the executor id, then the cursor. The sealer reads it
+/// by fixed offsets.
+#[test]
+fn the_recorded_cursor_publisher_offers_the_kind_9_record() {
+    use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
+
+    let ingress = FakeIngress::new();
+    let sub = ClusterTxOrderingSubscription::new(FakeEgress::new()).with_ingress(ingress.clone());
+    let mut publisher = sub.recorded_cursor_publisher(2);
+    assert_eq!(publisher.publish(0x0102), OfferOutcome::Accepted);
+    assert_eq!(
+        ingress.accepted(),
+        vec![vec![9u8, 2, 0x02, 0x01, 0, 0, 0, 0, 0, 0]],
+        "kind 9, the executor id, then the cursor as u64 LE"
+    );
+    ingress.set_outcome(OfferOutcome::NotConnected);
+    assert_eq!(publisher.publish(3), OfferOutcome::NotConnected);
+}
+
+/// The status and the lag rejects are not records of the ordering: a
 /// consumer skips them and delivers the stream around them.
 #[test]
-fn status_and_da_lag_frames_are_skipped() {
-    use kardamom_cluster_adapter::wire::{encode_da_lag_reject, encode_status};
+fn status_and_lag_reject_frames_are_skipped() {
+    use kardamom_cluster_adapter::wire::{
+        encode_da_lag_reject, encode_record_lag_reject, encode_status,
+    };
 
     let egress = FakeEgress::new();
     egress.push(encode_status(&kardamom_types::ClusterStatus::default()));
@@ -314,6 +336,12 @@ fn status_and_da_lag_frames_are_skipped() {
         alloy_primitives::Address::ZERO,
         0,
         &kardamom_types::ClusterStatus::default(),
+    ));
+    egress.push(encode_record_lag_reject(
+        alloy_primitives::Address::ZERO,
+        0,
+        0,
+        &kardamom_types::cluster_status::RecordLagStatus::default(),
     ));
     egress.push(encode_egress_record(0, &relayed_txref(0, 1)).unwrap());
     egress.push(encode_egress_boundary(1, 1, 250, 0));

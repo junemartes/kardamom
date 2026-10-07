@@ -486,6 +486,29 @@ fn no_known_archive_is_no_answer() {
     assert!(!refused.covers(&[]));
 }
 
+/// Each archive started a new recording of the session just after the
+/// range, and it no longer holds an older recording that covers the range.
+/// Each archive refuses, so the entry is unjoinable and the void path runs.
+#[test]
+fn a_range_before_the_oldest_recording_on_every_archive_is_unjoinable() {
+    let archives = vec!["10.0.0.1:8010".to_owned(), "10.0.0.2:8010".to_owned()];
+    let from = BPosition {
+        term_id: 238,
+        term_offset: 30_000,
+    };
+    let mut refused = super::join::RefusedArchives::default();
+    archives
+        .iter()
+        .map(|archive| kardamom_log::refetch::FakeArchiveCatalog {
+            archive: archive.clone(),
+            recordings: vec![(15_653_952, None)],
+        })
+        .filter_map(|catalog| catalog.answer(from).err())
+        .for_each(|e| refused.note(&e.into()));
+
+    assert!(refused.covers(&archives));
+}
+
 #[test]
 fn a_join_with_no_recovery_times_out_and_is_not_unjoinable() {
     let buffer = JoinBuffer::new();

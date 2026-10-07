@@ -139,4 +139,23 @@ final class ClusterNodeTest {
         assertFalse(ClusterNode.isTornLastFragment(new IllegalStateException("active Mark file detected")));
         assertFalse(ClusterNode.isTornLastFragment(new RuntimeException((String) null)));
     }
+
+    @Test
+    void aRecordLagBudgetAboveZeroIsRefusedWhileTheSnapshotDropsTheCursors() {
+        assertEquals(0L, ClusterNode.requireRecordLagBudgetAllowed(0L, false), "0 is always allowed");
+        final IllegalStateException e = assertThrows(
+            IllegalStateException.class, () -> ClusterNode.requireRecordLagBudgetAllowed(16_384L, false));
+        assertTrue(e.getMessage().contains("kardamom.cluster.recordLagBudget"), e.getMessage());
+        assertTrue(e.getMessage().contains("version 10"), e.getMessage());
+        assertTrue(e.getMessage().contains("version 11 lifts this check"), e.getMessage());
+        assertEquals(16_384L, ClusterNode.requireRecordLagBudgetAllowed(16_384L, true),
+            "a writer that keeps the cursors allows the budget");
+    }
+
+    @Test
+    void thisReleaseDropsTheCursorsSoOnlyBudgetZeroStarts() {
+        assertFalse(io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors());
+        assertThrows(IllegalStateException.class, () -> ClusterNode.requireRecordLagBudgetAllowed(
+            1L, io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors()));
+    }
 }

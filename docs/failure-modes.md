@@ -271,6 +271,8 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 The sealer orders a transaction reference before the archives make its data durable. A failure such as the blackout can leave an entry with no data. The sealer can remove such an entry with a canonical *void record*. The rule has no clock in it.
 
 - A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and every archive refuses the range.
+  - An archive refuses when it has no recording of the session, when each recording starts after the range, or when the range is in a gap or after an ended recording.
+  - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse.
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
