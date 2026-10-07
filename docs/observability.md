@@ -366,6 +366,18 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 - A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.
 - The interop watcher exports `kardamom_da_watcher_remote_*` counters with the label `origin` (the peer chain id).
 
+### Executor stream
+
+Each executor exports these metrics for its executor stream (`exec_txs`). See "The executor stream" in [failure-modes.md](failure-modes.md#the-executor-stream-the-executor-records-what-it-joins).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_executor_exec_stream_recorded_index` | The recorded cursor: the highest canonical index whose records the local archive has written. It never passes the recording position. It moves with the canonical order, also with no transaction load. A flat value on a chain that progresses means that the archive of the node takes no records. |
+| `kardamom_executor_exec_stream_session_id` | The Aeron session id of the recorded publication. A restarted executor shows a new value. |
+| `kardamom_executor_exec_stream_publish_blocked_ms_total` | Milliseconds that the publisher waited for the archive to take a record. The executor stalls while it grows. |
+
+- The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
+
 ### Inbox indexer
 
 | Metric | Meaning |

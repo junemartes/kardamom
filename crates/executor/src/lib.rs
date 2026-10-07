@@ -26,4 +26,7 @@ pub use config::ExecutorFileConfig;
 /// Executor-side BAL publication. This is sequencer-role behavior layered on
 /// the shared engine: it publishes each block's `BlockDelta` on `tx_bal`.
 pub mod bal;
+/// The executor stream: the joined transactions of this executor, recorded
+/// on the local archive and published live.
+pub mod exec_stream;
 pub mod parallel;

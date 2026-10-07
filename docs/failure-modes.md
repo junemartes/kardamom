@@ -387,6 +387,20 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.
 - **Leader failover above the executor** is invisible. The cluster client hides reconnects from the reader thread.
 
+### The executor stream: the executor records what it joins
+
+Each executor publishes the transactions that it joins on the executor stream (`exec_txs`), in canonical order. The archive on the node of the executor records the stream. See [aeron-discovery.md](aeron-discovery.md) for the two publications.
+
+- **Start**: the executor opens its recorded IPC publication and starts its recording on the local archive. It joins nothing before that recording of its own session is active. A recording that does not start within 60 s fails the start. Nomad then restarts the executor.
+- **Order**: the reader sends each joined record to the stream before it sends the record to execution. The reader also sends a progress mark after each message that takes a slot.
+- **Archive back-pressure or archive loss**: the recorded publication refuses the record. The publisher offers it again until the archive takes it. The channel from the reader fills, and the reader blocks. This executor stalls. It drops no record, and it never executes a record that its archive did not take. The other executors carry the chain. `kardamom_executor_exec_stream_publish_blocked_ms_total` counts the wait.
+- **Restart**: a restarted executor gets a new Aeron session, so its archive makes a new recording. The recording of the earlier session stays in the archive. `kardamom_executor_exec_stream_session_id` shows the new session.
+- **Recorded cursor**: `kardamom_executor_exec_stream_recorded_index` is the highest canonical index whose records the local archive has written. It never passes the recording position. At archive sync level 1 it is durable on the node. At level 0 it survives a crash, not a power loss. Nothing reads the cursor yet.
+- **Locator log**: `<state_dir>/exec_stream/locators.log` maps a canonical index to a session and a position in a recording: one entry for the first record of each session, then one entry every 1024 records. A torn last entry is cut at the next start, and a lookup then takes the previous entry, a lower bound. A checkpoint restore or a parked state starts a new log. Nothing reads the log yet.
+- **Recording loss**: the recorder thread reads the recording position every 20 ms. When no read succeeds for the loss wait, the driver timeout of the archive client (`AERON_DRIVER_TIMEOUT`, the Aeron stall tolerance: 10 s by default, 30 s in CI) plus 5 s, and at least 10 s (the recording stopped, or the archive no longer answers), the recorder thread ends and logs `exec_txs recorder ended: the local recording is lost`. The publisher then fails, also during a wait for a refused record. The reader stops with an error, and the process exits. Nomad restarts it, and the start waits for a recording of the new session. An executor never runs without a recorded copy of what it joins. A stall that every Aeron party survives does not end the recorder. The start budget of an Aeron client uses the same rule.
+- **Shared media driver**: the recorded publication is exclusive. Each executor has its own session and its own recording, also when several executors share one media driver (the single-host e2e stack).
+- Proof: `graceful-executor` and `hard-executor` assert that the restarted executor shows a new session and that its recorded cursor advances. The check does not apply, and logs that, when no executor exports the gauges, or when no recorded cursor moves in the window. The `chaos-executor` shard runs no load, so the L1 epochs move the cursor.
+
 ## Ingress (xN, active/active)
 
 The ingress replicas are shared-nothing. There is no leader and no sticky session. Any replica can accept the transaction of any sender.
