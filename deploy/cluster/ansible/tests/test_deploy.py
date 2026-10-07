@@ -233,6 +233,8 @@ class DeployTest(unittest.TestCase):
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
+        exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
