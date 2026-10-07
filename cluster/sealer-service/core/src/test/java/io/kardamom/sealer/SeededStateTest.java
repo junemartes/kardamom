@@ -45,14 +45,14 @@ class SeededStateTest {
         return CanonicalSealerState.seeded(
             seed, capacity, VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, BUDGET);
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(BUDGET, 0L));
     }
 
     private static CanonicalSealerState reload(CanonicalSealerState state) {
         return CanonicalSealerState.load(
             ByteBuffer.wrap(state.takeSnapshot()), 64, Set.of(), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, BUDGET);
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(BUDGET, 0L));
     }
 
     @Test

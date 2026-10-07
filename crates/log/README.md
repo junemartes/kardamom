@@ -32,10 +32,11 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 | `TxDeposits` | DA watcher | Full `Deposit` envelopes. Recorded by the archive of the DA watcher node. |
 | `TxRemoteEpochs` | Interop watcher | One record for each peer-chain origin block with cross-chain messages. RAM only. |
 | `TxBal` | Executor | The block access list (`BlockDelta`) of each block. RAM only. |
+| `ExecTxs` | Executor | One `ExecTxRecord` for each transaction that an executor joins, in canonical order. Typed handles exist. No service publishes or subscribes to it. |
 | Per-recorder fsync watermark | A recorder | Typed handles exist. The ingress subscribes to it for the local-fsync ack policies. |
 
 - `LogConfig` accepts any subset of the keys. A missing key takes the built-in default.
-- An unknown key is an error. The loader (`LogConfig::from_toml_path`) also checks the cross-field rules of `[channels]` and `[discovery]`.
+- An unknown key is an error. The loader (`LogConfig::from_toml_path`) also checks the cross-field rules of `[channels]` and `[discovery]`. Two streams on one stream id are an error.
 - Service binaries use `LogConfig::resolve` behind the `--log-config` flag.
 
 ### Discovery
@@ -57,6 +58,12 @@ The multicast side streams (`tx_data`, `tx_deposits`) are lossy for a subscriber
 
 - `fetch_tx_data` and `fetch_deposits` run a bounded replay of `[from, recorded position)` from a remote archive. They deliver the records to the caller.
 - The replay is session-keyed. It pins the session id of the original publisher. A restarted publisher is never confused with its predecessor.
+- An archive can have more than one recording of a session. It starts a new recording when the image of the session comes back. The refetcher replays from the newest recording that starts at or before the requested position and that did not end before it.
+- An archive refuses a range (`LogError::RangeAbsent`) when it holds no byte of it:
+  - It has no recording of the session.
+  - Each recording of the session starts after the position.
+  - The recording before the position ended at or before it. The position is in a gap or after the last recording.
+- A connect failure, a timeout, or a live recording that does not reach the position yet is not a refusal.
 - The refetcher has its own `AeronRuntime` and its own archive control session. A slow refetch never starves the live polling.
 - All resources are lazy. Nothing exists until the first miss.
 - The archive endpoints come from a static list (`tx_data_archive_endpoints`, `tx_deposits_archive_endpoints` in `[aeron]`) or from the discovered archive records. An empty static list disables the refetch.

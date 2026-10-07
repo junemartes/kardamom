@@ -165,6 +165,27 @@ public final class SealerWire {
     /** Exact length of a {@link #KIND_SEED_EPOCH} frame. */
     static final int SEED_EPOCH_LEN = SEED_DIGEST_OFFSET + SealerSeed.HASH_LEN;
 
+    /**
+     * Recorded cursor, an executor's system record:
+     * {@code [kind:9][executor_id:u8][recorded_through:u64 LE]}. Every
+     * canonical index at or below {@code recorded_through} is joined and
+     * recorded by this executor, or voided. The executor id is its void
+     * voter id. The sealer keeps the best cursor as the floor of the
+     * record-lag guard, and fans the resulting {@link #EGRESS_KIND_STATUS}
+     * out to every session when the best cursor moves up.
+     *
+     * <p>The frame is shorter than {@link #MIN_INGRESS_LEN}, so a member
+     * that does not know the kind drops it as malformed and never orders
+     * it as a record. Matches Rust {@code KIND_RECORDED_CURSOR}.</p>
+     */
+    public static final byte KIND_RECORDED_CURSOR = 9;
+    /** Offset of the u8 executor id within a {@link #KIND_RECORDED_CURSOR} frame. */
+    static final int RECORDED_EXECUTOR_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE recorded-through index within a {@link #KIND_RECORDED_CURSOR} frame. */
+    static final int RECORDED_THROUGH_OFFSET = RECORDED_EXECUTOR_OFFSET + Byte.BYTES;
+    /** Exact length of a {@link #KIND_RECORDED_CURSOR} frame. */
+    static final int RECORDED_CURSOR_LEN = RECORDED_THROUGH_OFFSET + Long.BYTES;
+
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 LE canonical index within a {@link #KIND_VOID_REQUEST} frame. */
@@ -264,13 +285,17 @@ public final class SealerWire {
      */
     public static final byte EGRESS_KIND_WINDOW_FULL = 8;
     /**
-     * The chain's data-availability status, broadcast to every session on
-     * every boundary tick, on every posted cursor, and to a session that
-     * announces itself:
-     * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}.
-     * The ingress serves {@code safe} from the posted head and raises its
-     * {@code da_lag} halt from the flag. Not retained: a session learns the
-     * current status when it announces itself.
+     * The chain's status, broadcast to every session on every boundary
+     * tick, on every posted cursor, on every move up of the best recorded
+     * cursor, and to a session that announces itself:
+     * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}
+     * (50 bytes), then the record-lag tail
+     * {@code [best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]}
+     * (17 bytes). {@code best_recorded} is {@code u64::MAX} before the
+     * first recorded cursor. A reader that knows only the first 50 bytes
+     * ignores the tail. The ingress serves {@code safe} from the posted
+     * head and raises its {@code da_lag} halt from the flag. Not retained:
+     * a session learns the current status when it announces itself.
      */
     public static final byte EGRESS_KIND_STATUS = 9;
     /**
@@ -290,6 +315,15 @@ public final class SealerWire {
      * Matches Rust {@code EGRESS_KIND_ORIGIN_GAP}.
      */
     public static final byte EGRESS_KIND_ORIGIN_GAP = 12;
+    /**
+     * The record-lag guard refused a user record:
+     * {@code [kind:13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]}.
+     * {@code sealed_index} is the last ordered canonical index and
+     * {@code recorded_index} the best recorded cursor. Offered only to the
+     * offering session, and only while the guard is on. The record is not
+     * ordered. Matches Rust {@code EGRESS_KIND_RECORD_LAG_REJECT}.
+     */
+    public static final byte EGRESS_KIND_RECORD_LAG_REJECT = 13;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

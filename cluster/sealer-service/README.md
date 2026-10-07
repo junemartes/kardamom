@@ -40,6 +40,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 | 6 | Void request | `[kind=6][voter_id:u8][index:u64][tx_hash:32]` |
 | 7 | Posted cursor | `[kind=7][posted_head:u64]` |
 | 8 | Seed record | `[kind=8][digest:32]` |
+| 9 | Recorded cursor | `[kind=9][executor_id:u8][recorded_through:u64]` (10 bytes) |
 
 - Kind 0: the guard header is `sender`, `nonce`, `deadline` and `tip`.
   - The service reads the header for the contiguity guard, the deadline check and the ordering window.
@@ -67,6 +68,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 - Kind 6: the void request is a vote, not a command.
   - A consumer with a voter id sends it when the entry at `index` has no data and every archive refuses the range.
   - The service appends a void record only when every configured voter votes for the same `(index, tx_hash)`.
+  - A snapshot restore keeps only the votes of the configured voters. A vote of a voter that the configuration no longer names drops. The next vote of a configured voter then decides an entry that every configured voter voted for.
   - The service refuses a vote from a stranger, with a wrong hash, for a slot that is not a `TxRef`, outside the void window, or for an entry that is already voided.
   - The ledger holds at most 1024 indices with open votes. The voter id must be below 64.
 - Kind 7: the posted cursor is the system record of the batcher. It has no guard header.
@@ -77,6 +79,12 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 - Kind 8: the seed record is a system record of the sealer. See [Seeded start](#seeded-start).
   - Only the service offers it. A frame from a client session, or a frame that is not 33 bytes, is malformed and the service drops it.
   - It carries the SHA-256 of the seed file.
+- Kind 9: the recorded cursor is a system record of an executor. It has no guard header. See [Record-lag guard](#record-lag-guard).
+  - Every canonical index at or below `recorded_through` is joined and recorded by the executor, or voided. `executor_id` is the void voter id of the executor.
+  - The sealer keeps the cursor of each executor in the replicated state. A cursor never moves down.
+  - A frame that is not 10 bytes, an `executor_id` that is not a configured voter, or a cursor at or above the canonical count is malformed. The service drops it.
+  - When the best cursor moves up, the sealer sends an egress kind 9 to every session.
+  - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
 
 ### Relayed record types
 
@@ -107,10 +115,11 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 6 | Remote-origin reject | `[kind=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]` | the offering session |
 | 7 | Past deadline | `[kind=7][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]` | the offering session |
 | 8 | Window full | `[kind=8][sender:20][nonce:u64]` | the offering session |
-| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]` (50 bytes) | all sessions |
+| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64][best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]` (67 bytes) | all sessions |
 | 10 | DA-lag reject | `[kind=10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]` | the offering session |
 | 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
+| 13 | Record-lag reject | `[kind=13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]` | the offering session |
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -119,7 +128,10 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
   - This egress kind 6 is not the ingress kind 6 (the void request). The two numbers are on different sides of the wire.
 - Kind 7 and kind 8: see the next section.
 - Kind 9: the status of the chain. `halted` is `1` when the DA-lag guard refuses user records.
-  - The service sends it on each boundary tick, on each posted cursor that moves up, and to a session that announces itself with a kind 1 or a kind 2.
+  - The last 17 bytes are the record-lag guard. `best_recorded` is `u64::MAX` before the first recorded cursor. `record_lag_halted` is `1` when the record-lag guard refuses user records.
+  - A reader that knows only the first 50 bytes ignores the last 17. The Rust reader reads a 50-byte frame as no recorded cursor and the guard off.
+  - This egress kind 9 is not the ingress kind 9 (the recorded cursor).
+  - The service sends it on each boundary tick, on each posted cursor that moves up, on each recorded cursor that moves the best cursor up, and to a session that announces itself with a kind 1 or a kind 2.
   - It is not retained. A session that announces itself gets the current status.
 - Kind 10: the DA-lag guard refused a record. The sequencer drops the record and reports the `da-lag` reason. See [DA-lag guard](#da-lag-guard).
 - Kind 11: the cursor of the requester is past the head of the sealer. See [Replay ahead of the head](#replay-ahead-of-the-head).
@@ -127,6 +139,8 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 - Kind 12: the sealer refused an epoch, because an earlier epoch is missing. The sequencer offers its unconfirmed epochs again from `expected_origin`.
   - The sealer logs `cluster ORIGIN-GAP` at powers of two.
   - The check reads only replicated state, so every member refuses the same epoch.
+- Kind 13: the record-lag guard refused a record. `sealed_index` is the last ordered canonical index. `recorded_index` is the best recorded cursor. See [Record-lag guard](#record-lag-guard).
+  - The sealer sends it only while the guard is on. A sequencer that does not know kind 13 drops the frame, so turn the guard on only after every sequencer knows it.
 
 ## Egress back-pressure
 
@@ -217,6 +231,26 @@ The DA-lag guard stops the chain from sealing far ahead of the data that the bat
 - The sealer sends the status (egress kind 9) to all sessions. The ingress raises a `da_lag` halt from the `halted` flag and clears it when the flag is `0`.
 - The ingress `da_lag` halt pauses the submits of the ingress. See [the client JSON-RPC API](../../docs/json-rpc.md) and [the failure model](../../docs/failure-modes.md#halts-and-service-events).
 - Every member must use the same budget. See `kardamom.cluster.daLagBudgetBlocks` in [Settings](#settings).
+
+## Record-lag guard
+
+The record-lag guard stops the chain from ordering far ahead of the transaction data that the executors recorded.
+
+- Each executor sends its recorded cursor (ingress kind 9). The sealer keeps the cursor of each executor in the replicated state.
+- The best cursor is the maximum over the configured executors. One recorded copy is enough for the other executors and the consumers. One dead or slow executor does not stop the chain.
+- The sealer refuses a user record when `budget > 0` and `sealed_index - best_recorded > budget`. `sealed_index` is the last ordered canonical index.
+  - The code default budget is `0`: the guard is off.
+  - The refused record is not ordered. The sealer sends an egress kind 13 to the offering session.
+  - A refused record moves nothing. The nonce of the sender does not change, so a new submission is accepted as fresh.
+- While no executor sent a cursor, the guard refuses nothing. A new cluster, or a member that restores a snapshot with no cursor, does not halt before the first cursor.
+- The guard runs at the same point as the DA-lag guard, and before it. When both guards refuse, the record gets the egress kind 13.
+- These inputs still enter while the guard refuses:
+  - a record with an all-zero `sender` (deposits)
+  - an origin record and a remote-origin record
+  - a void request and the void record
+  - the boundary tick
+- The status (egress kind 9) carries the best cursor, the budget and the `record_lag_halted` flag.
+- Every member must use the same budget. See `kardamom.cluster.recordLagBudget` in [Settings](#settings).
 
 ## Ordering window
 
@@ -318,6 +352,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.voidVoters` | empty (env `KARDAMOM_VOID_VOTERS`) | yes | The voter ids, for example `0,1,2,3,4`. Empty refuses every void request. Each id must be below 64. |
 | `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
+| `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
@@ -342,6 +377,10 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - With no budget (`0`), nothing bounds the stretch.
   - Use the same value on every member, so the replay range does not change after a failover.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
+- `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
+  - The deploy does not pass it yet, so the guard is off.
+  - While the member writes snapshot version 10, a value above `0` stops the start. A version-10 snapshot holds no recorded cursors, so a member that restores one would decide differently from its peers. The release that writes snapshot version 11 lifts this check. See [Snapshot](#snapshot).
+  - The budget and `daLagBudgetBlocks` are not in the snapshot.
 - `seedSnapshot`: the deploy passes the job variable `cluster_seed_snapshot`.
   - The variable is empty in a normal deploy. An empty path means no seed.
   - When the variable is set, the deploy passes an empty `remoteOrigins`.
@@ -384,6 +423,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster CONTIGUITY-REJECT` | The guard refused a record with a nonce gap. |
 | `cluster PAST-DEADLINE` | The sealer refused a record past its deadline. |
 | `cluster DA-LAG-REJECT` | The DA-lag guard refused a record (`nonce`, `sealedHead`, `postedHead`, `budget`, `totalDaLagRejected`). |
+| `cluster RECORD-LAG-REJECT` | The record-lag guard refused a record (`nonce`, `sealedIndex`, `bestRecorded`, `budget`, `totalRecordLagRejected`). |
 | `cluster POSTED-CURSOR` | The posted head moved up (`postedHead`, `sealedHead`, `retained`, `halted`). |
 | `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
 | `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
@@ -408,14 +448,19 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
-| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
-- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
+- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.
 
 ## Snapshot
 
-- The snapshot format is version 10. A member also loads older versions. An older snapshot restores a posted head of `0` and a state that started at genesis.
+- The member reads snapshot versions 1 to 11. It writes version 10.
+  - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
+  - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
+  - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
+  - A snapshot before version 9 restores a posted head of `0`. A snapshot before version 10 restores a state that started at genesis.
+  - A snapshot before version 11 restores no recorded cursor. The record-lag guard then refuses nothing until the first cursor.
 - The state section holds:
   - the dedup window with the deadline of each id
   - the per-sender nonces
@@ -424,6 +469,8 @@ The chaos suite and operators read these lines. The sealer has no other observab
   - the ordering window size
   - the posted head, after the ordering window size
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
+  - from version 11 only, the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
+    - A restore drops the cursor of an executor that is not a configured voter.
 - The retained egress frames follow the state section. See `retention` in [Settings](#settings).
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The leader triggers it. The action is a log entry, so all members snapshot at the same position.
