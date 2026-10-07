@@ -74,6 +74,7 @@ Every service that drives a cluster session exports the state of that session un
 ### Host and agent metrics
 
 - `nomad/node-exporter.system.nomad.hcl` runs one `node_exporter` on every node. It listens on port 9100 (Consul service `node-exporter`). It exports the CPU, memory, disk, file systems and network of the host.
+- On the local (container) profile, all nodes share one host. There, the exporter reads only the `/proc` collectors: load, memory, network, pressure and vmstat. Twelve exporters that read the host hardware files in `/sys` (cpu, cpufreq, mdadm, nvme) stall in D state and stop the host. The job variable `host_hardware` selects the set.
 - Every Nomad agent publishes its own metrics on `/v1/metrics?format=prometheus`.
   - A client publishes the node resources and the allocations.
   - A server publishes the Raft and scheduler state.

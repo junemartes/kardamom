@@ -119,11 +119,16 @@
 # Prometheus scrapes every service by its Consul node name, so it comes
 # up after the services it scrapes; Grafana provisions the dashboards.
 # The host exporter is a system job; Prometheus discovers it through
-# Consul.
+# Consul. The nodes of the local profile share one host, so their
+# exporters skip the host hardware collectors (see the job file).
 - name: Deploy the host exporter and monitoring
   ansible.builtin.include_tasks: job.yml
   loop:
-    - {name: node-exporter, file: node-exporter.system.nomad.hcl, wait: false}
+    - name: node-exporter
+      file: node-exporter.system.nomad.hcl
+      wait: false
+      vars:
+        host_hardware: "{{ 'off' if deployment_profile == 'local' else 'on' }}"
     - {name: monitoring, wait: false}
   loop_control:
     loop_var: workloads_job
