@@ -34,6 +34,10 @@ fn frame(fill: u8) -> AlignedVec {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test exec_txs_recording -- --ignored`"]
 async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
+    // A short driver timeout gives the recorder the floor of its loss
+    // wait, 10 s, so the loss check below stays short.
+    // SAFETY: no thread of this test binary reads the environment yet.
+    unsafe { std::env::set_var("AERON_DRIVER_TIMEOUT", "5000") };
     kardamom_log::testing::require_docker().await;
     let SingleNodeRig { cluster, rt, cfg } = AeronTestCluster::single_node_runtime(5401).await;
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
@@ -65,7 +69,6 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
                 |outcome| ready_tx.send(outcome).expect("ready"),
                 PositionReport {
                     every: Duration::from_millis(20),
-                    lost_after: Duration::from_secs(1),
                     send: |position| {
                         let _ = positions_tx.send(position);
                     },
@@ -101,8 +104,16 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
     assert!(reached, "the recording position never reached {last}");
 
     // Closing the runtime closes the publications, so the recording stops.
+    // The recorder waits its loss budget (the driver timeout plus a
+    // margin, at least 10 s) before it gives up.
     drop((publication, other, rt));
+    let closed = Instant::now();
     let outcome = recorder.join().expect("no panic");
+    assert!(
+        closed.elapsed() >= Duration::from_secs(10),
+        "the recorder waited only {:?}",
+        closed.elapsed()
+    );
     let err = outcome.expect_err("a stopped recording ends the recorder");
     assert!(err.to_string().contains("is lost"), "got {err}");
     stop.cancel();

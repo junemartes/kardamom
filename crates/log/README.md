@@ -74,7 +74,7 @@ The recording position of the Aeron Archive is byte-durable only when the archiv
 2. The ingress archives record `tx_data`. The DA watcher archive records `tx_deposits`. The executors use these recordings to rebuild a missed range (see Archive refetch).
 3. The archive on each executor node records the `exec_txs` stream of its executor, from an IPC publication. An IPC publication cannot run ahead of the archive, so the recording loses no frame. A slow archive stalls that executor instead.
    - `record_stream_reporting` reads the recording position every 20 ms. The executor counts a record as recorded only when this position reaches the end of the record. At level 1 that record is then durable on the node. At level 0 it survives a process crash, not a power loss.
-   - `record_stream_reporting` ends with an error when no position read succeeds for `PositionReport::lost_after`. The executor then stops: it never publishes without a recorded copy.
+   - `record_stream_reporting` ends with an error when no position read succeeds for the `DriverBudget` of the archive client: its driver timeout (`AERON_DRIVER_TIMEOUT`) plus 5 s, at least 10 s. The client start budget uses the same rule. The executor then stops: it never publishes without a recorded copy.
    - `AeronRuntime::open_exclusive_publication` gives each executor its own session, also on a shared media driver. A shared publication would put the frames of several executors into one session and one recording.
    - The recording position and the offer position of the publication are in one raw position space. `PubHandle::stream_position` converts the position that a publish returns into that space.
 

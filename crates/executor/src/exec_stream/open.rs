@@ -31,10 +31,6 @@ const RECORDED_CHANNEL: &str = "aeron:ipc?alias=exec-txs";
 /// How often the recorder thread reads the recording position.
 const POSITION_EVERY: Duration = Duration::from_millis(20);
 
-/// A recording with no readable position for this long is lost. The
-/// recorder thread then ends, and the publisher fails.
-const RECORDING_LOST_AFTER: Duration = Duration::from_secs(2);
-
 /// The depth of the channel from the reader to the publisher. A full
 /// channel blocks the reader.
 const ITEMS_DEPTH: usize = 4096;
@@ -255,7 +251,6 @@ impl RecorderBody {
             },
             PositionReport {
                 every: POSITION_EVERY,
-                lost_after: RECORDING_LOST_AFTER,
                 send: |position| {
                     let _ = positions.try_send(position);
                 },

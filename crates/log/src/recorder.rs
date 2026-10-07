@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::AeronConfig;
+use crate::driver_budget::DriverBudget;
 use crate::error::LogError;
 
 type Archive = rusteron_archive::AeronArchive;
@@ -54,6 +55,9 @@ pub struct ArchiveSession {
     /// multi-destination subscription on the same client.
     aeron_client: rusteron_archive::Aeron,
     pub archive: Archive,
+    /// The wait for a quiet archive, from the driver timeout of this
+    /// client. It is read once, when the session connects.
+    driver_budget: DriverBudget,
 }
 
 impl ArchiveSession {
@@ -104,6 +108,7 @@ pub fn connect_archive_with_timeout(
 ) -> Result<ArchiveSession, LogError> {
     let ctx = rusteron_archive::AeronContext::new()
         .map_err(|e| LogError::Aeron(format!("archive AeronContext::new: {e}")))?;
+    let driver_budget = DriverBudget::of_archive_client(&ctx)?;
     if let Some(dir) = aeron_dir {
         let dir_c = crate::ffi::dir_cstring(dir)?;
         ctx.set_dir(dir_c.as_c_str())
@@ -156,6 +161,7 @@ pub fn connect_archive_with_timeout(
     Ok(ArchiveSession {
         aeron_client: aeron,
         archive,
+        driver_budget,
     })
 }
 
@@ -273,10 +279,14 @@ pub fn record_stream_until_stopped(
 /// also durable on local storage. A failed read sends nothing, so a reader
 /// of the reports never sees a position that the archive did not confirm.
 ///
-/// The function returns an error when no read succeeds for
-/// `report.lost_after`: the recording ended (the publication or the
-/// archive is gone), or the archive no longer answers. The caller then
-/// has no recorded copy and must stop publishing.
+/// The function returns an error when no read succeeds for the
+/// [`DriverBudget`] of the archive client: the driver timeout
+/// (`AERON_DRIVER_TIMEOUT`, the stall tolerance of the deploy) plus a
+/// margin. A stall that every Aeron party survives therefore never ends
+/// the recorder. A longer silence means that the recording ended (the
+/// publication or the archive is gone) or that the archive no longer
+/// answers. The caller then has no recorded copy and must stop
+/// publishing.
 ///
 /// # Errors
 ///
@@ -290,13 +300,15 @@ pub fn record_stream_reporting(
     ready: impl FnOnce(Result<i64, String>),
     report: PositionReport<impl FnMut(i64)>,
 ) -> Result<(), LogError> {
-    let Some(recorder) = Recorder::start_reporting(aeron_dir, aeron_cfg, stream, stop, ready)?
+    let Some((recorder, budget)) =
+        Recorder::start_reporting(aeron_dir, aeron_cfg, stream, stop, ready)?
     else {
         return Ok(());
     };
     let mut reporter = PositionReporter {
         recorder,
         report,
+        lost_after: budget.duration(),
         last_read: std::time::Instant::now(),
     };
     while !stop.is_cancelled() {
@@ -306,10 +318,9 @@ pub fn record_stream_reporting(
 }
 
 /// Where and how often [`record_stream_reporting`] reports the recording
-/// position, and how long a run of failed reads may last.
+/// position.
 pub struct PositionReport<F> {
     pub every: Duration,
-    pub lost_after: Duration,
     pub send: F,
 }
 
@@ -318,6 +329,8 @@ pub struct PositionReport<F> {
 struct PositionReporter<F> {
     recorder: Recorder,
     report: PositionReport<F>,
+    /// A run of failed reads this long ends the reporter.
+    lost_after: Duration,
     last_read: std::time::Instant,
 }
 
@@ -333,10 +346,10 @@ impl<F: FnMut(i64)> PositionReporter<F> {
                 self.last_read = std::time::Instant::now();
                 (self.report.send)(position);
             }
-            Err(e) if self.last_read.elapsed() >= self.report.lost_after => {
+            Err(e) if self.last_read.elapsed() >= self.lost_after => {
                 return Err(LogError::Aeron(format!(
                     "the recording {} is lost: no position for {:?}: {e}",
-                    self.recorder.recording_id, self.report.lost_after
+                    self.recorder.recording_id, self.lost_after
                 )));
             }
             Err(_) => (),
@@ -434,15 +447,16 @@ impl Recorder {
     /// Connect an archive session and start recording `stream`. Report the
     /// startup outcome exactly once through `ready`: `Ok(recording_id)`
     /// once the recording is active, or `Err(reason)` on any failure,
-    /// including a `stop` during startup. Returns `Ok(None)` when `stop`
-    /// cancels before the recording appears.
+    /// including a `stop` during startup. Returns the recorder and the
+    /// driver budget of its session, or `Ok(None)` when `stop` cancels
+    /// before the recording appears.
     fn start_reporting(
         aeron_dir: Option<&Path>,
         aeron_cfg: &AeronConfig,
         stream: RecordedStream<'_>,
         stop: &CancellationToken,
         ready: impl FnOnce(Result<i64, String>),
-    ) -> Result<Option<Self>, LogError> {
+    ) -> Result<Option<(Self, DriverBudget)>, LogError> {
         let session = match connect_archive(aeron_dir, aeron_cfg) {
             Ok(s) => s,
             Err(e) => {
@@ -455,10 +469,11 @@ impl Recorder {
             stream_id,
             kind,
         } = stream;
+        let budget = session.driver_budget;
         match Recorder::start_stream(session.archive, channel, stream_id, kind, stop) {
             Ok(Some(r)) => {
                 ready(Ok(r.recording_id()));
-                Ok(Some(r))
+                Ok(Some((r, budget)))
             }
             Ok(None) => {
                 // Stopped before the recording appeared (shutdown during

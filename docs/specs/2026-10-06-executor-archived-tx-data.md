@@ -274,8 +274,12 @@ Compatibility of each change:
 - The executor node also writes the MDBX state DB. Put the archive directory on the same NVMe
   with power-loss protection, or on its own volume. Phase 2 measures the cost.
 - The executor process does not run without the recording. When the recorder reads no recording
-  position for 2 s, the publisher fails, the reader stops, and the process exits. The restart
-  waits for a recording of the new session.
+  position for the loss wait, the publisher fails, the reader stops, and the process exits. The
+  restart waits for a recording of the new session.
+- The loss wait is the driver timeout of the archive client (`AERON_DRIVER_TIMEOUT`, the Aeron
+  stall tolerance of the deploy: 10 s by default, 30 s in CI) plus 5 s, and at least 10 s. It is
+  the rule of the Aeron client start budget (`DriverBudget` in `crates/log`). A stall that
+  every Aeron party survives does not end the recorder.
 - The executor process does not start without the recording. Its readiness waits for a live
   recording of its recorded publication, as the ingress does for its lanes
   (`crates/ingress/src/bin/kardamom-ingress/recorders.rs:172`). It reuses
@@ -811,7 +815,8 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
     milliseconds. The gauge `kardamom_executor_exec_stream_session_id` is new. The chaos check
     reads it.
   - The first locator of a session names the first reported recording position, a lower bound.
-  - The end of the local recording is fatal (section 3.6).
+  - The end of the local recording is fatal (section 3.6). The loss wait follows the driver
+    timeout of the archive client, with the rule of the client start budget.
   - A static plane whose `exec_txs_channel` is IPC opens only the recorded publication.
   - The spied-UDP question of section 3.1 stays open. P2 keeps the two publications.
 
