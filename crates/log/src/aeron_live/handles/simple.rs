@@ -1,5 +1,6 @@
-//! The five structurally identical single-stream handle pairs: `TxErrors`,
-//! `TxStatus`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `FsyncWatermark`. Each is a publisher
+//! The structurally identical single-stream handle pairs: `TxErrors`,
+//! `TxStatus`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
+//! `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
 //! publish surface. [`declare_channel_handles!`] stamps out the
@@ -14,7 +15,7 @@ use crate::discovery::plane::{DiscoveredPublisher, DiscoveredSubscriber};
 use crate::error::LogError;
 use kardamom_types::service::ServiceEvent;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{BPosition, EpochRecord, FsyncWatermark, TxError, TxStatus};
+use kardamom_types::{BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, TxError, TxStatus};
 
 /// Name the discovery topic and stream of one single-stream handle pair,
 /// so [`crate::discovery::StreamPlane`] can open it either way.
@@ -319,6 +320,22 @@ declare_channel_handles! {
 }
 
 declare_channel_handles! {
+    /// `exec_txs` publisher (executor → validator, batcher, executor archive).
+    publisher ExecTxsPublisherHandle {
+        /// # Errors
+        ///
+        /// Returns an error if the underlying Aeron offer fails or times
+        /// out (see `PubHandle::publish`).
+        pub fn publish(&self, r: &ExecTxRecord) -> Result<BPosition, LogError> {
+            self.inner.publish(r)
+        }
+    }
+    /// `exec_txs` subscriber (executor → validator, batcher, executor archive).
+    subscriber ExecTxsSubscriberHandle(ExecTxRecord);
+    open(ch) = (ch.exec_txs_channel, ch.exec_txs_stream_id);
+}
+
+declare_channel_handles! {
     /// Per-recorder fsync watermark publisher.
     publisher FsyncWatermarkPublisherHandle {
         /// # Errors
@@ -371,4 +388,11 @@ discoverable!(
     ServiceEvent,
     Topic::ServiceEvents,
     events_stream_id
+);
+discoverable!(
+    ExecTxsPublisherHandle,
+    ExecTxsSubscriberHandle,
+    ExecTxRecord,
+    Topic::ExecTxs,
+    exec_txs_stream_id
 );

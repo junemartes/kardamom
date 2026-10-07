@@ -186,6 +186,37 @@ fn tx_status_defaults_present() {
 }
 
 #[test]
+fn exec_txs_defaults_present() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(ch.exec_txs_stream_id, 1005);
+    assert_eq!(ch.exec_txs_channel, "aeron:ipc?alias=exec-txs");
+    ch.validate().expect("the default stream ids are distinct");
+}
+
+#[test]
+fn a_stream_id_that_two_streams_share_is_rejected() {
+    let err = load("[channels]\nexec_txs_stream_id = 1004\n")
+        .expect_err("exec_txs on the BAL stream id must be rejected");
+    assert!(
+        err.to_string()
+            .contains("tx_bal_stream_id and exec_txs_stream_id share the stream id 1004"),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_stream_id_on_a_tx_data_lane_is_rejected() {
+    let err = load("[channels]\nexec_txs_stream_id = 2255\n")
+        .expect_err("exec_txs on the last tx_data lane must be rejected");
+    assert!(
+        err.to_string()
+            .contains("exec_txs_stream_id (2255) is a tx_data lane id"),
+        "got {err}"
+    );
+    load("[channels]\nexec_txs_stream_id = 2256\n").expect("the id after the last lane is free");
+}
+
+#[test]
 fn round_trips_through_toml() {
     // A fully serialized config must parse back identically. This guards
     // the serde attributes against a field that serializes but will not
@@ -424,6 +455,7 @@ fn the_deployed_channels_template_loads() {
     );
     let cfg = load(&rendered).expect("rendered channels.toml.tpl loads");
     assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
+    assert_eq!(cfg.channels.exec_txs_stream_id, 1005);
     assert_eq!(cfg.discovery.cluster_id, "kardamom-dev");
     assert_eq!(
         cfg.discovery

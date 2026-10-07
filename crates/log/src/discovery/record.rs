@@ -30,6 +30,7 @@ pub enum Topic {
     TxRemoteEpochs,
     TxBal,
     ServiceEvents,
+    ExecTxs,
 }
 
 impl Topic {
@@ -45,6 +46,7 @@ impl Topic {
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
             Self::ServiceEvents => "events",
+            Self::ExecTxs => "exec_txs",
         }
     }
 
@@ -65,7 +67,8 @@ impl Topic {
             | Self::TxStatus
             | Self::TxDeposits
             | Self::TxRemoteEpochs
-            | Self::TxBal => None,
+            | Self::TxBal
+            | Self::ExecTxs => None,
         }
     }
 
@@ -80,6 +83,7 @@ impl Topic {
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),
             "events" => Some(Self::ServiceEvents),
+            "exec_txs" => Some(Self::ExecTxs),
             _ => None,
         }
     }
@@ -323,3 +327,6 @@ impl ClusterMemberRecord {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
