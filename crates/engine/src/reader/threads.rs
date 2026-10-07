@@ -14,9 +14,11 @@ use kardamom_types::{
 
 use crate::error::ExecutorError;
 
+use super::cluster::slot_width;
 use super::join::{JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
 use super::ports::{
-    ExecSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
+    ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription,
+    TxOrderingSubscription,
 };
 use super::void::{ParkOutcome, ReadAhead, VoidPark};
 
@@ -142,18 +144,20 @@ pub(super) enum Flow {
 }
 
 /// The `tx_ordering` reader thread's state: the subscription, the join
-/// buffer and its optional archive recovery, and the exec sink. One
-/// instance lives for the reader thread's whole life.
+/// buffer and its optional archive recovery, the exec sink, and the
+/// executor-stream sink. One instance lives for the reader thread's whole
+/// life.
 ///
 /// The reader forwards every record it receives. The canonical stream is
 /// the sealer's egress, which is already deduplicated and totally
 /// ordered, and the cluster subscription drops any replay overlap by
 /// canonical index. So there is no dedup here.
-pub struct TxOrderingReader<O, S> {
+pub struct TxOrderingReader<O, S, E> {
     sub: O,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: S,
+    exec_stream: E,
     recovery: Option<JoinRecovery>,
     /// The canonical index of the first record this reader read. A void
     /// record for an entry below it names an entry that an earlier run of
@@ -174,18 +178,23 @@ pub struct TxOrderingReader<O, S> {
 /// refetch instead of an immediate death; see [`JoinRecovery`]. The reader
 /// builds it once, inside its own thread, because the recovery's Aeron
 /// resources are thread-bound.
-pub struct TxOrderingInputs<O, S> {
+///
+/// `exec_stream` gets each joined record before the exec thread does, and
+/// a progress mark after each message that takes a slot.
+pub struct TxOrderingInputs<O, S, E> {
     pub sub: O,
     pub buffer: JoinBuffer,
     pub cfg: ReaderConfig,
     pub exec_out: S,
+    pub exec_stream: E,
     pub recovery_factory: Option<JoinRecoveryFactory>,
 }
 
-impl<O, S> TxOrderingReader<O, S>
+impl<O, S, E> TxOrderingReader<O, S, E>
 where
     O: TxOrderingSubscription + 'static,
     S: ExecSink,
+    E: ExecStreamSink,
 {
     /// Spawn the single `tx_ordering` reader thread. It pulls
     /// [`TxOrderingMessage`] records in canonical order. For each `TxRef`,
@@ -199,7 +208,7 @@ where
     /// # Panics
     ///
     /// Panics if the OS refuses to spawn the thread.
-    pub fn spawn(inputs: TxOrderingInputs<O, S>) -> JoinHandle<Result<(), ExecutorError>> {
+    pub fn spawn(inputs: TxOrderingInputs<O, S, E>) -> JoinHandle<Result<(), ExecutorError>> {
         thread::Builder::new()
             .name("executor-reader-b".into())
             .spawn(move || Self::new(inputs).run())
@@ -208,12 +217,13 @@ where
 
     /// Build the loop state. Runs on the reader thread, so the recovery
     /// factory builds its Aeron resources there.
-    pub(super) fn new(inputs: TxOrderingInputs<O, S>) -> Self {
+    pub(super) fn new(inputs: TxOrderingInputs<O, S, E>) -> Self {
         let TxOrderingInputs {
             sub,
             buffer,
             cfg,
             exec_out,
+            exec_stream,
             recovery_factory,
         } = inputs;
         let recovery = recovery_factory.map(JoinRecoveryFactory::build);
@@ -222,6 +232,7 @@ where
             buffer,
             cfg,
             exec_out,
+            exec_stream,
             recovery,
             first_index: None,
             backlog: ReadAhead::new(),
@@ -284,8 +295,15 @@ where
         }
     }
 
-    /// A `TxRef`: join against the buffer, warn on buffer growth, then
-    /// dispatch the joined envelope.
+    /// The error of a reader whose executor-stream publisher is gone. The
+    /// reader stops, because it must not execute a record that the stream
+    /// did not take.
+    fn stream_closed() -> ExecutorError {
+        ExecutorError::State("the executor stream publisher stopped".into())
+    }
+
+    /// A `TxRef`: join against the buffer, warn on buffer growth, send the
+    /// joined record to the executor stream, then dispatch the envelope.
     fn on_tx_ref(
         &mut self,
         tx_ref: kardamom_types::TxRef,
@@ -298,6 +316,9 @@ where
             JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
         };
         self.warn_on_buffer_growth();
+        self.exec_stream
+            .record(position.as_index(), &tx_ref, &env)
+            .map_err(|_| Self::stream_closed())?;
         Ok(self.send(ReaderToExec::Tx {
             envelope: env,
             position,
@@ -418,7 +439,8 @@ where
     }
 
     /// One receive-then-dispatch step: pull the next `tx_ordering` message,
-    /// and dispatch it to its handler. Returns `Flow::Stop` on a clean
+    /// dispatch it to its handler, then send the message's progress mark
+    /// to the executor stream. Returns `Flow::Stop` on a clean
     /// `tx_ordering` close. The loop in [`Self::run`] stays a plain
     /// dispatch on the result.
     fn step(&mut self) -> Result<Flow, ExecutorError> {
@@ -432,6 +454,40 @@ where
             Err(e) => return Err(e),
         };
         self.first_index.get_or_insert(position.as_index());
+        let through = Self::last_slot(position, &msg);
+        match self.dispatch(position, msg)? {
+            Flow::Continue => self.mark(through),
+            Flow::Stop => Ok(Flow::Stop),
+        }
+    }
+
+    /// The last canonical slot that `msg` at `position` takes. A boundary
+    /// takes no slot. Every other record takes `slot_width` slots from its
+    /// own index.
+    fn last_slot(position: BPosition, msg: &TxOrderingMessage) -> Option<u64> {
+        if let TxOrderingMessage::BoundaryStart(_) = msg {
+            return None;
+        }
+        position
+            .as_index()
+            .checked_add(slot_width(msg).checked_sub(1)?)
+    }
+
+    /// Send the progress mark of a dispatched message, when it takes a
+    /// slot.
+    fn mark(&self, through: Option<u64>) -> Result<Flow, ExecutorError> {
+        through
+            .map_or(Ok(()), |t| self.exec_stream.passed(t))
+            .map_err(|_| Self::stream_closed())?;
+        Ok(Flow::Continue)
+    }
+
+    /// Dispatch one message to its handler.
+    fn dispatch(
+        &mut self,
+        position: BPosition,
+        msg: TxOrderingMessage,
+    ) -> Result<Flow, ExecutorError> {
         match msg {
             TxOrderingMessage::TxRef(tx_ref) => self.on_tx_ref(tx_ref, position),
             TxOrderingMessage::Epoch(epoch) => Ok(self.expand_epoch(epoch)),

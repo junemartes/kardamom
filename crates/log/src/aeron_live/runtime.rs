@@ -69,6 +69,8 @@ pub(super) enum RuntimeCmd {
     },
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },
+    /// Lossy publish — one offer, no ack, a refused frame only counts.
+    PublishLossy { pub_id: u32, bytes: AlignedVec },
     /// Register a new publication. The Aeron thread executes
     /// `aeron.add_publication()` and replies with the assigned `pub_id`
     /// and the publication's Aeron session id.

@@ -35,7 +35,7 @@ use crossbeam_channel::Sender;
 use kardamom_types::SnapshotSource;
 
 use crate::reader::{
-    EpochObserver, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
+    EpochObserver, ExecStreamSink, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
 };
 
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
@@ -98,6 +98,7 @@ pub trait ExecPorts {
 ///     type TxData = ClusterTxDataSubscription;
 ///     type TxOrdering = ClusterTxOrderingSubscription;
 ///     type TxReceipts = Either<AttestingReceiptSink<PlainSink>, PlainSink>; // attester tee
+///     type ExecStream = NoExecStream;
 /// }
 /// ```
 ///
@@ -110,6 +111,11 @@ pub trait EngineWiring: ExecPorts {
     type TxOrdering: TxOrderingSubscription + 'static;
     /// The `tx_receipts` publication the commit thread drains into.
     type TxReceipts: TxReceiptsPublication + 'static;
+    /// Where the `tx_ordering` reader sends each joined record and each
+    /// progress mark. The executor names its stream publisher channel. A
+    /// role that publishes no executor stream names
+    /// [`NoExecStream`](crate::reader::NoExecStream).
+    type ExecStream: ExecStreamSink;
 }
 
 /// The exec-thread's state database, as named by a wiring. Shorthand for
@@ -118,7 +124,8 @@ pub type SnapshotDb<W> = <<W as ExecPorts>::Snapshots as SnapshotSource>::Db;
 
 /// What the reader threads consume: the M `tx_data` subscriptions, the
 /// canonical `tx_ordering` subscription, and the optional archive-backed
-/// join-miss recovery.
+/// join-miss recovery. It also names where the reader sends what it
+/// joins: the executor stream.
 pub struct Inbound<W: EngineWiring> {
     /// One subscription per sequencer partition (M total). Callers may
     /// supply them in any order, since each subscription declares its own
@@ -130,6 +137,8 @@ pub struct Inbound<W: EngineWiring> {
     /// [`crate::reader::JoinRecovery`]). `None` keeps the plain bounded
     /// join.
     pub join_recovery: Option<JoinRecoveryFactory>,
+    /// The executor-stream sink of the `tx_ordering` reader.
+    pub exec_stream: W::ExecStream,
 }
 
 /// The actor's outbound ports: the `tx_receipts` publication and the three

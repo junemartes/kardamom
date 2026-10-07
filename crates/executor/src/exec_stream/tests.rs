@@ -1,0 +1,333 @@
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use alloy_primitives::{Address, B256};
+use bytes::Bytes;
+use crossbeam_channel::{Sender, bounded};
+use kardamom_engine::ExecStreamItem;
+use kardamom_log::error::LogError;
+use kardamom_types::{BPosition, ExecTxRecord, TxEnvelope, TxRef};
+use rkyv::util::AlignedVec;
+use tokio_util::sync::CancellationToken;
+
+use super::cursor::RecordedCursor;
+use super::locators::{LOCATOR_EVERY, Locator, LocatorLog};
+use super::publisher::{ExecStreamPublisher, PublisherInputs, StreamPublications};
+
+const SESSION: i32 = 77;
+
+fn record(index: u64) -> ExecTxRecord {
+    let fill = u8::try_from(index % 251).expect("below 251");
+    ExecTxRecord {
+        index,
+        tx_ref: TxRef {
+            tx_hash: B256::repeat_byte(fill),
+            shard_id: 0,
+            tx_data_position: BPosition::from_index(index),
+            tx_data_session_id: 0,
+        },
+        envelope: TxEnvelope {
+            correlation_id: index,
+            raw_tx: Bytes::from(vec![fill; 40]),
+            sender: Address::repeat_byte(fill),
+            tx_hash: B256::repeat_byte(fill),
+            max_inclusion_block: u64::MAX,
+        },
+    }
+}
+
+/// Publications that keep what they take. The recorded side refuses every
+/// offer while `open` is false, and counts the refusals.
+#[derive(Clone)]
+struct FakePublications {
+    open: Arc<AtomicBool>,
+    refused: Arc<AtomicUsize>,
+    end: Arc<AtomicI64>,
+    recorded: Arc<Mutex<Vec<(u64, i64)>>>,
+    live: Arc<Mutex<Vec<u64>>>,
+}
+
+impl FakePublications {
+    fn new(open: bool) -> Self {
+        Self {
+            open: Arc::new(AtomicBool::new(open)),
+            refused: Arc::new(AtomicUsize::new(0)),
+            end: Arc::new(AtomicI64::new(0)),
+            recorded: Arc::default(),
+            live: Arc::default(),
+        }
+    }
+
+    fn index_of(bytes: &AlignedVec) -> u64 {
+        kardamom_log::codec::materialize::<ExecTxRecord>(bytes)
+            .expect("an ExecTxRecord")
+            .index
+    }
+
+    fn recorded_indices(&self) -> Vec<u64> {
+        self.recorded
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(i, _)| *i)
+            .collect()
+    }
+}
+
+impl StreamPublications for FakePublications {
+    fn session_id(&self) -> i32 {
+        SESSION
+    }
+
+    fn offer_recorded(&self, bytes: &AlignedVec) -> Result<i64, LogError> {
+        if !self.open.load(Ordering::Acquire) {
+            self.refused.fetch_add(1, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(1));
+            return Err(LogError::Aeron("back pressured".into()));
+        }
+        let len = i64::try_from(bytes.len()).expect("a small frame");
+        let end = self.end.fetch_add(len, Ordering::AcqRel) + len;
+        self.recorded
+            .lock()
+            .expect("lock")
+            .push((Self::index_of(bytes), end));
+        Ok(end)
+    }
+
+    fn offer_live(&self, bytes: &AlignedVec) {
+        self.live.lock().expect("lock").push(Self::index_of(bytes));
+    }
+}
+
+/// A publisher over `pubs` on its own thread, with the reader's channel of
+/// `depth` and the position channel.
+struct Rig {
+    items: Sender<ExecStreamItem>,
+    positions: Sender<i64>,
+    handle: thread::JoinHandle<anyhow::Result<()>>,
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl Rig {
+    fn spawn(pubs: &FakePublications, depth: usize) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("exec_stream").join("locators.log");
+        let (items, items_rx) = bounded(depth);
+        let (positions, positions_rx) = bounded(16);
+        positions.send(0).expect("the start position");
+        let handle = ExecStreamPublisher::spawn(PublisherInputs {
+            items: items_rx,
+            positions: positions_rx,
+            publications: pubs.clone(),
+            locators: LocatorLog::open(&path).expect("open the locator log"),
+            stop: CancellationToken::new(),
+        })
+        .expect("spawn");
+        Self {
+            items,
+            positions,
+            handle,
+            _dir: dir,
+            path,
+        }
+    }
+
+    fn send_records(&self, indices: impl Iterator<Item = u64>) {
+        indices.for_each(|i| {
+            self.items
+                .send(ExecStreamItem::Record(record(i)))
+                .expect("record");
+            self.items.send(ExecStreamItem::Passed(i)).expect("mark");
+        });
+    }
+
+    /// Close the reader side, join the publisher, and reopen the locator
+    /// log it wrote.
+    fn finish(self) -> LocatorLog {
+        let Self {
+            items,
+            positions,
+            handle,
+            _dir,
+            path,
+        } = self;
+        Self::close(items, positions);
+        handle.join().expect("no panic").expect("a clean end");
+        LocatorLog::open(&path).expect("reopen")
+    }
+
+    /// The named point at which the reader and the recorder hang up.
+    fn close(_items: Sender<ExecStreamItem>, _positions: Sender<i64>) {}
+}
+
+#[test]
+fn records_leave_in_the_order_the_reader_sends_them() {
+    let pubs = FakePublications::new(true);
+    let rig = Rig::spawn(&pubs, 8);
+    rig.send_records(0..100);
+    rig.finish();
+    let expected: Vec<u64> = (0..100).collect();
+    assert_eq!(pubs.recorded_indices(), expected);
+    assert_eq!(*pubs.live.lock().expect("lock"), expected);
+}
+
+#[test]
+fn back_pressure_blocks_the_sink_and_drops_nothing() {
+    let pubs = FakePublications::new(false);
+    let rig = Rig::spawn(&pubs, 2);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let items = rig.items.clone();
+        let sent = Arc::clone(&sent);
+        thread::spawn(move || {
+            (0..20u64).for_each(|i| {
+                items.send(ExecStreamItem::Record(record(i))).expect("send");
+                sent.fetch_add(1, Ordering::AcqRel);
+            });
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        sent.load(Ordering::Acquire) <= 3,
+        "the full channel blocks the reader"
+    );
+    assert!(
+        pubs.refused.load(Ordering::Acquire) > 0,
+        "the publisher retries"
+    );
+    assert_eq!(pubs.recorded_indices(), [] as [u64; 0]);
+    pubs.open.store(true, Ordering::Release);
+    reader.join().expect("the reader ends");
+    rig.finish();
+    assert_eq!(pubs.recorded_indices(), (0..20).collect::<Vec<u64>>());
+}
+
+#[test]
+fn the_publisher_writes_a_locator_for_the_session_start_and_every_1024_records() {
+    let pubs = FakePublications::new(true);
+    let rig = Rig::spawn(&pubs, 64);
+    let count = LOCATOR_EVERY * 2 + 5;
+    rig.send_records(10..10 + count);
+    let log = rig.finish();
+    let ends = pubs.recorded.lock().expect("lock").clone();
+    let start_of = |n: usize| n.checked_sub(1).map_or(0, |prev| ends[prev].1);
+    let first = Locator {
+        index: 10,
+        session_id: SESSION,
+        position: 0,
+    };
+    assert_eq!(log.lookup(10), Some(first));
+    assert_eq!(log.lookup(10 + LOCATOR_EVERY - 1), Some(first));
+    let second = log.lookup(10 + LOCATOR_EVERY).expect("the second entry");
+    let n = usize::try_from(LOCATOR_EVERY).expect("small");
+    assert_eq!(second.position, start_of(n));
+    assert_eq!(log.lookup(9), None);
+}
+
+#[test]
+fn the_locator_log_survives_a_torn_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("locators.log");
+    let entries: Vec<Locator> = (0..3)
+        .map(|i| Locator {
+            index: i * LOCATOR_EVERY,
+            session_id: SESSION,
+            position: i64::try_from(i).expect("small") * 4096,
+        })
+        .collect();
+    let mut log = LocatorLog::open(&path).expect("open");
+    for &l in &entries {
+        log.append(l).expect("append");
+    }
+    // A crash in the middle of the next append leaves 10 bytes of it.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(&[0xAB; 10]))
+        .expect("tear the tail");
+    let mut log = LocatorLog::open(&path).expect("reopen");
+    assert_eq!(std::fs::metadata(&path).expect("stat").len(), 72);
+    assert_eq!(log.lookup(u64::MAX), Some(entries[2]));
+    let next = Locator {
+        index: 3 * LOCATOR_EVERY,
+        session_id: SESSION,
+        position: 3 * 4096,
+    };
+    log.append(next).expect("append after the cut");
+    let log = LocatorLog::open(&path).expect("reopen again");
+    assert_eq!(log.lookup(u64::MAX), Some(next));
+    assert_eq!(log.lookup(3 * LOCATOR_EVERY - 1), Some(entries[2]));
+}
+
+#[test]
+fn a_corrupt_tail_entry_is_cut_and_the_lookup_takes_the_previous_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("locators.log");
+    let mut log = LocatorLog::open(&path).expect("open");
+    let good = Locator {
+        index: 0,
+        session_id: SESSION,
+        position: 0,
+    };
+    log.append(good).expect("append");
+    log.append(Locator {
+        index: 1024,
+        session_id: SESSION,
+        position: 9000,
+    })
+    .expect("append");
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes[30] ^= 0xFF;
+    std::fs::write(&path, &bytes).expect("flip a bit");
+    let log = LocatorLog::open(&path).expect("reopen");
+    assert_eq!(log.lookup(2000), Some(good));
+}
+
+#[test]
+fn a_lookup_returns_the_newest_entry_at_or_below_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut log = LocatorLog::open(&dir.path().join("locators.log")).expect("open");
+    let at = |index, session_id, position| Locator {
+        index,
+        session_id,
+        position,
+    };
+    // The first session reaches 2048. A restart resumes at 900 in a new
+    // session, below the last entry of the first one.
+    let entries = [
+        at(0, 1, 0),
+        at(1024, 1, 70_000),
+        at(2048, 1, 140_000),
+        at(900, 2, 0),
+    ];
+    for l in entries {
+        log.append(l).expect("append");
+    }
+    assert_eq!(log.lookup(899), Some(at(0, 1, 0)));
+    assert_eq!(log.lookup(950), Some(at(900, 2, 0)));
+    assert_eq!(log.lookup(5000), Some(at(900, 2, 0)));
+}
+
+#[test]
+fn the_recorded_cursor_never_passes_the_recording_position() {
+    let mut cursor = RecordedCursor::new(100);
+    // Nothing is offered: a mark passes at once.
+    assert_eq!(cursor.passed(4), Some(4));
+    cursor.offered(200);
+    assert_eq!(cursor.passed(5), None, "record 5 ends past the recording");
+    cursor.offered(300);
+    assert_eq!(cursor.passed(6), None);
+    // A mark with no new record waits for the record before it.
+    assert_eq!(cursor.passed(7), None);
+    assert_eq!(cursor.recorded(199), None);
+    assert_eq!(cursor.through(), Some(4));
+    assert_eq!(cursor.recorded(250), Some(5));
+    // A late, lower report does not move the recording position back.
+    assert_eq!(cursor.recorded(120), None);
+    assert_eq!(cursor.recorded(300), Some(7));
+    assert_eq!(cursor.passed(8), Some(8));
+}

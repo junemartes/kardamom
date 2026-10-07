@@ -488,7 +488,7 @@ pub fn cluster_tx_ordering_subscription(
 
 /// Canonical slots one record occupies. See [`wire::epoch_slots`] for why an
 /// epoch is the only record wider than a single slot.
-fn slot_width(msg: &TxOrderingMessage) -> u64 {
+pub(crate) fn slot_width(msg: &TxOrderingMessage) -> u64 {
     match msg {
         TxOrderingMessage::Epoch(e) => wire::epoch_slots(e),
         TxOrderingMessage::RemoteEpoch(r) => wire::remote_epoch_slots(r),

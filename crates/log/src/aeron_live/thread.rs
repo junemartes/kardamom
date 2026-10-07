@@ -341,6 +341,25 @@ impl AeronThread {
         });
     }
 
+    /// Make one offer of a lossy frame. A refused offer, or an unknown
+    /// publication, drops the frame and counts it under the stream id.
+    fn offer_lossy(&self, pub_id: u32, bytes: &rkyv::util::AlignedVec) {
+        let Some(entry) = self.pubs.get(pub_id as usize) else {
+            return;
+        };
+        let code = entry.publication.offer(
+            bytes.as_slice(),
+            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+        );
+        if code < 0 {
+            metrics::counter!(
+                super::BEST_EFFORT_DROPPED_TOTAL,
+                "stream_id" => entry.stream_id.to_string()
+            )
+            .increment(1);
+        }
+    }
+
     /// Open a publication and append it to `pubs`, replying with its
     /// index and its Aeron session id.
     fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<OpenedPub, LogError> {
@@ -376,7 +395,11 @@ impl AeronThread {
             layout,
             stream_id,
         });
-        Ok(OpenedPub { pub_id, session_id })
+        Ok(OpenedPub {
+            pub_id,
+            session_id,
+            layout,
+        })
     }
 
     /// Open a subscription behind a fragment assembler, and append it to
@@ -440,6 +463,9 @@ impl AeronThread {
             }
             RuntimeCmd::PublishBestEffort { pub_id, bytes } => {
                 self.enqueue_publish(pub_id, bytes, None);
+            }
+            RuntimeCmd::PublishLossy { pub_id, bytes } => {
+                self.offer_lossy(pub_id, &bytes);
             }
             RuntimeCmd::OpenPublication {
                 uri,

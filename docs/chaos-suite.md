@@ -84,8 +84,8 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 **Executor shard**
 
-- [`graceful-executor`](failure-modes.md#executor): stops one executor allocation with a graceful stop. The job returns to three replicas.
-- [`hard-executor`](failure-modes.md#executor): kills one executor task. The job returns to three replicas.
+- [`graceful-executor`](failure-modes.md#executor): stops one executor allocation with a graceful stop. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
+- [`hard-executor`](failure-modes.md#executor): kills one executor task. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
 - [`node-failure-executor`](failure-modes.md#executor): kills a whole executor node. The fleet keeps progressing with two replicas. The node returns.
 - [`node-replace-executor`](failure-modes.md#executor): replaces an executor node through the Terraform root. The new node has a new address and empty volumes.
 - [`state-checkpoint-restore`](failure-modes.md#executor): wipes the state of executor-0. It restores from the checkpoint of executor-1.

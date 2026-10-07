@@ -237,6 +237,60 @@ async fn connect_cluster(
     Ok(connected)
 }
 
+/// The streams this replica writes besides the BAL: the receipts, the
+/// lifecycle beacon on `events`, and the executor stream.
+struct Outputs {
+    tx_receipts_pub: wiring::LiveTxReceiptsPub,
+    exec_stream: kardamom_executor::exec_stream::ExecStream,
+}
+
+/// What [`Outputs::open`] needs.
+struct OutputsConfig<'a> {
+    args: &'a Args,
+    rt_pub: &'a AeronRuntime,
+    plane: &'a mut StreamPlane,
+    aeron_cfg: &'a kardamom_log::config::AeronConfig,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl Outputs {
+    /// Open the outputs on the publication runtime. The executor stream
+    /// opens last: its local recording must be active before the engine
+    /// joins anything.
+    async fn open(cfg: OutputsConfig<'_>) -> Result<Self> {
+        let OutputsConfig {
+            args,
+            rt_pub,
+            plane,
+            aeron_cfg,
+            stop,
+        } = cfg;
+        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args).await?;
+        // This replica's lifecycle on the `events` stream: the ingress pauses
+        // submits once every executor is halted.
+        plane
+            .publisher::<ServiceEventsPublisherHandle>(rt_pub)
+            .await
+            .context("open events")?
+            .spawn_process_beacon();
+        let exec_stream = kardamom_executor::exec_stream::ExecStream::open(
+            kardamom_executor::exec_stream::ExecStreamConfig {
+                rt_pub,
+                plane,
+                aeron_dir: args.aeron_dir.as_deref(),
+                aeron_cfg,
+                state_dir: &args.state_dir,
+                stop,
+            },
+        )
+        .await?;
+        Ok(Self {
+            tx_receipts_pub,
+            exec_stream,
+        })
+    }
+}
+
 /// What one process sets up once: tracing, the metrics exporter, the
 /// parsed configs, the checkpoint server, and the shutdown signal. Every
 /// revolution of the pipeline starts from this.
@@ -254,6 +308,31 @@ struct Boot {
 }
 
 impl Boot {
+    /// The engine config of one revolution.
+    fn engine_config(
+        &self,
+        chain_id: std::num::NonZeroU64,
+        genesis: Option<&kardamom_types::Genesis>,
+        resume: bool,
+    ) -> ExecutorConfig {
+        let mut cfg = ExecutorConfig {
+            chain_id,
+            fees: genesis.and_then(|g| g.fees),
+            ..ExecutorConfig::default()
+        };
+        // Always bound the tx_data join wait. A replica whose multicast
+        // tx_data image races a sequencer restart (a new publisher session)
+        // can lose an envelope, and an unbounded join wait then freezes that
+        // replica silently while its peers advance. Failing loudly hands
+        // recovery to the designed loop: Nomad restarts the task, and crash
+        // recovery replays the tx_data gap from the archive. See
+        // `bounded_join_timeout` for why the fresh-start bound exceeds
+        // resume's.
+        cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume);
+        cfg.reader.voter_id = self.args.void_voter_id;
+        cfg
+    }
+
     async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
         kardamom_obs::init_service!(
@@ -268,6 +347,7 @@ impl Boot {
         )
         .await?;
         kardamom_engine::metrics::describe();
+        kardamom_executor::exec_stream::ExecStreamMetrics::describe();
         let file_cfg = load_file_config(&args)?;
         tracing::info!(
             lanes = kardamom_types::shard_map::LANE_COUNT,
@@ -386,16 +466,17 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         args.replay_destination_endpoint.as_deref(),
     );
 
-    let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
+    let outputs = Outputs::open(OutputsConfig {
+        args,
+        rt_pub: &rt_pub,
+        plane: &mut plane,
+        aeron_cfg: &aeron_cfg,
+        stop: shutdown.clone(),
+    })
+    .await?;
+    let exec_stream_threads = outputs.exec_stream.threads;
 
-    let tx_receipts_pub = wiring::open_tx_receipts_pub(&rt_pub, &mut plane, args).await?;
-    // This replica's lifecycle on the `events` stream: the ingress pauses
-    // submits once every executor is halted.
-    plane
-        .publisher::<ServiceEventsPublisherHandle>(&rt_pub)
-        .await
-        .context("open events")?
-        .spawn_process_beacon();
+    let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
 
     let WriterAdapters {
         mut writer,
@@ -408,21 +489,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         _nonce_query: nonce_query,
     } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
-    let mut cfg = ExecutorConfig {
-        chain_id,
-        fees: genesis.as_ref().and_then(|g| g.fees),
-        ..ExecutorConfig::default()
-    };
-    // Always bound the tx_data join wait. A replica whose multicast
-    // tx_data image races a sequencer restart (a new publisher session)
-    // can lose an envelope, and an unbounded join wait then freezes that
-    // replica silently while its peers advance. Failing loudly hands
-    // recovery to the designed loop: Nomad restarts the task, and crash
-    // recovery replays the tx_data gap from the archive. See
-    // `bounded_join_timeout` for why the fresh-start bound exceeds
-    // resume's.
-    cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
-    cfg.reader.voter_id = args.void_voter_id;
+    let cfg = boot.engine_config(chain_id, genesis.as_ref(), start.is_resume());
 
     let block_exec = wiring::build_block_exec(args);
 
@@ -437,9 +504,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
                 tx_ordering: tx_ordering_sub,
                 // Join-miss archive refetch (None on single-host/IPC runs).
                 join_recovery,
+                exec_stream: outputs.exec_stream.sink,
             },
             Outbound {
-                tx_receipts: tx_receipts_pub,
+                tx_receipts: outputs.tx_receipts_pub,
                 snapshots,
                 writer_signal,
                 writer_queue,
@@ -474,6 +542,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     });
 
     let engine_error = wait_for_engine(rt, cluster_guard, shutdown, join).await;
+    // The reader is gone, so the stream publisher drains and ends.
+    tokio::task::spawn_blocking(move || exec_stream_threads.join())
+        .await
+        .context("join the exec stream threads")?;
     // The plane's registrations deregister once the engine has stopped.
     plane.shutdown().await;
     // Stop the state writer thread (this closes the delta channel, joins

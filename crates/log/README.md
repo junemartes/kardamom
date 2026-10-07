@@ -10,8 +10,8 @@
 | Component | Module | What it does |
 |---|---|---|
 | Channel handles | `aeron_live` | Typed publisher and subscriber handles for each application channel. One dedicated Aeron thread runs behind each `AeronRuntime`. |
-| Offer retry | `aeron_live` | Retries a parked offer until it succeeds or 5 s pass. A best-effort publish drops the record instead. `kardamom_log_best_effort_dropped_total{stream_id}` counts the drops. |
-| Recorders | `recorder` | Record a stream in the local Aeron Archive: `tx_data` (`RecorderKind::TxData`) and `tx_deposits` (`RecorderKind::TxDeposits`). |
+| Offer retry | `aeron_live` | Retries a parked offer until it succeeds or 5 s pass. A best-effort publish drops the record instead. A lossy publish (`PubHandle::publish_lossy`) makes one offer and drops a refused record with no log line. `kardamom_log_best_effort_dropped_total{stream_id}` counts both kinds of drop. |
+| Recorders | `recorder` | Record a stream in the local Aeron Archive: `tx_data` (`RecorderKind::TxData`), `tx_deposits` (`RecorderKind::TxDeposits`) and the `exec_txs` publication of one executor session (`RecorderKind::ExecTxs`). `record_stream_reporting` also reports the recording position. |
 | Archive refetch | `refetch` | Fetches a missed range of `tx_data` or `tx_deposits` from a remote archive. |
 | Discovery | `discovery` | The Consul-based discovery of the dynamic MDC transport. |
 | Archive catalog paging | `archive_catalog` | Pages the recording catalog of an archive for one stream id. Internal. |
@@ -32,7 +32,7 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 | `TxDeposits` | DA watcher | Full `Deposit` envelopes. Recorded by the archive of the DA watcher node. |
 | `TxRemoteEpochs` | Interop watcher | One record for each peer-chain origin block with cross-chain messages. RAM only. |
 | `TxBal` | Executor | The block access list (`BlockDelta`) of each block. RAM only. |
-| `ExecTxs` | Executor | One `ExecTxRecord` for each transaction that an executor joins, in canonical order. Typed handles exist. No service publishes or subscribes to it. |
+| `ExecTxs` | Executor | One `ExecTxRecord` for each transaction that an executor joins, in canonical order. Each executor writes a recorded IPC publication (`aeron:ipc?alias=exec-txs`), which the archive of its node records, and a lossy live publication. No service subscribes to it yet. |
 | Per-recorder fsync watermark | A recorder | Typed handles exist. The ingress subscribes to it for the local-fsync ack policies. |
 
 - `LogConfig` accepts any subset of the keys. A missing key takes the built-in default.
@@ -72,6 +72,9 @@ The recording position of the Aeron Archive is byte-durable only when the archiv
    - Level 0 leaves a recording in the page cache. Level 2 also syncs the metadata.
    - `AeronConfig::file_sync_level` and `catalog_file_sync_level` hold the intended levels. Both default to 1. No code reads them to start a daemon.
 2. The ingress archives record `tx_data`. The DA watcher archive records `tx_deposits`. The executors use these recordings to rebuild a missed range (see Archive refetch).
+3. The archive on each executor node records the `exec_txs` stream of its executor, from an IPC publication. An IPC publication cannot run ahead of the archive, so the recording loses no frame. A slow archive stalls that executor instead.
+   - `record_stream_reporting` reads the recording position every 20 ms. The executor counts a record as recorded only when this position reaches the end of the record. At level 1 that record is then durable on the node. At level 0 it survives a process crash, not a power loss.
+   - The recording position and the offer position of the publication are in one raw position space. `PubHandle::stream_position` converts the position that a publish returns into that space.
 
 For survival of a correlated power loss, point `archive_dir` at enterprise NVMe with power-loss protection (PLP). Without PLP, `fdatasync` only flushes to the cache of the device.
 

@@ -68,13 +68,12 @@ impl TermLayout {
     ///
     /// # Errors
     ///
-    /// Returns an error message if `pos`'s term precedes `recording_id`'s
-    /// initial term.
-    pub(crate) fn position_of(self, pos: BPosition, recording_id: i64) -> Result<i64, String> {
+    /// Returns an error message if `pos`'s term precedes the initial term.
+    pub(crate) fn position_of(self, pos: BPosition) -> Result<i64, String> {
         let term_count = i64::from(pos.term_id) - i64::from(self.initial_term_id);
         if term_count < 0 {
             return Err(format!(
-                "position term {} precedes recording {recording_id}'s initial term {}",
+                "position term {} precedes the initial term {}",
                 pos.term_id, self.initial_term_id
             ));
         }
@@ -133,7 +132,7 @@ mod tests {
                 term_offset,
             };
             let raw = layout
-                .position_of(pos, 1)
+                .position_of(pos)
                 .expect("term_id at or after initial_term_id");
             let decoded = layout.decode(raw).expect("position fits i32 after shift");
             assert_eq!(decoded, pos, "layout {layout:?}, raw position {raw}");

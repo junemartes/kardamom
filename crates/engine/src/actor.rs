@@ -255,6 +255,7 @@ impl<W: EngineWiring + 'static> Inbound<W> {
             tx_data,
             tx_ordering,
             join_recovery,
+            exec_stream,
         } = self;
         let buffer = JoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth.get());
@@ -267,6 +268,7 @@ impl<W: EngineWiring + 'static> Inbound<W> {
             buffer,
             cfg: cfg.reader.clone(),
             exec_out: tx_r2e,
+            exec_stream,
             recovery_factory: join_recovery,
         });
         (tx_data_handles, tx_ordering_handle, rx_r2e)

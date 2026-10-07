@@ -125,6 +125,7 @@ pub(super) fn run_ordering(
         buffer: buf,
         cfg,
         exec_out: tx,
+        exec_stream: NoExecStream,
         recovery_factory: None,
     });
     h.join().expect("no panic")?;
@@ -295,6 +296,7 @@ fn channel_b_reader_tolerates_a_publisher_lag() {
         buffer: buf,
         cfg,
         exec_out: tx,
+        exec_stream: NoExecStream,
         recovery_factory: None,
     });
     h.join().expect("no panic").expect("ok");

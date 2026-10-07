@@ -4,6 +4,9 @@
 //! Topology: the ingress records the `TxData` lanes and the DA watcher
 //! records `TxDeposits`, so the executor can replay full transaction and
 //! deposit envelopes on crash recovery (see [`Recorder::start_stream`]).
+//! Each executor records its own `ExecTxs` publication on the archive of
+//! its node, and reads the recording position back
+//! ([`record_stream_reporting`]).
 //! A producer binary spawns those through [`RecorderThreads`], which
 //! stops and joins them when it drops.
 //!
@@ -168,6 +171,11 @@ pub enum RecorderKind {
     TxData { sequencer_id: u8 },
     /// `TxDeposits` recorder (carries full `Deposit` envelopes from the DA watcher).
     TxDeposits,
+    /// `ExecTxs` recorder of one executor publication (carries one
+    /// `ExecTxRecord` for each joined transaction). The recorder adopts
+    /// only the recording of `session_id`, so a restarted executor never
+    /// reads the position of the recording of its earlier session.
+    ExecTxs { session_id: i32 },
 }
 
 impl RecorderKind {
@@ -178,8 +186,26 @@ impl RecorderKind {
         match self {
             RecorderKind::TxData { .. } => "tx_data",
             RecorderKind::TxDeposits => "tx_deposits",
+            RecorderKind::ExecTxs { .. } => "exec_txs",
         }
     }
+
+    /// The publisher session whose recording this kind adopts, or `None`
+    /// to adopt the newest recording of the stream.
+    fn session_id(self) -> Option<i32> {
+        match self {
+            RecorderKind::ExecTxs { session_id } => Some(session_id),
+            RecorderKind::TxData { .. } | RecorderKind::TxDeposits => None,
+        }
+    }
+}
+
+/// The stream that [`record_stream_reporting`] records.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedStream<'a> {
+    pub channel: &'a str,
+    pub stream_id: i32,
+    pub kind: RecorderKind,
 }
 
 /// Body of a dedicated stream-recorder thread. This is the recorder-thread
@@ -228,30 +254,91 @@ pub fn record_stream_until_stopped(
     stop: &CancellationToken,
     ready: impl FnOnce(Result<i64, String>),
 ) -> Result<(), LogError> {
-    let session = match connect_archive(aeron_dir, aeron_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            ready(Err(format!("connect archive: {e}")));
-            return Err(e);
-        }
+    let stream = RecordedStream {
+        channel,
+        stream_id,
+        kind,
     };
-    let recorder = match Recorder::start_stream(session.archive, channel, stream_id, kind, stop) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            // Stopped before the recording appeared (shutdown during
-            // startup). Report it so a waiting barrier does not hang.
-            ready(Err("stopped before the recording materialised".into()));
-            return Ok(());
-        }
-        Err(e) => {
-            ready(Err(format!("start {} recording: {e}", kind.label())));
-            return Err(e);
-        }
-    };
-    ready(Ok(recorder.recording_id()));
-    // Hold the recording (and its archive session) alive until shutdown.
-    futures::executor::block_on(stop.cancelled());
+    if Recorder::start_reporting(aeron_dir, aeron_cfg, stream, stop, ready)?.is_some() {
+        // Hold the recording (and its archive session) alive until shutdown.
+        futures::executor::block_on(stop.cancelled());
+    }
     Ok(())
+}
+
+/// [`record_stream_until_stopped`], and while the recording runs, hand its
+/// recording position to `report.send` every `report.every`, until `stop`
+/// is cancelled. A position is the raw stream position up to which the
+/// archive has written the recording. At archive file sync level 1 it is
+/// also durable on local storage. A failed read sends nothing, so a reader
+/// of the reports never sees a position that the archive did not confirm.
+///
+/// # Errors
+///
+/// Returns an error as [`record_stream_until_stopped`] does.
+pub fn record_stream_reporting(
+    aeron_dir: Option<&Path>,
+    aeron_cfg: &AeronConfig,
+    stream: RecordedStream<'_>,
+    stop: &CancellationToken,
+    ready: impl FnOnce(Result<i64, String>),
+    report: PositionReport<impl FnMut(i64)>,
+) -> Result<(), LogError> {
+    let Some(recorder) = Recorder::start_reporting(aeron_dir, aeron_cfg, stream, stop, ready)?
+    else {
+        return Ok(());
+    };
+    let mut reporter = PositionReporter {
+        recorder,
+        report,
+        failing: false,
+    };
+    while !stop.is_cancelled() {
+        reporter.report_then_wait();
+    }
+    Ok(())
+}
+
+/// Where and how often [`record_stream_reporting`] reports the recording
+/// position.
+pub struct PositionReport<F> {
+    pub every: Duration,
+    pub send: F,
+}
+
+/// The reporting loop of [`record_stream_reporting`]: the recorder, where
+/// its positions go, and whether the last read failed.
+struct PositionReporter<F> {
+    recorder: Recorder,
+    report: PositionReport<F>,
+    /// Set while reads fail, so a run of failed reads logs once.
+    failing: bool,
+}
+
+impl<F: FnMut(i64)> PositionReporter<F> {
+    /// Read the recording position once and send it, then wait.
+    fn report_then_wait(&mut self) {
+        match self.recorder.position() {
+            Ok(position) => {
+                self.failing = false;
+                (self.report.send)(position);
+            }
+            Err(e) => self.note_failure(&e),
+        }
+        std::thread::sleep(self.report.every);
+    }
+
+    fn note_failure(&mut self, e: &LogError) {
+        if self.failing {
+            return;
+        }
+        warn!(
+            recording_id = self.recorder.recording_id,
+            error = %e,
+            "no recording position to report; the reports stop until a read succeeds"
+        );
+        self.failing = true;
+    }
 }
 
 /// The stream-recorder threads one producer binary spawned, and the one
@@ -332,14 +419,75 @@ impl Drop for RecorderThreads {
 
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
-    /// this field is deliberately not `Arc<Archive>`.
-    // RAII: dropping this field closes the archive session and stops the
-    // recording. The field is never read; its only purpose is the drop.
-    _archive: Archive,
+    /// this field is deliberately not `Arc<Archive>`. Dropping it closes
+    /// the archive session.
+    archive: Archive,
     recording_id: i64,
 }
 
 impl Recorder {
+    /// Connect an archive session and start recording `stream`. Report the
+    /// startup outcome exactly once through `ready`: `Ok(recording_id)`
+    /// once the recording is active, or `Err(reason)` on any failure,
+    /// including a `stop` during startup. Returns `Ok(None)` when `stop`
+    /// cancels before the recording appears.
+    fn start_reporting(
+        aeron_dir: Option<&Path>,
+        aeron_cfg: &AeronConfig,
+        stream: RecordedStream<'_>,
+        stop: &CancellationToken,
+        ready: impl FnOnce(Result<i64, String>),
+    ) -> Result<Option<Self>, LogError> {
+        let session = match connect_archive(aeron_dir, aeron_cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                ready(Err(format!("connect archive: {e}")));
+                return Err(e);
+            }
+        };
+        let RecordedStream {
+            channel,
+            stream_id,
+            kind,
+        } = stream;
+        match Recorder::start_stream(session.archive, channel, stream_id, kind, stop) {
+            Ok(Some(r)) => {
+                ready(Ok(r.recording_id()));
+                Ok(Some(r))
+            }
+            Ok(None) => {
+                // Stopped before the recording appeared (shutdown during
+                // startup). Report it so a waiting barrier does not hang.
+                ready(Err("stopped before the recording materialised".into()));
+                Ok(None)
+            }
+            Err(e) => {
+                ready(Err(format!("start {} recording: {e}", kind.label())));
+                Err(e)
+            }
+        }
+    }
+
+    /// The recording position of an active recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails, or when the recording is not
+    /// active.
+    fn position(&self) -> Result<i64, LogError> {
+        let position = self
+            .archive
+            .get_recording_position(self.recording_id)
+            .map_err(|e| LogError::Aeron(format!("get_recording_position: {e}")))?;
+        if position < 0 {
+            return Err(LogError::Aeron(format!(
+                "recording {} is not active",
+                self.recording_id
+            )));
+        }
+        Ok(position)
+    }
+
     /// Start recording an arbitrary `(channel, stream_id)`. This is the
     /// generic entry point used by the per-sequencer `tx_data` recorder (in
     /// the sequencer process) and the `tx_deposits` recorder (in the DA
@@ -415,7 +563,7 @@ impl Recorder {
         let _ = Self::fetch_descriptor(&archive, recording_id)?;
 
         Ok(Some(Self {
-            _archive: archive,
+            archive,
             recording_id,
         }))
     }
@@ -486,7 +634,7 @@ impl Recorder {
         kind: RecorderKind,
         logged_waiting: &mut bool,
     ) -> ControlFlow<i64> {
-        match Self::active_recording_for_stream(archive, stream_id) {
+        match Self::active_recording_for_stream(archive, stream_id, kind.session_id()) {
             Ok(Some(id)) => {
                 info!(recording_id = id, ?kind, "recording ready");
                 return ControlFlow::Break(id);
@@ -585,10 +733,12 @@ impl Recorder {
     /// the newest recording for this stream can sit beyond any single
     /// page. Adopting a stale id would poll a dead recording's position.
     /// Aeron only lists recordings with an in-progress image, so this
-    /// returns `None` until a publisher has connected to the stream.
+    /// returns `None` until a publisher has connected to the stream. With
+    /// `session_id`, only a recording of that publisher session counts.
     fn active_recording_for_stream(
         archive: &Archive,
         stream_id: i32,
+        session_id: Option<i32>,
     ) -> Result<Option<i64>, LogError> {
         // This runs on every poll tick in `find_or_start_recording`'s
         // wait loop. `for_each_recording_of_stream` releases its leaked
@@ -596,6 +746,9 @@ impl Recorder {
         // tick never leaks a boxed consumer.
         let mut latest: Option<i64> = None;
         archive.for_each_recording_of_stream(stream_id, |desc| {
+            if session_id.is_some_and(|s| s != desc.session_id()) {
+                return;
+            }
             let id = desc.recording_id();
             latest = Some(latest.map_or(id, |cur| cur.max(id)));
         })?;
