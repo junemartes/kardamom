@@ -508,7 +508,7 @@ impl ReceiptFloorFeed {
             biased;
             () = shutdown.cancelled() => return ControlFlow::Break(()),
             msg = rx.recv_batch() => match msg {
-                Some((_pos, batch)) => batch,
+                Some((_, batch)) => batch,
                 // The subscription closed. The runtime shut down.
                 // Nothing more to feed.
                 None => return ControlFlow::Break(()),

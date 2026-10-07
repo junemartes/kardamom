@@ -485,6 +485,13 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
 
 - Trigger: any divergence. Examples are re-executed receipts or a BAL that disagree with the executor, or an MPT state-root mismatch.
+- Every executor replica publishes its own BAL and receipts. The validator compares the result of **every** replica with its own re-execution. The arrival order does not matter.
+  - The re-execution of the validator is the reference. A replica whose result differs is a divergence, also when the other replicas agree with the validator.
+  - Such a divergence halts the validator, like any other divergence. A wrong executor must never pass silently, and the consumers of `tx_receipts` can read the receipts of any replica.
+  - The divergence names the replica: the Aeron session id of its publication. The verdict, the halt detail, and the log line carry it, and `validator_replica_divergence_total{replica, check}` counts it. The executor logs its session ids at start (`tx_bal publication open`, `tx_receipts publication open`).
+  - A replica result that arrives after the check of its key is still compared. The validator keeps the checked result of the last 64 blocks and the last 4096 receipts for this. A result below that window counts in `validator_replica_results_unchecked_total`.
+  - The account rows of a replica are compared only when they arrive before the validator passes their position. Later rows count as unverified (`validator_rows_unverified_total`).
+  - Proof: the unit tests of `seams_tests.rs`. A wrong BAL or receipt that arrives first, last, or after the check halts and names its replica. Three agreeing replicas pass.
 - Effect: the validator holds the `validator_divergence` halt (see "Halts and service events").
   - It serves its exporter and the `/halt` record. It makes no progress.
   - `/ready` fails. The gauge `validator_verdict_standing` is 1.

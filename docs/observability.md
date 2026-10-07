@@ -454,6 +454,26 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
 `_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
 
+### Validator replica checks
+
+Every executor replica publishes its own BAL on `tx_bal` and its own receipts on `tx_receipts`.
+The validator compares the result of every replica with its own re-execution.
+The Aeron session id of the publication names the replica.
+
+| Metric | Meaning |
+|---|---|
+| `validator_replica_divergence_total{replica, check}` | Proven divergences by the replica they name. `replica` is the session id. `check` is `bal`, `receipt`, or `rows`. |
+| `validator_replica_results_checked_total{check}` | Replica results that matched the re-execution. With N replicas, this grows about N times as fast as `validator_blocks_verified_total` (`check="bal"`). |
+| `validator_replica_results_unchecked_total{check}` | Replica results that the validator never compared. Not a fault. |
+
+- A result is unchecked in three cases:
+  - It arrives below the check window: 64 blocks for a BAL, 4096 canonical records for a receipt.
+  - It repeats a result of the same replica for the same key.
+  - Its key already holds results from 8 replicas.
+- Steady growth of the unchecked counter means a replica lags the validator by more than the window.
+- The executor logs the session ids at start: `tx_bal publication open` and `tx_receipts publication open`, with the field `session`.
+  With discovery, the publisher record in the catalog carries the same id in its `session_id` meta.
+
 ## Log lines for diagnosis
 
 Some services have no metrics for their key events. Their log lines are the diagnosis tool.

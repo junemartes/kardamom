@@ -11,7 +11,7 @@ use kardamom_log::config::ChannelUri;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{SnapshotReceiver, StateSnapshot};
 use kardamom_validator::attester::AttesterHandle;
-use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
+use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, ReplicaId, metrics};
 use tokio_util::sync::CancellationToken;
 
 /// Silence window on `tx_bal` before the pump reopens the subscription.
@@ -128,10 +128,10 @@ impl BalPump {
             biased;
             // Release the runtime clone promptly on shutdown.
             () = self.shutdown.cancelled() => return None,
-            r = tokio::time::timeout(BAL_SILENCE_REOPEN, self.bal_rx.recv()) => r,
+            r = tokio::time::timeout(BAL_SILENCE_REOPEN, self.bal_rx.recv_from()) => r,
         };
-        let frame = match recv {
-            Ok(Some((_pos, frame))) => frame,
+        let (session, frame) = match recv {
+            Ok(Some(received)) => received,
             Ok(None) => return None, // The runtime is shutting down.
             Err(_) => {
                 self.on_silence();
@@ -139,7 +139,10 @@ impl BalPump {
             }
         };
         self.index_claims(&frame);
-        self.bals.insert(frame.delta().clone());
+        // The publication's session names the replica, so a divergence
+        // can name it too.
+        self.bals
+            .insert(ReplicaId::from_session(session), frame.delta().clone());
         Some(())
     }
 
@@ -287,16 +290,18 @@ impl ReceiptsPump {
         while self.step().await.is_some() {}
     }
 
-    /// One receive step. Returns `None` once shutdown is requested or the
-    /// sender side is gone, either of which releases this task's
-    /// `AeronRuntime` clone.
+    /// One receive step. The frame's publication session names the
+    /// replica that published it. Returns `None` once shutdown is
+    /// requested or the sender side is gone, either of which releases
+    /// this task's `AeronRuntime` clone.
     async fn step(&mut self) -> Option<()> {
         let next = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => return None,
             r = self.rx.recv_batch() => r,
         };
-        let (_pos, batch) = next?;
+        let (session, batch) = next?;
+        let replica = ReplicaId::from_session(session);
         let end = batch.end_tx_idx();
         let kardamom_types::ReceiptBatch { receipts, accounts } = batch;
         // Rows first, so the commit thread finds them whenever it finds
@@ -304,10 +309,10 @@ impl ReceiptsPump {
         if let Some(end) = end
             && !accounts.is_empty()
         {
-            self.receipts.insert_rows(end, accounts);
+            self.receipts.insert_rows(replica, end, accounts);
         }
         for r in receipts {
-            self.receipts.insert(r);
+            self.receipts.insert(replica, r);
         }
         Some(())
     }

@@ -582,6 +582,16 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
     pub fn try_recv(&mut self) -> Option<(BPosition, T)> {
         try_recv_decoded(&mut self.rx, decode_typed_frame)
     }
+
+    /// The next frame, with the Aeron session id of its publication. Each
+    /// publisher process opens its own publication, so the session tells
+    /// apart the publishers of one stream.
+    pub async fn recv_from(&mut self) -> Option<(i32, T)> {
+        recv_decoded(&mut self.rx, |frame| {
+            decode_typed_frame(frame).map_break(|(_, v)| (frame.session, v))
+        })
+        .await
+    }
 }
 
 /// Decode one `tx_data` fragment as a `TxEnvelope`, pairing it with a

@@ -32,6 +32,11 @@ pub(crate) async fn open_tx_receipts_pub(
         .tx_receipts_publisher(rt_pub, args.recorder_id)
         .await
         .context("open TxReceiptsPublisherHandle")?;
+    // A validator names a divergent replica by this session id.
+    tracing::info!(
+        session = handle.session_id(),
+        "tx_receipts publication open"
+    );
     Ok(LiveTxReceiptsPub { handle })
 }
 
