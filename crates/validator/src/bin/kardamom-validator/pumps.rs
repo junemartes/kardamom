@@ -141,8 +141,12 @@ impl BalPump {
         self.index_claims(&frame);
         // The publication's session names the replica, so a divergence
         // can name it too.
-        self.bals
-            .insert(ReplicaId::from_session(session), frame.delta().clone());
+        let delta = frame.delta();
+        self.bals.insert(
+            delta.block_number,
+            ReplicaId::from_session(session),
+            delta.clone(),
+        );
         Some(())
     }
 
@@ -309,10 +313,10 @@ impl ReceiptsPump {
         if let Some(end) = end
             && !accounts.is_empty()
         {
-            self.receipts.insert_rows(replica, end, accounts);
+            self.receipts.rows.insert(end, replica, accounts);
         }
         for r in receipts {
-            self.receipts.insert(replica, r);
+            self.receipts.receipts.insert(r.tx_idx, replica, r);
         }
         Some(())
     }

@@ -8,6 +8,16 @@ const R1: ReplicaId = ReplicaId::from_session(11);
 const R2: ReplicaId = ReplicaId::from_session(22);
 const R3: ReplicaId = ReplicaId::from_session(33);
 
+/// Publish `replica`'s BAL for `block` with balance `bal_val`.
+fn bal(bals: &BalBuffer, replica: ReplicaId, block: u64, bal_val: u64) {
+    bals.insert(block, replica, delta(block, bal_val));
+}
+
+/// Publish `replica`'s receipt.
+fn publish(buf: &ReceiptBuffer, replica: ReplicaId, receipt: Receipt) {
+    buf.receipts.insert(receipt.tx_idx, replica, receipt);
+}
+
 fn delta(block: u64, bal_val: u64) -> BlockDelta {
     BlockDelta {
         block_number: block,
@@ -67,8 +77,8 @@ fn item(idx: u64, rows: Vec<AccountRow>) -> ReceiptRows {
 fn sink_with_two_receipts() -> (Arc<ReceiptBuffer>, Arc<Divergence>, ValidatorReceiptSink) {
     let buf = ReceiptBuffer::new();
     let div = Divergence::new();
-    buf.insert(R1, receipt(0, true, 21_000, 0xab));
-    buf.insert(R1, receipt(1, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(1, true, 21_000, 0xab));
     let sink =
         ValidatorReceiptSink::new(buf.clone(), div.clone()).with_wait(Duration::from_millis(50));
     (buf, div, sink)
@@ -79,9 +89,9 @@ fn matching_rows_pass_and_a_forged_row_halts() {
     let (buf, div, mut sink) = sink_with_two_receipts();
     // The batch [0, 1] ends at 1. Account 0x11 was last written at 0,
     // so its row is checked against the value recorded there.
-    buf.insert_rows(
-        R1,
+    buf.rows.insert(
         BPosition::from_index(1),
+        R1,
         vec![row(0x11, 1), row(0x22, 2)],
     );
     let (n, err) =
@@ -91,8 +101,9 @@ fn matching_rows_pass_and_a_forged_row_halts() {
 
     // A published row that disagrees with the local state at its
     // position is a proven divergence.
-    buf.insert(R1, receipt(2, true, 21_000, 0xab));
-    buf.insert_rows(R1, BPosition::from_index(2), vec![row(0x11, 9)]);
+    publish(&buf, R1, receipt(2, true, 21_000, 0xab));
+    buf.rows
+        .insert(BPosition::from_index(2), R1, vec![row(0x11, 9)]);
     let (n, err) = sink.publish_receipts(&[item(2, vec![row(0x22, 3)])]);
     assert_eq!(n, 0);
     assert!(matches!(err, Some(ExecutorError::Divergence(_))));
@@ -103,10 +114,12 @@ fn matching_rows_pass_and_a_forged_row_halts() {
 fn unknown_account_and_bare_receipt_leave_rows_unverified() {
     let (buf, div, mut sink) = sink_with_two_receipts();
     // A row for an account this validator never wrote: unverified.
-    buf.insert_rows(R1, BPosition::from_index(0), vec![row(0x33, 5)]);
+    buf.rows
+        .insert(BPosition::from_index(0), R1, vec![row(0x33, 5)]);
     // Rows at a position whose local receipt carries none (the
     // parallel-validation shape): unverified, even when they differ.
-    buf.insert_rows(R1, BPosition::from_index(1), vec![row(0x11, 9)]);
+    buf.rows
+        .insert(BPosition::from_index(1), R1, vec![row(0x11, 9)]);
     let (n, err) = sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, Vec::new())]);
     assert_eq!((n, err.is_none()), (2, true));
     assert!(!div.is_halted());
@@ -139,7 +152,7 @@ fn matching_bal_forwards_and_does_not_diverge() {
     };
     let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
 
-    bals.insert(R1, delta(1, 100));
+    bal(&bals, R1, 1, 100);
     q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
 
     assert!(!div.is_halted());
@@ -153,7 +166,7 @@ fn mismatched_bal_fail_stops() {
     let inner = RecordingQueue::default();
     let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
 
-    bals.insert(R1, delta(1, 100)); // The BAL has balance 100.
+    bal(&bals, R1, 1, 100); // The BAL has balance 100.
     // The local delta has 999.
     let err = q
         .submit(boundary(1), delta(1, 999), Vec::new())
@@ -188,14 +201,14 @@ fn consistent_receipt_passes_inconsistent_fails() {
     let mut sink =
         ValidatorReceiptSink::new(buf.clone(), div.clone()).with_wait(Duration::from_millis(50));
 
-    buf.insert(R1, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(0, true, 21_000, 0xab));
     // The execution-correctness fields match, so the check passes.
     sink.publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
         .unwrap();
     assert!(!div.is_halted());
 
     // The write_set_hash values differ, so the process must stop.
-    buf.insert(R1, receipt(1, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(1, true, 21_000, 0xab));
     let err = sink
         .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
         .unwrap_err();
@@ -254,7 +267,7 @@ fn receipt_mismatch_dumps_flight_ring() {
         .with_wait(Duration::from_millis(50))
         .with_flight(ring);
 
-    buf.insert(R1, receipt(3, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(3, true, 21_000, 0xab));
     let err = sink
         .publish(CMessage::Receipt(receipt(3, true, 21_000, 0xff)))
         .unwrap_err();
@@ -300,7 +313,7 @@ fn log_only_divergence_fail_stops() {
     let mut local = receipt(0, true, 21_000, 0xab);
     local.logs = vec![log(0x02)];
 
-    buf.insert(R1, published);
+    publish(&buf, R1, published);
     let err = sink.publish(CMessage::Receipt(local)).unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
     assert!(div.is_halted());
@@ -328,18 +341,15 @@ fn receipt_sink() -> (Arc<ReceiptBuffer>, Arc<Divergence>, ValidatorReceiptSink)
     (buf, div, sink)
 }
 
-/// Assert that the standing divergence names `replica` on `check`: in
-/// the attribution and at the end of the reason.
-fn assert_names(div: &Divergence, replica: ReplicaId, check: Check) {
+/// Assert that the standing divergence names exactly the sessions
+/// `differ` on `check`, in the attribution and at the end of the reason.
+fn assert_names(div: &Divergence, differ: &[ReplicaId], check: Check) -> Attribution {
     assert!(div.is_halted());
-    assert_eq!(div.replica(), Some(Attribution { replica, check }));
-    let tag = format!(
-        "[replica session {} on {}]",
-        replica.session(),
-        check.stream()
-    );
+    let a = div.replica().expect("a replica attribution");
+    assert_eq!((a.check, a.differ.as_slice()), (check, differ));
     let reason = div.reason().unwrap();
-    assert!(reason.ends_with(&tag), "{reason}");
+    assert!(reason.ends_with(&format!("[{a}]")), "{reason}");
+    a
 }
 
 // Three replicas, and the wrong BAL arrives first. A buffer that keeps
@@ -347,27 +357,27 @@ fn assert_names(div: &Divergence, replica: ReplicaId, check: Check) {
 #[test]
 fn a_wrong_bal_that_arrives_first_halts() {
     let (bals, div, mut q) = bal_queue();
-    bals.insert(R1, delta(1, 999));
-    bals.insert(R2, delta(1, 100));
-    bals.insert(R3, delta(1, 100));
+    bal(&bals, R1, 1, 999);
+    bal(&bals, R2, 1, 100);
+    bal(&bals, R3, 1, 100);
     let err = q
         .submit(boundary(1), delta(1, 100), Vec::new())
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
-    assert_names(&div, R1, Check::Bal);
+    assert_names(&div, &[R1], Check::Bal);
 }
 
 #[test]
 fn a_wrong_bal_that_arrives_last_halts() {
     let (bals, div, mut q) = bal_queue();
-    bals.insert(R1, delta(1, 100));
-    bals.insert(R2, delta(1, 100));
-    bals.insert(R3, delta(1, 999));
+    bal(&bals, R1, 1, 100);
+    bal(&bals, R2, 1, 100);
+    bal(&bals, R3, 1, 999);
     let err = q
         .submit(boundary(1), delta(1, 100), Vec::new())
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
-    assert_names(&div, R3, Check::Bal);
+    assert_names(&div, &[R3], Check::Bal);
 }
 
 // A wrong BAL that arrives after its block's check is compared with the
@@ -375,16 +385,16 @@ fn a_wrong_bal_that_arrives_last_halts() {
 #[test]
 fn a_wrong_bal_after_the_check_halts_at_the_next_block() {
     let (bals, div, mut q) = bal_queue();
-    bals.insert(R1, delta(1, 100));
+    bal(&bals, R1, 1, 100);
     q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
-    bals.insert(R2, delta(1, 100));
-    bals.insert(R3, delta(1, 999));
-    bals.insert(R1, delta(2, 100));
+    bal(&bals, R2, 1, 100);
+    bal(&bals, R3, 1, 999);
+    bal(&bals, R1, 2, 100);
     let err = q
         .submit(boundary(2), delta(2, 100), Vec::new())
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
-    assert_names(&div, R3, Check::Bal);
+    assert_names(&div, &[R3], Check::Bal);
     assert!(
         div.reason()
             .unwrap()
@@ -399,29 +409,29 @@ fn a_bal_after_the_wait_is_still_checked() {
     let (bals, div, mut q) = bal_queue();
     q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
     assert!(!div.is_halted());
-    bals.insert(R1, delta(1, 999));
-    bals.insert(R1, delta(2, 100));
+    bal(&bals, R1, 1, 999);
+    bal(&bals, R1, 2, 100);
     q.submit(boundary(2), delta(2, 100), Vec::new())
         .unwrap_err();
-    assert_names(&div, R1, Check::Bal);
+    assert_names(&div, &[R1], Check::Bal);
 }
 
 #[test]
 fn three_agreeing_replicas_pass() {
     let (bals, div, mut q) = bal_queue();
     for r in [R1, R2, R3] {
-        bals.insert(r, delta(1, 100));
+        bal(&bals, r, 1, 100);
     }
     q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
     let (buf, _, mut sink) = receipt_sink();
     for r in [R1, R2, R3] {
-        buf.insert(r, receipt(0, true, 21_000, 0xab));
+        publish(&buf, r, receipt(0, true, 21_000, 0xab));
     }
     sink.publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
         .unwrap();
     // The next block passes too: block 1 left no late result behind.
     for r in [R1, R2, R3] {
-        bals.insert(r, delta(2, 100));
+        bal(&bals, r, 2, 100);
     }
     q.submit(boundary(2), delta(2, 100), Vec::new()).unwrap();
     assert!(!div.is_halted());
@@ -432,14 +442,14 @@ fn three_agreeing_replicas_pass() {
 #[test]
 fn a_wrong_receipt_that_arrives_first_halts() {
     let (buf, div, mut sink) = receipt_sink();
-    buf.insert(R1, receipt(0, true, 21_000, 0xff));
-    buf.insert(R2, receipt(0, true, 21_000, 0xab));
-    buf.insert(R3, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R1, receipt(0, true, 21_000, 0xff));
+    publish(&buf, R2, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R3, receipt(0, true, 21_000, 0xab));
     let err = sink
         .publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
-    assert_names(&div, R1, Check::Receipt);
+    assert_names(&div, &[R1], Check::Receipt);
 }
 
 // Two replicas disagree with each other. The validator's re-execution
@@ -448,30 +458,31 @@ fn a_wrong_receipt_that_arrives_first_halts() {
 #[test]
 fn replicas_that_disagree_name_the_wrong_one() {
     let (buf, div, mut sink) = receipt_sink();
-    buf.insert(R1, receipt(0, true, 21_000, 0xab));
-    buf.insert(R2, receipt(0, true, 21_000, 0xff));
+    publish(&buf, R1, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R2, receipt(0, true, 21_000, 0xff));
     let err = sink
         .publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
         .unwrap_err();
     assert!(matches!(err, ExecutorError::Divergence(_)));
-    assert_names(&div, R2, Check::Receipt);
+    assert_names(&div, &[R2], Check::Receipt);
     assert!(div.reason().unwrap().contains("receipt mismatch at tx_idx"));
 }
 
 #[test]
 fn wrong_rows_name_the_replica() {
     let (buf, div, mut sink) = sink_with_two_receipts();
-    buf.insert_rows(
-        R1,
+    buf.rows.insert(
         BPosition::from_index(1),
+        R1,
         vec![row(0x11, 1), row(0x22, 2)],
     );
-    buf.insert_rows(R2, BPosition::from_index(1), vec![row(0x11, 9)]);
+    buf.rows
+        .insert(BPosition::from_index(1), R2, vec![row(0x11, 9)]);
     let (n, err) =
         sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, vec![row(0x22, 2)])]);
     assert_eq!(n, 1);
     assert!(matches!(err, Some(ExecutorError::Divergence(_))));
-    assert_names(&div, R2, Check::Rows);
+    assert_names(&div, &[R2], Check::Rows);
 }
 
 // The validator keeps the checked write-sets of the check window only.
@@ -482,16 +493,121 @@ fn checked_results_stay_inside_the_window() {
     let (bals, div, mut q) = bal_queue();
     let last = BalBuffer::CHECK_WINDOW * 3;
     (1..=last).for_each(|b| {
-        bals.insert(R1, delta(b, 100));
+        bal(&bals, R1, b, 100);
         q.submit(boundary(b), delta(b, 100), Vec::new()).unwrap();
     });
     assert_eq!(
         q.checked.len(),
         usize::try_from(BalBuffer::CHECK_WINDOW + 1).unwrap()
     );
-    bals.insert(R2, delta(1, 999));
-    bals.insert(R1, delta(last + 1, 100));
+    bal(&bals, R2, 1, 999);
+    bal(&bals, R1, last + 1, 100);
     q.submit(boundary(last + 1), delta(last + 1, 100), Vec::new())
         .unwrap();
     assert!(!div.is_halted());
+}
+
+// A replica that restarts and replays a block publishes its result again
+// under a new session. The late result agrees, so it passes.
+#[test]
+fn a_late_result_from_a_new_session_that_agrees_passes() {
+    let (bals, div, mut q) = bal_queue();
+    bal(&bals, R1, 1, 100);
+    q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
+    bal(&bals, ReplicaId::from_session(44), 1, 100);
+    bal(&bals, R1, 2, 100);
+    q.submit(boundary(2), delta(2, 100), Vec::new()).unwrap();
+    assert!(!div.is_halted());
+}
+
+// A correct replica that restarts in a loop publishes the same bytes
+// under ever new sessions. They share one entry, so they never push out
+// the wrong result of another replica.
+#[test]
+fn a_restart_storm_does_not_push_out_a_wrong_result() {
+    let (bals, div, mut q) = bal_queue();
+    bal(&bals, R1, 1, 999);
+    (100..300i32).for_each(|s| bal(&bals, ReplicaId::from_session(s), 1, 100));
+    q.submit(boundary(1), delta(1, 100), Vec::new())
+        .unwrap_err();
+    let a = assert_names(&div, &[R1], Check::Bal);
+    assert!(!a.validator_suspect());
+}
+
+// Two replicas on one media driver publish under one session. A wrong
+// result under the shared session is compared, not dropped as a repeat.
+#[test]
+fn two_replicas_sharing_one_session_are_both_compared() {
+    let (bals, div, mut q) = bal_queue();
+    bal(&bals, R1, 1, 100);
+    bal(&bals, R1, 1, 999);
+    q.submit(boundary(1), delta(1, 100), Vec::new())
+        .unwrap_err();
+    let a = assert_names(&div, &[R1], Check::Bal);
+    assert_eq!(a.agree, vec![R1]);
+}
+
+// A session that already agreed and then publishes a different result
+// for the same key (a late repeat) is compared too.
+#[test]
+fn a_late_repeat_with_a_different_value_is_compared() {
+    let (bals, div, mut q) = bal_queue();
+    bal(&bals, R1, 1, 100);
+    q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
+    bal(&bals, R1, 1, 999);
+    bal(&bals, R1, 2, 100);
+    q.submit(boundary(2), delta(2, 100), Vec::new())
+        .unwrap_err();
+    assert_names(&div, &[R1], Check::Bal);
+}
+
+// Every differing session of the key is named, with the count of those
+// that agree.
+#[test]
+fn every_differing_replica_is_named() {
+    let (buf, div, mut sink) = receipt_sink();
+    publish(&buf, R1, receipt(0, true, 21_000, 0xff));
+    publish(&buf, R2, receipt(0, true, 21_000, 0xab));
+    publish(&buf, R3, receipt(0, true, 21_000, 0xee));
+    sink.publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
+        .unwrap_err();
+    let a = assert_names(&div, &[R1, R3], Check::Receipt);
+    assert_eq!(a.agree, vec![R2]);
+    assert!(
+        div.reason()
+            .unwrap()
+            .contains("[2 of 3 replica sessions differ")
+    );
+}
+
+// Every replica differs from the validator, and the replicas agree with
+// each other: the verdict says that the validator is the suspect.
+#[test]
+fn all_replicas_differ_and_agree_makes_the_validator_the_suspect() {
+    let (bals, div, mut q) = bal_queue();
+    for r in [R1, R2, R3] {
+        bal(&bals, r, 1, 999);
+    }
+    q.submit(boundary(1), delta(1, 100), Vec::new())
+        .unwrap_err();
+    let a = assert_names(&div, &[R1, R2, R3], Check::Bal);
+    assert!(a.validator_suspect());
+    assert!(
+        div.reason()
+            .unwrap()
+            .contains("so the validator is the suspect")
+    );
+}
+
+// Every replica differs, but the replicas also differ from each other:
+// no side is the suspect from the counts alone.
+#[test]
+fn all_replicas_differ_from_each_other_names_them_all() {
+    let (bals, div, mut q) = bal_queue();
+    bal(&bals, R1, 1, 997);
+    bal(&bals, R2, 1, 998);
+    q.submit(boundary(1), delta(1, 100), Vec::new())
+        .unwrap_err();
+    let a = assert_names(&div, &[R1, R2], Check::Bal);
+    assert!(!a.validator_suspect());
 }

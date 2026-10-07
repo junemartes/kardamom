@@ -25,8 +25,9 @@
 //! wait briefly for the matching data to arrive.
 //!
 //! Every executor replica publishes its own BAL and receipts. The seams
-//! compare the result of every replica, and a divergence names the
-//! replica whose result differs ([`Attribution`]).
+//! compare the result of every replica. A divergence names every replica
+//! session whose result differs, and counts the ones that agree
+//! ([`Attribution`]).
 //!
 //! Module layout: the seams are in `seams.rs`, their verification buffers
 //! are in `buffers.rs`, and the per-replica check is in `replica.rs`. All
@@ -71,7 +72,7 @@ mod replica;
 mod seams;
 
 pub use buffers::*;
-pub use replica::{Arrival, Attribution, Check, ReplicaId, Taken};
+pub use replica::{Attribution, Check, Distinct, ReplicaId, Taken};
 pub use seams::*;
 
 /// Shared divergence flag. Once set, the validator has found a proven
@@ -81,8 +82,8 @@ pub use seams::*;
 pub struct Divergence {
     halted: AtomicBool,
     reason: OnceLock<String>,
-    /// The replica that the first divergence names, when a replica's
-    /// result proved it.
+    /// The replicas that the first divergence names, when replica results
+    /// proved it.
     replica: OnceLock<Attribution>,
 }
 
@@ -106,8 +107,9 @@ impl Divergence {
         }
         tracing::error!(
             reason = %reason,
-            replica = replica.map(|a| a.replica.session()),
-            check = replica.map(|a| a.check.id()),
+            replicas = replica.as_ref().map(Attribution::sessions).as_deref(),
+            check = replica.as_ref().map(|a| a.check.id()),
+            validator_suspect = replica.as_ref().map(Attribution::validator_suspect),
             "validator divergence detected — halting"
         );
         let _ = self.reason.set(reason);
@@ -115,8 +117,8 @@ impl Divergence {
         let Some(attribution) = replica else {
             return;
         };
+        metrics::counter_replica_divergence(&attribution);
         let _ = self.replica.set(attribution);
-        metrics::counter_replica_divergence(attribution);
     }
 
     #[must_use]
@@ -149,21 +151,21 @@ impl Divergence {
         reason
     }
 
-    /// [`halt`](Self::halt) for a divergence that a replica's result
-    /// proves. The reason ends with the replica, so the verdict file and
-    /// the halt record name it too.
+    /// [`halt`](Self::halt) for a divergence that replica results prove.
+    /// The reason ends with the attribution, so the verdict file and the
+    /// halt record name the replicas too.
     pub fn halt_replica(&self, attribution: Attribution, detail: &str) -> String {
         let reason = format!("{detail} [{attribution}]");
         self.latch(reason.clone(), Some(attribution));
         reason
     }
 
-    /// The replica that the recorded divergence names. `None` when no
+    /// The replicas that the recorded divergence names. `None` when no
     /// divergence stands, or when no replica result proved it (an epoch
     /// fault, a forged record).
     #[must_use]
     pub fn replica(&self) -> Option<Attribution> {
-        self.replica.get().copied()
+        self.replica.get().cloned()
     }
 }
 

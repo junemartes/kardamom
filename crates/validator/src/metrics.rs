@@ -2,7 +2,7 @@
 //! of the other services: thin wrappers over the `metrics` facade, so the
 //! call sites stay readable and the names live in one place.
 
-use crate::replica::{Attribution, Check};
+use crate::replica::{Attribution, Check, Skip};
 
 const DIVERGENCE_TOTAL: &str = "validator_divergence_total";
 const BLOCKS_VERIFIED_TOTAL: &str = "validator_blocks_verified_total";
@@ -15,16 +15,18 @@ const ROWS_VERIFIED_TOTAL: &str = "validator_rows_verified_total";
 /// account with no recorded local value, or rows at a position whose
 /// local receipt carried none. Not a fault.
 const ROWS_UNVERIFIED_TOTAL: &str = "validator_rows_unverified_total";
-/// Proven divergences, one for each replica that a divergence names,
+/// Proven divergences, one for each session that a divergence names,
 /// labeled `replica` (the Aeron session id) and `check`.
 const REPLICA_DIVERGENCE_TOTAL: &str = "validator_replica_divergence_total";
 /// Replica results that agreed with the local re-execution, labeled
 /// `check`. With N replicas, this grows about N times as fast as the
 /// verified count.
 const REPLICA_RESULTS_CHECKED_TOTAL: &str = "validator_replica_results_checked_total";
-/// Replica results that were never compared, labeled `check`: a result
-/// below the check window, a repeat of one replica for one key, or a
-/// result over the bound of replicas for one key. Not a fault.
+/// Replica results that do not count as checked, labeled `check` and
+/// `reason`: `late` (below the check window), `repeat` (a session repeats
+/// a result it published), `bound` (over the bound of distinct results or
+/// sessions of a key), `evicted` (the buffer was full), `ahead` (the key
+/// is beyond the reach above the cursor). Not a fault.
 const REPLICA_RESULTS_UNCHECKED_TOTAL: &str = "validator_replica_results_unchecked_total";
 pub const COMMITTED_BLOCK: &str = "validator_committed_block";
 /// 1 while a divergence verdict stands in the verdict file beside the
@@ -91,7 +93,7 @@ pub fn describe() {
     );
     metrics::describe_counter!(
         REPLICA_RESULTS_UNCHECKED_TOTAL,
-        "Executor replica results that were never compared: too late, a repeat, or over the bound"
+        "Executor replica results that do not count as checked (reason=late|repeat|bound|evicted|ahead)"
     );
     metrics::describe_counter!(
         FEED_SUBSCRIPTION_REJECTED_TOTAL,
@@ -143,26 +145,36 @@ pub fn counter_divergence() {
     metrics::counter!(DIVERGENCE_TOTAL).increment(1);
 }
 
-/// Count a divergence that names a replica.
-pub fn counter_replica_divergence(attribution: Attribution) {
+/// Count a divergence once for each session it names.
+pub fn counter_replica_divergence(attribution: &Attribution) {
+    for replica in &attribution.differ {
+        metrics::counter!(
+            REPLICA_DIVERGENCE_TOTAL,
+            "replica" => replica.session().to_string(),
+            "check" => attribution.check.id()
+        )
+        .increment(1);
+    }
+}
+
+/// Count `n` replica results that agreed with the re-execution.
+pub fn counter_replica_checked(check: Check, n: usize) {
+    metrics::counter!(REPLICA_RESULTS_CHECKED_TOTAL, "check" => check.id()).increment(n as u64);
+}
+
+/// Count `n` replica results that do not count as checked, for `skip`.
+pub(crate) fn counter_replica_unchecked(check: Check, skip: Skip, n: usize) {
     metrics::counter!(
-        REPLICA_DIVERGENCE_TOTAL,
-        "replica" => attribution.replica.session().to_string(),
-        "check" => attribution.check.id()
+        REPLICA_RESULTS_UNCHECKED_TOTAL,
+        "check" => check.id(),
+        "reason" => skip.id()
     )
-    .increment(1);
+    .increment(n as u64);
 }
 
-pub fn counter_replica_checked(check: Check) {
-    metrics::counter!(REPLICA_RESULTS_CHECKED_TOTAL, "check" => check.id()).increment(1);
-}
-
-pub fn counter_replica_unchecked(check: Check) {
-    metrics::counter!(REPLICA_RESULTS_UNCHECKED_TOTAL, "check" => check.id()).increment(1);
-}
-
-pub fn counter_rows_verified() {
-    metrics::counter!(ROWS_VERIFIED_TOTAL).increment(1);
+/// Count `n` replica batches whose rows matched the local state.
+pub fn counter_rows_verified(n: usize) {
+    metrics::counter!(ROWS_VERIFIED_TOTAL).increment(n as u64);
 }
 
 /// Count `n` replica batches whose rows could not be checked.

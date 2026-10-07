@@ -485,13 +485,17 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
 
 - Trigger: any divergence. Examples are re-executed receipts or a BAL that disagree with the executor, or an MPT state-root mismatch.
-- Every executor replica publishes its own BAL and receipts. The validator compares the result of **every** replica with its own re-execution. The arrival order does not matter.
+- Every executor replica publishes its own BAL and receipts. The validator compares the BAL and the receipts of **every** replica with its own re-execution. The arrival order does not matter.
   - The re-execution of the validator is the reference. A replica whose result differs is a divergence, also when the other replicas agree with the validator.
   - Such a divergence halts the validator, like any other divergence. A wrong executor must never pass silently, and the consumers of `tx_receipts` can read the receipts of any replica.
-  - The divergence names the replica: the Aeron session id of its publication. The verdict, the halt detail, and the log line carry it, and `validator_replica_divergence_total{replica, check}` counts it. The executor logs its session ids at start (`tx_bal publication open`, `tx_receipts publication open`).
-  - A replica result that arrives after the check of its key is still compared. The validator keeps the checked result of the last 64 blocks and the last 4096 receipts for this. A result below that window counts in `validator_replica_results_unchecked_total`.
-  - The account rows of a replica are compared only when they arrive before the validator passes their position. Later rows count as unverified (`validator_rows_unverified_total`).
-  - Proof: the unit tests of `seams_tests.rs`. A wrong BAL or receipt that arrives first, last, or after the check halts and names its replica. Three agreeing replicas pass.
+  - The validator compares every result of the key before it halts. The verdict names every differing session, and says how many agree: `[k of n replica sessions differ on <stream>: session <id>, ...]`. When every session differs and all of them published one result, the verdict says that the validator is the suspect.
+  - A replica is named by the Aeron session id of its publication. The verdict, the halt detail, and the log line carry it, and `validator_replica_divergence_total{replica, check}` counts each named session. The executor logs its session ids at start (`tx_bal publication open`, `tx_receipts publication open`).
+  - A session can name two processes: two replicas on one media driver, or a restart that attaches to a live publication. The buffers keep every distinct result of a session, so a shared session cannot hide a wrong result.
+  - The buffers keep each distinct result once, with the sessions that published it. A replica that restarts in a loop and republishes the same bytes takes no extra space, so it cannot push out a wrong result.
+  - A replica result that arrives after the check of its key is still compared. The validator keeps the checked result of the last 64 blocks and the last 4096 receipts for this.
+  - Every result that is not compared counts in `validator_replica_results_unchecked_total{check, reason}`: below the window, a repeat, over a bound, evicted, or a key beyond the reach above the cursor (2^20 blocks, 2^32 receipts).
+  - Account rows are weaker. The rows of a replica are compared only when they arrive before the validator passes their position. Replicas end their batches at different positions, so later rows have no local state to compare with. They count as unverified (`validator_rows_unverified_total`).
+  - Proof: the unit tests of `seams_tests.rs` and `buffers_tests.rs`. A wrong BAL or receipt that arrives first, last, after the check, or under a shared session halts and names every differing session. Three agreeing replicas and a restart replay pass. A restart storm does not push out a wrong result.
 - Effect: the validator holds the `validator_divergence` halt (see "Halts and service events").
   - It serves its exporter and the `/halt` record. It makes no progress.
   - `/ready` fails. The gauge `validator_verdict_standing` is 1.
@@ -500,7 +504,8 @@ The failure philosophy is inverted here: **halting is the feature**. A divergenc
 - Recovery: follow the runbook [`validator_divergence`](runbooks/validator_divergence.md), then clear the halt in one of two ways.
   - `POST /halt/clear` on the node of the validator.
   - `kardamom-validator --state-dir <dir> --clear-verdict`.
-  - Either clear ends both the halt and the verdict file. The validator resumes from its cursor and verifies the block again.
+  - Either clear ends both the halt and the verdict file. The validator resumes from its cursor.
+  - A divergence that replica results proved is not checked again. The resumed run opens new buffers, and the streams do not replay. The halted block, and every block published during the halt, commit unverified. The runbook says what to do before the clear.
 - Proof: the chain-semantics test `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta` on the real `tx_bal` channel. The executor is stopped with SIGSTOP, so nothing competes. The test asserts the halting log line and the halt record with the divergence cause.
 - The validator exits on SIGTERM. The graceful shutdown of the chain-semantics suite bounds it at 20 s.
 - The attester is on only when `--output-oracle` and `--attester-key` are both set. It then needs `--l1-rpc-url`.
@@ -542,7 +547,7 @@ A divergence is a state, not a dead process.
 
 - **Behind the head** (a fresh start against a running chain, or a restart)
   - The per-block BALs ride a lossy `tx_bal` multicast. Its term buffer holds only the recent window.
-  - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL.
+  - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL. The live head is a run of at least 4 buffered blocks beyond that distance, so one wrong block number far ahead does not turn the skip on.
   - The validator **commits such a block unverified at once**. It does not wait the full BAL timeout for each block, because that wait would make the catch-up slower than the chain grows.
   - Continuous verification is a property of a validator that is caught up, at the head.
 - **Brief lapse** (a pause or stall shorter than the live term buffer)

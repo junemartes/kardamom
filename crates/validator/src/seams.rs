@@ -18,7 +18,7 @@ use kardamom_types::{
 };
 
 use crate::buffers::{BalBuffer, ReceiptBuffer};
-use crate::replica::{Arrival, Attribution, Check, Checked, Compared, Mismatch, Taken};
+use crate::replica::{Attribution, Check, Checked, Compared, Distinct, Mismatch, Taken};
 use crate::{Divergence, metrics};
 
 /// How long the exec thread waits for a block's BAL before it skips the check.
@@ -154,7 +154,7 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
         let arrived = !taken.current.is_empty();
         self.checked
             .check(block, delta, taken)
-            .map_err(|m| self.diverged(&m))?;
+            .map_err(|m| self.diverged(m))?;
         if arrived {
             metrics::counter_block_verified();
         } else {
@@ -172,14 +172,10 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
     /// Record the divergence of a replica BAL whose write-set differs
     /// from the local one. `Divergence` is fatal; the engine does not
     /// retry it.
-    fn diverged(&self, m: &Mismatch<u64, BlockDelta>) -> ExecutorError {
-        let summary = write_set_diff_summary(&m.local, &m.published.value);
+    fn diverged(&self, m: Mismatch<u64, BlockDelta>) -> ExecutorError {
+        let summary = write_set_diff_summary(&m.local, &m.published);
         let detail = format!("block {} write-set != BAL: {summary}", m.key);
-        let attribution = Attribution {
-            replica: m.published.replica,
-            check: Check::Bal,
-        };
-        ExecutorError::Divergence(self.divergence.halt_replica(attribution, &detail))
+        ExecutorError::Divergence(self.divergence.halt_replica(m.attribution, &detail))
     }
 }
 
@@ -335,76 +331,89 @@ impl ValidatorReceiptSink {
         }
     }
 
-    /// Check one local receipt, then the published account rows of every
-    /// replica batch that ends at its position, when a frame ending there
-    /// has arrived.
+    /// Check one local receipt, then the published account rows of the
+    /// replica batches that end at its position and arrived before the
+    /// sink reached it.
     fn check_item(&mut self, item: &ReceiptRows) -> Result<(), ExecutorError> {
         self.latched()?;
         self.check_receipt(&item.receipt)?;
         self.recent.record(item.receipt.tx_idx, &item.accounts);
-        let Taken { current, late } = self.receipts.take_rows(item.receipt.tx_idx);
+        let Taken { current, late } = self.receipts.rows.take(item.receipt.tx_idx, Duration::ZERO);
         // Rows that arrive after the sink passed their position meet a
         // later local state, so they stay unverified.
-        metrics::counter_rows_unverified(late.len());
+        metrics::counter_rows_unverified(
+            late.iter().map(|(_, rows)| Distinct::results(rows)).sum(),
+        );
         // Under parallel validation only a block's last receipt carries
         // rows. A receipt with no rows is not at a position where the
         // local state is known per position, so the rows stay unverified.
         if item.accounts.is_empty() {
-            metrics::counter_rows_unverified(current.len());
+            metrics::counter_rows_unverified(Distinct::results(&current));
             return Ok(());
         }
-        current
-            .iter()
-            .try_for_each(|published| self.check_rows(&item.receipt, published))
+        self.check_rows(&item.receipt, &current)
     }
 
-    /// Compare one replica's published rows with the local state at the
-    /// same position. A row for an account with no recorded local value
-    /// is unverified, not a divergence: a cold start can begin inside a
-    /// batch.
+    /// Compare the published rows of every replica with the local state
+    /// at the same position. A row for an account with no recorded local
+    /// value is unverified, not a divergence: a cold start can begin
+    /// inside a batch.
     fn check_rows(
         &self,
         local: &Receipt,
-        published: &Arrival<Vec<AccountRow>>,
+        published: &[Distinct<Vec<AccountRow>>],
     ) -> Result<(), ExecutorError> {
-        let mismatch = published.value.iter().find_map(|row| {
-            self.recent
-                .local(row)
-                .filter(|l| *l != row)
-                .map(|l| (row, l))
-        });
-        let Some((row, local_row)) = mismatch else {
-            self.count_rows(&published.value);
+        let Some((attribution, rows)) = Attribution::judge(Check::Rows, published, &[], |rows| {
+            self.row_mismatch(rows).is_none()
+        }) else {
+            for d in published {
+                self.count_rows(&d.value, d.replicas.len());
+            }
             return Ok(());
         };
-        let detail = format!(
-            "account row mismatch at tx_idx {:?}: {} local(nonce={}, balance={}) vs \
-             published(nonce={}, balance={}) [tx_hash={} block={}]",
-            local.tx_idx,
-            row.address,
-            local_row.nonce,
-            local_row.balance,
-            row.nonce,
-            row.balance,
-            local.tx_hash,
-            local.block_number,
-        );
-        let attribution = Attribution {
-            replica: published.replica,
-            check: Check::Rows,
-        };
+        let detail = self
+            .row_mismatch(rows)
+            .map_or_else(String::new, |(row, local_row)| {
+                format!(
+                    "account row mismatch at tx_idx {:?}: {} local(nonce={}, balance={}) vs \
+                 published(nonce={}, balance={}) [tx_hash={} block={}]",
+                    local.tx_idx,
+                    row.address,
+                    local_row.nonce,
+                    local_row.balance,
+                    row.nonce,
+                    row.balance,
+                    local.tx_hash,
+                    local.block_number,
+                )
+            });
         Err(ExecutorError::Divergence(
             self.divergence.halt_replica(attribution, &detail),
         ))
     }
 
-    /// Count a batch with no mismatch: verified when every row had a
-    /// local value to compare with, unverified otherwise.
-    fn count_rows(&self, published: &[AccountRow]) {
+    /// The first published row that differs from its recorded local
+    /// value, with that local value.
+    fn row_mismatch<'a>(
+        &'a self,
+        rows: &'a [AccountRow],
+    ) -> Option<(&'a AccountRow, &'a AccountRow)> {
+        rows.iter().find_map(|row| {
+            self.recent
+                .local(row)
+                .filter(|l| *l != row)
+                .map(|l| (row, l))
+        })
+    }
+
+    /// Count the `n` replica batches of one value with no mismatch:
+    /// verified when every row had a local value to compare with,
+    /// unverified otherwise.
+    fn count_rows(&self, published: &[AccountRow], n: usize) {
         if published.iter().all(|row| self.recent.local(row).is_some()) {
-            metrics::counter_rows_verified();
+            metrics::counter_rows_verified(n);
         } else {
-            metrics::counter_rows_unverified(1);
+            metrics::counter_rows_unverified(n);
         }
     }
     /// Cross-checks one local receipt against the published receipt of
@@ -414,20 +423,20 @@ impl ValidatorReceiptSink {
     /// `receipt_missing`). `Err` halts the validator on a proven
     /// mismatch, after a best-effort flight dump.
     fn check_receipt(&mut self, local: &Receipt) -> Result<(), ExecutorError> {
-        let taken = self.receipts.take(local.tx_idx, self.wait);
+        let taken = self.receipts.receipts.take(local.tx_idx, self.wait);
         if taken.current.is_empty() {
             // No published receipt to compare against, so skip the check.
             metrics::counter_receipt_missing();
         }
         self.checked
             .check(local.tx_idx, local, taken)
-            .map_err(|m| self.diverged(&m))
+            .map_err(|m| self.diverged(m))
     }
 
     /// Record the divergence of a replica receipt that differs from the
     /// local one. `local` here is the checked receipt of the position.
-    fn diverged(&self, m: &Mismatch<BPosition, Receipt>) -> ExecutorError {
-        let (local, published) = (&m.local, &m.published.value);
+    fn diverged(&self, m: Mismatch<BPosition, Receipt>) -> ExecutorError {
+        let (local, published) = (&m.local, &m.published);
         // Include the tx identity, not only the mismatch, so
         // responders can find the transaction without a separate
         // hash lookup.
@@ -456,11 +465,7 @@ impl ValidatorReceiptSink {
         if let Some(f) = self.flight.as_ref() {
             f.dump_receipt_divergence(local, published);
         }
-        let attribution = Attribution {
-            replica: m.published.replica,
-            check: Check::Receipt,
-        };
-        ExecutorError::Divergence(self.divergence.halt_replica(attribution, &detail))
+        ExecutorError::Divergence(self.divergence.halt_replica(m.attribution, &detail))
     }
 }
 
