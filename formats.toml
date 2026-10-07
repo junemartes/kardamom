@@ -27,42 +27,53 @@
 # The sealer's Aeron Cluster snapshot. The loader refuses a version outside
 # the read range, so a member that rolls back cannot load a newer
 # snapshot. A member that joins late can get a snapshot of another member,
-# so the format is shared.
+# so the format is shared. This release reads v11 and still writes v10.
 [format.sealer-snapshot]
 writes = 10
 reads_min = 1
-reads_max = 10
+reads_max = 11
 shared = true
 code = [
-    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
-# to 7. The sealer itself writes kind 8 into its log. The sealer orders an
-# unknown kind of 85 bytes or more as a user record, and drops a shorter
-# one. Thus a new kind that changes the replicated state can fork members
-# that run different versions.
+# to 7. The sealer itself writes kind 8 into its log. The sealer reads
+# kind 9 (the recorded cursor), but no service sends it in this release:
+# the executor does not start its publisher. The sealer orders an unknown
+# kind of 85 bytes or more as a user record, and drops a shorter one. Thus
+# a new kind that changes the replicated state can fork members that run
+# different versions.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
-reads_max = 8
+reads_max = 9
 shared = true
 code = [
-    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_SEED_EPOCH",
-    "crates/cluster-adapter/src/wire/mod.rs#KIND_POSTED_CURSOR",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_RECORDED_CURSOR",
+    "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
 ]
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
-# kind with a warning.
+# kind with a warning. The sealer sends kind 13 (the record-lag reject)
+# only when recordLagBudget is above 0.
+#
+# The status frame (kind 9) is 50 bytes, or 67 bytes with the record-lag
+# fields at the tail. A reader of either release reads either size: an old
+# reader ignores the tail, and a new reader reads a frame with no tail as
+# the guard off.
 [format.sealer-egress-kinds]
 writes = 12
 reads_min = 1
-reads_max = 12
+reads_max = 13
 shared = true
 code = [
-    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_ORIGIN_GAP",
-    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_ORIGIN_GAP",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_RECORD_LAG_REJECT",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_RECORD_LAG_REJECT",
+    "crates/cluster-adapter/src/wire/mod.rs#STATUS_WITH_RECORD_LAG_LEN",
 ]
+activation = { flag = "recordLagBudget", writes = 13 }
 
 # The record type inside a relayed egress frame. The Rust writers send
 # types 0 to 3, and the sealer writes type 4 (void). The Rust reader drops

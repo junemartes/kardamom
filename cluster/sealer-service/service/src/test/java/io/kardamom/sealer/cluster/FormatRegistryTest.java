@@ -17,6 +17,7 @@ import java.util.IntSummaryStatistics;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.IntStream;
@@ -75,12 +76,15 @@ final class FormatRegistryTest {
 
     @Test
     void ingressKindsMatchTheRegistry() {
-        assertKinds("sealer-ingress-kinds", kinds("KIND_"));
+        // The sealer reads the recorded cursor, but no service sends it yet.
+        assertKinds("sealer-ingress-kinds", "KIND_", "KIND_RECORDED_CURSOR");
     }
 
     @Test
     void egressKindsMatchTheRegistry() {
-        assertKinds("sealer-egress-kinds", kinds("EGRESS_KIND_"));
+        // The record-lag reject waits for recordLagBudget: the activation
+        // of the format in formats.toml.
+        assertKinds("sealer-egress-kinds", "EGRESS_KIND_", "EGRESS_KIND_RECORD_LAG_REJECT");
     }
 
     @Test
@@ -115,18 +119,27 @@ final class FormatRegistryTest {
         assertEquals(Map.of("writes", value, "reads_min", value, "reads_max", value), registry.get(id), id);
     }
 
-    /** The sealer writes and reads every kind from the lowest to the highest. */
-    private static void assertKinds(final String id, final IntSummaryStatistics kinds) {
+    /**
+     * The sealer reads every kind from the lowest to the highest. The
+     * default writers send every kind except {@code unsent}.
+     */
+    private static void assertKinds(final String id, final String prefix, final String unsent) {
+        final IntSummaryStatistics read = kinds(prefix, name -> true);
+        final IntSummaryStatistics written = kinds(prefix, name -> !name.equals(unsent));
         assertEquals(
-            Map.of("writes", kinds.getMax(), "reads_min", kinds.getMin(), "reads_max", kinds.getMax()),
+            Map.of("writes", written.getMax(), "reads_min", read.getMin(), "reads_max", read.getMax()),
             registry.get(id), id);
     }
 
-    /** The byte constants of {@link SealerWire} whose names start with {@code prefix}. */
-    private static IntSummaryStatistics kinds(final String prefix) {
+    /**
+     * The byte constants of {@link SealerWire} whose names start with
+     * {@code prefix} and pass {@code keep}.
+     */
+    private static IntSummaryStatistics kinds(final String prefix, final Predicate<String> keep) {
         return Arrays.stream(SealerWire.class.getDeclaredFields())
             .filter(field -> Modifier.isStatic(field.getModifiers()))
             .filter(field -> field.getType() == byte.class && field.getName().startsWith(prefix))
+            .filter(field -> keep.test(field.getName()))
             .mapToInt(field -> read(field, () -> field.getByte(null)))
             .summaryStatistics();
     }

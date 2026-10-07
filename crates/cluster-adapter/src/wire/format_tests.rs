@@ -29,8 +29,8 @@ fn is_known_record_type(record_type: u8) -> bool {
 }
 
 #[test]
-fn the_ingress_kinds_stay_within_the_registry() {
-    let writes = Registry::workspace_versions("sealer-ingress-kinds").writes;
+fn the_ingress_kinds_stay_within_the_sealer_reader() {
+    let reads_max = Registry::workspace_versions("sealer-ingress-kinds").reads_max;
     let kinds = [
         KIND_INGRESS_RECORD,
         KIND_REPLAY_REQUEST,
@@ -40,8 +40,9 @@ fn the_ingress_kinds_stay_within_the_registry() {
         KIND_REMOTE_ORIGIN_RECORD,
         KIND_VOID_REQUEST,
         KIND_POSTED_CURSOR,
+        KIND_RECORDED_CURSOR,
     ];
-    assert!(kinds.into_iter().all(|kind| u32::from(kind) <= writes));
+    assert!(kinds.into_iter().all(|kind| u32::from(kind) <= reads_max));
 }
 
 #[test]

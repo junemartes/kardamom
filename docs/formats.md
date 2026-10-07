@@ -44,7 +44,7 @@ The version tests:
 |---|---|---|
 | `kardamom-state` | `state-db`, `checkpoint-manifest` | the constants |
 | `kardamom-batcher` | `kar1-batch` | `decode` accepts exactly `reads_min..=reads_max`, and `VERSION` is `writes` |
-| `kardamom-cluster-adapter` | sealer ingress kinds, egress kinds, record types | the egress decoder and the record type decoder accept exactly the read range; the ingress kinds stay at or below `writes` |
+| `kardamom-cluster-adapter` | sealer ingress kinds, egress kinds, record types | the egress decoder and the record type decoder accept exactly the read range; the Rust ingress kinds stay at or below `reads_max` |
 | `kardamom-cluster-client` | `cluster-app-version` | the major of the app version |
 | `kardamom-reconstruct` | `sealer-seed` | the constant |
 | `kardamom-log` | `discovery-record` | the constant |
