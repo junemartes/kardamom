@@ -15,7 +15,7 @@ you have the wrong crate.
 - `TxEnvelope` — raw tx + correlation id + sender + tx_hash + inclusion deadline (sender and tx_hash always populated; `max_inclusion_block` is the last block the sealer may order the tx into, and `i64::MAX` in the ingress means no deadline)
 - `Receipt`, `WireLog` — per-tx execution receipt + log entry
 - `BlockBoundaryStart`, `BlockBoundary` — block markers (no state root; `BlockBoundary` carries the block's `base_fee` and `gas_used`)
-- `TxError`, `TxErrorReason` — sequencer rejection signal on `tx_errors`; the reasons are `DuplicatedTx`, `Evicted`, `Expired`, `PastDeadline`, `FeeInvalid`, `FeeTooLow`, `InsufficientFunds` and `DaLag` (`sealed_head`, `posted_head`, `budget_blocks`: the sealer refused the tx on its DA-lag guard)
+- `TxError`, `TxErrorReason` — sequencer rejection signal on `tx_errors`; the reasons are `DuplicatedTx`, `Evicted`, `Expired`, `PastDeadline`, `FeeInvalid`, `FeeTooLow`, `InsufficientFunds`, `DaLag` (`sealed_head`, `posted_head`, `budget_blocks`: the sealer refused the tx on its DA-lag guard) and `RecordLag` (`sealed_index`, `recorded_index`, `budget`: the sealer refused the tx on its record-lag guard); `TxErrorReason::word` gives the reason word that a client sees
 - `TxStatus`, `TxStage` — one step of a tx on the `tx_status` stream (`Offered`, `Sealed`, `Executed`, `Rejected`); `TxStageKind` is the stage without its payload
 - `FeeSchedule` — the genesis `[fees]` section: `base_fee_initial` and `beneficiary`
 - `BlockFees` — the base fee and the tip beneficiary of one block; `BlockFees::NONE` is the chain with no schedule

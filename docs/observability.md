@@ -273,11 +273,12 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltL1CursorUnreadable` | critical | `kardamom_halt{cause="l1_cursor_unreadable"} == 1`. |
 | `KardamomHaltValidatorDivergence` | critical | `kardamom_halt{cause="validator_divergence"} == 1`. |
 | `KardamomHaltOriginGap` | critical | `kardamom_halt{cause="origin_gap"} == 1` for 1 minute. |
+| `KardamomHaltRecordLag` | critical | `kardamom_halt{cause="record_lag"} == 1`. The record-lag guard is off by default, so this alert cannot fire until a later release turns the guard on. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The nine `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
+- The ten `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
   - `KardamomHaltOriginGap` waits 1 minute. A restarted sequencer can miss the epoch that the sealer expects, and its twin offers that epoch again within milliseconds. Only a gap that no replica fills pages.
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
