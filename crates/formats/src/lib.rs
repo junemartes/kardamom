@@ -7,17 +7,23 @@
 //!
 //! [`Registry::parse`] is the one boundary. In a registry that it returns,
 //! each format has `reads_min <= writes <= reads_max`, at least one code
-//! location, and an activation version inside its read range. Each waiver
-//! names a known format and gives a reason.
+//! location, and an activation version inside its read range. Each
+//! `one_way` and `coordinated` waiver names a format of the registry, each
+//! `retired` waiver names a format that is not in it, and each waiver
+//! gives a reason.
+//!
+//! [`Comparison::report`] compares any two registries: a pull request
+//! against its base, or a deploy target against the deployed release.
 
 mod check;
+mod support;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub use check::{Comparison, Finding, Rule};
+pub use check::{Comparison, Finding, Report, Rule};
 
 /// The versions of one format that a release writes and reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +49,9 @@ impl Versions {
 }
 
 /// A file that defines a format, relative to the workspace root, and a
-/// text in that file. The registry spells it `path#symbol`.
+/// name in that file. The registry spells it `path#symbol`. It is a
+/// pointer for the reader of the registry: the check finds the symbol as a
+/// whole word, and nothing more.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 struct Location {
@@ -66,9 +74,20 @@ impl TryFrom<String> for Location {
 }
 
 impl Location {
-    /// True when the file under `root` exists and holds the symbol.
+    /// True when the file under `root` holds the symbol as a whole word:
+    /// no identifier character touches either end of it.
     fn found(&self, root: &Path) -> bool {
-        std::fs::read_to_string(root.join(&self.path)).is_ok_and(|text| text.contains(&self.symbol))
+        std::fs::read_to_string(root.join(&self.path)).is_ok_and(|text| {
+            text.match_indices(&self.symbol).any(|(start, symbol)| {
+                let before = text[..start].chars().next_back();
+                let after = text[start + symbol.len()..].chars().next();
+                !before.is_some_and(Self::is_word) && !after.is_some_and(Self::is_word)
+            })
+        })
+    }
+
+    fn is_word(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
     }
 }
 
@@ -87,8 +106,19 @@ struct Format {
     writes: u32,
     reads_min: u32,
     reads_max: u32,
+    /// True when two releases of a mixed fleet read each other's output.
+    /// False for a file that only one process writes and reads.
+    shared: bool,
+    /// True when the data stays for all time, as a batch on L1 does. A
+    /// release never stops reading an old version of it.
+    #[serde(default)]
+    permanent: bool,
     code: Vec<Location>,
     activation: Option<Activation>,
+    /// The fingerprint of each part of a frozen layout, by part name. A
+    /// test in the owning crate computes each one from the code.
+    #[serde(default)]
+    layout: BTreeMap<String, String>,
 }
 
 impl Format {
@@ -125,10 +155,35 @@ impl Format {
     }
 }
 
+/// A waiver table of the registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waivers {
+    /// `[one_way.<id>]`: a rollback to the base is not safe.
+    OneWay,
+    /// `[coordinated.<id>]`: a rolling deploy is not safe.
+    Coordinated,
+    /// `[retired.<id>]`: the head drops a format of the base.
+    Retired,
+}
+
+impl Waivers {
+    const ALL: [Self; 3] = [Self::OneWay, Self::Coordinated, Self::Retired];
+
+    /// The table name in `formats.toml`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OneWay => "one_way",
+            Self::Coordinated => "coordinated",
+            Self::Retired => "retired",
+        }
+    }
+}
+
 /// A release that breaks a rule on purpose, for one version of one
-/// format. `version` is the head `writes` under `one_way`, and the head
-/// `reads_min` under `coordinated`.
-#[derive(Debug, Deserialize)]
+/// format. `version` is the version that the finding names: see
+/// [`Finding::head`].
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Waiver {
     version: u32,
@@ -144,26 +199,35 @@ struct Table {
     one_way: BTreeMap<String, Waiver>,
     #[serde(default)]
     coordinated: BTreeMap<String, Waiver>,
+    #[serde(default)]
+    retired: BTreeMap<String, Waiver>,
 }
 
 impl Table {
-    fn waivers(&self, rule: Rule) -> &BTreeMap<String, Waiver> {
-        match rule {
-            Rule::Rollback => &self.one_way,
-            Rule::Rolling => &self.coordinated,
+    fn waivers(&self, table: Waivers) -> &BTreeMap<String, Waiver> {
+        match table {
+            Waivers::OneWay => &self.one_way,
+            Waivers::Coordinated => &self.coordinated,
+            Waivers::Retired => &self.retired,
         }
     }
 
-    fn validate_waiver(&self, rule: Rule, id: &str, waiver: &Waiver) -> Result<(), RegistryError> {
-        if !self.format.contains_key(id) {
-            return Err(RegistryError::UnknownWaiver {
-                table: rule.table(),
+    fn validate_waiver(
+        &self,
+        table: Waivers,
+        id: &str,
+        waiver: &Waiver,
+    ) -> Result<(), RegistryError> {
+        let listed = self.format.contains_key(id);
+        if listed == (table == Waivers::Retired) {
+            return Err(RegistryError::WaiverTarget {
+                table: table.name(),
                 id: id.to_owned(),
             });
         }
         if waiver.reason.trim().is_empty() {
             return Err(RegistryError::NoReason {
-                table: rule.table(),
+                table: table.name(),
                 id: id.to_owned(),
             });
         }
@@ -186,15 +250,15 @@ impl Registry {
             .format
             .iter()
             .try_for_each(|(id, format)| format.validate(id))?;
-        Rule::ALL
+        Waivers::ALL
             .into_iter()
-            .flat_map(|rule| {
+            .flat_map(|kind| {
                 table
-                    .waivers(rule)
+                    .waivers(kind)
                     .iter()
-                    .map(move |(id, waiver)| (rule, id, waiver))
+                    .map(move |(id, waiver)| (kind, id, waiver))
             })
-            .try_for_each(|(rule, id, waiver)| table.validate_waiver(rule, id, waiver))?;
+            .try_for_each(|(kind, id, waiver)| table.validate_waiver(kind, id, waiver))?;
         Ok(Self(table))
     }
 
@@ -271,8 +335,10 @@ pub enum RegistryError {
         flag: String,
         writes: u32,
     },
-    #[error("[{table}.{id}] names no format")]
-    UnknownWaiver { table: &'static str, id: String },
+    #[error(
+        "[{table}.{id}]: a one_way or coordinated waiver names a format of the registry, and a retired waiver names a format that is not in it"
+    )]
+    WaiverTarget { table: &'static str, id: String },
     #[error("[{table}.{id}] has no reason")]
     NoReason { table: &'static str, id: String },
 }

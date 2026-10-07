@@ -1,9 +1,9 @@
 //! `kardamom-formats`: compare the format registry of a change with the
 //! registry of its base revision. `just check-formats BASE` runs it. The
-//! exit status is 1 when the change breaks a rule that no waiver covers,
-//! or when a code location in the registry is not found.
+//! exit status is 1 when the change breaks a rule that no new waiver
+//! covers, or when a code location in the registry is not found.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -12,9 +12,9 @@ use kardamom_formats::{Comparison, Registry, RegistryError};
 /// Compare the format registry with the registry of a base revision.
 #[derive(Debug, Parser)]
 struct Cli {
-    /// The registry of the change.
+    /// The root of the change: the directory that holds its formats.toml.
     #[arg(long)]
-    head: PathBuf,
+    root: PathBuf,
     /// The registry of the base revision. Leave it out when the base has
     /// no registry: then only the head is checked.
     #[arg(long)]
@@ -22,10 +22,10 @@ struct Cli {
 }
 
 impl Cli {
-    /// Print each problem. Return true when there is none.
+    /// Print each line of the check. Return true when nothing fails.
     fn run(&self) -> Result<bool, RegistryError> {
-        let head = Registry::read(&self.head)?;
-        let missing = head.missing_code(self.head.parent().unwrap_or(Path::new(".")));
+        let head = Registry::read(&self.root.join("formats.toml"))?;
+        let missing = head.missing_code(&self.root);
         for line in &missing {
             println!("{line}");
         }
@@ -34,15 +34,12 @@ impl Cli {
             return Ok(missing.is_empty());
         };
         let base = Registry::read(base)?;
-        let comparison = Comparison::new(&base, &head);
-        let findings = comparison.findings();
-        for finding in &findings {
-            println!("{}", comparison.verdict(finding));
+        let report = Comparison::new(&base, &head).report();
+        let lines = [&report.waived, &report.notes, &report.problems];
+        for line in lines.into_iter().flatten() {
+            println!("{line}");
         }
-        let waived = findings
-            .iter()
-            .all(|finding| comparison.waiver(finding).is_some());
-        Ok(missing.is_empty() && waived)
+        Ok(missing.is_empty() && report.passed())
     }
 }
 

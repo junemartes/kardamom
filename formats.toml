@@ -6,30 +6,33 @@
 #   writes     the version this release writes with its default configuration
 #   reads_min  the oldest version this release reads
 #   reads_max  the newest version this release reads
+#   shared     true when two releases of a mixed fleet read each other's
+#              output; false for a file that one process writes and reads
+#   permanent  optional, true when the data stays for all time: a release
+#              never stops reading an old version
 #   code       "path#symbol": a file that defines the format, and a name in
-#              that file. A test checks that each file holds its symbol.
+#              that file. A test checks that each file holds the symbol as a
+#              whole word. It is a pointer, not a proof.
 #   activation optional { flag = "...", writes = N }: the version the writer
 #              writes when an operator switches the flag on
+#   layout     optional table [format.<id>.layout]: a fingerprint of each
+#              part of a frozen layout. A test computes each one from code.
 #
 # For a set of message kinds, the version is the highest kind number.
 # A format with no version constant has a frozen layout. It has version 1.
 #
-# Tests in the crates that own a constant, and a test in the sealer, check
-# that the code constants equal this file. `just check-formats BASE`
-# compares this file with the file at the base revision:
-#
-#   writes > base reads_max     a rollback to the base is not safe. Add
-#                               [one_way.<id>] with version = writes.
-#   reads_min > base writes     a rolling deploy is not safe. Add
-#                               [coordinated.<id>] with version = reads_min.
+# `just check-formats BASE` compares this file with the file at the base
+# revision. docs/formats.md lists the rules and the waiver tables.
 
-# The sealer's Aeron Cluster snapshot. The loader refuses a version above
-# the read maximum, so a member that rolls back cannot load a newer
-# snapshot.
+# The sealer's Aeron Cluster snapshot. The loader refuses a version outside
+# the read range, so a member that rolls back cannot load a newer
+# snapshot. A member that joins late can get a snapshot of another member,
+# so the format is shared.
 [format.sealer-snapshot]
 writes = 10
 reads_min = 1
 reads_max = 10
+shared = true
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_VERSION",
 ]
@@ -43,6 +46,7 @@ code = [
 writes = 8
 reads_min = 0
 reads_max = 8
+shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_SEED_EPOCH",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_POSTED_CURSOR",
@@ -54,6 +58,7 @@ code = [
 writes = 12
 reads_min = 1
 reads_max = 12
+shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_ORIGIN_GAP",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_ORIGIN_GAP",
@@ -67,6 +72,7 @@ code = [
 writes = 4
 reads_min = 0
 reads_max = 4
+shared = true
 code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
@@ -78,6 +84,7 @@ code = [
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = true
 code = [
     "crates/reconstruct/src/seed.rs#const VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/SealerSeed.java#int VERSION",
@@ -89,6 +96,7 @@ code = [
 writes = 0
 reads_min = 0
 reads_max = 0
+shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/ClusterNode.java#APP_VERSION",
     "crates/cluster-client/src/session/mod.rs#APP_SEMANTIC_VERSION",
@@ -101,6 +109,7 @@ code = [
 writes = 3
 reads_min = 3
 reads_max = 3
+shared = false
 code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
 
 # The checkpoint manifest. The reader ignores the version key and unknown
@@ -110,6 +119,7 @@ code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = true
 code = ["crates/state/src/checkpoint/manifest.rs#MANIFEST_VERSION"]
 
 # The KAR1 batch on DA and L1. The batch stays there for all time. The
@@ -119,7 +129,9 @@ code = ["crates/state/src/checkpoint/manifest.rs#MANIFEST_VERSION"]
 writes = 5
 reads_min = 4
 reads_max = 5
-code = ["crates/batcher/src/frame.rs#VERSION_NO_CURSOR"]
+shared = true
+permanent = true
+code = ["crates/batcher/src/frame.rs#BlockLayout"]
 
 # Frozen layout. The batcher spool: one rkyv ClosedBlock per file. A spool
 # that does not decode stops the batcher at start.
@@ -127,10 +139,15 @@ code = ["crates/batcher/src/frame.rs#VERSION_NO_CURSOR"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = false
 code = [
     "crates/batcher/src/live/spool.rs#ClosedBlock",
     "crates/batcher/src/batch.rs#pub struct ClosedBlock",
 ]
+[format.batcher-spool.layout]
+ClosedBlock = "rkyv size 48 align 8"
+RecordedTx = "rkyv size 88 align 8"
+RemoteEpochRecord = "rkyv size 64 align 8"
 
 # Frozen layout. The batcher cursor, as serde JSON. An old reader ignores
 # a new field. A new field has a serde default, so a new reader reads an
@@ -139,7 +156,10 @@ code = [
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = false
 code = ["crates/batcher/src/live/cursor.rs#pub struct BatchCursor"]
+[format.batcher-cursor.layout]
+BatchCursor = '{"next_index":1,"next_block":2,"last_batch_index":3}'
 
 # Frozen layout. The da-watcher L1 cursor: exactly two fields on one line.
 # Any other line is an operator halt (L1CursorUnreadable).
@@ -147,7 +167,10 @@ code = ["crates/batcher/src/live/cursor.rs#pub struct BatchCursor"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = false
 code = ["crates/da_watcher/src/l1_cursor.rs#pub struct L1Cursor"]
+[format.l1-cursor.layout]
+L1Cursor = "7 0x0707070707070707070707070707070707070707070707070707070707070707"
 
 # Frozen layout. The rkyv records on the Aeron streams and in the tx_data
 # archives: receipts, block deltas, boundaries, service events, transaction
@@ -157,6 +180,7 @@ code = ["crates/da_watcher/src/l1_cursor.rs#pub struct L1Cursor"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = true
 code = [
     "crates/types/src/receipt.rs#pub struct Receipt",
     "crates/types/src/delta.rs#pub struct BlockDelta",
@@ -166,6 +190,14 @@ code = [
     "crates/types/src/tx_error.rs#pub struct TxError",
     "crates/types/src/envelope.rs#pub struct TxEnvelope",
 ]
+[format.aeron-stream-records.layout]
+Receipt = "rkyv size 256 align 16"
+BlockDelta = "rkyv size 40 align 8"
+BlockBoundary = "rkyv size 64 align 16"
+ServiceEvent = "rkyv size 64 align 8"
+TxStatus = "rkyv size 112 align 16"
+TxError = "rkyv size 80 align 16"
+TxEnvelope = "rkyv size 80 align 8"
 
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.
@@ -173,7 +205,10 @@ code = [
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = false
 code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
+[format.notifier-outbox.layout]
+OutboxRecord = "rkyv size 120 align 8"
 
 # Frozen layout. The Redis cache keys and values. Redis keeps no data on
 # disk, and the cache is advisory. A new layout uses a new key prefix.
@@ -181,7 +216,14 @@ code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = true
 code = ["crates/cache/src/keys.rs#pub fn receipt"]
+[format.redis-cache.layout]
+account = "acct:0x0000000000000000000000000000000000000000"
+receipt = "rcpt:0x0000000000000000000000000000000000000000:5"
+head = "head:3"
+pending = "pending:0x0000000000000000000000000000000000000000"
+index_tag = "00000000000000000007"
 
 # The service discovery records in Consul. A runtime ignores a record of
 # another version, so a mixed fleet does not find its peers.
@@ -189,12 +231,12 @@ code = ["crates/cache/src/keys.rs#pub fn receipt"]
 writes = 1
 reads_min = 1
 reads_max = 1
+shared = true
 code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 
 # Releases that break a rule on purpose. Each entry covers one version of
-# one format: `version` is the head `writes` under one_way, and the head
-# `reads_min` under coordinated. A later change to the same format needs a
-# new entry.
+# one format: the version that the check names. Only an entry that is new
+# against the base counts. docs/formats.md has the rules.
 #
 # [one_way.sealer-snapshot]
 # version = 11
@@ -202,3 +244,5 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 [one_way]
 
 [coordinated]
+
+[retired]

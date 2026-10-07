@@ -375,10 +375,6 @@ fn auth_rejected_fails_session() {
 
 #[test]
 fn app_version_major_matches_the_registry() {
-    let registry = kardamom_formats::Registry::workspace().unwrap();
     let major = u32::try_from(APP_SEMANTIC_VERSION >> 16).unwrap();
-    assert_eq!(
-        registry.versions("cluster-app-version"),
-        Some(kardamom_formats::Versions::exact(major))
-    );
+    kardamom_formats::Registry::assert_exact("cluster-app-version", major);
 }

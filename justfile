@@ -216,8 +216,10 @@ check-formats $base:
     trap 'rm -f "$base_file"' EXIT
     base_arg=()
     if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
-        jj log --no-graph -r "$base" -T 'commit_id ++ "\n"' >/dev/null
-        if [ -n "$(jj file list -r "$base" formats.toml 2>/dev/null)" ]; then
+        # `jj file list` fails on an unknown revision, and prints nothing
+        # when the revision has no formats.toml.
+        listed="$(jj file list -r "$base" formats.toml)"
+        if [ -n "$listed" ]; then
             jj file show -r "$base" formats.toml >"$base_file"
             base_arg=(--base "$base_file")
         fi
@@ -229,7 +231,7 @@ check-formats $base:
             base_arg=(--base "$base_file")
         fi
     fi
-    cargo run --quiet --locked -p kardamom-formats -- --head formats.toml "${base_arg[@]}"
+    cargo run --quiet --locked -p kardamom-formats --features cli -- --root . "${base_arg[@]}"
 
 # Run the test suite across all features.
 test:

@@ -43,6 +43,8 @@ tokio-util = { workspace = true }
 toml.workspace = true
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format layout against it.
+kardamom-formats.workspace = true
 # Enables the in-memory fakes for this crate's own integration tests.
 kardamom-da-watcher = { path = ".", features = ["testing", "test-support"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }

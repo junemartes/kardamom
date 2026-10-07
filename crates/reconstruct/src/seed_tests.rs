@@ -141,9 +141,5 @@ fn a_seed_refuses_a_head_without_a_canonical_end() {
 
 #[test]
 fn seed_version_matches_the_registry() {
-    let registry = kardamom_formats::Registry::workspace().unwrap();
-    assert_eq!(
-        registry.versions("sealer-seed"),
-        Some(kardamom_formats::Versions::exact(super::VERSION))
-    );
+    kardamom_formats::Registry::assert_exact("sealer-seed", super::VERSION);
 }

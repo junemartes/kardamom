@@ -86,10 +86,6 @@ fn log_codetx_receipts_channel_b_message_roundtrip() {
 
 #[test]
 fn discovery_version_matches_the_registry() {
-    let registry = kardamom_formats::Registry::workspace().unwrap();
     let version = kardamom_log::discovery::DISCOVERY_VERSION.parse().unwrap();
-    assert_eq!(
-        registry.versions("discovery-record"),
-        Some(kardamom_formats::Versions::exact(version))
-    );
+    kardamom_formats::Registry::assert_exact("discovery-record", version);
 }

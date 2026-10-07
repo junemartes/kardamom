@@ -132,13 +132,28 @@ fn a_payload_with_and_without_cursors_is_refused() {
     assert!(err.contains("one version"), "{err}");
 }
 
+/// A payload of no blocks at `version`, uncompressed.
+fn empty_payload(version: u8) -> Vec<u8> {
+    [
+        &MAGIC[..],
+        &[version, 0],
+        &0_u32.to_le_bytes(),
+        &0_u16.to_le_bytes(),
+    ]
+    .concat()
+}
+
 #[test]
 fn kar1_versions_match_the_registry() {
-    let registry = kardamom_formats::Registry::workspace().unwrap();
-    let versions = kardamom_formats::Versions {
-        writes: VERSION.into(),
-        reads_min: VERSION_NO_CURSOR.into(),
-        reads_max: VERSION.into(),
-    };
-    assert_eq!(registry.versions("kar1-batch"), Some(versions));
+    let kar1 = kardamom_formats::Registry::workspace_versions("kar1-batch");
+    assert_eq!(kar1.writes, u32::from(VERSION));
+    let read: Vec<u32> = (0..=u8::MAX)
+        .filter(|version| decode(&empty_payload(*version)).is_ok())
+        .map(u32::from)
+        .collect();
+    let expected: Vec<u32> = (kar1.reads_min..=kar1.reads_max).collect();
+    assert_eq!(
+        read, expected,
+        "the decoder reads exactly the registry range"
+    );
 }

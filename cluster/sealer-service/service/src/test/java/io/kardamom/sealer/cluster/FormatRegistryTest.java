@@ -4,26 +4,34 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.SealerSeed;
+import io.kardamom.sealer.VoidLedger;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.IntSummaryStatistics;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
 import org.agrona.SemanticVersion;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * The sealer's format constants against the format registry,
+ * The sealer's format constants and readers against the format registry,
  * {@code formats.toml} at the repository root. The build passes the path
  * of the file in the {@code kardamom.formats} system property.
+ *
+ * <p>The build has no TOML library, so {@link Sections} reads only the
+ * version lines of each {@code [format.<id>]} table. The Rust parser in
+ * {@code kardamom-formats} checks the full file.</p>
  */
 final class FormatRegistryTest {
     private static final Pattern HEADER = Pattern.compile("^\\[(.*)\\]$");
@@ -41,14 +49,28 @@ final class FormatRegistryTest {
     }
 
     @Test
-    void snapshotVersionsMatchTheRegistry() {
+    void snapshotWriterMatchesTheRegistry() {
         // A sealer that reads one snapshot version ahead of the version it
-        // writes has two constants. Otherwise one constant is both.
-        final Class<?> state = CanonicalSealerState.class;
-        assertEquals(staticInt(state, "SNAPSHOT_WRITE_VERSION", "SNAPSHOT_VERSION"),
+        // writes has a separate write constant. Otherwise one constant is both.
+        assertEquals(staticInt(CanonicalSealerState.class, "SNAPSHOT_WRITE_VERSION", "SNAPSHOT_VERSION"),
             version("sealer-snapshot", "writes"));
-        assertEquals(staticInt(state, "SNAPSHOT_READ_VERSION", "SNAPSHOT_VERSION"),
-            version("sealer-snapshot", "reads_max"));
+    }
+
+    @Test
+    void snapshotLoaderReadsExactlyTheRegistryRange() {
+        final int readsMin = version("sealer-snapshot", "reads_min");
+        final int readsMax = version("sealer-snapshot", "reads_max");
+        final int magic = staticInt(CanonicalSealerState.class, "SNAPSHOT_MAGIC");
+        final List<Integer> read = IntStream.rangeClosed(0, readsMax + 1)
+            .filter(snapshotVersion -> loaderAccepts(magic, snapshotVersion))
+            .boxed()
+            .toList();
+        assertEquals(IntStream.rangeClosed(readsMin, readsMax).boxed().toList(), read);
+    }
+
+    @Test
+    void voidRecordTypeMatchesTheRegistry() {
+        assertEquals(VoidLedger.RT_VOID, version("sealer-record-types", "writes"));
     }
 
     @Test
@@ -69,6 +91,20 @@ final class FormatRegistryTest {
     @Test
     void appVersionMajorMatchesTheRegistry() {
         assertExact("cluster-app-version", SemanticVersion.major(ClusterNode.APP_VERSION));
+    }
+
+    /**
+     * False when the loader refuses the snapshot version itself. The rest of
+     * the snapshot is zeros, so a later field can still fail to parse.
+     */
+    private static boolean loaderAccepts(final int magic, final int snapshotVersion) {
+        final byte[] snapshot = ByteBuffer.allocate(4096).putInt(magic).putInt(snapshotVersion).array();
+        try {
+            CanonicalSealerState.load(snapshot, 16);
+            return true;
+        } catch (final RuntimeException refused) {
+            return !String.valueOf(refused.getMessage()).startsWith("unsupported snapshot version");
+        }
     }
 
     private static int version(final String id, final String key) {

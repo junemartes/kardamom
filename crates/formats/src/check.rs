@@ -1,9 +1,13 @@
 //! The release check: the rules that a head registry breaks against a
-//! base registry, and the waivers in the head that cover them.
+//! base registry, and the new waivers in the head that cover them.
+//!
+//! The check is incremental when the base is the base of a pull request.
+//! It is the release gate when the base is the registry of the deployed
+//! release and the head is the registry of the deploy target.
 
 use std::fmt;
 
-use crate::{Format, Registry};
+use crate::{Format, Registry, Waiver, Waivers};
 
 /// A rule between two releases of one format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,17 +18,21 @@ pub enum Rule {
     /// The head reads what the base writes: `reads_min <= base writes`.
     /// When it holds, a rolling deploy from the base to the head is safe.
     Rolling,
+    /// For a shared format, the base reads what the head writes. When it
+    /// does not hold, a base reader in a mixed fleet fails during a roll.
+    MixedFleet,
+    /// The head lists every format of the base.
+    Retired,
 }
 
 impl Rule {
-    pub(crate) const ALL: [Self; 2] = [Self::Rollback, Self::Rolling];
-
-    /// The registry table whose entries waive this rule.
+    /// The waiver table whose entries waive this rule.
     #[must_use]
-    pub const fn table(self) -> &'static str {
+    pub const fn waivers(self) -> Waivers {
         match self {
-            Self::Rollback => "one_way",
-            Self::Rolling => "coordinated",
+            Self::Rollback => Waivers::OneWay,
+            Self::Rolling | Self::MixedFleet => Waivers::Coordinated,
+            Self::Retired => Waivers::Retired,
         }
     }
 }
@@ -34,11 +42,11 @@ impl Rule {
 pub struct Finding {
     pub rule: Rule,
     pub id: String,
-    /// The head `writes` for [`Rule::Rollback`], the head `reads_min` for
-    /// [`Rule::Rolling`]. A waiver names this version.
+    /// The version that a waiver names: the head `writes` for
+    /// [`Rule::Rollback`] and [`Rule::MixedFleet`], the head `reads_min`
+    /// for [`Rule::Rolling`], and the base `writes` for [`Rule::Retired`].
     pub head: u32,
-    /// The base `reads_max` for [`Rule::Rollback`], the base `writes` for
-    /// [`Rule::Rolling`].
+    /// The base version that the rule compares with.
     pub base: u32,
 }
 
@@ -54,6 +62,14 @@ impl fmt::Display for Finding {
                 f,
                 "{id}: the head reads only from version {head}, and the base writes version {base}. A rolling deploy is not safe."
             ),
+            Rule::MixedFleet => write!(
+                f,
+                "{id}: the format is shared, the head writes version {head}, and the base reads only up to version {base}. A rolling deploy is not safe."
+            ),
+            Rule::Retired => write!(
+                f,
+                "{id}: the base lists the format at version {base}, and the head does not list it."
+            ),
         }
     }
 }
@@ -67,15 +83,36 @@ impl Format {
             head,
             base,
         };
-        let rollback = (self.writes > base.reads_max)
-            .then(|| finding(Rule::Rollback, self.writes, base.reads_max));
+        let one_way = self.writes > base.reads_max;
+        let rollback = one_way.then(|| finding(Rule::Rollback, self.writes, base.reads_max));
+        let mixed = (one_way && self.shared)
+            .then(|| finding(Rule::MixedFleet, self.writes, base.reads_max));
         let rolling = (self.reads_min > base.writes)
             .then(|| finding(Rule::Rolling, self.reads_min, base.writes));
-        rollback.into_iter().chain(rolling)
+        rollback.into_iter().chain(mixed).chain(rolling)
     }
 }
 
-/// A head registry compared with the registry of its base revision.
+/// The result of a comparison.
+#[derive(Debug, Default)]
+pub struct Report {
+    /// The findings that a new waiver of the head covers, one line each.
+    pub waived: Vec<String>,
+    /// The lines that make the check fail.
+    pub problems: Vec<String>,
+    /// The lines for information only.
+    pub notes: Vec<String>,
+}
+
+impl Report {
+    /// True when the head breaks no rule that a new waiver does not cover.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// A head registry compared with a base registry.
 pub struct Comparison<'a> {
     base: &'a Registry,
     head: &'a Registry,
@@ -87,42 +124,163 @@ impl<'a> Comparison<'a> {
         Self { base, head }
     }
 
-    /// Every rule that the head breaks, in format id order. A format that
-    /// the base does not list is new and breaks no rule.
+    /// Compare the two registries.
+    #[must_use]
+    pub fn report(&self) -> Report {
+        let findings = self.findings();
+        let (waived, unwaived): (Vec<_>, Vec<_>) = findings
+            .iter()
+            .map(|finding| self.verdict(finding))
+            .partition(|(waived, _)| *waived);
+        let problems = unwaived
+            .into_iter()
+            .map(|(_, line)| line)
+            .chain(self.unused_waivers(&findings))
+            .chain(self.permanent_problems())
+            .chain(self.layout_problems())
+            .collect();
+        Report {
+            waived: waived.into_iter().map(|(_, line)| line).collect(),
+            problems,
+            notes: self.activation_notes().collect(),
+        }
+    }
+
+    /// Every rule that the head breaks: first the formats that both list,
+    /// in id order, then the formats that only the base lists.
     #[must_use]
     pub fn findings(&self) -> Vec<Finding> {
+        let retired = self
+            .base
+            .0
+            .format
+            .iter()
+            .filter(|(id, _)| !self.head.0.format.contains_key(*id))
+            .map(|(id, base)| Finding {
+                rule: Rule::Retired,
+                id: id.clone(),
+                head: base.writes,
+                base: base.writes,
+            });
+        self.pairs()
+            .flat_map(|(id, head, base)| head.findings_against(id, base))
+            .chain(retired)
+            .collect()
+    }
+
+    /// The reason of the new head waiver that covers `finding`. A waiver
+    /// covers a finding when it is in the table of the rule and names the
+    /// same format and version.
+    #[must_use]
+    pub fn waiver(&self, finding: &Finding) -> Option<&'a str> {
+        let table = finding.rule.waivers();
+        self.head
+            .0
+            .waivers(table)
+            .get(&finding.id)
+            .filter(|waiver| {
+                waiver.version == finding.head && self.is_new(table, &finding.id, waiver)
+            })
+            .map(|waiver| waiver.reason.as_str())
+    }
+
+    /// Whether `finding` is waived, and its line for the report.
+    fn verdict(&self, finding: &Finding) -> (bool, String) {
+        let table = finding.rule.waivers().name();
+        let Finding { id, head, .. } = finding;
+        match self.waiver(finding) {
+            Some(reason) => (
+                true,
+                format!("{finding} Waived by [{table}.{id}]: {reason}"),
+            ),
+            None => (
+                false,
+                format!(
+                    "{finding} Add [{table}.{id}] with version = {head} and a reason, or change the release. See docs/formats.md."
+                ),
+            ),
+        }
+    }
+
+    /// The formats that both registries list: the id, the head entry and
+    /// the base entry.
+    fn pairs(&self) -> impl Iterator<Item = (&'a String, &'a Format, &'a Format)> {
+        let base = self.base;
         self.head
             .0
             .format
             .iter()
-            .filter_map(|(id, head)| self.base.0.format.get(id).map(|base| (id, head, base)))
-            .flat_map(|(id, head, base)| head.findings_against(id, base))
-            .collect()
+            .filter_map(move |(id, head)| base.0.format.get(id).map(|base| (id, head, base)))
     }
 
-    /// The reason of the head waiver that covers `finding`. A waiver
-    /// covers a finding when it names the same format and version.
-    #[must_use]
-    pub fn waiver(&self, finding: &Finding) -> Option<&'a str> {
-        self.head
+    /// A head waiver is new when the base has no waiver in the same table
+    /// for the same format and version. Only a new waiver covers a finding.
+    fn is_new(&self, table: Waivers, id: &str, waiver: &Waiver) -> bool {
+        self.base
             .0
-            .waivers(finding.rule)
-            .get(&finding.id)
-            .filter(|waiver| waiver.version == finding.head)
-            .map(|waiver| waiver.reason.as_str())
+            .waivers(table)
+            .get(id)
+            .is_none_or(|old| old.version != waiver.version)
     }
 
-    /// One line for `finding`: the waiver that covers it, or the entry
-    /// that the head must add.
-    #[must_use]
-    pub fn verdict(&self, finding: &Finding) -> String {
-        let table = finding.rule.table();
-        let Finding { id, head, .. } = finding;
-        match self.waiver(finding) {
-            Some(reason) => format!("{finding} Waived by [{table}.{id}]: {reason}"),
-            None => format!(
-                "{finding} Add [{table}.{id}] with version = {head} and a reason, or change the release. See docs/formats.md."
-            ),
-        }
+    fn unused_waivers<'f>(&'f self, findings: &'f [Finding]) -> impl Iterator<Item = String> + 'f {
+        Waivers::ALL
+            .into_iter()
+            .flat_map(|table| {
+                self.head
+                    .0
+                    .waivers(table)
+                    .iter()
+                    .map(move |(id, waiver)| (table, id, waiver))
+            })
+            .filter(|(table, id, waiver)| self.is_new(*table, id, waiver))
+            .filter(|(table, id, waiver)| {
+                !findings.iter().any(|finding| {
+                    finding.rule.waivers() == *table && finding.id == **id && finding.head == waiver.version
+                })
+            })
+            .map(|(table, id, waiver)| {
+                format!(
+                    "[{}.{id}] with version = {} is new and covers no finding. Remove it, or give it the version that the finding names.",
+                    table.name(),
+                    waiver.version
+                )
+            })
+    }
+
+    fn permanent_problems(&self) -> impl Iterator<Item = String> + '_ {
+        self.pairs()
+            .filter(|(_, head, base)| (head.permanent || base.permanent) && head.reads_min > base.reads_min)
+            .map(|(id, _, base)| {
+                format!(
+                    "{id}: the data stays for all time, and the head stops reading version {}. No waiver covers this.",
+                    base.reads_min
+                )
+            })
+    }
+
+    fn layout_problems(&self) -> impl Iterator<Item = String> + '_ {
+        self.pairs()
+            .filter(|(_, head, base)| head.writes == base.writes && head.layout != base.layout)
+            .map(|(id, head, _)| {
+                format!(
+                    "{id}: the layout changes, and the version stays {}. Give the format a new version, or a new id.",
+                    head.writes
+                )
+            })
+    }
+
+    fn activation_notes(&self) -> impl Iterator<Item = String> + '_ {
+        self.pairs().filter_map(|(id, head, base)| {
+            head.activation
+                .as_ref()
+                .filter(|activation| activation.writes > base.reads_max)
+                .map(|activation| {
+                    format!(
+                        "{id}: flag {} writes version {}, and the base reads only up to version {}. Switch the flag on only after no node runs the base.",
+                        activation.flag, activation.writes, base.reads_max
+                    )
+                })
+        })
     }
 }
