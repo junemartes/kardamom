@@ -240,6 +240,14 @@ Every run has these checks.
 | Keep-pace | Each executor must advance while the sealer advances, and the gap to the sealer must stay within `LOAD_MAX_GAP` blocks. |
 | Liveness | A non-chaos run fails when a service reports `kardamom_service_up=0` at the end. |
 
+**Metric reads.** The checks read the exporters of the executors, the ingress and the lane-0 sequencer replicas.
+
+- The suite gives the load the bridge address of each node from the node contract. The load reads each exporter directly over the bridge.
+- When a direct read fails, the load reads the same exporter through `docker exec <node> curl 127.0.0.1:<port>/metrics`. That read ends after 10 s, so a stalled `docker exec` cannot hold the final snapshot.
+- The chaos probes use the same reader (`ExporterReader` in `kardamom-bench`). They reach the ingress exporter over the bridge too.
+- The report field `scrape_fallbacks` counts these fallbacks in the snapshots that the verdict reads. A high count means that the bridge reads failed. A runner-wide exec stall then degrades the verdict.
+- `kardamom-load --metrics-via-docker true` (the CLI default) reads every exporter through `docker exec` only. `false` reads `http://<node>:<port>/metrics` first.
+
 **Chaos mode.** The suite runs the load in chaos mode.
 
 - A transient gap, a missing executor metric or a down service is informational.

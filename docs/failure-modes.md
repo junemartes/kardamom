@@ -1058,6 +1058,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.
+  - The load harness of the chaos suite reads its metrics the same way: directly over the bridge, with exec as the fallback. The load report counts each fallback as `scrape_fallbacks`.
   - The exporter of every service runs on a dedicated thread. A wedged service runtime cannot take `/metrics` down.
   - When you read a chaos failure, tell "the pipeline stalled" from "the probes went dark" before you diagnose.
 
@@ -1090,6 +1091,3 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The case can fail with `aeron did not reach >= 8 running ... within 60s (have 7)` after the destructive wipe. The SLO knob is `CHAOS_RESTART_SLO_S` (default 60).
   - The failing runs are otherwise green, and they pass on a re-run.
   - While that shard is red, real regressions behind it are invisible.
-- **Load-harness scrapes ride `docker exec`**
-  - The chaos *probes* use direct HTTP. `kardamom-load --metrics-via-docker` defaults to true.
-  - A runner-wide exec stall can degrade the keep-pace verdicts. The chaos-mode leniency masks it.

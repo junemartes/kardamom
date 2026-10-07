@@ -127,22 +127,9 @@ impl Harness {
             chaos_mode: false,
             fixed_rate: true,
             scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
-            metrics_via_docker: true,
             subscribe: false,
             feed_confirm: false,
-            executor_nodes: self
-                .probes
-                .executors
-                .iter()
-                .map(|n| n.container.clone())
-                .collect(),
-            ingress_node: self.probes.ingresses[0].container.clone(),
-            sequencer_nodes: self
-                .probes
-                .sequencers
-                .iter()
-                .map(|n| n.container.clone())
-                .collect(),
+            metrics: self.probes.load_metrics(&self.probes.ingresses[0]),
             output: Some(run.report.clone()),
         })
     }
