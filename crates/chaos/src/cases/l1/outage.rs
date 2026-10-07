@@ -1,11 +1,12 @@
 //! `batcher-outage-past-retention`: the batcher is frozen until the
 //! sealers' egress floor passes its cursor and a snapshot lands, then
-//! thawed. The thaw has two valid ends. The batcher restarts and posts
-//! the group it restores from its spool, or it keeps running and posts
-//! the group it holds in memory. Either way the group lands right after
-//! the covered block. The batcher then gets the rest of the gap replayed,
-//! or rebuilds it from the state databases' block references and the
-//! `tx_data` archives, and posts on past the sealers' floor.
+//! thawed. The thaw has one valid end. The freeze is longer than the
+//! service interval of the Aeron clients of the batcher, so a client
+//! times out and the process exits. The orchestrator restarts it, and it
+//! posts the group it restores from its spool. The group lands right
+//! after the covered block. The batcher then gets the rest of the gap
+//! replayed, or rebuilds it from the state databases' block references
+//! and the `tx_data` archives, and posts on past the sealers' floor.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -234,15 +235,6 @@ impl Lines {
     }
 }
 
-/// How the batcher came through the thaw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThawPath {
-    /// It restarted and posted the group it restored from the spool.
-    Restored,
-    /// It kept running and posted the group it held in memory.
-    Survived,
-}
-
 /// The batcher at the freeze: the block L1 covered, and its log counts.
 #[derive(Debug, Clone, Copy)]
 struct AtFreeze {
@@ -263,9 +255,9 @@ impl AtFreeze {
 
     /// Judge the recovered batch and the log counts read after it. The
     /// batch must start right after the covered block: no block is lost
-    /// and none is posted twice. A batcher that restarted must have
+    /// and none is posted twice. The batcher must have restarted and
     /// restored its group from the spool.
-    fn judge(&self, batch: Posted, now: Lines, ctx: &str) -> anyhow::Result<ThawPath> {
+    fn judge(&self, batch: Posted, now: Lines, ctx: &str) -> anyhow::Result<()> {
         let next = self.covered.checked_add(1).ok_or_else(|| {
             crate::chaos_fail!("{ctx}: the covered block {} has no successor", self.covered)
         })?;
@@ -276,21 +268,22 @@ impl AtFreeze {
             batch.index,
             batch.l2_block_start
         );
-        match (
-            now.restored > self.lines.restored,
+        anyhow::ensure!(
             now.starts > self.lines.starts,
-        ) {
-            (true, _) => Ok(ThawPath::Restored),
-            (false, false) => Ok(ThawPath::Survived),
-            (false, true) => Err(crate::chaos_fail!(
-                "{ctx}: the batcher restarted after the thaw but never logged '{SPOOL_RESTORED_LINE}' — its spool was not restored"
-            )),
-        }
+            "{}: {ctx}: the batcher kept running after the thaw — an Aeron client timeout must end the process",
+            crate::FAIL_PREFIX
+        );
+        anyhow::ensure!(
+            now.restored > self.lines.restored,
+            "{}: {ctx}: the batcher restarted after the thaw but never logged '{SPOOL_RESTORED_LINE}' — its spool was not restored",
+            crate::FAIL_PREFIX
+        );
+        Ok(())
     }
 }
 
 /// The frozen group lands on L1 right after the covered block, from the
-/// spool of a restarted batcher or from the memory of a running one.
+/// spool of the restarted batcher.
 async fn await_spool_posted(
     h: &Harness,
     l1: &L1,
@@ -318,9 +311,9 @@ async fn await_spool_posted(
             t.as_secs()
         )
     })?;
-    let path = at.judge(batch, lines, ctx)?;
+    at.judge(batch, lines, ctx)?;
     crate::log(format!(
-        "{ctx}: the frozen group was posted ({path:?}): batch {} covers {}..={} after the covered block {}",
+        "{ctx}: the restarted batcher posted the frozen group from its spool: batch {} covers {}..={} after the covered block {}",
         batch.index, batch.l2_block_start, batch.l2_block_end, at.covered
     ));
     Ok(())

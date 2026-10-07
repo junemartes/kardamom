@@ -1,4 +1,4 @@
-use super::{AtFreeze, Frozen, Lines, ThawPath};
+use super::{AtFreeze, Frozen, Lines};
 use crate::l1::Posted;
 
 const CTX: &str = "batcher-outage-past-retention";
@@ -48,20 +48,20 @@ fn a_recovered_batch_with_a_gap_or_an_overlap_fails() {
 }
 
 #[test]
-fn the_thaw_path_follows_the_log_counts() {
+fn only_a_restart_that_restores_the_spool_passes() {
     let at = at_freeze(1747);
     let recovered = batch(41, 1748, 1760);
     let restored = Lines {
         starts: 4,
         restored: 2,
     };
-    assert_eq!(
-        at.judge(recovered, restored, CTX).unwrap(),
-        ThawPath::Restored
-    );
-    assert_eq!(
-        at.judge(recovered, at.lines, CTX).unwrap(),
-        ThawPath::Survived
+    at.judge(recovered, restored, CTX).unwrap();
+    let survived = at.judge(recovered, at.lines, CTX).unwrap_err();
+    assert!(
+        survived
+            .to_string()
+            .contains("the batcher kept running after the thaw"),
+        "{survived}"
     );
     let lost = Lines {
         starts: 4,

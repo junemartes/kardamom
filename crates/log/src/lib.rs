@@ -31,6 +31,7 @@ pub mod codec;
 pub mod config;
 pub mod discovery;
 pub mod error;
+mod fail_fast;
 mod ffi;
 mod offer_retry;
 pub mod recorder;

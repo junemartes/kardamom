@@ -165,7 +165,8 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.
   - Each freeze attempt finds the batcher container again. A restart between two attempts can replace the container.
   - The frozen group must land on L1 right after the covered block. The case finds the first batch that ends past the covered block, and that batch must start at the next block. More batches can land before the poll reads L1, so the case does not read the last batch.
-  - The thaw has two valid ends. The batcher restarts and logs `pending group restored from the spool`. Or the batcher keeps running and posts the group from memory. A batcher that restarts and does not log the restore fails the case.
+  - The thaw has one valid end. The freeze is longer than the service interval of the Aeron clients, so a client times out and the batcher exits. Nomad restarts it, and it logs `pending group restored from the spool`.
+  - A batcher that keeps running after the thaw fails the case. A batcher that restarts and does not log the restore fails the case.
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.
   - In both cases the L1 record must be contiguous.

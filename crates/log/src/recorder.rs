@@ -38,6 +38,7 @@ use tracing::{info, warn};
 use crate::archive_catalog::ArchiveCatalog;
 use crate::config::AeronConfig;
 use crate::error::LogError;
+use crate::fail_fast::FailFast;
 
 type Archive = rusteron_archive::AeronArchive;
 
@@ -106,6 +107,7 @@ pub fn connect_archive_with_timeout(
         ctx.set_dir(dir_c.as_c_str())
             .map_err(|e| LogError::Aeron(format!("archive set_dir: {e}")))?;
     }
+    ctx.fail_fast()?;
     let aeron = rusteron_archive::Aeron::new(&ctx)
         .map_err(|e| LogError::Aeron(format!("archive Aeron::new: {e}")))?;
     aeron

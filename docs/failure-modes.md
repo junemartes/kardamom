@@ -643,7 +643,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - The batcher posts the pending group of the spool first. It does this even when a refusal stops the reader before the group is due. The spool is the only copy of those blocks.
 - Proof: `batcher-outage-past-retention`.
   - The case freezes the batcher with a non-empty spool. It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
-  - It asserts that the frozen group lands right after the covered block. A batcher that restarts after the thaw must restore the group from its spool. A batcher that keeps running posts the group from memory.
+  - It asserts that the frozen group lands right after the covered block.
+  - It asserts that the batcher exits after the thaw and restores the group from its spool. The freeze is longer than the service interval of the Aeron clients, so a client times out and ends the process (see "Aeron stall tolerance"). A batcher that keeps running fails the case.
   - It then accepts one of two ends. The sealers serve the replay, and L1 covers the head at the thaw with no refusal. This is the expected end. Or the sealers refuse, and the batcher rebuilds the gap and posts past the floor.
   - It asserts that the record on L1 is contiguous.
   - The persisted-state stage of the shard then proves the rebuild from L1 through the recovered range.
@@ -1040,6 +1041,11 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The default is **10000** ms, the Aeron default. Staging and production keep it. A longer value delays the detection of a dead client or driver by the same time.
   - The Raft election and leader heartbeat timeouts are separate and do not change.
   - CI sets **30000** ms (the `cluster-e2e` workflow and the container recipes of `deploy/cluster/justfile`). A shared CI runner can stall for more than 10 s. At 10 s, such a stall kills a healthy party: a client exits on `MediaDriver keepalive: age=... > timeout=10000ms` or on `service interval exceeded`.
+  - A client timeout ends the process in every Aeron context of a Rust service.
+    - The live runtime and every archive control session (the recorder, the catalog and the join-miss refetch) install the same error handler.
+    - The handler logs `aeron client error; exiting` and exits with status 1. Nomad then restarts the service.
+    - A timed-out client closes all of its publications and subscriptions, and it cannot recover. The restart is the one recovery path.
+    - Proof: the `client_timeout_exit` test of `kardamom-log` stops a child process past a 1 s liveness timeout, and the child must exit with status 1.
   - The chaos cases that need an eviction read the same value (`StallTolerance` in `crates/chaos/src/knobs.rs`). The `sequencer-lapse` and `validator-lapse` freezes default to the tolerance plus 20 s. The retention-overrun freeze lasts at least that long. The waits after a driver loss grow by the tolerance.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
@@ -1063,7 +1069,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **L1 outage**
   - The followers cross-check two L1 sources. The batcher rebuilds a range that the sealer no longer retains from the references in the state DBs and from the `tx_data` archives (see "Batcher").
   - The `chaos-l1` shard serves a lying L1 through `kardamom-l1-fault-proxy`: `l1-liar`, `l1-null-receipts`, `two-day-outage` and `batcher-outage-past-retention`.
-  - Proven: the resume of the batcher through the lies, the stale-post alert, the recovery after an outage past the retention window, the contiguous record, and the rebuild parity.
+  - Proven: the resume of the batcher through the lies, the stale-post alert, the recovery after an outage past the retention window (the batcher exits on the Aeron client timeout and restores its spool), the contiguous record, and the rebuild parity.
   - Open: the followers of that shard read one source, the proxy. This is the wiring of the shard, not a limit of the code. The halt on a swallowed log, the disagreement counter and the self-resume after a wrong hash are therefore not cases yet.
   - Open: the proxy does not serve gas spikes of a real L1.
 - **Bridge, injection and DA-parity cases are Target-L only**
