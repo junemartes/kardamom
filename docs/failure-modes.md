@@ -69,8 +69,13 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 | `validator_divergence` | validator | operator | [`validator_divergence`](runbooks/validator_divergence.md) |
 | `l1_cursor_unreadable` | da-watcher | operator | [`l1_cursor_unreadable`](runbooks/l1_cursor_unreadable.md) |
 | `origin_gap` | sequencer | auto | [`origin_gap`](runbooks/origin_gap.md) |
+| `record_lag` | sealer (raised by the ingress) | auto | [`record_lag`](runbooks/record_lag.md) |
 
 - The sealer is a Java service with no Rust exporter. The ingress observes the sealer and raises its halts under `service="sealer"`.
+- The ingress raises `record_lag` while the status frame says the record-lag guard refuses. It clears the halt when the flag clears.
+  - When the record-lag flag and the DA-lag flag both stand, the ingress names `record_lag`. The executors record before the batcher can post.
+  - The sealer answers a refused record with the egress kind 13. The sequencer maps it to the transaction error `RecordLag`.
+  - The record-lag guard is present in the sealer, but it is off by default. The budget is `0`, and a budget above `0` stops the sealer start. A later release turns the guard on. Until then, no service raises `record_lag`.
 - The sections for the sequencer, the batcher, the da-watcher and the validator describe how each one reaches its halts.
 
 **The `revert_to_posted_head` runbook.** It has no cause. The `replay_unavailable` runbook sends the operator to it.
@@ -107,6 +112,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 |---|---|
 | Sealer `sealer_no_quorum` | The ingress sets the root after 10 s with no status frame. It pauses submits. The sequencer pauses after 10 s with no boundary. Its publish loop offers nothing until a boundary returns. |
 | Sealer `da_lag` | The ingress pauses submits. Deposits and boundaries continue. |
+| Sealer `record_lag` | The ingress pauses submits. Deposits and boundaries continue. |
 | Every executor halted | The ingress pauses submits. |
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |

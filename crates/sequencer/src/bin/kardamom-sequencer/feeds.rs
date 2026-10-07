@@ -122,8 +122,8 @@ pub(crate) struct EgressWatermarkFeed {
     partition: u32,
     watermark: SharedWatermark,
     /// The refs the sealer refused for good: late ones, and ones the
-    /// DA-lag guard refused. The publish loop drops each one and tells
-    /// the client.
+    /// DA-lag guard or the record-lag guard refused. The publish loop
+    /// drops each one and tells the client.
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     /// The epoch pump's signals: each growth of the boundaries' L1
@@ -218,6 +218,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_da_lag_frame(frame) {
+            return;
+        }
+        if self.on_record_lag_frame(frame) {
             return;
         }
         if self.on_origin_gap_frame(frame) {

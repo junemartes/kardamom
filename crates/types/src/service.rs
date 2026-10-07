@@ -46,11 +46,16 @@ pub enum HaltCause {
     /// missing, and the sequencer does not hold the missing epoch. Or the
     /// sequencer holds too many relayed epochs that no boundary confirms.
     OriginGap,
+    /// The last ordered canonical index is more than the record-lag
+    /// budget past the highest index that an executor recorded. A new
+    /// variant goes last: the `events` stream carries the archived
+    /// discriminant, and a reader of an older build must decode the rest.
+    RecordLag,
 }
 
 impl HaltCause {
     /// Every cause, for the tests that check the rules and the runbooks.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -60,6 +65,7 @@ impl HaltCause {
         Self::SealerNoQuorum,
         Self::L1CursorUnreadable,
         Self::OriginGap,
+        Self::RecordLag,
     ];
 
     /// The stable id: the `cause` label of the gauge and the alert.
@@ -82,13 +88,14 @@ impl HaltCause {
             Self::SealerNoQuorum => RecoveryId::SealerNoQuorum,
             Self::L1CursorUnreadable => RecoveryId::L1CursorUnreadable,
             Self::OriginGap => RecoveryId::OriginGap,
+            Self::RecordLag => RecoveryId::RecordLag,
         }
     }
 
     /// Whether the service resumes by itself when the cause goes. A lie
-    /// of an L1 source, an L1 outage, a DA lag, and a lost quorum all
-    /// clear on their own: the source agrees again, L1 answers, the
-    /// batcher posts, a leader commits. An origin gap clears when a
+    /// of an L1 source, an L1 outage, a DA lag, a record lag, and a lost
+    /// quorum all clear on their own: the source agrees again, L1
+    /// answers, the batcher posts, an executor records, a leader commits. An origin gap clears when a
     /// boundary confirms the missing epoch. A refused replay, a
     /// divergence, and an unreadable cursor need an operator: a range must
     /// be recovered or the chain reverted, a verdict must be examined, or a
@@ -101,7 +108,8 @@ impl HaltCause {
             | Self::L1Unreachable
             | Self::DaLag
             | Self::SealerNoQuorum
-            | Self::OriginGap => Clears::Auto,
+            | Self::OriginGap
+            | Self::RecordLag => Clears::Auto,
             Self::ReplayUnavailable | Self::ValidatorDivergence | Self::L1CursorUnreadable => {
                 Clears::Operator
             }
@@ -131,11 +139,14 @@ pub enum RecoveryId {
     /// The sequencer's origin gap. It goes after every older variant, for
     /// the same reason.
     OriginGap,
+    /// The sealer's record lag. It goes after every older variant, for
+    /// the same reason.
+    RecordLag,
 }
 
 impl RecoveryId {
     /// Every runbook, for the test that checks each file exists.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -145,6 +156,7 @@ impl RecoveryId {
         Self::SealerNoQuorum,
         Self::L1CursorUnreadable,
         Self::OriginGap,
+        Self::RecordLag,
         Self::RevertToPostedHead,
     ];
 
@@ -162,6 +174,7 @@ impl RecoveryId {
             Self::SealerNoQuorum => "sealer_no_quorum",
             Self::L1CursorUnreadable => "l1_cursor_unreadable",
             Self::OriginGap => "origin_gap",
+            Self::RecordLag => "record_lag",
             Self::RevertToPostedHead => "revert_to_posted_head",
         }
     }
@@ -448,6 +461,12 @@ mod tests {
         assert_eq!(HaltCause::SealerNoQuorum.id(), "sealer_no_quorum");
         assert_eq!(HaltCause::SealerNoQuorum.clears(), Clears::Auto);
         assert_eq!(HaltCause::ValidatorDivergence.clears(), Clears::Operator);
+        assert_eq!(HaltCause::RecordLag.id(), "record_lag");
+        assert_eq!(HaltCause::RecordLag.clears(), Clears::Auto);
+        assert_eq!(
+            HaltCause::RecordLag.recovery().runbook(),
+            "docs/runbooks/record_lag.md"
+        );
         assert_eq!(
             RecoveryId::RevertToPostedHead.runbook(),
             "docs/runbooks/revert_to_posted_head.md"
