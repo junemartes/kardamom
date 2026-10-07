@@ -1,6 +1,12 @@
-//! Verification buffers: a shared, bounded, cursor-pruned core, plus typed
-//! wrappers for the BAL (by block number), receipts (by canonical `tx_idx`),
-//! and per-block claim indexes.
+//! Verification buffers: a shared, bounded, cursor-pruned core, plus the
+//! replica buffers for the BAL (by block number), receipts and account rows
+//! (by canonical `tx_idx`), and the per-block claim index buffer.
+//!
+//! A replica buffer keeps every distinct result of each key, with the
+//! sessions that published it. A second result for a key never replaces
+//! the first, so the consumer compares the result of every replica. A
+//! session that repeats a result it already published adds nothing, so a
+//! replica that restarts in a loop takes no extra space.
 //!
 //! The binary's Aeron subscriber tasks fill the buffers. The sync exec and
 //! commit threads drain them, and wait briefly for the matching data to
@@ -23,110 +29,243 @@
 //!   (see the comment in [`KeyedBuffer::take`]) with one primitive.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use kardamom_types::{AccountRow, BPosition, BlockDelta, Receipt};
 
+use crate::metrics;
+use crate::replica::{Check, Distinct, ReplicaId, Skip, Taken};
+
 /// Key of a verification buffer. It maps to the increasing index (block
 /// number or canonical record index) that the catch-up and pruning logic
 /// uses.
-trait BufKey: Ord + Copy {
+pub trait BufKey: Ord + Copy {
     fn index(self) -> u64;
+    fn from_index(index: u64) -> Self;
 }
 impl BufKey for u64 {
     fn index(self) -> u64 {
         self
+    }
+    fn from_index(index: u64) -> Self {
+        index
     }
 }
 impl BufKey for BPosition {
     fn index(self) -> u64 {
         self.as_index()
     }
+    fn from_index(index: u64) -> Self {
+        BPosition::from_index(index)
+    }
 }
 
-/// Shared core of [`BalBuffer`] and [`ReceiptBuffer`]. The producer task
-/// inserts values. The sync consumer thread calls `take` in increasing key
-/// order, and waits briefly for matching data. The buffer is bounded and
-/// cursor-pruned, so late or stale data can never leak: an entry the
-/// consumer's cursor has already passed will never be requested again.
-struct KeyedBuffer<K: BufKey, V> {
-    inner: Mutex<KeyedInner<K, V>>,
-    cv: Condvar,
-    /// Max retained entries. On overflow, the oldest entry is evicted. The
+/// What one key of a [`KeyedBuffer`] holds, and how a later insert for
+/// the same key joins it.
+trait Slot: Sized {
+    type Item;
+    fn first(item: Self::Item) -> Self;
+    /// Join a later insert for the key, or say why the slot refuses it.
+    fn join(&mut self, item: Self::Item) -> Result<(), Skip>;
+    /// The replica results the slot holds.
+    fn results(&self) -> usize;
+}
+
+/// The latest insert for a key replaces the earlier one. The claim
+/// index is a scheduling hint, not a checked result, so one copy is
+/// enough.
+struct Latest<V>(V);
+
+impl<V> Slot for Latest<V> {
+    type Item = V;
+    fn first(item: V) -> Self {
+        Self(item)
+    }
+    fn join(&mut self, item: V) -> Result<(), Skip> {
+        self.0 = item;
+        Ok(())
+    }
+    fn results(&self) -> usize {
+        1
+    }
+}
+
+/// Upper bound on the distinct results of one key. Correct replicas
+/// publish one value, so a second value already shows a divergence.
+const MAX_DISTINCT: usize = 8;
+/// Upper bound on the sessions named for one distinct result. It covers
+/// the replicas, plus the new sessions of replicas that restart inside
+/// the window.
+const MAX_SESSIONS: usize = 32;
+
+/// The distinct results of one key, in arrival order.
+struct Results<V>(Vec<Distinct<V>>);
+
+impl<V: PartialEq> Slot for Results<V> {
+    type Item = (ReplicaId, V);
+    fn first((replica, value): (ReplicaId, V)) -> Self {
+        Self(vec![Distinct {
+            value,
+            replicas: vec![replica],
+        }])
+    }
+    fn join(&mut self, (replica, value): (ReplicaId, V)) -> Result<(), Skip> {
+        let full = self.0.len() >= MAX_DISTINCT;
+        match self.0.iter_mut().find(|d| d.value == value) {
+            Some(d) if d.replicas.contains(&replica) => Err(Skip::Repeat),
+            Some(d) if d.replicas.len() >= MAX_SESSIONS => Err(Skip::Bound),
+            Some(d) => {
+                d.replicas.push(replica);
+                Ok(())
+            }
+            None if full => Err(Skip::Bound),
+            None => {
+                self.0.push(Distinct {
+                    value,
+                    replicas: vec![replica],
+                });
+                Ok(())
+            }
+        }
+    }
+    fn results(&self) -> usize {
+        Distinct::results(&self.0)
+    }
+}
+
+/// The limits of one buffer. The distances are in key index units.
+#[derive(Clone, Copy)]
+struct Bounds {
+    /// Max retained keys. On overflow, the highest key is evicted, so a
+    /// key far ahead never pushes out a key near the consumer. The
     /// consumer treats missing data as "could not verify", never as a
-    /// divergence, so eviction can only leave a block or tx unverified.
+    /// divergence, so eviction can only leave a key unverified.
     cap: NonZeroUsize,
-    /// Catch-up skip horizon, in index units. See [`take`](Self::take).
+    /// Catch-up skip horizon. See [`KeyedBuffer::take_step`].
     lookbehind: u64,
+    /// How far below the consumer's cursor an insert is still taken. The
+    /// next take hands it over as a late entry. Zero keeps only the
+    /// cursor key itself.
+    late_window: u64,
+    /// How far above the consumer's cursor an insert is still taken. A
+    /// key beyond it is a wrong or wrapped key, not a live one.
+    reach: u64,
 }
 
-struct KeyedInner<K: BufKey, V> {
-    map: BTreeMap<K, V>,
-    /// Index of the latest key requested by `take`. Requests only increase,
-    /// so an insert strictly below this index is a late arrival for a key
-    /// the consumer already handled (took, skipped, or timed out). The
-    /// buffer drops it. This stops the buffer from holding dead entries.
+/// How many buffered keys must lie beyond the catch-up horizon before
+/// the consumer skips a key. A real live head is a run of keys. One
+/// wrong key far ahead does not turn the skip on.
+const SKIP_EVIDENCE: usize = 4;
+
+/// Shared core of the replica buffers and [`ClaimBuffer`]. The producer
+/// task inserts values. The sync consumer thread calls `take` in
+/// increasing key order, and waits briefly for matching data. The buffer
+/// is bounded and cursor-pruned, so late or stale data can never leak:
+/// each take hands over every entry below its key, and an insert outside
+/// the window around the cursor is refused.
+struct KeyedBuffer<K, S> {
+    inner: Mutex<KeyedInner<K, S>>,
+    cv: Condvar,
+    bounds: Bounds,
+}
+
+struct KeyedInner<K, S> {
+    map: BTreeMap<K, S>,
+    /// Index of the latest key requested by `take`. Requests only
+    /// increase. An insert more than the late window below this index is
+    /// for a key that the consumer can no longer use, so the buffer
+    /// refuses it. This stops the buffer from holding dead entries.
     cursor: Option<u64>,
 }
 
-/// One cycle of [`KeyedBuffer::take`]'s wait loop.
-enum TakeStep<'a, K: BufKey, V> {
-    /// The final result: found, or given up on.
-    Done(Option<V>),
-    /// Not ready yet; wait another cycle with this guard.
-    Retry(std::sync::MutexGuard<'a, KeyedInner<K, V>>),
+/// What an insert did: the reason the buffer refused the item, and how
+/// many replica results the cap evicted.
+struct Inserted {
+    refused: Option<Skip>,
+    evicted: usize,
 }
 
-impl<K: BufKey, V> KeyedBuffer<K, V> {
-    fn new(cap: NonZeroUsize, lookbehind: u64) -> Self {
+/// What a take hands over: the slot of the key, the slots below it, and
+/// how many replica results it dropped beyond the reach.
+struct Took<K, S> {
+    current: Option<S>,
+    below: BTreeMap<K, S>,
+    beyond: usize,
+}
+
+/// One cycle of [`KeyedBuffer::take`]'s wait loop.
+enum TakeStep<'a, K, S> {
+    /// The final result: found, or given up on.
+    Done(Option<S>),
+    /// Not ready yet; wait another cycle with this guard.
+    Retry(std::sync::MutexGuard<'a, KeyedInner<K, S>>),
+}
+
+impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
+    fn new(bounds: Bounds) -> Self {
         Self {
             inner: Mutex::new(KeyedInner {
                 map: BTreeMap::new(),
                 cursor: None,
             }),
             cv: Condvar::new(),
-            cap,
-            lookbehind,
+            bounds,
         }
     }
 
-    /// Insert `value` under `key`. Returns whether the buffer took it: a
-    /// late arrival below the consumer's cursor is dropped.
-    fn insert(&self, key: K, value: V) -> bool {
-        let taken = self.insert_locked(key, value);
-        if taken {
+    /// Insert `item` under `key`, and wake the waiters when the buffer
+    /// took it.
+    fn insert(&self, key: K, item: S::Item) -> Inserted {
+        let inserted = self.insert_locked(key, item);
+        if inserted.refused.is_none() {
             self.cv.notify_all();
         }
-        taken
+        inserted
     }
 
-    /// Insert `value` under the lock, and release the lock when this
-    /// returns. Returns whether the map changed, so the caller knows to
-    /// notify waiters.
-    fn insert_locked(&self, key: K, value: V) -> bool {
+    /// Insert `item` under the lock, and release the lock when this
+    /// returns. One insert adds at most one key, so at most one key is
+    /// evicted.
+    fn insert_locked(&self, key: K, item: S::Item) -> Inserted {
         let mut g = self
             .inner
             .lock()
             .expect("verification buffer lock poisoned");
-        // This is a late arrival below the consumer's cursor: no future
-        // take will request it. Dropping it here, plus the prune in
-        // `take`, stops the buffer from holding dead entries.
-        if g.cursor.is_some_and(|c| key.index() < c) {
-            return false;
-        }
-        g.map.insert(key, value);
-        while g.map.len() > self.cap.get() {
-            g.map.pop_first();
-        }
-        true
+        let refused =
+            g.cursor
+                .and_then(|c| self.outside(key, c))
+                .or_else(|| match g.map.entry(key) {
+                    Entry::Vacant(e) => {
+                        e.insert(S::first(item));
+                        None
+                    }
+                    Entry::Occupied(mut e) => e.get_mut().join(item).err(),
+                });
+        let evicted = (g.map.len() > self.bounds.cap.get())
+            .then(|| g.map.pop_last())
+            .flatten()
+            .map_or(0, |(_, slot)| slot.results());
+        Inserted { refused, evicted }
     }
 
-    /// Take the value for `key`, and wait up to `timeout` for it to arrive.
-    /// Returns `None` if it never arrives. The caller treats that as "could
-    /// not verify", never as a divergence.
-    fn take(&self, key: K, timeout: Duration) -> Option<V> {
+    /// Why `key` is outside the window around `cursor`, if it is.
+    fn outside(&self, key: K, cursor: u64) -> Option<Skip> {
+        let index = key.index();
+        if index < cursor.saturating_sub(self.bounds.late_window) {
+            return Some(Skip::Late);
+        }
+        (index > cursor.saturating_add(self.bounds.reach)).then_some(Skip::Ahead)
+    }
+
+    /// Take the slot for `key`, and wait up to `timeout` for it to
+    /// arrive. Also hands over every slot below `key`: the entries that
+    /// arrived after their own take, or that no take requested. The
+    /// current slot is `None` if it never arrives. The caller treats that
+    /// as "could not verify", never as a divergence.
+    fn take(&self, key: K, timeout: Duration) -> Took<K, S> {
         // Use a deadline, not a fresh timeout per wakeup. Inserts for other
         // keys call notify_all on every block (about 250ms to 2s on a live
         // chain). A fresh timeout per wakeup would mean a wait for a key
@@ -137,14 +276,27 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
             .inner
             .lock()
             .expect("verification buffer lock poisoned");
-        // Requests only increase: everything below `key` is already
-        // resolved (taken, skipped, or timed out) and can be pruned.
-        // Remember the cursor so late re-arrivals are dropped at insert.
-        g.cursor = Some(g.cursor.map_or(key.index(), |c| c.max(key.index())));
-        g.map = std::mem::take(&mut g.map).split_off(&key);
+        // Requests only increase: everything below `key` goes to the
+        // caller now. Remember the cursor, so inserts outside the window
+        // are refused. Entries that arrived before the first take can
+        // lie beyond the reach; they go now.
+        let cursor = g.cursor.map_or(key.index(), |c| c.max(key.index()));
+        g.cursor = Some(cursor);
+        let beyond = g.map.split_off(&K::from_index(
+            cursor.saturating_add(self.bounds.reach).saturating_add(1),
+        ));
+        let upper = g.map.split_off(&key);
+        let below = std::mem::replace(&mut g.map, upper);
+        let beyond = beyond.values().map(Slot::results).sum();
         loop {
             match self.take_step(g, &key, deadline) {
-                TakeStep::Done(result) => return result,
+                TakeStep::Done(current) => {
+                    return Took {
+                        current,
+                        below,
+                        beyond,
+                    };
+                }
                 TakeStep::Retry(next_g) => g = next_g,
             }
         }
@@ -156,23 +308,26 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
     /// return; `Retry` carries the guard for another cycle.
     fn take_step<'a>(
         &'a self,
-        mut g: std::sync::MutexGuard<'a, KeyedInner<K, V>>,
+        mut g: std::sync::MutexGuard<'a, KeyedInner<K, S>>,
         key: &K,
         deadline: std::time::Instant,
-    ) -> TakeStep<'a, K, V> {
+    ) -> TakeStep<'a, K, S> {
         if let Some(v) = g.map.remove(key) {
             return TakeStep::Done(Some(v));
         }
-        // Catch-up check: if the live head (the highest buffered key) is
-        // far ahead of `key`, this item has aged out of the live
-        // stream's buffer and will never arrive. Return None now
-        // instead of waiting out the timeout, so the validator catches
-        // up fast after a cold start or a lapse longer than the live
-        // buffer. A caught-up validator asks for keys near the head, so
-        // this check never triggers and verification runs as normal.
-        if let Some((&head, _)) = g.map.last_key_value()
-            && head.index() > key.index().saturating_add(self.lookbehind)
-        {
+        // Catch-up check: if the live head (a run of buffered keys) is
+        // far ahead of `key`, this item has aged out of the live stream's
+        // buffer and will never arrive. Return None now instead of
+        // waiting out the timeout, so the validator catches up fast after
+        // a cold start or a lapse longer than the live buffer. A
+        // caught-up validator asks for keys near the head, so this check
+        // never triggers and verification runs as normal.
+        let horizon = K::from_index(
+            key.index()
+                .saturating_add(self.bounds.lookbehind)
+                .saturating_add(1),
+        );
+        if g.map.range(horizon..).nth(SKIP_EVIDENCE - 1).is_some() {
             return TakeStep::Done(None);
         }
         let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
@@ -198,61 +353,45 @@ impl<K: BufKey, V> KeyedBuffer<K, V> {
     }
 }
 
-/// Buffer of executor-published BALs, keyed by block number. The Aeron
-/// `tx_bal` subscriber task calls [`insert`](Self::insert). The sync exec
-/// thread calls [`take`](Self::take), and waits briefly for the matching
-/// block.
-pub struct BalBuffer {
-    core: KeyedBuffer<u64, BlockDelta>,
+/// Buffer of one kind of executor result: every distinct result of each
+/// key, with the sessions that published it. The binary's subscriber
+/// task calls [`insert`](Self::insert); the sync consumer thread calls
+/// [`take`](Self::take). Every result the buffer does not hand over
+/// counts in `validator_replica_results_unchecked_total`.
+pub struct ReplicaBuffer<K, V> {
+    core: KeyedBuffer<K, Results<V>>,
+    check: Check,
 }
 
-impl Default for BalBuffer {
-    fn default() -> Self {
+impl<K: BufKey, V: PartialEq> ReplicaBuffer<K, V> {
+    fn with(check: Check, bounds: Bounds) -> Self {
         Self {
-            core: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
+            core: KeyedBuffer::new(bounds),
+            check,
         }
     }
-}
 
-impl BalBuffer {
-    /// How far below the live head (the highest buffered block) a
-    /// requested block must be to count as unrecoverable backlog. Its BAL
-    /// has aged out of the live `tx_bal` multicast buffer and will never
-    /// arrive, so the validator commits it unverified at once instead of
-    /// waiting. A caught-up validator asks for blocks near the head (a
-    /// smaller lag than this value), so it always waits and verifies.
-    /// Only a validator catching up from a cold start, or after a lapse
-    /// longer than the multicast buffer, skips the wait.
-    pub(crate) const BACKLOG_LOOKBEHIND: u64 = 16;
-    /// Bound on buffered BALs (whole `BlockDelta` values, the heavyweight
-    /// case). This is about 17 to 35 minutes of chain at a 250ms-to-2s
-    /// block rate, well beyond the verify window, so eviction fires only
-    /// if the consumer stalls outright.
-    pub(crate) const MAX_BUFFERED: NonZeroUsize =
-        NonZeroUsize::new(1024).expect("compile-time constant");
-
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// Insert the result `value` that `replica` published for `key`.
+    pub fn insert(&self, key: K, replica: ReplicaId, value: V) {
+        let inserted = self.core.insert(key, (replica, value));
+        if let Some(skip) = inserted.refused {
+            metrics::counter_replica_unchecked(self.check, skip, 1);
+        }
+        metrics::counter_replica_unchecked(self.check, Skip::Evicted, inserted.evicted);
     }
 
-    #[cfg(test)]
-    fn with_cap(cap: NonZeroUsize) -> Arc<Self> {
-        Arc::new(Self {
-            core: KeyedBuffer::new(cap, Self::BACKLOG_LOOKBEHIND),
-        })
-    }
-
-    pub fn insert(&self, delta: BlockDelta) {
-        self.core.insert(delta.block_number, delta);
-    }
-
-    /// Take the BAL for `block`, and wait up to `timeout` for it to arrive.
-    /// Returns `None` if it never arrives; the caller treats that as
-    /// "could not verify", not as a divergence. See [`KeyedBuffer::take`]
-    /// for the deadline and catch-up rules.
-    pub fn take(&self, block: u64, timeout: Duration) -> Option<BlockDelta> {
-        self.core.take(block, timeout)
+    /// Take the results for `key`, and wait up to `timeout` for the first
+    /// to arrive. Also hands over the results of lower keys that arrived
+    /// after their take. An empty `current` means "could not verify", not
+    /// a divergence. See [`KeyedBuffer::take`] for the deadline rule and
+    /// [`KeyedBuffer::take_step`] for the catch-up skip.
+    pub fn take(&self, key: K, timeout: Duration) -> Taken<K, V> {
+        let took = self.core.take(key, timeout);
+        metrics::counter_replica_unchecked(self.check, Skip::Ahead, took.beyond);
+        Taken {
+            current: took.current.map(|r| r.0).unwrap_or_default(),
+            late: took.below.into_iter().map(|(k, r)| (k, r.0)).collect(),
+        }
     }
 
     #[cfg(test)]
@@ -261,31 +400,79 @@ impl BalBuffer {
     }
 }
 
-/// Buffer of executor-published receipts, keyed by canonical `tx_idx`. The
-/// `tx_receipts` subscriber task fills it; the commit thread drains it.
+/// Buffer of executor-published BALs, keyed by block number. The Aeron
+/// `tx_bal` subscriber task inserts; the sync exec thread takes, and
+/// waits briefly for the matching block.
+pub type BalBuffer = ReplicaBuffer<u64, BlockDelta>;
+
+impl BalBuffer {
+    /// How far below the live head a requested block must be to count
+    /// as unrecoverable backlog. Its BAL has aged out of the live
+    /// `tx_bal` multicast buffer and will never arrive, so the validator
+    /// commits it unverified at once instead of waiting. A caught-up
+    /// validator asks for blocks near the head (a smaller lag than this
+    /// value), so it always waits and verifies. Only a validator catching
+    /// up from a cold start, or after a lapse longer than the multicast
+    /// buffer, skips the wait.
+    pub(crate) const BACKLOG_LOOKBEHIND: u64 = 16;
+    /// Bound on buffered blocks. Each block holds at most `MAX_DISTINCT`
+    /// whole `BlockDelta` values, the heavyweight case. This is about 17
+    /// to 35 minutes of chain at a 250ms-to-2s block rate, well beyond the
+    /// verify window, so eviction fires only if the consumer stalls
+    /// outright.
+    pub(crate) const MAX_BUFFERED: NonZeroUsize =
+        NonZeroUsize::new(1024).expect("compile-time constant");
+    /// How many blocks below the checked block a replica's BAL is still
+    /// compared: a replica that lags the validator by up to this many
+    /// blocks is checked. The validator keeps one checked write-set for
+    /// each block of the window.
+    pub(crate) const CHECK_WINDOW: u64 = 64;
+    /// How many blocks above the checked block a BAL is still taken:
+    /// about 3 days of chain at 250ms blocks. A validator further behind
+    /// than this rebuilds from a peer checkpoint, not by catch-up.
+    pub(crate) const REACH: u64 = 1 << 20;
+    const BOUNDS: Bounds = Bounds {
+        cap: Self::MAX_BUFFERED,
+        lookbehind: Self::BACKLOG_LOOKBEHIND,
+        late_window: Self::CHECK_WINDOW,
+        reach: Self::REACH,
+    };
+
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::with(Check::Bal, Self::BOUNDS))
+    }
+
+    #[cfg(test)]
+    fn with_cap(cap: NonZeroUsize) -> Arc<Self> {
+        Arc::new(Self::with(
+            Check::Bal,
+            Bounds {
+                cap,
+                ..Self::BOUNDS
+            },
+        ))
+    }
+}
+
+/// Buffer of executor-published receipts and account rows, both keyed by
+/// canonical `tx_idx`. The `tx_receipts` subscriber task fills it; the
+/// commit thread drains it.
 pub struct ReceiptBuffer {
-    core: KeyedBuffer<BPosition, Receipt>,
+    pub receipts: ReplicaBuffer<BPosition, Receipt>,
     /// Published account rows, keyed by their batch's end position. Only a
     /// batch end carries rows, so most positions have no entry. The rows
     /// travel in the frame that carried the end receipt, so they are
     /// present whenever that receipt is, and the commit thread takes them
-    /// with no wait.
-    rows: KeyedBuffer<BPosition, Vec<AccountRow>>,
-}
-
-impl Default for ReceiptBuffer {
-    fn default() -> Self {
-        Self {
-            core: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
-            rows: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
-        }
-    }
+    /// with no wait. Rows have no late window: rows that arrive after the
+    /// commit thread passed their position meet a later local state.
+    pub rows: ReplicaBuffer<BPosition, Vec<AccountRow>>,
 }
 
 impl ReceiptBuffer {
     /// This mirrors [`BalBuffer::BACKLOG_LOOKBEHIND`], but in canonical
-    /// records rather than blocks. When the highest buffered `tx_idx` is
-    /// this far ahead of the requested one, the executor's receipt for the
+    /// records rather than blocks. When the buffered head is this far
+    /// ahead of the requested `tx_idx`, the executor's receipt for the
     /// requested tx has aged out of the live `tx_receipts` stream and will
     /// never arrive. The buffer skips it at once, marked unverified,
     /// instead of blocking the commit thread for the full wait per
@@ -294,39 +481,36 @@ impl ReceiptBuffer {
     /// validator's requests trail the head by less than this, so it always
     /// waits and verifies.
     const BACKLOG_LOOKBEHIND: u64 = 4096;
-    /// Bound on buffered receipts. Receipts are small structs; this cap is
+    /// Bound on buffered positions. Each position holds at most
+    /// `MAX_DISTINCT` receipts. Receipts are small structs; this cap is
     /// only a leak guard.
     const MAX_BUFFERED: NonZeroUsize = NonZeroUsize::new(1 << 16).expect("compile-time constant");
+    /// How many canonical records below the checked one a replica's
+    /// receipt is still compared. The validator keeps one checked receipt
+    /// for each record of the window.
+    pub(crate) const CHECK_WINDOW: u64 = 4096;
+    /// How many canonical records above the checked one a receipt is still
+    /// taken: [`BalBuffer::REACH`] blocks of 4096 records.
+    const REACH: u64 = 1 << 32;
+    const BOUNDS: Bounds = Bounds {
+        cap: Self::MAX_BUFFERED,
+        lookbehind: Self::BACKLOG_LOOKBEHIND,
+        late_window: Self::CHECK_WINDOW,
+        reach: Self::REACH,
+    };
 
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn insert(&self, receipt: Receipt) {
-        self.core.insert(receipt.tx_idx, receipt);
-    }
-
-    /// See [`KeyedBuffer::take`] for the deadline rules and the aged-out
-    /// catch-up skip.
-    pub fn take(&self, idx: BPosition, timeout: Duration) -> Option<Receipt> {
-        self.core.take(idx, timeout)
-    }
-
-    /// Record a published batch's account rows under its end position. A
-    /// frame that arrives after the commit thread passed that position is
-    /// dropped, and its rows count as unverified.
-    pub fn insert_rows(&self, end: BPosition, rows: Vec<AccountRow>) {
-        if !self.rows.insert(end, rows) {
-            crate::metrics::counter_rows_unverified();
-        }
-    }
-
-    /// The published rows of a batch that ends at `idx`, when a frame
-    /// ending there has arrived. No wait: a frame that arrives later is
-    /// dropped as a late arrival, and its rows stay unverified.
-    pub fn take_rows(&self, idx: BPosition) -> Option<Vec<AccountRow>> {
-        self.rows.take(idx, Duration::ZERO)
+        Arc::new(Self {
+            receipts: ReplicaBuffer::with(Check::Receipt, Self::BOUNDS),
+            rows: ReplicaBuffer::with(
+                Check::Rows,
+                Bounds {
+                    late_window: 0,
+                    ..Self::BOUNDS
+                },
+            ),
+        })
     }
 }
 
@@ -335,13 +519,16 @@ impl ReceiptBuffer {
 /// missing claim index falls back to sequential re-execution, never to a
 /// gap in verification.
 pub struct ClaimBuffer {
-    core: KeyedBuffer<u64, (NonZeroU16, Arc<crate::parallel::ClaimIndex>)>,
+    core: KeyedBuffer<u64, Latest<(NonZeroU16, Arc<crate::parallel::ClaimIndex>)>>,
 }
 
 impl Default for ClaimBuffer {
     fn default() -> Self {
         Self {
-            core: KeyedBuffer::new(BalBuffer::MAX_BUFFERED, BalBuffer::BACKLOG_LOOKBEHIND),
+            core: KeyedBuffer::new(Bounds {
+                late_window: 0,
+                ..BalBuffer::BOUNDS
+            }),
         }
     }
 }
@@ -381,113 +568,13 @@ impl ClaimBuffer {
         block: u64,
         timeout: Duration,
     ) -> Option<(NonZeroU16, Arc<crate::parallel::ClaimIndex>)> {
-        self.core.take(block, timeout)
+        self.core
+            .take(block, timeout)
+            .current
+            .map(|latest| latest.0)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::{Address, B256, U256};
-    use kardamom_types::{AccountChange, StorageChange};
-
-    fn delta(block: u64, bal_val: u64) -> BlockDelta {
-        BlockDelta {
-            block_number: block,
-            accounts: vec![AccountChange {
-                address: Address::from([0x11; 20]),
-                nonce: 1,
-                balance: U256::from(bal_val),
-                code_hash: B256::ZERO,
-            }],
-            storage: vec![StorageChange {
-                address: Address::from([0x11; 20]),
-                key: B256::from(U256::from(1u64)),
-                value: U256::from(7u64),
-            }],
-            code: vec![],
-            receipts: vec![],
-        }
-    }
-
-    fn receipt(idx: u64, status: bool, gas: u64, wsh: u8) -> Receipt {
-        Receipt {
-            tx_idx: BPosition::from_index(idx),
-            status,
-            gas_used: gas,
-            write_set_hash: B256::from([wsh; 32]),
-            ..Default::default()
-        }
-    }
-
-    // The receipt buffer mirrors the BAL catch-up skip. When the buffered
-    // head is far ahead of the requested tx_idx, the receipt has aged out
-    // of the live stream, and take() must return None at once instead of
-    // blocking the commit thread for the full wait per historical tx.
-    #[test]
-    fn receipt_take_skips_aged_out_backlog_immediately() {
-        let buf = ReceiptBuffer::new();
-        buf.insert(receipt(10_000, true, 21_000, 0xab)); // This is the live head, far ahead.
-        let start = std::time::Instant::now();
-        let got = buf.take(BPosition::from_index(0), Duration::from_secs(5));
-        assert!(got.is_none(), "aged-out receipt must be skipped");
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "skip must not consume the wait window: {:?}",
-            start.elapsed()
-        );
-    }
-
-    // Data that arrives after its take() gave up, by a skip or a timeout,
-    // must not leak in the buffer forever. Inserts below the consumer's
-    // cursor are dropped, and stale entries are pruned as the cursor moves.
-    #[test]
-    fn late_arrival_below_cursor_does_not_leak() {
-        let bals = BalBuffer::new();
-        // The consumer asked for block 5 and gave up; nothing is buffered.
-        assert!(bals.take(5, Duration::from_millis(10)).is_none());
-        // BALs for blocks the cursor has passed arrive late, so they are dropped.
-        bals.insert(delta(3, 100));
-        bals.insert(delta(4, 100));
-        assert_eq!(bals.len(), 0, "late below-cursor inserts must be dropped");
-        // An in-window insert still works.
-        bals.insert(delta(6, 100));
-        assert_eq!(bals.len(), 1);
-        assert!(bals.take(6, Duration::from_millis(10)).is_some());
-        // Entries below a later request are pruned by the take itself.
-        bals.insert(delta(7, 100));
-        assert!(bals.take(9, Duration::from_millis(10)).is_none());
-        assert_eq!(bals.len(), 0, "stale entry below the cursor must be pruned");
-    }
-
-    // The buffer is bounded, so a stalled consumer cannot make it hold the
-    // whole live stream in RAM. The oldest entry is evicted first, which can
-    // only leave a block unverified, never cause a false divergence.
-    #[test]
-    fn buffer_is_bounded_evicting_oldest() {
-        let bals = BalBuffer::with_cap(NonZeroUsize::new(3).expect("fixture cap"));
-        for b in 1..=5u64 {
-            bals.insert(delta(b, 100));
-        }
-        assert_eq!(bals.len(), 3);
-        // Blocks 1 and 2 are evicted; blocks 3 through 5 are kept.
-        assert!(bals.take(3, Duration::from_millis(10)).is_some());
-        assert!(bals.take(4, Duration::from_millis(10)).is_some());
-        assert!(bals.take(5, Duration::from_millis(10)).is_some());
-    }
-
-    #[test]
-    fn buffers_block_until_value_arrives() {
-        // take() must return promptly once another thread inserts a value.
-        // This covers the handoff from the Aeron task to the exec thread.
-        let bals = BalBuffer::new();
-        let bals2 = bals.clone();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            bals2.insert(delta(7, 5));
-        });
-        let got = bals.take(7, Duration::from_secs(2)).expect("delta arrives");
-        assert_eq!(got.block_number, 7);
-        h.join().unwrap();
-    }
-}
+#[path = "buffers_tests.rs"]
+mod tests;

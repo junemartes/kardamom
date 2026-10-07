@@ -108,6 +108,8 @@ async fn spawn_writer_and_bal(
         .tx_bal_publisher(rt_pub)
         .await
         .context("open tx_bal publication")?;
+    // A validator names a divergent replica by this session id.
+    tracing::info!(session = bal_pub.session_id(), "tx_bal publication open");
     // EIP-7928 BAL publisher. The exec thread hands off each block's
     // captured Bal and receipts-free delta. This thread encodes and
     // delivers it with an ack and bounded retry, retaining recent
