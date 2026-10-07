@@ -1,10 +1,11 @@
 //! A client timeout ends the process in every Aeron context that this
-//! crate builds. A child process holds one client against a media driver
+//! crate builds. A child process holds a client against a media driver
 //! with a 1 s client liveness timeout. The test stops the child with
 //! `SIGSTOP` for longer than that timeout and then continues it. The
 //! service interval check of the client then fails. The child must log
-//! the line of the crate's error handler and exit with status 1, so that
-//! the supervisor restarts it.
+//! the line of the crate's error handler on stdout and exit with status
+//! 1, so that the supervisor restarts it. One child holds both clients,
+//! so both conductor threads call the handler at the same time.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -14,11 +15,12 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::AeronConfig;
-use kardamom_log::recorder::connect_archive;
+use kardamom_log::recorder::{ArchiveSession, connect_archive};
 use kardamom_log::testing::{AeronTestCluster, require_docker};
 
 /// The env var that names the context a child process holds.
@@ -47,6 +49,9 @@ enum Context {
     Runtime,
     /// The client of an archive control session.
     Archive,
+    /// Both clients in one process. Both time out at once, so both
+    /// conductor threads call the handler at the same time.
+    Both,
 }
 
 impl Context {
@@ -54,6 +59,7 @@ impl Context {
         match self {
             Self::Runtime => "runtime",
             Self::Archive => "archive",
+            Self::Both => "both",
         }
     }
 
@@ -61,18 +67,26 @@ impl Context {
         match name {
             "runtime" => Self::Runtime,
             "archive" => Self::Archive,
+            "both" => Self::Both,
             other => panic!("unknown context {other:?}"),
         }
+    }
+
+    fn runtime(dir: &Path) -> AeronRuntime {
+        AeronRuntime::spawn_with_dir(dir).expect("runtime")
+    }
+
+    fn archive(dir: &Path) -> ArchiveSession {
+        connect_archive(Some(dir), &AeronConfig::default()).expect("archive session")
     }
 
     /// Start the client of this context against `dir`, report it ready,
     /// and hold it until the process ends.
     fn hold(self, dir: &Path) -> ! {
         match self {
-            Self::Runtime => Held::forever(AeronRuntime::spawn_with_dir(dir).expect("runtime")),
-            Self::Archive => Held::forever(
-                connect_archive(Some(dir), &AeronConfig::default()).expect("archive session"),
-            ),
+            Self::Runtime => Held::forever(Self::runtime(dir)),
+            Self::Archive => Held::forever(Self::archive(dir)),
+            Self::Both => Held::forever((Self::runtime(dir), Self::archive(dir))),
         }
     }
 
@@ -88,17 +102,21 @@ impl Context {
         child.signal("STOP");
         std::thread::sleep(STOPPED_FOR);
         child.signal("CONT");
-        let out = child.await_exit().unwrap_or_else(|| {
+        let (out, stdout) = child.await_exit().unwrap_or_else(|| {
             panic!(
                 "{self:?}: the child kept running {}s after the client timeout",
                 EXIT_BUDGET.as_secs()
             )
         });
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{self:?}: stderr: {stderr}");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{self:?}: stdout: {stdout} stderr: {stderr}"
+        );
         assert!(
-            stderr.contains(HANDLER_LINE),
-            "{self:?}: no handler line in stderr: {stderr}"
+            stdout.contains(HANDLER_LINE),
+            "{self:?}: no handler line in stdout: {stdout} stderr: {stderr}"
         );
     }
 }
@@ -121,6 +139,8 @@ impl Held {
 struct ChildClient {
     child: Child,
     context: Context,
+    /// The stdout lines after the ready line, once the child ends.
+    rest: JoinHandle<String>,
 }
 
 impl ChildClient {
@@ -137,8 +157,12 @@ impl ChildClient {
             .spawn()
             .expect("spawn the child");
         let stdout = child.stdout.take().expect("piped stdout");
-        if Self::await_ready(stdout) {
-            return Self { child, context };
+        if let Some(rest) = Self::await_ready(stdout) {
+            return Self {
+                child,
+                context,
+                rest,
+            };
         }
         let _ = child.kill();
         let out = child.wait_with_output().expect("wait for the child");
@@ -150,16 +174,19 @@ impl ChildClient {
     }
 
     /// Wait for the ready line on `stdout`. A reader thread keeps the
-    /// pipe drained until the child ends.
-    fn await_ready(stdout: ChildStdout) -> bool {
+    /// pipe drained until the child ends, and its handle gives the lines
+    /// after the ready line. `None` when no ready line comes.
+    fn await_ready(stdout: ChildStdout) -> Option<JoinHandle<String>> {
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        let rest = std::thread::spawn(move || {
             let mut lines = BufReader::new(stdout).lines().map_while(Result::ok);
             let ready = lines.any(|line| line.contains(READY_LINE));
             let _ = tx.send(ready);
-            lines.count()
+            lines.collect::<Vec<_>>().join("\n")
         });
-        rx.recv_timeout(READY_BUDGET).unwrap_or(false)
+        rx.recv_timeout(READY_BUDGET)
+            .unwrap_or(false)
+            .then_some(rest)
     }
 
     /// Send `SIGNAL` to the child with `kill`.
@@ -176,17 +203,19 @@ impl ChildClient {
         );
     }
 
-    /// The output of the child once it exits, or `None` when it still
-    /// runs after [`EXIT_BUDGET`]. A child that still runs is killed.
-    fn await_exit(self) -> Option<Output> {
+    /// The output of the child once it exits, with its stdout after the
+    /// ready line, or `None` when it still runs after [`EXIT_BUDGET`]. A
+    /// child that still runs is killed.
+    fn await_exit(self) -> Option<(Output, String)> {
         let pid = self.child.id().to_string();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || tx.send(self.child.wait_with_output()));
-        let out = rx.recv_timeout(EXIT_BUDGET).ok();
-        if out.is_none() {
+        let Ok(out) = rx.recv_timeout(EXIT_BUDGET) else {
             let _ = Command::new("kill").args(["-KILL", &pid]).status();
-        }
-        out.map(|r| r.expect("wait for the child"))
+            return None;
+        };
+        let rest = self.rest.join().expect("stdout reader");
+        Some((out.expect("wait for the child"), rest))
     }
 }
 
@@ -200,9 +229,8 @@ fn child_holds_one_client() {
         return;
     };
     let dir = std::env::var(DIR_ENV).expect("aeron dir env");
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    // The same subscriber as every service binary: `fmt` on stdout.
+    tracing_subscriber::fmt().init();
     Context::parse(&name).hold(Path::new(&dir));
 }
 
@@ -216,4 +244,10 @@ async fn a_client_timeout_in_the_runtime_context_exits() {
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test client_timeout_exit -- --ignored`"]
 async fn a_client_timeout_in_the_archive_context_exits() {
     Context::Archive.assert_timeout_exits().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test client_timeout_exit -- --ignored`"]
+async fn a_client_timeout_in_both_contexts_at_once_exits() {
+    Context::Both.assert_timeout_exits().await;
 }

@@ -644,7 +644,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - Proof: `batcher-outage-past-retention`.
   - The case freezes the batcher with a non-empty spool. It holds the freeze until the load passes twice the retention and a Raft snapshot lands. It then thaws the batcher.
   - It asserts that the frozen group lands right after the covered block.
-  - It asserts that the batcher exits after the thaw and restores the group from its spool. The freeze is longer than the service interval of the Aeron clients, so a client times out and ends the process (see "Aeron stall tolerance"). A batcher that keeps running fails the case.
+  - It asserts that the batcher exits after the thaw and restores the group from its spool. The freeze lasts at least the stall tolerance plus 20 s, so a client times out and ends the process (see "Aeron stall tolerance").
+  - A batcher that keeps running fails the case. The failure says whether the handler logged `aeron client error; exiting` (the exit hung) or no timeout fired.
   - It then accepts one of two ends. The sealers serve the replay, and L1 covers the head at the thaw with no refusal. This is the expected end. Or the sealers refuse, and the batcher rebuilds the gap and posts past the floor.
   - It asserts that the record on L1 is contiguous.
   - The persisted-state stage of the shard then proves the rebuild from L1 through the recovered range.
@@ -1041,11 +1042,13 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The default is **10000** ms, the Aeron default. Staging and production keep it. A longer value delays the detection of a dead client or driver by the same time.
   - The Raft election and leader heartbeat timeouts are separate and do not change.
   - CI sets **30000** ms (the `cluster-e2e` workflow and the container recipes of `deploy/cluster/justfile`). A shared CI runner can stall for more than 10 s. At 10 s, such a stall kills a healthy party: a client exits on `MediaDriver keepalive: age=... > timeout=10000ms` or on `service interval exceeded`.
-  - A client timeout ends the process in every Aeron context of a Rust service.
+  - Every Aeron client error ends the process, in every Aeron context of a Rust service. A timeout is the common case.
     - The live runtime and every archive control session (the recorder, the catalog and the join-miss refetch) install the same error handler.
-    - The handler logs `aeron client error; exiting` and exits with status 1. Nomad then restarts the service.
+    - The handler logs `aeron client error; exiting` and ends the process with `_exit(1)`. Nomad then restarts the service.
+    - `_exit` runs no exit-time code. Two conductor threads can time out at the same time, and two concurrent `exit` calls can hang in glibc before 2.41. Exit-time destructors (mdbx, aws-lc) would also run while other threads still use those libraries.
+    - Each binary logs through the `fmt` subscriber to the line-buffered stdout, so the handler line is written before `_exit`.
     - A timed-out client closes all of its publications and subscriptions, and it cannot recover. The restart is the one recovery path.
-    - Proof: the `client_timeout_exit` test of `kardamom-log` stops a child process past a 1 s liveness timeout, and the child must exit with status 1.
+    - Proof: the `client_timeout_exit` test of `kardamom-log` stops a child process past a 1 s liveness timeout. The child must log the handler line on stdout and exit with status 1. One child holds a runtime client and an archive session, so both time out together.
   - The chaos cases that need an eviction read the same value (`StallTolerance` in `crates/chaos/src/knobs.rs`). The `sequencer-lapse` and `validator-lapse` freezes default to the tolerance plus 20 s. The retention-overrun freeze lasts at least that long. The waits after a driver loss grow by the tolerance.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.

@@ -17,6 +17,7 @@ fn at_freeze(covered: u64) -> AtFreeze {
         lines: Lines {
             starts: 3,
             restored: 1,
+            exits: 2,
         },
     }
 }
@@ -54,18 +55,29 @@ fn only_a_restart_that_restores_the_spool_passes() {
     let restored = Lines {
         starts: 4,
         restored: 2,
+        exits: 3,
     };
     at.judge(recovered, restored, CTX).unwrap();
-    let survived = at.judge(recovered, at.lines, CTX).unwrap_err();
+    let no_timeout = at.judge(recovered, at.lines, CTX).unwrap_err();
     assert!(
-        survived
+        no_timeout
             .to_string()
-            .contains("the batcher kept running after the thaw"),
-        "{survived}"
+            .contains("no Aeron client timeout fired"),
+        "{no_timeout}"
+    );
+    let hung = Lines {
+        exits: 3,
+        ..at.lines
+    };
+    let hung = at.judge(recovered, hung, CTX).unwrap_err();
+    assert!(
+        hung.to_string().contains("the process hung in its exit"),
+        "{hung}"
     );
     let lost = Lines {
         starts: 4,
         restored: 1,
+        exits: 3,
     };
     let error = at.judge(recovered, lost, CTX).unwrap_err();
     assert!(

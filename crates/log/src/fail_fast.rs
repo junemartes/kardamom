@@ -1,11 +1,13 @@
 //! The fail-fast error handler of every Aeron context in this crate.
 //!
-//! A client that loses its driver, or that stalls past its service
-//! interval, closes all of its publications and subscriptions. It cannot
-//! recover. A process that keeps running with such a client keeps its
-//! `/metrics` port up, so supervisors and probes see a live service that
-//! is stuck. So the handler ends the process, and the supervisor restarts
-//! it. The restart is the one recovery path.
+//! The handler ends the process on every error that an Aeron client
+//! reports, not only on a timeout. A client that loses its driver, or
+//! that stalls past its service interval, closes all of its publications
+//! and subscriptions. It cannot recover. A process that keeps running
+//! with such a client keeps its `/metrics` port up, so supervisors and
+//! probes see a live service that is stuck. So the handler ends the
+//! process, and the supervisor restarts it. The restart is the one
+//! recovery path.
 //!
 //! `rusteron-client` and `rusteron-archive` each generate their own
 //! context type and their own handler trait. One macro gives the handler
@@ -27,7 +29,17 @@ impl TracingErrorHandler {
             code = error_code,
             msg, "aeron client error; exiting (fail-fast, as aeron's default handler does)"
         );
-        std::process::exit(1);
+        // The `fmt` subscriber of every binary writes each event as one
+        // line to the line-buffered stdout, so the line is on the file
+        // descriptor before `_exit`. `exit` is not safe here: two
+        // conductor threads can call it at the same time, and glibc
+        // before 2.41 can hang on a second concurrent `exit`. It also
+        // runs exit-time destructors (mdbx, aws-lc) while other threads
+        // still use those libraries.
+        //
+        // SAFETY: `_exit` ends the process at once. It runs no Rust or C
+        // code after the call, so no invariant of this process can break.
+        unsafe { libc::_exit(1) }
     }
 }
 
