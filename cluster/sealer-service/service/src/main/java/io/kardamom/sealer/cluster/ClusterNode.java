@@ -9,6 +9,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
@@ -37,6 +38,11 @@ public final class ClusterNode {
     // Pinned to 0.3.0 (Aeron 1.44's default appVersion) on both the
     // ConsensusModule and the ServiceContainer. They must agree.
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
+
+    /** The property of the DA-lag budget, in blocks. */
+    static final String DA_LAG_BUDGET_SETTING = "kardamom.cluster.daLagBudgetBlocks";
+    /** The property of the record-lag budget, in canonical records. */
+    static final String RECORD_LAG_BUDGET_SETTING = "kardamom.cluster.recordLagBudget";
 
     public static void main(final String[] args) {
         // Every stdout line carries its time from here on (see the class).
@@ -72,10 +78,26 @@ public final class ClusterNode {
         // Replicated configuration like the horizon. Zero turns the guard
         // off. -Dkardamom.cluster.daLagBudgetBlocks wins over the
         // DA_LAG_BUDGET_BLOCKS env var.
-        final long daLagBudgetBlocks = parseDaLagBudget(
-            System.getProperty("kardamom.cluster.daLagBudgetBlocks", System.getenv("DA_LAG_BUDGET_BLOCKS")));
+        final long daLagBudgetBlocks = parseBudget(
+            DA_LAG_BUDGET_SETTING,
+            System.getProperty(DA_LAG_BUDGET_SETTING, System.getenv("DA_LAG_BUDGET_BLOCKS")),
+            CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS,
+            "block count");
         System.out.println("cluster da-lag budget memberId=" + memberId
             + " blocks=" + (daLagBudgetBlocks == 0 ? "0 <guard off>" : Long.toString(daLagBudgetBlocks)));
+        // The record-lag budget: how far the last ordered index may run past
+        // the best recorded cursor of the executors before the sealer
+        // refuses new transactions. Replicated configuration like the
+        // DA-lag budget. Zero turns the guard off.
+        // -Dkardamom.cluster.recordLagBudget wins over the
+        // KARDAMOM_RECORD_LAG_BUDGET env var.
+        final long recordLagBudget = parseBudget(
+            RECORD_LAG_BUDGET_SETTING,
+            System.getProperty(RECORD_LAG_BUDGET_SETTING, System.getenv("KARDAMOM_RECORD_LAG_BUDGET")),
+            CanonicalSealerState.DEFAULT_RECORD_LAG_BUDGET,
+            "record count");
+        System.out.println("cluster record-lag budget memberId=" + memberId
+            + " records=" + (recordLagBudget == 0 ? "0 <guard off>" : Long.toString(recordLagBudget)));
         // The ordering window: 20 with priority fees on, 0 for first come,
         // first served. Replicated configuration like the two above: it
         // decides the relay order. The deploy sets it from the same value
@@ -160,7 +182,8 @@ public final class ClusterNode {
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
                     dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                    inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
+                    inclusionHorizonBlocks, orderingWindow,
+                    new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, barrier));
@@ -593,23 +616,28 @@ public final class ClusterNode {
         }
     }
 
-    /** The DA-lag budget from its property or env value; unset means the default. */
-    static long parseDaLagBudget(final String raw) {
+    /**
+     * A lag budget from its property or env value; unset or blank means
+     * {@code defaultValue}.
+     *
+     * @param setting the property name, for the error text
+     * @param unit    what the value counts, for the error text
+     * @throws IllegalStateException if the value is not a number or is negative
+     */
+    static long parseBudget(final String setting, final String raw, final long defaultValue, final String unit) {
         if (raw == null || raw.isBlank()) {
-            return CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS;
+            return defaultValue;
         }
-        final long blocks;
+        final long budget;
         try {
-            blocks = Long.parseLong(raw.trim());
+            budget = Long.parseLong(raw.trim());
         } catch (final NumberFormatException e) {
-            throw new IllegalStateException(
-                "kardamom.cluster.daLagBudgetBlocks: '" + raw + "' is not a block count", e);
+            throw new IllegalStateException(setting + ": '" + raw + "' is not a " + unit, e);
         }
-        if (blocks < 0) {
-            throw new IllegalStateException(
-                "kardamom.cluster.daLagBudgetBlocks: " + blocks + " is negative");
+        if (budget < 0) {
+            throw new IllegalStateException(setting + ": " + budget + " is negative");
         }
-        return blocks;
+        return budget;
     }
 
     private static ClusteredServiceContainer.Context serviceContext(

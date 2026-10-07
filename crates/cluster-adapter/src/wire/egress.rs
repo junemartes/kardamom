@@ -5,6 +5,7 @@
 //! parent module.
 
 use alloy_primitives::{Address, B256};
+use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
@@ -19,8 +20,8 @@ use super::{
     EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH,
-    RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, WireError, encode_kind_2u64, rd_i32,
-    rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, WireError,
+    encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -96,6 +97,17 @@ pub enum EgressItem {
         posted_head: u64,
         budget_blocks: u64,
     },
+    /// Record-lag reject. The sealer refused `sender`'s ref at `nonce`
+    /// because the last ordered index `sealed_index` is more than `budget`
+    /// past the best recorded cursor `recorded_index`. The record is not
+    /// ordered.
+    RecordLagReject {
+        sender: Address,
+        nonce: u64,
+        sealed_index: u64,
+        recorded_index: u64,
+        budget: u64,
+    },
 }
 
 impl EgressItem {
@@ -130,6 +142,7 @@ impl EgressItem {
                 offered_origin: rd_u64(buf, 1)?,
                 expected_origin: rd_u64(buf, 9)?,
             }),
+            super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
             other => Err(WireError::BadEgressKind(other)),
         }
     }
@@ -197,7 +210,33 @@ impl EgressItem {
             retained_frames: rd_u64(buf, 26)?,
             floor_index: rd_u64(buf, 34)?,
             floor_block: rd_u64(buf, 42)?,
+            record_lag: Self::decode_record_lag_tail(buf)?,
         }))
+    }
+
+    /// The record-lag tail after the first [`STATUS_LEN`] bytes of a status
+    /// frame. A frame with no tail reads as no cursor and the guard off.
+    fn decode_record_lag_tail(buf: &[u8]) -> Result<RecordLagStatus, WireError> {
+        if buf.len() <= STATUS_LEN {
+            return Ok(RecordLagStatus::default());
+        }
+        let best = rd_u64(buf, STATUS_LEN)?;
+        Ok(RecordLagStatus {
+            best_recorded: (best != u64::MAX).then_some(best),
+            budget: rd_u64(buf, STATUS_LEN + 8)?,
+            halted: rd_u8(buf, STATUS_LEN + 16)? != 0,
+        })
+    }
+
+    fn decode_record_lag_reject(buf: &[u8]) -> Result<Self, WireError> {
+        let sender = rd_slice(buf, 1, SENDER_LEN)?;
+        Ok(Self::RecordLagReject {
+            sender: Address::from_slice(sender),
+            nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+            sealed_index: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+            recorded_index: rd_u64(buf, 1 + SENDER_LEN + 16)?,
+            budget: rd_u64(buf, 1 + SENDER_LEN + 24)?,
+        })
     }
 
     fn decode_da_lag_reject(buf: &[u8]) -> Result<Self, WireError> {
@@ -482,7 +521,7 @@ pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + 8 * 6 + 1);
+    let mut b = Vec::with_capacity(super::STATUS_WITH_RECORD_LAG_LEN);
     b.push(EGRESS_KIND_STATUS);
     b.extend_from_slice(&status.posted_head.to_le_bytes());
     b.extend_from_slice(&status.sealed_head.to_le_bytes());
@@ -491,6 +530,10 @@ pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
     b.extend_from_slice(&status.retained_frames.to_le_bytes());
     b.extend_from_slice(&status.floor_index.to_le_bytes());
     b.extend_from_slice(&status.floor_block.to_le_bytes());
+    let lag = &status.record_lag;
+    b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
+    b.extend_from_slice(&lag.budget.to_le_bytes());
+    b.push(u8::from(lag.halted));
     b
 }
 
@@ -506,6 +549,26 @@ pub fn encode_da_lag_reject(sender: Address, nonce: u64, status: &ClusterStatus)
     b.extend_from_slice(&status.sealed_head.to_le_bytes());
     b.extend_from_slice(&status.posted_head.to_le_bytes());
     b.extend_from_slice(&status.budget_blocks.to_le_bytes());
+    b
+}
+
+/// Frame a record-lag reject exactly as the Java service does. The real
+/// encoder is the Java service; this is a test and mock-server helper.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_record_lag_reject(
+    sender: Address,
+    nonce: u64,
+    sealed_index: u64,
+    lag: &RecordLagStatus,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + SENDER_LEN + 8 * 4);
+    b.push(super::EGRESS_KIND_RECORD_LAG_REJECT);
+    b.extend_from_slice(sender.as_slice());
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(&sealed_index.to_le_bytes());
+    b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
+    b.extend_from_slice(&lag.budget.to_le_bytes());
     b
 }
 

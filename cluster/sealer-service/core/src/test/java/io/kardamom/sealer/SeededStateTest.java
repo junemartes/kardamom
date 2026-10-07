@@ -45,14 +45,14 @@ class SeededStateTest {
         return CanonicalSealerState.seeded(
             seed, capacity, VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, BUDGET);
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(BUDGET, 0L));
     }
 
     private static CanonicalSealerState reload(CanonicalSealerState state) {
         return CanonicalSealerState.load(
             ByteBuffer.wrap(state.takeSnapshot()), 64, Set.of(), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, BUDGET);
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(BUDGET, 0L));
     }
 
     @Test
@@ -147,7 +147,9 @@ class SeededStateTest {
     @Test
     void a_version_9_snapshot_restores_a_state_started_at_genesis() {
         final byte[] current = seeded(64, seed()).takeSnapshot();
-        final byte[] v9 = Arrays.copyOf(current, current.length - 1 - SealerSeed.HASH_LEN);
+        // Cut the version-11 cursor count (1), the seed status (1) and the
+        // seed digest.
+        final byte[] v9 = Arrays.copyOf(current, current.length - 1 - 1 - SealerSeed.HASH_LEN);
         ByteBuffer.wrap(v9).putInt(4, 9);
         final CanonicalSealerState restored = CanonicalSealerState.load(v9, 64);
         assertEquals(SeedStatus.GENESIS, restored.seedStatus());

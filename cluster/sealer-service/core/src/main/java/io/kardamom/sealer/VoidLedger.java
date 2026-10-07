@@ -210,7 +210,8 @@ public final class VoidLedger {
         return buf.array();
     }
 
-    private boolean isVoter(int voterId) {
+    /** Whether {@code voterId} is a configured voter. */
+    boolean isVoter(int voterId) {
         return voterId >= 0 && voterId < MAX_VOTERS && (config.voterMask & (1L << voterId)) != 0L;
     }
 

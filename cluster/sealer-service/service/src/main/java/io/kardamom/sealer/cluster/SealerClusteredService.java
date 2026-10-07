@@ -10,6 +10,7 @@ import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.ClusterStatus;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.OrderingWindow;
 import io.kardamom.sealer.OriginOutcome;
 import io.kardamom.sealer.RemoteOriginAdvance;
@@ -155,13 +156,15 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private final long inclusionHorizonBlocks;
     /**
-     * The DA-lag budget, in blocks. Replicated configuration: it decides
-     * accept-or-reject inside the replicated state machine. Zero turns the
-     * guard off.
+     * The DA-lag and the record-lag budgets. Replicated configuration:
+     * they decide accept-or-reject inside the replicated state machine.
+     * Zero turns a guard off.
      */
-    private final long daLagBudgetBlocks;
+    private final LagBudgets budgets;
     /** DA-lag rejects emitted (logged at power-of-two counts). */
     private long daLagRejectCount = 0;
+    /** Record-lag rejects emitted (logged at power-of-two counts). */
+    private long recordLagRejectCount = 0;
     /**
      * The priority window in front of the record path. Replicated
      * configuration: its size decides the relay order, so every member runs
@@ -209,10 +212,10 @@ public final class SealerClusteredService implements ClusteredService {
             long inclusionHorizonBlocks,
             int orderingWindow) {
         this(dedupCapacity, tickIntervalMs, memberId, remoteOrigins, voidConfig,
-            inclusionHorizonBlocks, orderingWindow, CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS);
+            inclusionHorizonBlocks, orderingWindow, LagBudgets.DEFAULT);
     }
 
-    /** The full constructor, with this member's ordering window size and DA-lag budget. */
+    /** The full constructor, with this member's ordering window size and lag budgets. */
     public SealerClusteredService(
             int dedupCapacity,
             long tickIntervalMs,
@@ -221,10 +224,10 @@ public final class SealerClusteredService implements ClusteredService {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow,
-            long daLagBudgetBlocks) {
+            LagBudgets budgets) {
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
         this.window = new OrderingWindow<>(orderingWindow);
-        this.daLagBudgetBlocks = daLagBudgetBlocks;
+        this.budgets = budgets;
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
         this.memberId = memberId;
@@ -293,7 +296,7 @@ public final class SealerClusteredService implements ClusteredService {
         } else {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
-                inclusionHorizonBlocks, window.capacity(), daLagBudgetBlocks);
+                inclusionHorizonBlocks, window.capacity(), budgets);
             this.egress = new SealerEgress(
                 cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -330,7 +333,7 @@ public final class SealerClusteredService implements ClusteredService {
         final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         this.state = CanonicalSealerState.load(
             buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
-            daLagBudgetBlocks);
+            budgets);
         openEgress(buf);
     }
 
@@ -342,7 +345,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void startSeeded(final SealerSeed seed) {
         this.state = CanonicalSealerState.seeded(
-            seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), daLagBudgetBlocks);
+            seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), budgets);
         openEgress(ByteBuffer.allocate(0));
         // The seed head is on L1, so the purge floor starts there. The first
         // snapshot after the seed confirmation is the first purge mark.
@@ -364,7 +367,7 @@ public final class SealerClusteredService implements ClusteredService {
         egress.setPostedHead(state.postedHead());
     }
 
-    /** The chain's status: the posted and sealed heads, the guard, and the retention floors. */
+    /** The chain's status: the posted and sealed heads, both guards, and the retention floors. */
     private ClusterStatus status() {
         return new ClusterStatus(
             state.postedHead(),
@@ -373,7 +376,10 @@ public final class SealerClusteredService implements ClusteredService {
             state.daLagHalted(),
             egress.retainedCount(),
             egress.firstRetainedIndex(),
-            egress.firstRetainedBlock());
+            egress.firstRetainedBlock(),
+            state.bestRecorded(),
+            state.recordLagBudget(),
+            state.recordLagHalted());
     }
 
     @Override
@@ -474,6 +480,9 @@ public final class SealerClusteredService implements ClusteredService {
                 return;
             case SealerWire.KIND_POSTED_CURSOR:
                 onPostedCursor(buffer, offset, length);
+                return;
+            case SealerWire.KIND_RECORDED_CURSOR:
+                onRecordedCursor(buffer, offset, length);
                 return;
             case SealerWire.KIND_SEED_EPOCH:
                 onSeedEpoch(session, buffer, offset, length);
@@ -808,6 +817,7 @@ public final class SealerClusteredService implements ClusteredService {
             case PAST_DEADLINE -> onPastDeadline(r, outcome.maxInclusionBlock);
             case WINDOW_FULL -> onWindowFull(r);
             case DA_LAG_REJECT -> onDaLagReject(r);
+            case RECORD_LAG_REJECT -> onRecordLagReject(r);
             case RELAYED -> outcome.relayed.ifPresent(egress::offerRelayed);
             case DUPLICATE -> { }
         }
@@ -844,6 +854,35 @@ public final class SealerClusteredService implements ClusteredService {
             + " retained=" + egress.retainedCount()
             + " halted=" + state.daLagHalted());
         egress.offerStatus(status());
+    }
+
+    /**
+     * Handle a {@link SealerWire#KIND_RECORDED_CURSOR} frame: one
+     * executor's recorded cursor. The state keeps the best cursor as the
+     * floor of the record-lag guard. When the best cursor moves up, every
+     * session learns the new status. A frame of another length, from an
+     * executor id that is not a configured voter, or with a cursor at or
+     * past the canonical count, drops as malformed. Every member drops it
+     * the same way, because the checks read only replicated state.
+     */
+    private void onRecordedCursor(final DirectBuffer buffer, final int offset, final int length) {
+        if (length != SealerWire.RECORDED_CURSOR_LEN) {
+            onMalformedFrame("recorded-cursor", length);
+            return;
+        }
+        final int executorId = buffer.getByte(offset + SealerWire.RECORDED_EXECUTOR_OFFSET) & 0xFF;
+        final long recordedThrough =
+            buffer.getLong(offset + SealerWire.RECORDED_THROUGH_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final boolean advanced;
+        try {
+            advanced = state.onRecordedCursor(executorId, recordedThrough);
+        } catch (final IllegalArgumentException ex) {
+            onMalformedFrame("recorded-cursor-refused", length);
+            return;
+        }
+        if (advanced) {
+            egress.offerStatus(status());
+        }
     }
 
     /**
@@ -897,6 +936,23 @@ public final class SealerClusteredService implements ClusteredService {
                 + " totalDaLagRejected=" + daLagRejectCount);
         }
         egress.offerDaLagReject(r.session, r.sender, nonce, status());
+    }
+
+    /**
+     * Answer one offer the record-lag guard refused. The record is not
+     * ordered until an executor records more, so the sequencer reports it
+     * to the client instead of republishing.
+     */
+    private void onRecordLagReject(final HeldRecord r) {
+        recordLagRejectCount++;
+        if (Long.bitCount(recordLagRejectCount) == 1) {
+            System.out.println("cluster RECORD-LAG-REJECT memberId=" + memberId
+                + " nonce=" + r.nonce + " sealedIndex=" + state.sealedIndex()
+                + " bestRecorded=" + state.bestRecorded()
+                + " budget=" + state.recordLagBudget()
+                + " totalRecordLagRejected=" + recordLagRejectCount);
+        }
+        egress.offerRecordLagReject(r.session, r.sender, r.nonce, state.sealedIndex(), status());
     }
 
     /**
