@@ -1,0 +1,493 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["kardamom", "nomad"],
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Kardamom Nomad",
+  "uid": "kardamom-nomad",
+  "version": 1,
+  "weekStart": "",
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(up{job=\"nomad\"}, node)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "node",
+        "multi": true,
+        "name": "node",
+        "options": [],
+        "query": {"query": "label_values(up{job=\"nomad\"}, node)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(nomad_nomad_job_summary_running, exported_job)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "job",
+        "multi": true,
+        "name": "nomad_job",
+        "options": [],
+        "query": {"query": "label_values(nomad_nomad_job_summary_running, exported_job)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "1 while Prometheus scrapes the metrics of the Nomad agent (server or client) on the node.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "up{job=\"nomad\", node=~\"$node\"}",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Nomad agents up",
+      "type": "stat"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 4}, "id": 2, "panels": [], "title": "Allocations", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The job summary of the Nomad leader. failed, lost and complete count the allocations that the garbage collector did not remove yet.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 5},
+      "id": 3,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_running{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_starting{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_queued{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_failed{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_lost{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "E"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_complete{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "F"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_unknown{exported_job=~\"$nomad_job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "G"
+        }
+      ],
+      "title": "Allocations by job and status",
+      "transformations": [
+        {"id": "merge", "options": {}},
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true},
+            "indexByName": {},
+            "renameByName": {
+              "Value #A": "running",
+              "Value #B": "starting",
+              "Value #C": "queued",
+              "Value #D": "failed",
+              "Value #E": "lost",
+              "Value #F": "complete",
+              "Value #G": "unknown",
+              "exported_job": "job"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 5},
+      "id": 4,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_running{exported_job=~\"$nomad_job\"})",
+          "legendFormat": "{{exported_job}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Running allocations by job",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "From the job summary. A queued allocation finds no node with room.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "id": 5,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_failed{exported_job=~\"$nomad_job\"}) > 0",
+          "legendFormat": "failed {{exported_job}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_lost{exported_job=~\"$nomad_job\"}) > 0",
+          "legendFormat": "lost {{exported_job}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job) (nomad_nomad_job_summary_queued{exported_job=~\"$nomad_job\"}) > 0",
+          "legendFormat": "queued {{exported_job}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Failed and lost allocations by job",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "id": 6,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_allocations_running{job=\"nomad\", node=~\"$node\"}",
+          "legendFormat": "running {{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_allocations_pending{job=\"nomad\", node=~\"$node\"} > 0",
+          "legendFormat": "pending {{node}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_allocations_blocked{job=\"nomad\", node=~\"$node\"} > 0",
+          "legendFormat": "blocked {{node}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_allocations_migrating{job=\"nomad\", node=~\"$node\"} > 0",
+          "legendFormat": "migrating {{node}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Allocations per client",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23}, "id": 7, "panels": [], "title": "Restarts and failures", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Restarts of a task in place, by the restart block of its group.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "id": 8,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, task, node) (increase(nomad_client_allocs_restart{exported_job=~\"$nomad_job\", node=~\"$node\"}[10m])) > 0",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task restarts (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Tasks that ended with a failure.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "id": 9,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, task, node) (increase(nomad_client_allocs_failed{exported_job=~\"$nomad_job\", node=~\"$node\"}[10m])) > 0",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task failures (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Tasks that the kernel killed at their memory limit. Nomad exports the series from the first OOM kill on the client.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "id": 10,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, task, node) (increase(nomad_client_allocs_oom_killed{exported_job=~\"$nomad_job\", node=~\"$node\"}[10m])) > 0",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task OOM kills (10m)",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32}, "id": 11, "panels": [], "title": "Task resource use", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "bytes", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 12,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, task, node) (nomad_client_allocs_memory_usage{exported_job=~\"$nomad_job\", node=~\"$node\"})",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task memory",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Memory use over the memory of the task's resources block. At 100 the kernel kills the task.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"lineWidth": 1, "fillOpacity": 10, "thresholdsStyle": {"mode": "line"}},
+          "unit": "percent",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 90}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 13,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "100 * max by (exported_job, task, node) (nomad_client_allocs_memory_usage{exported_job=~\"$nomad_job\", node=~\"$node\"} / nomad_client_allocs_memory_allocated{exported_job=~\"$nomad_job\", node=~\"$node\"})",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task memory of its limit (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 41},
+      "id": 14,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, task, node) (nomad_client_allocs_cpu_total_percent{exported_job=~\"$nomad_job\", node=~\"$node\"})",
+          "legendFormat": "{{exported_job}}/{{task}} {{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Task CPU (% of one core)",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 49}, "id": 15, "panels": [], "title": "Client resources", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0, "max": 100}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 50},
+      "id": 16,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "avg by (node) (nomad_client_host_cpu_total_percent{job=\"nomad\", node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client CPU busy (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The scheduler's view: the CPU shares the allocations reserve, of the client's total.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0, "max": 100}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 50},
+      "id": 17,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "100 * nomad_client_allocated_cpu{job=\"nomad\", node=~\"$node\"} / (nomad_client_allocated_cpu{job=\"nomad\", node=~\"$node\"} + nomad_client_unallocated_cpu{job=\"nomad\", node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "CPU reserved by allocations (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The scheduler's view. At 100 a new allocation does not fit on the client.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0, "max": 100}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 50},
+      "id": 18,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "100 * nomad_client_allocated_memory{job=\"nomad\", node=~\"$node\"} / (nomad_client_allocated_memory{job=\"nomad\", node=~\"$node\"} + nomad_client_unallocated_memory{job=\"nomad\", node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memory reserved by allocations (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "bytes", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
+      "id": 19,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_host_memory_used{job=\"nomad\", node=~\"$node\"}",
+          "legendFormat": "used {{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_host_memory_total{job=\"nomad\", node=~\"$node\"}",
+          "legendFormat": "total {{node}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Client memory used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0, "max": 100}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
+      "id": 20,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "nomad_client_host_disk_used_percent{job=\"nomad\", node=~\"$node\"}",
+          "legendFormat": "{{node}} {{disk}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client disk used (%)",
+      "type": "timeseries"
+    }
+  ]
+}
