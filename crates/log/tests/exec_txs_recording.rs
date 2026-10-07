@@ -1,6 +1,10 @@
-//! Real-Aeron check of the executor-stream recording: the archive records
-//! an IPC publication of one session, and the recorder reports recording
-//! positions that reach the end of every offered frame.
+//! Real-Aeron check of the executor-stream recording:
+//!
+//! 1. two exclusive IPC publications on one driver have their own sessions;
+//! 2. the archive records the session of one of them, and the recorder
+//!    reports recording positions that reach the end of every frame of
+//!    that session, with no frame of the other;
+//! 3. when the publication closes, the recorder ends with an error.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -33,8 +37,14 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
     kardamom_log::testing::require_docker().await;
     let SingleNodeRig { cluster, rt, cfg } = AeronTestCluster::single_node_runtime(5401).await;
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
-    let publication = rt.open_publication(CHANNEL, STREAM).expect("publication");
+    let publication = rt
+        .open_exclusive_publication(CHANNEL, STREAM)
+        .expect("publication");
+    let other = rt
+        .open_exclusive_publication(CHANNEL, STREAM)
+        .expect("a second publication");
     let session_id = publication.session_id();
+    assert_ne!(session_id, other.session_id(), "each has its own session");
 
     let stop = CancellationToken::new();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -55,6 +65,7 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
                 |outcome| ready_tx.send(outcome).expect("ready"),
                 PositionReport {
                     every: Duration::from_millis(20),
+                    lost_after: Duration::from_secs(1),
                     send: |position| {
                         let _ = positions_tx.send(position);
                     },
@@ -70,6 +81,9 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
     let ends: Vec<i64> = (0..FRAMES)
         .map(|i| {
             let fill = u8::try_from(i).expect("below 256");
+            other
+                .publish_bytes(frame(0xEE))
+                .expect("publish on the other");
             let end = publication.publish_bytes(frame(fill)).expect("publish");
             publication.stream_position(end).expect("a raw position")
         })
@@ -86,9 +100,10 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
     .any(|position| position == last);
     assert!(reached, "the recording position never reached {last}");
 
+    // Closing the runtime closes the publications, so the recording stops.
+    drop((publication, other, rt));
+    let outcome = recorder.join().expect("no panic");
+    let err = outcome.expect_err("a stopped recording ends the recorder");
+    assert!(err.to_string().contains("is lost"), "got {err}");
     stop.cancel();
-    recorder
-        .join()
-        .expect("no panic")
-        .expect("the recorder ends cleanly");
 }

@@ -16,6 +16,7 @@ use tracing::warn;
 use super::bound::BoundControl;
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
+use super::table_pub::TablePub;
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
 use crate::error::LogError;
 use crate::offer_retry::OFFER_TIMEOUT;
@@ -347,10 +348,7 @@ impl AeronThread {
         let Some(entry) = self.pubs.get(pub_id as usize) else {
             return;
         };
-        let code = entry.publication.offer(
-            bytes.as_slice(),
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
+        let code = entry.publication.offer(bytes.as_slice());
         if code < 0 {
             metrics::counter!(
                 super::BEST_EFFORT_DROPPED_TOTAL,
@@ -364,7 +362,22 @@ impl AeronThread {
     /// index and its Aeron session id.
     fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<OpenedPub, LogError> {
         let publication = self.open_pub(uri, stream_id)?;
-        self.push_pub(publication, stream_id)
+        self.push_pub(TablePub::Shared(publication), stream_id)
+    }
+
+    /// Open an exclusive publication and append it to `pubs`, replying
+    /// with its index and its own Aeron session id.
+    fn cmd_open_exclusive_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<OpenedPub, LogError> {
+        let c = crate::ffi::c_uri(uri, "uri")?;
+        let publication = self
+            .aeron
+            .add_exclusive_publication(c.as_c_str(), stream_id, ADD_PUB_TIMEOUT)
+            .map_err(|e| LogError::Aeron(format!("add_exclusive_publication {uri}: {e}")))?;
+        self.push_pub(TablePub::Exclusive(publication), stream_id)
     }
 
     /// Open a dynamic MDC publication whose control endpoint names port
@@ -378,16 +391,20 @@ impl AeronThread {
     ) -> Result<(OpenedPub, SocketAddr), LogError> {
         let publication = self.open_pub(uri, stream_id)?;
         let control = BoundControl::new(&publication, uri).wait()?;
-        Ok((self.push_pub(publication, stream_id)?, control))
+        Ok((
+            self.push_pub(TablePub::Shared(publication), stream_id)?,
+            control,
+        ))
     }
 
     /// Append `publication` to `pubs` and return its index and its Aeron
     /// session id. Also reads the publication's term layout once (its
     /// `position_bits_to_shift` and `initial_term_id`), so later offer
     /// decodes never re-derive it.
-    fn push_pub(&mut self, publication: super::Pub, stream_id: i32) -> Result<OpenedPub, LogError> {
-        let layout = TermLayout::from_publication(&publication)?;
-        let session_id = publication.session_id();
+    fn push_pub(&mut self, publication: TablePub, stream_id: i32) -> Result<OpenedPub, LogError> {
+        let constants = publication.constants()?;
+        let layout = TermLayout::from_publication(&constants)?;
+        let session_id = constants.session_id();
         let pub_id = u32::try_from(self.pubs.len())
             .map_err(|_| LogError::Aeron("publication table exceeds u32::MAX entries".into()))?;
         self.pubs.push(PubEntry {
@@ -473,6 +490,13 @@ impl AeronThread {
                 ack,
             } => {
                 let _ = ack.send(self.cmd_open_publication(&uri, stream_id));
+            }
+            RuntimeCmd::OpenExclusivePublication {
+                uri,
+                stream_id,
+                ack,
+            } => {
+                let _ = ack.send(self.cmd_open_exclusive_publication(&uri, stream_id));
             }
             RuntimeCmd::OpenMdcPublication {
                 uri,

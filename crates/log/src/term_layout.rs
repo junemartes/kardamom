@@ -45,15 +45,11 @@ impl TermLayout {
     ///
     /// # Errors
     ///
-    /// Returns an error if reading the publication's constants fails, or
-    /// if `term_buffer_length` does not fit `i32` or is not a positive
-    /// power of two.
+    /// Returns an error if `term_buffer_length` does not fit `i32` or is
+    /// not a positive power of two.
     pub(crate) fn from_publication(
-        publication: &rusteron_client::AeronPublication,
+        constants: &rusteron_client::AeronPublicationConstants,
     ) -> Result<Self, LogError> {
-        let constants = publication
-            .get_constants()
-            .map_err(|e| LogError::Aeron(format!("publication constants: {e}")))?;
         let term_buffer_length = i32::try_from(constants.term_buffer_length()).map_err(|_| {
             LogError::Aeron(format!(
                 "publication term_buffer_length overflow: {}",

@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use anyhow::{Context, anyhow};
-use crossbeam_channel::{Receiver, select};
+use crossbeam_channel::{Receiver, TryRecvError, select};
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::error::LogError;
 use kardamom_types::ExecTxRecord;
@@ -115,8 +115,8 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
     ///
     /// # Errors
     ///
-    /// Returns an error when a record fails to encode, or when shutdown
-    /// ends a wait for a refused record.
+    /// Returns an error when a record fails to encode, when the local
+    /// recording ends, or when shutdown ends a wait for a refused record.
     fn run(mut self) -> anyhow::Result<()> {
         while let Flow::Continue = self.step()? {}
         info!(
@@ -135,22 +135,34 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
                 Err(_) => Ok(Flow::Stop),
             },
             recv(self.inputs.positions) -> position => {
-                if let Ok(position) = position {
-                    ExecStreamMetrics::recorded(self.cursor.recorded(position));
-                } else {
-                    self.on_recorder_gone();
-                }
+                let position = position.map_err(|_| Self::recording_ended())?;
+                ExecStreamMetrics::recorded(self.cursor.recorded(position));
                 Ok(Flow::Continue)
             },
         }
     }
 
-    /// The recorder thread ended. The recording itself goes on in the
-    /// archive, so the records still go out, but no new position arrives
-    /// and the recorded cursor stops.
-    fn on_recorder_gone(&mut self) {
-        warn!("exec stream: the recorder thread ended; the recorded cursor stops");
-        self.inputs.positions = crossbeam_channel::never();
+    /// The recorder thread ended: the local recording is lost, or the
+    /// archive no longer answers. This executor then has no recorded copy
+    /// of what it joins, so the publisher fails. The reader stops, and the
+    /// process exits. A restart waits for a new recording.
+    fn recording_ended() -> anyhow::Error {
+        tracing::error!("exec stream: the local exec_txs recording ended; the executor stops");
+        anyhow!("the local exec_txs recording ended")
+    }
+
+    /// Take the recording positions that arrived while an offer waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the recorder thread ended.
+    fn poll_recorder(&mut self) -> anyhow::Result<()> {
+        match self.inputs.positions.try_recv() {
+            Ok(position) => ExecStreamMetrics::recorded(self.cursor.recorded(position)),
+            Err(TryRecvError::Empty) => (),
+            Err(TryRecvError::Disconnected) => return Err(Self::recording_ended()),
+        }
+        Ok(())
     }
 
     fn on_item(&mut self, item: ExecStreamItem) -> anyhow::Result<()> {
@@ -178,15 +190,33 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
     /// Offer `bytes` to the recorded publication until it takes them. The
     /// thread blocks meanwhile, so the reader's channel fills and the
     /// reader blocks too: this executor stalls and drops nothing.
-    fn offer_until_taken(&self, bytes: &AlignedVec) -> anyhow::Result<i64> {
-        let mut wait = RefusedOffers::new(&self.inputs.stop);
+    fn offer_until_taken(&mut self, bytes: &AlignedVec) -> anyhow::Result<i64> {
+        let mut wait = RefusedOffers::new();
         loop {
-            if let ControlFlow::Break(taken) =
-                wait.settle(self.inputs.publications.offer_recorded(bytes))
-            {
-                return taken;
+            if let Some(end) = self.offer_once(bytes, &mut wait)? {
+                return Ok(end);
             }
         }
+    }
+
+    /// One offer of a record. A refused offer also checks shutdown and the
+    /// recorder, so a wait ends when the recording ends.
+    fn offer_once(
+        &mut self,
+        bytes: &AlignedVec,
+        wait: &mut RefusedOffers,
+    ) -> anyhow::Result<Option<i64>> {
+        let offer = self.inputs.publications.offer_recorded(bytes);
+        if let ControlFlow::Break(end) = wait.settle(offer) {
+            return Ok(Some(end));
+        }
+        if self.inputs.stop.is_cancelled() {
+            return Err(anyhow!(
+                "shutdown while the exec_txs archive refused a record"
+            ));
+        }
+        self.poll_recorder()?;
+        Ok(None)
     }
 
     /// Append a locator for the first record of the session and for every
@@ -215,24 +245,22 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
 
 /// The refused offers of one record: it counts the time the publisher
 /// waits, and logs the start and the end of the wait once.
-struct RefusedOffers<'a> {
-    stop: &'a CancellationToken,
+struct RefusedOffers {
     last: Instant,
     refused: bool,
 }
 
-impl<'a> RefusedOffers<'a> {
-    fn new(stop: &'a CancellationToken) -> Self {
+impl RefusedOffers {
+    fn new() -> Self {
         Self {
-            stop,
             last: Instant::now(),
             refused: false,
         }
     }
 
     /// Settle one offer: `Break` with the end position when it was taken,
-    /// `Break` with an error when shutdown ends the wait, else `Continue`.
-    fn settle(&mut self, offer: Result<i64, LogError>) -> ControlFlow<anyhow::Result<i64>> {
+    /// else `Continue`.
+    fn settle(&mut self, offer: Result<i64, LogError>) -> ControlFlow<i64> {
         let now = Instant::now();
         if offer.is_err() || self.refused {
             ExecStreamMetrics::blocked(now.saturating_duration_since(self.last));
@@ -241,11 +269,8 @@ impl<'a> RefusedOffers<'a> {
         match offer {
             Ok(end) => {
                 self.log_taken();
-                ControlFlow::Break(Ok(end))
+                ControlFlow::Break(end)
             }
-            Err(_) if self.stop.is_cancelled() => ControlFlow::Break(Err(anyhow!(
-                "shutdown while the exec_txs archive refused a record"
-            ))),
             Err(e) => {
                 self.log_refused(&e);
                 ControlFlow::Continue(())

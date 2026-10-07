@@ -79,6 +79,14 @@ pub(super) enum RuntimeCmd {
         stream_id: i32,
         ack: CbSender<Result<OpenedPub, LogError>>,
     },
+    /// Register a new exclusive publication. The Aeron thread executes
+    /// `aeron.add_exclusive_publication()`, so the publication has its own
+    /// session even when another client adds the same channel and stream.
+    OpenExclusivePublication {
+        uri: String,
+        stream_id: i32,
+        ack: CbSender<Result<OpenedPub, LogError>>,
+    },
     /// Register a new dynamic MDC publication whose control endpoint
     /// names port 0. The Aeron thread replies as for `OpenPublication`,
     /// plus the control address the driver bound.

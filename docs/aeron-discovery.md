@@ -42,7 +42,7 @@ The `exec_txs` stream carries the transactions that an executor joins, in canoni
 
 - The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
 - Each executor opens two publications on stream 1005. One publisher thread writes both, in the same order:
-  - The recorded publication, `aeron:ipc?alias=exec-txs`. The archive on the node of the executor records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording loses no frame.
+  - The recorded publication, an exclusive IPC publication on `aeron:ipc?alias=exec-txs`. The archive on the node of the executor records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording loses no frame. An exclusive publication has its own session, so the executors that share one media driver never write into one session.
   - The live publication, a dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_txs`). It is lossy: one offer for each record, and a refused offer drops the record. A consumer repairs a gap from an archive.
 - A static plane whose `exec_txs_channel` is IPC opens only the recorded publication. Its consumers read that one.
 - A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.

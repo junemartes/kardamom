@@ -273,9 +273,15 @@ pub fn record_stream_until_stopped(
 /// also durable on local storage. A failed read sends nothing, so a reader
 /// of the reports never sees a position that the archive did not confirm.
 ///
+/// The function returns an error when no read succeeds for
+/// `report.lost_after`: the recording ended (the publication or the
+/// archive is gone), or the archive no longer answers. The caller then
+/// has no recorded copy and must stop publishing.
+///
 /// # Errors
 ///
-/// Returns an error as [`record_stream_until_stopped`] does.
+/// Returns an error as [`record_stream_until_stopped`] does, or
+/// [`LogError::Aeron`] when the recording is lost.
 pub fn record_stream_reporting(
     aeron_dir: Option<&Path>,
     aeron_cfg: &AeronConfig,
@@ -291,53 +297,52 @@ pub fn record_stream_reporting(
     let mut reporter = PositionReporter {
         recorder,
         report,
-        failing: false,
+        last_read: std::time::Instant::now(),
     };
     while !stop.is_cancelled() {
-        reporter.report_then_wait();
+        reporter.report_then_wait()?;
     }
     Ok(())
 }
 
 /// Where and how often [`record_stream_reporting`] reports the recording
-/// position.
+/// position, and how long a run of failed reads may last.
 pub struct PositionReport<F> {
     pub every: Duration,
+    pub lost_after: Duration,
     pub send: F,
 }
 
 /// The reporting loop of [`record_stream_reporting`]: the recorder, where
-/// its positions go, and whether the last read failed.
+/// its positions go, and the time of the last good read.
 struct PositionReporter<F> {
     recorder: Recorder,
     report: PositionReport<F>,
-    /// Set while reads fail, so a run of failed reads logs once.
-    failing: bool,
+    last_read: std::time::Instant,
 }
 
 impl<F: FnMut(i64)> PositionReporter<F> {
     /// Read the recording position once and send it, then wait.
-    fn report_then_wait(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no read succeeded for `lost_after`.
+    fn report_then_wait(&mut self) -> Result<(), LogError> {
         match self.recorder.position() {
             Ok(position) => {
-                self.failing = false;
+                self.last_read = std::time::Instant::now();
                 (self.report.send)(position);
             }
-            Err(e) => self.note_failure(&e),
+            Err(e) if self.last_read.elapsed() >= self.report.lost_after => {
+                return Err(LogError::Aeron(format!(
+                    "the recording {} is lost: no position for {:?}: {e}",
+                    self.recorder.recording_id, self.report.lost_after
+                )));
+            }
+            Err(_) => (),
         }
         std::thread::sleep(self.report.every);
-    }
-
-    fn note_failure(&mut self, e: &LogError) {
-        if self.failing {
-            return;
-        }
-        warn!(
-            recording_id = self.recorder.recording_id,
-            error = %e,
-            "no recording position to report; the reports stop until a read succeeds"
-        );
-        self.failing = true;
+        Ok(())
     }
 }
 

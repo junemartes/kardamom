@@ -35,6 +35,32 @@ impl AeronRuntime {
         Ok(self.pub_handle(opened))
     }
 
+    /// Open an exclusive publication. Unlike [`Self::open_publication`],
+    /// the driver never shares it with another client that adds the same
+    /// channel and stream id, so its session id is its own. Use it for a
+    /// stream whose recording must hold the frames of one publisher only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error as [`Self::open_publication`] does.
+    pub fn open_exclusive_publication(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<PubHandle, LogError> {
+        let uri = uri.to_string();
+        let opened = request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::OpenExclusivePublication {
+                uri,
+                stream_id,
+                ack,
+            },
+            "open_exclusive_publication",
+        )?;
+        Ok(self.pub_handle(opened))
+    }
+
     /// Open a dynamic MDC publication whose control endpoint names port
     /// 0, and return its handle and the control address the driver bound.
     /// The driver holds that socket for the life of the publication, so

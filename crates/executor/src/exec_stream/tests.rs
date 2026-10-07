@@ -146,7 +146,7 @@ impl Rig {
     }
 
     /// Close the reader side, join the publisher, and reopen the locator
-    /// log it wrote.
+    /// log it wrote. The recorder stays up until the publisher ended.
     fn finish(self) -> LocatorLog {
         let Self {
             items,
@@ -155,13 +155,29 @@ impl Rig {
             _dir,
             path,
         } = self;
-        Self::close(items, positions);
+        Self::hang_up(items);
         handle.join().expect("no panic").expect("a clean end");
+        Self::hang_up(positions);
         LocatorLog::open(&path).expect("reopen")
     }
 
-    /// The named point at which the reader and the recorder hang up.
-    fn close(_items: Sender<ExecStreamItem>, _positions: Sender<i64>) {}
+    /// End the recorder while the reader stays, and return the publisher's
+    /// outcome.
+    fn end_recorder(self) -> anyhow::Result<()> {
+        let Self {
+            items,
+            positions,
+            handle,
+            ..
+        } = self;
+        Self::hang_up(positions);
+        let outcome = handle.join().expect("no panic");
+        Self::hang_up(items);
+        outcome
+    }
+
+    /// The named point at which one side hangs up.
+    fn hang_up<T>(_sender: Sender<T>) {}
 }
 
 #[test]
@@ -330,4 +346,32 @@ fn the_recorded_cursor_never_passes_the_recording_position() {
     assert_eq!(cursor.recorded(120), None);
     assert_eq!(cursor.recorded(300), Some(7));
     assert_eq!(cursor.passed(8), Some(8));
+}
+
+#[test]
+fn a_recorder_end_makes_the_publisher_fail() {
+    let pubs = FakePublications::new(true);
+    let rig = Rig::spawn(&pubs, 8);
+    rig.send_records(0..3);
+    let err = rig.end_recorder().expect_err("a lost recording is fatal");
+    assert!(err.to_string().contains("recording ended"), "got {err}");
+}
+
+#[test]
+fn a_recorder_end_ends_a_wait_for_a_refused_record() {
+    let pubs = FakePublications::new(false);
+    let rig = Rig::spawn(&pubs, 8);
+    rig.send_records(0..1);
+    let refused = std::iter::repeat_with(|| {
+        thread::sleep(Duration::from_millis(5));
+        pubs.refused.load(Ordering::Acquire)
+    })
+    .take(400)
+    .any(|n| n > 0);
+    assert!(refused, "the publisher waits on the refused record");
+    let err = rig
+        .end_recorder()
+        .expect_err("a lost recording ends the wait");
+    assert!(err.to_string().contains("recording ended"), "got {err}");
+    assert_eq!(pubs.recorded_indices(), [] as [u64; 0]);
 }

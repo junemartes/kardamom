@@ -129,7 +129,7 @@ Each executor opens two publications. One publisher thread writes both, in the s
 
 | Publication | Channel | Purpose |
 |---|---|---|
-| Recorded | `aeron:ipc?alias=exec-txs`, stream 1005 | The local archive records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording never loses a frame. |
+| Recorded | `aeron:ipc?alias=exec-txs`, stream 1005, an exclusive publication | The local archive records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording never loses a frame. An exclusive publication has its own session, also when executors share one media driver. |
 | Live | dynamic MDC, topic `exec_txs`, stream 1005 | The consumers subscribe. It is lossy, like `tx_data`. A consumer repairs a gap from an archive. |
 
 - One spied UDP publication could replace the pair. Phase 2 checks on Aeron 1.45 whether a
@@ -167,6 +167,9 @@ content. Each executor therefore keeps a locator log.
 - The publisher thread appends one entry for the first record of each session, then one entry
   every 1024 records. It writes the entry after the offer, so an entry never points past its
   record.
+- An entry names the end position of the record before it. The first entry of a session names
+  the first recording position that the recorder reported, before any offer. That is the start
+  of the record, or a lower bound.
 - A torn or missing tail entry costs nothing. The lookup takes the previous entry, which is a
   lower bound, and the replay is longer.
 - A lookup of `i` takes the newest entry with `index <= i` and replays that session from that
@@ -270,6 +273,9 @@ Compatibility of each change:
   then crash-safe, not power-safe.
 - The executor node also writes the MDBX state DB. Put the archive directory on the same NVMe
   with power-loss protection, or on its own volume. Phase 2 measures the cost.
+- The executor process does not run without the recording. When the recorder reads no recording
+  position for 2 s, the publisher fails, the reader stops, and the process exits. The restart
+  waits for a recording of the new session.
 - The executor process does not start without the recording. Its readiness waits for a live
   recording of its recorded publication, as the ingress does for its lanes
   (`crates/ingress/src/bin/kardamom-ingress/recorders.rs:172`). It reuses
@@ -572,7 +578,7 @@ The budget is in canonical records, because the sealer sees references, not byte
 | Alert | `KardamomHaltRecordLag` on `kardamom_halt{cause="record_lag"} == 1` in `deploy/alerts.yml`, next to `KardamomHaltDaLag` (`deploy/alerts.yml:184-193`). |
 | Client error | `chain halted: record_lag at sealer`, code -32010, as `da_lag` (`docs/runbooks/da_lag.md:16-18`). The JSON-RPC mapping is at `crates/ingress/src/json_rpc.rs:437`. |
 | Ingress gauges | `kardamom_ingress_cluster_recorded_head`, `kardamom_ingress_cluster_record_lag`. |
-| Executor gauges | `kardamom_executor_exec_stream_recorded_index`, `kardamom_executor_exec_stream_publish_blocked_seconds_total`. |
+| Executor gauges | `kardamom_executor_exec_stream_recorded_index`, `kardamom_executor_exec_stream_session_id`, and the counter `kardamom_executor_exec_stream_publish_blocked_ms_total` (milliseconds, because a `metrics` counter is an integer). |
 | Sealer log | `cluster RECORDED-CURSOR executor=<id> recorded=<n> best=<n> halted=<b>`, on change only. |
 | Engine counter | `kardamom_engine_peer_fetch_total{outcome}` with `located`, `not_held`, `not_reached`, `lost`, `unreachable`, `mismatch`. |
 
@@ -798,6 +804,16 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
   executor section, `crates/log/README.md` durability model.
 - Rules: R5 (one owner thread, channels), R6 (sink as an associated type), R14 (reuse
   `record_stream_until_stopped`).
+- Deviations in P2 (#531):
+  - The recorded publication is exclusive (`AeronRuntime::open_exclusive_publication`). A shared
+    IPC publication puts the records of every executor on one media driver into one session.
+  - The blocked counter is `kardamom_executor_exec_stream_publish_blocked_ms_total`, in
+    milliseconds. The gauge `kardamom_executor_exec_stream_session_id` is new. The chaos check
+    reads it.
+  - The first locator of a session names the first reported recording position, a lower bound.
+  - The end of the local recording is fatal (section 3.6).
+  - A static plane whose `exec_txs_channel` is IPC opens only the recorded publication.
+  - The spied-UDP question of section 3.1 stays open. P2 keeps the two publications.
 
 ### P3. The sealer recorded cursor (guard code, off)
 

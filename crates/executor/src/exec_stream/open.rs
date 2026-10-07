@@ -24,11 +24,16 @@ use super::publisher::{ExecStreamPublisher, PublisherInputs, StreamPublications}
 
 /// The recorded publication. An IPC publication cannot run ahead of its
 /// slowest subscriber, the local archive, so the recording never loses a
-/// frame.
+/// frame. The publication is exclusive: every executor has its own
+/// session, also when several executors share one media driver.
 const RECORDED_CHANNEL: &str = "aeron:ipc?alias=exec-txs";
 
 /// How often the recorder thread reads the recording position.
 const POSITION_EVERY: Duration = Duration::from_millis(20);
+
+/// A recording with no readable position for this long is lost. The
+/// recorder thread then ends, and the publisher fails.
+const RECORDING_LOST_AFTER: Duration = Duration::from_secs(2);
 
 /// The depth of the channel from the reader to the publisher. A full
 /// channel blocks the reader.
@@ -116,7 +121,7 @@ impl ExecStream {
         let stream_id = cfg.plane.channels().exec_txs_stream_id;
         let ipc = cfg
             .rt_pub
-            .open_publication(RECORDED_CHANNEL, stream_id)
+            .open_exclusive_publication(RECORDED_CHANNEL, stream_id)
             .context("open the recorded exec_txs publication")?;
         let live = Self::open_live(cfg.rt_pub, cfg.plane).await?;
         let session_id = ipc.session_id();
@@ -250,13 +255,17 @@ impl RecorderBody {
             },
             PositionReport {
                 every: POSITION_EVERY,
+                lost_after: RECORDING_LOST_AFTER,
                 send: |position| {
                     let _ = positions.try_send(position);
                 },
             },
         );
         if let Err(e) = outcome {
-            tracing::error!(error = %e, "exec_txs recorder exited with error");
+            tracing::error!(
+                error = %e,
+                "exec_txs recorder ended: the local recording is lost; the executor stops"
+            );
         }
     }
 }
