@@ -352,7 +352,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.voidVoters` | empty (env `KARDAMOM_VOID_VOTERS`) | yes | The voter ids, for example `0,1,2,3,4`. Empty refuses every void request. Each id must be below 64. |
 | `kardamom.cluster.voidWindow` | `65536` | yes | The number of newest canonical indices that a void can name. |
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
-| `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
+| `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
@@ -379,7 +379,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
 - `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
   - The deploy does not pass it yet, so the guard is off.
-  - Keep it at `0` while the member writes snapshot version 10. See [Snapshot](#snapshot).
+  - While the member writes snapshot version 10, a value above `0` stops the start. A version-10 snapshot holds no recorded cursors, so a member that restores one would decide differently from its peers. The release that writes snapshot version 11 lifts this check. See [Snapshot](#snapshot).
   - The budget and `daLagBudgetBlocks` are not in the snapshot.
 - `seedSnapshot`: the deploy passes the job variable `cluster_seed_snapshot`.
   - The variable is empty in a normal deploy. An empty path means no seed.
@@ -458,7 +458,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 - The member reads snapshot versions 1 to 11. It writes version 10.
   - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
   - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
-  - The release that turns on the cursor publisher and the record-lag guard writes version 11. Do not set `recordLagBudget` above `0` before that release.
+  - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
   - A snapshot before version 9 restores a posted head of `0`. A snapshot before version 10 restores a state that started at genesis.
   - A snapshot before version 11 restores no recorded cursor. The record-lag guard then refuses nothing until the first cursor.
 - The state section holds:

@@ -170,6 +170,15 @@ public final class CanonicalSealerState {
      */
     private static final int SNAPSHOT_WRITE_VERSION = 10;
 
+    /**
+     * Whether {@link #takeSnapshot()} writes the recorded cursors. Only
+     * then may the record-lag budget be above 0: a member that restores a
+     * snapshot without cursors refuses less than its peers that kept them.
+     */
+    public static boolean snapshotKeepsRecordedCursors() {
+        return SNAPSHOT_WRITE_VERSION >= 11;
+    }
+
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
     /** Remote-origin reject reason: the anchor does not advance. */

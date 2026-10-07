@@ -91,11 +91,13 @@ public final class ClusterNode {
         // DA-lag budget. Zero turns the guard off.
         // -Dkardamom.cluster.recordLagBudget wins over the
         // KARDAMOM_RECORD_LAG_BUDGET env var.
-        final long recordLagBudget = parseBudget(
-            RECORD_LAG_BUDGET_SETTING,
-            System.getProperty(RECORD_LAG_BUDGET_SETTING, System.getenv("KARDAMOM_RECORD_LAG_BUDGET")),
-            CanonicalSealerState.DEFAULT_RECORD_LAG_BUDGET,
-            "record count");
+        final long recordLagBudget = requireRecordLagBudgetAllowed(
+            parseBudget(
+                RECORD_LAG_BUDGET_SETTING,
+                System.getProperty(RECORD_LAG_BUDGET_SETTING, System.getenv("KARDAMOM_RECORD_LAG_BUDGET")),
+                CanonicalSealerState.DEFAULT_RECORD_LAG_BUDGET,
+                "record count"),
+            CanonicalSealerState.snapshotKeepsRecordedCursors());
         System.out.println("cluster record-lag budget memberId=" + memberId
             + " records=" + (recordLagBudget == 0 ? "0 <guard off>" : Long.toString(recordLagBudget)));
         // The ordering window: 20 with priority fees on, 0 for first come,
@@ -636,6 +638,29 @@ public final class ClusterNode {
         }
         if (budget < 0) {
             throw new IllegalStateException(setting + ": " + budget + " is negative");
+        }
+        return budget;
+    }
+
+    /**
+     * Refuse a record-lag budget above 0 while the snapshot writer drops the
+     * recorded cursors. A member that restores such a snapshot holds no
+     * cursor, so its guard refuses nothing while the guards of its peers
+     * refuse: the replicated decisions split.
+     *
+     * @param budget                 the parsed record-lag budget
+     * @param snapshotKeepsCursors   whether the snapshot writer writes the cursors
+     * @return {@code budget}
+     * @throws IllegalStateException if the budget is above 0 and the writer
+     *         drops the cursors
+     */
+    static long requireRecordLagBudgetAllowed(final long budget, final boolean snapshotKeepsCursors) {
+        if (budget > 0 && !snapshotKeepsCursors) {
+            throw new IllegalStateException(RECORD_LAG_BUDGET_SETTING + ": " + budget
+                + " is not allowed in this release; it must be 0. The snapshot writer still writes"
+                + " version 10, which holds no recorded cursors, so a member that restores a snapshot"
+                + " would hold no cursors and decide differently from its peers. The release that"
+                + " writes snapshot version 11 lifts this check.");
         }
         return budget;
     }
