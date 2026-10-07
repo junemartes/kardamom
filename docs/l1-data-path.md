@@ -187,9 +187,10 @@ The job is `deploy/cluster/nomad/da-proxy.nomad.hcl`. It runs the image `ghcr.io
 | `eigenda_network` | `EIGENDA_NETWORK` | `sepolia_testnet` or `mainnet`. The proxy fills the disperser and the contract addresses from it. |
 | `eigenda_cert_verifier` | `EIGENDA_CERT_VERIFIER` | Address of the `EigenDACertVerifierRouter` of the network. Empty gives the known address for `sepolia_testnet` only. Other networks need a value. |
 | `eigenda_ledger_mode` | none | Payment mode of the signer. Default `on-demand-only`. Other values: `reservation-only`, `reservation-and-on-demand`. |
-| `eigenda_signer_key` | `BATCHER_KEY` | Key that signs dispersals. It is the batcher key. Empty makes the proxy read-only. |
-| `eigenda_eth_rpc` | `L1_RPC` | L1 endpoint that the proxy uses to check certificates. |
 
+- The signer key (`BATCHER_KEY`) and the L1 endpoint that checks certificates (`L1_RPC`) are secrets.
+  They are not job variables. The task reads them from the Nomad Variable `nomad/jobs/da-proxy`.
+  See "Secrets" in [`deploy/cluster/README.md`](../deploy/cluster/README.md#secrets).
 - The deploy role does not set `eigenda_ledger_mode`. Change it as a job variable.
 - The default ledger mode pays from an on-demand deposit.
   - The batcher account must hold a deposit in the EigenDA PaymentVault.

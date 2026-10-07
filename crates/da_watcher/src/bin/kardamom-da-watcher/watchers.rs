@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 use kardamom_da_watcher::interop::{CursorReconcile, InteropWatcher, WsRemoteChainSource};
-use kardamom_da_watcher::{L1ResumeAfter, L1Watcher, WatcherHandle};
+use kardamom_da_watcher::{L1Endpoints, L1ResumeAfter, L1Watcher, WatcherHandle};
 use kardamom_log::aeron_live::{TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle};
 use kardamom_obs::bin::wait_for_shutdown;
 
@@ -57,8 +57,8 @@ impl Watchers {
 
         if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
             tracing::info!(
-                l1_rpc = ?l1.endpoints.rpcs,
-                l1_light_client = ?l1.endpoints.light_client,
+                l1_rpc = ?l1.endpoints.origins(),
+                l1_light_client = ?l1.endpoints.light_client.as_deref().map(L1Endpoints::origin),
                 lockbox = ?l1.cfg.lockbox,
                 poll_interval = ?l1.cfg.poll_interval,
                 resume_after = ?l1.cfg.resume_after.map(L1ResumeAfter::block),

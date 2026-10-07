@@ -27,10 +27,11 @@
 # ansible/deploy.yml deploys the settlement address, with
 # kardamom-deploy against anvil, and injects it at submit time:
 #   nomad run -var 'settlement_address=0x<addr>' batcher.nomad.hcl
-# The batcher EOA is anvil dev account #2, pre-funded. Its key below is
-# the public anvil dev mnemonic key. Real deployments must inject a
-# real secret instead; this is the first key plumbing in
-# deploy/cluster, and the spec flags it.
+# The batcher's L1 key (KARDAMOM_L1_KEY) and its L1 endpoints
+# (KARDAMOM_L1_RPC) come from the Nomad Variable nomad/jobs/batcher,
+# which the workloads role writes: a real key and a keyed URL never
+# appear in the job. Without a real L1 the role writes the in-cluster
+# anvil and anvil dev account #2, which is pre-funded.
 #
 # This job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory. ansible/deploy.yml does this.
@@ -40,13 +41,6 @@ variable "settlement_address" {
   # This is a placeholder. Replace it with `-var
   # settlement_address=0x...` at submit time.
   default = "0x0000000000000000000000000000000000000000"
-}
-
-variable "batcher_key" {
-  type = string
-  # anvil dev account #2. This public dev key matches crates/e2e
-  # BATCHER_KEY.
-  default = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
 }
 
 # Digest-pinned image. ansible/deploy.yml
@@ -132,12 +126,6 @@ variable "idle_flush_ms" {
   type        = string
   description = "Post a group of empty blocks after this wait, in milliseconds. Empty: the same as flush_ms."
   default     = ""
-}
-
-variable "l1_rpc" {
-  type        = string
-  description = "The L1 JSON-RPC endpoints, comma-separated, best first. A request falls back to the next on an error or a rate limit. The default is the in-cluster anvil by its Consul service record."
-  default     = "http://anvil.service.consul:8546"
 }
 
 # The query endpoints that serve block references: every executor's
@@ -259,7 +247,6 @@ job "batcher" {
             # dynamic ports.
             "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
             "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
-            "--l1-rpc", var.l1_rpc,
             "--settlement", "${var.settlement_address}",
             "--da-proxy", var.da_proxy,
             "--cursor-file", "/opt/kardamom/batcher/cursor.json",
@@ -297,7 +284,20 @@ job "batcher" {
         # and the service code never overrides it.
         AERON_DRIVER_TIMEOUT  = var.aeron_stall_tolerance_ms
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9002"
-        KARDAMOM_L1_KEY       = "${var.batcher_key}"
+      }
+
+      # The L1 endpoints (KARDAMOM_L1_RPC, comma-separated, best first)
+      # and the batcher's key (KARDAMOM_L1_KEY), from the job's Nomad
+      # Variable, which the workloads role writes. They reach the task as
+      # environment, never as a job variable or an argument, so a job
+      # read does not show them.
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/batcher" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        EOT
       }
 
       # Cluster LogConfig (UDP multicast channels), read through

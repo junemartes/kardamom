@@ -313,7 +313,7 @@ job "monitoring" {
         image        = "prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a"
         network_mode = "host"
         args = [
-          "--config.file=/local/alertmanager.yml",
+          "--config.file=/secrets/alertmanager.yml",
           "--storage.path=/alloc/data/alertmanager",
           # One instance: no peer gossip. The default listener takes port
           # 9094 on every interface of the host, outside the job's ports.
@@ -324,8 +324,10 @@ job "monitoring" {
       # The routing of the operator, from the Nomad variable. Without it,
       # the one receiver notifies nobody, and the alerts show on the
       # Alertmanager page only. A change reloads Alertmanager in place.
+      # A receiver can hold a token, so the file goes to the secrets
+      # directory, which a file read of the allocation does not show.
       template {
-        destination   = "local/alertmanager.yml"
+        destination   = "secrets/alertmanager.yml"
         change_mode   = "signal"
         change_signal = "SIGHUP"
         data          = <<-EOT

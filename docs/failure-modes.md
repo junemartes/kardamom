@@ -130,7 +130,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 - The inhibit file `deploy/alertmanager-inhibit.yml` mutes `KardamomServicePaused` while a `KardamomHalt*` alert with the same `cause` fires.
   - One incident pages once, with the runbook of the root.
   - An operator pause has `cause="operator"`, so the inhibit rule never mutes it.
-- No job loads the inhibit file. Copy it into the `alertmanager` item of the Nomad variable `nomad/jobs/monitoring`, beside your routes and receivers.
+- The deploy adds the inhibit file to the Alertmanager configuration that it gets in `ALERTMANAGER_CONFIG_FILE`. An operator who writes the `alertmanager` item of `nomad/jobs/monitoring` by hand copies the file into it.
 - The alert detail is in [`observability.md`](observability.md).
 
 ### DA-lag guard and posted-head retention floor

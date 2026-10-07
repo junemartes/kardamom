@@ -5,6 +5,7 @@ Requires ansible-playbook and nomad on PATH; never connects to a real cluster.
 """
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -22,6 +23,10 @@ SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'va
 # The images the manifest pins beyond the default deployment: the jobs a
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
+# The Nomad Variable a job's template renders into the task environment.
+SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
+# A secret no rendered job, job variable or play output may hold.
+SENTINEL = 'SECRET-SENTINEL'
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -45,6 +50,13 @@ class NomadAPI(BaseHTTPRequestHandler):
                           'JobModifyIndex': 1 if old else 0})
         elif self.path.startswith('/v1/jobs?'):
             assert body['EnforceIndex'] is True
+            # A job that renders its Nomad Variable into the task
+            # environment registers only after the role wrote it: a new
+            # task blocks on a missing one.
+            env_templates = [t['EmbeddedTmpl'] for g in body['Job']['TaskGroups'] for task in g['Tasks']
+                             for t in task['Templates'] or [] if t['Envvars']]
+            for path in SECRET_PATH.findall(''.join(env_templates)):
+                assert path in state['variables'], f'{body["Job"]["ID"]} registers before {path}'
             state['jobs'][body['Job']['ID']] = body['Job']
             state['writes'].append(body['Job']['ID'])
             if body['Job']['ID'] in state['deployments']:
@@ -64,11 +76,17 @@ class NomadAPI(BaseHTTPRequestHandler):
             raise AssertionError(self.path)
 
     def do_PUT(self):
-        # The bootstrap variable of a new sealer cluster.
+        # The bootstrap variable of a new sealer cluster, or the secrets
+        # of a job.
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
-        assert body['Path'] == 'nomad/jobs/cluster' and body['Items'] == {'bootstrap': 'true'}, body
-        self.server.state['writes'].append('bootstrap-open')
+        path = self.path.split('?')[0].removeprefix('/v1/var/')
+        assert self.path.startswith('/v1/var/nomad/jobs/') and body['Path'] == path, (self.path, body)
+        if path == 'nomad/jobs/cluster':
+            assert body['Items'] == {'bootstrap': 'true'}, body
+            self.server.state['writes'].append('bootstrap-open')
+        else:
+            self.server.state['variables'][path] = body['Items']
+            self.server.state['variable_writes'].append(path)
         self.respond(body)
 
     def do_DELETE(self):
@@ -81,7 +99,14 @@ class NomadAPI(BaseHTTPRequestHandler):
         parts = self.path.split('?')[0].split('/')
         parts += [''] * (6 - len(parts))
         state = self.server.state
-        if parts[2] == 'deployment' and parts[3] == 'allocations':
+        if parts[2] == 'var':
+            path = '/'.join(self.path.split('?')[0].split('/')[3:])
+            if path in state['variables']:
+                self.respond({'Path': path, 'Items': state['variables'][path]})
+            else:
+                self.send_response(404)
+                self.end_headers()
+        elif parts[2] == 'deployment' and parts[3] == 'allocations':
             allocs = self.allocations(parts[4])
             allocs[0]['DeploymentStatus']['Canary'] = True
             self.respond(allocs)
@@ -186,7 +211,8 @@ class DeployTest(unittest.TestCase):
             f'{s} registry.example:5000/kardamom-{s}:test@sha256:{"a" * 64}\n' for s in MANIFEST))
         # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
-        self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {}}
+        self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
+                          'variables': {}, 'variable_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
         self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n')
@@ -236,8 +262,54 @@ class DeployTest(unittest.TestCase):
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
+        # Without a real L1, the batcher and the da-watcher get the
+        # in-cluster anvil, and the batcher the anvil dev key.
+        variables = self.api.state['variables']
+        self.assertEqual(variables['nomad/jobs/da-watcher'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
+        self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
+        self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
+        self.assertEqual(sorted(self.api.state['variable_writes']), ['nomad/jobs/batcher', 'nomad/jobs/da-watcher'])
         self.run_deploy()
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
+        self.assertEqual(len(self.api.state['variable_writes']), 2, 'unchanged redeploy must not write secrets')
+
+    def test_secrets_reach_tasks_only_through_nomad_variables(self):
+        # Every keyed URL and key the deploy gets, by the environment the
+        # deploy workflow sets.
+        l1 = f'https://l1.example/v3/{SENTINEL}-L1'
+        followers = f'https://a.example/v2/{SENTINEL}-A,https://b.example/v3/{SENTINEL}-B'
+        key = f'0x{SENTINEL}-KEY'
+        # An Alertmanager configuration with a receiver token, and its own
+        # Go templates, which must arrive as data.
+        alertmanager = Path(self.tmp.name) / 'alertmanager.yml'
+        alertmanager.write_text(
+            'route:\n  receiver: telegram\nreceivers:\n  - name: telegram\n    telegram_configs:\n'
+            f'      - bot_token: "{SENTINEL}-BOT"\n        chat_id: 1\n'
+            '        message: \'{{ .CommonLabels.alertname }} {{ range .Alerts }}{{ .Annotations.runbook }}{{ end }}\'\n')
+        output = self.run_deploy(environ={
+            'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
+            'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
+            'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
+        self.assertNotIn(SENTINEL, output)
+        state = self.api.state
+        for name, job in [*state['plans'].items(), *state['jobs'].items()]:
+            self.assertNotIn(SENTINEL, json.dumps(job), name)
+        monitoring = state['variables'].pop('nomad/jobs/monitoring')
+        self.assertEqual(monitoring['rules'], 'groups: []')
+        self.assertTrue(monitoring['alertmanager'].startswith(alertmanager.read_text()), monitoring['alertmanager'].replace(SENTINEL, '<S>'))
+        self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
+        self.assertEqual(state['variables'], {
+            'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
+            'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
+                                    'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
+            'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},
+            'nomad/jobs/l1-indexer': {'KARDAMOM_L1_RPC': followers},
+        })
+        # Each job renders its own variable into the task environment.
+        for path in list(state['variables']):
+            job = state['jobs'][path.rsplit('/', 1)[1]]
+            templates = [t for g in job['TaskGroups'] for task in g['Tasks'] for t in task['Templates'] or []]
+            self.assertIn(f'nomadVar "{path}"', ''.join(t['EmbeddedTmpl'] for t in templates if t['Envvars']), path)
 
     @unittest.skipUnless(shutil.which('anvil') and (ANSIBLE.parents[2] / 'target/debug/kardamom-deploy').exists(),
                          'anvil and a debug kardamom-deploy binary required')
@@ -309,7 +381,7 @@ class DeployTest(unittest.TestCase):
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
-        }, check=True)
+        })
         plans = self.api.state['plans']
         self.assertIn('l1-light-client', plans)
         self.assertTrue(all(job['Namespace'] == 'staging' for job in plans.values()))
@@ -318,9 +390,9 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn('http://execution.example', validator)
         # The indexer follows the light client and reads the payloads from
         # the DA proxy; the batcher resumes from the indexer.
-        indexer = json.dumps(plans['l1-indexer'])
-        self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', indexer)
-        self.assertIn('http://kardamom-da-proxy.service.consul:3100', indexer)
+        self.assertEqual(self.api.state['variables']['nomad/jobs/l1-indexer'],
+                         {'KARDAMOM_L1_RPC': 'http://kardamom-l1-light-client.service.dc1.consul:8548'})
+        self.assertIn('http://kardamom-da-proxy.service.consul:3100', json.dumps(plans['l1-indexer']))
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
@@ -332,23 +404,21 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')
         for name in ('executor', 'validator'):
             self.assertIn('base_fee_initial', self.genesis_template(plans[name]), name)
-        self.assertEqual(self.api.state['writes'], [])
 
     def test_fault_proxy_routes_the_followers_through_it(self):
-        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'}, check=True)
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'})
         plans = self.api.state['plans']
         proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
         for job in ('batcher', 'da-watcher', 'l1-indexer'):
-            self.assertIn(proxy, json.dumps(plans[job]), job)
+            self.assertEqual(self.api.state['variables'][f'nomad/jobs/{job}']['KARDAMOM_L1_RPC'], proxy, job)
         indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
         self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
         self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
-        self.assertEqual(self.api.state['writes'], [])
 
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the

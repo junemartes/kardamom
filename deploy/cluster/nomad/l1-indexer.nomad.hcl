@@ -17,12 +17,6 @@
 # to it against a testnet too. The empty defaults exist for
 # `just validate` only; the workloads role passes every value.
 
-variable "l1_rpc" {
-  type        = string
-  description = "The L1 JSON-RPC endpoints the indexer follows, comma-separated. With two or more, a block, a log query or a hash is archived only when two agree."
-  default     = ""
-}
-
 # The light client's endpoint, when one runs: its answer settles a read
 # it serves, and a public endpoint that disagrees with it is the liar.
 variable "l1_light_client_rpc" {
@@ -144,7 +138,6 @@ job "l1-indexer" {
         ]
         args = concat(
           [
-            "--l1-rpc", var.l1_rpc,
             "--da-proxy", var.da_proxy,
             "--settlement", var.settlement_address,
             "--lockbox", var.lockbox_address,
@@ -165,6 +158,21 @@ job "l1-indexer" {
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9009"
+      }
+
+      # The L1 endpoints the indexer follows (KARDAMOM_L1_RPC,
+      # comma-separated; with two or more, a read is archived only when
+      # two agree), from the job's Nomad
+      # Variable, which the workloads role writes. They reach the task as
+      # environment, never as a job variable or an argument, so a job
+      # read does not show them.
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/l1-indexer" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        EOT
       }
 
       service {

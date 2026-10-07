@@ -247,7 +247,10 @@ Check the file with `promtool check rules deploy/alerts.yml`.
 nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.yml
 ```
 
+- The deploy writes the variable when it gets `ALERTMANAGER_CONFIG_FILE` (and, as an option, `PROMETHEUS_RULES_FILE`).
+  It adds `deploy/alertmanager-inhibit.yml` to the configuration. See "Secrets" in [`deploy/cluster/README.md`](../deploy/cluster/README.md#secrets).
 - The job reads the variable with its workload identity and renders the two files.
+  The Alertmanager configuration goes to `secrets/`, because a receiver can hold a token.
 - A change to the variable reloads Prometheus and Alertmanager in place (SIGHUP).
 - Without the variable, Prometheus evaluates `deploy/alerts.yml` only.
   Alertmanager sends every alert to a receiver that notifies nobody.
@@ -292,8 +295,8 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 
 - It mutes `KardamomServicePaused` while a `KardamomHalt*` alert with the same `cause` label fires.
 - An operator pause has `cause="operator"`. No halt alert has that cause, so the rule never mutes it.
-- No job loads this file. The monitoring job takes its Alertmanager configuration from the `alertmanager` item of the Nomad variable.
-  Copy the rule into that configuration, beside your routes and receivers.
+- The deploy adds this file to the configuration of `ALERTMANAGER_CONFIG_FILE` before it writes the `alertmanager` item.
+  An operator who writes the item by hand copies the rule into it.
 
 These counters need an alert of your own. No rule in `deploy/alerts.yml` watches them:
 

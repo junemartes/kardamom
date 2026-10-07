@@ -68,8 +68,9 @@ struct Args {
     /// repeat the flag, or separate the endpoints with commas. Enables the
     /// L1 deposit path. It requires `--lockbox`. With two or more, a
     /// block is accepted when two agree; a source that fails or lies
-    /// rotates out for a backoff.
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    /// rotates out for a backoff. A deployment passes the list in the
+    /// environment, so a keyed URL stays out of the process arguments.
+    #[arg(long, env = "KARDAMOM_L1_RPC", hide_env_values = true, value_delimiter = ',', num_args = 1..)]
     l1_rpc: Vec<String>,
     /// The L1 light client's endpoint. Its answer settles a read when it
     /// serves the block; a public endpoint that disagrees with it is the
