@@ -21,6 +21,7 @@ The metrics ports of the deploy (`deploy/cluster/nomad`) are below. Other servic
 |---|---|
 | sequencer | 9001 + 10 × lane (9001 for lane 0, 9011 for lane 1) |
 | batcher | 9002 |
+| executor | 9004 |
 | da-watcher | 9005 |
 | ingress | 9006 |
 | validator | 9006 |

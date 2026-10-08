@@ -53,6 +53,7 @@ fn ids_are_stable_and_distinct() {
         );
     }
     assert_eq!(HaltCause::DaLag.clears(), Clears::Auto);
+    assert_eq!(HaltCause::RecordLag.clears(), Clears::Auto);
     assert_eq!(HaltCause::ValidatorDivergence.clears(), Clears::Operator);
     assert_eq!(
         RecoveryId::RevertToPostedHead.runbook(),

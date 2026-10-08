@@ -41,7 +41,7 @@ struct Rig<S> {
     da: FakeDaProxy,
     store: Store,
     follower: Follower<S, Arc<RecordedBlocks>>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl<S: L1Source> Rig<S> {
@@ -63,7 +63,7 @@ impl<S: L1Source> Rig<S> {
             da,
             store,
             follower,
-            _dir: dir,
+            dir,
         }
     }
 }
@@ -336,4 +336,21 @@ impl L1Source for Scripted {
     async fn logs(&self, filter: &alloy_rpc_types_eth::Filter) -> Result<Vec<Log>, L1SourceError> {
         self.0.logs(filter).await
     }
+}
+
+#[tokio::test]
+async fn a_failed_cursor_write_replays_the_range() {
+    let source = Arc::new(MockL1Source::new());
+    source.push_tip(Ok(3));
+    let mut rig = Rig::new(source.clone(), config(1));
+    let tmp = rig.dir.path().join("cursor.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    assert!(rig.follower.tick().await.is_err());
+    assert_eq!(rig.follower.cursor().l1_block, None);
+    std::fs::remove_dir(&tmp).unwrap();
+    source.push_tip(Ok(3));
+    rig.follower.tick().await.unwrap();
+    let numbers: Vec<u64> = rig.sink.blocks().iter().map(|b| b.number).collect();
+    assert_eq!(numbers, [1, 2, 3, 1, 2, 3]);
+    assert_eq!(rig.store.cursor().unwrap(), rig.follower.cursor());
 }

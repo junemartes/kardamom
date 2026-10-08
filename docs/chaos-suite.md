@@ -84,8 +84,8 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 **Executor shard**
 
-- [`graceful-executor`](failure-modes.md#executor): stops one executor allocation with a graceful stop. The job returns to three replicas.
-- [`hard-executor`](failure-modes.md#executor): kills one executor task. The job returns to three replicas.
+- [`graceful-executor`](failure-modes.md#executor): stops one executor allocation with a graceful stop. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
+- [`hard-executor`](failure-modes.md#executor): kills one executor task. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
 - [`node-failure-executor`](failure-modes.md#executor): kills a whole executor node. The fleet keeps progressing with two replicas. The node returns.
 - [`node-replace-executor`](failure-modes.md#executor): replaces an executor node through the Terraform root. The new node has a new address and empty volumes.
 - [`state-checkpoint-restore`](failure-modes.md#executor): wipes the state of executor-0. It restores from the checkpoint of executor-1.
@@ -239,6 +239,14 @@ Every run has these checks.
 | Drops | The sequencer counters for dropped, evicted and backpressured transactions are in the report. A sequencer drop of a past-nonce transaction fails a non-chaos run. |
 | Keep-pace | Each executor must advance while the sealer advances, and the gap to the sealer must stay within `LOAD_MAX_GAP` blocks. |
 | Liveness | A non-chaos run fails when a service reports `kardamom_service_up=0` at the end. |
+
+**Metric reads.** The checks read the exporters of the executors, the ingress and the lane-0 sequencer replicas.
+
+- The suite gives the load the bridge address of each node from the node contract. The load reads each exporter directly over the bridge.
+- When a direct read fails, the load reads the same exporter through `docker exec <node> curl 127.0.0.1:<port>/metrics`. That read ends after 10 s, so a stalled `docker exec` cannot hold the final snapshot.
+- The chaos probes use the same reader (`ExporterReader` in `kardamom-bench`). They reach the ingress exporter over the bridge too.
+- The report field `scrape_fallbacks` counts these fallbacks in the snapshots that the verdict reads. A high count means that the bridge reads failed. A runner-wide exec stall then degrades the verdict.
+- `kardamom-load --metrics-via-docker true` (the CLI default) reads every exporter through `docker exec` only. `false` reads `http://<node>:<port>/metrics` first.
 
 **Chaos mode.** The suite runs the load in chaos mode.
 

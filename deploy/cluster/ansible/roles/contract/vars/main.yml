@@ -27,6 +27,7 @@ contract_mirrors:
       - '    cluster_id '
       - '    node_ip '
       - '    archive_topics '
+      - "('exec_txs' if 'executor' in roles_set"
       - '    archive_topics_follower '
     forbidden:
       - "\n  servers"

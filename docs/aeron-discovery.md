@@ -36,14 +36,18 @@ The streams and their publishers:
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
 | `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
-| `exec_txs` | executor (not published) | validator, batcher, executor archive (none subscribes) |
+| `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
 The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
 
 - The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
-- The runtime knows the topic, the record type and the handles. No service publishes the stream, and no service subscribes to it.
-  The table names the services that the topic is for.
+- Each executor opens two publications on stream 1005. One publisher thread writes both, in the same order:
+  - The recorded publication, an exclusive IPC publication on `aeron:ipc?alias=exec-txs`. The archive on the node of the executor records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording loses no frame. An exclusive publication has its own session, so the executors that share one media driver never write into one session.
+  - The live publication, a dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_txs`). It is lossy: one offer for each record, and a refused offer drops the record. A consumer repairs a gap from an archive.
+- A static plane whose `exec_txs_channel` is IPC opens only the recorded publication. Its consumers read that one.
+- A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.
+- The validator and the batcher name the topic as their future source. No service subscribes to it yet.
 
 The `l1_blocks` stream carries the finalized L1 blocks: one `L1Block` for each block, in block order.
 
@@ -181,6 +185,14 @@ once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way, and the L1 follower
 its `l1_blocks` publication, through `StreamPlane::record_own`.
 
+Each executor records its own recorded `exec_txs` publication on the
+archive of its node. The recorder adopts only the recording of the
+session of this run, so a restarted executor never reads the position of
+the recording of its earlier session. The executor joins nothing before
+that recording is active. The recorder thread reads the recording
+position every 20 ms. The publisher thread computes the recorded cursor
+from it (`kardamom_executor_exec_stream_recorded_index`).
+
 ## Deployment profiles
 
 `deploy/cluster/config/channels.toml.tpl` sets `enabled = true` and the
@@ -212,6 +224,7 @@ The file names no fixed address.
   follows the recording node in both profiles: the ingress nodes for
   `tx_data`, the node with the `da-watcher` role for `tx_deposits`, and
   the nodes with the `indexer` role for `l1_blocks`.
+  The executor nodes also record `exec_txs`; no consumer reads that stream yet.
 - A node records at most one topic beside `l1_blocks`. A node that
   records nothing has empty tags.
 - Every job renders the file with `change_mode = "noop"`. A change in the
@@ -230,7 +243,7 @@ No job configures a publication control port.
 | Job | Publications |
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
-| executor | receipts, boundaries, BAL |
+| executor | receipts, boundaries, BAL, the live `exec_txs` publication |
 | da-watcher | deposits, remote epochs |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
@@ -240,7 +253,12 @@ meta of the node:
 
 - `tx_data` on a node with the `ingress` role.
 - `tx_deposits` on a node with the `da-watcher` role.
+- `exec_txs` on a node with the `executor` role. The archive keeps the stream of the executor on that node.
 - Empty on every other node.
+
+An archive record with an unknown topic fails to parse, and a refetch
+client then skips the whole record. So a runtime that knows `exec_txs`
+deploys before the executor nodes advertise it.
 
 The `archive_topics_follower` meta is `l1_blocks` on a node with the
 `indexer` role, and empty elsewhere. The record's `topics` meta lists both

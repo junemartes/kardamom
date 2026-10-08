@@ -30,7 +30,7 @@ class DaLagGuardTest {
         return new CanonicalSealerState(
                 64, 1, Set.of(), VoidLedger.Config.DISABLED,
                 CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-                CanonicalSealerState.DEFAULT_ORDERING_WINDOW, budget);
+                CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(budget, 0L));
     }
 
     /** One user record of the shared sender, by nonce. */

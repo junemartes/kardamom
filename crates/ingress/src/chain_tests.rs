@@ -5,6 +5,7 @@ use kardamom_obs::events::{Board, BoardView};
 use kardamom_obs::halt::{Halt, HaltCause, ServiceEvent, ServiceState};
 use kardamom_obs::lifecycle::{Lifecycle, Slots};
 use kardamom_types::ClusterStatus;
+use kardamom_types::cluster_status::RecordLagStatus;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -67,6 +68,64 @@ fn the_da_lag_flag_halts_the_sealer_and_the_next_status_clears_it() {
         (root.service.as_str(), root.cause),
         (SEALER, HaltCause::DaLag)
     );
+
+    chain.on_status(&ClusterStatus::default(), now);
+    assert_eq!(sealer.slots().halt, None);
+    assert_eq!(
+        ChainWatch::submit_root(&sealer.slots(), &BoardView::default()),
+        None
+    );
+}
+
+/// The record-lag flag halts the sealer on `record_lag`. With both flags
+/// up, the record lag is the root; when it clears, the DA lag stands; when
+/// both clear, the halt ends.
+#[test]
+fn the_record_lag_flag_comes_before_the_da_lag_flag_and_each_clears() {
+    let sealer = Arc::new(Lifecycle::new(Some(SEALER)));
+    let mut chain = watch_over(&sealer);
+    let now = Instant::now();
+    let da_lag = ClusterStatus {
+        posted_head: 100,
+        sealed_head: 160,
+        budget_blocks: 50,
+        halted: true,
+        ..ClusterStatus::default()
+    };
+    let both = ClusterStatus {
+        record_lag: RecordLagStatus {
+            best_recorded: Some(3_000),
+            budget: 16_384,
+            halted: true,
+        },
+        ..da_lag
+    };
+
+    chain.on_status(&both, now);
+    let halt = sealer.slots().halt.unwrap();
+    assert_eq!(halt.cause, HaltCause::RecordLag);
+    assert!(
+        halt.detail.contains("best recorded index is 3000"),
+        "{}",
+        halt.detail
+    );
+    let root = ChainWatch::submit_root(&sealer.slots(), &BoardView::default()).unwrap();
+    assert_eq!(
+        (root.service.as_str(), root.cause),
+        (SEALER, HaltCause::RecordLag)
+    );
+
+    chain.on_status(&da_lag, now);
+    assert_eq!(sealer.slots().halt.unwrap().cause, HaltCause::DaLag);
+
+    chain.on_status(
+        &ClusterStatus {
+            record_lag: both.record_lag,
+            ..ClusterStatus::default()
+        },
+        now,
+    );
+    assert_eq!(sealer.slots().halt.unwrap().cause, HaltCause::RecordLag);
 
     chain.on_status(&ClusterStatus::default(), now);
     assert_eq!(sealer.slots().halt, None);

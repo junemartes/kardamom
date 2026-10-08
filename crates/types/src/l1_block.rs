@@ -3,13 +3,14 @@
 //!
 //! The follower is the one service that reads L1 data. A record on the
 //! stream is a block that two L1 sources agreed on, that descends from the
-//! record before it, and whose finality step ends at the light client's
-//! finalized header where a light client runs. The consumers trust the
+//! record before it, and whose range ending at the finalized tip is checked against the
+//! light client where one runs. Historical catch-up ranges rely on the
+//! source quorum until they reach that anchor. The consumers trust the
 //! record and check only its parent link against their own cursor.
 //!
 //! Two follower instances publish the same blocks. A consumer takes the
 //! first record of each block number and drops a second record with the
-//! same hash. Two records of one number with different hashes mean that
+//! same complete payload. Two inconsistent records of one number mean that
 //! one instance read a lie its cross-check did not catch: the consumer
 //! halts. [`L1BlockDedup`] holds this rule.
 
@@ -69,10 +70,10 @@ pub struct L1Block {
     pub batches: Vec<BatchEntry>,
 }
 
-/// How many block numbers a consumer keeps the first hash of. Two
+/// How many block numbers a consumer keeps the first record of. Two
 /// follower instances run within a few finality steps of each other (one
-/// step is 32 blocks), so a second record always arrives inside this
-/// horizon.
+/// step is 32 blocks), so this covers ordinary overlap. Older duplicates cannot be compared;
+/// archive reconciliation is required after a longer outage.
 pub const DEDUP_HORIZON: u64 = 8192;
 
 /// What a consumer does with one record.
@@ -81,7 +82,7 @@ pub enum Admit {
     /// The next block after the consumer's head, and it descends from the
     /// head: the consumer takes it.
     Next,
-    /// A block the consumer already took, with the same hash, or a block
+    /// A block the consumer already took, with the same payload, or a block
     /// at or below its start: the consumer drops it.
     Duplicate,
     /// A block past the next one: the records between are missing on
@@ -102,15 +103,17 @@ pub enum Admit {
         first: B256,
         second: B256,
     },
+    /// The header agrees but the derived epoch or other payload differs.
+    ContentDisagreement { number: u64 },
 }
 
-/// The consumer's side of the two instances: its head and the first hash
+/// The consumer's side of the two instances: its head and the first record
 /// of every block number inside [`DEDUP_HORIZON`] below the head.
 #[derive(Debug, Clone)]
 pub struct L1BlockDedup {
     head: u64,
     head_hash: B256,
-    seen: BTreeMap<u64, B256>,
+    seen: BTreeMap<u64, L1Block>,
 }
 
 impl L1BlockDedup {
@@ -121,7 +124,7 @@ impl L1BlockDedup {
         Self {
             head: number,
             head_hash: hash,
-            seen: BTreeMap::from([(number, hash)]),
+            seen: BTreeMap::new(),
         }
     }
 
@@ -142,15 +145,27 @@ impl L1BlockDedup {
     /// record, so a record it could not handle stays the next one.
     #[must_use]
     pub fn admit(&self, record: &L1Block) -> Admit {
-        if let Some(&first) = self.seen.get(&record.number) {
-            return if first == record.hash {
+        if let Some(first) = self.seen.get(&record.number) {
+            if first.hash != record.hash {
+                return Admit::Disagreement {
+                    number: record.number,
+                    first: first.hash,
+                    second: record.hash,
+                };
+            }
+            return if first == record {
                 Admit::Duplicate
             } else {
-                Admit::Disagreement {
+                Admit::ContentDisagreement {
                     number: record.number,
-                    first,
-                    second: record.hash,
                 }
+            };
+        }
+        if record.number == self.head && record.hash != self.head_hash {
+            return Admit::Disagreement {
+                number: record.number,
+                first: self.head_hash,
+                second: record.hash,
             };
         }
         if record.number <= self.head {
@@ -176,7 +191,7 @@ impl L1BlockDedup {
     pub fn take(&mut self, record: &L1Block) {
         self.head = record.number;
         self.head_hash = record.hash;
-        self.seen.insert(record.number, record.hash);
+        self.seen.insert(record.number, record.clone());
         let floor = self.head.saturating_sub(DEDUP_HORIZON);
         self.seen = self.seen.split_off(&floor);
     }

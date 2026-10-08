@@ -64,6 +64,17 @@ class Channels(unittest.TestCase):
         self.assertEqual(self.archive_topics(found.group(1)), 'tx_deposits')
         self.assertEqual(self.archive_topics('ingress', ['ingress'] + local['ingress']['roles']), 'tx_data')
 
+    def test_each_executor_node_records_its_own_executor_stream(self):
+        local = yaml.safe_load((CLUSTER / 'ansible/group_vars/all.yml').read_text())['node_classes']
+        executor_roles = ['executor'] + local['executor'].get('roles', [])
+        self.assertEqual(self.archive_topics('executor', executor_roles), 'exec_txs')
+        production = (CLUSTER / 'ansible/inventories/production/hosts.example.ini').read_text()
+        found = re.findall(r'^executor-\d+ .*\brole=(\S+)', production, re.MULTILINE)
+        self.assertEqual(len(found), 3)
+        self.assertEqual({self.archive_topics(role) for role in found}, {'exec_txs'})
+        for role in ['sequencer', 'sealer', 'validator', 'batcher', 'control']:
+            self.assertEqual(self.archive_topics(role), '', role)
+
 
 if __name__ == '__main__':
     unittest.main()

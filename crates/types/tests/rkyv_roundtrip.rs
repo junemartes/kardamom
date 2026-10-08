@@ -184,6 +184,25 @@ fn tx_error_roundtrip() {
     assert_eq!(roundtrip(&e), e);
 }
 
+/// The record-lag refusal keeps its three values and its reason word
+/// through the wire.
+#[test]
+fn record_lag_tx_error_roundtrip() {
+    let e = TxError {
+        sender: Address::repeat_byte(0x56),
+        nonce: 8,
+        reason: TxErrorReason::RecordLag {
+            sealed_index: 20_000,
+            recorded_index: 3_000,
+            budget: 16_384,
+        },
+    };
+    let back = roundtrip(&e);
+    assert_eq!(back, e);
+    assert_eq!(back.reason.word(), "record-lag");
+    assert_eq!(back.reason.expected_nonce(), None);
+}
+
 #[test]
 fn tx_status_roundtrip_every_stage() {
     let hash = B256::repeat_byte(0x33);

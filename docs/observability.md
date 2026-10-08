@@ -74,6 +74,7 @@ Every service that drives a cluster session exports the state of that session un
 ### Host and agent metrics
 
 - `nomad/node-exporter.system.nomad.hcl` runs one `node_exporter` on every node. It listens on port 9100 (Consul service `node-exporter`). It exports the CPU, memory, disk, file systems and network of the host.
+- On the local (container) profile, all nodes share one host. There, the exporter reads only the `/proc` collectors: load, memory, network, pressure and vmstat. Twelve exporters that read the host hardware files in `/sys` (cpu, cpufreq, mdadm, nvme) stall in D state and stop the host. The job variable `host_hardware` selects the set.
 - Every Nomad agent publishes its own metrics on `/v1/metrics?format=prometheus`.
   - A client publishes the node resources and the allocations.
   - A server publishes the Raft and scheduler state.
@@ -275,13 +276,14 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltL1CursorUnreadable` | critical | `kardamom_halt{cause="l1_cursor_unreadable"} == 1`. |
 | `KardamomHaltValidatorDivergence` | critical | `kardamom_halt{cause="validator_divergence"} == 1`. |
 | `KardamomHaltOriginGap` | critical | `kardamom_halt{cause="origin_gap"} == 1` for 1 minute. |
+| `KardamomHaltRecordLag` | critical | `kardamom_halt{cause="record_lag"} == 1`. The record-lag guard is off by default, so this alert cannot fire until a later release turns the guard on. |
 | `KardamomHaltL1LightClientMismatch` | critical | `kardamom_halt{cause="l1_light_client_mismatch"} == 1`. |
 | `KardamomHaltL1FollowerDisagreement` | critical | `kardamom_halt{cause="l1_follower_disagreement"} == 1`. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The eleven `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
+- The twelve `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
   - `KardamomHaltOriginGap` waits 1 minute. A restarted sequencer can miss the epoch that the sealer expects, and its twin offers that epoch again within milliseconds. Only a gap that no replica fills pages.
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
@@ -367,6 +369,18 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 
 - A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.
 - The interop watcher exports `kardamom_da_watcher_remote_*` counters with the label `origin` (the peer chain id).
+
+### Executor stream
+
+Each executor exports these metrics for its executor stream (`exec_txs`). See "The executor stream" in [failure-modes.md](failure-modes.md#the-executor-stream-the-executor-records-what-it-joins).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_executor_exec_stream_recorded_index` | The recorded cursor: the highest canonical index whose records the local archive has written. It never passes the recording position. It moves with the canonical order, also with no transaction load. A flat value on a chain that progresses means that the archive of the node takes no records. |
+| `kardamom_executor_exec_stream_session_id` | The Aeron session id of the recorded publication. A restarted executor shows a new value. |
+| `kardamom_executor_exec_stream_publish_blocked_ms_total` | Milliseconds that the publisher waited for the archive to take a record. The executor stalls while it grows. |
+
+- The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
 
 ### L1 follower (inbox indexer)
 
@@ -460,6 +474,30 @@ See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
 
 The state mirror exports `kardamom_state_mirror_serving`, `_batches_applied_total`, `_producer_disagreement_total`,
 `_head_tx_idx`, `_rebuilds_total`, `_rebuild_seconds`, `_write_retries_total`, and `_wait_replica_zero_total`.
+
+### Validator replica checks
+
+Every executor replica publishes its own BAL on `tx_bal` and its own receipts on `tx_receipts`.
+The validator compares the BAL and the receipts of every replica with its own re-execution.
+The Aeron session id of the publication names the replica.
+
+| Metric | Meaning |
+|---|---|
+| `validator_replica_divergence_total{replica, check}` | Proven divergences, once for each session a divergence names. `replica` is the session id. `check` is `bal`, `receipt`, or `rows`. |
+| `validator_replica_results_checked_total{check}` | Replica results that matched the re-execution. With N replicas, this grows about N times as fast as `validator_blocks_verified_total` (`check="bal"`). |
+| `validator_replica_results_unchecked_total{check, reason}` | Replica results that do not count as checked. Not a fault. |
+
+- The `reason` label of the unchecked counter:
+  - `late`: the result arrived below the check window (64 blocks for a BAL, 4096 canonical records for a receipt), or its key has no checked result left.
+  - `repeat`: the session already published the same result for the key.
+  - `bound`: the key already holds 8 distinct results, or the result already names 32 sessions.
+  - `evicted`: the buffer was full. The highest key goes first.
+  - `ahead`: the key is more than the reach above the cursor (2^20 blocks, 2^32 records).
+- Steady growth of `late` means a replica lags the validator by more than the window. Growth of `ahead` means a publisher sends wrong keys.
+- `validator_rows_verified_total` and `validator_rows_unverified_total` count one replica batch each.
+  Rows that arrive after the validator passed their position count as unverified.
+- The executor logs the session ids at start: `tx_bal publication open` and `tx_receipts publication open`, with the field `session`.
+  With discovery, the publisher record in the catalog carries the same id in its `session_id` meta.
 
 ## Log lines for diagnosis
 

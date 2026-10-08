@@ -1,0 +1,350 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["kardamom", "aeron"],
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Kardamom Aeron",
+  "uid": "kardamom-aeron",
+  "version": 1,
+  "weekStart": "",
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kardamom_service_up, host_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "host",
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": {"query": "label_values(kardamom_service_up, host_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(node_uname_info{job=\"node\"}, node)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "node",
+        "multi": true,
+        "name": "node",
+        "options": [],
+        "query": {"query": "label_values(node_uname_info{job=\"node\"}, node)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "code": {"language": "plaintext", "showLineNumbers": false, "showMiniMap": false},
+        "content": "The media driver and the archive export no metrics today. The Aeron counters (errors, NAKs, retransmits,\npublication positions, client counts, recording positions) live in the CnC file of each driver, and nothing\nreads them into Prometheus. Read them on the node with AeronStat and the archive's ListRecordings tool.\n\nThis page shows what exports today:\n\n- the media driver tasks, from the Nomad agents: memory, CPU and restarts;\n- the term buffers, as the use of the aeron.dir tmpfs on each node, from the node exporter;\n- the UDP buffer drops of each node, which cause NAKs and retransmits;\n- the clients: publication back-pressure and drops, the cluster sessions and the egress retention of the sealer.",
+        "mode": "markdown"
+      },
+      "title": "What this page shows",
+      "type": "text"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7}, "id": 2, "panels": [], "title": "Media drivers (Nomad and node exporter)", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The archiving media driver task on each node. The term buffers in the tmpfs aeron.dir count against the task's memory limit.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "bytes", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 3,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (node) (nomad_client_allocs_memory_usage{exported_job=\"aeron\", node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "max(nomad_client_allocs_memory_allocated{exported_job=\"aeron\"})",
+          "legendFormat": "limit",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Media driver memory",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "percent", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 4,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (node) (nomad_client_allocs_cpu_total_percent{exported_job=\"aeron\", node=~\"$node\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Media driver CPU (% of one core)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The aeron job runs the shared driver. The cluster job runs the sealer with its own embedded driver.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 5,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, node) (increase(nomad_client_allocs_restart{exported_job=~\"aeron|cluster\", node=~\"$node\"}[10m])) > 0",
+          "legendFormat": "{{exported_job}} {{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (exported_job, node) (increase(nomad_client_allocs_oom_killed{exported_job=~\"aeron|cluster\", node=~\"$node\"}[10m])) > 0",
+          "legendFormat": "OOM {{exported_job}} {{node}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Media driver and sealer restarts (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The log buffers of every publication and image on the node live in this tmpfs. A full tmpfs stops new publications.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "bytes", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 6,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "node_filesystem_size_bytes{job=\"node\", node=~\"$node\", mountpoint=\"/opt/kardamom/aeron-mount\"} - node_filesystem_avail_bytes{job=\"node\", node=~\"$node\", mountpoint=\"/opt/kardamom/aeron-mount\"}",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Term buffers: aeron.dir tmpfs used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"lineWidth": 1, "fillOpacity": 10, "thresholdsStyle": {"mode": "line"}},
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 80}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 7,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "100 * (1 - node_filesystem_avail_bytes{job=\"node\", node=~\"$node\", mountpoint=\"/opt/kardamom/aeron-mount\"} / node_filesystem_size_bytes{job=\"node\", node=~\"$node\", mountpoint=\"/opt/kardamom/aeron-mount\"})",
+          "legendFormat": "{{node}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Term buffers: aeron.dir tmpfs used (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Datagrams the kernel dropped on the node. A receiver that loses a datagram sends a NAK, and the sender retransmits. The driver's own NAK and retransmit counters are not exported.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "pps", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "id": 8,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(node_netstat_Udp_RcvbufErrors{job=\"node\", node=~\"$node\"}[1m])",
+          "legendFormat": "receive {{node}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(node_netstat_Udp_SndbufErrors{job=\"node\", node=~\"$node\"}[1m])",
+          "legendFormat": "send {{node}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(node_netstat_Udp_InErrors{job=\"node\", node=~\"$node\"}[1m])",
+          "legendFormat": "in errors {{node}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "UDP buffer drops (cause NAKs and retransmits)",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32}, "id": 9, "panels": [], "title": "Clients (service exporters)", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Offers that the publication refused because the subscribers are behind (BACK_PRESSURED).",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "ops", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33},
+      "id": 10,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (host_id, partition) (rate(kardamom_sequencer_backpressure_total{host_id=~\"$host\"}[1m]))",
+          "legendFormat": "{{host_id}} p{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sequencer publication back-pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Best-effort publishes that failed: expired in the queue, no publication, or past the offer deadline (back-pressure or not connected).",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "ops", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33},
+      "id": 11,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (service, host_id, stream_id) (rate(kardamom_log_best_effort_dropped_total{host_id=~\"$host\"}[1m]))",
+          "legendFormat": "{{service}} {{host_id}} stream {{stream_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Best-effort publishes dropped",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The session of each sealer cluster client. connected 0: the client finds no member that answers.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 41},
+      "id": 12,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_cluster_client_connected{host_id=~\"$host\"}",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_cluster_client_leader_member_id{host_id=~\"$host\"}",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "B"
+        }
+      ],
+      "title": "Cluster sessions",
+      "transformations": [
+        {"id": "merge", "options": {}},
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true},
+            "indexByName": {},
+            "renameByName": {"Value #A": "connected", "Value #B": "leader member"}
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "More than one session per process life is a reconnect. A leader change in steady state is an election.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 41},
+      "id": 13,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (service, host_id) (increase(kardamom_cluster_client_leader_changes_total{host_id=~\"$host\"}[10m]))",
+          "legendFormat": "leader changes {{service}} {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (service, host_id) (increase(kardamom_cluster_client_sessions_total{host_id=~\"$host\"}[10m]))",
+          "legendFormat": "sessions {{service}} {{host_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Cluster leader changes and new sessions (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The egress frames the sealer keeps for replay, as each ingress sees it. A dropped frame is a malformed frame, and the value must stay 0.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 41},
+      "id": 14,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_ingress_cluster_retained_frames{host_id=~\"$host\"}",
+          "legendFormat": "retained {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "rate(kardamom_ingress_cluster_frames_dropped_total{host_id=~\"$host\"}[1m])",
+          "legendFormat": "dropped/s {{host_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Sealer egress: retained frames and dropped frames",
+      "type": "timeseries"
+    }
+  ]
+}

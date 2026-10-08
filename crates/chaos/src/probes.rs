@@ -4,6 +4,8 @@
 
 use std::net::Ipv4Addr;
 
+use kardamom_bench::load::MetricsTargets;
+
 use crate::contract::NodeContract;
 use crate::harness::INGRESS_RPC_PORT;
 use crate::metrics::{self, Scrape, Target};
@@ -55,6 +57,12 @@ pub struct Probed {
 }
 
 impl Probed {
+    /// The load harness target of the exporter on `port` of this node,
+    /// read over the bridge.
+    fn metrics_target(&self, port: u16) -> Target {
+        Target::bridged(self.ip, &self.container, port)
+    }
+
     /// The JSON-RPC URL of this node, when it is an ingress node.
     #[must_use]
     pub fn rpc_url(&self) -> String {
@@ -68,7 +76,7 @@ pub struct Probes {
     scrape: Scrape,
     /// The executor nodes, by index.
     pub executors: Vec<Probed>,
-    /// The ingress nodes, by index. Their exporter binds loopback.
+    /// The ingress nodes, by index.
     pub ingresses: Vec<Probed>,
     /// The aux node that runs the validator.
     pub validator: Probed,
@@ -105,6 +113,24 @@ impl Probes {
             validator,
             sequencers: probed(contract, "sequencer"),
         })
+    }
+
+    /// The exporters a load reads over the bridge: every executor, the
+    /// `ingress` it submits through, and the lane-0 replica of every
+    /// sequencer.
+    #[must_use]
+    pub fn load_metrics(&self, ingress: &Probed) -> MetricsTargets {
+        let at = |nodes: &[Probed], port| {
+            nodes
+                .iter()
+                .map(|n| n.metrics_target(port))
+                .collect::<Vec<_>>()
+        };
+        MetricsTargets {
+            executors: at(&self.executors, EXECUTOR_PORT),
+            ingress: ingress.metrics_target(INGRESS_PORT),
+            sequencers: at(&self.sequencers, SEQUENCER_LANE0_PORT),
+        }
     }
 
     /// The containers of the nodes that run the L1 follower: the aux node
@@ -181,10 +207,11 @@ impl Probes {
         metrics::sum_where(&body, metric, label)
     }
 
-    /// One ingress node's loopback target.
+    /// One ingress node's exporter, reached over the bridge. The ingress
+    /// binds its exporter on every address of the host network.
     #[must_use]
     pub fn ingress_target(&self, node: &Probed) -> Target {
-        Target::loopback(&node.container, INGRESS_PORT)
+        Target::bridged(node.ip, &node.container, INGRESS_PORT)
     }
 
     /// The lane-0 replica target on sequencer node `i`.

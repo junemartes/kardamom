@@ -1,51 +1,18 @@
 //! Prometheus scrape and parse. A scrape tries the bridge address first
 //! and falls back to `docker exec` on the node, since a hard kill of a
 //! privileged sibling can stall the host's dockerd and take every exec
-//! probe with it. A failed scrape is `None`, never zero: a metric that
-//! is absent, or a node that does not answer, must not read as a value.
+//! probe with it. The load harness reads its targets with the same
+//! [`ExporterReader`]. A failed scrape is `None`, never zero: a metric
+//! that is absent, or a node that does not answer, must not read as a
+//! value.
 
-use std::net::Ipv4Addr;
-use std::time::Duration;
-
-use crate::nodes::Nodes;
-
-/// Where one exporter is reached.
-#[derive(Debug, Clone)]
-pub struct Target {
-    /// The bridge address, when the exporter binds beyond loopback.
-    pub ip: Option<Ipv4Addr>,
-    /// The node container, for the `docker exec` fallback.
-    pub node: String,
-    pub port: u16,
-}
-
-impl Target {
-    /// An exporter reached over the bridge, with the exec fallback.
-    #[must_use]
-    pub fn bridged(ip: Ipv4Addr, node: &str, port: u16) -> Self {
-        Self {
-            ip: Some(ip),
-            node: node.to_string(),
-            port,
-        }
-    }
-
-    /// A loopback-only exporter, reached through the node.
-    #[must_use]
-    pub fn loopback(node: &str, port: u16) -> Self {
-        Self {
-            ip: None,
-            node: node.to_string(),
-            port,
-        }
-    }
-}
+use kardamom_bench::load::ExporterReader;
+pub use kardamom_bench::load::MetricsTarget as Target;
 
 /// The scraper.
 #[derive(Debug, Clone)]
 pub struct Scrape {
-    http: reqwest::Client,
-    nodes: Nodes,
+    reader: ExporterReader,
 }
 
 impl Default for Scrape {
@@ -55,7 +22,7 @@ impl Default for Scrape {
 }
 
 impl Scrape {
-    /// A scraper with a five-second HTTP budget per probe.
+    /// A scraper with a time bound on each read.
     ///
     /// # Panics
     ///
@@ -63,42 +30,13 @@ impl Scrape {
     /// TLS backend causes.
     #[must_use]
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("build the scrape HTTP client");
-        Self { http, nodes: Nodes }
+        let reader = ExporterReader::new().expect("build the scrape HTTP client");
+        Self { reader }
     }
 
     /// One `/metrics` body, or `None` when no probe answers.
     pub async fn fetch(&self, target: &Target) -> Option<String> {
-        if let Some(body) = self.fetch_direct(target).await {
-            return Some(body);
-        }
-        self.fetch_via_node(target).await
-    }
-
-    async fn fetch_direct(&self, target: &Target) -> Option<String> {
-        let ip = target.ip?;
-        let url = format!("http://{ip}:{}/metrics", target.port);
-        self.http
-            .get(&url)
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .text()
-            .await
-            .ok()
-    }
-
-    async fn fetch_via_node(&self, target: &Target) -> Option<String> {
-        let script = format!(
-            "curl -fsS --max-time 5 http://127.0.0.1:{}/metrics",
-            target.port
-        );
-        self.nodes.exec(&target.node, &script).await.ok()
+        self.reader.read(target).await.body
     }
 
     /// Whether the exporter answers at all.

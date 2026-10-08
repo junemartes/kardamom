@@ -93,7 +93,8 @@ fn voter_cfg() -> ReaderConfig {
     }
 }
 
-type TestReader = TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>>;
+type TestReader =
+    TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream>;
 
 /// A reader over `sub`, with its exec sink's far end.
 fn reader(
@@ -107,6 +108,7 @@ fn reader(
         buffer,
         cfg,
         exec_out,
+        exec_stream: NoExecStream,
         recovery_factory: None,
     });
     (reader, rx)

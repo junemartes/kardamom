@@ -236,15 +236,17 @@ impl<S: L1Source, K: BlockSink> Follower<S, K> {
             .flat_map(|b| &b.batches)
             .map(|b| b.index)
             .next_back();
-        self.cursor.last_batch = last_batch.or(self.cursor.last_batch);
-        self.cursor.l1_block = blocks
+        let mut cursor = self.cursor;
+        cursor.last_batch = last_batch.or(cursor.last_batch);
+        cursor.l1_block = blocks
             .last()
             .map(|b| BlockId {
                 number: b.number,
                 hash: b.hash,
             })
             .or(self.cursor.l1_block);
-        self.store.set_cursor(&self.cursor)?;
+        self.store.set_cursor(&cursor)?;
+        self.cursor = cursor;
         if let Some(block) = self.cursor.l1_block {
             gauge!(INDEXED_BLOCK).set(gauge_value(block.number));
         }

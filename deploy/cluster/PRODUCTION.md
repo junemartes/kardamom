@@ -69,7 +69,7 @@ The da-watcher has its own node class in the production profile.
 
 - The role `da-watcher` selects the node.
 - The Aeron archive of that node records the topic `tx_deposits`. The da-watcher publishes it.
-- The `archive_topics` node meta carries this. The ingress nodes record `tx_data`. Other nodes record nothing. See [`../../docs/aeron-discovery.md`](../../docs/aeron-discovery.md).
+- The `archive_topics` node meta carries this. The ingress nodes record `tx_data`. Each executor node records the `exec_txs` stream of its own executor. Other nodes record nothing. See [`../../docs/aeron-discovery.md`](../../docs/aeron-discovery.md).
 - The local profile keeps the da-watcher on `aux-0`.
 
 ### One server or three

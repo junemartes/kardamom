@@ -3,20 +3,22 @@
 ## Cause
 
 A consumer of the `l1_blocks` stream (the da-watcher, the batcher) received two
-records of one L1 block number with different hashes. The two follower
+records of one L1 block number with different hashes or payloads. The two follower
 instances published different blocks: the sources of one instance lie in a way
 its two-source check did not catch, for example two endpoints of one provider.
 
 ## Confirm
 
 1. Read `/halt` on the halted consumer. The detail names the block number and
-   the two hashes. The first hash is the record the consumer took.
+   the two hashes, or a payload disagreement with matching headers. Preserve
+   both complete records, including epochs/deposits and batches.
 2. Read `kardamom_l1_follower_published_block_number` and the log of each
    follower instance (`l1-indexer-0`, `l1-indexer-1`). Find the instance that
    indexed each hash: `curl -s -X POST -d '{"jsonrpc":"2.0","id":1,
    "method":"indexer_l1_block","params":[<number>]}' http://<node>:8549`.
-3. Ask an L1 endpoint of a third provider for the block by number. Its hash
-   names the honest instance.
+3. Ask an independent L1 provider for the block and its settlement/lockbox
+   logs. Compare the complete derived records; a matching header hash alone
+   cannot identify an instance that omitted or changed logs.
 4. Read the validator's epoch check (`validator_epoch_faults_total`). A lie
    that reached the chain also fails there.
 

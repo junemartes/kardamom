@@ -136,3 +136,23 @@ fn the_horizon_bounds_what_the_dedup_keeps() {
         }
     );
 }
+
+#[test]
+fn matching_headers_do_not_hide_changed_payloads() {
+    let mut dedup = L1BlockDedup::after(10, hash(10, 0));
+    let record = block(11, 0);
+    assert_eq!(admit(&mut dedup, &record), Admit::Next);
+    let mut changed = record.clone();
+    changed.epoch.l1_number = 12;
+    assert_eq!(
+        dedup.admit(&changed),
+        Admit::ContentDisagreement { number: 11 }
+    );
+    changed = record.clone();
+    changed.timestamp += 1;
+    assert_eq!(
+        dedup.admit(&changed),
+        Admit::ContentDisagreement { number: 11 }
+    );
+    assert_eq!(dedup.admit(&record), Admit::Duplicate);
+}

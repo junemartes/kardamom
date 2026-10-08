@@ -82,8 +82,9 @@ client {
     # archive_topics: the topic this node's Aeron archive records, for
     # the kardamom-aeron-archive service record (nomad/aeron.system.nomad.hcl).
     # The ingress nodes record tx_data; the da-watcher's node records
-    # tx_deposits (it publishes there).
-    archive_topics = "{{ 'tx_data' if 'ingress' in roles_set else ('tx_deposits' if 'da-watcher' in roles_set else '') }}"
+    # tx_deposits (it publishes there); each executor node records the
+    # exec_txs stream of its own executor.
+    archive_topics = "{{ 'tx_data' if 'ingress' in roles_set else ('tx_deposits' if 'da-watcher' in roles_set else ('exec_txs' if 'executor' in roles_set else '')) }}"
     # archive_topics_follower: l1_blocks on a node of the L1 follower
     # (the indexer role), which records the stream beside the topic of
     # its other role; empty elsewhere.

@@ -2,7 +2,8 @@
 //! ([`ValidatorWriterQueue`]) and the per-tx receipt check with the
 //! account-row check ([`ValidatorReceiptSink`]). Both use existing engine
 //! trait seams ([`StateWriterQueue`], [`TxReceiptsPublication`]) and stop
-//! the process via [`Divergence`] on a proven mismatch.
+//! the process via [`Divergence`] on a proven mismatch. Both compare the
+//! result of every executor replica, and a mismatch names the replica.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use kardamom_types::{
 };
 
 use crate::buffers::{BalBuffer, ReceiptBuffer};
+use crate::replica::{Attribution, Check, Checked, Compared, Distinct, Mismatch, Taken};
 use crate::{Divergence, metrics};
 
 /// How long the exec thread waits for a block's BAL before it skips the check.
@@ -24,12 +26,15 @@ const BAL_WAIT: Duration = Duration::from_secs(5);
 /// How long the commit thread waits for a tx's published receipt before it skips.
 const RECEIPT_WAIT: Duration = Duration::from_secs(5);
 
-/// Returns `true` when two block deltas have the same write-set (accounts,
-/// storage, code). Receipts are checked separately via `tx_receipts`, so this
-/// function skips them on purpose. The validator and the executor both build
-/// these vectors from sorted maps, so equal content means equal order.
-fn write_set_eq(a: &BlockDelta, b: &BlockDelta) -> bool {
-    a.accounts == b.accounts && a.storage == b.storage && a.code == b.code
+impl Compared for BlockDelta {
+    /// Returns `true` when two block deltas have the same write-set
+    /// (accounts, storage, code). Receipts are checked separately via
+    /// `tx_receipts`, so this check skips them on purpose. The validator
+    /// and the executor both build these vectors from sorted maps, so
+    /// equal content means equal order.
+    fn agrees(&self, other: &Self) -> bool {
+        self.accounts == other.accounts && self.storage == other.storage && self.code == other.code
+    }
 }
 
 /// Return a short summary of the first write-set field that differs.
@@ -55,27 +60,30 @@ fn write_set_diff_summary(local: &BlockDelta, bal: &BlockDelta) -> String {
     }
 }
 
-/// Returns `true` when the two receipts agree on the execution-output
-/// fields: success status, gas used, the write-set hash (the per-tx
-/// determinism witness), and the emitted logs. The check includes logs
-/// because `write_set_hash` covers state writes but not events. Without the
-/// log check, a log-only divergence would pass silently.
-///
-/// The check skips the RPC enrichment fields on purpose (`nonce`, `from`,
-/// `to`, `contract_address`, `effective_gas_price`, `block_number`,
-/// `transaction_index`, `cumulative_gas_used`). These fields derive
-/// deterministically from inputs the check already covers: the envelope,
-/// the canonical order, and the per-block `gas_used` sums. A divergence in
-/// one of them implies a divergence in a checked field, so comparing them
-/// would only re-verify arithmetic, not execution.
-fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
-    local.status == published.status
-        && local.gas_used == published.gas_used
-        && local.write_set_hash == published.write_set_hash
-        && local.logs == published.logs
-        // The typed skip cause is part of the deterministic transition:
-        // same input, same reason on every replica.
-        && local.skip_reason == published.skip_reason
+impl Compared for Receipt {
+    /// Returns `true` when the two receipts agree on the execution-output
+    /// fields: success status, gas used, the write-set hash (the per-tx
+    /// determinism witness), and the emitted logs. The check includes logs
+    /// because `write_set_hash` covers state writes but not events. Without
+    /// the log check, a log-only divergence would pass silently.
+    ///
+    /// The check skips the RPC enrichment fields on purpose (`nonce`,
+    /// `from`, `to`, `contract_address`, `effective_gas_price`,
+    /// `block_number`, `transaction_index`, `cumulative_gas_used`). These
+    /// fields derive deterministically from inputs the check already
+    /// covers: the envelope, the canonical order, and the per-block
+    /// `gas_used` sums. A divergence in one of them implies a divergence
+    /// in a checked field, so comparing them would only re-verify
+    /// arithmetic, not execution.
+    fn agrees(&self, other: &Self) -> bool {
+        self.status == other.status
+            && self.gas_used == other.gas_used
+            && self.write_set_hash == other.write_set_hash
+            && self.logs == other.logs
+            // The typed skip cause is part of the deterministic transition:
+            // same input, same reason on every replica.
+            && self.skip_reason == other.skip_reason
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,13 +91,17 @@ fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Wraps the trie-aware [`StateWriterQueue`]. It checks each block's
-/// write-set against the executor's BAL, then sends the delta to the writer,
-/// which advances the MPT state root. It stops the process on a mismatch.
+/// write-set against the BAL of every executor replica, then sends the
+/// delta to the writer, which advances the MPT state root. It stops the
+/// process on a mismatch.
 pub struct ValidatorWriterQueue<Q: StateWriterQueue> {
     inner: Q,
     bals: Arc<BalBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// The checked write-sets of recent blocks, for the replica BALs that
+    /// arrive after their block's check.
+    checked: Checked<u64, BlockDelta>,
     /// Highest block already submitted in this process's lifetime. A
     /// cluster session replay (lapse and reconnect, no restart) re-delivers
     /// blocks the validator already ran. Re-execution against already-
@@ -112,6 +124,7 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
             bals,
             divergence,
             wait: BAL_WAIT,
+            checked: Checked::new(Check::Bal, BalBuffer::CHECK_WINDOW),
             verify_floor: 0,
             high_water: 0,
         }
@@ -132,6 +145,38 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
         self.wait = wait;
         self
     }
+
+    /// Compare the write-set of `block` with the BAL of every replica:
+    /// the BALs that arrived for the block, and the late BALs of lower
+    /// blocks. A missing BAL leaves the block unverified.
+    fn verify(&mut self, block: u64, delta: &BlockDelta) -> Result<(), ExecutorError> {
+        let taken = self.bals.take(block, self.wait);
+        let arrived = !taken.current.is_empty();
+        self.checked
+            .check(block, delta, taken)
+            .map_err(|m| self.diverged(m))?;
+        if arrived {
+            metrics::counter_block_verified();
+        } else {
+            // The BAL never arrived, so this block stays unverified. This
+            // is not a proven divergence: log it and count it.
+            tracing::warn!(
+                block,
+                "no BAL received within timeout; block left unverified"
+            );
+            metrics::counter_bal_missing();
+        }
+        Ok(())
+    }
+
+    /// Record the divergence of a replica BAL whose write-set differs
+    /// from the local one. `Divergence` is fatal; the engine does not
+    /// retry it.
+    fn diverged(&self, m: Mismatch<u64, BlockDelta>) -> ExecutorError {
+        let summary = write_set_diff_summary(&m.local, &m.published);
+        let detail = format!("block {} write-set != BAL: {summary}", m.key);
+        ExecutorError::Divergence(self.divergence.halt_replica(m.attribution, &detail))
+    }
 }
 
 impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
@@ -151,24 +196,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
             return self.inner.submit(block, delta, refs);
         }
         self.high_water = block.block_number;
-        if let Some(bal) = self.bals.take(block.block_number, self.wait) {
-            if write_set_eq(&delta, &bal) {
-                metrics::counter_block_verified();
-            } else {
-                let summary = write_set_diff_summary(&delta, &bal);
-                let reason = format!("block {} write-set != BAL: {summary}", block.block_number);
-                // `Divergence` is fatal; the engine does not retry it.
-                return Err(ExecutorError::Divergence(self.divergence.halt(reason)));
-            }
-        } else {
-            // The BAL never arrived, so this block stays unverified. This
-            // is not a proven divergence: log it and count it.
-            tracing::warn!(
-                block = block.block_number,
-                "no BAL received within timeout; block left unverified"
-            );
-            metrics::counter_bal_missing();
-        }
+        self.verify(block.block_number, &delta)?;
         // Send the delta to the trie-aware writer; this advances the MPT state root.
         self.inner.submit(block, delta, refs)
     }
@@ -226,13 +254,16 @@ impl RecentAccounts {
 
 /// Implements [`TxReceiptsPublication`], but checks receipts instead of
 /// publishing them. It compares each recomputed receipt against the
-/// executor's published receipt for the same `tx_idx`, and the published
-/// account rows of a batch that ends there against the local state, and
-/// stops the process on a mismatch.
+/// receipt of every executor replica for the same `tx_idx`, and the
+/// published account rows of a batch that ends there against the local
+/// state, and stops the process on a mismatch.
 pub struct ValidatorReceiptSink {
     receipts: Arc<ReceiptBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// The checked receipts of recent positions, for the replica receipts
+    /// that arrive after their position's check.
+    checked: Checked<BPosition, Receipt>,
     /// Recent-block input ring for the receipt-divergence dump. The mismatch
     /// fires after the block's records and claims are gone, so without this
     /// ring a mismatch leaves only a log line, with nothing to replay.
@@ -247,6 +278,7 @@ impl ValidatorReceiptSink {
             receipts,
             divergence,
             wait: RECEIPT_WAIT,
+            checked: Checked::new(Check::Receipt, ReceiptBuffer::CHECK_WINDOW),
             flight: None,
             recent: RecentAccounts::default(),
         }
@@ -299,82 +331,116 @@ impl ValidatorReceiptSink {
         }
     }
 
-    /// Check one local receipt, then the published account rows of a
-    /// batch that ends at its position, when a frame ending there has
-    /// arrived.
+    /// Check one local receipt, then the published account rows of the
+    /// replica batches that end at its position and arrived before the
+    /// sink reached it.
     fn check_item(&mut self, item: &ReceiptRows) -> Result<(), ExecutorError> {
         self.latched()?;
         self.check_receipt(&item.receipt)?;
         self.recent.record(item.receipt.tx_idx, &item.accounts);
-        let Some(published) = self.receipts.take_rows(item.receipt.tx_idx) else {
-            return Ok(());
-        };
+        let Taken { current, late } = self.receipts.rows.take(item.receipt.tx_idx, Duration::ZERO);
+        // Rows that arrive after the sink passed their position meet a
+        // later local state, so they stay unverified.
+        metrics::counter_rows_unverified(
+            late.iter().map(|(_, rows)| Distinct::results(rows)).sum(),
+        );
         // Under parallel validation only a block's last receipt carries
         // rows. A receipt with no rows is not at a position where the
         // local state is known per position, so the rows stay unverified.
         if item.accounts.is_empty() {
-            metrics::counter_rows_unverified();
+            metrics::counter_rows_unverified(Distinct::results(&current));
             return Ok(());
         }
-        self.check_rows(&item.receipt, &published)
+        self.check_rows(&item.receipt, &current)
     }
 
-    /// Compare published rows with the local state at the same position.
-    /// A row for an account with no recorded local value is unverified,
-    /// not a divergence: a cold start can begin inside a batch.
-    fn check_rows(&self, local: &Receipt, published: &[AccountRow]) -> Result<(), ExecutorError> {
-        let mismatch = published.iter().find_map(|row| {
+    /// Compare the published rows of every replica with the local state
+    /// at the same position. A row for an account with no recorded local
+    /// value is unverified, not a divergence: a cold start can begin
+    /// inside a batch.
+    fn check_rows(
+        &self,
+        local: &Receipt,
+        published: &[Distinct<Vec<AccountRow>>],
+    ) -> Result<(), ExecutorError> {
+        let Some((attribution, rows)) = Attribution::judge(Check::Rows, published, &[], |rows| {
+            self.row_mismatch(rows).is_none()
+        }) else {
+            for d in published {
+                self.count_rows(&d.value, d.replicas.len());
+            }
+            return Ok(());
+        };
+        let detail = self
+            .row_mismatch(rows)
+            .map_or_else(String::new, |(row, local_row)| {
+                format!(
+                    "account row mismatch at tx_idx {:?}: {} local(nonce={}, balance={}) vs \
+                 published(nonce={}, balance={}) [tx_hash={} block={}]",
+                    local.tx_idx,
+                    row.address,
+                    local_row.nonce,
+                    local_row.balance,
+                    row.nonce,
+                    row.balance,
+                    local.tx_hash,
+                    local.block_number,
+                )
+            });
+        Err(ExecutorError::Divergence(
+            self.divergence.halt_replica(attribution, &detail),
+        ))
+    }
+
+    /// The first published row that differs from its recorded local
+    /// value, with that local value.
+    fn row_mismatch<'a>(
+        &'a self,
+        rows: &'a [AccountRow],
+    ) -> Option<(&'a AccountRow, &'a AccountRow)> {
+        rows.iter().find_map(|row| {
             self.recent
                 .local(row)
                 .filter(|l| *l != row)
                 .map(|l| (row, l))
-        });
-        let Some((row, local_row)) = mismatch else {
-            self.count_rows(published);
-            return Ok(());
-        };
-        let reason = format!(
-            "account row mismatch at tx_idx {:?}: {} local(nonce={}, balance={}) vs \
-             published(nonce={}, balance={}) [tx_hash={} block={}]",
-            local.tx_idx,
-            row.address,
-            local_row.nonce,
-            local_row.balance,
-            row.nonce,
-            row.balance,
-            local.tx_hash,
-            local.block_number,
-        );
-        Err(ExecutorError::Divergence(self.divergence.halt(reason)))
+        })
     }
 
-    /// Count a batch with no mismatch: verified when every row had a
-    /// local value to compare with, unverified otherwise.
-    fn count_rows(&self, published: &[AccountRow]) {
+    /// Count the `n` replica batches of one value with no mismatch:
+    /// verified when every row had a local value to compare with,
+    /// unverified otherwise.
+    fn count_rows(&self, published: &[AccountRow], n: usize) {
         if published.iter().all(|row| self.recent.local(row).is_some()) {
-            metrics::counter_rows_verified();
+            metrics::counter_rows_verified(n);
         } else {
-            metrics::counter_rows_unverified();
+            metrics::counter_rows_unverified(n);
         }
     }
-    /// Cross-checks one local receipt against the executor's published
-    /// receipt. `Ok` when they match, or when no published receipt
-    /// turned up in time to compare (counted as `receipt_missing`).
-    /// `Err` halts the validator on a proven mismatch, after a
-    /// best-effort flight dump.
-    fn check_receipt(&self, local: &Receipt) -> Result<(), ExecutorError> {
-        let Some(published) = self.receipts.take(local.tx_idx, self.wait) else {
+    /// Cross-checks one local receipt against the published receipt of
+    /// every replica, and the late replica receipts of lower positions
+    /// against their checked receipts. `Ok` when they all match, or when
+    /// no published receipt turned up in time to compare (counted as
+    /// `receipt_missing`). `Err` halts the validator on a proven
+    /// mismatch, after a best-effort flight dump.
+    fn check_receipt(&mut self, local: &Receipt) -> Result<(), ExecutorError> {
+        let taken = self.receipts.receipts.take(local.tx_idx, self.wait);
+        if taken.current.is_empty() {
             // No published receipt to compare against, so skip the check.
             metrics::counter_receipt_missing();
-            return Ok(());
-        };
-        if receipt_consistent(local, &published) {
-            return Ok(());
         }
+        self.checked
+            .check(local.tx_idx, local, taken)
+            .map_err(|m| self.diverged(m))
+    }
+
+    /// Record the divergence of a replica receipt that differs from the
+    /// local one. `local` here is the checked receipt of the position.
+    fn diverged(&self, m: Mismatch<BPosition, Receipt>) -> ExecutorError {
+        let (local, published) = (&m.local, &m.published);
         // Include the tx identity, not only the mismatch, so
         // responders can find the transaction without a separate
         // hash lookup.
-        let reason = format!(
+        let detail = format!(
             "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
              logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
              [tx_hash={} from={} to={:?} block={} tx_index={}]",
@@ -397,310 +463,12 @@ impl ValidatorReceiptSink {
         // stop is permanent, so this is the only chance to capture
         // the block inputs behind the mismatch.
         if let Some(f) = self.flight.as_ref() {
-            f.dump_receipt_divergence(local, &published);
+            f.dump_receipt_divergence(local, published);
         }
-        Err(ExecutorError::Divergence(self.divergence.halt(reason)))
+        ExecutorError::Divergence(self.divergence.halt_replica(m.attribution, &detail))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::{Address, B256, U256};
-    use kardamom_types::{AccountChange, BPosition, StorageChange};
-    use std::sync::Mutex;
-
-    fn delta(block: u64, bal_val: u64) -> BlockDelta {
-        BlockDelta {
-            block_number: block,
-            accounts: vec![AccountChange {
-                address: Address::from([0x11; 20]),
-                nonce: 1,
-                balance: U256::from(bal_val),
-                code_hash: B256::ZERO,
-            }],
-            storage: vec![StorageChange {
-                address: Address::from([0x11; 20]),
-                key: B256::from(U256::from(1u64)),
-                value: U256::from(7u64),
-            }],
-            code: vec![],
-            receipts: vec![],
-        }
-    }
-
-    fn boundary(block: u64) -> BlockBoundary {
-        BlockBoundary {
-            block_number: block,
-            end_tx_idx: BPosition::from_index(block),
-            l2_timestamp: 1_700_000_000 + block,
-            l1_origin: 0,
-            base_fee: 0,
-            gas_used: 0,
-        }
-    }
-
-    fn receipt(idx: u64, status: bool, gas: u64, wsh: u8) -> Receipt {
-        Receipt {
-            tx_idx: BPosition::from_index(idx),
-            status,
-            gas_used: gas,
-            write_set_hash: B256::from([wsh; 32]),
-            ..Default::default()
-        }
-    }
-
-    fn row(byte: u8, nonce: u64) -> AccountRow {
-        AccountRow {
-            address: Address::from([byte; 20]),
-            nonce,
-            balance: U256::from(nonce),
-        }
-    }
-
-    fn item(idx: u64, rows: Vec<AccountRow>) -> ReceiptRows {
-        ReceiptRows {
-            receipt: receipt(idx, true, 21_000, 0xab),
-            accounts: rows,
-        }
-    }
-
-    /// A sink whose buffer already holds the published receipts 0 and 1.
-    fn sink_with_two_receipts() -> (Arc<ReceiptBuffer>, Arc<Divergence>, ValidatorReceiptSink) {
-        let buf = ReceiptBuffer::new();
-        let div = Divergence::new();
-        buf.insert(receipt(0, true, 21_000, 0xab));
-        buf.insert(receipt(1, true, 21_000, 0xab));
-        let sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
-            .with_wait(Duration::from_millis(50));
-        (buf, div, sink)
-    }
-
-    #[test]
-    fn matching_rows_pass_and_a_forged_row_halts() {
-        let (buf, div, mut sink) = sink_with_two_receipts();
-        // The batch [0, 1] ends at 1. Account 0x11 was last written at 0,
-        // so its row is checked against the value recorded there.
-        buf.insert_rows(BPosition::from_index(1), vec![row(0x11, 1), row(0x22, 2)]);
-        let (n, err) =
-            sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, vec![row(0x22, 2)])]);
-        assert_eq!((n, err.is_none()), (2, true));
-        assert!(!div.is_halted());
-
-        // A published row that disagrees with the local state at its
-        // position is a proven divergence.
-        buf.insert(receipt(2, true, 21_000, 0xab));
-        buf.insert_rows(BPosition::from_index(2), vec![row(0x11, 9)]);
-        let (n, err) = sink.publish_receipts(&[item(2, vec![row(0x22, 3)])]);
-        assert_eq!(n, 0);
-        assert!(matches!(err, Some(ExecutorError::Divergence(_))));
-        assert!(div.reason().unwrap().contains("account row mismatch"));
-    }
-
-    #[test]
-    fn unknown_account_and_bare_receipt_leave_rows_unverified() {
-        let (buf, div, mut sink) = sink_with_two_receipts();
-        // A row for an account this validator never wrote: unverified.
-        buf.insert_rows(BPosition::from_index(0), vec![row(0x33, 5)]);
-        // Rows at a position whose local receipt carries none (the
-        // parallel-validation shape): unverified, even when they differ.
-        buf.insert_rows(BPosition::from_index(1), vec![row(0x11, 9)]);
-        let (n, err) = sink.publish_receipts(&[item(0, vec![row(0x11, 1)]), item(1, Vec::new())]);
-        assert_eq!((n, err.is_none()), (2, true));
-        assert!(!div.is_halted());
-    }
-
-    /// Recording fake inner writer queue.
-    #[derive(Default)]
-    struct RecordingQueue {
-        submitted: Arc<Mutex<Vec<u64>>>,
-    }
-    impl StateWriterQueue for RecordingQueue {
-        fn submit(
-            &mut self,
-            block: BlockBoundary,
-            _delta: BlockDelta,
-            _refs: Vec<TxRef>,
-        ) -> Result<(), ExecutorError> {
-            self.submitted.lock().unwrap().push(block.block_number);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn matching_bal_forwards_and_does_not_diverge() {
-        let bals = BalBuffer::new();
-        let div = Divergence::new();
-        let submitted = Arc::new(Mutex::new(Vec::new()));
-        let inner = RecordingQueue {
-            submitted: submitted.clone(),
-        };
-        let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
-
-        bals.insert(delta(1, 100));
-        q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
-
-        assert!(!div.is_halted());
-        assert_eq!(*submitted.lock().unwrap(), vec![1]);
-    }
-
-    #[test]
-    fn mismatched_bal_fail_stops() {
-        let bals = BalBuffer::new();
-        let div = Divergence::new();
-        let inner = RecordingQueue::default();
-        let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone());
-
-        bals.insert(delta(1, 100)); // The BAL has balance 100.
-        // The local delta has 999.
-        let err = q
-            .submit(boundary(1), delta(1, 999), Vec::new())
-            .unwrap_err();
-
-        assert!(matches!(err, ExecutorError::Divergence(_)));
-        assert!(div.is_halted());
-        assert!(div.reason().unwrap().contains("write-set != BAL"));
-    }
-
-    #[test]
-    fn missing_bal_does_not_diverge() {
-        let bals = BalBuffer::new();
-        let div = Divergence::new();
-        let submitted = Arc::new(Mutex::new(Vec::new()));
-        let inner = RecordingQueue {
-            submitted: submitted.clone(),
-        };
-        let mut q = ValidatorWriterQueue::new(inner, bals.clone(), div.clone())
-            .with_wait(Duration::from_millis(50));
-
-        // No BAL is inserted: submit must still forward, and must not flag a divergence.
-        q.submit(boundary(1), delta(1, 100), Vec::new()).unwrap();
-        assert!(!div.is_halted());
-        assert_eq!(*submitted.lock().unwrap(), vec![1]);
-    }
-
-    #[test]
-    fn consistent_receipt_passes_inconsistent_fails() {
-        let buf = ReceiptBuffer::new();
-        let div = Divergence::new();
-        let mut sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
-            .with_wait(Duration::from_millis(50));
-
-        buf.insert(receipt(0, true, 21_000, 0xab));
-        // The execution-correctness fields match, so the check passes.
-        sink.publish(CMessage::Receipt(receipt(0, true, 21_000, 0xab)))
-            .unwrap();
-        assert!(!div.is_halted());
-
-        // The write_set_hash values differ, so the process must stop.
-        buf.insert(receipt(1, true, 21_000, 0xab));
-        let err = sink
-            .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
-            .unwrap_err();
-        assert!(matches!(err, ExecutorError::Divergence(_)));
-        assert!(div.is_halted());
-
-        // Regression test: a retry of the same publish finds the buffer
-        // empty. It must keep failing through the divergence latch, and
-        // must not fall into the "unverified" Ok arm.
-        let err2 = sink
-            .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
-            .unwrap_err();
-        assert!(matches!(err2, ExecutorError::Divergence(_)));
-    }
-
-    /// A receipt mismatch with the flight ring attached must leave a
-    /// replayable record: both receipts, plus the ring's recent block
-    /// inputs.
-    #[test]
-    fn receipt_mismatch_dumps_flight_ring() {
-        use kardamom_engine::actor::BufferedRecord;
-        use kardamom_engine::exec_types::TxIndex;
-
-        let dir = std::env::temp_dir().join(format!("kardamom-flight-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: test-local env var; tests in this file don't race on it.
-        unsafe { std::env::set_var("KARDAMOM_FLIGHT_DIR", &dir) };
-
-        let ring = crate::flight::FlightRing::new();
-        ring.push(
-            7,
-            std::num::NonZeroU16::new(20).expect("fixture granularity"),
-            kardamom_engine::block_env::ExecEnv {
-                chain_id: 1,
-                block_number: 7,
-                l2_timestamp: 1_700_000_000,
-                fees: kardamom_types::BlockFees::NONE,
-            },
-            &[BufferedRecord::Tx {
-                tx_idx: TxIndex(0),
-                position: BPosition::from_index(0),
-                envelope: kardamom_types::TxEnvelope {
-                    correlation_id: 1,
-                    raw_tx: vec![0xde, 0xad].into(),
-                    sender: Address::from([0x11; 20]),
-                    tx_hash: B256::from([0x22; 32]),
-                    max_inclusion_block: u64::MAX,
-                },
-            }],
-            None,
-        );
-
-        let buf = ReceiptBuffer::new();
-        let div = Divergence::new();
-        let mut sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
-            .with_wait(Duration::from_millis(50))
-            .with_flight(ring);
-
-        buf.insert(receipt(3, true, 21_000, 0xab));
-        let err = sink
-            .publish(CMessage::Receipt(receipt(3, true, 21_000, 0xff)))
-            .unwrap_err();
-        assert!(matches!(err, ExecutorError::Divergence(_)));
-
-        let dump = dir.join("receipt-divergence-0-3.json");
-        let body = std::fs::read_to_string(&dump).expect("dump file must exist");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // Check both receipts, field by field.
-        assert_eq!(
-            v["local"]["write_set_hash"],
-            format!("{:?}", B256::from([0xff; 32]))
-        );
-        assert_eq!(
-            v["published"]["write_set_hash"],
-            format!("{:?}", B256::from([0xab; 32]))
-        );
-        // The ring's block inputs can be replayed.
-        assert_eq!(v["ring"][0]["block"], 7);
-        assert_eq!(v["ring"][0]["granularity"], 20);
-        assert_eq!(v["ring"][0]["records"][0]["kind"], "tx");
-        assert_eq!(v["ring"][0]["records"][0]["raw"], "dead");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // A log-only divergence (same status, gas, and write-set hash) must
-    // trip the check. Logs are published execution output, not enrichment.
-    #[test]
-    fn log_only_divergence_fail_stops() {
-        use kardamom_types::WireLog;
-        let buf = ReceiptBuffer::new();
-        let div = Divergence::new();
-        let mut sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
-            .with_wait(Duration::from_millis(50));
-
-        let log = |topic: u8| WireLog {
-            address: Address::from([0x22; 20]),
-            topics: vec![B256::repeat_byte(topic)],
-            data: bytes::Bytes::default(),
-        };
-        let mut published = receipt(0, true, 21_000, 0xab);
-        published.logs = vec![log(0x01)];
-        let mut local = receipt(0, true, 21_000, 0xab);
-        local.logs = vec![log(0x02)];
-
-        buf.insert(published);
-        let err = sink.publish(CMessage::Receipt(local)).unwrap_err();
-        assert!(matches!(err, ExecutorError::Divergence(_)));
-        assert!(div.is_halted());
-    }
-}
+#[path = "seams_tests.rs"]
+mod tests;
