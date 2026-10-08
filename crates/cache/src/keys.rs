@@ -65,6 +65,19 @@ pub fn parse_tag(tag: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The frozen key layout against the format registry
+    /// (`formats.toml` at the workspace root).
+    #[test]
+    fn the_key_layout_matches_the_registry() {
+        let id = "redis-cache";
+        let check = kardamom_formats::Registry::assert_layout;
+        check(id, "account", &account(Address::ZERO));
+        check(id, "receipt", &receipt(Address::ZERO, 5));
+        check(id, "head", &head(3));
+        check(id, "pending", &pending(Address::ZERO));
+        check(id, "index_tag", &index_tag(7));
+    }
+
     #[test]
     fn tags_order_as_strings_and_round_trip() {
         let small = index_tag(9);

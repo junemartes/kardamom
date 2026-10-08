@@ -33,6 +33,8 @@
 mod cursor;
 mod events;
 mod feed;
+#[cfg(test)]
+mod format_tests;
 pub mod poll;
 mod post_age;
 mod posted_cursor;

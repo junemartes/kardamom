@@ -83,3 +83,9 @@ fn log_codetx_receipts_channel_b_message_roundtrip() {
     let back_b: TxOrderingMessage = materialize(&bytes_b).unwrap();
     assert_eq!(back_b, b);
 }
+
+#[test]
+fn discovery_version_matches_the_registry() {
+    let version = kardamom_log::discovery::DISCOVERY_VERSION.parse().unwrap();
+    kardamom_formats::Registry::assert_exact("discovery-record", version);
+}

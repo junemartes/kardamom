@@ -368,3 +368,10 @@ fn quarantine_failed_message_has_a_readable_gap() {
     assert!(msg.contains("could not be quarantined:"), "got {msg:?}");
     assert!(!msg.contains("be  quarantined"), "got {msg:?}");
 }
+
+#[test]
+fn format_versions_match_the_registry() {
+    use kardamom_formats::Registry;
+    Registry::assert_exact("state-db", crate::meta::SCHEMA_VERSION);
+    Registry::assert_exact("checkpoint-manifest", super::manifest::MANIFEST_VERSION);
+}

@@ -372,3 +372,9 @@ fn auth_rejected_fails_session() {
     );
     assert!(matches!(d.state(), SessionState::Failed(_)));
 }
+
+#[test]
+fn app_version_major_matches_the_registry() {
+    let major = u32::try_from(APP_SEMANTIC_VERSION >> 16).unwrap();
+    kardamom_formats::Registry::assert_exact("cluster-app-version", major);
+}

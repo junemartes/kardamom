@@ -42,6 +42,8 @@ tokio = { workspace = true, features = ["net", "rt", "io-util", "macros", "time"
 tracing.workspace = true
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format constants against it.
+kardamom-formats.workspace = true
 tempfile.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
