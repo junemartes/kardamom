@@ -11,6 +11,10 @@ use crate::error::StateError;
 
 use super::checkpoint_data_file;
 
+/// The manifest layout version that `encode` writes. The parser ignores
+/// it, as it ignores every unknown key.
+pub(crate) const MANIFEST_VERSION: u32 = 1;
+
 /// A sidecar file written next to every checkpoint: it says what these
 /// bytes are.
 ///
@@ -45,7 +49,7 @@ impl CheckpointManifest {
     #[must_use]
     pub(crate) fn encode(&self) -> String {
         format!(
-            "version=1\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n",
+            "version={MANIFEST_VERSION}\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n",
             self.block, self.image_keccak, self.genesis_digest
         )
     }

@@ -478,3 +478,18 @@ fn remote_epoch_record_golden_bytes_are_pinned() {
         rkyv::from_bytes::<_, rkyv::rancor::Error>(&aligned).unwrap();
     assert_eq!(back, v);
 }
+
+/// The frozen stream records against the format registry
+/// (`formats.toml` at the workspace root).
+#[test]
+fn stream_record_layouts_match_the_registry() {
+    use kardamom_formats::Registry;
+    let id = "aeron-stream-records";
+    Registry::assert_rkyv_layout::<kardamom_types::receipt::Receipt>(id, "Receipt");
+    Registry::assert_rkyv_layout::<kardamom_types::delta::BlockDelta>(id, "BlockDelta");
+    Registry::assert_rkyv_layout::<kardamom_types::boundary::BlockBoundary>(id, "BlockBoundary");
+    Registry::assert_rkyv_layout::<kardamom_types::service::ServiceEvent>(id, "ServiceEvent");
+    Registry::assert_rkyv_layout::<kardamom_types::tx_status::TxStatus>(id, "TxStatus");
+    Registry::assert_rkyv_layout::<kardamom_types::tx_error::TxError>(id, "TxError");
+    Registry::assert_rkyv_layout::<kardamom_types::envelope::TxEnvelope>(id, "TxEnvelope");
+}

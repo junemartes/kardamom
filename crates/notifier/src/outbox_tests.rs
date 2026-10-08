@@ -75,3 +75,11 @@ fn the_cursor_persists_and_defaults_to_zero() {
     assert_eq!(cursor.load(), 4096);
     assert!(!dir.path().join("d.cursor.tmp").exists());
 }
+
+#[test]
+fn the_outbox_layout_matches_the_registry() {
+    kardamom_formats::Registry::assert_rkyv_layout::<OutboxRecord>(
+        "notifier-outbox",
+        "OutboxRecord",
+    );
+}

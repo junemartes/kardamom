@@ -35,6 +35,11 @@ tasks.named('test') {
         '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED'
     )
     maxHeapSize = '1g'
+    // FormatRegistryTest reads the format registry at the repository root.
+    // As a test input, a change to the file runs the test again.
+    def formats = rootProject.file('../../formats.toml')
+    inputs.file(formats)
+    systemProperty 'kardamom.formats', formats.canonicalPath
     // TestCluster spins up many threads; give the forked worker a single test fork.
     maxParallelForks = 1
 }

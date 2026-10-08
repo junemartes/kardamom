@@ -60,6 +60,7 @@ kardamom-exec-core = { path = "crates/exec-core" }
 kardamom-log = { path = "crates/log" }
 kardamom-engine = { path = "crates/engine" }
 kardamom-validator = { path = "crates/validator" }
+kardamom-formats = { path = "crates/formats" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 # NOTE: rusteron's `static` feature links Aeron statically but is broken on
 # Linux release builds (rust-lld "undefined symbol: aeron_*"; the crate's own

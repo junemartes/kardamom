@@ -63,3 +63,7 @@ impl FromStr for L1Cursor {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "l1_cursor_tests.rs"]
+mod tests;

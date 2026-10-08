@@ -34,6 +34,8 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format layout against it.
+kardamom-formats.workspace = true
 serde_json = "1"
 # rkyv roundtrip tests only — nothing I/O
 # `sol!`-generated encoder: the compiler-grade oracle the hand-rolled

@@ -50,7 +50,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   # Mechanical checks from docs/STYLE.md (clippy pedantic, unreachable_pub,
-  # rustfmt, forbidden patterns). Same toolchain and cache as the clippy job.
+  # rustfmt, forbidden patterns), then the format registry check. Same
+  # toolchain and cache as the clippy job.
   style:
     name: style
     runs-on: ubuntu-latest
@@ -73,6 +74,19 @@ jobs:
         with:
           just-version: 1.49.0
       - run: just style
+      # The format registry against the base branch (docs/formats.md). The
+      # checkout of a pull request is its merge into the base, so the tip
+      # of the base branch is the base revision.
+      - name: Fetch the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+      - name: Check formats against the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: just check-formats "origin/$BASE_REF"
       - run: python3 -m unittest discover -s scripts/hooks/tests
 
   build:

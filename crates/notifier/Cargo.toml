@@ -44,6 +44,8 @@ tower = { version = "0.5", features = ["util"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format layout against it.
+kardamom-formats.workspace = true
 jsonrpsee = { workspace = true, features = ["ws-client"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 tempfile = { workspace = true }

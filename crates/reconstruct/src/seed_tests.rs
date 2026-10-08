@@ -138,3 +138,8 @@ fn a_seed_refuses_a_head_without_a_canonical_end() {
     let err = Rebuilt::new(true).seed().unwrap_err().to_string();
     assert!(err.contains("carries no canonical cursor"), "{err}");
 }
+
+#[test]
+fn seed_version_matches_the_registry() {
+    kardamom_formats::Registry::assert_exact("sealer-seed", super::VERSION);
+}
