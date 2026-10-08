@@ -13,6 +13,9 @@ pub(super) const START_LINE: &str = "live batcher starting";
 /// The lines of a start that waits on the indexer, or scans the logs
 /// the endpoint swallowed: the two ways a start dies on a lying L1.
 const OLD_RESUME_LINES: [&str; 2] = ["indexer behind L1; waiting", "no BatchPosted event with it"];
+/// The line of the Aeron error handler of every Rust service, just
+/// before the process exits.
+pub(super) const AERON_EXIT_LINE: &str = "aeron client error; exiting";
 /// The line of a restart that found its pending group on disk.
 pub(super) const SPOOL_RESTORED_LINE: &str = "pending group restored from the spool";
 /// The line of a replay the sealers refused, with the floor block

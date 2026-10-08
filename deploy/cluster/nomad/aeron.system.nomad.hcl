@@ -230,7 +230,8 @@ job "aeron" {
         #
         # The archive sync levels go in the same way: the image
         # entrypoint has no setting for them, and the Aeron default is 0.
-        _JAVA_OPTIONS = "-Xmx160m -Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Daeron.archive.file.sync.level=${var.archive_file_sync_level} -Daeron.archive.catalog.file.sync.level=${var.archive_file_sync_level}"
+        # A failed driver thread must terminate the JVM so Nomad restarts it.
+        _JAVA_OPTIONS = "-Xmx160m -XX:+ExitOnOutOfMemoryError -Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Daeron.archive.file.sync.level=${var.archive_file_sync_level} -Daeron.archive.catalog.file.sync.level=${var.archive_file_sync_level}"
       }
 
       # The archive record of the discovery contract

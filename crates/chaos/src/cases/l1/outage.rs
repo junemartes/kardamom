@@ -1,18 +1,19 @@
 //! `batcher-outage-past-retention`: the batcher is frozen until the
 //! sealers' egress floor passes its cursor and a snapshot lands, then
-//! thawed. The thaw has two valid ends. The batcher restarts and posts
-//! the group it restores from its spool, or it keeps running and posts
-//! the group it holds in memory. Either way the group lands right after
-//! the covered block. The batcher then gets the rest of the gap replayed,
-//! or rebuilds it from the state databases' block references and the
-//! `tx_data` archives, and posts on past the sealers' floor.
+//! thawed. The thaw has one valid end. The freeze is longer than the
+//! service interval of the Aeron clients of the batcher, so a client
+//! times out and the process exits. The orchestrator restarts it, and it
+//! posts the group it restores from its spool. The group lands right
+//! after the covered block. The batcher then gets the rest of the gap
+//! replayed, or rebuilds it from the state databases' block references
+//! and the `tx_data` archives, and posts on past the sealers' floor.
 
 use std::cell::Cell;
 use std::time::Duration;
 
 use super::batcher::{
-    REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, START_LINE, count, field_in_last,
-    require_posting,
+    AERON_EXIT_LINE, REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, START_LINE, count,
+    field_in_last, require_posting,
 };
 use crate::harness::Harness;
 use crate::l1::{L1, Posted};
@@ -169,12 +170,16 @@ async fn await_answering(
     .map(|_| ())
 }
 
-/// Hold until the ingress delta passed twice the retention, two minutes
+/// The least hold of a floor pass when nothing else bounds it.
+pub(super) const MIN_HOLD: Duration = Duration::from_mins(2);
+
+/// Hold until the ingress delta passed twice the retention, `min_hold`
 /// passed, and the sealers took a snapshot; the delta and the time.
 pub(super) async fn hold_until_floor_passes(
     h: &Harness,
     rx0: i64,
     snapshots0: usize,
+    min_hold: Duration,
     ctx: &str,
 ) -> anyhow::Result<(i64, Duration)> {
     let retention = h.knobs.cluster_retention.ok_or_else(|| {
@@ -202,7 +207,7 @@ pub(super) async fn hold_until_floor_passes(
             .evidence
             .count_lines(CLUSTER_TASK, SNAPSHOT_LINE, Streams::StdoutOnly)
             .await?;
-        let passed = d >= need && elapsed >= Duration::from_mins(2) && snapshots > snapshots0;
+        let passed = d >= need && elapsed >= min_hold && snapshots > snapshots0;
         Ok::<_, anyhow::Error>(passed.then_some(d))
     })
     .await?;
@@ -223,6 +228,9 @@ struct Lines {
     /// The lines of a start that restored its pending group from the
     /// spool.
     restored: usize,
+    /// The lines of the Aeron error handler: one for each handler call
+    /// before an exit.
+    exits: usize,
 }
 
 impl Lines {
@@ -230,17 +238,24 @@ impl Lines {
         Ok(Self {
             starts: count(h, START_LINE).await?,
             restored: count(h, SPOOL_RESTORED_LINE).await?,
+            exits: count(h, AERON_EXIT_LINE).await?,
         })
     }
-}
 
-/// How the batcher came through the thaw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThawPath {
-    /// It restarted and posted the group it restored from the spool.
-    Restored,
-    /// It kept running and posted the group it held in memory.
-    Survived,
+    /// Fail unless the batcher restarted after `self`. A batcher that
+    /// did not restart either logged the handler line and hung in its
+    /// exit, or saw no Aeron error at all.
+    fn require_restart(&self, now: Lines, ctx: &str) -> anyhow::Result<()> {
+        match (now.starts > self.starts, now.exits > self.exits) {
+            (true, _) => Ok(()),
+            (false, true) => Err(crate::chaos_fail!(
+                "{ctx}: the batcher logged '{AERON_EXIT_LINE}' after the thaw but kept running — the process hung in its exit"
+            )),
+            (false, false) => Err(crate::chaos_fail!(
+                "{ctx}: the batcher kept running after the thaw and logged no '{AERON_EXIT_LINE}' — no Aeron client timeout fired"
+            )),
+        }
+    }
 }
 
 /// The batcher at the freeze: the block L1 covered, and its log counts.
@@ -263,9 +278,9 @@ impl AtFreeze {
 
     /// Judge the recovered batch and the log counts read after it. The
     /// batch must start right after the covered block: no block is lost
-    /// and none is posted twice. A batcher that restarted must have
+    /// and none is posted twice. The batcher must have restarted and
     /// restored its group from the spool.
-    fn judge(&self, batch: Posted, now: Lines, ctx: &str) -> anyhow::Result<ThawPath> {
+    fn judge(&self, batch: Posted, now: Lines, ctx: &str) -> anyhow::Result<()> {
         let next = self.covered.checked_add(1).ok_or_else(|| {
             crate::chaos_fail!("{ctx}: the covered block {} has no successor", self.covered)
         })?;
@@ -276,21 +291,18 @@ impl AtFreeze {
             batch.index,
             batch.l2_block_start
         );
-        match (
+        self.lines.require_restart(now, ctx)?;
+        anyhow::ensure!(
             now.restored > self.lines.restored,
-            now.starts > self.lines.starts,
-        ) {
-            (true, _) => Ok(ThawPath::Restored),
-            (false, false) => Ok(ThawPath::Survived),
-            (false, true) => Err(crate::chaos_fail!(
-                "{ctx}: the batcher restarted after the thaw but never logged '{SPOOL_RESTORED_LINE}' — its spool was not restored"
-            )),
-        }
+            "{}: {ctx}: the batcher restarted after the thaw but never logged '{SPOOL_RESTORED_LINE}' — its spool was not restored",
+            crate::FAIL_PREFIX
+        );
+        Ok(())
     }
 }
 
 /// The frozen group lands on L1 right after the covered block, from the
-/// spool of a restarted batcher or from the memory of a running one.
+/// spool of the restarted batcher.
 async fn await_spool_posted(
     h: &Harness,
     l1: &L1,
@@ -318,9 +330,9 @@ async fn await_spool_posted(
             t.as_secs()
         )
     })?;
-    let path = at.judge(batch, lines, ctx)?;
+    at.judge(batch, lines, ctx)?;
     crate::log(format!(
-        "{ctx}: the frozen group was posted ({path:?}): batch {} covers {}..={} after the covered block {}",
+        "{ctx}: the restarted batcher posted the frozen group from its spool: batch {} covers {}..={} after the covered block {}",
         batch.index, batch.l2_block_start, batch.l2_block_end, at.covered
     ));
     Ok(())
@@ -358,7 +370,10 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
         "{ctx}: batcher frozen with {} spooled blocks, L1 covered through {}",
         frozen.blocks, at.covered
     ));
-    let (delta, held) = hold_until_floor_passes(h, rx0, snapshots0, ctx).await?;
+    // The freeze must outlast the service interval of the Aeron clients
+    // of the batcher, or the thaw does not end the process.
+    let min_hold = h.knobs.aeron_stall.evicting_freeze().max(MIN_HOLD);
+    let (delta, held) = hold_until_floor_passes(h, rx0, snapshots0, min_hold, ctx).await?;
     crate::log(format!(
         "{ctx}: the floor passed ({delta} frames in {}s); thawing",
         held.as_secs()

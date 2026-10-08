@@ -123,27 +123,40 @@ locals {
       - job_name: node
         consul_sd_configs:
           - server: 127.0.0.1:8500
+            datacenter: ${var.datacenter}
             services: [node-exporter]
         relabel_configs:
           - source_labels: [__meta_consul_node]
             target_label: node
-      - job_name: nomad
+      %{ for role in ["server", "client"] }
+      - job_name: nomad-${role}
         metrics_path: /v1/metrics
         params:
           format: [prometheus]
         scheme: ${var.nomad_tls_dir != "" ? "https" : "http"}
         tls_config:
           ca_file: ${var.nomad_tls_dir != "" ? "/etc/kardamom/nomad-ca.pem" : ""}
-          server_name: ${var.nomad_tls_dir != "" ? "client.${var.nomad_region}.nomad" : ""}
+          server_name: ${var.nomad_tls_dir != "" ? "${role}.${var.nomad_region}.nomad" : ""}
         consul_sd_configs:
           - server: 127.0.0.1:8500
-            services: ["${var.cluster_id}-nomad", "${var.cluster_id}-nomad-client"]
+            datacenter: ${var.datacenter}
+            services: ["${var.cluster_id}-nomad${role == "client" ? "-client" : ""}"]
             # A server registers its http, rpc and serf ports under one
             # name; only the http port serves the metrics.
             tags: [http]
         relabel_configs:
           - source_labels: [__meta_consul_node]
             target_label: node
+          - target_label: job
+            replacement: nomad
+      %{ if role == "client" }
+          # A server can also register as a client. Its certificate has
+          # the server name, and the server scrape already covers it.
+          - source_labels: [__meta_consul_node]
+            regex: '{{ range $i, $s := service "${var.cluster_id}-nomad" }}{{ if $i }}|{{ end }}{{ $s.Node }}{{ end }}'
+            action: drop
+      %{ endif }
+      %{ endfor }
   EOT
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",

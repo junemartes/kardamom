@@ -1,9 +1,9 @@
 //! The rebuild: scan the co-located executor's newest checkpoint into
-//! Redis, tagged with the checkpoint's end position.
+//! Redis, tagged with the last included transaction position.
 //!
 //! The mirror is already subscribed and applying live batches when this
 //! runs, so nothing is replayed. The rebuild waits for a checkpoint whose
-//! end position is at or beyond the first live position, restores it into
+//! last included position is at or beyond the first live position, restores it into
 //! the mirror's scratch directory (never the live env), opens it read
 //! only, and streams the accounts table to Redis in chunks. A live row
 //! for the same account wins by position.
@@ -59,6 +59,26 @@ impl TriedCheckpoint {
     }
 }
 
+/// A checkpoint and the inclusive position shared by its rows and live receipts.
+struct RebuildSnapshot {
+    snapshot: StateSnapshot,
+    end: BPosition,
+}
+
+impl RebuildSnapshot {
+    fn new(snapshot: StateSnapshot, first_live: BPosition) -> Result<Option<Self>> {
+        // A checkpoint end is an exclusive record count. Receipt positions
+        // are zero-based, so a count equal to first_live excludes that receipt.
+        let last = snapshot.end_tx_position()?.as_index().checked_sub(1);
+        Ok(last
+            .filter(|last| *last >= first_live.as_index())
+            .map(|last| Self {
+                snapshot,
+                end: BPosition::from_index(last),
+            }))
+    }
+}
+
 impl Rebuild {
     pub(crate) fn new(checkpoints_dir: PathBuf, scratch: PathBuf) -> Self {
         Self {
@@ -69,7 +89,7 @@ impl Rebuild {
 
     /// Run one rebuild. `first_live` is the first live batch end this
     /// mirror applied; the checkpoint must reach it. Returns the
-    /// checkpoint's end position.
+    /// checkpoint's last included position.
     pub(crate) async fn run(
         &self,
         cache: &AccountCache,
@@ -77,8 +97,8 @@ impl Rebuild {
         shutdown: &CancellationToken,
     ) -> Result<BPosition> {
         let started = Instant::now();
-        let snapshot = self.wait_for_checkpoint(first_live, shutdown).await?;
-        let end = snapshot.end_tx_position()?;
+        let RebuildSnapshot { snapshot, end } =
+            self.wait_for_checkpoint(first_live, shutdown).await?;
         info!(
             block = snapshot.block_number(),
             end = end.as_index(),
@@ -104,7 +124,7 @@ impl Rebuild {
         &self,
         first_live: BPosition,
         shutdown: &CancellationToken,
-    ) -> Result<StateSnapshot> {
+    ) -> Result<RebuildSnapshot> {
         let mut tried = TriedCheckpoint::new();
         loop {
             if let Some(snapshot) = self.try_newest(first_live, &mut tried).await? {
@@ -122,7 +142,7 @@ impl Rebuild {
         &self,
         first_live: BPosition,
         tried: &mut TriedCheckpoint,
-    ) -> Result<Option<StateSnapshot>> {
+    ) -> Result<Option<RebuildSnapshot>> {
         let Some(newest) = latest_checkpoint(&self.checkpoints_dir)? else {
             warn!(dir = %self.checkpoints_dir.display(), "rebuild: no checkpoint yet");
             return Ok(None);
@@ -145,7 +165,7 @@ impl Rebuild {
     /// executor prunes its old checkpoints, so one can vanish between
     /// the listing and the read; `restore_newest_readable` skips such a
     /// checkpoint instead of renaming it out of the executor's way.
-    fn open_newest(&self, newest: u64, first_live: BPosition) -> Result<Option<StateSnapshot>> {
+    fn open_newest(&self, newest: u64, first_live: BPosition) -> Result<Option<RebuildSnapshot>> {
         let restored = restore_newest_readable(&self.checkpoints_dir, &self.scratch, None)?;
         let Some((block, _)) = restored else {
             warn!("rebuild: no restorable checkpoint");
@@ -156,17 +176,15 @@ impl Rebuild {
             .open()
             .context("open the restored checkpoint")?;
         let snapshot = StateSnapshot::open(&env)?;
-        let end = snapshot.end_tx_position()?;
-        if end < first_live {
+        let restored = RebuildSnapshot::new(snapshot, first_live)?;
+        if restored.is_none() {
             info!(
                 block,
-                end = end.as_index(),
                 first_live = first_live.as_index(),
                 "rebuild: newest checkpoint {newest} is behind the first live batch; waiting"
             );
-            return Ok(None);
         }
-        Ok(Some(snapshot))
+        Ok(restored)
     }
 }
 
@@ -237,6 +255,9 @@ async fn write_chunk(
         pause(shutdown, WRITE_RETRY, "the rebuild").await?;
     }
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {

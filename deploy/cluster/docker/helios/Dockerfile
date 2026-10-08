@@ -4,8 +4,8 @@
 # the release asset's sha256, so a changed asset fails the build.
 FROM ubuntu:24.04
 
-ARG HELIOS_VERSION=0.11.1
-ARG HELIOS_SHA256=339bf4ce73073c53790e41e3217b6d91f0e5d8571132b9e88689997613162ddb
+ARG HELIOS_VERSION=0.12.0
+ARG HELIOS_SHA256=dd2746b11323f8f4a4e4613891b275148f34963bf4912cab79a34316a02a94b4
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
