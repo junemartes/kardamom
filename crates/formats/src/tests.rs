@@ -234,3 +234,58 @@ fn parse_refuses_bad_code_locations() {
     let no_code = text([1, 1, 1], "").replace("[\"a.rs#X\"]", "[]");
     assert!(matches!(refusal(&no_code), RegistryError::NoCode(_)));
 }
+
+#[test]
+fn a_writer_below_the_base_reader_is_not_rollback_safe() {
+    let base = shared([3, 3, 4], "");
+    let head = shared([2, 2, 4], "");
+    assert_eq!(
+        findings(&base, &head),
+        [(Rule::Rollback, 2, 3), (Rule::MixedFleet, 2, 3)]
+    );
+}
+
+#[test]
+fn a_reader_below_the_base_writer_is_not_rolling_safe() {
+    let base = registry([4, 1, 4], "");
+    let head = registry([3, 1, 3], "");
+    assert_eq!(findings(&base, &head), [(Rule::Rolling, 3, 4)]);
+}
+
+#[test]
+fn changing_the_shared_flag_does_not_hide_a_mixed_fleet() {
+    let base = shared([10, 1, 10], "");
+    let head = registry([11, 1, 11], ONE_WAY_11);
+    assert!(!report(&base, &head).passed());
+}
+
+#[test]
+fn permanent_formats_cannot_drop_newer_readers_or_the_designation() {
+    let base = registry([5, 4, 6], "permanent = true\n");
+    assert!(!report(&base, &registry([5, 4, 5], "permanent = true\n")).passed());
+    assert!(!report(&base, &registry([5, 4, 6], "")).passed());
+    let retired =
+        Registry::parse("[format]\n[retired.snap]\nversion = 5\nreason = \"r\"\n").unwrap();
+    assert!(!report(&base, &retired).passed());
+}
+
+#[test]
+fn an_activation_below_the_base_reader_is_a_note() {
+    let base = registry([3, 3, 3], "");
+    let head = registry([3, 1, 3], "activation = { flag = \"f\", writes = 1 }\n");
+    let report = report(&base, &head);
+    assert!(report.passed());
+    assert_eq!(report.notes.len(), 1);
+}
+
+#[test]
+fn a_compatible_writer_downgrade_passes() {
+    assert!(report(&registry([3, 1, 3], ""), &registry([2, 1, 3], "")).passed());
+}
+
+#[test]
+fn a_code_location_needs_both_path_and_symbol() {
+    for location in ["a.rs#", "#X", "#"] {
+        assert!(Registry::parse(&text([1, 1, 1], "").replace("a.rs#X", location)).is_err());
+    }
+}

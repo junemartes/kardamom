@@ -76,8 +76,8 @@ impl FoundRecording {
             LogError::Aeron(format!("refetch: recording {} has {e}", self.recording_id))
         })?;
         layout
-            .position_of(pos, self.recording_id)
-            .map_err(|e| LogError::Aeron(format!("refetch: {e}")))
+            .position_of(pos)
+            .map_err(|e| LogError::Aeron(format!("refetch: recording {}: {e}", self.recording_id)))
     }
 
     fn locate(self, from: BPosition) -> Result<Located, LogError> {

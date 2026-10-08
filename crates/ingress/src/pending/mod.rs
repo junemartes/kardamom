@@ -444,6 +444,11 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             posted_head,
             budget_blocks,
         } => IngressError::da_lag(*sealed_head, *posted_head, *budget_blocks),
+        TxErrorReason::RecordLag {
+            sealed_index,
+            recorded_index,
+            budget,
+        } => IngressError::record_lag(*sealed_index, *recorded_index, *budget),
     }
 }
 

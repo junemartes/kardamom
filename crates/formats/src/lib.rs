@@ -66,6 +66,9 @@ impl TryFrom<String> for Location {
         let (path, symbol) = text
             .split_once('#')
             .ok_or_else(|| RegistryError::Location(text.clone()))?;
+        if path.is_empty() || symbol.is_empty() {
+            return Err(RegistryError::Location(text));
+        }
         Ok(Self {
             path: path.to_owned(),
             symbol: symbol.to_owned(),

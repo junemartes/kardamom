@@ -45,15 +45,11 @@ impl TermLayout {
     ///
     /// # Errors
     ///
-    /// Returns an error if reading the publication's constants fails, or
-    /// if `term_buffer_length` does not fit `i32` or is not a positive
-    /// power of two.
+    /// Returns an error if `term_buffer_length` does not fit `i32` or is
+    /// not a positive power of two.
     pub(crate) fn from_publication(
-        publication: &rusteron_client::AeronPublication,
+        constants: &rusteron_client::AeronPublicationConstants,
     ) -> Result<Self, LogError> {
-        let constants = publication
-            .get_constants()
-            .map_err(|e| LogError::Aeron(format!("publication constants: {e}")))?;
         let term_buffer_length = i32::try_from(constants.term_buffer_length()).map_err(|_| {
             LogError::Aeron(format!(
                 "publication term_buffer_length overflow: {}",
@@ -68,13 +64,12 @@ impl TermLayout {
     ///
     /// # Errors
     ///
-    /// Returns an error message if `pos`'s term precedes `recording_id`'s
-    /// initial term.
-    pub(crate) fn position_of(self, pos: BPosition, recording_id: i64) -> Result<i64, String> {
+    /// Returns an error message if `pos`'s term precedes the initial term.
+    pub(crate) fn position_of(self, pos: BPosition) -> Result<i64, String> {
         let term_count = i64::from(pos.term_id) - i64::from(self.initial_term_id);
         if term_count < 0 {
             return Err(format!(
-                "position term {} precedes recording {recording_id}'s initial term {}",
+                "position term {} precedes the initial term {}",
                 pos.term_id, self.initial_term_id
             ));
         }
@@ -133,7 +128,7 @@ mod tests {
                 term_offset,
             };
             let raw = layout
-                .position_of(pos, 1)
+                .position_of(pos)
                 .expect("term_id at or after initial_term_id");
             let decoded = layout.decode(raw).expect("position fits i32 after shift");
             assert_eq!(decoded, pos, "layout {layout:?}, raw position {raw}");

@@ -383,14 +383,15 @@ impl Harness {
         let (samples, _) = outcome.or_fail(|t| {
             crate::chaos_fail!(
                 "restarted replica on {} (:{}) never came up: metrics unscrapable within {}s of restart",
-                target.node,
-                target.port,
+                target.name,
+                target.port(),
                 t.as_secs()
             )
         })?;
         crate::log(format!(
             "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics; established-sender coverage stays on the twin)",
-            target.node, target.port
+            target.name,
+            target.port()
         ));
         Ok(())
     }

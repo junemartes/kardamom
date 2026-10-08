@@ -9,6 +9,7 @@ use rkyv::util::AlignedVec;
 use super::{AeronRuntime, RuntimeCmd, request};
 use crate::codec;
 use crate::error::LogError;
+use crate::term_layout::TermLayout;
 use kardamom_types::BPosition;
 
 impl AeronRuntime {
@@ -30,6 +31,32 @@ impl AeronRuntime {
                 ack,
             },
             "open_publication",
+        )?;
+        Ok(self.pub_handle(opened))
+    }
+
+    /// Open an exclusive publication. Unlike [`Self::open_publication`],
+    /// the driver never shares it with another client that adds the same
+    /// channel and stream id, so its session id is its own. Use it for a
+    /// stream whose recording must hold the frames of one publisher only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error as [`Self::open_publication`] does.
+    pub fn open_exclusive_publication(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<PubHandle, LogError> {
+        let uri = uri.to_string();
+        let opened = request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::OpenExclusivePublication {
+                uri,
+                stream_id,
+                ack,
+            },
+            "open_exclusive_publication",
         )?;
         Ok(self.pub_handle(opened))
     }
@@ -66,16 +93,19 @@ impl AeronRuntime {
             cmd_tx: self.cmd_tx.clone(),
             pub_id: opened.pub_id,
             session_id: opened.session_id,
+            layout: opened.layout,
         }
     }
 }
 
 /// The Aeron thread's reply to an open: the row index of the publication
-/// in its table and the session id the driver assigned.
+/// in its table, the session id the driver assigned, and the term layout
+/// of the publication.
 #[derive(Clone, Copy)]
 pub(in crate::aeron_live) struct OpenedPub {
     pub(in crate::aeron_live) pub_id: u32,
     pub(in crate::aeron_live) session_id: i32,
+    pub(in crate::aeron_live) layout: TermLayout,
 }
 
 /// `Send + Sync` publication handle. Forwards each publish through the
@@ -85,6 +115,7 @@ pub struct PubHandle {
     cmd_tx: CbSender<RuntimeCmd>,
     pub_id: u32,
     session_id: i32,
+    layout: TermLayout,
 }
 
 impl PubHandle {
@@ -118,6 +149,33 @@ impl PubHandle {
             pub_id: self.pub_id,
             bytes,
         });
+    }
+
+    /// Lossy publish for a stream whose consumers repair gaps from an
+    /// archive. The Aeron thread makes one offer. A refused offer drops
+    /// the frame, with no retry and no log line, and counts it in
+    /// [`BEST_EFFORT_DROPPED_TOTAL`](super::super::BEST_EFFORT_DROPPED_TOTAL).
+    /// The frame does not wait behind the retry queue, so use this method
+    /// only on a publication that takes no queued publish.
+    pub fn publish_lossy(&self, bytes: AlignedVec) {
+        let _ = self.cmd_tx.send(RuntimeCmd::PublishLossy {
+            pub_id: self.pub_id,
+            bytes,
+        });
+    }
+
+    /// The raw stream position of `pos`, a position that a publish of this
+    /// handle returned. A recording of this publication counts its
+    /// recording position in the same raw space.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pos` lies before the initial term of the
+    /// publication.
+    pub fn stream_position(&self, pos: BPosition) -> Result<i64, LogError> {
+        self.layout
+            .position_of(pos)
+            .map_err(|e| LogError::Aeron(format!("publication {}: {e}", self.session_id)))
     }
 
     /// Encode a typed message and publish blockingly.

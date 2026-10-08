@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use super::exec_stream::ExecStreamSessions;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -11,16 +12,26 @@ use crate::poll::{self, Budget};
 pub(crate) const RESTORED: &str = "restored state from checkpoint";
 pub(crate) const FETCHED: &str = "fetched checkpoint from peer";
 
+/// The restarted executor must also record a new session of its stream
+/// and move its recorded cursor (see [`ExecStreamSessions`]).
 pub(crate) async fn graceful_executor(h: &mut Harness) -> anyhow::Result<()> {
+    let sessions = ExecStreamSessions::read(h).await;
     h.inject_graceful("executor").await?;
-    h.assert_count("executor", 3, h.knobs.restart_slo).await
+    h.assert_count("executor", 3, h.knobs.restart_slo).await?;
+    sessions
+        .assert_restart_records(h, "graceful-executor")
+        .await
 }
 
+/// The restarted executor must also record a new session of its stream
+/// and move its recorded cursor (see [`ExecStreamSessions`]).
 pub(crate) async fn hard_executor(h: &mut Harness) -> anyhow::Result<()> {
+    let sessions = ExecStreamSessions::read(h).await;
     let nodes = executor_containers(h);
     let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
     h.inject_hard(&refs, "executor").await?;
-    h.assert_count("executor", 3, h.knobs.restart_slo).await
+    h.assert_count("executor", 3, h.knobs.restart_slo).await?;
+    sessions.assert_restart_records(h, "hard-executor").await
 }
 
 /// A count of 2, not 1: with a killed marker set, the replacement check

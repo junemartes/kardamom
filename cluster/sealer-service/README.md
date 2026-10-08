@@ -139,7 +139,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 - Kind 12: the sealer refused an epoch, because an earlier epoch is missing. The sequencer offers its unconfirmed epochs again from `expected_origin`.
   - The sealer logs `cluster ORIGIN-GAP` at powers of two.
   - The check reads only replicated state, so every member refuses the same epoch.
-- Kind 13: the record-lag guard refused a record. `sealed_index` is the last ordered canonical index. `recorded_index` is the best recorded cursor. See [Record-lag guard](#record-lag-guard).
+- Kind 13: the record-lag guard refused a record. `sealed_index` is the last ordered canonical index. `recorded_index` is the best recorded cursor. The sequencer drops the record and reports the `record-lag` reason. See [Record-lag guard](#record-lag-guard).
   - The sealer sends it only while the guard is on. A sequencer that does not know kind 13 drops the frame, so turn the guard on only after every sequencer knows it.
 
 ## Egress back-pressure

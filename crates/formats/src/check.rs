@@ -12,10 +12,10 @@ use crate::{Format, Registry, Waiver, Waivers};
 /// A rule between two releases of one format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
-    /// The base reads what the head writes: `writes <= base reads_max`.
+    /// The base read range contains the version that the head writes.
     /// When it holds, a rollback from the head to the base is safe.
     Rollback,
-    /// The head reads what the base writes: `reads_min <= base writes`.
+    /// The head read range contains the version that the base writes.
     /// When it holds, a rolling deploy from the base to the head is safe.
     Rolling,
     /// For a shared format, the base reads what the head writes. When it
@@ -43,7 +43,7 @@ pub struct Finding {
     pub rule: Rule,
     pub id: String,
     /// The version that a waiver names: the head `writes` for
-    /// [`Rule::Rollback`] and [`Rule::MixedFleet`], the head `reads_min`
+    /// [`Rule::Rollback`] and [`Rule::MixedFleet`], the incompatible head read boundary
     /// for [`Rule::Rolling`], and the base `writes` for [`Rule::Retired`].
     pub head: u32,
     /// The base version that the rule compares with.
@@ -56,15 +56,15 @@ impl fmt::Display for Finding {
         match self.rule {
             Rule::Rollback => write!(
                 f,
-                "{id}: the head writes version {head}, and the base reads only up to version {base}. A rollback to the base is not safe."
+                "{id}: the head writes version {head}, outside the base read boundary {base}. A rollback to the base is not safe."
             ),
             Rule::Rolling => write!(
                 f,
-                "{id}: the head reads only from version {head}, and the base writes version {base}. A rolling deploy is not safe."
+                "{id}: the base writes version {base}, outside the head read boundary {head}. A rolling deploy is not safe."
             ),
             Rule::MixedFleet => write!(
                 f,
-                "{id}: the format is shared, the head writes version {head}, and the base reads only up to version {base}. A rolling deploy is not safe."
+                "{id}: the format is shared, the head writes version {head}, outside the base read boundary {base}. A rolling deploy is not safe."
             ),
             Rule::Retired => write!(
                 f,
@@ -75,6 +75,15 @@ impl fmt::Display for Finding {
 }
 
 impl Format {
+    /// The end of the read range nearest a version outside it.
+    fn read_boundary(&self, version: u32) -> u32 {
+        if version < self.reads_min {
+            self.reads_min
+        } else {
+            self.reads_max
+        }
+    }
+
     /// The rules that this head entry breaks against the `base` entry.
     fn findings_against(&self, id: &str, base: &Format) -> impl Iterator<Item = Finding> {
         let finding = |rule, head, base| Finding {
@@ -83,12 +92,13 @@ impl Format {
             head,
             base,
         };
-        let one_way = self.writes > base.reads_max;
-        let rollback = one_way.then(|| finding(Rule::Rollback, self.writes, base.reads_max));
-        let mixed = (one_way && self.shared)
-            .then(|| finding(Rule::MixedFleet, self.writes, base.reads_max));
-        let rolling = (self.reads_min > base.writes)
-            .then(|| finding(Rule::Rolling, self.reads_min, base.writes));
+        let one_way = !base.reads(self.writes);
+        let base_boundary = base.read_boundary(self.writes);
+        let rollback = one_way.then(|| finding(Rule::Rollback, self.writes, base_boundary));
+        let mixed = (one_way && (self.shared || base.shared))
+            .then(|| finding(Rule::MixedFleet, self.writes, base_boundary));
+        let rolling = (!self.reads(base.writes))
+            .then(|| finding(Rule::Rolling, self.read_boundary(base.writes), base.writes));
         rollback.into_iter().chain(mixed).chain(rolling)
     }
 }
@@ -249,14 +259,27 @@ impl<'a> Comparison<'a> {
     }
 
     fn permanent_problems(&self) -> impl Iterator<Item = String> + '_ {
+        let removed = self
+            .base
+            .0
+            .format
+            .iter()
+            .filter(|(id, base)| base.permanent && !self.head.0.format.contains_key(*id))
+            .map(|(id, _)| {
+                format!(
+                    "{id}: permanent data still needs a reader. No retirement waiver covers this."
+                )
+            });
         self.pairs()
-            .filter(|(_, head, base)| (head.permanent || base.permanent) && head.reads_min > base.reads_min)
+            .filter(|(_, head, base)| (head.permanent || base.permanent)
+                && (head.reads_min > base.reads_min || head.reads_max < base.reads_max
+                    || !head.permanent))
             .map(|(id, _, base)| {
                 format!(
-                    "{id}: the data stays for all time, and the head stops reading version {}. No waiver covers this.",
-                    base.reads_min
+                    "{id}: permanent data must retain its reader range {}..={} and permanent designation. No waiver covers this.",
+                    base.reads_min, base.reads_max
                 )
-            })
+            }).chain(removed)
     }
 
     fn layout_problems(&self) -> impl Iterator<Item = String> + '_ {
@@ -274,11 +297,11 @@ impl<'a> Comparison<'a> {
         self.pairs().filter_map(|(id, head, base)| {
             head.activation
                 .as_ref()
-                .filter(|activation| activation.writes > base.reads_max)
+                .filter(|activation| !base.reads(activation.writes))
                 .map(|activation| {
                     format!(
                         "{id}: flag {} writes version {}, and the base reads only up to version {}. Switch the flag on only after no node runs the base.",
-                        activation.flag, activation.writes, base.reads_max
+                        activation.flag, activation.writes, base.read_boundary(activation.writes)
                     )
                 })
         })

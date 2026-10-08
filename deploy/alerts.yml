@@ -192,6 +192,17 @@ groups:
           description: "The sealed head is more than the DA-lag budget past the last block posted to L1. The sealer refuses new transactions until the batcher posts again; the ingresses pause submits on it. The ingress observes the sealer and exports this halt. Find why the batcher does not post. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/da_lag.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/da_lag.md"
 
+      - alert: KardamomHaltRecordLag
+        expr: kardamom_halt{cause="record_lag"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: record_lag
+        annotations:
+          summary: "{{ $labels.service }} halted: record_lag ({{ $labels.host_id }})"
+          description: "The last ordered canonical index is more than the record-lag budget past the highest index that an executor recorded. The sealer refuses new transactions until an executor records again; the ingresses pause submits on it. The ingress observes the sealer and exports this halt. Find why no executor records. Detail: kardamom_chainStatus on the ingress, and http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/record_lag.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/record_lag.md"
+
       - alert: KardamomHaltSealerNoQuorum
         expr: kardamom_halt{cause="sealer_no_quorum"} == 1
         for: 0m

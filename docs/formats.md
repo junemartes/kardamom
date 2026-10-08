@@ -80,16 +80,16 @@ the base. For each format that both files list, it applies these rules:
 
 | Rule | Holds when | When it does not hold, add |
 |---|---|---|
-| Rollback | `writes <= base reads_max` | `[one_way.<id>]` with `version` = the head `writes` |
-| Mixed fleet, for a shared format | `writes <= base reads_max` | also `[coordinated.<id>]` with `version` = the head `writes` |
-| Rolling deploy | `reads_min <= base writes` | `[coordinated.<id>]` with `version` = the head `reads_min` |
+| Rollback | `base reads_min <= writes <= base reads_max` | `[one_way.<id>]` with `version` = the head `writes` |
+| Mixed fleet, for a shared format | `base reads_min <= writes <= base reads_max` | also `[coordinated.<id>]` with `version` = the head `writes` |
+| Rolling deploy | `reads_min <= base writes <= reads_max` | `[coordinated.<id>]` with `version` = the incompatible head read boundary (`reads_min` or `reads_max`) |
 | Retired | the head lists every format of the base | `[retired.<id>]` with `version` = the base `writes` |
 
 Each waiver also has a `reason`. The check also fails in these cases, and
 no waiver covers them:
 
 - A new waiver covers no finding.
-- A permanent format raises `reads_min`.
+- A permanent format narrows either end of its read range, drops its permanent designation, or is retired.
 - A `layout` fingerprint changes, and `writes` stays the same. Give the
   format a new version, or a new id.
 
@@ -100,7 +100,7 @@ These rules apply too:
 - A waiver covers one version only.
 - A format that the base does not list is new. It passes.
 - When the base has no `formats.toml`, only the head file is checked.
-- When `activation.writes > base reads_max`, the check prints a note:
+- When `activation.writes` falls outside the base read range, the check prints a note:
   switch the flag on only after no node runs the base.
 
 ## The pull request check is incremental
@@ -145,7 +145,7 @@ each finding by hand.
 5. A change to a version constant also changes `formats.toml`. The tests fail until the two agree.
 6. A frozen layout does not change. A new shape goes in a new file, a new key prefix, or a new stream.
 7. Keep a format in the registry while a supported release reads or writes it.
-8. Never raise `reads_min` of a permanent format. Every old version stays readable.
+8. Never narrow the read range of a permanent format or retire its reader. Every old version stays readable.
 9. Give a new key of `formats.toml` itself a default. The check must still
    parse the file of an older base.
 

@@ -69,8 +69,13 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 | `validator_divergence` | validator | operator | [`validator_divergence`](runbooks/validator_divergence.md) |
 | `l1_cursor_unreadable` | da-watcher | operator | [`l1_cursor_unreadable`](runbooks/l1_cursor_unreadable.md) |
 | `origin_gap` | sequencer | auto | [`origin_gap`](runbooks/origin_gap.md) |
+| `record_lag` | sealer (raised by the ingress) | auto | [`record_lag`](runbooks/record_lag.md) |
 
 - The sealer is a Java service with no Rust exporter. The ingress observes the sealer and raises its halts under `service="sealer"`.
+- The ingress raises `record_lag` while the status frame says the record-lag guard refuses. It clears the halt when the flag clears.
+  - When the record-lag flag and the DA-lag flag both stand, the ingress names `record_lag`. The executors record before the batcher can post.
+  - The sealer answers a refused record with the egress kind 13. The sequencer maps it to the transaction error `RecordLag`.
+  - The record-lag guard is present in the sealer, but it is off by default. The budget is `0`, and a budget above `0` stops the sealer start. A later release turns the guard on. Until then, no service raises `record_lag`.
 - The sections for the sequencer, the batcher, the da-watcher and the validator describe how each one reaches its halts.
 
 **The `revert_to_posted_head` runbook.** It has no cause. The `replay_unavailable` runbook sends the operator to it.
@@ -107,6 +112,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 |---|---|
 | Sealer `sealer_no_quorum` | The ingress sets the root after 10 s with no status frame. It pauses submits. The sequencer pauses after 10 s with no boundary. Its publish loop offers nothing until a boundary returns. |
 | Sealer `da_lag` | The ingress pauses submits. Deposits and boundaries continue. |
+| Sealer `record_lag` | The ingress pauses submits. Deposits and boundaries continue. |
 | Every executor halted | The ingress pauses submits. |
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |
@@ -381,6 +387,20 @@ The executors are deterministic state machines. One dead or lagging replica neve
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.
 - **Leader failover above the executor** is invisible. The cluster client hides reconnects from the reader thread.
 
+### The executor stream: the executor records what it joins
+
+Each executor publishes the transactions that it joins on the executor stream (`exec_txs`), in canonical order. The archive on the node of the executor records the stream. See [aeron-discovery.md](aeron-discovery.md) for the two publications.
+
+- **Start**: the executor opens its recorded IPC publication and starts its recording on the local archive. It joins nothing before that recording of its own session is active. A recording that does not start within 60 s fails the start. Nomad then restarts the executor.
+- **Order**: the reader sends each joined record to the stream before it sends the record to execution. The reader also sends a progress mark after each message that takes a slot.
+- **Archive back-pressure or archive loss**: the recorded publication refuses the record. The publisher offers it again until the archive takes it. The channel from the reader fills, and the reader blocks. This executor stalls. It drops no record, and it never executes a record that its archive did not take. The other executors carry the chain. `kardamom_executor_exec_stream_publish_blocked_ms_total` counts the wait.
+- **Restart**: a restarted executor gets a new Aeron session, so its archive makes a new recording. The recording of the earlier session stays in the archive. `kardamom_executor_exec_stream_session_id` shows the new session.
+- **Recorded cursor**: `kardamom_executor_exec_stream_recorded_index` is the highest canonical index whose records the local archive has written. It never passes the recording position. At archive sync level 1 it is durable on the node. At level 0 it survives a crash, not a power loss. Nothing reads the cursor yet.
+- **Locator log**: `<state_dir>/exec_stream/locators.log` maps a canonical index to a session and a position in a recording: one entry for the first record of each session, then one entry every 1024 records. A torn last entry is cut at the next start, and a lookup then takes the previous entry, a lower bound. A checkpoint restore or a parked state starts a new log. Nothing reads the log yet.
+- **Recording loss**: the recorder thread reads the recording position every 20 ms. When no read succeeds for the loss wait, the driver timeout of the archive client (`AERON_DRIVER_TIMEOUT`, the Aeron stall tolerance: 10 s by default, 30 s in CI) plus 5 s, and at least 10 s (the recording stopped, or the archive no longer answers), the recorder thread ends and logs `exec_txs recorder ended: the local recording is lost`. The publisher then fails, also during a wait for a refused record. The reader stops with an error, and the process exits. Nomad restarts it, and the start waits for a recording of the new session. An executor never runs without a recorded copy of what it joins. A stall that every Aeron party survives does not end the recorder. The start budget of an Aeron client uses the same rule.
+- **Shared media driver**: the recorded publication is exclusive. Each executor has its own session and its own recording, also when several executors share one media driver (the single-host e2e stack).
+- Proof: `graceful-executor` and `hard-executor` assert that the restarted executor shows a new session and that its recorded cursor advances. The check does not apply, and logs that, when no executor exports the gauges, or when no recorded cursor moves in the window. The `chaos-executor` shard runs no load, so the L1 epochs move the cursor.
+
 ## Ingress (xN, active/active)
 
 The ingress replicas are shared-nothing. There is no leader and no sticky session. Any replica can accept the transaction of any sender.
@@ -487,6 +507,17 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
 
 - Trigger: any divergence. Examples are re-executed receipts or a BAL that disagree with the executor, or an MPT state-root mismatch.
+- Every executor replica publishes its own BAL and receipts. The validator compares the BAL and the receipts of **every** replica with its own re-execution. The arrival order does not matter.
+  - The re-execution of the validator is the reference. A replica whose result differs is a divergence, also when the other replicas agree with the validator.
+  - Such a divergence halts the validator, like any other divergence. A wrong executor must never pass silently, and the consumers of `tx_receipts` can read the receipts of any replica.
+  - The validator compares every result of the key before it halts. The verdict names every differing session, and says how many agree: `[k of n replica sessions differ on <stream>: session <id>, ...]`. When every session differs and all of them published one result, the verdict says that the validator is the suspect.
+  - A replica is named by the Aeron session id of its publication. The verdict, the halt detail, and the log line carry it, and `validator_replica_divergence_total{replica, check}` counts each named session. The executor logs its session ids at start (`tx_bal publication open`, `tx_receipts publication open`).
+  - A session can name two processes: two replicas on one media driver, or a restart that attaches to a live publication. The buffers keep every distinct result of a session, so a shared session cannot hide a wrong result.
+  - The buffers keep each distinct result once, with the sessions that published it. A replica that restarts in a loop and republishes the same bytes takes no extra space, so it cannot push out a wrong result.
+  - A replica result that arrives after the check of its key is still compared. The validator keeps the checked result of the last 64 blocks and the last 4096 receipts for this.
+  - Every result that is not compared counts in `validator_replica_results_unchecked_total{check, reason}`: below the window, a repeat, over a bound, evicted, or a key beyond the reach above the cursor (2^20 blocks, 2^32 receipts).
+  - Account rows are weaker. The rows of a replica are compared only when they arrive before the validator passes their position. Replicas end their batches at different positions, so later rows have no local state to compare with. They count as unverified (`validator_rows_unverified_total`).
+  - Proof: the unit tests of `seams_tests.rs` and `buffers_tests.rs`. A wrong BAL or receipt that arrives first, last, after the check, or under a shared session halts and names every differing session. Three agreeing replicas and a restart replay pass. A restart storm does not push out a wrong result.
 - Effect: the validator holds the `validator_divergence` halt (see "Halts and service events").
   - It serves its exporter and the `/halt` record. It makes no progress.
   - `/ready` fails. The gauge `validator_verdict_standing` is 1.
@@ -495,7 +526,8 @@ The failure philosophy is inverted here: **halting is the feature**. A divergenc
 - Recovery: follow the runbook [`validator_divergence`](runbooks/validator_divergence.md), then clear the halt in one of two ways.
   - `POST /halt/clear` on the node of the validator.
   - `kardamom-validator --state-dir <dir> --clear-verdict`.
-  - Either clear ends both the halt and the verdict file. The validator resumes from its cursor and verifies the block again.
+  - Either clear ends both the halt and the verdict file. The validator resumes from its cursor.
+  - A divergence that replica results proved is not checked again. The resumed run opens new buffers, and the streams do not replay. The halted block, and every block published during the halt, commit unverified. The runbook says what to do before the clear.
 - Proof: the chain-semantics test `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta` on the real `tx_bal` channel. The executor is stopped with SIGSTOP, so nothing competes. The test asserts the halting log line and the halt record with the divergence cause.
 - The validator exits on SIGTERM. The graceful shutdown of the chain-semantics suite bounds it at 20 s.
 - The attester is on only when `--output-oracle` and `--attester-key` are both set. It then needs `--l1-rpc-url`.
@@ -537,7 +569,7 @@ A divergence is a state, not a dead process.
 
 - **Behind the head** (a fresh start against a running chain, or a restart)
   - The per-block BALs ride a lossy `tx_bal` multicast. Its term buffer holds only the recent window.
-  - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL.
+  - A backlog block more than `BACKLOG_LOOKBEHIND` (16) blocks behind the live head has an unrecoverable BAL. The live head is a run of at least 4 buffered blocks beyond that distance, so one wrong block number far ahead does not turn the skip on.
   - The validator **commits such a block unverified at once**. It does not wait the full BAL timeout for each block, because that wait would make the catch-up slower than the chain grows.
   - Continuous verification is a property of a validator that is caught up, at the head.
 - **Brief lapse** (a pause or stall shorter than the live term buffer)
@@ -1046,6 +1078,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.
+  - The load harness of the chaos suite reads its metrics the same way: directly over the bridge, with exec as the fallback. The load report counts each fallback as `scrape_fallbacks`.
   - The exporter of every service runs on a dedicated thread. A wedged service runtime cannot take `/metrics` down.
   - When you read a chaos failure, tell "the pipeline stalled" from "the probes went dark" before you diagnose.
 
@@ -1078,6 +1111,3 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The case can fail with `aeron did not reach >= 8 running ... within 60s (have 7)` after the destructive wipe. The SLO knob is `CHAOS_RESTART_SLO_S` (default 60).
   - The failing runs are otherwise green, and they pass on a re-run.
   - While that shard is red, real regressions behind it are invisible.
-- **Load-harness scrapes ride `docker exec`**
-  - The chaos *probes* use direct HTTP. `kardamom-load --metrics-via-docker` defaults to true.
-  - A runner-wide exec stall can degrade the keep-pace verdicts. The chaos-mode leniency masks it.
