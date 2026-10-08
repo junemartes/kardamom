@@ -1,4 +1,4 @@
-use super::{AtFreeze, Frozen, Lines, ThawPath};
+use super::{AtFreeze, Frozen, Lines};
 use crate::l1::Posted;
 
 const CTX: &str = "batcher-outage-past-retention";
@@ -17,6 +17,7 @@ fn at_freeze(covered: u64) -> AtFreeze {
         lines: Lines {
             starts: 3,
             restored: 1,
+            exits: 2,
         },
     }
 }
@@ -48,24 +49,35 @@ fn a_recovered_batch_with_a_gap_or_an_overlap_fails() {
 }
 
 #[test]
-fn the_thaw_path_follows_the_log_counts() {
+fn only_a_restart_that_restores_the_spool_passes() {
     let at = at_freeze(1747);
     let recovered = batch(41, 1748, 1760);
     let restored = Lines {
         starts: 4,
         restored: 2,
+        exits: 3,
     };
-    assert_eq!(
-        at.judge(recovered, restored, CTX).unwrap(),
-        ThawPath::Restored
+    at.judge(recovered, restored, CTX).unwrap();
+    let no_timeout = at.judge(recovered, at.lines, CTX).unwrap_err();
+    assert!(
+        no_timeout
+            .to_string()
+            .contains("no Aeron client timeout fired"),
+        "{no_timeout}"
     );
-    assert_eq!(
-        at.judge(recovered, at.lines, CTX).unwrap(),
-        ThawPath::Survived
+    let hung = Lines {
+        exits: 3,
+        ..at.lines
+    };
+    let hung = at.judge(recovered, hung, CTX).unwrap_err();
+    assert!(
+        hung.to_string().contains("the process hung in its exit"),
+        "{hung}"
     );
     let lost = Lines {
         starts: 4,
         restored: 1,
+        exits: 3,
     };
     let error = at.judge(recovered, lost, CTX).unwrap_err();
     assert!(

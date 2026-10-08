@@ -139,6 +139,9 @@ job "l1-light-client" {
           "--execution-rpc", "${var.execution_rpc}",
           "--consensus-rpc", "${var.consensus_rpc}",
           "--checkpoint", "${var.checkpoint}",
+          # The container user has no home directory. Saved checkpoints
+          # belong in the writable allocation data directory.
+          "--data-dir", "/alloc/data/helios",
           # Bind to the node IP, not localhost. The validator runs on a
           # different node, and must reach it.
           "--rpc-bind-ip", "${meta.node_ip}",
