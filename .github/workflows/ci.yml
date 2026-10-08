@@ -87,6 +87,7 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: just check-formats "origin/$BASE_REF"
+      - run: python3 -m unittest discover -s scripts/hooks/tests
 
   build:
     name: build
