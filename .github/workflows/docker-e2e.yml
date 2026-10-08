@@ -85,7 +85,7 @@ jobs:
           cargo test \
             -p kardamom-log \
             --features 'docker-e2e' \
-            --test aeron_live_e2e -- --ignored --nocapture
+            --test aeron_live_e2e --test client_timeout_exit -- --ignored --nocapture
 
       # The account cache against a real Redis container: the monotone
       # write rule, the account and receipt reads, and the mirror heads.

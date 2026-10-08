@@ -4194,6 +4194,7 @@ dependencies = [
  "kardamom-formats",
  "kardamom-obs",
  "kardamom-types",
+ "libc",
  "metrics",
  "reqwest 0.13.4",
  "rkyv",
@@ -4207,6 +4208,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -4351,6 +4353,7 @@ dependencies = [
 name = "kardamom-state-mirror"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "clap",
  "kardamom-cache",
@@ -4360,6 +4363,7 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",
