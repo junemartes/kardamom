@@ -4331,6 +4331,7 @@ dependencies = [
 name = "kardamom-state-mirror"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "clap",
  "kardamom-cache",
@@ -4340,6 +4341,7 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml",
