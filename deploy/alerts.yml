@@ -71,6 +71,35 @@ groups:
           summary: "da-watcher ticks failing ({{ $labels.host_id }})"
           description: "Over half the da-watcher's ticks failed for 15m. No new epoch reaches the chain. Inspect the da-watcher log for the first failed tick."
 
+      # The newest record on l1_blocks is more than two finality steps
+      # (64 blocks, about 13 minutes) behind the finalized tip. It fires
+      # before any downstream symptom of a stalled follower, such as the
+      # batcher's post age, so the page points at the cause.
+      - alert: KardamomL1FollowerLag
+        expr: >-
+          max(kardamom_l1_indexer_l1_finalized_block_number)
+          - max(kardamom_l1_follower_published_block_number) > 64
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the L1 follower is {{ $value }} blocks behind the finalized tip"
+          description: "No follower instance published the finalized L1 blocks for two finality steps. The da-watcher and the batcher wait on the l1_blocks stream, so deposits and the batcher's post age stall next. Runbook: docs/runbooks/l1_follower_lag.md."
+          runbook: "docs/runbooks/l1_follower_lag.md"
+
+      # A follower sleeps until its planned wake time between finality
+      # steps. A wake more than two minutes overdue means the process
+      # froze or its loop stopped.
+      - alert: KardamomL1FollowerWakeOverdue
+        expr: time() - kardamom_l1_follower_next_wake_seconds > 120
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "L1 follower wake overdue by {{ $value }}s ({{ $labels.host_id }})"
+          description: "The follower planned to read L1 at kardamom_l1_follower_next_wake_seconds and did not. Its /ready answers 503. The other instance carries the stream alone. Runbook: docs/runbooks/l1_follower_wake_overdue.md."
+          runbook: "docs/runbooks/l1_follower_wake_overdue.md"
+
       - alert: KardamomL1SourceDisagreement
         # Two L1 sources answered differently for the same block or log.
         # A follower halts on this; it is never resolved by majority.
@@ -235,6 +264,28 @@ groups:
           summary: "{{ $labels.service }} halted: validator_divergence ({{ $labels.host_id }})"
           description: "The validator's re-execution disagreed with the executor's published result. The validator holds, serves its metrics, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/validator_divergence.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/validator_divergence.md"
+
+      - alert: KardamomHaltL1LightClientMismatch
+        expr: kardamom_halt{cause="l1_light_client_mismatch"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_light_client_mismatch
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_light_client_mismatch ({{ $labels.host_id }})"
+          description: "The last header of the L1 follower's finality step is not the light client's finalized header for that number, though two sources agreed on it. Either both sources lie the same way or the light client is wrong. The follower publishes nothing until an operator clears the halt. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_light_client_mismatch.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_light_client_mismatch.md"
+
+      - alert: KardamomHaltL1FollowerDisagreement
+        expr: kardamom_halt{cause="l1_follower_disagreement"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: l1_follower_disagreement
+        annotations:
+          summary: "{{ $labels.service }} halted: l1_follower_disagreement ({{ $labels.host_id }})"
+          description: "Two records of one L1 block number with different hashes arrived on l1_blocks: one follower instance read a lie its two-source check did not catch. The consumer takes nothing more from the stream until an operator clears the halt. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_follower_disagreement.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/l1_follower_disagreement.md"
 
       # A restarted sequencer can miss the epoch the sealer expects while
       # its twin offers it again within milliseconds. The rule waits one

@@ -272,8 +272,7 @@ impl Harness {
     ) -> anyhow::Result<()> {
         self.inject_gate(case, load, rx0).await?;
         case.run(self).await?;
-        case.assert_recovered_progress(self).await?;
-        self.assert_executors_converged(case.name()).await
+        case.assert_recovered_progress(self).await
     }
 
     fn pick_account(&mut self, case: Case) -> anyhow::Result<u32> {
@@ -393,19 +392,23 @@ impl Harness {
 }
 
 impl Case {
-    /// The progress probe after the body, by case family: the cluster
-    /// cases and a node failure use the executor gauge with a wide
-    /// window, since a returning node thrashes the runner.
+    /// Every replica must converge and advance after the body. Executor
+    /// restarts use that convergence budget directly: a recorded session
+    /// can resume before execution catches up, and a concurrent sealer
+    /// snapshot can pause boundaries beyond the ten-second live probe.
+    /// Other cases also require their family-specific progress probe.
     async fn assert_recovered_progress(self, h: &Harness) -> anyhow::Result<()> {
-        match self.name() {
-            n if n.starts_with("cluster-") => {
-                h.assert_executor_progress(Duration::from_mins(1)).await
+        match self {
+            Self::GracefulExecutor | Self::HardExecutor => {}
+            _ if self.name().starts_with("cluster-") => {
+                h.assert_executor_progress(Duration::from_mins(1)).await?;
             }
-            n if n.starts_with("node-failure-") => {
-                h.assert_executor_progress(Duration::from_mins(3)).await
+            _ if self.name().starts_with("node-failure-") => {
+                h.assert_executor_progress(Duration::from_mins(3)).await?;
             }
-            _ => h.assert_progress().await,
+            _ => h.assert_progress().await?,
         }
+        h.assert_executors_converged(self.name()).await
     }
 
     /// Chaos mode already tolerates duplicate-submit drops. Every other

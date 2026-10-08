@@ -61,7 +61,7 @@ The example inventory (`ansible/inventories/production/hosts.example.ini`) has t
 
 - The ingress and sequencer nodes are not in the inventory. They are elastic nodes. See [Elastic first boot](#elastic-first-boot-with-kardamom-enroll).
 - The edge is the load balancer of the provider. The ingress servers are its targets.
-- The `l1-indexer` job needs a node with the role `indexer`. Add `node_roles=indexer` to a node, or a group for it, when the deployment runs the indexer.
+- The `l1-indexer` job (the L1 follower) runs two instances, each on its own node with the role `indexer`. Add `node_roles=indexer` to two nodes, or a group of two. A deployment with one such node sets `L1_INDEXER_COUNT=1` and loses the second instance's cover. The Aeron archive of each node records `l1_blocks` (`archive_topics_follower`).
 
 ### The da-watcher class
 

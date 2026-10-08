@@ -157,7 +157,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
   - The wrong hash halts the single-source followers. The case then does the operator step.
   - It restarts the da-watcher from its registered job, with no flag. The start resumes after the L1 origin of the sealer and reads the hash of that block again. It never removes the cursor file.
   - The cursor file of the da-watcher must then stand at or before the L1 origin of the sealer, within 60 s.
-  - It re-indexes the archive of the indexer from the first block of the chain.
+  - It re-indexes the archive of each follower instance (the aux node and `ingress-0`) from the first block of the chain.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.

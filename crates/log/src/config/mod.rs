@@ -277,6 +277,11 @@ pub struct AeronConfig {
     /// records it).
     #[serde(default)]
     pub tx_deposits_archive_endpoints: Vec<String>,
+
+    /// Same as above for the `l1_blocks` stream (the nodes of the L1
+    /// follower record it).
+    #[serde(default)]
+    pub l1_blocks_archive_endpoints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -405,6 +410,13 @@ pub struct ChannelsConfig {
     pub exec_txs_channel: ChannelUri,
     pub exec_txs_stream_id: i32,
 
+    /// `l1_blocks`: the L1 follower publishes one `L1Block` for each
+    /// finalized L1 block, in block order. Every follower instance
+    /// publishes every block; a consumer keeps the first record of each
+    /// block number. The archive of every follower node records it.
+    pub l1_blocks_channel: ChannelUri,
+    pub l1_blocks_stream_id: i32,
+
     /// Per-recorder fsync watermark stream, parameterized by
     /// `recorder_id`, for example "aeron:ipc?alias=fsync-wm-{rid}". The
     /// ingress subscribes to it for the local-fsync ack policies.
@@ -488,7 +500,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 10] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 11] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -505,6 +517,7 @@ impl ChannelsConfig {
             ("events_stream_id", self.events_stream_id),
             ("tx_bal_stream_id", self.tx_bal_stream_id),
             ("exec_txs_stream_id", self.exec_txs_stream_id),
+            ("l1_blocks_stream_id", self.l1_blocks_stream_id),
             ("fsync_watermark_stream_id", self.fsync_watermark_stream_id),
         ]
     }
@@ -647,6 +660,7 @@ impl Default for AeronConfig {
             archive_control_response_channel: "aeron:ipc".into(),
             tx_data_archive_endpoints: Vec::new(),
             tx_deposits_archive_endpoints: Vec::new(),
+            l1_blocks_archive_endpoints: Vec::new(),
         }
     }
 }
@@ -708,6 +722,10 @@ impl Default for ChannelsConfig {
             // below the fsync-watermark block (1010).
             exec_txs_channel: "aeron:ipc?alias=exec-txs".into(),
             exec_txs_stream_id: 1005,
+            // 1020 follows the events stream (1019), the last of the
+            // 1015..=1019 side-stream block.
+            l1_blocks_channel: "aeron:ipc?alias=l1-blocks".into(),
+            l1_blocks_stream_id: 1020,
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
         }

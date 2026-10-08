@@ -1,7 +1,7 @@
 # L1 and data availability
 
 This document is the operator reference for the data path to L1: the batcher, the EigenDA proxy,
-the settlement contract, the inbox indexer, and the tools that read them back. The failure behavior
+the settlement contract, the L1 follower (the inbox indexer), and the tools that read them back. The failure behavior
 is in [failure-modes.md](failure-modes.md). The deploy switches are in
 [../deploy/cluster/README.md](../deploy/cluster/README.md).
 
@@ -18,7 +18,8 @@ sealer egress ─▶ kardamom-batcher ──payload──▶ EigenDA proxy ─�
                                        l2BlockStart, l2BlockEnd, recordsCommitment)
                        │  emits BatchPosted
                        ▼
-        kardamom-l1-indexer ──▶ archive (batches, payloads, epochs)
+        kardamom-l1-indexer ──▶ archive (batches, payloads, epochs, blocks)
+          (the L1 follower)  ──▶ l1_blocks stream (one record per finalized block)
 ```
 
 - The batcher packs closed blocks into a KAR1 payload.
@@ -207,7 +208,43 @@ A deployment without `EIGENDA_NETWORK` runs `kardamom-da-store` (`nomad/da-store
 
 ## `kardamom-l1-indexer`
 
-The indexer follows finalized L1. It archives the batches, their payloads, and the epoch record of each block.
+The indexer is the L1 follower: the one service that reads L1 data. It reads the finalized L1 once per
+finality step, archives the batches, their payloads, and the epoch record of each block, and publishes
+one `L1Block` record for each finalized block on the `l1_blocks` Aeron stream (id 1020).
+
+- Each tick reads the finalized tip, then the headers of the range after the cursor in one JSON-RPC batch
+  request, then the settlement's and the lockbox's logs in one query with both addresses for each chunk of
+  `--max-log-range` blocks.
+- Each header must name the one before it as its parent, and the first must name the cursor's block.
+- With a light client, the last header of a range that ends at the finalized tip must be the light client's
+  header for that number. A mismatch is the operator halt `l1_light_client_mismatch`. While the follower
+  catches up, the ranges in the middle have the two-source rule alone; the anchor of the range that reaches
+  the tip then covers them through the parent chain.
+- The order of a range: the archive, then the records on the stream, then the cursor. A failure before the
+  cursor write reads the range again; the consumers drop the copies.
+- A record on the stream is a block that two sources agreed on and that descends from the record before it.
+  A consumer checks only the parent link against its own cursor.
+- Two instances run on two nodes, and both publish. A consumer keeps the first record of each number
+  (`kardamom_types::L1BlockDedup`). Two records of one number with different hashes halt the consumer:
+  `l1_follower_disagreement`.
+
+### The poll follows the finality schedule
+
+- With `--beacon-api`, the follower reads the genesis time, `SECONDS_PER_SLOT` and `SLOTS_PER_EPOCH` once.
+  After a range that reaches the finalized tip, it sleeps until the next epoch boundary, then reads the tip
+  every `--poll-interval-secs` (one slot) until the tip moves. A range behind the tip reads the next at once.
+- A failed tick, a halt included, reads again after one slot.
+- Without `--beacon-api` (anvil), the follower reads every `--poll-interval-secs`.
+- Before each sleep, the follower exports the wake time, `kardamom_l1_follower_next_wake_seconds`. It is
+  ready while now is before that time plus one slot and 10 s.
+
+### Retention of the stream
+
+The archive of each follower node records `l1_blocks`, and nothing purges the recording. A consumer that
+restarts after a sealer fleet rebuild resumes at the L1 origin M of the batcher's posted head, so a future
+purge of the recording keeps every block at or above M: the same floor as the other retentions of the
+cluster. The follower's own archive (`blocks/`, `epochs/`) keeps every block since its start block, and is
+the backstop below M.
 
 - The archive is not a source of truth. L1 and the DA layer within its retention can rebuild it.
 - A lost archive costs a re-index from the start block. It does not cost the chain.
@@ -224,8 +261,13 @@ The indexer follows finalized L1. It archives the batches, their payloads, and t
 | `--start-block` | none | finalized block at first start | First L1 block to index on an empty archive. Use the block of the contract deploy. |
 | `--data-dir` | none | none | Archive directory. Required. |
 | `--listen` | none | `0.0.0.0:8549` | Address of the JSON-RPC API. |
-| `--poll-interval-secs` | none | `12` | Seconds between ticks. |
-| `--blocks-per-tick` | none | `64` | The most blocks that one tick indexes. |
+| `--beacon-api` | none | none | A beacon API. With it, the follower reads on the finality schedule. |
+| `--poll-interval-secs` | none | `12` | One slot: the read cadence while the tip does not move or the follower is halted, and the whole cadence without `--beacon-api`. |
+| `--blocks-per-tick` | none | `64` | The most blocks that one tick indexes and one header batch holds. |
+| `--max-log-range` | none | `10` | The most blocks one log query spans. Alchemy's free plan caps it at 10. |
+| `--log-config` | `KARDAMOM_LOG_CONFIG` | IPC defaults | The Aeron channels and discovery. |
+| `--aeron-dir` | none | Aeron's default | The media driver directory. |
+| `--archive-durability` | `KARDAMOM_ARCHIVE_DURABILITY` | off | Record `l1_blocks` on the node's archive, and publish nothing before the recording is live. It needs `[discovery]`. The job sets it. |
 | `--metrics-addr` | `KARDAMOM_METRICS_ADDR` | `127.0.0.1:9549` | Address of the `/metrics` and `/ready` listener. |
 | `--host-id` | `KARDAMOM_HOST_ID` | `local` | Value of the `host_id` label. |
 
@@ -239,9 +281,10 @@ The cluster job binds the metrics listener to `0.0.0.0:9009`.
 | `indexer_batch(index)` | The descriptor of a batch, or `null`. |
 | `indexer_payload(daCert)` | The payload as `0x` hex, or `null`. |
 | `indexer_epoch(l1Block)` | The epoch record of an L1 block as `0x` hex, or `null`. |
+| `indexer_l1_block(l1Block)` | The `l1_blocks` record of an L1 block as `0x` hex (rkyv `L1Block`), or `null`. |
 | `indexer_halt()` | The lifecycle record: `service` (`l1-indexer`), `state`, `halted`, `pause`, and the halt fields while a halt stands. |
 
-- The indexer has no Aeron runtime. It is not on the `events` stream. A tool that reads from it calls `indexer_halt()`.
+- The indexer publishes its state on the `events` stream. A tool without an Aeron runtime calls `indexer_halt()`.
 - `kardamom-reconstruct` calls `indexer_halt()` before it reads from an indexer. It refuses a halted or paused indexer.
   The error is `the indexer is <state> (cause <cause>, runbook <runbook>); refuse to rebuild from it`.
 
@@ -250,7 +293,8 @@ The cluster job binds the metrics listener to `0.0.0.0:9009`.
 ```text
 <data-dir>/
   batches/<index>.json            descriptor of one batch
-  epochs/<l1_block>.rkyv          epoch record of one L1 block
+  epochs/<l1_block>.rkyv          epoch record of one L1 block: the bytes of the record's epoch on l1_blocks
+  blocks/<l1_block>.rkyv          the l1_blocks record of one L1 block
   payloads/<keccak(cert)>.bin     payload, named by the hash of its certificate
   cursor.json                     last indexed block and its hash; written last
 ```
@@ -270,7 +314,7 @@ The cluster job binds the metrics listener to `0.0.0.0:9009`.
 
 ## Two L1 sources for the followers
 
-The da-watcher and the indexer are the followers. They walk L1 block by block. Each one reads through a set of sources.
+The da-watcher and the indexer are the followers. Each one reads through a set of sources.
 
 - `--l1-rpc` is a list of public endpoints. `--l1-light-client-rpc` is the light client.
 - The set accepts the ids of a block, or the result of a log query, in these cases:
@@ -298,8 +342,9 @@ The log line, the error, the `/halt` record, and the `kardamom_halt` gauge carry
 | `l1_source_disagreement` | Two sources gave different answers, and no light client settles it. Both answers are in the log. | The sources agree again. Remove the lying endpoint. |
 | `l1_unreachable` | No source answers, or fewer sources answer than the rule needs. | A source returns after its backoff. |
 | `l1_chain_break` | A finalized block does not descend from the block that the follower holds. | The follower reads a chain that links. It retries on each tick. |
+| `l1_light_client_mismatch` | The last header of the indexer's step is not the light client's header. | An operator clears it after the runbook. |
 
-- Each halt of a follower clears by itself. The follower retries the same range on each tick.
+- Each halt of a follower but `l1_light_client_mismatch` clears by itself. The follower retries the same range every slot.
 - `l1_sources_out` is the label of the error when fewer sources answer than the rule needs. The halt cause for that error is `l1_unreachable`.
 - A halted follower serves `/halt` on its metrics port, and its `/ready` answers 503.
   See [observability.md](observability.md).

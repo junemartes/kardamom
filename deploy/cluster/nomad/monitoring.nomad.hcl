@@ -164,6 +164,7 @@ locals {
     "kardamom-validator", "kardamom-state-mirror", "kardamom-notifier",
     "kardamom-chain-status", "kardamom-hosts", "kardamom-nomad", "kardamom-aeron",
     "kardamom-da",
+    "kardamom-l1-follower",
   ]
 }
 

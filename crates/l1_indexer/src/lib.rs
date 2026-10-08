@@ -1,7 +1,10 @@
-//! The inbox indexer: an archive of what the chain needs from its L1 inbox.
+//! The L1 follower: the one service that reads L1 data, and the archive of
+//! what the chain needs from its L1 inbox.
 //!
-//! The indexer follows the finalized L1 through an [`L1Source`] (the light
-//! client on a production deployment) and keeps, for as long as the
+//! The follower reads the finalized L1 through an [`L1Source`] set, once
+//! per finality step, and publishes one [`L1Block`] record for each
+//! finalized block on the `l1_blocks` stream. The da-watcher and the
+//! batcher read the stream instead of L1. It keeps, for as long as the
 //! operator says:
 //!
 //! - every batch the settlement contract posted (`BatchPosted`): its
@@ -24,26 +27,15 @@
 pub mod api;
 pub mod follow;
 pub mod metrics;
+pub mod schedule;
+pub mod sink;
 pub mod store;
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::B256;
 use kardamom_obs::halt::{Halt, HaltCause};
 use serde::{Deserialize, Serialize};
 
-/// One posted batch, as the indexer keeps it: the `BatchPosted` event's
-/// fields plus where on L1 it was posted.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchEntry {
-    pub index: u64,
-    /// The EigenDA certificate of the batch's payload, as posted.
-    pub da_cert: Bytes,
-    pub l2_block_start: u64,
-    pub l2_block_end: u64,
-    pub records_commitment: B256,
-    /// The L1 block that carried the `postBatch` transaction.
-    pub l1_block: u64,
-    pub l1_tx: B256,
-}
+pub use kardamom_types::l1_block::{BatchEntry, L1Block};
 
 /// A finalized L1 block: its number and its hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,9 +54,10 @@ pub struct Cursor {
     pub last_batch: Option<u64>,
 }
 
-/// Errors of the indexer. A chain break and an L1 source that does not
-/// answer put the follower in a halt (see [`IndexerError::halt`]); every
-/// other error is a failed tick that the next tick retries.
+/// Errors of the indexer. A chain break, an L1 source that does not
+/// answer, and a light client that disagrees put the follower in a halt
+/// (see [`IndexerError::halt`]); every other error is a failed tick that
+/// the next tick retries.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
     #[error("L1 source: {0}")]
@@ -79,6 +72,18 @@ pub enum IndexerError {
         expected: B256,
         parent: B256,
     },
+    #[error(
+        "L1 block {number} ends the finality step with hash {follower}, but the light client's finalized header has {light_client}"
+    )]
+    LightClientMismatch {
+        number: u64,
+        follower: B256,
+        light_client: B256,
+    },
+    #[error("l1_blocks stream: {0}")]
+    Publish(String),
+    #[error("beacon API: {0}")]
+    Beacon(String),
     #[error("store: {0}")]
     Store(String),
     #[error("epoch derivation at L1 block {number}: {error}")]
@@ -96,16 +101,20 @@ pub enum IndexerError {
 impl IndexerError {
     /// The halt this error puts the follower in: `l1_chain_break` for a
     /// block that does not descend from the indexed one, `l1_unreachable`
-    /// for a provider that does not answer, and the halt of an L1 read
-    /// that failed ([`kardamom_da_watcher::L1SourceError::halt_cause`]).
-    /// `None` for every other error. Every one of these halts clears by
-    /// itself: the follower retries the same range on every tick.
+    /// for a provider or a beacon API that does not answer,
+    /// `l1_light_client_mismatch` for a step that does not end at the
+    /// light client's header, and the halt of an L1 read that failed
+    /// ([`kardamom_da_watcher::L1SourceError::halt_cause`]). `None` for
+    /// every other error. The light client halt waits for an operator;
+    /// every other one clears by itself: the follower retries the same
+    /// range every slot.
     #[must_use]
     pub fn halt(&self) -> Option<Halt> {
         let cause = match self {
             Self::ChainBreak { .. } => Some(HaltCause::L1ChainBreak),
+            Self::LightClientMismatch { .. } => Some(HaltCause::L1LightClientMismatch),
             Self::Source(e) => e.halt_cause(),
-            Self::Provider(_) => Some(HaltCause::L1Unreachable),
+            Self::Provider(_) | Self::Beacon(_) => Some(HaltCause::L1Unreachable),
             _ => None,
         };
         cause.map(|cause| Halt::new(cause, self.to_string()))

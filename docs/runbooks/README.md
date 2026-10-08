@@ -25,7 +25,7 @@ The metrics ports of the deploy (`deploy/cluster/nomad`) are below. Other servic
 | da-watcher | 9005 |
 | ingress | 9006 |
 | validator | 9006 |
-| l1-indexer | 9009 |
+| l1-indexer (the L1 follower) | 9009 |
 
 The `/halt` route and the `POST /halt/clear` command sit beside `/metrics` on that port. The clear accepts a loopback peer only. Run it on the node of the service:
 
@@ -48,6 +48,15 @@ An operator can pause a service for maintenance. Run these commands on the node 
 curl -s -X POST 'http://127.0.0.1:<port>/pause?note=disk-swap'
 curl -s -X POST http://127.0.0.1:<port>/resume
 ```
+
+## Alerts without a halt
+
+Two alerts of the L1 follower have a runbook and no halt:
+
+- [`l1_follower_lag.md`](l1_follower_lag.md): `KardamomL1FollowerLag`, no
+  instance publishes the finalized blocks.
+- [`l1_follower_wake_overdue.md`](l1_follower_wake_overdue.md):
+  `KardamomL1FollowerWakeOverdue`, one instance does not read on its plan.
 
 ## Procedures
 

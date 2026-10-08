@@ -35,6 +35,7 @@ pub mod epoch_delivery;
 pub mod exec_record;
 pub mod fees;
 pub mod genesis;
+pub mod l1_block;
 pub mod limits;
 pub mod num;
 pub mod position;
@@ -66,6 +67,7 @@ pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
 pub use exec_record::ExecTxRecord;
 pub use fees::{BlockFees, FeeSchedule, TxFees};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
+pub use l1_block::{BatchEntry, L1Block, L1BlockDedup};
 pub use position::{BPosition, TxDataLoc};
 pub use prover::{
     BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,

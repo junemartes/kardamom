@@ -68,6 +68,16 @@ impl L1SourceError {
     }
 }
 
+/// One L1 block header: the fields the follower records for the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1Header {
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    /// Seconds since the Unix epoch.
+    pub timestamp: u64,
+}
+
 /// The L1 view the watcher needs. All methods async and fallible.
 #[async_trait]
 pub trait L1Source: Send + Sync + 'static {
@@ -87,6 +97,18 @@ pub trait L1Source: Send + Sync + 'static {
     /// forces a lying L1 endpoint to fabricate a consistent chain, instead
     /// of isolated blocks.
     async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError>;
+
+    /// The headers of the blocks `from..=to`, in block order, from one
+    /// JSON-RPC batch request. The follower needs every hash of a range:
+    /// each block has an epoch, and each block must descend from the one
+    /// before it. The batch saves round trips, not provider units.
+    async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError>;
+
+    /// The light client's hash of block `number`, or `None` when the set
+    /// runs no light client. A source that is not a set has none.
+    async fn light_client_hash(&self, _number: u64) -> Result<Option<B256>, L1SourceError> {
+        Ok(None)
+    }
 
     /// Hash of L1 block `number`. Convenience over [`Self::block_ids`].
     async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
@@ -146,6 +168,14 @@ impl<S: L1Source> L1Source for std::sync::Arc<S> {
         (**self).logs(filter).await
     }
 
+    async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError> {
+        (**self).headers(from, to).await
+    }
+
+    async fn light_client_hash(&self, number: u64) -> Result<Option<B256>, L1SourceError> {
+        (**self).light_client_hash(number).await
+    }
+
     async fn lockbox_logs(
         &self,
         lockbox: Address,
@@ -162,7 +192,9 @@ pub mod fakes {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{Address, B256, Filter, L1Source, L1SourceError, LockboxLog, RpcLog, async_trait};
+    use super::{
+        Address, B256, Filter, L1Header, L1Source, L1SourceError, LockboxLog, RpcLog, async_trait,
+    };
 
     /// In-memory `L1Source` driven by a scripted queue. Tests push expected
     /// `(tip, logs)` pairs in order. Each `process_once` call consumes one
@@ -229,6 +261,29 @@ pub mod fakes {
             Ok(())
         }
 
+        /// The scripted `(hash, parent_hash)` of block `number`, unserved.
+        fn ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
+            if *self.block_hash_fails.lock().unwrap() {
+                return Err(L1SourceError::Provider(
+                    "scripted block_hash failure".into(),
+                ));
+            }
+            let hashes = self.hashes.lock().unwrap();
+            let at = |n: u64| {
+                hashes
+                    .get(&n)
+                    .copied()
+                    .unwrap_or_else(|| Self::filler_hash(n))
+            };
+            // Filler hashes chain by construction: block N's parent is the
+            // filler for N-1. So a mock chain stays self-consistent unless
+            // a test deliberately breaks it.
+            if self.parent_lies.lock().unwrap().contains(&number) {
+                return Ok((at(number), Self::filler_hash(number + 1_000_000)));
+            }
+            Ok((at(number), at(number.saturating_sub(1))))
+        }
+
         /// Reads served so far.
         #[must_use]
         pub fn calls(&self) -> u64 {
@@ -271,25 +326,24 @@ pub mod fakes {
 
         async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
             self.serve()?;
-            if *self.block_hash_fails.lock().unwrap() {
-                return Err(L1SourceError::Provider(
-                    "scripted block_hash failure".into(),
-                ));
-            }
-            let hashes = self.hashes.lock().unwrap();
-            let at = |n: u64| {
-                hashes
-                    .get(&n)
-                    .copied()
-                    .unwrap_or_else(|| Self::filler_hash(n))
-            };
-            // Filler hashes chain by construction: block N's parent is the
-            // filler for N-1. So a mock chain stays self-consistent unless
-            // a test deliberately breaks it.
-            if self.parent_lies.lock().unwrap().contains(&number) {
-                return Ok((at(number), Self::filler_hash(number + 1_000_000)));
-            }
-            Ok((at(number), at(number.saturating_sub(1))))
+            self.ids(number)
+        }
+
+        /// One read for the whole range, as a batch is one round trip.
+        /// Each header carries the ids of `block_ids` and the timestamp
+        /// `12 * number`.
+        async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError> {
+            self.serve()?;
+            (from..=to)
+                .map(|number| {
+                    self.ids(number).map(|(hash, parent_hash)| L1Header {
+                        number,
+                        hash,
+                        parent_hash,
+                        timestamp: number.saturating_mul(12),
+                    })
+                })
+                .collect()
         }
 
         async fn logs(&self, _filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {

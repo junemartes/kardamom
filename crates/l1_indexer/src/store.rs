@@ -2,7 +2,9 @@
 //!
 //! - `batches/<index>.json`: a [`BatchEntry`].
 //! - `epochs/<l1_block>.rkyv`: the epoch record of that block, the bytes
-//!   the epoch stream carries.
+//!   the epoch stream carries, and the bytes of the `epoch` field of the
+//!   block's record on `l1_blocks`.
+//! - `blocks/<l1_block>.rkyv`: the block's `l1_blocks` record.
 //! - `payloads/<keccak(cert)>.bin`: the payload bytes, named by the
 //!   certificate's hash (a certificate is a few hundred bytes).
 //! - `cursor.json`: the [`Cursor`], written last, after the items of a
@@ -18,7 +20,7 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::{Bytes, keccak256};
 use kardamom_types::epoch::EpochRecord;
 
-use crate::{BatchEntry, Cursor, IndexerError};
+use crate::{BatchEntry, Cursor, IndexerError, L1Block};
 
 /// The archive rooted at one directory.
 #[derive(Clone, Debug)]
@@ -33,7 +35,7 @@ impl Store {
     /// Returns an error when a directory cannot be created.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, IndexerError> {
         let root = root.as_ref().to_path_buf();
-        for sub in ["batches", "epochs", "payloads"] {
+        for sub in ["batches", "blocks", "epochs", "payloads"] {
             fs::create_dir_all(root.join(sub))?;
         }
         Ok(Self { root })
@@ -140,6 +142,34 @@ impl Store {
                 .join(format!("{}.rkyv", epoch.l1_number)),
             &bytes,
         )
+    }
+
+    /// Store a block's `l1_blocks` record.
+    ///
+    /// # Errors
+    /// Returns an error when the record does not serialize or the write fails.
+    pub fn put_block(&self, block: &L1Block) -> Result<(), IndexerError> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(block)
+            .map_err(|e| IndexerError::Store(format!("block {}: {e}", block.number)))?;
+        Self::write_atomic(
+            &self
+                .root
+                .join("blocks")
+                .join(format!("{}.rkyv", block.number)),
+            &bytes,
+        )
+    }
+
+    /// The stored bytes of a block's `l1_blocks` record, or `None`.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn block_bytes(&self, l1_block: u64) -> Result<Option<Vec<u8>>, IndexerError> {
+        let path = self.root.join("blocks").join(format!("{l1_block}.rkyv"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(fs::read(path)?))
     }
 
     /// The stored bytes of an epoch record, or `None`.
