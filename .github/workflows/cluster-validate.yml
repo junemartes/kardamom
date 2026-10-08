@@ -56,7 +56,9 @@ jobs:
   nomad-validate:
     name: nomad job validate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The isolated suite runs full Ansible deployments, then image and
+    # signing tests. This job budget is separate from deployment SLOs.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
