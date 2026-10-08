@@ -19,9 +19,9 @@ pub enum LogError {
     Discovery(String),
 
     /// An archive answered, and it does not hold the requested range: it
-    /// has no recording of the session, or its newest recording of the
-    /// session ended before the range. This is a definite answer about one
-    /// copy. An archive that did not answer gives [`Self::Aeron`] instead.
+    /// has no recording of the session, each recording of the session
+    /// starts after the range, or the recording before the range ended at
+    /// or before it. This is a definite answer about one copy. An archive that did not answer gives [`Self::Aeron`] instead.
     /// The join layer counts these answers: when every archive gives one, no
     /// retry can recover the range.
     #[error("refetch: archive {archive} does not hold the range: {detail}")]

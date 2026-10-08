@@ -412,7 +412,11 @@ pub fn open_inbound<W>(
     cfg: InboundConfig<'_>,
 ) -> Result<(crate::Inbound<W>, kardamom_cluster_adapter::LiveCluster)>
 where
-    W: crate::EngineWiring<TxData = LiveTxDataSub, TxOrdering = LiveTxOrderingSub>,
+    W: crate::EngineWiring<
+            TxData = LiveTxDataSub,
+            TxOrdering = LiveTxOrderingSub,
+            ExecStream = crate::reader::NoExecStream,
+        >,
 {
     let tx_data = open_tx_data_subs(cfg.rt, cfg.plane)?;
     let join_recovery = archive_join_recovery(
@@ -435,6 +439,7 @@ where
             tx_data,
             tx_ordering,
             join_recovery,
+            exec_stream: crate::reader::NoExecStream,
         },
         cluster_guard,
     ))

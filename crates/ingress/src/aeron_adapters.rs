@@ -184,7 +184,7 @@ impl ReceiptBatchPump {
     }
 
     async fn run(mut self, mut rx: TxReceiptsReceiver) {
-        while let Some((_pos, batch)) = rx.recv_batch().await {
+        while let Some((_, batch)) = rx.recv_batch().await {
             self.on_batch(batch);
         }
     }

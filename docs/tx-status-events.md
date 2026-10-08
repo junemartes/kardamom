@@ -84,6 +84,7 @@ The keys are `snake_case`. An optional field that has no value is left out. It i
 | `fee-too-low` | left out | The fee cap is below the base fee. Sign again with a higher cap. |
 | `insufficient-funds` | left out | The balance does not cover the worst-case cost. |
 | `da-lag` | left out | The sealer refused the transaction because the sealed head is too far past the posted head. Submit again after the batcher posts. |
+| `record-lag` | left out | The sealer refused the transaction because no executor recorded the chain within the record-lag budget. Submit again after an executor records. The guard is off by default until a later release. |
 
 - The reason words are the same as in the `txError` frames of `kardamom_subscribeReceipts`. See [Client JSON-RPC API](json-rpc.md#receipt-subscription).
 - The sequencer fee gate gives `fee-invalid`, `fee-too-low` and `insufficient-funds`. The gate runs only when priority fees are on. See [Priority fees](priority-fees.md).

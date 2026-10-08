@@ -244,7 +244,7 @@ impl Harness {
         let spec = LoadSpec {
             rpc_url: other.rpc_url(),
             receipt_rpcs: vec![self.rpc_url.clone()],
-            ingress_node: other.container.clone(),
+            metrics: self.probes.load_metrics(other),
             ..self.probe_spec(case, account, nonce, "fresh-sender")
         };
         Ok(ProbeLeg {
@@ -317,19 +317,7 @@ impl Harness {
                 .reschedule_slo
                 .saturating_add(Duration::from_mins(1)),
             report_path: Self::report_path(case.name()),
-            executor_nodes: self
-                .probes
-                .executors
-                .iter()
-                .map(|n| n.container.clone())
-                .collect(),
-            ingress_node: self.probes.ingresses[0].container.clone(),
-            sequencer_nodes: self
-                .probes
-                .sequencers
-                .iter()
-                .map(|n| n.container.clone())
-                .collect(),
+            metrics: self.probes.load_metrics(&self.probes.ingresses[0]),
         }
     }
 

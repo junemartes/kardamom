@@ -329,6 +329,13 @@ declare_channel_handles! {
         pub fn publish(&self, r: &ExecTxRecord) -> Result<BPosition, LogError> {
             self.inner.publish(r)
         }
+
+        /// Publish one encoded record with one offer, and drop it when the
+        /// offer is refused (see `PubHandle::publish_lossy`). The live
+        /// stream is lossy: a consumer repairs a gap from an archive.
+        pub fn publish_lossy(&self, bytes: rkyv::util::AlignedVec) {
+            self.inner.publish_lossy(bytes);
+        }
     }
     /// `exec_txs` subscriber (executor → validator, batcher, executor archive).
     subscriber ExecTxsSubscriberHandle(ExecTxRecord);

@@ -18,6 +18,7 @@ pub(crate) mod coordinated;
 pub(crate) mod da_lag;
 pub(crate) mod da_watcher;
 pub(crate) mod deploy;
+pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod resize;

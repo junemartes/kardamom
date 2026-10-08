@@ -5,7 +5,8 @@
 /// confirmed on L1 (its published cursor), the last sealed block, the
 /// DA-lag budget, and whether the guard refuses new transactions. The
 /// egress retention floors ride along, so an observer can show how far
-/// the retention stretched above the posted head.
+/// the retention stretched above the posted head. The record-lag guard
+/// follows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ClusterStatus {
     /// The last L2 block posted to L1; 0 until the batcher publishes.
@@ -22,6 +23,22 @@ pub struct ClusterStatus {
     pub floor_index: u64,
     /// The oldest boundary block still retained.
     pub floor_block: u64,
+    /// The record-lag guard. A status frame from a sealer that does not
+    /// send the guard reads as the default: no cursor, the guard off.
+    pub record_lag: RecordLagStatus,
+}
+
+/// The sealer's record-lag guard: the best recorded cursor of the
+/// executors, the budget, and whether the guard refuses new transactions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecordLagStatus {
+    /// The highest canonical index that one executor or more recorded;
+    /// `None` before the first recorded cursor.
+    pub best_recorded: Option<u64>,
+    /// The budget in canonical records; 0 means the guard is off.
+    pub budget: u64,
+    /// Whether the guard refuses new transactions.
+    pub halted: bool,
 }
 
 impl ClusterStatus {

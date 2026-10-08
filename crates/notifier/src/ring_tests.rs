@@ -165,3 +165,22 @@ fn rejected_carries_the_reason_words() {
     assert_eq!(s.event.reason.as_deref(), Some("expired"));
     assert_eq!(s.event.expected_nonce, Some(4));
 }
+
+#[test]
+fn a_record_lag_refusal_carries_its_word_and_no_nonce() {
+    let mut r = ring(100);
+    let error = TxError {
+        sender: sender(6),
+        nonce: 6,
+        reason: TxErrorReason::RecordLag {
+            sealed_index: 20_000,
+            recorded_index: 3_000,
+            budget: 16_384,
+        },
+    };
+    let Insert::Stored(s) = r.insert(&TxStatus::rejected(hash(6), &error), Instant::now()) else {
+        panic!("stored");
+    };
+    assert_eq!(s.event.reason.as_deref(), Some("record-lag"));
+    assert_eq!(s.event.expected_nonce, None);
+}
