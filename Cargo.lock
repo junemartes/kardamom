@@ -4177,6 +4177,7 @@ dependencies = [
  "if-addrs",
  "kardamom-obs",
  "kardamom-types",
+ "libc",
  "metrics",
  "reqwest 0.13.4",
  "rkyv",
@@ -4190,6 +4191,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

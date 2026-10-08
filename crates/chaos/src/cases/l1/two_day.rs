@@ -16,7 +16,7 @@ use super::followers::{
     Followers, await_archive_complete, await_resume, heal_single_source_followers,
 };
 use super::halt::await_followers_halted;
-use super::outage::hold_until_floor_passes;
+use super::outage::{MIN_HOLD, hold_until_floor_passes};
 use crate::cases::da_watcher::assert_not_past_sealer;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
@@ -95,7 +95,7 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!(
         "{ctx}: T3: load until the floor passes the T1 cursor"
     ));
-    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, ctx).await?;
+    let (delta, held) = hold_until_floor_passes(h, rx_t1, snapshots0, MIN_HOLD, ctx).await?;
     let at_t3 = h.probes.batcher_posts().await.unwrap_or(0);
     anyhow::ensure!(
         at_t3 > after_t1,
