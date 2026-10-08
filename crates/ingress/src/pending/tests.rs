@@ -53,6 +53,44 @@ async fn tx_error_releases_parked_client_with_duplicate() {
     assert_eq!(p.len(), 0, "entry removed on release");
 }
 
+/// A record-lag refusal releases the parked submit with the chain-halt
+/// error that names the sealer's `record_lag` as the root.
+#[tokio::test]
+async fn a_record_lag_refusal_releases_the_parked_wait_with_the_chain_halt() {
+    let p = Arc::new(PendingReceipts::new(AckPolicy::OnQuorum));
+    let sender = Address::repeat_byte(0x66);
+    let nonce = 4u64;
+
+    let wait = p.register(sender, nonce);
+    let waiter = tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    p.on_tx_error(
+        sender,
+        nonce,
+        TxErrorReason::RecordLag {
+            sealed_index: 20_000,
+            recorded_index: 3_000,
+            budget: 16_384,
+        },
+    )
+    .await;
+
+    let err = waiter
+        .await
+        .expect("join")
+        .expect_err("a refusal releases with Err");
+    let IngressError::ChainHalted { root, detail } = err else {
+        panic!("a chain halt, not {err:?}");
+    };
+    assert_eq!(
+        (root.service.as_str(), root.cause),
+        ("sealer", kardamom_types::service::HaltCause::RecordLag)
+    );
+    assert!(detail.contains("recorded index 3000"), "{detail}");
+    assert_eq!(p.len(), 0, "entry removed on release");
+}
+
 #[tokio::test]
 async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
     // A sequencer overload-shed (Evicted) must error the parked submit,

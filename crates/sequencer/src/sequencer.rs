@@ -630,8 +630,8 @@ impl Sequencer {
     }
 
     /// Apply the terminal refusals the sealer answered this shard with: a
-    /// ref past its inclusion deadline, or one the DA-lag guard refused.
-    /// No republish can order either now: drop it from the unconfirmed
+    /// ref past its inclusion deadline, or one the DA-lag guard or the
+    /// record-lag guard refused. No republish can order it now: drop it from the unconfirmed
     /// ledger, so it never republishes, and tell the client, so it can
     /// resubmit instead of waiting out its timeout.
     fn apply_deadline_rejects<P: SequencerPorts>(
@@ -644,11 +644,11 @@ impl Sequencer {
         }
     }
 
-    /// One sealer refusal (past its deadline, or on a DA lag), for
-    /// [`Self::apply_deadline_rejects`]'s loop. The ledger entry carries
-    /// the transaction's hash, so the `Rejected` status goes out with the
-    /// error. An entry a receipt or a rewind already took gets the error
-    /// only.
+    /// One sealer refusal (past its deadline, on a DA lag, or on a record
+    /// lag), for [`Self::apply_deadline_rejects`]'s loop. The ledger entry
+    /// carries the transaction's hash, so the `Rejected` status goes out
+    /// with the error. An entry a receipt or a rewind already took gets
+    /// the error only.
     fn report_refusal<P: SequencerPorts>(
         &mut self,
         ports: &mut P,

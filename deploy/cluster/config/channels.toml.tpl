@@ -149,3 +149,9 @@ events_stream_id = 1019
 # Own group .21:40050. Stream 1004 (free range between receipts and fsync).
 tx_bal_channel = "aeron:udp?endpoint=239.192.56.21:40050|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_bal_stream_id = 1004
+
+# --- exec_txs: the executor stream, one record for each transaction that an
+# executor joins, in canonical order. No service publishes or reads it.
+# Own group .33:40110. Stream 1005 (next to BAL, another executor output).
+exec_txs_channel = "aeron:udp?endpoint=239.192.56.33:40110|interface={{ env "meta.node_ip" }}/32|ttl=1"
+exec_txs_stream_id = 1005

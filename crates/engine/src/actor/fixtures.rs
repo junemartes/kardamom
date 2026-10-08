@@ -69,6 +69,7 @@ where
     type TxData = D;
     type TxOrdering = O;
     type TxReceipts = R;
+    type ExecStream = crate::reader::NoExecStream;
 }
 
 /// A `tx_data` subscription backed by a crossbeam channel, standing in
@@ -198,6 +199,7 @@ impl ChannelHarness {
                 tx_data: tx_data_subs,
                 tx_ordering: ChanTxOrderingSub(b_rx),
                 join_recovery: None,
+                exec_stream: crate::reader::NoExecStream,
             },
             crate::Outbound {
                 tx_receipts: ChanReceiptsPub(c_tx),
