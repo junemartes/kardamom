@@ -3,7 +3,7 @@
 //! No I/O. No Aeron. No libmdbx. This crate is `#[no_std]`-friendly in
 //! spirit. It still uses `alloc` for `Vec` and `Bytes`.
 //!
-//! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`,
+//! Wire types (`TxEnvelope`, `ExecTxRecord`, `Receipt`, `BlockBoundary*`,
 //! `FsyncWatermark`, `QuorumWatermark`, `BlockDelta`) derive
 //! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. A consumer
 //! that needs zero-copy access uses `rkyv::access::<Archived<T>>(bytes)`. A
@@ -31,6 +31,8 @@ pub mod delta;
 pub mod deposit;
 pub mod envelope;
 pub mod epoch;
+pub mod epoch_delivery;
+pub mod exec_record;
 pub mod fees;
 pub mod genesis;
 pub mod limits;
@@ -61,6 +63,7 @@ pub use delta::{AccountChange, BalFrame, BlockDelta, CodeEntry, StorageChange};
 pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
+pub use exec_record::ExecTxRecord;
 pub use fees::{BlockFees, FeeSchedule, TxFees};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};

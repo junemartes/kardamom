@@ -380,6 +380,14 @@ final class SealerEgress {
     }
 
     /**
+     * Frame and offer an origin-gap reject to the offering session:
+     * {@code [kind:12][offered_origin:u64 LE][expected_origin:u64 LE]}.
+     */
+    void offerOriginGap(final ClientSession session, final long offeredOrigin, final long expectedOrigin) {
+        offerControl(session, SealerWire.EGRESS_KIND_ORIGIN_GAP, offeredOrigin, expectedOrigin);
+    }
+
+    /**
      * Frame and offer a remote-origin reject to the offering session:
      * {@code [kind:6][origin:u64 LE][first_seq:u64 LE][expected:u64 LE][reason:u8]}.
      */
@@ -442,7 +450,8 @@ final class SealerEgress {
     /**
      * Frame and broadcast the chain's status to every session, or offer it
      * to one session: {@code kind(1) | posted_head(8) | sealed_head(8) |
-     * budget(8) | halted(1) | retained(8) | floor_index(8) | floor_block(8)}.
+     * budget(8) | halted(1) | retained(8) | floor_index(8) | floor_block(8)
+     * | best_recorded(8) | record_lag_budget(8) | record_lag_halted(1)}.
      * Not retained: a session that announces itself gets the current one.
      */
     void offerStatus(final ClusterStatus status) {
@@ -476,6 +485,12 @@ final class SealerEgress {
         pos += Long.BYTES;
         buf.putLong(pos, status.floorBlock(), ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
+        buf.putLong(pos, status.bestRecorded(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.recordLagBudget(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putByte(pos, status.recordLagHalted() ? (byte) 1 : (byte) 0);
+        pos += Byte.BYTES;
         return pos;
     }
 
@@ -501,6 +516,35 @@ final class SealerEgress {
         buf.putLong(pos, status.postedHead(), ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         buf.putLong(pos, status.budgetBlocks(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
+    }
+
+    /**
+     * Frame and offer a record-lag reject to the offering session:
+     * {@code [kind:13][sender:20][nonce:u64 LE][sealed_index:u64 LE][recorded_index:u64 LE][budget:u64 LE]}.
+     *
+     * @param sealedIndex the last ordered canonical index
+     */
+    void offerRecordLagReject(
+            final ClientSession session,
+            final byte[] sender20,
+            final long nonce,
+            final long sealedIndex,
+            final ClusterStatus status) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, SealerWire.EGRESS_KIND_RECORD_LAG_REJECT);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, sender20);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, sealedIndex, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.bestRecorded(), ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, status.recordLagBudget(), ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         offerToSession(session, pos);
     }

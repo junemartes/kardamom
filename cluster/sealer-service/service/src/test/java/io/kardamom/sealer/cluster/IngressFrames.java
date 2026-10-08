@@ -141,6 +141,16 @@ final class IngressFrames {
             .array();
     }
 
+    /** A {@code KIND_RECORDED_CURSOR} frame: {@code [kind:9][executor_id:u8][recorded_through:u64 LE]}. */
+    static byte[] recordedCursorFrame(final int executorId, final long recordedThrough) {
+        return java.nio.ByteBuffer.allocate(SealerWire.RECORDED_CURSOR_LEN)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(SealerWire.KIND_RECORDED_CURSOR)
+            .put((byte) executorId)
+            .putLong(recordedThrough)
+            .array();
+    }
+
     /** Offer the batcher's posted cursor to the cluster. */
     static void offerPostedCursor(final AeronCluster client, final long postedHead) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();

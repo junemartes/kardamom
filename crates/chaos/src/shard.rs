@@ -86,9 +86,9 @@ impl Shard {
             // Every replica of one role down at once. Each case waits
             // for the whole fleet to return and then keeps the load on
             // it, so the shard runs its own cluster.
-            // The sealer total loss runs last: its recovery is the
-            // open product issue, and a failure there must not hide
-            // the executor cases.
+            // The sealer fleet wipe runs last: it restarts the chain from
+            // a state rebuilt from L1, the longest recovery, and a
+            // failure there must not hide the other cases.
             Self::Fleet => &[
                 "executor-fleet-loss-recover",
                 "executor-fleet-wipe-recover",
@@ -96,6 +96,7 @@ impl Shard {
                 "redis-total-loss-recover",
                 "cluster-quorum-loss-recover",
                 "cluster-total-loss-recover",
+                "sealer-fleet-total-wipe-recover",
             ],
             // Failures that cross the redundancy of a role. The blackout
             // runs last: it can leave a canonical entry whose transaction
@@ -217,7 +218,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 44);
+        assert_eq!(all.len(), 45);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -244,6 +245,10 @@ mod tests {
         assert_eq!(
             Shard::L1.cases().last(),
             Some(&"batcher-outage-past-retention")
+        );
+        assert_eq!(
+            Shard::Fleet.cases().last(),
+            Some(&"sealer-fleet-total-wipe-recover")
         );
     }
 }

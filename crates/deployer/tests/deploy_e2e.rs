@@ -2,20 +2,11 @@
 //! Skips gracefully if forge artifacts or anvil are missing.
 
 use alloy_primitives::{Address, Bytes, U256, address};
-use alloy_sol_types::sol;
 
+use kardamom_deployer::abi::ETHLockbox;
 use kardamom_deployer::dev_keys::DEV_OWNER;
 use kardamom_deployer::testkit::{AnvilRig, Funding};
 use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_pair};
-
-sol! {
-    #[sol(rpc)]
-    contract ETHLockbox {
-        function depositETH(address to, uint64 gasLimit, bytes calldata data) external payable;
-        function depositNonce() external view returns (uint64);
-        function l2Minter() external view returns (address);
-    }
-}
 
 #[tokio::test]
 async fn cross_chain_address_parity() {

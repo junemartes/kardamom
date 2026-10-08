@@ -23,7 +23,7 @@ Consul is the discovery control plane only. Messages travel between Aeron
 media drivers. Consul never relays a message, answers a per-message
 lookup, or orders anything.
 
-The migrated streams and their publishers:
+The streams and their publishers:
 
 | Topic | Publisher | Consumers |
 | --- | --- | --- |
@@ -35,6 +35,27 @@ The migrated streams and their publishers:
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
+| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
+| `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
+
+The `exec_txs` stream carries the transactions that an executor joins, in canonical order: one `ExecTxRecord` for each `TxRef`.
+
+- The stream id is 1005. The channel and the stream id are the keys `exec_txs_channel` and `exec_txs_stream_id` of `[channels]`.
+- Each executor opens two publications on stream 1005. One publisher thread writes both, in the same order:
+  - The recorded publication, an exclusive IPC publication on `aeron:ipc?alias=exec-txs`. The archive on the node of the executor records it. An IPC publication cannot run ahead of its slowest subscriber, so the recording loses no frame. An exclusive publication has its own session, so the executors that share one media driver never write into one session.
+  - The live publication, a dynamic MDC publication with a `kardamom-mdc-publisher` record (topic `exec_txs`). It is lossy: one offer for each record, and a refused offer drops the record. A consumer repairs a gap from an archive.
+- A static plane whose `exec_txs_channel` is IPC opens only the recorded publication. Its consumers read that one.
+- A slow or absent archive refuses the recorded offer. The publisher offers the record again until the archive takes it. The reader then blocks, and this executor stalls. It never executes a record that its archive did not take.
+- The validator and the batcher name the topic as their future source. No service subscribes to it yet.
+
+The `events` stream carries the lifecycle state of each service (running, halted, paused, resumed).
+See [failure-modes.md](failure-modes.md#halts-and-service-events).
+
+- The stream id is 1019. The channel and the stream id are the keys `events_channel` and `events_stream_id` of `[channels]`.
+- Delivery is best effort and RAM only. Nothing that changes the canonical order reads it.
+- The publication uses a term length of 64 KiB, the Aeron minimum. The other topics use the driver default.
+  A small term keeps the log buffers small, because each subscriber driver holds three terms for each publisher.
+- The sealer and the L1 indexer are not on the stream. The ingress observes the sealer from its status frame.
 
 The canonical order (`tx_ordering`) rides the Aeron Cluster. Discovery
 resolves the cluster member ingress endpoints; it never changes the
@@ -156,6 +177,14 @@ readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way.
 
+Each executor records its own recorded `exec_txs` publication on the
+archive of its node. The recorder adopts only the recording of the
+session of this run, so a restarted executor never reads the position of
+the recording of its earlier session. The executor joins nothing before
+that recording is active. The recorder thread reads the recording
+position every 20 ms. The publisher thread computes the recorded cursor
+from it (`kardamom_executor_exec_stream_recorded_index`).
+
 ## Deployment profiles
 
 `deploy/cluster/config/channels.toml.tpl` sets `enabled = true` and the
@@ -168,52 +197,71 @@ renders the file as a Nomad template on its node:
 | `datacenter` | `{{ env "node.datacenter" }}` | The profile's `datacenter`, the Nomad agent's own. |
 | `advertise_interface` | `{{ env "meta.node_ip" }}/32` | The node's private address, resolved by `roles/netinfo` and stamped as node meta. |
 
-So the local profile (explicit `node_ip` per inventory host) and the
+The local profile (explicit `node_ip` for each inventory host) and the
 production profile (`node_ip` resolved from the vSwitch address or the
-private interface) use one file, and an elastic node that joins from the
+private interface) use one file. An elastic node that joins from the
 image gets its scope from its own agent. The `kardamom-aeron-archive` and
 `kardamom-cluster-member` records read `${meta.cluster_id}` the same way.
 
-The file names no fixed address. The multicast fallback channels pin
-their `interface` to `{{ env "meta.node_ip" }}/32` too, and the fallback
-archive lists render from the archive records: the `kardamom-aeron-archive`
-service carries the node role as a tag, and the template lists
-`ingress.kardamom-aeron-archive` for `tx_data` and
-`aux.kardamom-aeron-archive` for `tx_deposits`. Every job renders the file
-with `change_mode = "noop"`: a change in the archive set rewrites the file,
-and the running process follows the catalog through discovery instead of
-restarting. `ansible/contract.yml` checks the chain id mirror, the
-placeholders, the role tag, and the node meta the Nomad agent template
-stamps.
+The file names no fixed address.
 
-No job configures a publication control port. Each publication names
-port 0 in its control endpoint, and the media driver binds an OS-chosen
-port. The runtime reads the bound address back from the driver's
-local-sockaddr counter (`aeron_publication_local_sockaddrs`), and the
-publisher record carries that address. The driver holds the socket from
-the bind on, so no other socket can take the port before the record is
-registered.
+- The multicast fallback channels pin their `interface` to
+  `{{ env "meta.node_ip" }}/32` too.
+- The fallback archive lists render from the archive records. The
+  `kardamom-aeron-archive` service carries the topic that the node
+  records (`archive_topics`) as a tag.
+- The template lists `tx_data.kardamom-aeron-archive` for `tx_data` and
+  `tx_deposits.kardamom-aeron-archive` for `tx_deposits`. The selection
+  follows the recording node in both profiles: the ingress nodes for
+  `tx_data`, and the node with the `da-watcher` role for `tx_deposits`.
+  The executor nodes carry the tag `exec_txs`. No consumer reads their
+  archives yet.
+- A node records at most one topic. A node that records nothing has an
+  empty tag.
+- Every job renders the file with `change_mode = "noop"`. A change in the
+  archive set rewrites the file. The running process follows the catalog
+  through discovery and does not restart.
+- `ansible/contract.yml` checks the chain id mirror, the placeholders,
+  the role tag, and the node meta that the Nomad agent template stamps.
+
+No job configures a publication control port.
+
+- Each publication names port 0 in its control endpoint. The media driver binds an OS-chosen port.
+- The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
+- The publisher record carries the address that the driver bound.
+- The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
 
 | Job | Publications |
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
-| executor | receipts, boundaries, BAL |
+| executor | receipts, boundaries, BAL, the live `exec_txs` publication |
 | da-watcher | deposits, remote epochs |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
 
-The aeron system job registers the archive record with the node's
-`archive_topics` meta: `tx_data` on the ingress nodes, `tx_deposits` on
-the aux node, empty elsewhere. The cluster job registers the member
-record with `member_id` equal to the sealer node's index.
+The aeron system job registers the archive record with the `archive_topics`
+meta of the node:
 
-## Cutover
+- `tx_data` on a node with the `ingress` role.
+- `tx_deposits` on a node with the `da-watcher` role.
+- `exec_txs` on a node with the `executor` role. The archive keeps the stream of the executor on that node.
+- Empty on every other node.
 
-No multicast-to-MDC mixed deployment is assumed compatible. The cutover
-is coordinated: every service reads the same `channels.toml`, and
-`[discovery] enabled` flips the whole cluster at once. Recordings made on
-the multicast channels keep their catalog entries and their original
-channel URIs; a refetch of a range recorded before the cutover resolves it
-by session id as before.
+An archive record with an unknown topic fails to parse, and a refetch
+client then skips the whole record. So a runtime that knows `exec_txs`
+deploys before the executor nodes advertise it.
+
+The `da-watcher` role is on its own node in the production profile. In the
+local profile it is on the `aux` node.
+
+The cluster job registers the member record with `member_id` equal to the
+index of the sealer node.
+
+## Switching a cluster to discovery
+
+- A cluster does not mix multicast and MDC deployments.
+- Every service reads the same `channels.toml`. `[discovery] enabled` switches the whole cluster at once.
+- Recordings made on the multicast channels keep their catalog entries and their original channel URIs.
+- A refetch of a range that was recorded on multicast resolves it by session id.
 
 ## Local runs
 

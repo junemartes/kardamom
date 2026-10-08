@@ -196,7 +196,7 @@ class DeployTest(unittest.TestCase):
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
 
-    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml"):
+    def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
         variables = {
             'workloads_nomad_addr': f'http://127.0.0.1:{self.api.server_port}',
             'workloads_manifest': str(self.manifest),
@@ -217,6 +217,8 @@ class DeployTest(unittest.TestCase):
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
+        env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
@@ -226,10 +228,13 @@ class DeployTest(unittest.TestCase):
 
     def test_deploy_order_pinning_and_repeat(self):
         self.run_deploy()
+        self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
+        exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
@@ -301,7 +306,9 @@ class DeployTest(unittest.TestCase):
             'workloads_namespace': 'staging',
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
+            'workloads_cluster_log_purge_keep': '5',
             'workloads_cluster_file_sync_level': '2',
+            'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
         }, check=True)
@@ -319,6 +326,9 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
+        self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
+        self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
         # One value turns priority fees on for every role that has a say.
         self.assertIn('-Dkardamom.cluster.orderingWindow=20', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'true')
@@ -342,6 +352,33 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
+        # A restart resumes after the last published L1 block only when the
+        # cursor file outlives the container.
+        self.run_deploy(check=True)
+        task = self.api.state['plans']['da-watcher']['TaskGroups'][0]['Tasks'][0]
+        self.assertIn('/opt/kardamom/da-watcher:/opt/kardamom/da-watcher', task['Config']['volumes'])
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--l1-cursor-file') + 1], '/opt/kardamom/da-watcher/l1-cursor')
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_the_da_watcher_follows_the_sealer_boundaries(self):
+        # The watcher confirms its epochs by the sealer's boundaries, so it
+        # needs a cluster session: the [cluster] config and its own egress.
+        self.run_deploy(check=True)
+        group = self.api.state['plans']['da-watcher']['TaskGroups'][0]
+        task = group['Tasks'][0]
+        args = task['Config']['args']
+        self.assertEqual(args[args.index('--config') + 1], '/local/da-watcher.toml')
+        self.assertEqual(args[args.index('--cluster-egress-endpoint') + 1],
+                         '${meta.node_ip}:${NOMAD_HOST_PORT_egress}')
+        templates = {t['DestPath']: t['EmbeddedTmpl'] for t in task['Templates']}
+        self.assertIn('[cluster]', templates['local/da-watcher.toml'])
+        self.assertIn('sealer-0.node.consul', templates['local/da-watcher.toml'])
+        ports = [p['Label'] for n in group['Networks'] for p in n.get('DynamicPorts') or []]
+        self.assertIn('egress', ports)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
@@ -349,6 +386,40 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    def test_every_aeron_party_takes_the_stall_tolerance(self):
+        for tolerance in (10000, 30000):
+            with self.subTest(tolerance=tolerance):
+                environ = {} if tolerance == 10000 else {'AERON_STALL_TOLERANCE_MS': str(tolerance)}
+                self.run_deploy(check=True, environ=environ)
+                self.assert_aeron_parties(self.api.state['plans'], tolerance)
+
+    def assert_aeron_parties(self, plans, tolerance):
+        """Every task that maps the Aeron directory carries the tolerance:
+        a Rust client as its driver timeout, a JVM with a media driver as
+        its driver timeout, client liveness, and a publication unblock
+        timeout above the liveness."""
+        jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
+        parties = [(name, task) for name, job in plans.items() for group in job['TaskGroups']
+                   for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
+        self.assertEqual({name for name, _ in parties}, {
+            'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
+            'state-mirror', 'notifier'})
+        liveness_ns = tolerance * 1_000_000
+        for name, task in parties:
+            if name not in jvm_options:
+                self.assertEqual(task['Env']['AERON_DRIVER_TIMEOUT'], str(tolerance), name)
+                continue
+            options = task['Env'][jvm_options[name]].split()
+            self.assertIn(f'-Daeron.driver.timeout={tolerance}', options, name)
+            self.assertIn(f'-Daeron.client.liveness.timeout={liveness_ns}', options, name)
+            unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
+            self.assertEqual(len(unblock), 1, name)
+            self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A restarted driver waits out the active-driver window of its
+        # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
+        delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']
+        self.assertEqual(delay_ns, (tolerance // 1000 + 5) * 1_000_000_000)
 
     @staticmethod
     def sequencer_env(plans):

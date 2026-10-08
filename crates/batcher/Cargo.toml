@@ -23,11 +23,12 @@ kardamom-log.workspace = true
 # crate, keeping the state DB confined to the executor, validator, and that tool.
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
-# populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
-# `contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json` at
-# compile time and cargo guarantees a crate's deps are compiled (and their
-# build scripts run) before the crate itself is compiled. Without this,
-# parallel build-script execution races on forge install.
+# populating `contracts/out/`. The `AcceptingVerifier` binding in `testkit.rs`
+# loads `contracts/out/KardamomProofOracle.t.sol/AcceptingVerifier.json` at
+# compile time, and cargo compiles a crate's deps (and runs their build
+# scripts) before the crate itself. Without this, parallel build-script
+# execution races on forge install. The ABI-only bindings read the committed
+# files in `contracts/abi/`, which need no forge build.
 kardamom-deployer = { path = "../deployer" }
 
 alloy-primitives.workspace = true

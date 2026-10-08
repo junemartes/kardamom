@@ -84,6 +84,17 @@ pub(crate) const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_mess
 /// `unknown_origin`, `bad_range`). A nonzero `seq_mismatch` rate means a
 /// watcher's cursor disagrees with the sealer's lane cursor.
 pub const REMOTE_ORIGIN_REJECT_TOTAL: &str = "kardamom_sequencer_remote_origin_reject_total";
+/// Origin-gap rejects the sealer answered this replica's epochs with. Each
+/// one makes the epoch pump offer its unconfirmed epochs again from the
+/// origin the sealer expects.
+pub const ORIGIN_GAP_TOTAL: &str = "kardamom_sequencer_origin_gap_total";
+/// The epochs the pump relayed, or took to relay, that no boundary
+/// confirmed yet.
+pub(crate) const EPOCHS_UNCONFIRMED: &str = "kardamom_sequencer_epochs_unconfirmed";
+/// The highest L1 origin a boundary carried: the last L1 block whose
+/// epoch the sealer ordered. The next epoch the sealer accepts is this
+/// block plus one. An operator resumes the da-watcher after this block.
+pub const L1_ORIGIN: &str = "kardamom_sequencer_l1_origin";
 
 /// Pre-registered per-partition metric handles for the hot loop.
 ///
@@ -245,6 +256,22 @@ pub fn record_remote_origin_reject(origin_chain_id: u64, reason: &'static str) {
     .increment(1);
 }
 
+pub fn record_origin_gap() {
+    counter!(ORIGIN_GAP_TOTAL).increment(1);
+}
+
+pub fn record_l1_origin(origin: u64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a gauge value; an L1 block number never nears 2^52, so the f64 mantissa holds it exactly"
+    )]
+    gauge!(L1_ORIGIN).set(origin as f64);
+}
+
+pub(crate) fn record_epochs_unconfirmed(held: usize) {
+    gauge!(EPOCHS_UNCONFIRMED).set(gauge_value(held));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +300,8 @@ mod tests {
         record_lag_suspected(0);
         record_remote_epoch_relayed(0, 0);
         record_remote_origin_reject(0, "seq_mismatch");
+        record_origin_gap();
+        record_epochs_unconfirmed(0);
+        record_l1_origin(0);
     }
 }

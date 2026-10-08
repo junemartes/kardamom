@@ -69,14 +69,14 @@ archive_dir = "/opt/kardamom/archive"
 # refetch client reads the archive endpoints from the `kardamom-aeron-archive`
 # records the aeron job registers (nomad/aeron.system.nomad.hcl), and these
 # static lists are the fallback. Nomad renders them from the same records at
-# task start: the archives tagged with the ingress role record tx_data (each
+# task start: the archives tagged tx_data record tx_data (each
 # ingress archive records every ingress publisher, so either endpoint serves
-# any range; consumers rotate on failure), and the archive tagged with the
-# aux role records tx_deposits. A change in the archive set re-renders the
+# any range; consumers rotate on failure), and the archive tagged
+# tx_deposits records tx_deposits. A change in the archive set re-renders the
 # file without a restart (the jobs set change_mode noop); the running
 # process follows the catalog through discovery instead.
-tx_data_archive_endpoints = [{{ range service "ingress.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
-tx_deposits_archive_endpoints = [{{ range service "aux.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
+tx_data_archive_endpoints = [{{ range service "tx_data.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
+tx_deposits_archive_endpoints = [{{ range service "tx_deposits.kardamom-aeron-archive" }}"{{ .Address }}:{{ .Port }}", {{ end }}]
 
 [channels]
 # --- TxData: full TxEnvelope bytes, one stream per lane. ----------------------
@@ -149,3 +149,9 @@ events_stream_id = 1019
 # Own group .21:40050. Stream 1004 (free range between receipts and fsync).
 tx_bal_channel = "aeron:udp?endpoint=239.192.56.21:40050|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_bal_stream_id = 1004
+
+# --- exec_txs: the executor stream, one record for each transaction that an
+# executor joins, in canonical order. No service publishes or reads it.
+# Own group .33:40110. Stream 1005 (next to BAL, another executor output).
+exec_txs_channel = "aeron:udp?endpoint=239.192.56.33:40110|interface={{ env "meta.node_ip" }}/32|ttl=1"
+exec_txs_stream_id = 1005

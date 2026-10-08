@@ -20,7 +20,7 @@ impl<W: ExecPorts> ExecState<W> {
         self.next_idx()?;
         // Check this before the epoch's deposits apply, so a rejected epoch
         // fail-stops instead of committing.
-        if let Some(obs) = self.hooks.epoch_observer.as_mut() {
+        if let Some(obs) = self.observers.epoch_observer.as_mut() {
             obs.observe(epoch)?;
         }
         tracing::debug!(
@@ -62,7 +62,7 @@ impl<W: ExecPorts> ExecState<W> {
         // committed snapshot. A read that skipped the pipelined parents
         // would seed the lane cursor one block low and halt on the next
         // honest record.
-        if let Some(obs) = self.hooks.remote_epoch_observer.as_mut() {
+        if let Some(obs) = self.observers.remote_epoch_observer.as_mut() {
             let parent_state = ParentState::new(
                 &self.block.delta,
                 self.commits.parent.as_ref(),

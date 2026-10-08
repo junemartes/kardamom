@@ -140,11 +140,17 @@ restores one of its checkpoints, skips the records of the new chain.
    the batcher's spool and cursor file. A spool that holds blocks after H
    continues the batcher's cursor, so the batcher would post reverted blocks.
    Without a cursor file, the batcher reads its cursor from the last posted
-   batch: `(E_H, H + 1)`.
+   batch: `(E_H, H + 1)`. Also remove the da-watcher's L1 cursor file. It
+   holds an origin of the reverted chain, past M. The da-watcher follows the
+   seeded sealer's origin M at its start (step 6), so the file matters only
+   when no boundary arrives within the start wait. An empty file then starts
+   the da-watcher at the finalized tip, and it follows M back as soon as a
+   boundary arrives.
 
    ```sh
    ssh aux-0 'find /opt/kardamom/state/validator /opt/kardamom/checkpoints -mindepth 1 -delete &&
-     rm -rf /opt/kardamom/batcher/spool /opt/kardamom/batcher/cursor.json'
+     rm -rf /opt/kardamom/batcher/spool /opt/kardamom/batcher/cursor.json &&
+     rm -f /opt/kardamom/da-watcher/l1-cursor'
    ```
 
 4. Empty the account cache. Its rows carry positions of the reverted chain,
@@ -166,15 +172,16 @@ restores one of its checkpoints, skips the records of the new chain.
    done
    ```
 
-2. Give every member the seed. A seed carries no remote-origin anchor, so a
-   seeded member runs with interop off: its allowlist must be empty.
+2. Give every member the seed. The cluster job mounts `/opt/kardamom/seed` and
+   passes `-Dkardamom.cluster.seedSnapshot`, empty in a normal deploy. A seed
+   carries no remote-origin anchor, so a seeded member runs with interop off:
+   its allowlist must be empty. The job's variable `cluster_seed_snapshot`
+   does both; on the saved job, `jq` does the same:
 
    ```sh
-   jq '.Job.TaskGroups[].Tasks[] |= (
-         .Config.volumes += ["/opt/kardamom/seed:/opt/kardamom/seed:ro"]
-         | .Env.JAVA_TOOL_OPTIONS |= (
-             gsub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins=")
-             + " -Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin"))' \
+   jq '.Job.TaskGroups[].Tasks[].Env.JAVA_TOOL_OPTIONS |= (
+         sub("-Dkardamom.cluster.seedSnapshot=[^ ]*"; "-Dkardamom.cluster.seedSnapshot=/opt/kardamom/seed/seed.bin")
+         | sub("-Dkardamom.cluster.remoteOrigins=[^ ]*"; "-Dkardamom.cluster.remoteOrigins="))' \
      cluster.json > cluster-seeded.json
    ```
 
@@ -224,13 +231,21 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
    checkpoint of the old chain survived: stop, and do step 3 again.
 2. Start the state mirrors: `nomad job run -json state-mirror.json`. They find
    the cache empty and rebuild it from an executor's newest checkpoint.
-3. Start the sequencers: `nomad job run -json sequencer.json`. They must run
-   before the da-watcher starts. A sequencer reads the da-watcher's epochs
-   live, with no replay, so an epoch published before the sequencers
-   subscribe never reaches the sealer.
-4. Start the da-watcher after block M. Without the flag, it starts at the
-   finalized tip, and the deposits of the blocks between M and the tip are
-   lost. If M is 0, the chain holds no epoch: leave out the flag.
+3. Start the sequencers: `nomad job run -json sequencer.json`. Start them
+   before the da-watcher. A sequencer reads the da-watcher's epochs live,
+   with no replay. An epoch published before the sequencers subscribe does
+   not reach the sealer at first; the da-watcher publishes it again 30 s
+   later, when no boundary confirms it.
+4. Start the da-watcher: `nomad job run -json da-watcher.json`. It waits for
+   the sealer's first boundary and resumes after the sealer's L1 origin M. Its
+   log shows `resuming after the sealer's L1 origin` with `sealer_origin=M`,
+   and the first tick writes block M to its L1 cursor file. If M is 0, the
+   chain holds no epoch: the da-watcher logs `the sealer holds no epoch yet`
+   and starts at the finalized tip, and the sealer accepts any first epoch.
+
+   Fallback, when the da-watcher logs `no boundary from the sealer within the
+   start wait` and the sealer cannot be repaired first: run it once with
+   `--l1-resume-after M`. The flag overrides the cursor file and the wait.
 
    ```sh
    jq --arg m "$M" '.Job.TaskGroups[0].Tasks[0].Config.args += ["--l1-resume-after", $m]' \
@@ -240,7 +255,8 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
 
    Read the da-watcher's metrics on the aux node:
    `kardamom_da_watcher_epochs_published_total` equals
-   `kardamom_da_watcher_l1_finalized_block_number` minus M.
+   `kardamom_da_watcher_l1_finalized_block_number` minus M, and
+   `kardamom_da_watcher_l1_confirmed_origin` grows past M.
 5. Start the ingresses and the batcher:
 
    ```sh
@@ -265,11 +281,12 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
 
 This procedure has no halt to clear. After the members log
 `sealer snapshot TAKEN`, the next `just deploy` registers the cluster job
-without the seed property and the da-watcher job without
+without the seed property, and the da-watcher job without the fallback
 `--l1-resume-after`. The deploy rolls the sealer members one at a time; each
-one restores the snapshot. A da-watcher that restarts with a stale
-`--l1-resume-after` sends epochs that the sealer already holds; the sealer
-drops them as a regression.
+one restores the snapshot. A da-watcher restart resumes after the sealer's L1
+origin. A da-watcher that restarts with a stale `--l1-resume-after` sends
+epochs that the sealer already holds; the sealer drops them as a regression,
+and the first boundary moves the da-watcher to the sealer's origin.
 
 The output attester is off in the deploy. Where it runs, L1 can hold output
 roots for the reverted blocks: roll them back as `revert_to_posted_head.md`

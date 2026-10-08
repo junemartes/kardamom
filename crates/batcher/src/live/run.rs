@@ -23,8 +23,8 @@ use tracing::{info, warn};
 use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, JoinRecoveryFactory, ReaderConfig, ReaderToExec, TxDataReader, TxOrderingInputs,
-    TxOrderingReader,
+    JoinBuffer, JoinRecoveryFactory, NoExecStream, ReaderConfig, ReaderToExec, TxDataReader,
+    TxOrderingInputs, TxOrderingReader,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
@@ -164,8 +164,8 @@ pub struct LiveArgs {
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
     /// references of the gap up to its floor are read from here, and the
-    /// bytes from the `tx_data` archives. Empty: a refused replay is a
-    /// fail-stop.
+    /// bytes from the `tx_data` archives. Empty: a refused replay raises the
+    /// `replay_unavailable` halt.
     pub block_refs_sources: Vec<String>,
 }
 
@@ -345,6 +345,7 @@ impl RunConfig {
             buffer: join_buffer,
             cfg: reader_cfg,
             exec_out: feed_tx,
+            exec_stream: NoExecStream,
             recovery_factory: join_recovery,
         });
 

@@ -4,6 +4,7 @@
 //! property that must hold.
 
 use alloy_primitives::{Address, B256, U256};
+use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord};
 use kardamom_types::{
@@ -301,9 +302,10 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
         retained_frames: 7000,
         floor_index: 90_000,
         floor_block: 95,
+        record_lag: RecordLagStatus::default(),
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), 50);
+    assert_eq!(b.len(), STATUS_WITH_RECORD_LAG_LEN);
     assert_eq!(b[0], 9, "kind 9 is the Java EGRESS_KIND_STATUS");
     assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 100);
     assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 160);
@@ -312,8 +314,96 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
     assert_eq!(u64::from_le_bytes(b[26..34].try_into().unwrap()), 7000);
     assert_eq!(u64::from_le_bytes(b[34..42].try_into().unwrap()), 90_000);
     assert_eq!(u64::from_le_bytes(b[42..50].try_into().unwrap()), 95);
+    assert_eq!(
+        u64::from_le_bytes(b[50..58].try_into().unwrap()),
+        u64::MAX,
+        "no recorded cursor is u64::MAX at offset 50"
+    );
     assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
     assert_eq!(status.lag(), 60);
+}
+
+/// The Java service reads the recorded cursor at fixed offsets, and the
+/// status tail sits at fixed offsets after the first 50 bytes.
+#[test]
+fn recorded_cursor_and_status_tail_layouts_are_pinned_byte_for_byte() {
+    assert_eq!(
+        encode_ingress_recorded_cursor(3, 0x0102),
+        [9, 3, 0x02, 0x01, 0, 0, 0, 0, 0, 0],
+        "kind 9, the executor id, then the cursor as u64 LE"
+    );
+    assert!(
+        encode_ingress_recorded_cursor(0, 0).len() < INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN,
+        "an old sealer drops the frame as a short record"
+    );
+
+    let status = kardamom_types::ClusterStatus {
+        sealed_head: 160,
+        record_lag: RecordLagStatus {
+            best_recorded: Some(77),
+            budget: 16_384,
+            halted: true,
+        },
+        ..Default::default()
+    };
+    let b = encode_status(&status);
+    assert_eq!(b.len(), 67);
+    assert_eq!(u64::from_le_bytes(b[50..58].try_into().unwrap()), 77);
+    assert_eq!(u64::from_le_bytes(b[58..66].try_into().unwrap()), 16_384);
+    assert_eq!(b[66], 1, "the record-lag flag at offset 66");
+    assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+}
+
+/// A sealer that does not send the record-lag tail sends 50 bytes. The
+/// frame reads as no recorded cursor and the guard off.
+#[test]
+fn a_status_frame_with_no_tail_reads_as_no_recorded_cursor() {
+    let status = kardamom_types::ClusterStatus {
+        posted_head: 100,
+        sealed_head: 160,
+        record_lag: RecordLagStatus {
+            best_recorded: Some(77),
+            budget: 5,
+            halted: true,
+        },
+        ..Default::default()
+    };
+    let b = encode_status(&status);
+    let EgressItem::Status(decoded) = EgressItem::decode(&b[..STATUS_LEN]).unwrap() else {
+        panic!("a status frame decodes as a status");
+    };
+    assert_eq!(decoded.posted_head, 100);
+    assert_eq!(decoded.record_lag, RecordLagStatus::default());
+    assert!(matches!(
+        EgressItem::decode(&b[..STATUS_LEN + 3]),
+        Err(WireError::TooShort { .. })
+    ));
+}
+
+#[test]
+fn record_lag_reject_roundtrip() {
+    let sender = Address::repeat_byte(0x99);
+    let lag = RecordLagStatus {
+        best_recorded: Some(40),
+        budget: 16_384,
+        halted: true,
+    };
+    let b = encode_record_lag_reject(sender, 12, 20_000, &lag);
+    assert_eq!(b.len(), 1 + 20 + 32);
+    assert_eq!(
+        b[0], 13,
+        "kind 13 is the Java EGRESS_KIND_RECORD_LAG_REJECT"
+    );
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::RecordLagReject {
+            sender,
+            nonce: 12,
+            sealed_index: 20_000,
+            recorded_index: 40,
+            budget: 16_384,
+        }
+    );
 }
 
 #[test]
@@ -528,6 +618,20 @@ fn replay_ahead_roundtrip() {
         EgressItem::ReplayAhead {
             head_index: 5,
             head_block: 3,
+        }
+    );
+}
+
+#[test]
+fn origin_gap_roundtrip() {
+    let b = encode_origin_gap(102, 101);
+    assert_eq!(b[0], 12, "kind 12, as Java EGRESS_KIND_ORIGIN_GAP");
+    assert_eq!(b.len(), 17, "kind, offered, expected");
+    assert_eq!(
+        EgressItem::decode(&b).unwrap(),
+        EgressItem::OriginGap {
+            offered_origin: 102,
+            expected_origin: 101,
         }
     );
 }

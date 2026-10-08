@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
@@ -44,7 +45,7 @@ class SealerRetentionFloorTest {
         return new SealerClusteredService(
             64, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
             CanonicalSealerState.DEFAULT_INCLUSION_HORIZON_BLOCKS,
-            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, 0L);
+            CanonicalSealerState.DEFAULT_ORDERING_WINDOW, new LagBudgets(0L, 0L));
     }
 
     private void deliver(

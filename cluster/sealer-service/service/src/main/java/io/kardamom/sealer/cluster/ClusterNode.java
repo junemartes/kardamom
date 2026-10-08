@@ -9,6 +9,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
@@ -38,6 +39,11 @@ public final class ClusterNode {
     // ConsensusModule and the ServiceContainer. They must agree.
     static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
+    /** The property of the DA-lag budget, in blocks. */
+    static final String DA_LAG_BUDGET_SETTING = "kardamom.cluster.daLagBudgetBlocks";
+    /** The property of the record-lag budget, in canonical records. */
+    static final String RECORD_LAG_BUDGET_SETTING = "kardamom.cluster.recordLagBudget";
+
     public static void main(final String[] args) {
         // Every stdout line carries its time from here on (see the class).
         System.setOut(new TimestampedOut(System.out));
@@ -56,10 +62,9 @@ public final class ClusterNode {
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
         final int ingressStreamId = Integer.getInteger("kardamom.cluster.ingressStreamId", 101);
         final long tickMs = Long.getLong("kardamom.cluster.tickMs", 2000L);
-        // Dedup window: this must exceed the worst-case racing-replica stall
-        // multiplied by the peak unique-record throughput, and every member
-        // must use the same value. See SealerWire.DEFAULT_DEDUP_CAPACITY for
-        // the sizing math.
+        // Dedup window capacity: a hard cap on the window. A fresh record
+        // past the cap gets back-pressure. Every member must use the same
+        // value. See SealerWire.DEFAULT_DEDUP_CAPACITY.
         final int dedupCapacity = Integer.getInteger(
             "kardamom.cluster.dedupCapacity", SealerWire.DEFAULT_DEDUP_CAPACITY);
         // Replicated configuration, like the capacity above: it decides
@@ -73,10 +78,28 @@ public final class ClusterNode {
         // Replicated configuration like the horizon. Zero turns the guard
         // off. -Dkardamom.cluster.daLagBudgetBlocks wins over the
         // DA_LAG_BUDGET_BLOCKS env var.
-        final long daLagBudgetBlocks = parseDaLagBudget(
-            System.getProperty("kardamom.cluster.daLagBudgetBlocks", System.getenv("DA_LAG_BUDGET_BLOCKS")));
+        final long daLagBudgetBlocks = parseBudget(
+            DA_LAG_BUDGET_SETTING,
+            System.getProperty(DA_LAG_BUDGET_SETTING, System.getenv("DA_LAG_BUDGET_BLOCKS")),
+            CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS,
+            "block count");
         System.out.println("cluster da-lag budget memberId=" + memberId
             + " blocks=" + (daLagBudgetBlocks == 0 ? "0 <guard off>" : Long.toString(daLagBudgetBlocks)));
+        // The record-lag budget: how far the last ordered index may run past
+        // the best recorded cursor of the executors before the sealer
+        // refuses new transactions. Replicated configuration like the
+        // DA-lag budget. Zero turns the guard off.
+        // -Dkardamom.cluster.recordLagBudget wins over the
+        // KARDAMOM_RECORD_LAG_BUDGET env var.
+        final long recordLagBudget = requireRecordLagBudgetAllowed(
+            parseBudget(
+                RECORD_LAG_BUDGET_SETTING,
+                System.getProperty(RECORD_LAG_BUDGET_SETTING, System.getenv("KARDAMOM_RECORD_LAG_BUDGET")),
+                CanonicalSealerState.DEFAULT_RECORD_LAG_BUDGET,
+                "record count"),
+            CanonicalSealerState.snapshotKeepsRecordedCursors());
+        System.out.println("cluster record-lag budget memberId=" + memberId
+            + " records=" + (recordLagBudget == 0 ? "0 <guard off>" : Long.toString(recordLagBudget)));
         // The ordering window: 20 with priority fees on, 0 for first come,
         // first served. Replicated configuration like the two above: it
         // decides the relay order. The deploy sets it from the same value
@@ -115,6 +138,11 @@ public final class ClusterNode {
             Integer.getInteger("kardamom.cluster.voidWindow", SealerWire.DEFAULT_RETENTION));
         System.out.println("cluster void voters memberId=" + memberId
             + " mask=0x" + Long.toHexString(voidConfig.voterMask) + " window=" + voidConfig.capacity);
+
+        // The Raft log purge: how many of the newest snapshots keep their
+        // log. Parsed before the launch, so a bad value never starts a member.
+        final Optional<PurgePlanner> purgePlanner =
+            PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
         final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me);
@@ -156,7 +184,8 @@ public final class ClusterNode {
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
                     dedupCapacity, tickMs, memberId, remoteOrigins, voidConfig,
-                    inclusionHorizonBlocks, orderingWindow, daLagBudgetBlocks);
+                    inclusionHorizonBlocks, orderingWindow,
+                    new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, barrier));
@@ -191,7 +220,8 @@ public final class ClusterNode {
              AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
-            startJoinWatchdog(consensus.electionStateCounter(), memberId);
+            startJoinWatchdog(consensus, contexts.clusterState(), memberId);
+            startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             barrier.await();
         }
     }
@@ -331,65 +361,49 @@ public final class ClusterNode {
 
     /**
      * Exits the process when the member never joins the cluster
-     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it).
+     * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it),
+     * or when its catch-up stalls
+     * ({@code -Dkardamom.cluster.catchupStallS}, default 300, 0 disables
+     * that rule only).
      *
      * <p>A member can wedge inside its first election, after a successful
      * launch, with no error and no exit. Aeron 1.44's
      * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
      * module spins in {@code Election.init} forever while the container
-     * reports healthy to Nomad (issue #195). PR #257 removed the known
-     * trigger. This watchdog covers the shape itself: an election that
-     * stays in INIT past the window is a wedge, never a slow join. See
-     * {@link JoinWatchdog} for why INIT is the only state it acts on.</p>
-     *
-     * <p>The exit is {@link Runtime#halt}, not {@link System#exit}. A
-     * graceful close joins the stuck agent thread and can hang the same
-     * way. The relaunch then goes through the mark-file retry loop above,
-     * which is the expected path after a hard exit. Exit code 3 marks the
-     * cause in the alloc's exit event.</p>
+     * reports healthy to Nomad. A follower whose log ends below the
+     * leader's purge point cycles through its catch-up forever, also while
+     * the container runs. See {@link JoinWatchdog} for the two rules, and
+     * {@link JoinWatchdogThread} for the exits.</p>
      */
-    private static void startJoinWatchdog(final org.agrona.concurrent.status.AtomicCounter electionState,
-        final int memberId) {
+    private static void startJoinWatchdog(
+            final ConsensusModule.Context consensus, final StateDir clusterDir, final int memberId) {
         final long windowS = Long.getLong("kardamom.cluster.joinWatchdogS", 60L);
         if (windowS <= 0) {
             System.out.println("cluster join watchdog DISABLED memberId=" + memberId);
             return;
         }
-        final JoinWatchdog watchdog = new JoinWatchdog(windowS * 1000L);
-        final Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    Thread.sleep(JOIN_WATCHDOG_POLL_MS);
-                } catch (final InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                if (electionState.isClosed()) {
-                    return;
-                }
-                final long nowMs = System.currentTimeMillis();
-                final ElectionState state = ElectionState.get(electionState);
-                if (watchdog.observe(state, nowMs)) {
-                    System.out.println("cluster JOIN WEDGE memberId=" + memberId
-                        + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
-                        + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
-                    System.out.flush();
-                    Runtime.getRuntime().halt(JOIN_WEDGE_EXIT_CODE);
-                }
-            }
-        }, "kardamom-join-watchdog");
-        t.setDaemon(true);
-        t.start();
-        System.out.println("cluster join watchdog up memberId=" + memberId + " windowS=" + windowS);
+        final long stallWindowS = Long.getLong("kardamom.cluster.catchupStallS", JoinWatchdog.DEFAULT_STALL_WINDOW_S);
+        new JoinWatchdogThread(memberId, consensus, clusterDir, windowS, stallWindowS).start();
+    }
+
+    /**
+     * Purge the Raft log behind the snapshots
+     * ({@code -Dkardamom.cluster.logPurgeKeepSnapshots}, default 3, 0
+     * disables it). See {@link PurgePlanner} for the rules, and
+     * {@link LogPurger} for the thread.
+     */
+    private static void startLogPurger(
+            final Optional<PurgePlanner> planner,
+            final LogPurger.Member member,
+            final ConsensusModule.Context consensus) {
+        planner.ifPresentOrElse(
+            p -> new LogPurger(member, p).start(consensus.electionStateCounter()),
+            () -> System.out.println("cluster log purge DISABLED memberId=" + member.memberId()));
     }
 
     /** Launch retries past the ~10s mark-file liveness window, with margin. */
     static final int MAX_LAUNCH_ATTEMPTS = 6;
     static final long LAUNCH_RETRY_DELAY_MS = 5_000;
-    /** How often the join watchdog samples the election state. */
-    static final long JOIN_WATCHDOG_POLL_MS = 1_000;
-    /** Process exit code when the join watchdog fires. */
-    static final int JOIN_WEDGE_EXIT_CODE = 3;
     /** The admin endpoint's port when none is given: 0, off. */
     static final int DEFAULT_ADMIN_PORT = 0;
     /** The service lag behind the commit position that still reads as ready. */
@@ -604,23 +618,51 @@ public final class ClusterNode {
         }
     }
 
-    /** The DA-lag budget from its property or env value; unset means the default. */
-    static long parseDaLagBudget(final String raw) {
+    /**
+     * A lag budget from its property or env value; unset or blank means
+     * {@code defaultValue}.
+     *
+     * @param setting the property name, for the error text
+     * @param unit    what the value counts, for the error text
+     * @throws IllegalStateException if the value is not a number or is negative
+     */
+    static long parseBudget(final String setting, final String raw, final long defaultValue, final String unit) {
         if (raw == null || raw.isBlank()) {
-            return CanonicalSealerState.DEFAULT_DA_LAG_BUDGET_BLOCKS;
+            return defaultValue;
         }
-        final long blocks;
+        final long budget;
         try {
-            blocks = Long.parseLong(raw.trim());
+            budget = Long.parseLong(raw.trim());
         } catch (final NumberFormatException e) {
-            throw new IllegalStateException(
-                "kardamom.cluster.daLagBudgetBlocks: '" + raw + "' is not a block count", e);
+            throw new IllegalStateException(setting + ": '" + raw + "' is not a " + unit, e);
         }
-        if (blocks < 0) {
-            throw new IllegalStateException(
-                "kardamom.cluster.daLagBudgetBlocks: " + blocks + " is negative");
+        if (budget < 0) {
+            throw new IllegalStateException(setting + ": " + budget + " is negative");
         }
-        return blocks;
+        return budget;
+    }
+
+    /**
+     * Refuse a record-lag budget above 0 while the snapshot writer drops the
+     * recorded cursors. A member that restores such a snapshot holds no
+     * cursor, so its guard refuses nothing while the guards of its peers
+     * refuse: the replicated decisions split.
+     *
+     * @param budget                 the parsed record-lag budget
+     * @param snapshotKeepsCursors   whether the snapshot writer writes the cursors
+     * @return {@code budget}
+     * @throws IllegalStateException if the budget is above 0 and the writer
+     *         drops the cursors
+     */
+    static long requireRecordLagBudgetAllowed(final long budget, final boolean snapshotKeepsCursors) {
+        if (budget > 0 && !snapshotKeepsCursors) {
+            throw new IllegalStateException(RECORD_LAG_BUDGET_SETTING + ": " + budget
+                + " is not allowed in this release; it must be 0. The snapshot writer still writes"
+                + " version 10, which holds no recorded cursors, so a member that restores a snapshot"
+                + " would hold no cursors and decide differently from its peers. The release that"
+                + " writes snapshot version 11 lifts this check.");
+        }
+        return budget;
     }
 
     private static ClusteredServiceContainer.Context serviceContext(

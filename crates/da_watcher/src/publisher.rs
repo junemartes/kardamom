@@ -41,31 +41,89 @@ pub trait EpochPublisher: Send + Sync + 'static {
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
 
     use super::{BPosition, EpochPublisher, EpochRecord, PublishError};
 
-    /// In-memory [`EpochPublisher`] that records every published epoch in
-    /// order. Its synthetic `BPosition` advances by `64` per record, so a
-    /// test can check positions without depending on Aeron framing.
-    #[derive(Default, Clone)]
+    /// In-memory [`EpochPublisher`]. It sends every published epoch, in
+    /// order, to the [`PublisherTap`] that [`Self::new`] returns. Its
+    /// synthetic `BPosition` advances by `64` per record, so a test can
+    /// check positions without depending on Aeron framing.
+    ///
+    /// A clone sends to the same tap and shares the position counter, so a
+    /// test can hand one stream of epochs to several watcher lifetimes.
+    #[derive(Clone)]
     pub struct InMemoryEpochPublisher {
-        pub published: Arc<Mutex<Vec<EpochRecord>>>,
-        pub fail_with_backpressure: Arc<Mutex<bool>>,
+        published: Sender<EpochRecord>,
+        count: Arc<AtomicI32>,
+        backpressure: Arc<AtomicBool>,
+    }
+
+    /// The test's side of an [`InMemoryEpochPublisher`]: the published
+    /// epochs, and the switch that jams the transport. The switch is
+    /// shared, because a test can jam the transport from another thread
+    /// while the watcher publishes.
+    pub struct PublisherTap {
+        published: Receiver<EpochRecord>,
+        backpressure: Arc<AtomicBool>,
+    }
+
+    impl InMemoryEpochPublisher {
+        #[must_use]
+        pub fn new() -> (Self, PublisherTap) {
+            let (tx, rx) = channel();
+            let backpressure = Arc::new(AtomicBool::new(false));
+            let publisher = Self {
+                published: tx,
+                count: Arc::new(AtomicI32::new(0)),
+                backpressure: Arc::clone(&backpressure),
+            };
+            let tap = PublisherTap {
+                published: rx,
+                backpressure,
+            };
+            (publisher, tap)
+        }
     }
 
     impl EpochPublisher for InMemoryEpochPublisher {
         fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
-            if *self.fail_with_backpressure.lock().unwrap() {
+            if self.backpressure.load(Ordering::Relaxed) {
                 return Err(PublishError::Backpressure);
             }
-            let mut v = self.published.lock().unwrap();
-            v.push(epoch.clone());
+            // The tap may be gone once the test stops reading; the publish
+            // still succeeds.
+            let _ = self.published.send(epoch.clone());
+            let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(BPosition {
                 term_id: 0,
                 // A fake position; test record counts never approach i32::MAX.
-                term_offset: i32::try_from(v.len()).expect("record count fits in i32") * 64,
+                term_offset: n * 64,
             })
+        }
+    }
+
+    impl PublisherTap {
+        /// Every epoch published since the last call, in order.
+        #[must_use]
+        pub fn epochs(&self) -> Vec<EpochRecord> {
+            self.published.try_iter().collect()
+        }
+
+        /// Jam the transport (`true`): every publish then fails with
+        /// [`PublishError::Backpressure`]. `false` clears it.
+        pub fn set_backpressure(&self, on: bool) {
+            self.backpressure.store(on, Ordering::Relaxed);
+        }
+
+        /// Block until `n` epochs publish, then jam the transport. If the
+        /// publisher drops first, return without jamming.
+        pub fn jam_after(self, n: usize) {
+            if self.published.iter().take(n).count() == n {
+                self.set_backpressure(true);
+            }
         }
     }
 }
@@ -86,23 +144,24 @@ mod tests {
 
     #[test]
     fn in_memory_publisher_records_in_order() {
-        let p = InMemoryEpochPublisher::default();
+        let (p, tap) = InMemoryEpochPublisher::new();
         p.publish(&epoch(1)).unwrap();
-        p.publish(&epoch(2)).unwrap();
-        let got = p.published.lock().unwrap();
+        let second = p.publish(&epoch(2)).unwrap();
+        let got = tap.epochs();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].l1_number, 1);
         assert_eq!(got[1].l1_number, 2);
+        assert_eq!(second.term_offset, 128);
     }
 
     #[test]
     fn in_memory_publisher_can_simulate_backpressure() {
-        let p = InMemoryEpochPublisher::default();
-        *p.fail_with_backpressure.lock().unwrap() = true;
+        let (p, tap) = InMemoryEpochPublisher::new();
+        tap.set_backpressure(true);
         assert!(matches!(
             p.publish(&epoch(1)),
             Err(PublishError::Backpressure)
         ));
-        assert!(p.published.lock().unwrap().is_empty());
+        assert!(tap.epochs().is_empty());
     }
 }

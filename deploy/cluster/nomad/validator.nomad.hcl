@@ -64,6 +64,21 @@ variable "query_port" {
   default = 9025
 }
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The driver timeout of the Aeron clients of the job, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -268,12 +283,12 @@ job "validator" {
           # blocks per e2e run under real load.
           "--trie-shadow-check", "8",
           ],
-          # Epoch verification against L1 (phase D). This appends
-          # only when both variables are configured. The validator
-          # requires --lockbox to parse as an address, so passing it
-          # empty would break every deploy that has not opted in. When
-          # unset, the validator still enforces the origin sequence;
-          # only the content check is off.
+          # The epoch content check against L1. This appends only
+          # when both variables are configured. The validator requires
+          # --lockbox to parse as an address, so passing it empty would
+          # break every deploy that has not opted in. The validator
+          # always enforces the origin sequence rules. Without these
+          # flags, only the content check is off.
           var.l1_rpc_url == "" || var.lockbox_address == "" ? [] : [
             "--l1-rpc-url", var.l1_rpc_url,
             "--lockbox", var.lockbox_address,
@@ -281,6 +296,13 @@ job "validator" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "validator-${NOMAD_ALLOC_INDEX}"
+        # The Aeron C client reads its driver timeout from this variable,
+        # and the service code never overrides it.
+        AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
         # Validator metrics run on port 9006. The executor holds port
         # 9004 on the same host.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9006"

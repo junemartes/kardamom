@@ -15,7 +15,9 @@ use std::time::Duration;
 use alloy_primitives::{Address, U256};
 use clap::Parser;
 
-use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig, SenderRange};
+use kardamom_bench::load::{
+    self, ANVIL_MNEMONIC, Completeness, LoadConfig, MetricsTargets, SenderRange,
+};
 
 /// Default `--target-tps`.
 const DEFAULT_TARGET_TPS: NonZeroU32 = NonZeroU32::new(200).unwrap();
@@ -156,7 +158,9 @@ struct Args {
     #[arg(long, default_value = "executor,ingress")]
     scrape: String,
 
-    /// Scrape through docker exec when true, or a direct curl when false.
+    /// Read every exporter through docker exec when true. When false, read
+    /// each exporter at http://<node>:<port>/metrics first, and fall back to
+    /// docker exec when that read fails.
     #[arg(long = "metrics-via-docker", default_value_t = true, action = clap::ArgAction::Set)]
     metrics_via_docker: bool,
 
@@ -243,12 +247,14 @@ async fn main() -> anyhow::Result<()> {
         chaos_mode: args.chaos_mode,
         fixed_rate: args.fixed_rate,
         scrape: csv(&args.scrape),
-        metrics_via_docker: args.metrics_via_docker,
         subscribe: args.subscribe,
         feed_confirm: args.feed_confirm,
-        executor_nodes: csv(&args.executor_nodes),
-        ingress_node: args.ingress_node,
-        sequencer_nodes: csv(&args.sequencer_nodes),
+        metrics: MetricsTargets::named(
+            &csv(&args.executor_nodes),
+            &args.ingress_node,
+            &csv(&args.sequencer_nodes),
+            args.metrics_via_docker,
+        )?,
         output: args.output,
     };
 

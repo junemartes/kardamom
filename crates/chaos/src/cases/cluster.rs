@@ -108,16 +108,24 @@ pub(crate) async fn follower_kill(h: &mut Harness) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long the rejoin drill waits for the leader's first log purge. The
+/// purge needs four snapshots (the three kept and the purge point), one
+/// archive segment of log below the purge point, and a posted head past
+/// the purge point's block.
+const PURGE_WAIT: Duration = Duration::from_mins(6);
+
 /// The blank-member catch-up drill: a follower's cluster directory and
 /// archive are wiped after its kill, so the restarted member owns
-/// nothing. It seeds from a peer's latest snapshot, or from position 0
-/// when the cluster has no snapshot, and catches up from the leader. The
-/// proof is positional: its latest post-wipe snapshot block must reach
-/// the head observed at wipe time. A position that never moves is a join
-/// wedge, not slow replay.
+/// nothing. The drill first waits until the leader has purged its log,
+/// so a replay from position 0 is impossible. The member seeds from a
+/// peer's latest snapshot and catches up from the leader. The proof is
+/// positional: its latest post-wipe snapshot block must reach the head
+/// observed at wipe time. A position that never moves is a join wedge,
+/// not slow replay.
 pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "cluster-member-rejoin";
     let leader = h.evidence.cluster_leader(h.knobs.leader_slo).await?;
+    await_log_purge(h, leader, ctx).await?;
     let follower = a_follower(leader);
     let before = Blank::observe(h, follower, ctx).await?;
     let node = sealer(h, follower)?;
@@ -135,6 +143,37 @@ pub(crate) async fn member_rejoin(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_executor_progress(Duration::from_mins(1)).await?;
     h.assert_count(CLUSTER_TASK, 3, h.knobs.restart_slo).await?;
     before.await_caught_up(h).await
+}
+
+/// Wait until `leader` logs a purge of its Raft log. The purge lines stay
+/// in the logs of the leader's allocation, so an earlier purge counts.
+async fn await_log_purge(h: &Harness, leader: u32, ctx: &str) -> anyhow::Result<()> {
+    let needle = format!("cluster LOG PURGED memberId={leader} ");
+    let (hs, needle_ref) = (h, &needle);
+    let outcome = poll::until(
+        Budget::new(PURGE_WAIT, Duration::from_secs(10)),
+        |_| async move {
+            Ok(hs
+                .evidence
+                .cluster_logs()
+                .await?
+                .contains(needle_ref.as_str())
+                .then_some(()))
+        },
+    )
+    .await?;
+    let ((), elapsed) = outcome.or_fail(|t| {
+        crate::chaos_fail!(
+            "{ctx}: leader memberId={leader} logged no '{}' within {}s — without a purged log the drill cannot prove a rejoin through a peer seed",
+            needle.trim_end(),
+            t.as_secs()
+        )
+    })?;
+    crate::log(format!(
+        "{ctx}: leader memberId={leader} has purged its Raft log ({}s); a replay from position 0 is impossible",
+        elapsed.as_secs()
+    ));
+    Ok(())
 }
 
 /// The machine-replacement drill for a Raft member: a follower's sealer

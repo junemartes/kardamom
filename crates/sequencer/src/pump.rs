@@ -1,14 +1,12 @@
-//! Generic origin-advancing pump body, shared by every lane that polls one
-//! record off a subscription and forwards it verbatim onto `tx_ordering`
-//! (today: [`crate::epoch`] and [`crate::remote_epoch`]).
+//! The origin lanes' relay step, and the one-slot retry pump.
 //!
-//! The two lanes differ only in three places: the subscriber type, the
-//! publish call, and whether a metric fires after a successful publish.
-//! [`Pump::step`] takes those three lane-specific pieces as parameters and
-//! owns the one piece of state every lane shares: the record popped off
-//! the subscription but not yet accepted by the cluster. Each lane's
-//! record type implements [`OriginLane`] on its `Pump<T>` to name those
-//! three pieces once.
+//! [`OriginLane`] is the step every lane that forwards one record off a
+//! subscription onto `tx_ordering` implements: [`crate::epoch`] and
+//! [`crate::remote_epoch`]. [`Pump`] is the one-slot body of the
+//! remote-epoch lane: it holds the record popped off the subscription but
+//! not yet accepted by the cluster. The epoch lane keeps every epoch until
+//! a boundary confirms it, so it has its own body,
+//! [`crate::epoch::EpochPump`].
 
 use kardamom_types::BPosition;
 
@@ -23,8 +21,7 @@ pub struct Held<T> {
 }
 
 /// One origin lane's relay step: poll one record off `sub` and publish it
-/// through `publ`, with the one-slot retry state on `self`. Implemented
-/// once per record type on [`Pump<T>`].
+/// through `publ`, with the lane's retry state on `self`.
 pub trait OriginLane<S, P> {
     /// Relay one record. Returns `Ok(true)` if a record was processed,
     /// `Ok(false)` if the subscription was idle and nothing was held.

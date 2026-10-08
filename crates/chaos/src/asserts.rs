@@ -275,9 +275,16 @@ impl Harness {
     ///
     /// # Errors
     ///
-    /// Returns an error if a replica's exporter or RPC stays dark for 120s.
+    /// Returns an error if a replica's exporter or RPC stays dark for 120 s
+    /// plus the Aeron stall tolerance.
     pub async fn assert_ingress_pair_live(&self, case: &str) -> anyhow::Result<()> {
-        let outcome = poll::until(Budget::secs(120, 5), |_| async move {
+        // A replica on a lost media driver exits only after its Aeron
+        // driver timeout, the stall tolerance, and then restarts.
+        let budget = Budget::new(
+            Duration::from_mins(2).saturating_add(self.knobs.aeron_stall.get()),
+            Duration::from_secs(5),
+        );
+        let outcome = poll::until(budget, |_| async move {
             Ok(self.dark_ingress().await?.is_none().then_some(()))
         })
         .await?;
@@ -376,14 +383,15 @@ impl Harness {
         let (samples, _) = outcome.or_fail(|t| {
             crate::chaos_fail!(
                 "restarted replica on {} (:{}) never came up: metrics unscrapable within {}s of restart",
-                target.node,
-                target.port,
+                target.name,
+                target.port(),
                 t.as_secs()
             )
         })?;
         crate::log(format!(
             "restarted replica on {} (:{}) is up and exporting ({samples} sequencer metrics; established-sender coverage stays on the twin)",
-            target.node, target.port
+            target.name,
+            target.port()
         ));
         Ok(())
     }

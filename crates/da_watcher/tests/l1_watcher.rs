@@ -21,15 +21,14 @@ fn lockbox() -> Address {
 }
 
 /// A watcher over the scripted source, resumed after L1 block `cursor`.
-/// The publisher is cloned in, so the test keeps its own handle on the
-/// published records.
+/// The test keeps the publisher's tap, to read the published records.
 fn watcher(
-    pub_: &InMemoryEpochPublisher,
+    pub_: InMemoryEpochPublisher,
     src: MockL1Source,
     cursor: Option<u64>,
 ) -> L1Watcher<MockL1Source, InMemoryEpochPublisher> {
     L1Watcher::new(
-        pub_.clone(),
+        pub_,
         src,
         DaWatcherConfig {
             lockbox: lockbox(),
@@ -37,6 +36,7 @@ fn watcher(
             resume_after: cursor
                 .map(|c| L1ResumeAfter::from(NonZeroU64::new(c).expect("a test cursor is not 0"))),
         },
+        None,
     )
 }
 
@@ -68,14 +68,14 @@ fn upg_log(number: u64, log_index: u64, feature: u64, activation: u64) -> Lockbo
 
 #[tokio::test]
 async fn seed_call_returns_zero_and_advances_cursor() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(100));
-    let mut w = watcher(&pub_, src, None);
+    let mut w = watcher(pub_, src, None);
     let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
     assert_eq!(w.cursor(), Some(100));
-    assert!(pub_.published.lock().unwrap().is_empty());
+    assert!(tap.epochs().is_empty());
 }
 
 /// The resume block is parsed once, at the flag. Block 0 names no epoch,
@@ -100,18 +100,18 @@ fn a_resume_block_is_a_nonzero_l1_block_number() {
 /// the tip, which would lose the deposits of the blocks in between.
 #[tokio::test]
 async fn a_resumed_watcher_publishes_every_block_after_the_resume_block() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(45));
     src.push_logs(Ok(vec![dep_log(43, 0, 700)]));
-    let mut w = watcher(&pub_, src, Some(41));
+    let mut w = watcher(pub_, src, Some(41));
     assert_eq!(w.cursor(), Some(41));
 
     let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 4);
     assert_eq!(w.cursor(), Some(45));
-    let v = pub_.published.lock().unwrap();
+    let v = tap.epochs();
     assert_eq!(
         v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
         vec![42, 43, 44, 45]
@@ -124,16 +124,16 @@ async fn a_resumed_watcher_publishes_every_block_after_the_resume_block() {
 /// plumbing, the sealer and slot accounting would need changes too.
 #[tokio::test]
 async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(201));
     src.push_logs(Ok(vec![upg_log(201, 0, 1, 0)]));
-    let mut w = watcher(&pub_, src, Some(200));
+    let mut w = watcher(pub_, src, Some(200));
 
     let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 1);
-    let v = pub_.published.lock().unwrap();
+    let v = tap.epochs();
     assert_eq!(v[0].deposits.len(), 1);
     let d = &v[0].deposits[0];
     assert!(d.is_system_transaction);
@@ -151,7 +151,7 @@ async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
 /// overtake a deposit that L1 sequenced first.
 #[tokio::test]
 async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(301));
     // Pushed out of order on purpose. The rule sorts by log_index.
@@ -160,11 +160,11 @@ async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
         upg_log(301, 1, 7, 1_700_000_000_250),
         dep_log(301, 0, 100),
     ]));
-    let mut w = watcher(&pub_, src, Some(300));
+    let mut w = watcher(pub_, src, Some(300));
 
     w.process_once().await.unwrap();
 
-    let v = pub_.published.lock().unwrap();
+    let v = tap.epochs();
     let kinds: Vec<bool> = v[0]
         .deposits
         .iter()
@@ -181,7 +181,7 @@ async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
 
 #[tokio::test]
 async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(153));
     // A single range query spans three blocks: two deposits in 151,
@@ -191,13 +191,13 @@ async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
         dep_log(151, 1, 200),
         dep_log(153, 5, 300),
     ]));
-    let mut w = watcher(&pub_, src, Some(150));
+    let mut w = watcher(pub_, src, Some(150));
 
     let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 3, "one epoch per block in (150, 153]");
     assert_eq!(w.cursor(), Some(153));
-    let v = pub_.published.lock().unwrap();
+    let v = tap.epochs();
     assert_eq!(
         v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
         vec![151, 152, 153],
@@ -227,16 +227,16 @@ async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
 /// sequence gets a hole that a verifier would reject.
 #[tokio::test]
 async fn depositless_range_still_emits_every_epoch() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(105));
     src.push_logs(Ok(vec![]));
-    let mut w = watcher(&pub_, src, Some(100));
+    let mut w = watcher(pub_, src, Some(100));
 
     let n = w.process_once().await.unwrap();
 
     assert_eq!(n, 5);
-    let v = pub_.published.lock().unwrap();
+    let v = tap.epochs();
     assert_eq!(
         v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
         vec![101, 102, 103, 104, 105]
@@ -246,10 +246,10 @@ async fn depositless_range_still_emits_every_epoch() {
 
 #[tokio::test]
 async fn not_finalized_surfaces_distinct_error_no_cursor_advance() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, _tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Err(L1SourceError::NotFinalized));
-    let mut w = watcher(&pub_, src, None);
+    let mut w = watcher(pub_, src, None);
     let err = w.process_once().await.unwrap_err();
     assert!(matches!(err, MonitorError::NotFinalized));
     assert!(w.cursor().is_none());
@@ -257,10 +257,10 @@ async fn not_finalized_surfaces_distinct_error_no_cursor_advance() {
 
 #[tokio::test]
 async fn tip_below_cursor_is_noop() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, _tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(50));
-    let mut w = watcher(&pub_, src, Some(100));
+    let mut w = watcher(pub_, src, Some(100));
     let n = w.process_once().await.unwrap();
     assert_eq!(n, 0);
     assert_eq!(w.cursor(), Some(100));
@@ -268,27 +268,15 @@ async fn tip_below_cursor_is_noop() {
 
 #[tokio::test]
 async fn backpressure_holds_cursor_so_next_tick_retries() {
-    let pub_ = InMemoryEpochPublisher::default();
-    *pub_.fail_with_backpressure.lock().unwrap() = true;
+    let (pub_, tap) = InMemoryEpochPublisher::new();
+    tap.set_backpressure(true);
     let src = MockL1Source::new();
     src.push_tip(Ok(200));
     src.push_logs(Ok(vec![dep_log(200, 0, 100)]));
-    let mut w = watcher(&pub_, src, Some(150));
+    let mut w = watcher(pub_, src, Some(150));
     let n = w.process_once().await.unwrap();
     assert_eq!(n, 0); // The first publish was backpressured, so the loop returned early.
     assert_eq!(w.cursor(), Some(150)); // The cursor did not advance.
-}
-
-/// Once `published` reaches 2 entries, trip `flag` and report done.
-fn trip_backpressure_once_published(
-    published: &std::sync::Arc<std::sync::Mutex<Vec<kardamom_types::EpochRecord>>>,
-    flag: &std::sync::Arc<std::sync::Mutex<bool>>,
-) -> bool {
-    if published.lock().unwrap().len() < 2 {
-        return false;
-    }
-    *flag.lock().unwrap() = true;
-    true
 }
 
 /// A partially published range must resume at the first block that did
@@ -296,23 +284,14 @@ fn trip_backpressure_once_published(
 /// must not skip past them.
 #[tokio::test]
 async fn partial_range_resumes_at_the_first_unpublished_block() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(104));
     src.push_logs(Ok(vec![]));
-    let mut w = watcher(&pub_, src, Some(100));
+    let mut w = watcher(pub_, src, Some(100));
 
     // Let 101 and 102 through, then jam the transport.
-    let flag = pub_.fail_with_backpressure.clone();
-    let published = pub_.published.clone();
-    std::thread::spawn(move || {
-        let _ = kardamom_obs::testkit::poll_sync(
-            "backpressure trip after 2 published",
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_millis(1),
-            || Ok(trip_backpressure_once_published(&published, &flag).then_some(())),
-        );
-    });
+    std::thread::spawn(move || tap.jam_after(2));
     let n = w.process_once().await.unwrap();
 
     assert!((1..=4).contains(&n));
@@ -325,7 +304,7 @@ async fn partial_range_resumes_at_the_first_unpublished_block() {
 /// would bake a wrong `source_hash` into the chain.
 #[tokio::test]
 async fn log_disagreeing_with_the_block_hash_is_rejected() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(151));
     src.push_logs(Ok(vec![LockboxLog::Deposit(DepositLog {
@@ -338,23 +317,23 @@ async fn log_disagreeing_with_the_block_hash_is_rejected() {
         gas_limit: 100,
         data: alloy_primitives::Bytes::new(),
     })]));
-    let mut w = watcher(&pub_, src, Some(150));
+    let mut w = watcher(pub_, src, Some(150));
 
     let err = w.process_once().await.unwrap_err();
 
     assert!(matches!(err, MonitorError::Derive(_)));
     assert_eq!(w.cursor(), Some(150), "cursor must not pass a bad epoch");
-    assert!(pub_.published.lock().unwrap().is_empty());
+    assert!(tap.epochs().is_empty());
 }
 
 #[tokio::test]
 async fn block_hash_failure_stops_the_range() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, _tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     src.push_tip(Ok(151));
     src.push_logs(Ok(vec![]));
     *src.block_hash_fails.lock().unwrap() = true;
-    let mut w = watcher(&pub_, src, Some(150));
+    let mut w = watcher(pub_, src, Some(150));
 
     let err = w.process_once().await.unwrap_err();
 
@@ -364,7 +343,7 @@ async fn block_hash_failure_stops_the_range() {
 
 #[tokio::test]
 async fn a_block_that_does_not_descend_from_the_published_one_is_refused() {
-    let pub_ = InMemoryEpochPublisher::default();
+    let (pub_, tap) = InMemoryEpochPublisher::new();
     let src = MockL1Source::new();
     // Blocks 10 and 11 publish; 12 then claims a parent that is not 11's
     // hash, twice: the watcher refuses it each time and keeps its cursor.
@@ -375,7 +354,7 @@ async fn a_block_that_does_not_descend_from_the_published_one_is_refused() {
     src.push_tip(Ok(12));
     src.push_logs(Ok(vec![]));
     src.parent_lies.lock().unwrap().insert(12);
-    let mut w = watcher(&pub_, src, Some(9));
+    let mut w = watcher(pub_, src, Some(9));
     assert_eq!(w.process_once().await.unwrap(), 2);
     assert_eq!(w.cursor(), Some(11));
     let err = w.process_once().await.unwrap_err();
@@ -384,7 +363,7 @@ async fn a_block_that_does_not_descend_from_the_published_one_is_refused() {
         "expected a chain break, got {err}"
     );
     assert_eq!(w.cursor(), Some(11));
-    assert_eq!(pub_.published.lock().unwrap().len(), 2);
+    assert_eq!(tap.epochs().len(), 2);
     let err = w.process_once().await.unwrap_err();
     assert!(matches!(err, MonitorError::ChainBreak { number: 12, .. }));
 }

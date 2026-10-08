@@ -29,6 +29,14 @@
 //!   `tx_deposits`, and advances the cursor. `spawn` wraps it in a
 //!   `tokio::time::interval` loop with structured logging. Returns a
 //!   [`watcher::WatcherHandle`].
+//! - [`cursor::CursorFile`]: the durable cursor of a watcher. The L1
+//!   watcher keeps the sealer's confirmed L1 origin there
+//!   ([`l1_cursor::L1Cursor`]), so a restart resumes after it and checks
+//!   the parent link again.
+//! - `window::Window`: the epochs the L1 watcher published that no sealer
+//!   boundary confirmed yet. The watcher publishes them again when no
+//!   boundary confirms one in time, so an epoch lost between the publish
+//!   and the commit is not lost for good.
 //!
 //! ## Semantics
 //!
@@ -63,23 +71,31 @@
 // `#[must_use]` on its own. The lint fires in the macros' output, so the crate
 // allows it here.
 #![allow(clippy::double_must_use)]
+pub mod boundaries;
+pub mod cursor;
 pub mod interop;
+pub mod l1_cursor;
 pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;
 pub mod source;
 pub mod sources;
 pub mod watcher;
+mod window;
 
 // The deposit-derivation rule lives in `kardamom_types::epoch`, so the
 // verifier shares it. A second copy would verify nothing.
+pub use boundaries::BoundaryFeed;
+pub use cursor::{CursorError, CursorFile};
 pub use kardamom_types::epoch::{
     DepositLog, LockboxLog, UpgradeLog, alias_l1_address, source_hash, source_hash_system,
 };
+pub use l1_cursor::{L1Cursor, L1CursorError};
 pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
 pub use source::{L1Source, L1SourceError};
 pub use sources::{L1Endpoints, L1Sources, SourceHalt};
 pub use watcher::{
-    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError, WatcherHandle,
+    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError, START_WAIT,
+    WatcherHandle,
 };

@@ -1,15 +1,18 @@
 //! BAL capture at the boundary handoff, footprint-shadow captures, and the
 //! boundary-alignment fail-stop.
 
+use std::time::Duration;
+
 use alloy_primitives::{Address, address};
 use alloy_signer_local::PrivateKeySigner;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{RecvTimeoutError, bounded, unbounded};
 
 use crate::error::ExecutorError;
 use crate::reader::ReaderToExec;
 use crate::state::StaticSnapshotSource;
 
 use crate::actor::BalHandoff;
+use crate::actor::test_hooks::EmptyBlockExec;
 use crate::actor::test_support::{ExecRig, ImmediateCommit, boundary_msg, feed, funded, tx_msg};
 
 /// This test goes through the actor. With a BAL channel attached, the
@@ -119,4 +122,28 @@ fn exec_hands_off_shadow_captures_at_boundary() {
         alloy_primitives::Address::ZERO,
     )
     .process_block(blk);
+}
+
+/// The whole-block mode has no per-tx captures, so it drops the shadow
+/// sender when the exec thread starts. The shadow thread then sees a
+/// closed channel and exits, while the exec thread still runs.
+#[test]
+fn whole_block_mode_drops_the_shadow_sender() {
+    let (stx, srx) = bounded::<crate::shadow::ShadowBlock>(8);
+    let (rig, _writer_log) = ExecRig::recording(
+        StaticSnapshotSource(crate::state::MockStateDatabase::builder().build()),
+        ImmediateCommit,
+    );
+    let (h, _rx_e2c) = {
+        // `_tx_r2e` keeps the reader channel open, so the exec thread
+        // stays alive until this block ends.
+        let (_tx_r2e, rx_r2e) = unbounded::<ReaderToExec>();
+        let spawned = rig.shadow(stx).block_exec(EmptyBlockExec).spawn(rx_r2e);
+        assert!(matches!(
+            srx.recv_timeout(Duration::from_secs(5)),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+        spawned
+    };
+    h.join().expect("no panic").expect("exec ok");
 }

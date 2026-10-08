@@ -158,6 +158,10 @@ job "l1-indexer" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "l1-indexer-${NOMAD_ALLOC_INDEX}"
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9009"

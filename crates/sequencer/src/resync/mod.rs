@@ -369,8 +369,8 @@ pub struct ResyncController {
     reject_rx_dead: bool,
     /// The sealer's terminal refusals, forwarded by the egress-watermark
     /// thread: a ref whose inclusion deadline the open block had passed,
-    /// or one the DA-lag guard refused. No republish can order either
-    /// now, so the publish loop drops the ledger entry and tells the
+    /// or one the DA-lag guard or the record-lag guard refused. No
+    /// republish can order it now, so the publish loop drops the ledger entry and tells the
     /// client, instead of republishing.
     deadline_rx: Receiver<SealerRefusal>,
     deadline_rx_dead: bool,
@@ -752,8 +752,8 @@ impl ResyncController {
 
 /// One terminal refusal from the sealer: the ref of `sender` at `nonce`
 /// is not ordered, and `reason` is what the client is told. The past
-/// deadline and the DA lag share this path, because the remedy is the
-/// same: drop the ledger entry and tell the client, who resubmits.
+/// deadline, the DA lag and the record lag share this path, because the
+/// remedy is the same: drop the ledger entry and tell the client, who resubmits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealerRefusal {
     pub sender: Address,
@@ -773,7 +773,8 @@ pub struct ResyncChannel {
     pub floor_tx: Sender<FloorUpdate>,
     pub reject_tx: Sender<(Address, u64, u64)>,
     /// The sealer's terminal refusals: late refs, and refs the DA-lag
-    /// guard refused. No republish can order them now.
+    /// guard or the record-lag guard refused. No republish can order them
+    /// now.
     pub deadline_tx: Sender<SealerRefusal>,
     pub watermark: SharedWatermark,
 }

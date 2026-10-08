@@ -49,7 +49,10 @@
 //!   inputs.
 //! - [`ports`]: outbound trait seams.
 //! - [`types`]: plain data types.
+//! - `tx_hook`: the [`TxHook`] seam around each tx record.
 //! - `exec_state`: the [`ExecState`] struct and its constructor.
+//! - `exec_block`: the per-block state, the execution mode, and the
+//!   optional captures.
 //! - `exec_thread`: the loop and [`ExecState::spawn`].
 //! - `exec_records`, `exec_markers`, `exec_boundary`: the `ReaderToExec`
 //!   arms.
@@ -67,6 +70,7 @@ use crate::error::ExecutorError;
 use crate::reader::{JoinBuffer, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 mod commit_thread;
+mod exec_block;
 mod exec_boundary;
 mod exec_markers;
 mod exec_records;
@@ -74,6 +78,7 @@ mod exec_settle;
 mod exec_state;
 mod exec_thread;
 mod ports;
+mod tx_hook;
 mod types;
 mod wiring;
 
@@ -97,9 +102,12 @@ mod exec_tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
 #[cfg(test)]
+mod test_hooks;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication, publish_each};
+pub use tx_hook::{NoTxHook, TxContext, TxHook, TxOutcome, VerifyRecordIdentity};
 pub use types::{
     BalHandoff, BlockExecOutput, BlockExecStrategy, BufferedRecord, ExecutorConfig, NoBlockExec,
     ResumePoint,
@@ -188,6 +196,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
             block_exec,
             epoch_observer,
             remote_epoch_observer,
+            tx_hook,
         } = hooks;
 
         let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
@@ -207,6 +216,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
                 block_exec,
                 epoch_observer,
                 remote_epoch_observer,
+                tx_hook,
             },
         });
         let commit = CommitLoop::new(tx_receipts, rx_e2c).spawn();
@@ -245,6 +255,7 @@ impl<W: EngineWiring + 'static> Inbound<W> {
             tx_data,
             tx_ordering,
             join_recovery,
+            exec_stream,
         } = self;
         let buffer = JoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth.get());
@@ -257,6 +268,7 @@ impl<W: EngineWiring + 'static> Inbound<W> {
             buffer,
             cfg: cfg.reader.clone(),
             exec_out: tx_r2e,
+            exec_stream,
             recovery_factory: join_recovery,
         });
         (tx_data_handles, tx_ordering_handle, rx_r2e)

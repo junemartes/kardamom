@@ -73,6 +73,7 @@ jobs:
         with:
           just-version: 1.49.0
       - run: just style
+      - run: python3 -m unittest discover -s scripts/hooks/tests
 
   build:
     name: build
@@ -223,6 +224,13 @@ jobs:
             openzeppelin/openzeppelin-contracts@v5.0.2 \
             openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
       - run: forge build --sizes
+      # The Rust `sol!` bindings read the committed ABIs, so they must match
+      # this build.
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: 1.49.0
+      - run: just abi-check
+        working-directory: .
 
   forge-test:
     name: forge test

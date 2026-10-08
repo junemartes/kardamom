@@ -41,6 +41,20 @@ pub const LAST_TICK_UNIX_SECONDS: &str = "kardamom_da_watcher_last_tick_unix_sec
 /// replays further and further back — an operator alarm, not an error path.
 pub const REMOTE_CURSOR_PERSIST_FAILURES_TOTAL: &str =
     "kardamom_da_watcher_remote_cursor_persist_failures_total";
+/// Failed writes of the L1 cursor file. Not fatal: a stale file makes a
+/// restart publish epochs again, and the sealer drops them. A growing
+/// count means the restart publishes again from further back.
+pub const L1_CURSOR_PERSIST_FAILURES_TOTAL: &str =
+    "kardamom_da_watcher_l1_cursor_persist_failures_total";
+/// The sealer's L1 origin as the boundaries carry it: the last epoch the
+/// sealer committed. The cursor file holds it.
+pub const L1_CONFIRMED_ORIGIN: &str = "kardamom_da_watcher_l1_confirmed_origin";
+/// Published epochs that no boundary confirmed yet. It stays near zero
+/// while the sealer commits; at the publish window's bound the watcher
+/// publishes no new epoch.
+pub const EPOCHS_UNCONFIRMED: &str = "kardamom_da_watcher_epochs_unconfirmed";
+/// Epochs published again because no boundary confirmed them in time.
+pub const EPOCHS_REPUBLISHED_TOTAL: &str = "kardamom_da_watcher_epochs_republished_total";
 
 pub fn describe() {
     metrics::describe_gauge!(L1_FINALIZED, "latest finalised L1 block number observed");
@@ -92,5 +106,21 @@ pub fn describe() {
     metrics::describe_counter!(
         REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
         "failed durable-cursor writes, labelled by origin chain id; non-fatal (stale resume is absorbed by dedup) but growth widens the restart replay window"
+    );
+    metrics::describe_gauge!(
+        L1_CONFIRMED_ORIGIN,
+        "the sealer's L1 origin from its boundaries: the last epoch it committed"
+    );
+    metrics::describe_gauge!(
+        EPOCHS_UNCONFIRMED,
+        "published epochs that no boundary confirmed yet"
+    );
+    metrics::describe_counter!(
+        EPOCHS_REPUBLISHED_TOTAL,
+        "epochs published again because no boundary confirmed them within the re-publish timeout"
+    );
+    metrics::describe_counter!(
+        L1_CURSOR_PERSIST_FAILURES_TOTAL,
+        "failed writes of the L1 cursor file; not fatal (the sealer drops the epochs a restart publishes again), but growth widens the restart replay window"
     );
 }

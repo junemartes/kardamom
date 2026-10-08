@@ -5,6 +5,7 @@
 //! outage and after it, so the verdict proves the chain accepts new
 //! transactions again and receipts them correctly.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cases::cluster::sealer;
@@ -16,7 +17,13 @@ use crate::harness::Harness;
 use crate::nomad::{SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
-use crate::stages::rebuild::{Rebuild, Rebuilt, Target};
+use crate::stages::rebuild::{Output, Rebuild, Rebuilt, Target};
+
+mod sealer_wipe;
+mod seed_evidence;
+mod seeding;
+
+pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
 
 /// How long three restarted members get to elect a leader. Each one
 /// restores its snapshot and replays the log tail before it votes, so
@@ -84,16 +91,17 @@ pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Resu
 /// must restore from its local checkpoint and replay the tail. Three
 /// restore lines prove that no executor re-synced from genesis or
 /// waited for a peer.
+///
+/// The job stops after the kills and starts again after the wipe.
+/// Nomad restarts a killed task in seconds, and a task that runs again
+/// before its wipe opens its old state and logs no restore.
 pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "executor-fleet-wipe-recover";
     let nodes = executor_containers(h);
     for node in &nodes {
         wait_peer_checkpoint(h, node, ctx).await?;
     }
-    let baseline = h
-        .evidence
-        .count_lines("executor", RESTORED, Streams::Both)
-        .await?;
+    let job = SavedJob::capture(&h.nomad, "executor").await?;
     crate::log(format!(
         "{ctx}: kill ALL executor tasks ({}) and wipe every state DB (checkpoints kept)",
         nodes.join(" ")
@@ -101,11 +109,14 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
     for node in &nodes {
         h.inject_hard(&[node], "executor").await?;
     }
-    await_exporters_dark(h, ctx).await?;
-    for node in &nodes {
-        wipe_dirs(h, node, ctx, "rm -rf /opt/kardamom/state/*").await?;
-    }
-    h.assert_count("executor", 3, h.knobs.restart_slo).await?;
+    job.stop().await?;
+    // The job starts again even when the wipe fails.
+    let wiped = wipe_stopped_fleet(h, ctx, &nodes).await;
+    let restored = job.restore().await;
+    let baseline = wiped?;
+    restored?;
+    h.assert_count("executor", nodes.len(), h.knobs.reschedule_slo)
+        .await?;
     await_exporter_back(h, ctx).await?;
     h.evidence
         .wait_count_reaches(
@@ -128,8 +139,27 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
     h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
+/// With the executor job stopped, wait until every exporter is dark,
+/// read the restore-line count, and wipe the state database of every
+/// node. No executor runs, so no restore line can land before the
+/// count. Returns the count.
+async fn wipe_stopped_fleet(h: &Harness, ctx: &str, nodes: &[String]) -> anyhow::Result<usize> {
+    await_exporters_dark(h, ctx).await?;
+    let baseline = h
+        .evidence
+        .count_lines("executor", RESTORED, Streams::Both)
+        .await?;
+    for node in nodes {
+        wipe_dirs(h, node, ctx, "rm -rf /opt/kardamom/state/*").await?;
+    }
+    Ok(baseline)
+}
+
 /// The executor's log line of a resume from its own state cursor.
 const RESUMED: &str = "resuming from persisted state cursor via cluster canonical replay";
+
+/// An executor's state directory on its node.
+const EXECUTOR_STATE: &str = "/opt/kardamom/state";
 
 /// Stop the executor job and wipe every state database and every
 /// checkpoint: no executor holds any state, and no peer can serve a
@@ -161,7 +191,7 @@ pub(crate) async fn executor_fleet_total_wipe_recover(h: &mut Harness) -> anyhow
     ));
     job.stop().await?;
     // The job starts again even when the rebuild or the install fails.
-    let installed = install_rebuilt_image(h, ctx, &nodes, head).await;
+    let installed = install_rebuilt_image(h, ctx, &nodes, head, None).await;
     let baseline = ResumeEvidence::read(h).await;
     let restored = job.restore().await;
     installed?;
@@ -175,35 +205,28 @@ pub(crate) async fn executor_fleet_total_wipe_recover(h: &mut Harness) -> anyhow
     h.assert_executor_progress(Duration::from_mins(3)).await
 }
 
-/// Wipe every executor node, rebuild an executor image through `head`
-/// from L1, and install it on every node.
+/// Wipe every executor node in `nodes`, rebuild an executor image
+/// through `head` from L1, and install it on every one of them. With
+/// `sealer_seed`, the same rebuild writes the seed a wiped sealer cluster
+/// starts from. Returns the image, so a caller can install it on another
+/// node later.
 async fn install_rebuilt_image(
     h: &Harness,
     ctx: &str,
     nodes: &[String],
     head: u64,
-) -> anyhow::Result<()> {
+    sealer_seed: Option<PathBuf>,
+) -> anyhow::Result<Rebuilt> {
     let mut owners = Vec::with_capacity(nodes.len());
     for node in nodes {
         owners.push(wipe_node(h, ctx, node).await?);
     }
-    let evidence = tempfile::Builder::new()
-        .prefix("chaos-total-wipe-")
-        .tempdir()?
-        .keep();
-    crate::log(format!("{ctx}: rebuild evidence: {}", evidence.display()));
     let rebuilt = Rebuild {
         harness: h,
-        evidence,
-        target: Target {
-            block: head,
-            // No writer is stopped at a known root in the middle of a
-            // case. The end-of-shard audit compares the resumed state
-            // with the validator instead.
-            root: None,
-            end_tx_idx: None,
-        },
-        executor_image: true,
+        evidence: evidence_dir(ctx, "chaos-total-wipe-")?,
+        target: unchecked_target(head),
+        output: Output::ExecutorImage,
+        sealer_seed,
     }
     .run()
     .await?;
@@ -219,43 +242,55 @@ async fn install_rebuilt_image(
     for (node, owner) in nodes.iter().zip(&owners) {
         install_image(h, ctx, node, owner, &rebuilt).await?;
     }
-    Ok(())
+    Ok(rebuilt)
 }
 
-/// Record who owns the node's state database, then wipe its state and
-/// its checkpoints.
+/// A new directory that keeps a rebuild's evidence after the case.
+fn evidence_dir(ctx: &str, prefix: &str) -> anyhow::Result<PathBuf> {
+    let evidence = tempfile::Builder::new().prefix(prefix).tempdir()?.keep();
+    crate::log(format!("{ctx}: rebuild evidence: {}", evidence.display()));
+    Ok(evidence)
+}
+
+/// A rebuild target with no root and no cursor to compare. No writer is
+/// stopped at a known root in the middle of a case. The end-of-shard
+/// audit compares the resumed state with the validator instead.
+fn unchecked_target(block: u64) -> Target {
+    Target {
+        block,
+        root: None,
+        end_tx_idx: None,
+    }
+}
+
+/// Record who owns the executor's state database, then wipe its state
+/// and its checkpoints.
 async fn wipe_node(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<StateOwner> {
-    let owner = StateOwner::read(h, ctx, node).await?;
-    wipe_dirs(
-        h,
-        node,
-        ctx,
-        "rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*",
-    )
-    .await?;
+    let owner = StateOwner::read(h, ctx, node, EXECUTOR_STATE).await?;
+    wipe_dirs(h, node, ctx, &owner.wipe_script()).await?;
     Ok(owner)
 }
 
-/// Who owns an executor's database file, and the mode of its state
+/// Who owns a consumer's database file, and the mode of its state
 /// directory, as `stat` prints them. The directory belongs to the node
 /// and is world-writable; the database file belongs to the user the
-/// executor runs as. A copy from the host carries the host's owner and
+/// consumer runs as. A copy from the host carries the host's owner and
 /// the 0700 mode of a temp directory, and mdbx opens a database it cannot
-/// write as read-only, which the executor refuses. So both are read
+/// write as read-only, which the consumer refuses. So both are read
 /// before the wipe and given to the installed image.
 struct StateOwner {
+    dir: &'static str,
     file_owner: String,
     dir_mode: String,
 }
 
 impl StateOwner {
-    const DIR: &'static str = "/opt/kardamom/state";
+    /// The node's checkpoint directory. A checkpoint of a wiped state is
+    /// a copy of it, so the wipe takes both.
+    const CHECKPOINTS: &'static str = "/opt/kardamom/checkpoints";
 
-    async fn read(h: &Harness, ctx: &str, node: &str) -> anyhow::Result<Self> {
-        let script = format!(
-            "stat -c '%u:%g' {dir}/mdbx.dat && stat -c '%a' {dir}",
-            dir = Self::DIR
-        );
+    async fn read(h: &Harness, ctx: &str, node: &str, dir: &'static str) -> anyhow::Result<Self> {
+        let script = format!("stat -c '%u:%g' {dir}/mdbx.dat && stat -c '%a' {dir}");
         let out = h.nodes.exec(node, &script).await.map_err(|e| {
             crate::chaos_fail!("{ctx}: could not stat the state database on {node}: {e}")
         })?;
@@ -266,18 +301,29 @@ impl StateOwner {
             ));
         };
         Ok(Self {
+            dir,
             file_owner: file_owner.to_string(),
             dir_mode: dir_mode.to_string(),
         })
     }
 
-    /// The script that makes the installed image the executor's own: the
+    /// The script that empties the state directory and the checkpoints,
+    /// hidden files included.
+    fn wipe_script(&self) -> String {
+        format!(
+            "find {dir} {checkpoints} -mindepth 1 -delete",
+            dir = self.dir,
+            checkpoints = Self::CHECKPOINTS
+        )
+    }
+
+    /// The script that makes the installed image the consumer's own: the
     /// writer's lock file removed, every file with the recorded owner, the
     /// directory with its recorded mode.
     fn restore_script(&self) -> String {
         format!(
             "rm -f {dir}/mdbx.lck && chown -R {owner} {dir}/. && chmod {mode} {dir} && chmod -R u+rwX {dir}/. && test -s {dir}/mdbx.dat",
-            dir = Self::DIR,
+            dir = self.dir,
             owner = self.file_owner,
             mode = self.dir_mode
         )
@@ -285,7 +331,7 @@ impl StateOwner {
 }
 
 /// Copy the image into the node's empty state directory, then make it
-/// the executor's own.
+/// the consumer's own.
 async fn install_image(
     h: &Harness,
     ctx: &str,
@@ -295,7 +341,7 @@ async fn install_image(
 ) -> anyhow::Result<()> {
     let source = format!("{}/.", image.state_dir.display());
     h.nodes
-        .docker_ok(&["cp", &source, &format!("{node}:{}/", StateOwner::DIR)])
+        .docker_ok(&["cp", &source, &format!("{node}:{}/", owner.dir)])
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: could not copy the image to {node}: {e}"))?;
     wipe_dirs(h, node, ctx, &owner.restore_script()).await?;

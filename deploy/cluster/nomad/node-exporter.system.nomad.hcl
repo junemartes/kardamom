@@ -5,11 +5,42 @@
 # mounted at /host. The exporter registers the node-exporter Consul
 # service, and the Prometheus of the monitoring job discovers the targets
 # through Consul, so an elastic node is scraped from the moment it joins.
+#
+# The container profile runs every node on one host. There, twelve
+# exporters read the same host hardware files in /sys (cpu, cpufreq,
+# mdadm, nvme), each read takes tens of seconds under load, and the stuck
+# threads pile up in D state until the host stops. So that profile sets
+# host_hardware = "off" and reads only the cheap /proc collectors.
 
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
+}
+
+variable "host_hardware" {
+  type        = string
+  description = "on: every default collector. off: only the /proc collectors (load, memory, network, pressure, vmstat), for nodes that share one host."
+  default     = "on"
+  validation {
+    condition     = contains(["on", "off"], var.host_hardware)
+    error_message = "The host_hardware value must be on or off."
+  }
+}
+
+locals {
+  collectors = {
+    # The pseudo file systems and the container layers are not disks.
+    on = ["--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|host/(dev|proc|sys|run|var/lib/docker/.+))($|/)"]
+    off = [
+      "--collector.disable-defaults",
+      "--collector.loadavg",
+      "--collector.meminfo",
+      "--collector.netdev",
+      "--collector.pressure",
+      "--collector.vmstat",
+    ]
+  }
 }
 
 job "node-exporter" {
@@ -50,12 +81,10 @@ job "node-exporter" {
         # bind it. A file system the host mounts after the start appears at
         # the next restart of the exporter.
         volumes = ["/:/host:ro"]
-        args = [
-          "--path.rootfs=/host",
-          "--web.listen-address=:9100",
-          # The pseudo file systems and the container layers are not disks.
-          "--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|host/(dev|proc|sys|run|var/lib/docker/.+))($|/)",
-        ]
+        args = concat(
+          ["--path.rootfs=/host", "--web.listen-address=:9100"],
+          local.collectors[var.host_hardware],
+        )
       }
 
       resources {

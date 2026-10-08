@@ -184,6 +184,25 @@ fn tx_error_roundtrip() {
     assert_eq!(roundtrip(&e), e);
 }
 
+/// The record-lag refusal keeps its three values and its reason word
+/// through the wire.
+#[test]
+fn record_lag_tx_error_roundtrip() {
+    let e = TxError {
+        sender: Address::repeat_byte(0x56),
+        nonce: 8,
+        reason: TxErrorReason::RecordLag {
+            sealed_index: 20_000,
+            recorded_index: 3_000,
+            budget: 16_384,
+        },
+    };
+    let back = roundtrip(&e);
+    assert_eq!(back, e);
+    assert_eq!(back.reason.word(), "record-lag");
+    assert_eq!(back.reason.expected_nonce(), None);
+}
+
 #[test]
 fn tx_status_roundtrip_every_stage() {
     let hash = B256::repeat_byte(0x33);
@@ -270,6 +289,27 @@ fn tx_ref_roundtrip() {
         tx_data_session_id: 0,
     };
     assert_eq!(roundtrip(&r), r);
+}
+
+#[test]
+fn exec_tx_record_roundtrip() {
+    let v = ExecTxRecord {
+        index: u64::MAX - 7,
+        tx_ref: TxRef {
+            tx_hash: B256::repeat_byte(0x22),
+            shard_id: 3,
+            tx_data_position: pos(9, 8192),
+            tx_data_session_id: -41,
+        },
+        envelope: TxEnvelope {
+            correlation_id: 17,
+            raw_tx: Bytes::from_static(b"signed-tx"),
+            sender: Address::repeat_byte(0x11),
+            tx_hash: B256::repeat_byte(0x22),
+            max_inclusion_block: 1_000,
+        },
+    };
+    assert_eq!(roundtrip(&v), v);
 }
 
 #[test]

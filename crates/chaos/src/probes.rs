@@ -4,7 +4,10 @@
 
 use std::net::Ipv4Addr;
 
+use kardamom_bench::load::MetricsTargets;
+
 use crate::contract::NodeContract;
+use crate::harness::INGRESS_RPC_PORT;
 use crate::metrics::{self, Scrape, Target};
 
 /// The executor gauge that only goes up: the pipeline-progress signal.
@@ -23,9 +26,14 @@ pub const VALIDATOR_PORT: u16 = 9006;
 /// node beyond loopback, so the monitoring job scrapes them.
 pub const BATCHER_PORT: u16 = 9002;
 pub const DA_WATCHER_PORT: u16 = 9005;
+/// The batcher's count of the posts it confirmed on L1.
+pub const BATCHER_POSTED_METRIC: &str = "kardamom_batcher_batches_posted_total";
 pub const INDEXER_PORT: u16 = 9009;
 /// Lane 0's metrics port: `9001 + 10 * lane`.
 pub const SEQUENCER_LANE0_PORT: u16 = 9001;
+/// The highest L1 origin a boundary carried, as a sequencer saw it: the
+/// last L1 block whose epoch the sealer ordered.
+pub const SEQUENCER_L1_ORIGIN_METRIC: &str = "kardamom_sequencer_l1_origin";
 /// The Nomad task name inside the `cluster` job.
 pub const CLUSTER_TASK: &str = "cluster";
 /// The sequencer samples a lane report prints; see
@@ -48,13 +56,27 @@ pub struct Probed {
     pub ip: Ipv4Addr,
 }
 
+impl Probed {
+    /// The load harness target of the exporter on `port` of this node,
+    /// read over the bridge.
+    fn metrics_target(&self, port: u16) -> Target {
+        Target::bridged(self.ip, &self.container, port)
+    }
+
+    /// The JSON-RPC URL of this node, when it is an ingress node.
+    #[must_use]
+    pub fn rpc_url(&self) -> String {
+        format!("http://{}:{INGRESS_RPC_PORT}", self.ip)
+    }
+}
+
 /// The probe set of one cluster.
 #[derive(Debug, Clone)]
 pub struct Probes {
     scrape: Scrape,
     /// The executor nodes, by index.
     pub executors: Vec<Probed>,
-    /// The ingress nodes, by index. Their exporter binds loopback.
+    /// The ingress nodes, by index.
     pub ingresses: Vec<Probed>,
     /// The aux node that runs the validator.
     pub validator: Probed,
@@ -91,6 +113,24 @@ impl Probes {
             validator,
             sequencers: probed(contract, "sequencer"),
         })
+    }
+
+    /// The exporters a load reads over the bridge: every executor, the
+    /// `ingress` it submits through, and the lane-0 replica of every
+    /// sequencer.
+    #[must_use]
+    pub fn load_metrics(&self, ingress: &Probed) -> MetricsTargets {
+        let at = |nodes: &[Probed], port| {
+            nodes
+                .iter()
+                .map(|n| n.metrics_target(port))
+                .collect::<Vec<_>>()
+        };
+        MetricsTargets {
+            executors: at(&self.executors, EXECUTOR_PORT),
+            ingress: ingress.metrics_target(INGRESS_PORT),
+            sequencers: at(&self.sequencers, SEQUENCER_LANE0_PORT),
+        }
     }
 
     /// The scraper, for probes a case builds itself.
@@ -156,10 +196,11 @@ impl Probes {
         metrics::sum_where(&body, metric, label)
     }
 
-    /// One ingress node's loopback target.
+    /// One ingress node's exporter, reached over the bridge. The ingress
+    /// binds its exporter on every address of the host network.
     #[must_use]
     pub fn ingress_target(&self, node: &Probed) -> Target {
-        Target::loopback(&node.container, INGRESS_PORT)
+        Target::bridged(node.ip, &node.container, INGRESS_PORT)
     }
 
     /// The lane-0 replica target on sequencer node `i`.
@@ -234,6 +275,31 @@ impl Probes {
             best = best.max(self.exec_metric(i, metric).await);
         }
         best
+    }
+
+    /// The last L1 block whose epoch the sealer ordered: the highest
+    /// boundary origin any lane-0 replica reports. Every replica reads
+    /// the same boundaries, so the maximum is the freshest view. `None`
+    /// before a replica saw a boundary with an origin.
+    pub async fn sealer_l1_origin(&self) -> Option<u64> {
+        let mut best = None;
+        for i in 0..self.sequencers.len() {
+            best = best.max(self.sequencer_l1_origin(i).await);
+        }
+        best
+    }
+
+    async fn sequencer_l1_origin(&self, i: usize) -> Option<u64> {
+        let body = self.scrape.fetch(&self.sequencer_lane0_target(i)).await?;
+        u64::try_from(metrics::first(&body, SEQUENCER_L1_ORIGIN_METRIC)?).ok()
+    }
+
+    /// The confirmed posts of the running batcher: zero when the
+    /// exporter answers before its first post, `None` when it does not
+    /// answer.
+    pub async fn batcher_posts(&self) -> Option<i64> {
+        self.aux_metric_where(BATCHER_PORT, BATCHER_POSTED_METRIC, "")
+            .await
     }
 
     /// The pipeline-progress probe: the highest committed block any

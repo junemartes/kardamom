@@ -151,8 +151,10 @@ jobs:
     # left five minutes of margin, and a slow runner cancelled a green
     # shard in its last stage. The chaos-l1 shard ends every case with
     # that audit and holds two adaptive freezes, so it runs about 65
-    # minutes. 90 keeps a real hang bounded.
-    timeout-minutes: 90
+    # minutes. The chaos-fleet shard ends with the sealer fleet wipe, two
+    # rebuilds from L1 and a seeded restart, and it runs about 92 minutes
+    # on a slow runner. 120 keeps a real hang bounded.
+    timeout-minutes: 120
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
       # result on a single run.
@@ -165,7 +167,9 @@ jobs:
         # now the deploy uses the clustered sealer — see "Configure shard").
         # chaos-fleet takes every replica of one role down at once: the sealer
         # quorum, the whole sealer set, the whole executor set, with and
-        # without their state databases, and the whole redis job.
+        # without their state databases, and the whole redis job. Its last
+        # case wipes the whole sealer set and restarts the chain from a seed
+        # rebuilt from L1.
         # chaos-coordinated crosses the redundancy of a role: both ingresses,
         # and both replicas of a sequencer lane.
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the
@@ -265,10 +269,15 @@ jobs:
         with:
           just-version: 1.49.0
 
+      # The runner stalls for more than 10 s at times (archive copies,
+      # cluster restarts). At Aeron's 10 s default, a stall kills a
+      # healthy client or media driver. 30 s is the value of the local
+      # e2e harness. The deploy and the chaos knobs read the same value.
       - name: Run shard (${{ matrix.shard }})
         run: just --justfile deploy/cluster/justfile shard "${{ matrix.shard }}"
         env:
           KARDAMOM_STAGED: "1"
+          AERON_STALL_TOLERANCE_MS: "30000"
 
       - name: Collect diagnostics
         if: failure()

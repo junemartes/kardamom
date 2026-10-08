@@ -67,13 +67,15 @@ mod bound;
 mod handles;
 mod pending;
 mod runtime;
+mod table_pub;
 mod thread;
 
 pub use handles::simple::{
-    FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, ServiceEventsPublisherHandle,
-    ServiceEventsSubscriberHandle, TxDepositsPublisherHandle, TxDepositsSubscriberHandle,
-    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
-    TxRemoteEpochsSubscriberHandle, TxStatusPublisherHandle, TxStatusSubscriberHandle,
+    ExecTxsPublisherHandle, ExecTxsSubscriberHandle, FsyncWatermarkPublisherHandle,
+    FsyncWatermarkSubscriberHandle, ServiceEventsPublisherHandle, ServiceEventsSubscriberHandle,
+    TxDepositsPublisherHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle, TxRemoteEpochsSubscriberHandle,
+    TxStatusPublisherHandle, TxStatusSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{

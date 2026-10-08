@@ -9,7 +9,12 @@
 - name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml
   vars:
-    workloads_job: {name: aeron, file: aeron.system.nomad.hcl, retries: 200}
+    workloads_job:
+      name: aeron
+      file: aeron.system.nomad.hcl
+      retries: 200
+      vars:
+        archive_file_sync_level: "{{ workloads_archive_file_sync_level }}"
 
 # The development L1: anvil runs only when no real L1 is given (L1_RPC).
 # Behind the fault proxy, the followers walk finalized blocks, so anvil
@@ -51,6 +56,7 @@
       vars:
         cluster_retention: "{{ workloads_cluster_retention }}"
         cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+        cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
         cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
         cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
         cluster_remote_origins: "{{ workloads_remote_origins }}"
@@ -113,11 +119,16 @@
 # Prometheus scrapes every service by its Consul node name, so it comes
 # up after the services it scrapes; Grafana provisions the dashboards.
 # The host exporter is a system job; Prometheus discovers it through
-# Consul.
+# Consul. The nodes of the local profile share one host, so their
+# exporters skip the host hardware collectors (see the job file).
 - name: Deploy the host exporter and monitoring
   ansible.builtin.include_tasks: job.yml
   loop:
-    - {name: node-exporter, file: node-exporter.system.nomad.hcl, wait: false}
+    - name: node-exporter
+      file: node-exporter.system.nomad.hcl
+      wait: false
+      vars:
+        host_hardware: "{{ 'off' if deployment_profile == 'local' else 'on' }}"
     - {name: monitoring, wait: false}
   loop_control:
     loop_var: workloads_job

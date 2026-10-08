@@ -14,6 +14,15 @@
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
+#
+# The watcher follows the sealer's commit through a boundary-only cluster
+# session (config/da-watcher.toml, --config): the boundaries' L1 origin
+# confirms the published epochs, the epochs that no boundary confirms are
+# published again, and a start resumes after the sealer's origin.
+#
+# The L1 cursor file (the sealer's confirmed L1 origin, by number and
+# hash) lives under /opt/kardamom/da-watcher, a host directory that the
+# common role creates. A start with no boundary resumes after that block.
 
 variable "lockbox_address" {
   type        = string
@@ -35,6 +44,21 @@ variable "image_ref" {
   default     = ""
 }
 
+# The Aeron stall tolerance, in milliseconds: how long an Aeron party
+# waits through a stalled peer before it declares the peer dead. Aeron's
+# default is 10000, and production keeps it: a longer value delays the
+# detection of a dead process. CI raises it to ride out host stalls.
+variable "aeron_stall_tolerance_ms" {
+  type        = number
+  description = "The driver timeout of the Aeron clients of the job, in milliseconds. Aeron's default is 10000."
+  default     = 10000
+
+  validation {
+    condition     = var.aeron_stall_tolerance_ms >= 1000 && floor(var.aeron_stall_tolerance_ms) == var.aeron_stall_tolerance_ms
+    error_message = "The Aeron stall tolerance must be a whole number of milliseconds, at least 1000."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -42,12 +66,11 @@ variable "datacenter" {
 }
 
 # The L1 endpoint the watcher derives epochs from. The default is the
-# in-cluster anvil by its Consul service record. When the L1 light client
-# is deployed (l1-light-client.nomad.hcl), the workloads role points this
-# at the light client, the same as the validator. The watcher is the
-# epoch SOURCE, so a lying endpoint here produces bad epochs at the
-# source rather than false halts (issue #163). Routing it through a
-# verifying client closes that.
+# in-cluster anvil by its Consul service record. The workloads role sets
+# this to its followers' L1 list (`workloads_followers_rpc`). The watcher
+# is the epoch SOURCE, so a lying endpoint here produces bad epochs at
+# the source rather than false halts. Two or more agreeing endpoints, or
+# a light client that settles the reads, close that.
 variable "l1_rpc" {
   type        = string
   description = "The L1 JSON-RPC endpoints the watcher derives epochs from, comma-separated. With two or more, a block is accepted when two agree. Default: the in-cluster anvil by its Consul service record."
@@ -110,6 +133,8 @@ job "da-watcher" {
       port "metrics" {
         static = 9005
       }
+      # The cluster-egress (response) endpoint of the boundary session.
+      port "egress" {}
     }
 
     task "da-watcher" {
@@ -123,13 +148,15 @@ job "da-watcher" {
         # so the pin holds.
         force_pull = true
         # Read-only rootfs. The da-watcher
-        # writes only to the bind-mounted aeron directory, plus
-        # Nomad's alloc, local, and secrets mounts. cluster-e2e
-        # validates this.
+        # writes only to the bind-mounted aeron directory and its cursor
+        # directory, plus Nomad's alloc, local, and secrets mounts.
+        # cluster-e2e validates this.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          # The L1 cursor file lives under the persistent mount.
+          "/opt/kardamom/da-watcher:/opt/kardamom/da-watcher",
         ]
         args = concat(
           [
@@ -138,6 +165,12 @@ job "da-watcher" {
             "--log-config", "/local/channels.toml",
             "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
             "--poll-interval-secs", "1",
+            "--l1-cursor-file", "/opt/kardamom/da-watcher/l1-cursor",
+            # Follow the sealer's boundaries. The egress channel is per
+            # allocation (the node IP and the dynamic port are known only
+            # at placement), so it is injected here.
+            "--config", "/local/da-watcher.toml",
+            "--cluster-egress-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_egress}",
             # Record tx_deposits to the archive, so a restarted
             # executor can replay deposit envelopes (Phase 2 crash
             # recovery).
@@ -148,6 +181,13 @@ job "da-watcher" {
       }
 
       env {
+        # The service identity on the metrics (host_id) and on the events
+        # stream (instance). Each instance must have its own, or the
+        # events of two instances merge into one state.
+        KARDAMOM_HOST_ID = "da-watcher-${NOMAD_ALLOC_INDEX}"
+        # The Aeron C client reads its driver timeout from this variable,
+        # and the service code never overrides it.
+        AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9005"
@@ -162,6 +202,12 @@ job "da-watcher" {
         # there re-renders the file; the process reads it once at start
         # and follows the catalog through discovery, so never restart.
         change_mode = "noop"
+      }
+
+      # The [cluster] section of the boundary session.
+      template {
+        destination = "local/da-watcher.toml"
+        data        = file("config/da-watcher.toml")
       }
 
       service {

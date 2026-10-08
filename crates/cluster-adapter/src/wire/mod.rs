@@ -54,15 +54,16 @@ pub use egress::{
 };
 #[cfg(any(test, feature = "testing"))]
 pub use egress::{
-    encode_contiguity_reject, encode_da_lag_reject, encode_past_deadline, encode_status,
-    encode_window_full,
+    encode_contiguity_reject, encode_da_lag_reject, encode_origin_gap, encode_past_deadline,
+    encode_record_lag_reject, encode_status, encode_window_full,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
     GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
-    encode_ingress_remote_epoch, encode_ingress_txref, encode_replay_request, encode_subscribe,
-    encode_void_request, ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
+    encode_ingress_recorded_cursor, encode_ingress_remote_epoch, encode_ingress_txref,
+    encode_replay_request, encode_subscribe, encode_void_request, ingress_deadline,
+    ingress_sender_nonce, ingress_tip, split_ingress,
 };
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
@@ -163,6 +164,16 @@ pub const KIND_VOID_REQUEST: u8 = 6;
 /// [`EGRESS_KIND_STATUS`] out to every session. Matches Java
 /// `KIND_POSTED_CURSOR`.
 pub const KIND_POSTED_CURSOR: u8 = 7;
+/// Ingress kind: an executor's recorded cursor, a system record:
+/// `[kind:u8 = 9][executor_id:u8][recorded_through:u64]`. Every canonical
+/// index at or below `recorded_through` is joined and recorded by this
+/// executor, or voided. The executor id is its void voter id. The sealer
+/// keeps the best cursor over the executors as the floor of its
+/// record-lag guard. The frame is shorter than a kind-0 frame, so a sealer
+/// that does not know the kind drops it as malformed. Kind 8 is the
+/// sealer's own seed record, which no Rust producer sends. Matches Java
+/// `KIND_RECORDED_CURSOR`.
+pub const KIND_RECORDED_CURSOR: u8 = 9;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the
@@ -227,13 +238,22 @@ pub const EGRESS_KIND_PAST_DEADLINE: u8 = 7;
 /// Matches Java `EGRESS_KIND_WINDOW_FULL`.
 pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
 
-/// Egress kind: the chain's data-availability status, broadcast to every
-/// session on every boundary tick, on every posted cursor, and to a
-/// session that announces itself:
-/// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`.
-/// The ingress serves `safe` from the posted head and raises its `da_lag`
-/// halt from the flag. Not retained. Matches Java `EGRESS_KIND_STATUS`.
+/// Egress kind: the chain's status, broadcast to every session on every
+/// boundary tick, on every posted cursor, on every move up of the best
+/// recorded cursor, and to a session that announces itself:
+/// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`
+/// ([`STATUS_LEN`] bytes), then the record-lag tail
+/// `[best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]`
+/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all). `best_recorded` is
+/// `u64::MAX` before the first recorded cursor. A frame with no tail
+/// decodes as no cursor and the guard off. The ingress serves `safe` from
+/// the posted head and raises its `da_lag` halt from the flag. Not
+/// retained. Matches Java `EGRESS_KIND_STATUS`.
 pub const EGRESS_KIND_STATUS: u8 = 9;
+/// Length of an [`EGRESS_KIND_STATUS`] frame without the record-lag tail.
+pub const STATUS_LEN: usize = 50;
+/// Length of an [`EGRESS_KIND_STATUS`] frame with the record-lag tail.
+pub const STATUS_WITH_RECORD_LAG_LEN: usize = STATUS_LEN + 8 + 8 + 1;
 
 /// Egress kind: the DA-lag guard refused a record:
 /// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.
@@ -241,6 +261,22 @@ pub const EGRESS_KIND_STATUS: u8 = 9;
 /// sequencer drops it and tells the client, which resubmits after the
 /// batcher posts again. Matches Java `EGRESS_KIND_DA_LAG_REJECT`.
 pub const EGRESS_KIND_DA_LAG_REJECT: u8 = 10;
+
+/// Egress kind: the sealer refused an origin record that skips an L1
+/// block: `[kind:u8 = 12][offered_origin:u64][expected_origin:u64]`.
+/// Offered only to the offering session. The record is not ordered, and
+/// its id does not enter the dedup window. The sequencer offers its
+/// unconfirmed epochs again, from `expected_origin`, in order. Matches
+/// Java `EGRESS_KIND_ORIGIN_GAP`.
+pub const EGRESS_KIND_ORIGIN_GAP: u8 = 12;
+
+/// Egress kind: the record-lag guard refused a record:
+/// `[kind:u8 = 13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]`.
+/// `sealed_index` is the last ordered canonical index and
+/// `recorded_index` the best recorded cursor. Offered only to the offering
+/// session, and only while the guard is on. The record is not ordered.
+/// Matches Java `EGRESS_KIND_RECORD_LAG_REJECT`.
+pub const EGRESS_KIND_RECORD_LAG_REJECT: u8 = 13;
 
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the

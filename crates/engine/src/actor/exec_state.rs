@@ -1,7 +1,6 @@
 //! The exec thread's loop state: the `ExecState` struct and its constructor.
 
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -11,18 +10,21 @@ use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
 use crate::reader::ReaderToExec;
 
-use super::types::{BalHandoff, BufferedRecord, ExecToCommit, ExecutorConfig, ResumePoint};
+use super::exec_block::{BalCapture, BlockRun, BlockState};
+use super::types::{BalHandoff, ExecToCommit, ExecutorConfig, ResumePoint};
 use super::wiring::{ExecPorts, SnapshotDb};
 
-/// The optional role-specific hooks `ExecState` carries: BAL capture,
-/// footprint-shadow capture, a whole-block execution strategy, and the two
-/// epoch observers. Grouped so `ExecInputs` and `ExecState::spawn` pass one value
-/// instead of five loose parameters.
+/// The optional role-specific hooks `ExecState` takes: BAL capture,
+/// footprint-shadow capture, a whole-block execution strategy, the two
+/// epoch observers, and the tx hook. Grouped so `ExecInputs` and
+/// `ExecState::spawn` pass one value instead of six loose parameters.
+/// [`ExecState::new`] moves the first three into the [`BlockState`] and the
+/// rest into [`ExecObservers`].
 pub(crate) struct ExecHooks<W: ExecPorts> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     /// Footprint shadow handoff (`crate::shadow`), one per block. Only the
     /// executor role uses this; it is `None` elsewhere. The whole-block
-    /// (validator) path ignores it: captures use the streaming arm instead.
+    /// path drops it: captures use the streaming arm instead.
     pub(super) shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     pub(super) block_exec: Option<W::BlockExec>,
     /// A role-specific epoch check, statically dispatched. See
@@ -33,6 +35,8 @@ pub(crate) struct ExecHooks<W: ExecPorts> {
     /// marker. `None` everywhere until the destination-validator
     /// `RemoteEpochVerifier` lands.
     pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
+    /// Hook around each tx record. See [`crate::actor::TxHook`].
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Every input [`ExecState::new`] and [`ExecState::spawn`] need: the config, the
@@ -61,68 +65,13 @@ pub(super) struct ExecIo<W: ExecPorts> {
     pub(super) sw_queue: W::WriterQueue,
 }
 
-/// Everything that belongs to the block being executed. The boundary arm
-/// consumes or resets each field when it seals the block.
-pub(super) struct BlockState<W: ExecPorts> {
-    pub(super) delta: PendingDelta,
-    /// EIP-7928 capture: the per-block Bal. It is maintained only when a
-    /// publisher is attached (executor role).
-    pub(super) bal: revm::state::bal::Bal,
-    /// Whole-block buffer. Used only when a block-exec strategy is
-    /// supplied (the validator parallel path).
-    pub(super) buffered: Vec<BufferedRecord>,
-    /// Per-block execution scope (streaming path): one EVM and one
-    /// commit-into cache for the whole block. Building these per tx used
-    /// about 90% of the allocation in the execution path.
-    ///
-    /// The code drops the scope at each boundary. It rebuilds the scope
-    /// lazily, at the block's first tx. The rebuild seeds it with the
-    /// parent and anything already in the live delta, for example deposits
-    /// that landed before the first tx.
-    pub(super) scope: Option<crate::executor::Executor<SnapshotDb<W>>>,
-    /// Per-block receipts, in arrival order. The code drains this into the
-    /// `BlockDelta` at each boundary, so the writer can persist the receipts
-    /// and the `tx_hash_index` tables. Each tx's receipt is cloned once, to
-    /// feed both this list and the streaming `tx_receipts` publisher. This
-    /// clone cost is flagged for saturation validation.
-    pub(super) receipts: Vec<kardamom_types::Receipt>,
-    /// The reference of every transaction of the block, in arrival
-    /// order: where its bytes are on a `tx_data` archive. The boundary
-    /// hands them to the state writer, which keeps each one with its
-    /// receipt, so the batcher can rebuild a block the sealer no longer
-    /// retains. One 56-byte copy per transaction.
-    pub(super) refs: Vec<kardamom_types::TxRef>,
-    /// Per-block RPC enrichment counters.
-    pub(super) tx_index: u64,
-    pub(super) cumulative_gas_used: u64,
-    /// Wall time spent executing the block's txs and deposits. This
-    /// excludes channel idle time between txs. The `BoundaryStart` handler
-    /// records this value when it closes the block. It is `None` for empty
-    /// blocks.
-    pub(super) apply_elapsed: Option<Duration>,
-    /// Shadow tx captures and the serial-lane count for the current block.
-    /// The code hands these off with `try_send` at each boundary; this never
-    /// blocks. Both stay empty when the shadow is off.
-    pub(super) shadow_captures: Vec<crate::shadow::ShadowTxCapture>,
-    pub(super) shadow_serial: u32,
-}
-
-impl<W: ExecPorts> BlockState<W> {
-    fn new() -> Self {
-        Self {
-            delta: PendingDelta::new(),
-            bal: revm::state::bal::Bal::new(),
-            buffered: Vec::new(),
-            scope: None,
-            receipts: Vec::new(),
-            refs: Vec::new(),
-            tx_index: 0,
-            cumulative_gas_used: 0,
-            apply_elapsed: None,
-            shadow_captures: Vec::new(),
-            shadow_serial: 0,
-        }
-    }
+/// The role's record hooks: the epoch checks, which the marker arms run,
+/// and the tx hook, which `on_tx` runs. An epoch check that is `None`
+/// does not run.
+pub(super) struct ExecObservers<W: ExecPorts> {
+    pub(super) epoch_observer: Option<W::Epoch>,
+    pub(super) remote_epoch_observer: Option<W::RemoteEpoch>,
+    pub(super) tx_hook: W::TxHook,
 }
 
 /// Pipelined commit, at depth K. At each boundary, the code submits the
@@ -202,7 +151,7 @@ pub(super) struct ExecMetrics {
 pub(crate) struct ExecState<W: ExecPorts> {
     pub(super) cfg: ExecutorConfig,
     pub(super) io: ExecIo<W>,
-    pub(super) hooks: ExecHooks<W>,
+    pub(super) observers: ExecObservers<W>,
     pub(super) block: BlockState<W>,
     pub(super) commits: CommitPipeline<W>,
     pub(super) cursor: Cursor,
@@ -227,7 +176,15 @@ impl<W: ExecPorts> ExecState<W> {
             sw_signal,
             sw_queue,
             start,
-            hooks,
+            hooks:
+                ExecHooks {
+                    bal_tx,
+                    shadow_tx,
+                    block_exec,
+                    epoch_observer,
+                    remote_epoch_observer,
+                    tx_hook,
+                },
         } = inputs;
         let snapshot = snapshots.snapshot_after(start.block);
         let fees = start.block_fees(cfg.fees);
@@ -240,8 +197,15 @@ impl<W: ExecPorts> ExecState<W> {
                 sw_signal,
                 sw_queue,
             },
-            hooks,
-            block: BlockState::new(),
+            observers: ExecObservers {
+                epoch_observer,
+                remote_epoch_observer,
+                tx_hook,
+            },
+            block: BlockState::new(
+                BlockRun::new(block_exec, shadow_tx),
+                bal_tx.map(BalCapture::new),
+            ),
             commits: CommitPipeline {
                 snapshot,
                 parent: None,

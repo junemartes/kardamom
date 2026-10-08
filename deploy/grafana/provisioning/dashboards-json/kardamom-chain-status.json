@@ -1,0 +1,546 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["kardamom", "status", "incident"],
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Kardamom Chain Status",
+  "uid": "kardamom-chain-status",
+  "version": 1,
+  "weekStart": "",
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kardamom_service_up, host_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "host",
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": {"query": "label_values(kardamom_service_up, host_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "10000", "value": "10000"},
+        "description": "The deploy's KARDAMOM_DA_LAG_BUDGET_BLOCKS. No metric exports it.",
+        "hide": 0,
+        "label": "DA-lag budget (blocks)",
+        "name": "da_lag_budget",
+        "options": [{"selected": true, "text": "10000", "value": "10000"}],
+        "query": "10000",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Service instances that halted on their own fault.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "count(kardamom_halt == 1) or vector(0)", "range": true, "refId": "A"}],
+      "title": "Halted",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Service instances that wait on a root outside themselves, or on an operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "count(kardamom_paused == 1) or vector(0)", "range": true, "refId": "A"}],
+      "title": "Paused",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)", "range": true, "refId": "A"}
+      ],
+      "title": "Firing alerts",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Service exporters that Prometheus cannot scrape: the process is down, frozen, or unreachable.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "count(up{job=~\"kardamom-.+\"} == 0) or vector(0)", "range": true, "refId": "A"}
+      ],
+      "title": "Scrape targets down",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The sealed head less the posted head, as the ingresses see it.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "max(kardamom_ingress_cluster_sealed_head - kardamom_ingress_cluster_posted_head)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "DA lag (blocks)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "s",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 600}, {"color": "red", "value": 1800}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 6,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "max(kardamom_batcher_last_post_age_seconds)", "range": true, "refId": "A"}],
+      "title": "Batcher last post age",
+      "type": "stat"
+    },
+    {
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 4},
+      "id": 7,
+      "options": {
+        "code": {"language": "plaintext", "showLineNumbers": false, "showMiniMap": false},
+        "content": "**In an incident:** find the root. A halted service names its cause and runbook (recovery). A paused\nservice names the root it waits on (root_service, cause). Fix the root; the pauses clear by themselves.\n\nThe full board of service states, with the records of services that stopped, is the JSON-RPC method\n`kardamom_chainStatus` on any ingress. Each service also serves its halt at `/halt` on its metrics port.\nRunbooks: `docs/runbooks/<cause>.md`. Set the DA-lag budget variable to the deploy's\n`KARDAMOM_DA_LAG_BUDGET_BLOCKS` (default 10000): no metric exports the budget.",
+        "mode": "markdown"
+      },
+      "title": "How to read this page",
+      "type": "text"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 9}, "id": 8, "panels": [], "title": "Service states", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Each service instance: running, paused or halted. A halt has priority over a pause.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {"text": "running", "color": "green", "index": 0},
+                "1": {"text": "paused", "color": "yellow", "index": 1},
+                "2": {"text": "halted", "color": "red", "index": 2}
+              }
+            }
+          ],
+          "custom": {"cellOptions": {"type": "color-background"}},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 10, "w": 8, "x": 0, "y": 10},
+      "id": 9,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "max by (service, host_id) (2 * (kardamom_halt == 1) or (kardamom_paused == 1) or 0 * kardamom_service_up)",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Service state",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true}, "indexByName": {}, "renameByName": {"Value": "state"}}
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "recovery is the id of the runbook: docs/runbooks/<cause>.md.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 8, "x": 8, "y": 10},
+      "id": 10,
+      "options": {"showHeader": true},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_halt == 1", "format": "table", "instant": true, "range": false, "refId": "A"}
+      ],
+      "title": "Halts: cause and recovery",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true, "Value": true}, "indexByName": {}, "renameByName": {}}
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "root_service and cause name the halt the service waits on; operator means an operator paused it.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 8, "x": 16, "y": 10},
+      "id": 11,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_paused == 1",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Pauses: reason and root",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true, "Value": true},
+            "indexByName": {},
+            "renameByName": {"root_service": "root service", "cause": "root cause"}
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {"text": "running", "color": "green", "index": 0},
+                "1": {"text": "paused", "color": "yellow", "index": 1},
+                "2": {"text": "halted", "color": "red", "index": 2}
+              }
+            }
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 20},
+      "id": 12,
+      "options": {
+        "alignValue": "left",
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "auto",
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "max by (service, host_id) (2 * (kardamom_halt == 1) or (kardamom_paused == 1) or 0 * kardamom_service_up)",
+          "legendFormat": "{{service}} {{host_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Service state over time",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "kardamom_halt{service, cause, recovery}: 1 while halted, 0 after the halt cleared.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+      "id": 13,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_halt",
+          "legendFormat": "{{service}} {{host_id}} {{cause}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Halt gauge",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "A service that no longer answers shows here and not in the state tables.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+      "id": 14,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "up{job=~\"kardamom-.+\"} == 0",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Scrape targets down",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true, "Value": true}, "indexByName": {}, "renameByName": {}}
+        }
+      ],
+      "type": "table"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38}, "id": 15, "panels": [], "title": "DA lag", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "From the sealer's status frame, as each ingress sees it. posted: the last L2 block on L1 (the safe head).",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 39},
+      "id": 16,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_ingress_cluster_sealed_head{host_id=~\"$host\"}",
+          "legendFormat": "sealed {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_ingress_cluster_posted_head{host_id=~\"$host\"}",
+          "legendFormat": "posted {{host_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Posted head and sealed head",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The sealed head less the posted head. Past the budget, the sealer refuses new transactions (halt cause da_lag).",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 39},
+      "id": 17,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_ingress_cluster_sealed_head{host_id=~\"$host\"} - kardamom_ingress_cluster_posted_head{host_id=~\"$host\"}",
+          "legendFormat": "lag {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "vector($da_lag_budget)", "legendFormat": "budget", "range": true, "refId": "B"}
+      ],
+      "title": "DA lag and budget (blocks)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"lineWidth": 1, "fillOpacity": 10, "thresholdsStyle": {"mode": "line"}},
+          "unit": "percent",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 100}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 39},
+      "id": 18,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "100 * max(kardamom_ingress_cluster_sealed_head - kardamom_ingress_cluster_posted_head) / $da_lag_budget",
+          "legendFormat": "lag",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "DA lag of the budget (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "s", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 47},
+      "id": 19,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_batcher_last_post_age_seconds",
+          "legendFormat": "age {{host_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "2 * kardamom_batcher_idle_flush_seconds",
+          "legendFormat": "alert threshold {{host_id}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Batcher last post age",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Seconds since each sequencer saw a block boundary of the sealer. The ingress halts the sealer as sealer_no_quorum after 10 s without one.",
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "s", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 47},
+      "id": 20,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "time() - kardamom_sequencer_last_boundary_unix_seconds",
+          "legendFormat": "{{host_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sealer: last boundary age (sequencers)",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 55}, "id": 21, "panels": [], "title": "Alerts", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "The alerts of deploy/alerts.yml and of the operator's rules, from Prometheus.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 56},
+      "id": 22,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "ALERTS{alertstate=~\"firing|pending\"}",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Firing and pending alerts",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {"excludeByName": {"Time": true, "__name__": true, "instance": true, "job": true, "Value": true}, "indexByName": {}, "renameByName": {}}
+        }
+      ],
+      "type": "table"
+    }
+  ]
+}

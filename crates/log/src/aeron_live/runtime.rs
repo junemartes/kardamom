@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, Sender as CbSender};
 use rkyv::util::AlignedVec;
@@ -22,9 +21,11 @@ use crate::error::LogError;
 use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 mod publication;
+mod start;
 
 pub(super) use publication::OpenedPub;
 pub use publication::PubHandle;
+use start::{StartReport, StartWait};
 
 // ---------------------------------------------------------------------------
 // AeronRuntime: the single Aeron thread + command bus.
@@ -68,10 +69,20 @@ pub(super) enum RuntimeCmd {
     },
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },
+    /// Lossy publish — one offer, no ack, a refused frame only counts.
+    PublishLossy { pub_id: u32, bytes: AlignedVec },
     /// Register a new publication. The Aeron thread executes
     /// `aeron.add_publication()` and replies with the assigned `pub_id`
     /// and the publication's Aeron session id.
     OpenPublication {
+        uri: String,
+        stream_id: i32,
+        ack: CbSender<Result<OpenedPub, LogError>>,
+    },
+    /// Register a new exclusive publication. The Aeron thread executes
+    /// `aeron.add_exclusive_publication()`, so the publication has its own
+    /// session even when another client adds the same channel and stream.
+    OpenExclusivePublication {
         uri: String,
         stream_id: i32,
         ack: CbSender<Result<OpenedPub, LogError>>,
@@ -143,23 +154,19 @@ fn request<R>(
 }
 
 /// The Aeron thread's whole body, run by [`AeronRuntime::spawn_with`] on
-/// its dedicated OS thread. Builds the client with `make_ctx`, reports the
-/// outcome on `started_tx`, then runs the poll/command loop until it exits.
+/// its dedicated OS thread. Builds the client with `make_ctx`, reports
+/// each start step on `report`, then runs the poll/command loop until it
+/// exits.
 fn aeron_thread_main<F>(
     make_ctx: F,
     cmd_rx: crossbeam_channel::Receiver<RuntimeCmd>,
-    started_tx: &CbSender<Result<(), LogError>>,
+    report: &StartReport,
 ) where
     F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
 {
-    let aeron = match make_ctx().and_then(|ctx| build_aeron(&ctx)) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = started_tx.send(Err(e));
-            return;
-        }
+    let Some(aeron) = report.start(make_ctx) else {
+        return;
     };
-    let _ = started_tx.send(Ok(()));
     if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
         error!(error = %e, "aeron runtime thread exited with error");
     }
@@ -188,7 +195,7 @@ impl AeronRuntime {
     /// # Errors
     ///
     /// Returns an error if building the default `AeronContext` fails, or
-    /// if the Aeron thread fails to start within 10 s (see
+    /// if the Aeron thread fails to start in time (see
     /// [`spawn_with`](Self::spawn_with)).
     pub fn spawn_default() -> Result<Self, LogError> {
         Self::spawn_with(|| {
@@ -224,33 +231,30 @@ impl AeronRuntime {
     /// without crossing the `!Send + !Sync` boundary that `AeronContext`
     /// sits on.
     ///
+    /// The wait for the start follows the driver timeout of the context:
+    /// the Aeron C client waits up to that timeout for a live media
+    /// driver, for example while a restarted driver comes up. The wait is
+    /// the driver timeout plus 5 s, and at least 10 s.
+    ///
     /// # Errors
     ///
     /// Returns an error if `make_ctx` fails, if building the `Aeron`
     /// client from the resulting context fails, if the OS thread spawn
-    /// fails, or if the Aeron thread does not signal a successful start
-    /// within 10 s.
+    /// fails, if `make_ctx` does not return within 10 s, or if the Aeron
+    /// thread does not signal a successful start within the wait above.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
     {
-        let (started_tx, started_rx) = crossbeam_channel::bounded::<Result<(), LogError>>(1);
+        let (report, wait) = StartWait::channel();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RuntimeCmd>();
 
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
-            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &started_tx))
+            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &report))
             .map_err(|e| LogError::Aeron(format!("spawn aeron thread: {e}")))?;
 
-        match started_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(LogError::Aeron(
-                    "aeron thread did not signal start within 10s".into(),
-                ));
-            }
-        }
+        wait.wait()?;
 
         let thread = Arc::new(AeronThread {
             cmd_tx: cmd_tx.clone(),
@@ -587,6 +591,16 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
 
     pub fn try_recv(&mut self) -> Option<(BPosition, T)> {
         try_recv_decoded(&mut self.rx, decode_typed_frame)
+    }
+
+    /// The next frame, with the Aeron session id of its publication. Each
+    /// publisher process opens its own publication, so the session tells
+    /// apart the publishers of one stream.
+    pub async fn recv_from(&mut self) -> Option<(i32, T)> {
+        recv_decoded(&mut self.rx, |frame| {
+            decode_typed_frame(frame).map_break(|(_, v)| (frame.session, v))
+        })
+        .await
     }
 }
 

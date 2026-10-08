@@ -54,7 +54,7 @@ fn spawn_resuming(
     feed: &MockInteropFeed,
     publisher: InMemoryRemoteEpochPublisher,
     start_seq: u64,
-    cursor_file: Option<CursorFile>,
+    cursor_file: Option<CursorFile<u64>>,
 ) -> WatcherHandle {
     let source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
         .with_reconnect(Duration::from_millis(20), NonZeroU32::new(50).unwrap());
@@ -459,10 +459,10 @@ async fn a_crash_between_publish_and_persist_resumes_stale_and_dedup_absorbs() {
         n, 1,
         "the re-publish is reported successful to the producer"
     );
-    cursor_file.persist(w.cursor()).unwrap();
+    cursor_file.persist(&w.cursor()).unwrap();
     let n = w.process_once().await.unwrap();
     assert_eq!(n, 1);
-    cursor_file.persist(w.cursor()).unwrap();
+    cursor_file.persist(&w.cursor()).unwrap();
 
     // The duplicate was absorbed, not executed twice: one copy of each
     // record, one dedup hit, and the lane is dense.
