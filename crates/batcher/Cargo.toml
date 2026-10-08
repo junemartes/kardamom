@@ -78,6 +78,8 @@ tempfile = { workspace = true, optional = true }
 anyhow.workspace = true
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format constants against it.
+kardamom-formats.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-deployer = { path = "../deployer", features = ["test-support"] }
 kardamom-batcher = { path = ".", features = ["test-support"] }

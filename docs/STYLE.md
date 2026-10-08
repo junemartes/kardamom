@@ -43,6 +43,12 @@ instruction per sentence.
   point at which a channel sender closes.
 - Keep log message text and fields, metric names, and CLI flag names.
 
+## Stored and wire formats
+
+A change to a stored or wire format follows `docs/formats.md`. The same
+change updates `formats.toml`. `just check-formats BASE` compares the file
+with the base revision.
+
 ## Mechanical checks
 
 `just style` runs three steps and reports every failure at the end. It exits non-zero when any step fails.

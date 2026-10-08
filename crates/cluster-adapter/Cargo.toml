@@ -33,6 +33,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The format registry: a test checks this crate's format constants against it.
+kardamom-formats.workspace = true
 kardamom-cluster-adapter = { path = ".", features = ["testing"] }
 toml.workspace = true
 kardamom-sequencer = { path = "../sequencer" }
