@@ -129,6 +129,8 @@ impl EngineWiring for ValidatorWiring {
     type TxData = bin_support::LiveTxDataSub;
     type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = TxReceiptsChain;
+    // The validator publishes no executor stream.
+    type ExecStream = kardamom_engine::NoExecStream;
 }
 
 impl Ready {

@@ -5,7 +5,7 @@
 //! `null`.
 
 use alloy_primitives::{Address, B256};
-use kardamom_types::{TxErrorReason, TxStage, TxStageKind, TxStatus};
+use kardamom_types::{TxStage, TxStageKind, TxStatus};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// One status event as a client sees it. `sender` and `nonce` are
@@ -59,10 +59,11 @@ impl TxStatusEvent {
         let (sender, nonce) = identity.map_or((None, None), |(s, n)| (Some(s), Some(n)));
         let (receipt_status, reason, expected_nonce) = match &status.stage {
             TxStage::Executed { status, .. } => (Some(u8::from(*status)), None, None),
-            TxStage::Rejected { reason, .. } => {
-                let (word, expected) = describe_reason(reason);
-                (None, Some(word.to_string()), expected)
-            }
+            TxStage::Rejected { reason, .. } => (
+                None,
+                Some(reason.word().to_string()),
+                reason.expected_nonce(),
+            ),
             TxStage::Offered { .. } | TxStage::Sealed => (None, None, None),
         };
         Self {
@@ -74,23 +75,6 @@ impl TxStatusEvent {
             reason,
             expected_nonce,
         }
-    }
-}
-
-/// The rejection words the receipt feed uses, so one client vocabulary
-/// serves both feeds. The deadline names a block, the fee reasons name
-/// amounts, and a halt names the chain's state, not a nonce, so their
-/// expected nonce stays empty.
-fn describe_reason(reason: &TxErrorReason) -> (&'static str, Option<u64>) {
-    match reason {
-        TxErrorReason::DuplicatedTx { expected_nonce } => ("duplicated-tx", Some(*expected_nonce)),
-        TxErrorReason::Evicted { expected_nonce } => ("evicted", Some(*expected_nonce)),
-        TxErrorReason::Expired { expected_nonce } => ("expired", Some(*expected_nonce)),
-        TxErrorReason::PastDeadline { .. } => ("past-deadline", None),
-        TxErrorReason::FeeInvalid { .. } => ("fee-invalid", None),
-        TxErrorReason::FeeTooLow { .. } => ("fee-too-low", None),
-        TxErrorReason::InsufficientFunds { .. } => ("insufficient-funds", None),
-        TxErrorReason::DaLag { .. } => ("da-lag", None),
     }
 }
 

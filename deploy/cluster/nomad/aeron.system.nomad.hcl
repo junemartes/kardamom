@@ -92,7 +92,7 @@ locals {
 # -Daeron.archive.catalog.file.sync.level): 0 leaves a write in the page
 # cache until the kernel flushes it, 1 syncs the data of every write
 # batch, 2 syncs data and metadata. At 1 the recording position of a
-# tx_data or tx_deposits recording is durable on disk. Level 1 costs
+# tx_data, tx_deposits or exec_txs recording is durable on disk. Level 1 costs
 # throughput on the recording path. Ansible deployment passes -var from
 # KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL.
 variable "archive_file_sync_level" {
@@ -239,8 +239,9 @@ job "aeron" {
       # the topics each node's archive records. `archive_topics` is
       # node meta the Nomad agent template stamps from the node role set
       # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
-      # record tx_data, the da-watcher node records tx_deposits, every other
-      # node records nothing and lists no topic. Nomad owns this record;
+      # record tx_data, the da-watcher node records tx_deposits, each
+      # executor node records the exec_txs stream of its own executor, every
+      # other node records nothing and lists no topic. Nomad owns this record;
       # the runtime never registers an archive. The record outlives every
       # publisher, so retained recordings stay discoverable.
       service {
@@ -271,7 +272,8 @@ job "aeron" {
       # and aux nodes, whose archive records a topic) they reach 350 MB,
       # and the kernel OOM-kills a driver limited to 384 MB. The service
       # containers of the node then fail on "aeron thread did not signal
-      # start".
+      # start". An executor node also records a topic: its one exec_txs
+      # IPC publication adds 3 terms of 4 MiB, which this size holds.
       resources {
         cpu    = 400
         memory = 768

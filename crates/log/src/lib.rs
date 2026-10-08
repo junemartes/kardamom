@@ -30,6 +30,7 @@ mod archive_catalog;
 pub mod codec;
 pub mod config;
 pub mod discovery;
+mod driver_budget;
 pub mod error;
 mod ffi;
 mod offer_retry;

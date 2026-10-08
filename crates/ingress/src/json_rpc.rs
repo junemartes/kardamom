@@ -384,15 +384,12 @@ impl ReceiptSubscription {
     fn on_error_result(&self, e: Result<TxError, broadcast::error::RecvError>) -> NextEvent {
         match e {
             Ok(err) if !self.filter.allows(err.sender) => NextEvent::FilteredOut,
-            Ok(err) => {
-                let (reason, expected_nonce) = describe_tx_error(&err.reason);
-                NextEvent::Event(ReceiptEvent::TxError {
-                    sender: err.sender,
-                    nonce: err.nonce,
-                    reason,
-                    expected_nonce,
-                })
-            }
+            Ok(err) => NextEvent::Event(ReceiptEvent::TxError {
+                sender: err.sender,
+                nonce: err.nonce,
+                reason: err.reason.word().to_string(),
+                expected_nonce: err.reason.expected_nonce(),
+            }),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
             }
@@ -407,34 +404,6 @@ impl ReceiptSubscription {
         let msg = serde_json::value::to_raw_value(event)
             .map_err(|e| format!("serialize subscription event: {e}"))?;
         Ok(self.sink.send(msg).await.is_ok())
-    }
-}
-
-/// Human- and machine-readable description of a sequencer rejection for
-/// the subscription stream. This match is exhaustive on purpose: a new
-/// `TxErrorReason` variant must decide its wire shape here.
-fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<u64>) {
-    match reason {
-        kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => {
-            ("duplicated-tx".to_string(), Some(*expected_nonce))
-        }
-        kardamom_types::TxErrorReason::Evicted { expected_nonce } => {
-            ("evicted".to_string(), Some(*expected_nonce))
-        }
-        kardamom_types::TxErrorReason::Expired { expected_nonce } => {
-            ("expired".to_string(), Some(*expected_nonce))
-        }
-        // The deadline names a block, not a nonce, so the nonce field of
-        // this wire shape stays empty. The fee reasons name amounts, not
-        // a nonce, so it stays empty for them too.
-        kardamom_types::TxErrorReason::PastDeadline { .. } => ("past-deadline".to_string(), None),
-        kardamom_types::TxErrorReason::FeeInvalid { .. } => ("fee-invalid".to_string(), None),
-        kardamom_types::TxErrorReason::FeeTooLow { .. } => ("fee-too-low".to_string(), None),
-        kardamom_types::TxErrorReason::InsufficientFunds { .. } => {
-            ("insufficient-funds".to_string(), None)
-        }
-        // A halt names the chain's state, not a nonce.
-        kardamom_types::TxErrorReason::DaLag { .. } => ("da-lag".to_string(), None),
     }
 }
 

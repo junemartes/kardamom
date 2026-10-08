@@ -24,9 +24,14 @@
 //! [`ReceiptBuffer`]). The sync exec/commit threads drain the buffers and
 //! wait briefly for the matching data to arrive.
 //!
+//! Every executor replica publishes its own BAL and receipts. The seams
+//! compare the result of every replica. A divergence names every replica
+//! session whose result differs, and counts the ones that agree
+//! ([`Attribution`]).
+//!
 //! Module layout: the seams are in `seams.rs`, their verification buffers
-//! are in `buffers.rs`. Both re-export here, so the crate root is the one
-//! import path.
+//! are in `buffers.rs`, and the per-replica check is in `replica.rs`. All
+//! three re-export here, so the crate root is the one import path.
 
 // The `#[async_trait]` and `#[rpc]` macros expand trait methods to functions
 // that carry a bare `#[must_use]` and return a pinned boxed future, which is
@@ -63,9 +68,11 @@ pub mod witness;
 
 mod block_accum;
 mod buffers;
+mod replica;
 mod seams;
 
 pub use buffers::*;
+pub use replica::{Attribution, Check, Distinct, ReplicaId, Taken};
 pub use seams::*;
 
 /// Shared divergence flag. Once set, the validator has found a proven
@@ -75,6 +82,9 @@ pub use seams::*;
 pub struct Divergence {
     halted: AtomicBool,
     reason: OnceLock<String>,
+    /// The replicas that the first divergence names, when replica results
+    /// proved it.
+    replica: OnceLock<Attribution>,
 }
 
 impl Divergence {
@@ -86,12 +96,29 @@ impl Divergence {
     /// Record a divergence and bump the metric. This is idempotent: the first
     /// reason wins.
     pub fn record(&self, reason: impl Into<String>) {
-        if !self.halted.swap(true, Ordering::SeqCst) {
-            let reason = reason.into();
-            tracing::error!(reason = %reason, "validator divergence detected — halting");
-            let _ = self.reason.set(reason);
-            metrics::counter_divergence();
+        self.latch(reason.into(), None);
+    }
+
+    /// Record the first divergence: the reason, the log line, and the
+    /// metrics. A later call changes nothing.
+    fn latch(&self, reason: String, replica: Option<Attribution>) {
+        if self.halted.swap(true, Ordering::SeqCst) {
+            return;
         }
+        tracing::error!(
+            reason = %reason,
+            replicas = replica.as_ref().map(Attribution::sessions).as_deref(),
+            check = replica.as_ref().map(|a| a.check.id()),
+            validator_suspect = replica.as_ref().map(Attribution::validator_suspect),
+            "validator divergence detected — halting"
+        );
+        let _ = self.reason.set(reason);
+        metrics::counter_divergence();
+        let Some(attribution) = replica else {
+            return;
+        };
+        metrics::counter_replica_divergence(&attribution);
+        let _ = self.replica.set(attribution);
     }
 
     #[must_use]
@@ -122,6 +149,23 @@ impl Divergence {
     pub fn halt(&self, reason: String) -> String {
         self.record(reason.clone());
         reason
+    }
+
+    /// [`halt`](Self::halt) for a divergence that replica results prove.
+    /// The reason ends with the attribution, so the verdict file and the
+    /// halt record name the replicas too.
+    pub fn halt_replica(&self, attribution: Attribution, detail: &str) -> String {
+        let reason = format!("{detail} [{attribution}]");
+        self.latch(reason.clone(), Some(attribution));
+        reason
+    }
+
+    /// The replicas that the recorded divergence names. `None` when no
+    /// divergence stands, or when no replica result proved it (an epoch
+    /// fault, a forged record).
+    #[must_use]
+    pub fn replica(&self) -> Option<Attribution> {
+        self.replica.get().cloned()
     }
 }
 

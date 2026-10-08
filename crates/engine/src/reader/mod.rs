@@ -51,14 +51,16 @@ mod void;
 
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{
-    EpochObserver, ExecSink, JoinRecovery, JoinRecoveryError, JoinRecoveryFactory, NoEpochCheck,
-    NoRemoteEpochCheck, RemoteEpochObserver, SinkClosed, TxDataSubscription,
-    TxOrderingSubscription,
+    EpochObserver, ExecSink, ExecStreamItem, ExecStreamSink, JoinRecovery, JoinRecoveryError,
+    JoinRecoveryFactory, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, RemoteEpochObserver,
+    SinkClosed, TxDataSubscription, TxOrderingSubscription,
 };
 pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_exec_stream;
 #[cfg(test)]
 mod tests_remote;
 #[cfg(test)]

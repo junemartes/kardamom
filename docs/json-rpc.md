@@ -34,6 +34,7 @@ receipt fields, the errors and the limits.
   - It holds the connection while it waits. Each held call uses one connection.
   - The wait ends with an error if the sequencer rejects the transaction, or if the timeout passes.
   - A DA-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `da_lag` at the service `sealer`.
+  - A record-lag reject from the sealer also ends the wait. The error is `-32010`, with the cause `record_lag` at the service `sealer`. The record-lag guard is off by default until a later release.
   - The timeout is 30 seconds. The `--pending-receipt-timeout-ms` flag (env `KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS`) sets it.
 - `kardamom_sendRawTransactionAsync` validates the transaction and publishes it. It returns the hash at once.
   - Use it to keep many transactions in flight on one connection.
@@ -184,6 +185,7 @@ A receipt is an Ethereum receipt with two more fields.
 | `fee-too-low` | `null` | The fee cap is below the base fee. |
 | `insufficient-funds` | `null` | The balance does not cover the worst-case cost. |
 | `da-lag` | `null` | The sealer refused the transaction because the sealed head is too far past the posted head. Submit again after the batcher posts. |
+| `record-lag` | `null` | The sealer refused the transaction because no executor recorded the chain within the record-lag budget. Submit again after an executor records. |
 
 - After a `lagged` frame, the client must poll `eth_getTransactionReceipt` for the transactions it waits for. Then it can continue to read the stream.
 - The subscription ends if the sink closes or a feed closes.
@@ -249,6 +251,7 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
 - The `data` of an operator pause is `{"cause":"operator","halt":"/halt"}`.
 - The pause check runs in the submit order after the drain check and before the rate limit. A refused call uses no token.
 - A DA-lag reject from the sealer reaches a waiting `eth_sendRawTransaction` as the same error, with `da_lag` at `sealer`. The `txError` frame has the reason `da-lag`.
+- A record-lag reject from the sealer reaches a waiting `eth_sendRawTransaction` as the same error, with `record_lag` at `sealer`. The `txError` frame has the reason `record-lag`.
 - Wait for the root to clear, then submit again. The ingress resumes by itself. An operator pause ends only on the operator resume.
 - The cause table and the halt model are in [Failure modes](failure-modes.md#halts-and-service-events). The recovery steps are in the [runbooks](runbooks/README.md).
 

@@ -262,6 +262,13 @@ impl TxReceiptsPublisherHandle {
         self.inner.publish(batch)
     }
 
+    /// The Aeron session id of the receipt publication. A validator names
+    /// this replica by it when the replica's receipts diverge.
+    #[must_use]
+    pub fn session_id(&self) -> i32 {
+        self.inner.session_id()
+    }
+
     /// Publish one receipt with no account rows, as a batch of one.
     ///
     /// # Errors
@@ -345,7 +352,7 @@ impl TxReceiptsSubscriberHandle {
     }
 
     /// See [`TxReceiptsReceiver::recv_batch`].
-    pub async fn recv_batch(&mut self) -> Option<(BPosition, ReceiptBatch)> {
+    pub async fn recv_batch(&mut self) -> Option<(i32, ReceiptBatch)> {
         self.receiver.recv_batch().await
     }
 
@@ -461,17 +468,19 @@ impl TxReceiptsReceiver {
         self.pending.pop_front()
     }
 
-    /// The next whole batch frame, receipts and account rows together. A
-    /// consumer that reads batches must not also call [`recv`](Self::recv)
-    /// on the same receiver: `recv` fans a frame out into receipts and
-    /// drops its rows. A malformed frame is skipped.
-    pub async fn recv_batch(&mut self) -> Option<(BPosition, ReceiptBatch)> {
+    /// The next whole batch frame, receipts and account rows together,
+    /// with the Aeron session id of its publication. Each executor replica
+    /// opens its own publication, so the session tells the replicas apart.
+    /// A consumer that reads batches must not also call
+    /// [`recv`](Self::recv) on the same receiver: `recv` fans a frame out
+    /// into receipts and drops its rows. A malformed frame is skipped.
+    pub async fn recv_batch(&mut self) -> Option<(i32, ReceiptBatch)> {
         loop {
             let frame = self.rx.recv().await?;
             let Some(batch) = decode_batch(&frame) else {
                 continue;
             };
-            return Some((frame.pos, batch));
+            return Some((frame.session, batch));
         }
     }
 }
@@ -741,12 +750,12 @@ mod tests {
         tx.send(RawFrame {
             bytes: codec::encode(&frame).unwrap().to_vec(),
             pos,
-            session: 0,
+            session: 41,
         })
         .unwrap();
 
-        let (got_pos, got) = receiver.recv_batch().await.expect("the good frame");
-        assert_eq!(got_pos, pos);
+        let (got_session, got) = receiver.recv_batch().await.expect("the good frame");
+        assert_eq!(got_session, 41);
         assert_eq!(got, frame);
     }
 }

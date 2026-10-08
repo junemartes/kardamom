@@ -147,7 +147,7 @@ job "da-proxy" {
         env         = true
         data        = <<-EOT
         {{- with nomadVar "nomad/jobs/da-proxy" }}{{ range $k, $v := . }}
-        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
         EOT
       }
 

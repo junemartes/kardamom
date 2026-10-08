@@ -1,12 +1,14 @@
 //! Reader ports: the subscription traits, the join-recovery seam, the
-//! epoch-observer hooks, and the exec-sink handoff.
+//! epoch-observer hooks, the exec-sink handoff, and the executor-stream
+//! sink.
 
 use crossbeam_channel::Sender;
 
 use kardamom_cluster_adapter::OfferOutcome;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, EpochRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage, VoidRecord,
+    BPosition, EpochRecord, ExecTxRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
+    TxRef, VoidRecord,
 };
 
 use crate::delta::ParentState;
@@ -263,5 +265,77 @@ impl ExecSink for Sender<ReaderToExec> {
 impl ExecSink for tokio::sync::mpsc::Sender<ReaderToExec> {
     fn send(&self, msg: ReaderToExec) -> Result<(), SinkClosed> {
         self.blocking_send(msg).map_err(|_| SinkClosed)
+    }
+}
+
+/// One item that the `tx_ordering` reader sends to the executor stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecStreamItem {
+    /// A transaction that the reader joined. The reader sends it before it
+    /// sends the transaction to the exec thread.
+    Record(ExecTxRecord),
+    /// The reader dispatched every canonical slot at or below this index.
+    /// The reader sends one mark after each message that takes a slot, so
+    /// a recorded cursor passes epochs, deposits and voids that carry no
+    /// record.
+    Passed(u64),
+}
+
+/// Where the `tx_ordering` reader sends what it joins: the executor stream.
+///
+/// The executor wires a bounded channel to its stream publisher. A full
+/// channel blocks the reader, so the executor never executes a record that
+/// its stream did not take. The validator and the batcher publish no
+/// stream and wire [`NoExecStream`].
+pub trait ExecStreamSink: Send + 'static {
+    /// Send the record of one joined transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SinkClosed)` when the stream publisher is gone.
+    fn record(&self, index: u64, tx_ref: &TxRef, envelope: &TxEnvelope) -> Result<(), SinkClosed>;
+
+    /// Send the progress mark `through`: every slot at or below it is
+    /// dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(SinkClosed)` when the stream publisher is gone.
+    fn passed(&self, through: u64) -> Result<(), SinkClosed>;
+}
+
+impl ExecStreamSink for Sender<ExecStreamItem> {
+    fn record(&self, index: u64, tx_ref: &TxRef, envelope: &TxEnvelope) -> Result<(), SinkClosed> {
+        let record = ExecTxRecord {
+            index,
+            tx_ref: *tx_ref,
+            envelope: envelope.clone(),
+        };
+        Sender::send(self, ExecStreamItem::Record(record)).map_err(|_| SinkClosed)
+    }
+
+    fn passed(&self, through: u64) -> Result<(), SinkClosed> {
+        Sender::send(self, ExecStreamItem::Passed(through)).map_err(|_| SinkClosed)
+    }
+}
+
+/// The [`ExecStreamSink`] of a role that publishes no executor stream: the
+/// validator, the batcher, and most tests. It takes every item and keeps
+/// nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoExecStream;
+
+impl ExecStreamSink for NoExecStream {
+    fn record(
+        &self,
+        _index: u64,
+        _tx_ref: &TxRef,
+        _envelope: &TxEnvelope,
+    ) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+
+    fn passed(&self, _through: u64) -> Result<(), SinkClosed> {
+        Ok(())
     }
 }

@@ -171,6 +171,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
                 tx_data: tx_data_subs,
                 tx_ordering: tx_ordering_sub,
                 join_recovery: None,
+                exec_stream: kardamom_engine::NoExecStream,
             },
             Outbound {
                 tx_receipts: ChanReceiptsPub(c_tx),

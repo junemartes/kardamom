@@ -86,4 +86,52 @@ pub enum TxErrorReason {
         posted_head: u64,
         budget_blocks: u64,
     },
+    /// The sealer refused the offer because its record-lag guard stands:
+    /// the last ordered canonical index `sealed_index` is more than
+    /// `budget` records past `recorded_index`, the highest index that an
+    /// executor recorded. The transaction is not ordered. The client
+    /// resubmits once an executor records again.
+    RecordLag {
+        sealed_index: u64,
+        recorded_index: u64,
+        budget: u64,
+    },
+}
+
+impl TxErrorReason {
+    /// The reason word a client sees, on the receipt subscription and on
+    /// the status feed. One vocabulary serves both feeds.
+    #[must_use]
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::DuplicatedTx { .. } => "duplicated-tx",
+            Self::Evicted { .. } => "evicted",
+            Self::Expired { .. } => "expired",
+            Self::PastDeadline { .. } => "past-deadline",
+            Self::FeeInvalid { .. } => "fee-invalid",
+            Self::FeeTooLow { .. } => "fee-too-low",
+            Self::InsufficientFunds { .. } => "insufficient-funds",
+            Self::DaLag { .. } => "da-lag",
+            Self::RecordLag { .. } => "record-lag",
+        }
+    }
+
+    /// The next nonce the sequencer expects from the sender, for the
+    /// reasons that name one. A deadline names a block, a fee reason
+    /// names amounts, and a halt names the chain's state, so these
+    /// reasons name no nonce.
+    #[must_use]
+    pub fn expected_nonce(&self) -> Option<u64> {
+        match self {
+            Self::DuplicatedTx { expected_nonce }
+            | Self::Evicted { expected_nonce }
+            | Self::Expired { expected_nonce } => Some(*expected_nonce),
+            Self::PastDeadline { .. }
+            | Self::FeeInvalid { .. }
+            | Self::FeeTooLow { .. }
+            | Self::InsufficientFunds { .. }
+            | Self::DaLag { .. }
+            | Self::RecordLag { .. } => None,
+        }
+    }
 }

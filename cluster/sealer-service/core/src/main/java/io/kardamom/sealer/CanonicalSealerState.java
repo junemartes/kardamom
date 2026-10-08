@@ -58,6 +58,12 @@ import java.util.TreeMap;
  *       {@code daLagBudgetBlocks} past it. Deposits and boundaries still
  *       enter. The cursor is in the replicated log and the budget is
  *       shared configuration, so every member refuses the same records.</li>
+ *   <li><b>Record-lag guard</b> — {@link #onRecordedCursor(int, long)}
+ *       adopts the recorded cursor of each executor, and
+ *       {@link #onRecord(byte[], byte[], long, long, byte[])} refuses a
+ *       user record while the last ordered index is more than
+ *       {@code recordLagBudget} past the best cursor. See
+ *       {@link RecordedCursors}.</li>
  *   <li><b>Seed</b> — {@link #seeded} starts a state at the head of a
  *       state rebuilt from L1, and {@link #onSeedEpoch} checks the seed
  *       record in the log against it. A state that started at genesis
@@ -111,6 +117,13 @@ public final class CanonicalSealerState {
      */
     public static final long DEFAULT_DA_LAG_BUDGET_BLOCKS = 10_000L;
 
+    /**
+     * Default record-lag budget, in canonical records: 0, the guard off.
+     * The guard refuses user records while the last ordered index is more
+     * than the budget past the best recorded cursor of the executors.
+     */
+    public static final long DEFAULT_RECORD_LAG_BUDGET = 0L;
+
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
     /**
      * Version 2 added the contiguity-guard sender map. Version 3 adds the
@@ -131,8 +144,40 @@ public final class CanonicalSealerState {
      * older snapshot restores 0, the value before any cursor was published.
      * Version 10 adds the seed status and the seed digest after the posted
      * head; an older snapshot restores a state that started at genesis.
+     * Version 11 adds the recorded cursors after the seed digest; an older
+     * snapshot restores no cursor, and the record-lag guard refuses
+     * nothing until the first cursor.
+     *
+     * <p>This is the newest version that {@link #load} reads. The writer
+     * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
-    private static final int SNAPSHOT_VERSION = 10;
+    private static final int SNAPSHOT_READ_VERSION = 11;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes. It stays one step
+     * behind {@link #SNAPSHOT_READ_VERSION}, so a member of the previous
+     * release, which reads up to version 10, can still restore every
+     * snapshot that this release writes. A rollback then does not stop the
+     * old members on the first new snapshot.
+     *
+     * <p>A version-10 snapshot holds no recorded cursor, so a member that
+     * restores one has no cursor until the next cursor record. With the
+     * record-lag guard off (budget 0) that changes no decision: the guard
+     * refuses nothing, and the cursors reach only the status frame. With a
+     * budget above 0, a restored member could refuse less than its peers.
+     * So the release that turns the cursor publisher and the guard on also
+     * sets this value to 11, after every member reads version 11.</p>
+     */
+    private static final int SNAPSHOT_WRITE_VERSION = 10;
+
+    /**
+     * Whether {@link #takeSnapshot()} writes the recorded cursors. Only
+     * then may the record-lag budget be above 0: a member that restores a
+     * snapshot without cursors refuses less than its peers that kept them.
+     */
+    public static boolean snapshotKeepsRecordedCursors() {
+        return SNAPSHOT_WRITE_VERSION >= 11;
+    }
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
@@ -260,6 +305,9 @@ public final class CanonicalSealerState {
      * Replicated configuration, like {@link #inclusionHorizonBlocks}.
      */
     private final long daLagBudgetBlocks;
+
+    /** The recorded cursor of each executor, and the record-lag guard. */
+    private RecordedCursors recorded;
 
     /**
      * The last L2 block the batcher confirmed on L1, echoed from the
@@ -391,19 +439,18 @@ public final class CanonicalSealerState {
             long inclusionHorizonBlocks,
             int orderingWindow) {
         this(dedupCapacity, initialBlockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
-            orderingWindow, DEFAULT_DA_LAG_BUDGET_BLOCKS);
+            orderingWindow, LagBudgets.DEFAULT);
     }
 
     /**
      * The full constructor, with the ordering window and this member's
-     * DA-lag budget. Both are replicated configuration: every member must
+     * lag budgets. Both are replicated configuration: every member must
      * agree on them, because they decide the relay order and
      * accept-or-reject inside the replicated state machine.
      *
-     * @param orderingWindow    the record count a window holds before it
-     *                          flushes, or 0 for no window
-     * @param daLagBudgetBlocks how far the sealed head may run past the
-     *                          posted head; zero turns the guard off
+     * @param orderingWindow the record count a window holds before it
+     *                       flushes, or 0 for no window
+     * @param budgets        the DA-lag and the record-lag budgets
      */
     public CanonicalSealerState(
             int dedupCapacity,
@@ -412,17 +459,13 @@ public final class CanonicalSealerState {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow,
-            long daLagBudgetBlocks) {
+            LagBudgets budgets) {
         if (dedupCapacity <= 0) {
             throw new IllegalArgumentException("dedupCapacity must be > 0, got " + dedupCapacity);
         }
         if (inclusionHorizonBlocks <= 0) {
             throw new IllegalArgumentException(
                     "inclusionHorizonBlocks must be > 0, got " + inclusionHorizonBlocks);
-        }
-        if (daLagBudgetBlocks < 0) {
-            throw new IllegalArgumentException(
-                    "daLagBudgetBlocks must be >= 0, got " + daLagBudgetBlocks);
         }
         this.remoteOriginAllowlist = Set.copyOf(remoteOrigins);
         if (orderingWindow < 0) {
@@ -431,7 +474,8 @@ public final class CanonicalSealerState {
         this.dedupCapacity = dedupCapacity;
         this.inclusionHorizonBlocks = inclusionHorizonBlocks;
         this.orderingWindow = orderingWindow;
-        this.daLagBudgetBlocks = daLagBudgetBlocks;
+        this.daLagBudgetBlocks = budgets.daLagBlocks();
+        this.recorded = new RecordedCursors(budgets.recordLagRecords());
         this.postedHead = 0L;
         this.dedup = new LinkedHashMap<>();
         this.byDeadline = new TreeMap<>();
@@ -458,7 +502,8 @@ public final class CanonicalSealerState {
      * open block is empty, and every block up to {@code H} counts as
      * posted, because the seed was rebuilt from what the batcher posted.
      *
-     * <p>The dedup window and the void ledger start empty: no record at or
+     * <p>The dedup window, the void ledger and the recorded cursors start
+     * empty: no record at or
      * below the head can be offered again. The nonce guard starts with the
      * seed's senders in the seed's order, the eldest first, so the guard
      * keeps the most recent senders up to {@code dedupCapacity}. The
@@ -470,7 +515,7 @@ public final class CanonicalSealerState {
      * @param voidConfig             the void ledger's configuration
      * @param inclusionHorizonBlocks the deadline horizon, in blocks
      * @param orderingWindow         the ordering window size, or 0
-     * @param daLagBudgetBlocks      the DA-lag budget, in blocks
+     * @param budgets                the DA-lag and the record-lag budgets
      * @return the seeded state, with its seed not yet confirmed
      */
     public static CanonicalSealerState seeded(
@@ -479,11 +524,11 @@ public final class CanonicalSealerState {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow,
-            long daLagBudgetBlocks) {
+            LagBudgets budgets) {
         final SealerSeed.Head head = seed.head();
         final CanonicalSealerState state = new CanonicalSealerState(
             dedupCapacity, head.block() + 1, Set.of(), voidConfig, inclusionHorizonBlocks,
-            orderingWindow, daLagBudgetBlocks);
+            orderingWindow, budgets);
         state.canonicalCount = head.endTxIdx();
         state.lastBoundaryCount = head.endTxIdx();
         state.lastL2Timestamp = head.l2Timestamp();
@@ -676,7 +721,14 @@ public final class CanonicalSealerState {
              * head, so the chain refuses new transactions until the batcher
              * posts again. Nothing was inserted or counted.
              */
-            DA_LAG_REJECT
+            DA_LAG_REJECT,
+            /**
+             * The last ordered index is more than the record-lag budget
+             * past the best recorded cursor, so the chain refuses new
+             * transactions until an executor records more. Nothing was
+             * inserted or counted.
+             */
+            RECORD_LAG_REJECT
         }
 
         public final Kind kind;
@@ -715,6 +767,10 @@ public final class CanonicalSealerState {
 
         static RecordOutcome daLagReject() {
             return new RecordOutcome(Kind.DA_LAG_REJECT, Optional.empty(), 0L, 0L);
+        }
+
+        static RecordOutcome recordLagReject() {
+            return new RecordOutcome(Kind.RECORD_LAG_REJECT, Optional.empty(), 0L, 0L);
         }
     }
 
@@ -763,7 +819,12 @@ public final class CanonicalSealerState {
         // record moves nothing: the sender's expected nonce stays, and the
         // client's resubmit after the batcher posts is accepted as fresh.
         // The all-zero sender is exempt: deposits keep entering, so the
-        // chain's L1 view stays current while it waits.
+        // chain's L1 view stays current while it waits. The record-lag
+        // guard comes first: when both guards refuse, the executors that
+        // do not record are the root nearer the source.
+        if (!isZeroSender(sender20) && recordLagHalted()) {
+            return RecordOutcome.recordLagReject();
+        }
         if (!isZeroSender(sender20) && daLagHalted()) {
             return RecordOutcome.daLagReject();
         }
@@ -1201,6 +1262,53 @@ public final class CanonicalSealerState {
         return daLagBudgetBlocks > 0 && sealedHead() - postedHead > daLagBudgetBlocks;
     }
 
+    /**
+     * Adopt the recorded cursor of one executor: every canonical index at
+     * or below {@code recordedThrough} is joined and recorded by that
+     * executor, or voided. A cursor only moves up; a cursor at or below the
+     * one the executor sent before changes nothing.
+     *
+     * @param executorId      the executor's void voter id
+     * @param recordedThrough the last recorded canonical index, unsigned
+     * @return whether the best recorded cursor moved up
+     * @throws IllegalArgumentException if the executor is not a configured
+     *         voter, or the cursor names an index that is not ordered yet
+     */
+    public boolean onRecordedCursor(int executorId, long recordedThrough) {
+        if (!voids.isVoter(executorId)) {
+            throw new IllegalArgumentException("executor " + executorId + " is not a configured voter");
+        }
+        if (Long.compareUnsigned(recordedThrough, canonicalCount) >= 0) {
+            throw new IllegalArgumentException("recorded cursor " + Long.toUnsignedString(recordedThrough)
+                + " is not below the canonical count " + canonicalCount);
+        }
+        return recorded.onCursor(executorId, recordedThrough);
+    }
+
+    /** The best recorded cursor of the executors, or {@link RecordedCursors#NONE}. */
+    public long bestRecorded() {
+        return recorded.best();
+    }
+
+    /** The record-lag budget this member runs with; 0 means the guard is off. */
+    public long recordLagBudget() {
+        return recorded.budget();
+    }
+
+    /** The last ordered canonical index; -1 before the first record. */
+    public long sealedIndex() {
+        return canonicalCount - 1;
+    }
+
+    /**
+     * Whether the record-lag guard refuses user records: the budget is on,
+     * an executor sent a cursor, and the last ordered index is more than
+     * the budget past the best cursor.
+     */
+    public boolean recordLagHalted() {
+        return recorded.halted(sealedIndex());
+    }
+
     /** L1 origin currently stamped into boundaries. */
     public long l1Origin() {
         return l1Origin;
@@ -1306,9 +1414,25 @@ public final class CanonicalSealerState {
      * Version 6 adds the void ledger after the peer map: see
      * {@link VoidLedger#writeTo}. Version 8 adds the posted head (8) after
      * the void ledger. Version 10 adds the seed status (1, the
-     * {@link SeedStatus} ordinal) and the seed digest (32) after it.</p>
+     * {@link SeedStatus} ordinal) and the seed digest (32) after it.
+     * Version 11 adds the recorded cursors after the seed digest: see
+     * {@link RecordedCursors#writeTo}.</p>
+     *
+     * <p>The writer writes {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
     public byte[] takeSnapshot() {
+        return takeSnapshot(SNAPSHOT_WRITE_VERSION);
+    }
+
+    /**
+     * {@link #takeSnapshot()} in the layout of {@code version}: 10 has no
+     * recorded-cursor section, 11 has it. A version-10 snapshot is the same
+     * bytes that the previous release writes for the same state.
+     *
+     * @param version 10 or 11
+     */
+    byte[] takeSnapshot(int version) {
+        boolean withCursors = version >= 11;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1319,10 +1443,11 @@ public final class CanonicalSealerState {
                 + voids.snapshotLen(canonicalCount)
                 + 4
                 + 8
-                + 1 + SealerSeed.HASH_LEN;
+                + 1 + SealerSeed.HASH_LEN
+                + (withCursors ? recorded.snapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
-        buf.putInt(SNAPSHOT_VERSION);
+        buf.putInt(version);
         buf.putLong(canonicalCount);
         buf.putLong(blockNumber);
         buf.putInt(idCount);
@@ -1367,6 +1492,10 @@ public final class CanonicalSealerState {
         // v10 tail: the seed status and the seed digest.
         buf.put((byte) seedStatus.ordinal());
         buf.put(seedDigest);
+        // v11 tail: the recorded cursors, in executor-id order.
+        if (withCursors) {
+            recorded.writeTo(buf);
+        }
         return buf.array();
     }
 
@@ -1441,7 +1570,7 @@ public final class CanonicalSealerState {
             int orderingWindow) {
         return load(ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN), dedupCapacity,
             remoteOrigins, voidConfig, inclusionHorizonBlocks, orderingWindow,
-            DEFAULT_DA_LAG_BUDGET_BLOCKS);
+            LagBudgets.DEFAULT);
     }
 
     /**
@@ -1455,7 +1584,7 @@ public final class CanonicalSealerState {
      * @param voidConfig             the void ledger's configuration
      * @param inclusionHorizonBlocks the deadline horizon, in blocks
      * @param orderingWindow         this member's configured window size
-     * @param daLagBudgetBlocks      the DA-lag budget, in blocks
+     * @param budgets                the DA-lag and the record-lag budgets
      * @return the restored state
      */
     public static CanonicalSealerState load(
@@ -1465,14 +1594,14 @@ public final class CanonicalSealerState {
             VoidLedger.Config voidConfig,
             long inclusionHorizonBlocks,
             int orderingWindow,
-            long daLagBudgetBlocks) {
+            LagBudgets budgets) {
         int magic = buf.getInt();
         if (magic != SNAPSHOT_MAGIC) {
             throw new IllegalArgumentException(
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version < 1 || version > SNAPSHOT_VERSION) {
+        if (version < 1 || version > SNAPSHOT_READ_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();
@@ -1500,7 +1629,7 @@ public final class CanonicalSealerState {
 
         CanonicalSealerState state = new CanonicalSealerState(
                 dedupCapacity, blockNumber, remoteOrigins, voidConfig, inclusionHorizonBlocks,
-                orderingWindow, daLagBudgetBlocks);
+                orderingWindow, budgets);
         for (int i = 0; i < idCount; i++) {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             buf.get(raw);
@@ -1580,6 +1709,10 @@ public final class CanonicalSealerState {
             state.seedStatus = seedStatusOf(buf.get());
             buf.get(state.seedDigest);
         }
+        if (version >= 11) {
+            state.recorded = RecordedCursors.readFrom(
+                buf, budgets.recordLagRecords(), state.voids::isVoter);
+        }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
         // trust-on-first-sight, and it causes no false rejects. A version-1
@@ -1589,7 +1722,9 @@ public final class CanonicalSealerState {
         // and each peer re-seeds on its next batch, the same
         // trust-on-first-sight behavior. A version-4 snapshot restores each
         // peer's anchor with an unknown lane cursor. The cursor seeds from
-        // the peer's next record.
+        // the peer's next record. A version-10 or older snapshot restores
+        // no recorded cursor, so the record-lag guard refuses nothing until
+        // the first cursor.
         state.canonicalCount = canonicalCount;
         return state;
     }

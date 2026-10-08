@@ -95,9 +95,9 @@ pub enum IngressError {
     #[error("account state unavailable: {0}")]
     StateUnavailable(String),
     /// The ingress pauses submits on a root halt upstream: the sealer
-    /// (a DA lag or a lost quorum), or every executor. The message and
-    /// the data name the root's service, its cause, and its runbook; the
-    /// pause ends by itself when the root clears.
+    /// (a DA lag, a record lag, or a lost quorum), or every executor. The
+    /// message and the data name the root's service, its cause, and its
+    /// runbook; the pause ends by itself when the root clears.
     #[error(
         "chain halted: {} at {} ({detail}); the ingress pauses submits until it clears; \
          cause and recovery at /halt and kardamom_chainStatus, runbook {}",
@@ -124,13 +124,31 @@ impl IngressError {
     /// halted on `da_lag`, and the sealer is the root.
     #[must_use]
     pub fn da_lag(sealed_head: u64, posted_head: u64, budget_blocks: u64) -> Self {
-        Self::ChainHalted {
-            root: kardamom_types::service::HaltRef::sealer(
-                kardamom_types::service::HaltCause::DaLag,
-            ),
-            detail: format!(
+        Self::sealer_halted(
+            kardamom_types::service::HaltCause::DaLag,
+            format!(
                 "sealed head {sealed_head}, posted head {posted_head}, budget {budget_blocks} blocks"
             ),
+        )
+    }
+
+    /// The sealer refused a record on its record-lag guard: the chain is
+    /// halted on `record_lag`, and the sealer is the root.
+    #[must_use]
+    pub fn record_lag(sealed_index: u64, recorded_index: u64, budget: u64) -> Self {
+        Self::sealer_halted(
+            kardamom_types::service::HaltCause::RecordLag,
+            format!(
+                "sealed index {sealed_index}, recorded index {recorded_index}, budget {budget} records"
+            ),
+        )
+    }
+
+    /// The chain is halted on `cause`, and the sealer is the root.
+    fn sealer_halted(cause: kardamom_types::service::HaltCause, detail: String) -> Self {
+        Self::ChainHalted {
+            root: kardamom_types::service::HaltRef::sealer(cause),
+            detail,
         }
     }
 
@@ -257,6 +275,18 @@ mod tests {
         assert!(data.contains("\"cause\":\"da_lag\""), "{data}");
         assert!(data.contains("\"root_service\":\"sealer\""), "{data}");
         assert!(data.contains("docs/runbooks/da_lag.md"), "{data}");
+
+        let rpc: ErrorObjectOwned = IngressError::record_lag(20_000, 3_000, 16_384).into();
+        assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
+        assert!(
+            rpc.message()
+                .starts_with("chain halted: record_lag at sealer (sealed index 20000"),
+            "{}",
+            rpc.message()
+        );
+        let data = rpc.data().expect("the typed cause").get();
+        assert!(data.contains("\"cause\":\"record_lag\""), "{data}");
+        assert!(data.contains("docs/runbooks/record_lag.md"), "{data}");
 
         let rpc: ErrorObjectOwned = IngressError::OperatorPaused {
             note: "disk swap".into(),

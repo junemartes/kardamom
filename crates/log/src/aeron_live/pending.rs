@@ -10,7 +10,7 @@ use crossbeam_channel::Sender as CbSender;
 use rkyv::util::AlignedVec;
 use tracing::warn;
 
-use super::Pub;
+use super::table_pub::TablePub;
 use crate::error::LogError;
 use crate::offer_retry::offer_code_str;
 use crate::term_layout::TermLayout;
@@ -21,7 +21,7 @@ use kardamom_types::BPosition;
 /// [`TermLayout::from_publication`]), so an offer decode never re-derives
 /// it.
 pub(super) struct PubEntry {
-    pub(super) publication: Pub,
+    pub(super) publication: TablePub,
     pub(super) layout: TermLayout,
     /// The Aeron stream id, the label of a dropped best-effort frame.
     pub(super) stream_id: i32,
@@ -140,10 +140,7 @@ impl PendingPublish {
         let Some(entry) = pubs.get(self.pub_id as usize) else {
             return OfferResult::UnknownPub;
         };
-        let code = entry.publication.offer(
-            self.bytes.as_slice(),
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
+        let code = entry.publication.offer(self.bytes.as_slice());
         if code < 0 {
             return OfferResult::Status(code);
         }

@@ -313,7 +313,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Sealer | `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the Raft log and the archive. `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs data and metadata. At `0`, a power loss that takes the members together can drop an entry that a quorum acknowledged. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
-| Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data` and `tx_deposits` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |
+| Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data`, `tx_deposits` and `exec_txs` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |
 | Aeron | `AERON_STALL_TOLERANCE_MS` | `10000` | How long every Aeron party waits through a stalled peer, in ms. The container recipes and CI use `30000`. See "Aeron stall tolerance" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#substrate-the-shared-failure-domain). |
 | Deploy | `KARDAMOM_CANARY` | `0` | `1` deploys one canary of the ingress and of the sequencer. |
 | Chaos | `KARDAMOM_CHAOS_CASES`, `CHAOS_TPS`, `LOAD_DURATION_S` and others | | The knobs of the chaos suite. See [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md). |
@@ -328,12 +328,12 @@ Preflight checks fail the deploy before it changes a job:
 
 A secret is a keyed L1 URL, a private key, or a receiver token. No job definition holds one.
 
-- `L1_RPC`, `L1_FOLLOWERS_RPC`, `BATCHER_KEY` and `ALERTMANAGER_CONFIG_FILE` reach the role as environment variables.
+- `L1_RPC`, `L1_FOLLOWERS_RPC`, `L1_LIGHT_CLIENT_EXECUTION_RPC`, `L1_LIGHT_CLIENT_CONSENSUS_RPC`, `BATCHER_KEY` and `ALERTMANAGER_CONFIG_FILE` reach the role as environment variables.
   - In CI, they come from GitHub environment secrets. They are never plain GitHub variables.
 - The role writes the secrets of a job to the Nomad Variable `nomad/jobs/<job>` (`roles/workloads/tasks/secrets.yml`).
   - It writes the variable before it registers the job, and only on a change.
   - These tasks run with `no_log`, so the play output does not show a secret.
-- The job renders its variable with a `template` block (`env = true`) into `secrets/`. The task gets the items as environment variables.
+- The job renders its variable with a `template` block (`env = true`) into `secrets/`. The task gets the items as environment variables. Values use `.Value | toJSON` so quotes, newlines and `#` survive [Nomad environment parsing](https://developer.hashicorp.com/nomad/docs/job-specification/template#environment-variables).
   - A task reads `nomad/jobs/<job>` with its workload identity. That needs no ACL policy.
   - The `secrets/` directory does not show in `nomad alloc fs`.
   - A `nomad job inspect` shows the template, not the values.
@@ -347,6 +347,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
 | `da-watcher`, `l1-indexer` | `KARDAMOM_L1_RPC` | The followers' L1 (`L1_FOLLOWERS_RPC` and its defaults). |
 | `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_ETH_RPC` | `L1_RPC`. |
 | `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX` | `BATCHER_KEY`. Without it the proxy is read-only. |
+| `l1-light-client` | `HELIOS_EXECUTION_RPC`, `HELIOS_CONSENSUS_RPC` | The upstream execution and beacon URLs. |
 | `monitoring` | `alertmanager`, `rules` | Files: `secrets/alertmanager.yml` and `local/operator-rules.yml`. |
 
 The followers name an L1 source in their logs by its scheme and host only. A provider key is in the path or the query of the URL, so the logs do not show it.

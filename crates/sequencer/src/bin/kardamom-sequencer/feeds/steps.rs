@@ -45,6 +45,48 @@ impl EgressWatermarkFeed {
         true
     }
 
+    /// Handle one record-lag reject frame. Returns `true` when `frame` was
+    /// one, so the caller does not also check it for a boundary.
+    ///
+    /// The sealer refused the ref because no executor recorded the chain
+    /// within the record-lag budget. No republish can order it until an
+    /// executor records again, so it takes the terminal-refusal channel:
+    /// the publish loop drops the ledger entry and tells the client to
+    /// resubmit later.
+    pub(super) fn on_record_lag_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_RECORD_LAG_REJECT) {
+            return false;
+        }
+        if let Ok(EgressItem::RecordLagReject {
+            sender,
+            nonce,
+            sealed_index,
+            recorded_index,
+            budget,
+        }) = EgressItem::decode(frame)
+        {
+            tracing::warn!(
+                partition = self.partition,
+                ?sender,
+                nonce,
+                sealed_index,
+                recorded_index,
+                budget,
+                "sealer record-lag reject received; dropping the ref"
+            );
+            self.forward_refusal(SealerRefusal {
+                sender,
+                nonce,
+                reason: kardamom_types::TxErrorReason::RecordLag {
+                    sealed_index,
+                    recorded_index,
+                    budget,
+                },
+            });
+        }
+        true
+    }
+
     /// Tell the epoch pump, and the `l1_origin` gauge, that the boundaries
     /// reached `l1_origin`, once per growth: a boundary arrives every
     /// tick, and the origin moves once per L1 block.
@@ -117,3 +159,7 @@ impl NonceLookupFeed {
         ControlFlow::Continue(())
     }
 }
+
+#[cfg(test)]
+#[path = "steps_tests.rs"]
+mod tests;

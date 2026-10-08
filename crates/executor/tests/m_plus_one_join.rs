@@ -378,6 +378,7 @@ fn spawn_m_plus_one_executor(
                 tx_data: tx_data_subs,
                 tx_ordering: tx_ordering_sub,
                 join_recovery: None,
+                exec_stream: kardamom_engine::NoExecStream,
             },
             Outbound {
                 tx_receipts: ChanReceiptsPub(c_tx),

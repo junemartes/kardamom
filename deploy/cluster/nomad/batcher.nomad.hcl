@@ -296,7 +296,7 @@ job "batcher" {
         env         = true
         data        = <<-EOT
         {{- with nomadVar "nomad/jobs/batcher" }}{{ range $k, $v := . }}
-        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
         EOT
       }
 

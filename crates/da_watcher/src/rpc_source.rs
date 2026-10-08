@@ -53,7 +53,19 @@ fn provider_error(e: RpcError<TransportErrorKind>) -> L1SourceError {
         RpcError::Transport(TransportErrorKind::HttpError(http)) if http.is_rate_limit_err() => {
             L1SourceError::RateLimited
         }
-        other => L1SourceError::Provider(other.to_string()),
+        RpcError::Transport(TransportErrorKind::HttpError(http)) => {
+            L1SourceError::Provider(format!("HTTP status {}", http.status))
+        }
+        RpcError::ErrorResp(error) => {
+            L1SourceError::Provider(format!("JSON-RPC error {}", error.code))
+        }
+        // Provider bodies and transport errors can echo credential-bearing URLs.
+        RpcError::Transport(_) => L1SourceError::Provider("transport failed".into()),
+        RpcError::NullResp => L1SourceError::Provider("null response".into()),
+        RpcError::UnsupportedFeature(_) => L1SourceError::Provider("unsupported feature".into()),
+        RpcError::LocalUsageError(_) => L1SourceError::Provider("local request failed".into()),
+        RpcError::SerError(_) => L1SourceError::Provider("request serialization failed".into()),
+        RpcError::DeserError { .. } => L1SourceError::Provider("invalid response JSON".into()),
     }
 }
 
@@ -361,5 +373,25 @@ mod tests {
             matches!(err, L1SourceError::Decode(ref m) if m.contains("u128::MAX")),
             "got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn provider_errors_do_not_echo_credentials() {
+        let secret = "https://user:password@rpc.invalid/key?token=private";
+        let error = provider_error(TransportErrorKind::custom_str(secret));
+        assert_eq!(error.to_string(), "L1 provider error: transport failed");
+        let error = provider_error(RpcError::ErrorResp(
+            serde_json::from_value(serde_json::json!({
+                "code": -32000, "message": secret
+            }))
+            .unwrap(),
+        ));
+        assert!(!error.to_string().contains(secret));
+        assert!(error.to_string().contains("-32000"));
     }
 }

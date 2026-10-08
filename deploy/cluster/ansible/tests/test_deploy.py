@@ -259,6 +259,8 @@ class DeployTest(unittest.TestCase):
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
+        exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
@@ -369,8 +371,8 @@ class DeployTest(unittest.TestCase):
 
     def test_optional_light_client_and_cluster_overrides(self):
         self.run_deploy({
-            'workloads_light_execution_rpc': 'http://execution.example',
-            'workloads_light_consensus_rpc': 'http://consensus.example',
+            'workloads_light_execution_rpc': f'https://execution.example/{SENTINEL}',
+            'workloads_light_consensus_rpc': f'https://consensus.example/{SENTINEL}',
             'workloads_light_checkpoint': '0x' + 'a' * 64,
             'workloads_lockbox_address': '0x' + '2' * 40,
             'workloads_namespace': 'staging',
@@ -384,6 +386,12 @@ class DeployTest(unittest.TestCase):
         })
         plans = self.api.state['plans']
         self.assertIn('l1-light-client', plans)
+        self.assertNotIn(SENTINEL, json.dumps(plans))
+        self.assertNotIn(SENTINEL, json.dumps(self.api.state['jobs']))
+        self.assertEqual(self.api.state['variables']['nomad/jobs/l1-light-client'], {
+            'HELIOS_EXECUTION_RPC': f'https://execution.example/{SENTINEL}',
+            'HELIOS_CONSENSUS_RPC': f'https://consensus.example/{SENTINEL}',
+        })
         self.assertTrue(all(job['Namespace'] == 'staging' for job in plans.values()))
         validator = json.dumps(plans['validator'])
         self.assertIn('http://kardamom-l1-light-client.service.dc1.consul:8548', validator)

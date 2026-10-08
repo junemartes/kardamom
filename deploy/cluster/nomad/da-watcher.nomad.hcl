@@ -194,7 +194,7 @@ job "da-watcher" {
         env         = true
         data        = <<-EOT
         {{- with nomadVar "nomad/jobs/da-watcher" }}{{ range $k, $v := . }}
-        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
         EOT
       }
 

@@ -171,7 +171,7 @@ job "l1-indexer" {
         env         = true
         data        = <<-EOT
         {{- with nomadVar "nomad/jobs/l1-indexer" }}{{ range $k, $v := . }}
-        {{ $k }}={{ $v }}{{ end }}{{ end }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
         EOT
       }
 

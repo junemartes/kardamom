@@ -118,6 +118,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::PastDeadline { .. }
                 | EgressItem::WindowFull { .. }
                 | EgressItem::DaLagReject { .. }
+                | EgressItem::RecordLagReject { .. }
                 | EgressItem::OriginGap { .. },
             ) => return ControlFlow::Continue(()),
             Err(e) => {
@@ -240,6 +241,7 @@ mod tests {
             retained_frames: 40,
             floor_index: 3,
             floor_block: 2,
+            ..ClusterStatus::default()
         };
         egress.push(kardamom_cluster_adapter::wire::encode_status(&status));
         egress.push(kardamom_cluster_adapter::wire::encode_da_lag_reject(
