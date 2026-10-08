@@ -25,12 +25,6 @@
 # to it against a testnet too. The empty defaults exist for
 # `just validate` only; the workloads role passes every value.
 
-variable "l1_rpc" {
-  type        = string
-  description = "The L1 JSON-RPC endpoints the indexer follows, comma-separated. With two or more, a block, a log query or a hash is archived only when two agree."
-  default     = ""
-}
-
 # The light client's endpoint, when one runs: its answer settles a read
 # it serves, and a public endpoint that disagrees with it is the liar.
 variable "l1_light_client_rpc" {
@@ -72,11 +66,6 @@ variable "poll_interval_secs" {
 # The beacon API the follower reads the genesis time and the slot length
 # from, once: with it, the follower reads L1 on the finality schedule.
 # Empty (anvil, which has no beacon chain): every poll interval.
-variable "beacon_api" {
-  type        = string
-  description = "A beacon API endpoint for the finality schedule. Empty: read every poll interval."
-  default     = ""
-}
 
 variable "max_log_range" {
   type        = string
@@ -195,7 +184,6 @@ job "l1-indexer" {
         ]
         args = concat(
           [
-            "--l1-rpc", var.l1_rpc,
             "--da-proxy", var.da_proxy,
             "--settlement", var.settlement_address,
             "--lockbox", var.lockbox_address,
@@ -210,7 +198,6 @@ job "l1-indexer" {
           var.start_block != "" ? ["--start-block", var.start_block] : [],
           var.poll_interval_secs != "" ? ["--poll-interval-secs", var.poll_interval_secs] : [],
           var.l1_light_client_rpc != "" ? ["--l1-light-client-rpc", var.l1_light_client_rpc] : [],
-          var.beacon_api != "" ? ["--beacon-api", var.beacon_api] : [],
           var.max_log_range != "" ? ["--max-log-range", var.max_log_range] : [],
         )
       }
@@ -234,6 +221,21 @@ job "l1-indexer" {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")
         change_mode = "noop"
+      }
+
+      # The L1 endpoints the indexer follows (KARDAMOM_L1_RPC,
+      # comma-separated; with two or more, a read is archived only when
+      # two agree), from the job's Nomad
+      # Variable, which the workloads role writes. They reach the task as
+      # environment, never as a job variable or an argument, so a job
+      # read does not show them.
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/l1-indexer" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
+        EOT
       }
 
       service {

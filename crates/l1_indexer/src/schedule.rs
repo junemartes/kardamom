@@ -82,16 +82,16 @@ impl FinalitySchedule {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| IndexerError::Beacon(format!("{url}: {e}")))?
+            .map_err(|e| IndexerError::Beacon(e.without_url().to_string()))?
             .json()
             .await
-            .map_err(|e| IndexerError::Beacon(format!("{url}: {e}")))
+            .map_err(|e| IndexerError::Beacon(e.without_url().to_string()))
     }
 
     fn number(name: &str, value: &str) -> Result<u64, IndexerError> {
         value
             .parse()
-            .map_err(|e| IndexerError::Beacon(format!("{name} {value:?}: {e}")))
+            .map_err(|e| IndexerError::Beacon(format!("{name}: {e}")))
     }
 
     fn positive(name: &str, value: &str) -> Result<NonZeroU64, IndexerError> {
@@ -136,5 +136,15 @@ mod tests {
         assert_eq!(s.next_step_after(1_383), 1_384);
         assert_eq!(s.next_step_after(1_384), 1_768);
         assert_eq!(s.next_step_after(500), 1_000);
+    }
+    #[tokio::test]
+    async fn a_failed_beacon_request_does_not_echo_the_key() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = FinalitySchedule::from_beacon(&format!("http://{address}/SECRET-SENTINEL"))
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("SECRET-SENTINEL"));
     }
 }

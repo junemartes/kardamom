@@ -127,11 +127,31 @@ impl L1Endpoints {
     async fn connect_one(
         url: String,
     ) -> Result<(String, RpcL1Source<impl Provider + 'static>), L1SourceError> {
+        let name = Self::origin(&url);
         let provider = ProviderBuilder::new()
             .connect(&url)
             .await
-            .map_err(|e| L1SourceError::Provider(format!("connect L1 RPC {url}: {e}")))?;
-        Ok((url, RpcL1Source::new(provider)))
+            .map_err(|e| L1SourceError::Provider(format!("connect L1 RPC {name}: {e}")))?;
+        Ok((name, RpcL1Source::new(provider)))
+    }
+
+    /// The names of the public endpoints, as the log lines carry them.
+    #[must_use]
+    pub fn origins(&self) -> Vec<String> {
+        self.rpcs.iter().map(|url| Self::origin(url)).collect()
+    }
+
+    /// The name of an endpoint in log lines and errors: its scheme and
+    /// host, with no user info, path or query. A provider puts its API
+    /// key in the path or the query, so the name never carries the key.
+    #[must_use]
+    pub fn origin(url: &str) -> String {
+        let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{scheme}://{host}")
     }
 }
 

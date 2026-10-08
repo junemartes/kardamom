@@ -10,7 +10,8 @@
 # The proxy runs on an EigenDA network only (var.eigenda_network). It
 # fills the disperser and the contract addresses from the network name.
 # The signer pays for dispersal from its PaymentVault deposit; the
-# batcher's account is used. Without a network the workloads role
+# batcher's account is used (its key comes from the Nomad Variable
+# nomad/jobs/da-proxy, below). Without a network the workloads role
 # deploys nomad/da-store.nomad.hcl, the file-backed stand-in, under the
 # same Consul service.
 #
@@ -21,12 +22,6 @@
 variable "eigenda_network" {
   type        = string
   description = "EigenDA network (sepolia_testnet, mainnet). The empty default exists for `just validate` only."
-  default     = ""
-}
-
-variable "eigenda_eth_rpc" {
-  type        = string
-  description = "The Ethereum RPC the proxy verifies certificates against (the L1 of the network)."
   default     = ""
 }
 
@@ -47,12 +42,6 @@ variable "eigenda_ledger_mode" {
   type        = string
   description = "The payment mode of the signer: on-demand-only, reservation-only, reservation-and-on-demand."
   default     = "on-demand-only"
-}
-
-variable "eigenda_signer_key" {
-  type        = string
-  description = "The hex private key that signs dispersals and pays from its PaymentVault deposit. Empty: the proxy is read-only."
-  default     = ""
 }
 
 variable "datacenter" {
@@ -135,17 +124,31 @@ job "da-proxy" {
 
       # The EigenDA V2 client.
       env {
-        EIGENDA_PROXY_STORAGE_BACKENDS_TO_ENABLE        = "V2"
-        EIGENDA_PROXY_STORAGE_DISPERSAL_BACKEND         = "V2"
-        EIGENDA_PROXY_EIGENDA_V2_NETWORK                = var.eigenda_network
-        EIGENDA_PROXY_EIGENDA_V2_ETH_RPC                = var.eigenda_eth_rpc
-        EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX = var.eigenda_signer_key
-        EIGENDA_PROXY_EIGENDA_V2_MAX_BLOB_LENGTH        = "16MiB"
-        EIGENDA_PROXY_EIGENDA_V2_CLIENT_LEDGER_MODE     = var.eigenda_ledger_mode
+        EIGENDA_PROXY_STORAGE_BACKENDS_TO_ENABLE    = "V2"
+        EIGENDA_PROXY_STORAGE_DISPERSAL_BACKEND     = "V2"
+        EIGENDA_PROXY_EIGENDA_V2_NETWORK            = var.eigenda_network
+        EIGENDA_PROXY_EIGENDA_V2_MAX_BLOB_LENGTH    = "16MiB"
+        EIGENDA_PROXY_EIGENDA_V2_CLIENT_LEDGER_MODE = var.eigenda_ledger_mode
         EIGENDA_PROXY_EIGENDA_V2_CERT_VERIFIER_ROUTER_OR_IMMUTABLE_VERIFIER_ADDR = (
           var.eigenda_cert_verifier != "" ? var.eigenda_cert_verifier :
           var.eigenda_network == "sepolia_testnet" ? "0x17ec4112c4BbD540E2c1fE0A49D264a280176F0D" : ""
         )
+      }
+
+      # The L1 the proxy verifies certificates against
+      # (EIGENDA_PROXY_EIGENDA_V2_ETH_RPC) and the signer's key
+      # (EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX; without it the
+      # proxy is read-only), from the job's Nomad Variable, which the
+      # workloads role writes. They reach the task as environment, never
+      # as a job variable or an argument, so a job read does not show
+      # them.
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/da-proxy" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
+        EOT
       }
 
       # The SRS points (32 MiB) and a few payloads in flight.

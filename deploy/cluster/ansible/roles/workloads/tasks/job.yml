@@ -34,6 +34,19 @@
     workloads_job_definition: >-
       {{ (workloads_compiled.stdout | from_json).Job | combine({'Namespace': workloads_namespace}) }}
 
+# The job's secrets go to its Nomad Variable before the job registers,
+# so a new task finds them.
+- name: Write the secrets of {{ workloads_job.name }}
+  ansible.builtin.include_tasks: secrets.yml
+  vars:
+    workloads_secrets_url: >-
+      {{ workloads_nomad_addr }}/v1/var/nomad/jobs/{{ workloads_job.name }}?namespace={{ workloads_namespace | urlencode }}
+    workloads_secrets_items: >-
+      {{ workloads_job.secrets | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
+  when:
+    - workloads_job.secrets | default({}) | length > 0
+    - not ansible_check_mode
+
 # A job with submit: false stops here, planned but not registered: the
 # sealer roll reads the plan and registers the groups one at a time.
 - name: Plan and register {{ workloads_job.name }}

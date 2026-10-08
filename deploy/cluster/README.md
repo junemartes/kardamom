@@ -298,6 +298,8 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Light client | `L1_LIGHT_CLIENT_CHECKPOINT` | empty | The weak-subjectivity checkpoint. It is required with the execution RPC. |
 | Light client | `L1_LIGHT_CLIENT_NETWORK` | `mainnet` | The network that the light client follows. |
 | Light client | `L1_LIGHT_CLIENT_HOST`, `L1_LIGHT_CLIENT_PORT` | `kardamom-l1-light-client.service.<datacenter>.consul`, `8548` | Where the validator and the followers reach the light client. |
+| Monitoring | `ALERTMANAGER_CONFIG_FILE` | empty | A file with the Alertmanager routes and receivers of the environment. Set: the role writes it, with the inhibit rules of `deploy/alertmanager-inhibit.yml` added, to the item `alertmanager` of `nomad/jobs/monitoring`. The file must not hold `inhibit_rules`. Empty: the role leaves the variable as it is. |
+| Monitoring | `PROMETHEUS_RULES_FILE` | empty (`groups: []`) | The extra Prometheus rule file of the environment, the item `rules`. The role writes it only with `ALERTMANAGER_CONFIG_FILE`. Prometheus loads `deploy/alerts.yml` in all cases. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the da-watcher and the indexer walk. A comma-separated list. With two or more entries, a block counts only when two agree. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
 | Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
@@ -324,6 +326,35 @@ Preflight checks fail the deploy before it changes a job:
 - The light client needs the execution RPC, the consensus RPC, the checkpoint and the lockbox address together.
 - A supplied settlement address must be a non-zero 20-byte hex address.
 - Without a settlement address, `kardamom-deploy` must exist and support `addresses --contract --json`.
+
+### Secrets
+
+A secret is a keyed L1 URL, a private key, or a receiver token. No job definition holds one.
+
+- `L1_RPC`, `L1_FOLLOWERS_RPC`, `L1_LIGHT_CLIENT_EXECUTION_RPC`, `L1_LIGHT_CLIENT_CONSENSUS_RPC`, `BATCHER_KEY` and `ALERTMANAGER_CONFIG_FILE` reach the role as environment variables.
+  - In CI, they come from GitHub environment secrets. They are never plain GitHub variables.
+- The role writes the secrets of a job to the Nomad Variable `nomad/jobs/<job>` (`roles/workloads/tasks/secrets.yml`).
+  - It writes the variable before it registers the job, and only on a change.
+  - These tasks run with `no_log`, so the play output does not show a secret.
+- The job renders its variable with a `template` block (`env = true`) into `secrets/`. The task gets the items as environment variables. Values use `.Value | toJSON` so quotes, newlines and `#` survive [Nomad environment parsing](https://developer.hashicorp.com/nomad/docs/job-specification/template#environment-variables).
+  - A task reads `nomad/jobs/<job>` with its workload identity. That needs no ACL policy.
+  - The `secrets/` directory does not show in `nomad alloc fs`.
+  - A `nomad job inspect` shows the template, not the values.
+- The deploy token needs `write`, `read` and `list` on `nomad/jobs/*` in its namespace.
+- A job that renders its variable waits for it. Without the role, write it first: `nomad var put nomad/jobs/<job> KEY=value`.
+
+| Job | Variable item | The task reads it as |
+|-----|---------------|----------------------|
+| `batcher` | `KARDAMOM_L1_RPC` | The L1 endpoints: the fault proxy, else `L1_RPC`, else the in-cluster anvil. |
+| `batcher` | `KARDAMOM_L1_KEY` | The L1 key: `BATCHER_KEY`, else the anvil dev key. |
+| `da-watcher`, `l1-indexer` | `KARDAMOM_L1_RPC` | The followers' L1 (`L1_FOLLOWERS_RPC` and its defaults). |
+| `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_ETH_RPC` | `L1_RPC`. |
+| `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX` | `BATCHER_KEY`. Without it the proxy is read-only. |
+| `l1-indexer` | `KARDAMOM_BEACON_API` | The beacon API for its finality schedule. |
+| `l1-light-client` | `HELIOS_EXECUTION_RPC`, `HELIOS_CONSENSUS_RPC` | The upstream execution and beacon URLs. |
+| `monitoring` | `alertmanager`, `rules` | Files: `secrets/alertmanager.yml` and `local/operator-rules.yml`. |
+
+The followers name an L1 source in their logs by its scheme and host only. A provider key is in the path or the query of the URL, so the logs do not show it.
 
 The L1 deployment rules:
 

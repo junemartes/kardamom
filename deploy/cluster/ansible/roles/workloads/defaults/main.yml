@@ -55,9 +55,36 @@ workloads_common_vars:
 # real L1 (the batcher, the da-watcher) read the given one.
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
 workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
-# The batcher's L1 key (KARDAMOM_L1_KEY of the batcher job). Empty keeps
-# the job's default, the anvil dev key.
+# The batcher's L1 key: the batcher's KARDAMOM_L1_KEY and the DA proxy's
+# signer. Empty: the batcher signs with workloads_batcher_dev_key, and
+# the proxy is read-only. Like every keyed L1 URL, it reaches a task
+# only through the job's Nomad Variable (tasks/secrets.yml).
 workloads_batcher_key: "{{ lookup('env', 'BATCHER_KEY') }}"
+# anvil dev account #2, pre-funded. This public dev key matches
+# crates/e2e BATCHER_KEY.
+workloads_batcher_dev_key: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+# The in-cluster anvil by its Consul service record: the L1 of the
+# batcher and the da-watcher without a real L1.
+workloads_anvil_service_rpc: "http://anvil.service.consul:{{ ports.anvil_l1 }}"
+# The Alertmanager configuration of the environment: a file with the
+# routes and the receivers, which can hold a receiver's token. Empty:
+# the deploy leaves the variable nomad/jobs/monitoring as it is. Given,
+# the deploy writes it, with the inhibit rules of
+# deploy/alertmanager-inhibit.yml added, so the file must not hold
+# inhibit_rules. PROMETHEUS_RULES_FILE is the optional rule file of the
+# environment, which Prometheus loads beside deploy/alerts.yml.
+workloads_alertmanager_config_file: "{{ lookup('env', 'ALERTMANAGER_CONFIG_FILE') }}"
+workloads_prometheus_rules_file: "{{ lookup('env', 'PROMETHEUS_RULES_FILE') }}"
+# A line break. Jinja in Ansible keeps a backslash in a string literal, so
+# a join takes this value.
+workloads_newline: "\n"
+workloads_inhibit_file: "{{ workloads_cluster_dir }}/../alertmanager-inhibit.yml"
+workloads_monitoring_secrets: >-
+  {{ {} if workloads_alertmanager_config_file | length == 0 else
+     {'alertmanager': [lookup('file', workloads_alertmanager_config_file),
+                       lookup('file', workloads_inhibit_file), ''] | join(workloads_newline),
+      'rules': lookup('file', workloads_prometheus_rules_file) if workloads_prometheus_rules_file | length > 0
+               else 'groups: []'} }}
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # The EigenDA network the DA proxy disperses to (sepolia_testnet,
 # mainnet). Empty: the file-backed stand-in (nomad/da-store.nomad.hcl),

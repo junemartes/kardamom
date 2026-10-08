@@ -8,6 +8,17 @@
         and workloads_light_checkpoint | length > 0 and workloads_lockbox_address | length > 0)
     fail_msg: The L1 light client requires execution RPC, consensus RPC, checkpoint and lockbox address.
 
+# The deploy adds the public inhibit rules; a second inhibit_rules key
+# would make the configuration invalid.
+- name: Validate the Alertmanager configuration of the environment
+  ansible.builtin.assert:
+    that:
+      - (lookup('file', workloads_alertmanager_config_file) | from_yaml).route is defined
+      - (lookup('file', workloads_alertmanager_config_file) | from_yaml).inhibit_rules is not defined
+    fail_msg: The Alertmanager configuration needs a route and must not hold inhibit_rules.
+  when: workloads_alertmanager_config_file | length > 0
+  no_log: true
+
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml
 

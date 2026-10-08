@@ -87,10 +87,11 @@
     workloads_job:
       name: l1-light-client
       vars:
-        execution_rpc: "{{ workloads_light_execution_rpc }}"
-        consensus_rpc: "{{ workloads_light_consensus_rpc }}"
         checkpoint: "{{ workloads_light_checkpoint }}"
         network: "{{ workloads_light_network }}"
+      secrets:
+        HELIOS_EXECUTION_RPC: "{{ workloads_light_execution_rpc }}"
+        HELIOS_CONSENSUS_RPC: "{{ workloads_light_consensus_rpc }}"
   when: workloads_light_execution_rpc | length > 0
 
 - name: Deploy pipeline followers
@@ -109,9 +110,11 @@
       wait: false
       vars: >-
         {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_rpc': workloads_followers_rpc}
-                     if workloads_l1_rpc_given | length > 0 or workloads_l1_fault_proxy | bool else {})
            | combine({'l1_light_client_rpc': workloads_followers_light_client} if workloads_followers_light_client | length > 0 else {}) }}
+      secrets:
+        KARDAMOM_L1_RPC: >-
+          {{ workloads_followers_rpc if workloads_l1_rpc_given | length > 0 or workloads_l1_fault_proxy | bool
+             else workloads_anvil_service_rpc }}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -129,7 +132,7 @@
       wait: false
       vars:
         host_hardware: "{{ 'off' if deployment_profile == 'local' else 'on' }}"
-    - {name: monitoring, wait: false}
+    - {name: monitoring, wait: false, secrets: "{{ workloads_monitoring_secrets }}"}
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -159,9 +162,10 @@
       name: da-proxy
       vars:
         eigenda_network: "{{ workloads_eigenda_network }}"
-        eigenda_eth_rpc: "{{ workloads_l1_rpc }}"
-        eigenda_signer_key: "{{ workloads_batcher_key }}"
         eigenda_cert_verifier: "{{ workloads_eigenda_cert_verifier }}"
+      secrets:
+        EIGENDA_PROXY_EIGENDA_V2_ETH_RPC: "{{ workloads_l1_rpc }}"
+        EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX: "{{ workloads_batcher_key }}"
   when: workloads_eigenda_network | length > 0
 
 - name: Wait for the DA proxy's API
@@ -183,16 +187,17 @@
     workloads_job:
       name: l1-indexer
       vars:
-        l1_rpc: "{{ workloads_followers_rpc }}"
         l1_light_client_rpc: "{{ workloads_followers_light_client }}"
         settlement_address: "{{ workloads_resolved_settlement }}"
         lockbox_address: >-
           {{ workloads_lockbox_address if workloads_lockbox_address | length > 0 else workloads_zero_address }}
         start_block: "{{ workloads_indexer_start_block }}"
         poll_interval_secs: "{{ workloads_indexer_poll_s }}"
-        beacon_api: "{{ workloads_indexer_beacon_api }}"
         max_log_range: "{{ workloads_indexer_max_log_range }}"
         follower_count: "{{ workloads_indexer_count }}"
+      secrets:
+        KARDAMOM_L1_RPC: "{{ workloads_followers_rpc }}"
+        KARDAMOM_BEACON_API: "{{ workloads_indexer_beacon_api }}"
   when: workloads_indexer_deployed | bool
 
 - name: Deploy the live batcher
@@ -200,21 +205,25 @@
   vars:
     workloads_job:
       name: batcher
-      # The real L1 and the batcher's own key when one is given; the
-      # job's defaults (the in-cluster anvil, the dev key) otherwise; the
-      # fault proxy when it is deployed. The indexer, when it runs, so a
-      # fresh batcher node reads its last batch from it.
+      # The indexer, when it runs, so a fresh batcher node reads its last
+      # batch from it.
       vars: >-
         {{ {'settlement_address': workloads_resolved_settlement}
-           | combine({'l1_rpc': workloads_l1_rpc} if workloads_l1_rpc_given | length > 0 else {})
-           | combine({'l1_rpc': workloads_fault_proxy_url} if workloads_l1_fault_proxy | bool else {})
-           | combine({'batcher_key': workloads_batcher_key} if workloads_batcher_key | length > 0 else {})
            | combine({'blocks_per_batch': workloads_batcher_blocks_per_batch} if workloads_batcher_blocks_per_batch | length > 0 else {})
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
                      if workloads_indexer_deployed | bool else {}) }}
+      # The fault proxy when it is deployed, else the real L1 when one is
+      # given, else the in-cluster anvil. The batcher's own key when one
+      # is given, else the anvil dev key.
+      secrets:
+        KARDAMOM_L1_RPC: >-
+          {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
+             else workloads_l1_rpc if workloads_l1_rpc_given | length > 0
+             else workloads_anvil_service_rpc }}
+        KARDAMOM_L1_KEY: "{{ workloads_batcher_key | default(workloads_batcher_dev_key, true) }}"
 
 - name: Record the deployed manifest
   ansible.builtin.import_tasks: record.yml

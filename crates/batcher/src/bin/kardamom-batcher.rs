@@ -92,12 +92,12 @@ struct Cli {
     /// separate the endpoints with commas. A request goes to the best
     /// endpoint first and falls back to the next on an error or a rate
     /// limit.
-    #[arg(long, env = "KARDAMOM_L1_RPC", value_delimiter = ',', num_args = 1..)]
+    #[arg(long, env = "KARDAMOM_L1_RPC", hide_env_values = true, value_delimiter = ',', num_args = 1..)]
     l1_rpc: Vec<String>,
 
     /// The batcher EOA private key (hex). Must equal the `settlement`'s
     /// `l1Batcher`.
-    #[arg(long, env = "KARDAMOM_L1_KEY")]
+    #[arg(long, env = "KARDAMOM_L1_KEY", hide_env_values = true)]
     l1_key: Option<String>,
 
     /// `KardamomL2Settlement` proxy address for live posting.

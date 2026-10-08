@@ -42,7 +42,9 @@ struct Args {
     /// L1 JSON-RPC HTTP endpoints: repeat the flag, or separate the
     /// endpoints with commas. With two or more, a read is accepted when
     /// two agree; a source that fails or lies rotates out for a backoff.
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    /// A deployment passes the list in the environment, so a keyed URL
+    /// stays out of the process arguments.
+    #[arg(long, env = "KARDAMOM_L1_RPC", hide_env_values = true, value_delimiter = ',', num_args = 1..)]
     l1_rpc: Vec<String>,
     /// The L1 light client's endpoint. Its answer settles a read when it
     /// serves the block; a public endpoint that disagrees with it is the
@@ -52,7 +54,7 @@ struct Args {
     /// A beacon API endpoint. The follower reads the chain's genesis time
     /// and slot length from it once, and then reads L1 on the finality
     /// schedule. Without it, the follower reads every poll interval.
-    #[arg(long)]
+    #[arg(long, env = "KARDAMOM_BEACON_API", hide_env_values = true)]
     beacon_api: Option<String>,
     /// The EigenDA proxy (`http://host:port`), for the payloads.
     #[arg(long, env = "KARDAMOM_DA_PROXY")]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_eth::{Filter, Log};
 use kardamom_da_watcher::source::fakes::MockL1Source;
-use kardamom_da_watcher::{L1Source, L1SourceError, L1Sources, SourceHalt};
+use kardamom_da_watcher::{L1Endpoints, L1Source, L1SourceError, L1Sources, SourceHalt};
 use kardamom_obs::testkit::{free_port, scrape};
 
 /// A set of `n` honest mocks, named `s0..`, with a one-hour backoff.
@@ -308,4 +308,26 @@ async fn a_header_batch_needs_two_agreeing_sources() {
         Err(L1SourceError::Halt(SourceHalt::Disagreement { .. }))
     ));
     assert_eq!(set.light_client_hash(3).await.unwrap(), None);
+}
+
+/// An endpoint's log name keeps the scheme and the host, and drops the
+/// user info, the path and the query, where a provider key sits.
+#[test]
+fn an_endpoint_name_never_carries_the_key() {
+    let endpoints = L1Endpoints {
+        rpcs: vec![
+            "https://eth-sepolia.g.alchemy.com/v2/SECRET-SENTINEL".into(),
+            "https://user:SECRET-SENTINEL@rpc.example:8545/?key=SECRET-SENTINEL".into(),
+            "http://anvil.service.consul:8546".into(),
+        ],
+        light_client: None,
+    };
+    assert_eq!(
+        endpoints.origins(),
+        [
+            "https://eth-sepolia.g.alchemy.com",
+            "https://rpc.example:8545",
+            "http://anvil.service.consul:8546",
+        ]
+    );
 }

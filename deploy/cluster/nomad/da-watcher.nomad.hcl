@@ -65,18 +65,6 @@ variable "datacenter" {
   default     = "dc1"
 }
 
-# The L1 endpoint the watcher derives epochs from. The default is the
-# in-cluster anvil by its Consul service record. The workloads role sets
-# this to its followers' L1 list (`workloads_followers_rpc`). The watcher
-# is the epoch SOURCE, so a lying endpoint here produces bad epochs at
-# the source rather than false halts. Two or more agreeing endpoints, or
-# a light client that settles the reads, close that.
-variable "l1_rpc" {
-  type        = string
-  description = "The L1 JSON-RPC endpoints the watcher derives epochs from, comma-separated. With two or more, a block is accepted when two agree. Default: the in-cluster anvil by its Consul service record."
-  default     = "http://anvil.service.consul:8546"
-}
-
 # The light client's endpoint, when one runs: its answer settles a read
 # it serves, and a public endpoint that disagrees with it is the liar.
 variable "l1_light_client_rpc" {
@@ -160,7 +148,6 @@ job "da-watcher" {
         ]
         args = concat(
           [
-            "--l1-rpc", var.l1_rpc,
             "--lockbox", "${var.lockbox_address}",
             "--log-config", "/local/channels.toml",
             "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
@@ -191,6 +178,24 @@ job "da-watcher" {
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9005"
+      }
+
+      # The L1 endpoints the watcher derives epochs from
+      # (KARDAMOM_L1_RPC, comma-separated; with two or more, a block is
+      # accepted when two agree). The watcher is the epoch source, so a
+      # lying endpoint makes bad epochs at the source; two agreeing
+      # endpoints, or a light client that settles the reads, close that.
+      # They come from the job's Nomad
+      # Variable, which the workloads role writes. They reach the task as
+      # environment, never as a job variable or an argument, so a job
+      # read does not show them.
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/da-watcher" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
+        EOT
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through

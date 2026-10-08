@@ -33,18 +33,6 @@
 # only against a real network. Validate changes to it manually against
 # a testnet before relying on them.
 
-variable "execution_rpc" {
-  type        = string
-  description = "UNTRUSTED upstream execution RPC helios proxies to. Untrusted by construction: helios verifies every response against a beacon-authenticated root, so this endpoint's honesty is not assumed — only its availability."
-  default     = ""
-}
-
-variable "consensus_rpc" {
-  type        = string
-  description = "Beacon API endpoint helios pulls light-client updates from."
-  default     = ""
-}
-
 variable "checkpoint" {
   type        = string
   description = "Weak-subjectivity checkpoint (a trusted beacon block root) helios syncs from. This IS a trust assumption — but a single auditable constant, sourced from several independent places or from our own node once, rather than continuous trust in a live endpoint. Rotate it when it ages out."
@@ -136,8 +124,8 @@ job "l1-light-client" {
         args = [
           "ethereum",
           "--network", "${var.network}",
-          "--execution-rpc", "${var.execution_rpc}",
-          "--consensus-rpc", "${var.consensus_rpc}",
+          "--execution-rpc", "${HELIOS_EXECUTION_RPC}",
+          "--consensus-rpc", "${HELIOS_CONSENSUS_RPC}",
           "--checkpoint", "${var.checkpoint}",
           # The container user has no home directory. Saved checkpoints
           # belong in the writable allocation data directory.
@@ -147,6 +135,15 @@ job "l1-light-client" {
           "--rpc-bind-ip", "${meta.node_ip}",
           "--rpc-port", "${var.rpc_port}",
         ]
+      }
+
+      template {
+        destination = "secrets/l1.env"
+        env         = true
+        data        = <<-EOT
+        {{- with nomadVar "nomad/jobs/l1-light-client" }}{{ range $k, $v := . }}
+        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
+        EOT
       }
 
       # A light client is cheap. The steady-state cost is one
