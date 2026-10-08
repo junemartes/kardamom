@@ -73,6 +73,7 @@ jobs:
         with:
           just-version: 1.49.0
       - run: just style
+      - run: python3 -m unittest discover -s scripts/hooks/tests
 
   build:
     name: build
