@@ -241,7 +241,8 @@ job "aeron" {
       # (ansible/roles/nomad/templates/nomad.hcl.j2): the ingress nodes
       # record tx_data, the da-watcher node records tx_deposits, each
       # executor node records the exec_txs stream of its own executor, every
-      # other node records nothing and lists no topic. Nomad owns this record;
+      # other node records nothing and lists no topic. The L1 follower nodes also record
+      # l1_blocks (`archive_topics_follower`). Nomad owns this record;
       # the runtime never registers an archive. The record outlives every
       # publisher, so retained recordings stay discoverable.
       service {
@@ -249,18 +250,19 @@ job "aeron" {
         port     = "archive_control"
         address  = "${meta.node_ip}"
         provider = "consul"
-        # The topic the node records, so a template can select the
-        # archives of one topic: config/channels.toml.tpl renders its
-        # fallback archive lists from `tx_data.kardamom-aeron-archive`
-        # and `tx_deposits.kardamom-aeron-archive`. A node records at
-        # most one topic.
-        tags = ["${meta.archive_topics}"]
+        # The topics the node records, one tag each, so a template can
+        # select the archives of one topic: config/channels.toml.tpl
+        # renders its fallback archive lists from
+        # `tx_data.kardamom-aeron-archive`, `tx_deposits.kardamom-aeron-archive`
+        # and `l1_blocks.kardamom-aeron-archive`. A node records at most
+        # one topic beside l1_blocks.
+        tags = ["${meta.archive_topics}", "${meta.archive_topics_follower}"]
         meta {
           discovery_version = "1"
           cluster_id        = "${meta.cluster_id}"
           chain_id          = "412346"
           archive_id        = "${node.unique.name}"
-          topics            = "${meta.archive_topics}"
+          topics            = "${meta.archive_topics},${meta.archive_topics_follower}"
         }
       }
 

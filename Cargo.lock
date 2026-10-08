@@ -3919,8 +3919,10 @@ dependencies = [
 name = "kardamom-da-watcher"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-client",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
  "alloy-transport",
@@ -3932,6 +3934,7 @@ dependencies = [
  "kardamom-cluster-adapter",
  "kardamom-da-watcher",
  "kardamom-interop-feed",
+ "kardamom-l1-fault-proxy",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
@@ -4153,9 +4156,11 @@ dependencies = [
  "jsonrpsee",
  "kardamom-batcher",
  "kardamom-da-watcher",
+ "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
  "metrics",
+ "reqwest 0.13.4",
  "rkyv",
  "serde",
  "serde_json",

@@ -70,6 +70,8 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 | `l1_cursor_unreadable` | da-watcher | operator | [`l1_cursor_unreadable`](runbooks/l1_cursor_unreadable.md) |
 | `origin_gap` | sequencer | auto | [`origin_gap`](runbooks/origin_gap.md) |
 | `record_lag` | sealer (raised by the ingress) | auto | [`record_lag`](runbooks/record_lag.md) |
+| `l1_light_client_mismatch` | l1-indexer | operator | [`l1_light_client_mismatch`](runbooks/l1_light_client_mismatch.md) |
+| `l1_follower_disagreement` | consumers of `l1_blocks` | operator | [`l1_follower_disagreement`](runbooks/l1_follower_disagreement.md) |
 
 - The sealer is a Java service with no Rust exporter. The ingress observes the sealer and raises its halts under `service="sealer"`.
 - The ingress raises `record_lag` while the status frame says the record-lag guard refuses. It clears the halt when the flag clears.
@@ -102,11 +104,11 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
   - A record is `gone` after 15 s with no heartbeat.
   - A `gone` record leaves the board after 5 min.
   - A cluster session that sees no boundary for 10 s calls the sealer halted on a lost quorum.
-- **Publishers.** The ingress, the sequencer, the executor, the validator, the batcher, the da-watcher and the state-mirror.
+- **Publishers.** The ingress, the sequencer, the executor, the validator, the batcher, the da-watcher, the l1-indexer and the state-mirror.
   - The validator also publishes the attester as `service="attester"`.
 - **Subscribers.** The ingress and the validator. Other services do not subscribe.
 - **The sealer is not on the stream.** The ingress observes it from the status frame (see "DA-lag guard") and from silence. It publishes the sealer as `sealer/cluster`.
-- **The l1-indexer is not on the stream.** It has no Aeron runtime. Its halt is on its own `/halt` route and on the `indexer_halt` JSON-RPC method.
+- **The l1-indexer is on the stream** as `l1-indexer/l1-indexer-<n>`. Its halt is also on its own `/halt` route and on the `indexer_halt` JSON-RPC method.
 
 | Root | Reaction |
 |---|---|
@@ -828,6 +830,35 @@ The case asserts these results:
 - The first ticks of the da-watcher publish every finalized L1 block after `M`.
 - The batcher posts again. The L1 record stays contiguous from `H`.
 - The recovery probe passes. The end-of-shard audit compares the executors with the validator and rebuilds the head from L1.
+
+## L1 follower
+
+The l1-indexer is the L1 follower: the one service that reads L1 data. It publishes one record for each finalized L1 block on the `l1_blocks` stream (id 1020), and the archive of its node records the stream. The details are in [`l1-data-path.md`](l1-data-path.md).
+
+**The read.** One read per finality step.
+
+- Each tick reads the finalized tip, the headers of the range in one batch request, and the settlement's and the lockbox's logs in one query with both addresses per chunk of `--max-log-range` blocks (10).
+- Every read goes through the two-source set: a disagreement halts it (`l1_source_disagreement`), and no answer halts it (`l1_unreachable`).
+- Each header must descend from the one before it, and the first from the cursor's block: `l1_chain_break`.
+- With a light client, the last header of a range that ends at the finalized tip must be the light client's finalized header for that number. A mismatch is the operator halt `l1_light_client_mismatch`, with nothing of the range published.
+- The order: the archive, the records on the stream, the cursor. A publish that the stream refuses holds the cursor; the next read publishes the range again, and the consumers drop the copies.
+- The follower publishes nothing before the archive records its publication (`--archive-durability`).
+
+**The poll.** With a beacon API, the follower sleeps from a step it consumed to the next epoch boundary, then reads every slot until the tip moves.
+
+- A halt reads every slot, so it clears within one slot of its cause.
+- `kardamom_l1_follower_next_wake_seconds` holds the planned wake. The follower is ready while now is before it plus one slot. `KardamomL1FollowerWakeOverdue` fires on a wake more than 2 minutes overdue.
+- An operator halt holds the follower until the clear, and it plans a wake every slot while it waits, so only the halt alert pages.
+- Without a beacon API (anvil in the e2e and chaos shards), the follower reads every slot, so the chaos cases keep their deposit timing.
+
+**Two instances.** The job runs two instances on two nodes. Both read and both publish.
+
+- A consumer keeps the first record of each block number and drops a second record with the same complete payload inside the dedup horizon.
+- Two records of one number with different hashes or payloads halt the consumer: `l1_follower_disagreement`, cleared by an operator. One instance read a lie its two-source check did not catch.
+- One instance down costs nothing. Both down pause the consumers, with the follower as the root.
+- `KardamomL1FollowerLag` fires when the newest record is more than two finality steps (64 blocks) behind the finalized tip.
+
+**Retention.** Nothing purges the `l1_blocks` recording. A future purge keeps every block at or above the L1 origin of the batcher's posted head: a sealer fleet rebuild seeds there, and the da-watcher resumes from it. The follower's own archive keeps every block since its start block, below that floor.
 
 ## DA-watcher
 

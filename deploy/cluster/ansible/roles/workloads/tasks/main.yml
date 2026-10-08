@@ -174,9 +174,10 @@
     - workloads_da_proxy_probe | bool
     - not ansible_check_mode
 
-# The indexer archives the posted batches and the epoch inputs; it
-# walks the followers' L1 and reads the payloads from the DA proxy (the
-# job's default, by its service record). It comes up before the
+# The indexer is the L1 follower: it reads L1 once per finality step,
+# publishes each finalized block on l1_blocks, and archives the posted
+# batches and the epoch inputs; it reads the payloads from the DA proxy
+# (the job's default, by its service record). It comes up before the
 # batcher, which reads a lost cursor's batch from it. It follows
 # finality: a real L1, or the in-cluster anvil behind the fault proxy,
 # which finalizes two blocks behind its head.
@@ -192,8 +193,11 @@
           {{ workloads_lockbox_address if workloads_lockbox_address | length > 0 else workloads_zero_address }}
         start_block: "{{ workloads_indexer_start_block }}"
         poll_interval_secs: "{{ workloads_indexer_poll_s }}"
+        max_log_range: "{{ workloads_indexer_max_log_range }}"
+        follower_count: "{{ workloads_indexer_count }}"
       secrets:
         KARDAMOM_L1_RPC: "{{ workloads_followers_rpc }}"
+        KARDAMOM_BEACON_API: "{{ workloads_indexer_beacon_api }}"
   when: workloads_indexer_deployed | bool
 
 - name: Deploy the live batcher

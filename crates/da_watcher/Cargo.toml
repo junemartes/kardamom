@@ -23,6 +23,7 @@ alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
 alloy-transport.workspace = true
+alloy-rpc-client.workspace = true
 
 async-trait = "0.1"
 futures.workspace = true
@@ -47,6 +48,8 @@ toml.workspace = true
 kardamom-da-watcher = { path = ".", features = ["testing", "test-support"] }
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
+kardamom-l1-fault-proxy = { path = "../l1_fault_proxy" }
+alloy-consensus.workspace = true
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 

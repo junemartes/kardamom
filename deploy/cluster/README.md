@@ -302,7 +302,10 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Monitoring | `PROMETHEUS_RULES_FILE` | empty (`groups: []`) | The extra Prometheus rule file of the environment, the item `rules`. The role writes it only with `ALERTMANAGER_CONFIG_FILE`. Prometheus loads `deploy/alerts.yml` in all cases. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the da-watcher and the indexer walk. A comma-separated list. With two or more entries, a block counts only when two agree. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
-| Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | The poll period, in seconds. |
+| Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
+| Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |
+| Indexer | `L1_MAX_LOG_RANGE` | empty (`10` in the binary) | The most blocks one log query spans: the provider's cap. |
+| Indexer | `L1_INDEXER_COUNT` | empty (`2` in the job) | Follower instances, each on its own node with the `indexer` role. |
 | Indexer | `L1_INDEXER_HOST`, `L1_INDEXER_PORT` | `kardamom-l1-indexer.service.<datacenter>.consul`, `8549` | Where the batcher reaches the indexer. |
 | Fault proxy | `KARDAMOM_L1_FAULT_PROXY` | `0` | `1` deploys the lying L1 of the `chaos-l1` shard in front of the in-cluster anvil. All followers read L1 through it. |
 | Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames. It is a minimum. The sealer keeps a frame above the posted head even past this window. See the [sealer README](../../cluster/sealer-service/README.md). |
@@ -347,6 +350,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
 | `da-watcher`, `l1-indexer` | `KARDAMOM_L1_RPC` | The followers' L1 (`L1_FOLLOWERS_RPC` and its defaults). |
 | `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_ETH_RPC` | `L1_RPC`. |
 | `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX` | `BATCHER_KEY`. Without it the proxy is read-only. |
+| `l1-indexer` | `KARDAMOM_BEACON_API` | The beacon API for its finality schedule. |
 | `l1-light-client` | `HELIOS_EXECUTION_RPC`, `HELIOS_CONSENSUS_RPC` | The upstream execution and beacon URLs. |
 | `monitoring` | `alertmanager`, `rules` | Files: `secrets/alertmanager.yml` and `local/operator-rules.yml`. |
 

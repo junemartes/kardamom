@@ -194,6 +194,20 @@ fn exec_txs_defaults_present() {
 }
 
 #[test]
+fn l1_blocks_defaults_present() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(ch.l1_blocks_stream_id, 1020);
+    assert_eq!(ch.l1_blocks_channel, "aeron:ipc?alias=l1-blocks");
+    let err = load("[channels]\nl1_blocks_stream_id = 1019\n")
+        .expect_err("l1_blocks on the events stream id must be rejected");
+    assert!(
+        err.to_string()
+            .contains("events_stream_id and l1_blocks_stream_id share the stream id 1019"),
+        "got {err}"
+    );
+}
+
+#[test]
 fn a_stream_id_that_two_streams_share_is_rejected() {
     let err = load("[channels]\nexec_txs_stream_id = 1004\n")
         .expect_err("exec_txs on the BAL stream id must be rejected");
@@ -456,6 +470,7 @@ fn the_deployed_channels_template_loads() {
     let cfg = load(&rendered).expect("rendered channels.toml.tpl loads");
     assert_eq!(cfg.channels.tx_receipts_endpoint_base_port, None);
     assert_eq!(cfg.channels.exec_txs_stream_id, 1005);
+    assert_eq!(cfg.channels.l1_blocks_stream_id, 1020);
     assert_eq!(cfg.discovery.cluster_id, "kardamom-dev");
     assert_eq!(
         cfg.discovery
@@ -467,6 +482,10 @@ fn the_deployed_channels_template_loads() {
     assert_eq!(cfg.aeron.tx_data_archive_endpoints, ["192.168.56.41:8010"]);
     assert_eq!(
         cfg.aeron.tx_deposits_archive_endpoints,
+        ["192.168.56.41:8010"]
+    );
+    assert_eq!(
+        cfg.aeron.l1_blocks_archive_endpoints,
         ["192.168.56.41:8010"]
     );
     assert!(

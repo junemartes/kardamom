@@ -399,8 +399,11 @@ class DeployTest(unittest.TestCase):
         # The indexer follows the light client and reads the payloads from
         # the DA proxy; the batcher resumes from the indexer.
         self.assertEqual(self.api.state['variables']['nomad/jobs/l1-indexer'],
-                         {'KARDAMOM_L1_RPC': 'http://kardamom-l1-light-client.service.dc1.consul:8548'})
+                         {'KARDAMOM_L1_RPC': 'http://kardamom-l1-light-client.service.dc1.consul:8548',
+                          'KARDAMOM_BEACON_API': f'https://consensus.example/{SENTINEL}'})
         self.assertIn('http://kardamom-da-proxy.service.consul:3100', json.dumps(plans['l1-indexer']))
+        follower = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertNotIn('--beacon-api', follower)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
@@ -427,6 +430,31 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
         self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
+
+    def test_the_follower_runs_twice_and_records_its_stream(self):
+        # Two instances on two nodes, each on the node's Aeron driver and
+        # recording l1_blocks; anvil has no beacon chain, so no schedule.
+        self.run_deploy({'workloads_l1_fault_proxy': True}, check=True)
+        group = self.api.state['plans']['l1-indexer']['TaskGroups'][0]
+        self.assertEqual(group['Count'], 2)
+        job = self.api.state['plans']['l1-indexer']
+        constraints = job.get('Constraints') or []
+        self.assertIn('distinct_hosts', json.dumps(constraints))
+        task = group['Tasks'][0]
+        args = task['Config']['args']
+        self.assertIn('--archive-durability', args)
+        self.assertEqual(args[args.index('--log-config') + 1], '/local/channels.toml')
+        self.assertEqual(args[args.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
+        self.assertNotIn('--beacon-api', args)
+        self.assertIn('/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount', task['Config']['volumes'])
+
+    def test_the_follower_takes_its_count_and_its_log_range(self):
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_count': '1',
+                         'workloads_indexer_max_log_range': '2000'}, check=True)
+        group = self.api.state['plans']['l1-indexer']['TaskGroups'][0]
+        self.assertEqual(group['Count'], 1)
+        args = group['Tasks'][0]['Config']['args']
+        self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
 
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the

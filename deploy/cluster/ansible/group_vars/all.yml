@@ -220,7 +220,9 @@ aeron_tmpfs_size: "2g"
 node_classes:
   control: { count: 1, tier: control }
   sequencer: { count: 2, tier: sequencer }
-  ingress: { count: 2, tier: worker, roles: [redis], instance_roles: { "1": [redis-replica] } } # active/active
+  # ingress-0 hosts the second L1 follower instance (indexer): the
+  # follower runs on two nodes.
+  ingress: { count: 2, tier: worker, roles: [redis], instance_roles: { "0": [indexer], "1": [redis-replica] } } # active/active
   executor: { count: 3, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, tier: worker } # 3-member Aeron Cluster (Raft) sealer
   aux: { count: 1, tier: worker, roles: [redis, redis-primary, batcher, monitoring, validator, da-watcher, indexer] }

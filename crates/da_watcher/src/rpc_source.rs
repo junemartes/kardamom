@@ -1,8 +1,10 @@
 //! Alloy-provider-backed implementation of [`crate::source::L1Source`].
 //!
-//! It has three jobs:
+//! It has four jobs:
 //!   * map `finalized_block_number()` to `eth_getBlockByNumber("finalized")`,
 //!   * map `block_ids(n)` to `eth_getBlockByNumber(n)`,
+//!   * map `headers(from, to)` to one JSON-RPC batch of
+//!     `eth_getBlockByNumber` calls,
 //!   * map `logs(filter)` to `eth_getLogs(filter)`. The trait's
 //!     `lockbox_logs` builds the lockbox filter on it and ABI-decodes each
 //!     result into a [`LockboxLog`].
@@ -12,14 +14,14 @@
 
 use alloy_primitives::{B256, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log as RpcLog};
+use alloy_rpc_types_eth::{Block, BlockNumberOrTag, Filter, Log as RpcLog};
 use alloy_sol_types::{SolEvent, sol};
 use alloy_transport::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
 use kardamom_types::epoch::UpgradeLog;
 
-use crate::source::{DepositLog, L1Source, L1SourceError, LockboxLog};
+use crate::source::{DepositLog, L1Header, L1Source, L1SourceError, LockboxLog};
 
 sol!(
     #[derive(Debug)]
@@ -30,7 +32,7 @@ sol!(
     )
 );
 
-pub(crate) use ETHLockbox::{DepositInitiated, UpgradeInitiated};
+pub use ETHLockbox::{DepositInitiated, UpgradeInitiated};
 
 /// Wraps an alloy `Provider` and exposes the L1 reads the followers need.
 pub struct RpcL1Source<P> {
@@ -102,6 +104,54 @@ where
     async fn logs(&self, filter: &Filter) -> Result<Vec<RpcLog>, L1SourceError> {
         self.provider.get_logs(filter).await.map_err(provider_error)
     }
+
+    async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError> {
+        let client = self.provider.client();
+        let mut batch = alloy_rpc_client::BatchRequest::new(client);
+        let waiters = (from..=to)
+            .map(|number| {
+                batch.add_call::<_, Option<Block>>(
+                    "eth_getBlockByNumber",
+                    &(BlockNumberOrTag::Number(number), false),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(provider_error)?;
+        batch.send().await.map_err(provider_error)?;
+        let blocks = futures::future::try_join_all(waiters)
+            .await
+            .map_err(provider_error)?;
+        (from..=to)
+            .zip(blocks)
+            .map(|(number, block)| Self::header_of(number, block))
+            .collect()
+    }
+}
+
+impl<P> RpcL1Source<P> {
+    /// The header of block `number` from its batch answer. The follower
+    /// asks only for blocks at or below the finalized tip, so a missing
+    /// block, or a block with another number, is a provider that lies or
+    /// lost the block.
+    fn header_of(number: u64, block: Option<Block>) -> Result<L1Header, L1SourceError> {
+        let header = block
+            .ok_or_else(|| {
+                L1SourceError::Provider(format!("finalized L1 block {number} not found"))
+            })?
+            .header;
+        if header.number != number {
+            return Err(L1SourceError::Provider(format!(
+                "asked for L1 block {number}, got block {}",
+                header.number
+            )));
+        }
+        Ok(L1Header {
+            number,
+            hash: header.hash,
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        })
+    }
 }
 
 /// Decode one lockbox log, dispatching on `topic[0]`.
@@ -110,7 +160,11 @@ where
 /// asked for exactly two signatures, so any other topic means the provider
 /// ignored the filter. Silently dropping it would derive an epoch that
 /// disagrees with L1.
-pub(crate) fn decode_lockbox_log(log: &RpcLog) -> Result<LockboxLog, L1SourceError> {
+///
+/// # Errors
+/// Returns [`L1SourceError::Decode`] for an unknown topic0 or a log that
+/// does not decode as its event.
+pub fn decode_lockbox_log(log: &RpcLog) -> Result<LockboxLog, L1SourceError> {
     let topic0 = *log
         .topic0()
         .ok_or_else(|| L1SourceError::Decode("log has no topic[0]".to_string()))?;

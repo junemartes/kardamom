@@ -31,7 +31,7 @@ use tracing::{error, warn};
 
 use crate::metrics;
 use crate::rpc_source::RpcL1Source;
-use crate::source::{L1Source, L1SourceError, LockboxLog};
+use crate::source::{L1Header, L1Source, L1SourceError, LockboxLog};
 
 /// How long a failed source stays out of the set.
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(30);
@@ -412,6 +412,28 @@ impl<S: L1Source> L1Source for L1Sources<S> {
         let live = self.live();
         let results = join_all(live.iter().map(|m| m.source.logs(filter))).await;
         self.agree(&format!("logs {filter:?}"), Self::answered(live, results))
+    }
+
+    async fn headers(&self, from: u64, to: u64) -> Result<Vec<L1Header>, L1SourceError> {
+        let live = self.live();
+        let results = join_all(live.iter().map(|m| m.source.headers(from, to))).await;
+        self.agree(
+            &format!("headers {from}..={to}"),
+            Self::answered(live, results),
+        )
+    }
+
+    /// Asks the light client whether or not it is rotated out: the anchor
+    /// is its own check, apart from the agreement of the reads.
+    async fn light_client_hash(&self, number: u64) -> Result<Option<B256>, L1SourceError> {
+        let Some(light_client) = self.members.iter().find(|m| m.authoritative) else {
+            return Ok(None);
+        };
+        light_client
+            .source
+            .block_ids(number)
+            .await
+            .map(|(hash, _)| Some(hash))
     }
 
     async fn lockbox_logs(

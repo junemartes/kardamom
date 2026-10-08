@@ -199,18 +199,19 @@ pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> a
 /// its anchor. Both cursors are on disk with the wrong hash. The
 /// da-watcher restarts from its registered job: the start resumes after
 /// the sealer's L1 origin and reads that block's hash again, so it skips
-/// no epoch and needs no resume flag. The indexer's archive is re-indexed
-/// from the chain's first block. The two-source followers never store an
-/// unagreed hash, which removes this step.
+/// no epoch and needs no resume flag. The archive of each follower
+/// instance is re-indexed from the chain's first block. The two-source
+/// followers never store an unagreed hash, which removes this step.
 pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
     crate::log(format!(
         "{ctx}: OPERATOR STEP (removed by the two-source followers): restart the da-watcher, re-index the archive"
     ));
     restart_and_follow_sealer(h, ctx).await?;
-    let aux = h.probes.validator.container.clone();
     let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
     indexer.stop().await?;
-    wipe_dirs(h, &aux, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;
+    for node in h.probes.follower_containers() {
+        wipe_dirs(h, &node, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;
+    }
     indexer.restore().await
 }
 

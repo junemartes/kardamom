@@ -42,7 +42,7 @@ use kardamom_log::aeron_live::{
     TxRemoteEpochsPublisherHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
-use kardamom_log::discovery::{DiscoveredRecorder, RecorderProgress, StreamPlane, Topic};
+use kardamom_log::discovery::{OwnRecording, StreamPlane, Topic};
 use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_stopped};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -558,8 +558,13 @@ impl DaWatcherService {
     /// `--archive-durability`, so returning before the recording is live
     /// would run without it while claiming otherwise.
     async fn start_deposits_recorder(&mut self) -> anyhow::Result<RecorderThreads> {
-        if let Some(membership) = self.plane.watch_topic(Topic::TxDeposits) {
-            return self.start_discovered_recorder(membership).await;
+        let own = OwnRecording {
+            topic: Topic::TxDeposits,
+            aeron_dir: self.aeron_dir.clone(),
+            aeron_cfg: self.aeron_cfg.clone(),
+        };
+        if let Some(recorders) = self.plane.record_own(own).await? {
+            return Ok(recorders);
         }
         let aeron_dir = self.aeron_dir.clone();
         let aeron_cfg = self.aeron_cfg.clone();
@@ -634,70 +639,5 @@ impl DaWatcherService {
             );
         }
         let _ = ready_tx.send(outcome);
-    }
-
-    /// The discovered twin of [`Self::start_deposits_recorder`]: one
-    /// thread records this watcher's own dynamic MDC publication through
-    /// its control endpoint, and readiness is that recording going live.
-    async fn start_discovered_recorder(
-        &self,
-        membership: tokio::sync::watch::Receiver<kardamom_log::discovery::Membership>,
-    ) -> anyhow::Result<RecorderThreads> {
-        let mut recorders = RecorderThreads::new();
-        let recorder = DiscoveredRecorder {
-            aeron_dir: self.aeron_dir.clone(),
-            aeron_cfg: self.aeron_cfg.clone(),
-            local_ip: self
-                .plane
-                .local_ip()
-                .context("discovered plane has an address")?,
-            own_instance: self
-                .plane
-                .instance_id()
-                .context("discovered plane has an instance")?
-                .to_string(),
-            expected_own: 1,
-            removal_grace: self.plane.removal_grace(),
-            membership,
-            stop: recorders.stop_token(),
-            runtime: tokio::runtime::Handle::current(),
-        };
-        let (ready_tx, ready_rx) = oneshot::channel::<RecorderProgress>();
-        recorders
-            .spawn("da-watcher-tx-deposits-recorder".into(), move |_stop| {
-                Self::run_discovered_recorder(recorder, ready_tx);
-            })
-            .context("spawn tx_deposits recorder thread")?;
-        match tokio::time::timeout(Duration::from_mins(1), ready_rx).await {
-            Ok(Ok(RecorderProgress::Ready { .. })) => {
-                tracing::info!("tx_deposits recording confirmed active");
-            }
-            Ok(Ok(RecorderProgress::Failed(reason))) => anyhow::bail!(
-                "archive durability requested but the tx_deposits recorder failed to start: {reason}"
-            ),
-            Ok(Err(_)) => anyhow::bail!(
-                "archive durability requested but the tx_deposits recorder thread exited before \
-                 reporting readiness"
-            ),
-            Err(_) => anyhow::bail!(
-                "archive durability requested but the tx_deposits recording did not become \
-                 active within 60s"
-            ),
-        }
-        Ok(recorders)
-    }
-
-    /// Run the discovery-driven recorder on its thread, and report its
-    /// progress on `ready_tx`. The recorder holds the threads' stop token.
-    fn run_discovered_recorder(
-        recorder: DiscoveredRecorder,
-        ready_tx: oneshot::Sender<RecorderProgress>,
-    ) {
-        let outcome = recorder.run(|progress| {
-            let _ = ready_tx.send(progress);
-        });
-        if let Err(e) = outcome {
-            tracing::error!(error = %e, "tx_deposits recorder exited with error");
-        }
     }
 }

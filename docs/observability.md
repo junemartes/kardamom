@@ -159,7 +159,7 @@ It answers 503 with the failed conditions when the rule does not hold.
 | `kardamom-batcher` | In live mode: `kardamom_batcher_feed_running == 1`. The offline scan needs only the liveness gauge. |
 | `kardamom-state-mirror` | `kardamom_state_mirror_serving == 1`. |
 | `kardamom-da-watcher` | The last tick (`kardamom_da_watcher_last_tick_unix_seconds`) is fresher than two poll periods plus 10 s. |
-| `kardamom-l1-indexer` | The last tick (`kardamom_l1_indexer_last_tick_unix_seconds`) is fresher than two poll periods plus 10 s. |
+| `kardamom-l1-indexer` | Now is before the planned wake time (`kardamom_l1_follower_next_wake_seconds`) plus one poll interval and 10 s. A follower sleeps between finality steps, so a rule on the last tick would fail between steps. |
 | `kardamom-notifier` | Liveness only. |
 
 - `--ready-lag-blocks` (env `KARDAMOM_READY_LAG_BLOCKS`, default 8) is a flag of the executor and the validator.
@@ -263,6 +263,8 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomBatcherResumeFailures` | critical | A batcher start failed to read L1 in the last 10 minutes. |
 | `KardamomL1IndexerTickErrors` | critical | More than half of the indexer ticks fail for 15 minutes. |
 | `KardamomDaWatcherTickErrors` | critical | More than half of the da-watcher ticks have an outcome other than `ok` for 15 minutes. |
+| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
+| `KardamomL1FollowerWakeOverdue` | critical | A follower instance is more than 2 minutes past its planned wake time for 2 minutes. Runbook: [`l1_follower_wake_overdue`](runbooks/l1_follower_wake_overdue.md). |
 | `KardamomL1SourceDisagreement` | critical | Two L1 sources gave different answers in the last 10 minutes. The follower halts. |
 | `KardamomValidatorEpochsUnverified` | warning | The validator committed an epoch without an L1 check in the last 10 minutes. |
 | `KardamomValidatorEpochFault` | critical | An epoch on the canonical stream does not match L1. The validator halts. |
@@ -278,11 +280,13 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltValidatorDivergence` | critical | `kardamom_halt{cause="validator_divergence"} == 1`. |
 | `KardamomHaltOriginGap` | critical | `kardamom_halt{cause="origin_gap"} == 1` for 1 minute. |
 | `KardamomHaltRecordLag` | critical | `kardamom_halt{cause="record_lag"} == 1`. The record-lag guard is off by default, so this alert cannot fire until a later release turns the guard on. |
+| `KardamomHaltL1LightClientMismatch` | critical | `kardamom_halt{cause="l1_light_client_mismatch"} == 1`. |
+| `KardamomHaltL1FollowerDisagreement` | critical | `kardamom_halt{cause="l1_follower_disagreement"} == 1`. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The ten `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
+- The twelve `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
   - `KardamomHaltOriginGap` waits 1 minute. A restarted sequencer can miss the epoch that the sealer expects, and its twin offers that epoch again within milliseconds. Only a gap that no replica fills pages.
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
@@ -381,17 +385,20 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
 
-### Inbox indexer
+### L1 follower (inbox indexer)
 
 | Metric | Meaning |
 | --- | --- |
+| `kardamom_l1_follower_next_wake_seconds` | Unix time of the next planned L1 read. The readiness rule and `KardamomL1FollowerWakeOverdue` use it. |
+| `kardamom_l1_follower_published_block_number` | Newest L1 block published on `l1_blocks`. `KardamomL1FollowerLag` uses it. |
+| `kardamom_l1_follower_l1_reads_total{read}` | L1 reads. The kinds are `tip`, `headers` (one batch request), `logs` and `light_client`. It shows the provider cost of the follower. |
 | `kardamom_l1_indexer_l1_finalized_block_number` | Newest finalized L1 block that the indexer saw. |
 | `kardamom_l1_indexer_indexed_block_number` | Highest L1 block with indexed batches and epoch. |
 | `kardamom_l1_indexer_last_batch_index` | Highest batch index that the indexer holds. |
 | `kardamom_l1_indexer_batches_total` | Batches indexed. |
 | `kardamom_l1_indexer_payload_bytes_total` | Payload bytes stored. |
 | `kardamom_l1_indexer_tick_total{outcome}` | Ticks. The outcomes are `idle`, `advanced`, and `error`. |
-| `kardamom_l1_indexer_last_tick_unix_seconds` | Unix time of the last tick. The readiness rule uses it. |
+| `kardamom_l1_indexer_last_tick_unix_seconds` | Unix time of the last tick. |
 
 ### Sequencer
 
