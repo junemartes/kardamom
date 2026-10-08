@@ -175,15 +175,19 @@ public final class VoidLedger {
         }
         long before = open == null ? 0L : open;
         long after = before | (1L << voterId);
+        // The decision checks only the configured voters, before the
+        // repeat check. A vote mask from a snapshot can hold every
+        // configured voter and still be open, when the writer had one
+        // voter more. The next vote of any configured voter decides it.
+        if ((after & config.voterMask) == config.voterMask) {
+            votes.remove(index);
+            return new Tally(Vote.DECIDED, Optional.of(take(index)));
+        }
         if (after == before) {
             return Tally.of(Vote.REPEATED);
         }
-        if (after != config.voterMask) {
-            votes.put(index, after);
-            return Tally.of(Vote.COUNTED);
-        }
-        votes.remove(index);
-        return new Tally(Vote.DECIDED, Optional.of(take(index)));
+        votes.put(index, after);
+        return Tally.of(Vote.COUNTED);
     }
 
     /** How many configured voters have voted for {@code index}. */
@@ -206,7 +210,8 @@ public final class VoidLedger {
         return buf.array();
     }
 
-    private boolean isVoter(int voterId) {
+    /** Whether {@code voterId} is a configured voter. */
+    boolean isVoter(int voterId) {
         return voterId >= 0 && voterId < MAX_VOTERS && (config.voterMask & (1L << voterId)) != 0L;
     }
 
@@ -314,8 +319,20 @@ public final class VoidLedger {
         }
         for (int i = 0; i < voteCount; i++) {
             long index = buf.getLong();
-            ledger.votes.put(index, buf.getLong());
+            ledger.restoreVote(index, buf.getLong());
         }
         return ledger;
+    }
+
+    /**
+     * Keep the bits of the configured voters in a vote mask from a
+     * snapshot. The writer can have had a voter that this configuration
+     * does not name. A mask with no configured voter left is no vote.
+     */
+    private void restoreVote(long index, long mask) {
+        long kept = mask & config.voterMask;
+        if (kept != 0L) {
+            votes.put(index, kept);
+        }
     }
 }

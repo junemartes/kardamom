@@ -3,8 +3,9 @@
 //! The sealer has no Rust runtime on the `events` stream, so the ingress
 //! observes it on its cluster session and keeps its state in a lifecycle
 //! of its own (`service = "sealer"`, `instance = "cluster"`): halted on
-//! `da_lag` while the status frame says the DA-lag guard refuses, halted
-//! on `sealer_no_quorum` while no status frame arrives for
+//! `record_lag` while the status frame says the record-lag guard refuses,
+//! on `da_lag` while it says the DA-lag guard refuses, and on
+//! `sealer_no_quorum` while no status frame arrives for
 //! [`SEALER_SILENCE`]. The binary publishes that lifecycle on the stream.
 //!
 //! The ingress pauses submits on a root: the sealer's halt first, then
@@ -19,6 +20,7 @@ use kardamom_obs::events::BoardView;
 use kardamom_obs::halt::{Halt, HaltCause, HaltRef, Record};
 use kardamom_obs::lifecycle::{Lifecycle, Slots, process};
 use kardamom_types::ClusterStatus;
+use kardamom_types::cluster_status::RecordLagStatus;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -98,14 +100,47 @@ impl ChainWatch {
         ControlFlow::Continue(())
     }
 
-    /// Mirror one status frame: the gauges, and the sealer's `da_lag`
-    /// halt. Any status frame proves the quorum, so it also ends a
-    /// `sealer_no_quorum` halt.
+    /// Mirror one status frame: the gauges, and the sealer's
+    /// `record_lag` or `da_lag` halt. Any status frame proves the quorum,
+    /// so it also ends a `sealer_no_quorum` halt.
     fn on_status(&mut self, status: &ClusterStatus, now: Instant) {
         self.last_status = Some(now);
         crate::metrics::record_cluster_status(status);
-        if status.halted {
-            self.sealer.raise(Halt::new(
+        match Self::status_halt(status) {
+            Some(halt) => self.sealer.raise(halt),
+            None => {
+                self.sealer.clear();
+            }
+        }
+    }
+
+    /// The sealer's halt that one status frame names. When both guards
+    /// refuse, the record lag is the root: the executors record before
+    /// the batcher can post.
+    fn status_halt(status: &ClusterStatus) -> Option<Halt> {
+        Self::record_lag_halt(&status.record_lag).or_else(|| Self::da_lag_halt(status))
+    }
+
+    /// The `record_lag` halt while the record-lag guard refuses.
+    fn record_lag_halt(lag: &RecordLagStatus) -> Option<Halt> {
+        lag.halted.then(|| {
+            let recorded = lag
+                .best_recorded
+                .map_or_else(|| "none".to_string(), |index| index.to_string());
+            Halt::new(
+                HaltCause::RecordLag,
+                format!(
+                    "the best recorded index is {recorded}; the budget is {} records",
+                    lag.budget
+                ),
+            )
+        })
+    }
+
+    /// The `da_lag` halt while the DA-lag guard refuses.
+    fn da_lag_halt(status: &ClusterStatus) -> Option<Halt> {
+        status.halted.then(|| {
+            Halt::new(
                 HaltCause::DaLag,
                 format!(
                     "sealed head {} is {} blocks past the posted head {}; the budget is {}",
@@ -114,10 +149,8 @@ impl ChainWatch {
                     status.posted_head,
                     status.budget_blocks
                 ),
-            ));
-        } else {
-            self.sealer.clear();
-        }
+            )
+        })
     }
 
     /// Call the sealer halted on a lost quorum once no status frame

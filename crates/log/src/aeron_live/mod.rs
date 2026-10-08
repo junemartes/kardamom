@@ -67,6 +67,7 @@ mod bound;
 mod handles;
 mod pending;
 mod runtime;
+mod table_pub;
 mod thread;
 
 pub use handles::simple::{

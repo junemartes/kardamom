@@ -1,20 +1,13 @@
 //! This module scrapes cluster metrics for the load harness.
 //!
-//! Each service's Prometheus exporter binds to loopback inside its own
-//! container, which runs on host-net inside the `DinD` node container.
-//! So the only way to reach an exporter from the orchestrator or host
-//! is `docker exec <node> curl 127.0.0.1:<port>/metrics`. A `direct`
-//! mode, plain `curl http://<node>:<port>`, is a fallback for a setup
-//! that rebinds the exporters to a routable address.
+//! A snapshot reads every target of the scrape set through
+//! [`ExporterReader`]: directly first, then through `docker exec` inside
+//! the node. A snapshot counts each fallback, because a runner-wide stall
+//! of `docker exec` hides every exec-based read at once.
 
 use std::collections::BTreeSet;
 
-use tokio::process::Command;
-
-// The default metrics ports. These match each service's --metrics-addr default.
-const PORT_EXECUTOR: u16 = 9004;
-const PORT_INGRESS: u16 = 9006;
-const PORT_SEQUENCER: u16 = 9001;
+use crate::load::exporter::{ExporterReader, MetricsTarget, MetricsTargets};
 
 // The exact Prometheus metric names each service exposes.
 const M_EXECUTOR_BLOCK: &str = "kardamom_executor_block_number";
@@ -67,50 +60,56 @@ pub(crate) struct MetricsSnapshot {
     /// missing from this list was never scraped, because it was not in
     /// the scrape set.
     pub service_up: Vec<(String, Option<u64>)>,
+    /// The reads of this snapshot whose direct read failed and that fell
+    /// back to `docker exec`.
+    pub fallbacks: u64,
 }
 
-/// The services to scrape, and the node-container names for each.
+/// The services to scrape, and the exporter targets of each.
 #[derive(Debug, Clone)]
 pub(crate) struct Scraper {
-    /// When true, use `docker exec <node> curl 127.0.0.1:<port>`.
-    /// When false, use a direct `curl http://<node>:<port>`.
-    pub via_docker: bool,
     /// The lowercased service names to scrape: any of executor, ingress,
     /// or sequencer. The sealer values ride along with the executor
     /// scrape, since the clustered sealer has no endpoint of its own.
+    scrape: BTreeSet<String>,
+    targets: MetricsTargets,
+    reader: ExporterReader,
+}
+
+/// The inputs of [`Scraper::new`].
+pub(crate) struct ScrapeSet {
     pub scrape: BTreeSet<String>,
-    /// The executor node-container names.
-    pub executor_nodes: Vec<String>,
-    /// The ingress node-container name.
-    pub ingress_node: String,
-    /// The sequencer node-container names.
-    pub sequencer_nodes: Vec<String>,
+    pub targets: MetricsTargets,
 }
 
 impl Scraper {
+    /// A scraper over `set`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be built.
+    pub(crate) fn new(set: ScrapeSet) -> anyhow::Result<Self> {
+        Ok(Self::with_reader(set, ExporterReader::new()?))
+    }
+
+    fn with_reader(set: ScrapeSet, reader: ExporterReader) -> Self {
+        Self {
+            scrape: set.scrape,
+            targets: set.targets,
+            reader,
+        }
+    }
+
     fn wants(&self, svc: &str) -> bool {
         self.scrape.contains(svc)
     }
 
-    /// Fetch one node's `/metrics` body. Returns `None` if unreachable.
-    async fn fetch(&self, node: &str, port: u16) -> Option<String> {
-        let url = format!("http://127.0.0.1:{port}/metrics");
-        let out = if self.via_docker {
-            Command::new("docker")
-                .args(["exec", node, "curl", "-fsS", "--max-time", "5", &url])
-                .output()
-                .await
-        } else {
-            let direct = format!("http://{node}:{port}/metrics");
-            Command::new("curl")
-                .args(["-fsS", "--max-time", "5", &direct])
-                .output()
-                .await
-        };
-        match out {
-            Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
-            _ => None,
-        }
+    /// Read one target's `/metrics` body into `snap`'s fallback count.
+    /// Returns `None` if no read answers.
+    async fn fetch(&self, snap: &mut MetricsSnapshot, target: &MetricsTarget) -> Option<String> {
+        let read = self.reader.read(target).await;
+        snap.fallbacks = snap.fallbacks.saturating_add(u64::from(read.fell_back));
+        read.body
     }
 
     /// Take a full snapshot of the configured services.
@@ -131,8 +130,8 @@ impl Scraper {
     /// Scrape every executor node into `snap`: block number, the
     /// re-exported sealer boundary stream, and liveness.
     async fn scrape_executors(&self, snap: &mut MetricsSnapshot) {
-        for node in &self.executor_nodes {
-            self.scrape_one_executor(snap, node).await;
+        for target in &self.targets.executors {
+            self.scrape_one_executor(snap, target).await;
         }
     }
 
@@ -140,15 +139,16 @@ impl Scraper {
     /// most advanced sealer boundary observation seen across executors
     /// so far (a single stalled executor should not hide sealer
     /// progress), plus liveness.
-    async fn scrape_one_executor(&self, snap: &mut MetricsSnapshot, node: &str) {
-        let body = self.fetch(node, PORT_EXECUTOR).await;
+    async fn scrape_one_executor(&self, snap: &mut MetricsSnapshot, target: &MetricsTarget) {
+        let body = self.fetch(snap, target).await;
+        let node = &target.name;
         let g = |m: &str| {
             body.as_deref()
                 .and_then(|b| sum_metric(b, m))
                 .map(|v| gauge_u64(v, m))
         };
         snap.executor_blocks
-            .push((node.to_string(), g(M_EXECUTOR_BLOCK)));
+            .push((node.clone(), g(M_EXECUTOR_BLOCK)));
         // This is sealer output, re-exported by this executor from
         // cluster egress.
         snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
@@ -159,7 +159,7 @@ impl Scraper {
     /// Scrape ingress into `snap`: submission counts, queue depth, and
     /// liveness.
     async fn scrape_ingress(&self, snap: &mut MetricsSnapshot) {
-        let body = self.fetch(&self.ingress_node, PORT_INGRESS).await;
+        let body = self.fetch(snap, &self.targets.ingress).await;
         // An absent counter on a scraped body means zero. The metrics-rs
         // library emits a counter only after its first increment. `None`
         // means the scrape itself failed. This is the same distinction
@@ -174,7 +174,7 @@ impl Scraper {
         snap.ingress_queue_depth = g(M_INGRESS_QUEUE);
         push_up(
             snap,
-            format!("ingress@{}", self.ingress_node),
+            format!("ingress@{}", self.targets.ingress.name),
             body.as_deref(),
         );
     }
@@ -183,9 +183,9 @@ impl Scraper {
     /// counters across nodes.
     async fn scrape_sequencers(&self, snap: &mut MetricsSnapshot) {
         let mut totals = SeqTotals::default();
-        for node in &self.sequencer_nodes {
-            let body = self.fetch(node, PORT_SEQUENCER).await;
-            totals.fold_node(snap, node, body.as_deref());
+        for target in &self.targets.sequencers {
+            let body = self.fetch(snap, target).await;
+            totals.fold_node(snap, &target.name, body.as_deref());
         }
         snap.seq_dropped_past = totals.scraped_any.then_some(totals.dropped_past);
         snap.seq_evictions = totals.scraped_any.then_some(totals.evictions);
@@ -368,6 +368,31 @@ kardamom_executor_block_apply_duration_seconds_count 7
         let mut snap = MetricsSnapshot::default();
         push_up(&mut snap, "executor@n0".to_string(), Some(SAMPLE));
         assert_eq!(snap.service_up, vec![("executor@n0".to_string(), None)]);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_counts_the_fallbacks_of_every_target() {
+        // A bridged target on a closed loopback port: the direct read
+        // fails, and `false` fails the read through the node.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let target = MetricsTarget::bridged(std::net::Ipv4Addr::LOCALHOST, "ingress-0", port);
+        let set = ScrapeSet {
+            scrape: ["executor", "ingress"].map(String::from).into(),
+            targets: MetricsTargets {
+                executors: vec![target.clone(), target.clone()],
+                ingress: target,
+                sequencers: Vec::new(),
+            },
+        };
+        let reader = ExporterReader::with_exec("false", std::time::Duration::from_secs(1)).unwrap();
+        let snap = Scraper::with_reader(set, reader).snapshot().await;
+        assert_eq!(snap.fallbacks, 3);
+        assert_eq!(snap.executor_blocks.len(), 2);
+        assert_eq!(snap.ingress_received, None);
     }
 
     #[test]

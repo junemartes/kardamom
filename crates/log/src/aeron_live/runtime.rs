@@ -70,10 +70,20 @@ pub(super) enum RuntimeCmd {
     },
     /// Best-effort publish — no ack, errors logged.
     PublishBestEffort { pub_id: u32, bytes: AlignedVec },
+    /// Lossy publish — one offer, no ack, a refused frame only counts.
+    PublishLossy { pub_id: u32, bytes: AlignedVec },
     /// Register a new publication. The Aeron thread executes
     /// `aeron.add_publication()` and replies with the assigned `pub_id`
     /// and the publication's Aeron session id.
     OpenPublication {
+        uri: String,
+        stream_id: i32,
+        ack: CbSender<Result<OpenedPub, LogError>>,
+    },
+    /// Register a new exclusive publication. The Aeron thread executes
+    /// `aeron.add_exclusive_publication()`, so the publication has its own
+    /// session even when another client adds the same channel and stream.
+    OpenExclusivePublication {
         uri: String,
         stream_id: i32,
         ack: CbSender<Result<OpenedPub, LogError>>,
@@ -582,6 +592,16 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
 
     pub fn try_recv(&mut self) -> Option<(BPosition, T)> {
         try_recv_decoded(&mut self.rx, decode_typed_frame)
+    }
+
+    /// The next frame, with the Aeron session id of its publication. Each
+    /// publisher process opens its own publication, so the session tells
+    /// apart the publishers of one stream.
+    pub async fn recv_from(&mut self) -> Option<(i32, T)> {
+        recv_decoded(&mut self.rx, |frame| {
+            decode_typed_frame(frame).map_break(|(_, v)| (frame.session, v))
+        })
+        .await
     }
 }
 
