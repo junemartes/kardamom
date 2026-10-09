@@ -12,6 +12,7 @@
 
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_state::env::Durability;
@@ -115,9 +116,33 @@ pub(crate) fn simple_delta(
     WriteBatch::new(boundary, delta)
 }
 
-/// Send one [`simple_delta`] block and drain the snapshot it produces.
+/// The bound on one wait for a committed block. The writer commits a test
+/// block in milliseconds, so a wait past this bound is a stalled writer or
+/// a wrong wait, not a slow host.
+const BLOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// Block until the writer publishes a snapshot at `block` or later, and
+/// return it.
+///
+/// The snapshot slot is latest-wins: one wake covers every commit since
+/// the previous receive. So a caller never counts wakes against blocks.
+/// This helper reads the block number of each snapshot instead.
+///
+/// # Panics
+///
+/// Panics when no such snapshot arrives within [`BLOCK_WAIT`], or when the
+/// writer stops first. A hung test is a failure with a message, not a
+/// test binary that never ends.
+pub(crate) fn wait_for_block(w: &WriterHandle, block: u64) -> StateSnapshot {
+    let deadline = Instant::now() + BLOCK_WAIT;
+    std::iter::from_fn(|| w.snapshot_rx.recv_deadline(deadline))
+        .find(|snap| snap.block_number() >= block)
+        .unwrap_or_else(|| panic!("no snapshot at block {block} or later within {BLOCK_WAIT:?}"))
+}
+
+/// Send one [`simple_delta`] block and wait for the snapshot at it.
 /// This is every test's "commit a block, and get its post-state view"
-/// step, over `WriteBatch::send` plus `snapshot_rx.recv`.
+/// step, over `WriteBatch::send` plus [`wait_for_block`].
 pub(crate) fn commit_block(
     w: &WriterHandle,
     block: u64,
@@ -129,7 +154,7 @@ pub(crate) fn commit_block(
     w.delta_tx
         .send(simple_delta(block, addr, balance, slot_idx, slot_value))
         .unwrap();
-    w.snapshot_rx.recv().unwrap()
+    wait_for_block(w, block)
 }
 
 /// Commit every block in `blocks`, each with balance `1000 + block` and
