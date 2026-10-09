@@ -106,8 +106,8 @@ impl Phase {
 }
 
 /// The three lies in order. Through each, the follower halts on the
-/// disagreement of its two sources, the da-watcher pauses on it, the
-/// batcher keeps posting, and the stale-post alert fires on
+/// disagreement of its two sources, the da-watcher and the batcher pause
+/// on it, the batcher keeps posting, and the stale-post alert fires on
 /// the swallowed logs; after each, every one of them resumes by itself
 /// and the archive catches up with L1; at the end, the DA record is
 /// contiguous.
