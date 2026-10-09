@@ -351,6 +351,9 @@ struct Boot {
     /// it before it starts, so a signal that lands during the repair
     /// between two revolutions ends the process instead of being lost.
     stop: tokio_util::sync::CancellationToken,
+    /// The executor id of the recorded cursor; `None` while the cursor is
+    /// off.
+    cursor_id: Option<u8>,
 }
 
 impl Boot {
@@ -380,6 +383,31 @@ impl Boot {
         cfg
     }
 
+    /// Repair a replay-window overrun between two revolutions, so the
+    /// next one restores a fetched peer checkpoint instead of asking for
+    /// the same refused `REPLAY_FROM` again. Returns the verdict of the
+    /// revolution that ended with `engine_error`.
+    fn repair(
+        &self,
+        engine_error: Option<ExecutorError>,
+        expected_genesis: Option<alloy_primitives::B256>,
+    ) -> Result<Verdict> {
+        let args = &self.args;
+        let repaired = bin_support::replay_unavailable_fallback(
+            engine_error.as_ref(),
+            args.checkpoint_dir.as_deref(),
+            &args.checkpoint_peers,
+            &args.state_dir,
+            expected_genesis,
+            false,
+        )?;
+        if let Some(outcome) = repaired {
+            metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
+                .increment(1);
+        }
+        Ok(verdict(engine_error, repaired))
+    }
+
     async fn init(args: Args) -> Result<Self> {
         bin_support::init_tracing();
         kardamom_obs::init_service!(
@@ -396,6 +424,7 @@ impl Boot {
         kardamom_engine::metrics::describe();
         kardamom_executor::exec_stream::ExecStreamMetrics::describe();
         let file_cfg = load_file_config(&args)?;
+        let cursor_id = args.recorded_cursor_id()?;
         tracing::info!(
             lanes = kardamom_types::shard_map::LANE_COUNT,
             chain_id = args.chain_id,
@@ -422,6 +451,7 @@ impl Boot {
             file_cfg,
             _checkpoints: checkpoints,
             stop,
+            cursor_id,
         })
     }
 }
@@ -526,6 +556,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     let answers = outputs.answers_lookup;
 
     let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
+    outputs.exec_stream.cursor.start(
+        boot.cursor_id
+            .map(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
+    );
 
     let WriterAdapters {
         mut writer,
@@ -607,23 +641,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // End the nonce query server before the repair: it holds a clone of
     // the state env, and the repair parks that env.
     stop_nonce_query(nonce_query).await;
-    // Replay-window overrun: repair between revolutions, so the next one
-    // restores a fetched peer checkpoint instead of re-requesting the
-    // same refused `REPLAY_FROM`. See
-    // `bin_support::replay_unavailable_fallback`.
-    let repaired = bin_support::replay_unavailable_fallback(
-        engine_error.as_ref(),
-        args.checkpoint_dir.as_deref(),
-        &args.checkpoint_peers,
-        &args.state_dir,
-        expected_genesis,
-        false,
-    )?;
-    if let Some(outcome) = repaired {
-        metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
-            .increment(1);
-    }
-    Ok(verdict(engine_error, repaired))
+    boot.repair(engine_error, expected_genesis)
 }
 
 /// The verdict for one engine result and the repair's result. `repaired`

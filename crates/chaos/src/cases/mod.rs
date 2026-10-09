@@ -22,6 +22,7 @@ pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
 pub(crate) mod peer_fetch;
+pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;

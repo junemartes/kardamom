@@ -82,6 +82,13 @@ pub(crate) struct Args {
     /// `kardamom.cluster.voidVoters` list, and each consumer has its own id.
     #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
     pub(crate) void_voter_id: Option<u8>,
+    /// Send the recorded cursor of the executor stream to the sealer, under
+    /// the `--void-voter-id` of this executor. The sealer keeps the best
+    /// cursor of the executors as the floor of its record-lag guard. A
+    /// sealer that does not know the cursor frame drops it, but switch this
+    /// on only after every sealer member reads it.
+    #[arg(long, env = "KARDAMOM_EXEC_CURSOR", default_value_t = false)]
+    pub(crate) exec_cursor: bool,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,
@@ -225,6 +232,21 @@ impl Args {
         };
         kardamom_state::ExecAnswers::spawn(archive_id).map(Some)
     }
+
+    /// The executor id that the recorded cursor goes out under: the void
+    /// voter id with `--exec-cursor` on, `None` with it off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `--exec-cursor` is on with no
+    /// `--void-voter-id`: the sealer takes a cursor only from a voter.
+    pub(crate) fn recorded_cursor_id(&self) -> anyhow::Result<Option<u8>> {
+        match (self.exec_cursor, self.void_voter_id) {
+            (false, _) => Ok(None),
+            (true, Some(id)) => Ok(Some(id)),
+            (true, None) => anyhow::bail!("--exec-cursor needs --void-voter-id"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +254,28 @@ mod tests {
     use clap::Parser;
 
     use super::Args;
+
+    fn parse(extra: &[&str]) -> Args {
+        let base = ["kardamom-executor", "--config", "executor.toml"];
+        Args::try_parse_from(base.iter().chain(extra)).expect("parses")
+    }
+
+    #[test]
+    fn the_recorded_cursor_is_off_by_default_and_needs_a_voter_id() {
+        let off = parse(&["--void-voter-id", "2"]);
+        assert_eq!(
+            off.recorded_cursor_id().expect("valid"),
+            None,
+            "off by default"
+        );
+        let on = parse(&["--void-voter-id", "2", "--exec-cursor"]);
+        assert_eq!(on.recorded_cursor_id().expect("valid"), Some(2));
+        let no_voter = parse(&["--exec-cursor"]);
+        assert!(
+            no_voter.recorded_cursor_id().is_err(),
+            "a cursor needs a voter id"
+        );
+    }
 
     /// `CheckpointInterval` gives clap one concrete type for this
     /// field. This test parses a real command line, so a clap

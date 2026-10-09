@@ -77,6 +77,19 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The recorded cursor, "on" or "off" (--exec-cursor). On, each executor
+# sends the recorded cursor of its stream to the sealer, the floor of the
+# record-lag guard. Switch it on only after every sealer member reads the
+# cursor frame. Ansible deployment passes -var from KARDAMOM_EXEC_CURSOR.
+variable "exec_cursor" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.exec_cursor)
+    error_message = "The exec_cursor value must be on or off."
+  }
+}
+
 variable "executor_query_port" {
   type    = number
   default = 9024
@@ -172,6 +185,8 @@ job "executor" {
         # (docs/agents/2026-08-01-bal-phase1-measurement and the DeFi
         # run), at zero parallelism cost under seeded execution.
         KARDAMOM_BAL_GRANULARITY = "20"
+        # The recorded cursor to the sealer, under the void voter id.
+        KARDAMOM_EXEC_CURSOR = var.exec_cursor == "on" ? "true" : "false"
         # KARDAMOM_BAL_MEASURE stays unset in deployed profiles. The
         # K-ladder measure mode re-encodes every frame 4 times, on the
         # publisher thread. Under DeFi loads, that saturated the
