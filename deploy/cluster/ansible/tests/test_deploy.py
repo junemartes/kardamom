@@ -187,10 +187,12 @@ class NomadAPI(BaseHTTPRequestHandler):
         elif parts[2] == 'deployment':
             # The deployment's verdict, by the job's scripted outcome. A
             # failed deployment of a job with auto_revert makes Nomad
-            # register the previous version again, as a new version.
+            # register the previous version again, as a new version; a
+            # job with no previous version stays where it is.
             deployment = state['deployments'][parts[3]]
             verdict = deployment.state()
-            if verdict['Status'] == 'failed' and not deployment.reverted and self.auto_revert(parts[3]):
+            if (verdict['Status'] == 'failed' and not deployment.reverted and self.auto_revert(parts[3])
+                    and self.version(parts[3]) > 0):
                 deployment.reverted = True
                 self.register(state['versions'][parts[3]][-2])
                 state['writes'].append(f'auto-revert:{parts[3]}')

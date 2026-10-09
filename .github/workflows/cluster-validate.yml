@@ -102,18 +102,24 @@ jobs:
           done
           exit $rc
       # Each deploy test runs a full play against the fake API, so the
-      # deploy classes run in their own processes, beside the other modules.
+      # deploy classes run in their own processes, beside the other
+      # modules. Every process runs from the repository root, as the
+      # single discover did: deploy/cluster/ansible/ansible.cfg turns
+      # become on, and a render under it is not readable by the runner.
       - name: Test Ansible workloads, images, and signing in isolation
-        working-directory: deploy/cluster/ansible
         run: |
+          tests=deploy/cluster/ansible/tests
           pids=()
-          for target in tests.test_deploy.DeployTest tests.test_deploy.SealerTest \
-                        tests.test_deploy.RecordTest tests.test_deploy.RollbackTest; do
-            python3 -m unittest -v "$target" > "/tmp/${target##*.}.log" 2>&1 &
+          for class in DeployTest SealerTest RecordTest RollbackTest; do
+            python3 -m unittest discover -s "$tests" -p test_deploy.py -k "$class" -v > "/tmp/$class.log" 2>&1 &
             pids+=($!)
           done
-          others=$(ls tests/test_*.py | grep -v test_deploy.py | sed 's#tests/##; s#\.py$##; s#^#tests.#')
-          python3 -m unittest -v $others > /tmp/others.log 2>&1 &
+          (
+            for module in "$tests"/test_*.py; do
+              [ "$(basename "$module")" = test_deploy.py ] && continue
+              python3 -m unittest discover -s "$tests" -p "$(basename "$module")" -v || exit 1
+            done
+          ) > /tmp/others.log 2>&1 &
           pids+=($!)
           rc=0
           for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
