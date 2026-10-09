@@ -493,15 +493,10 @@ fn continue_from_spool(
                 spool_first = first.block_number,
                 expected_first, "spool does not continue the confirmed cursor; dropping it"
             );
+            Spool::count_dropped("discontinuous");
             spool.clear_through(u64::MAX)?;
         }
-        return Ok((
-            Restored {
-                blocks: Vec::new(),
-                oldest_written: None,
-            },
-            cursor,
-        ));
+        return Ok((Restored::empty(), cursor));
     }
     let resume = restored.blocks.last().map_or(cursor, |last| BatchCursor {
         next_index: last.end_tx_idx.as_index(),

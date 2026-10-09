@@ -369,6 +369,70 @@ fn quarantine_failed_message_has_a_readable_gap() {
     assert!(!msg.contains("be  quarantined"), "got {msg:?}");
 }
 
+/// The manifest states the image's schema. A manifest from before the
+/// key parses with no schema, and a key the reader does not know is
+/// ignored.
+#[test]
+fn manifest_round_trips_the_schema_version() {
+    let manifest = CheckpointManifest {
+        block: 9,
+        image_keccak: B256::repeat_byte(0x11),
+        genesis_digest: B256::repeat_byte(0x22),
+        schema_version: Some(crate::meta::SCHEMA_VERSION),
+    };
+    let text = manifest.encode();
+    assert!(text.contains(&format!("schema_version={}\n", crate::meta::SCHEMA_VERSION)));
+    assert_eq!(CheckpointManifest::parse(&text).unwrap(), manifest);
+
+    let old = text
+        .lines()
+        .filter(|l| !l.starts_with("schema_version"))
+        .fold(String::new(), |mut acc, l| {
+            acc.push_str(l);
+            acc.push('\n');
+            acc
+        });
+    let parsed = CheckpointManifest::parse(&format!("{old}later_key=1\n")).unwrap();
+    assert_eq!(parsed.schema_version, None);
+    assert_eq!(parsed.block, 9);
+}
+
+/// A checkpoint whose manifest states a schema this release does not
+/// read is skipped before its image is copied. A reader of another
+/// process's directory takes the next-newest and leaves the skipped one
+/// in place.
+#[test]
+fn restore_skips_a_checkpoint_of_another_schema() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x27; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let readable = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 5);
+    let later = create_checkpoint(&env, ckpt.path()).unwrap();
+    drop(env);
+
+    // The newer checkpoint comes from a release with the next schema.
+    let mut manifest = read_manifest(&later.path).unwrap();
+    manifest.schema_version = Some(crate::meta::SCHEMA_VERSION + 1);
+    std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
+
+    let err = restore_checkpoint(&later.path, dst.path(), None).unwrap_err();
+    assert!(
+        matches!(err, StateError::UnreadableCheckpointSchema { schema, .. } if schema == crate::meta::SCHEMA_VERSION + 1),
+        "{err}"
+    );
+    assert!(!has_state_db(dst.path()).unwrap(), "nothing was copied");
+
+    let (block, path) = restore_newest_readable(ckpt.path(), dst.path(), None)
+        .unwrap()
+        .expect("the readable checkpoint restores");
+    assert_eq!(block, readable.block);
+    assert_eq!(path, readable.path);
+    assert!(later.path.exists(), "the skipped checkpoint stays put");
+}
+
 #[test]
 fn format_versions_match_the_registry() {
     use kardamom_formats::Registry;

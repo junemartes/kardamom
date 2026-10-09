@@ -8,12 +8,23 @@ use alloy_primitives::B256;
 
 use crate::env::StateEnv;
 use crate::error::StateError;
+use crate::meta::SCHEMA_VERSION;
 
 use super::checkpoint_data_file;
 
 /// The manifest layout version that `encode` writes. The parser ignores
-/// it, as it ignores every unknown key.
+/// it, as it ignores every unknown key. A new key is added at the tail
+/// and is optional, so the version stays.
 pub(crate) const MANIFEST_VERSION: u32 = 1;
+
+/// Checkpoints skipped because their image holds a state schema this
+/// release does not read.
+const UNREADABLE_SCHEMA_SKIPS: &str = "kardamom_checkpoint_unreadable_schema_skips_total";
+
+/// The state schema of a checkpoint image, as its manifest or its serving
+/// peer states it. `None` when the source predates the key; the image
+/// itself then says its schema when it opens.
+pub(crate) type ImageSchema = Option<u32>;
 
 /// A sidecar file written next to every checkpoint: it says what these
 /// bytes are.
@@ -43,13 +54,21 @@ pub(crate) struct CheckpointManifest {
     /// `KEY_GENESIS_DIGEST` from the image. This binds the image to a
     /// chain identity.
     pub genesis_digest: B256,
+    /// The state schema of the image, so an adopter skips an image it
+    /// cannot read before it copies it. `None` in a manifest from before
+    /// the key.
+    pub schema_version: ImageSchema,
 }
 
 impl CheckpointManifest {
     #[must_use]
     pub(crate) fn encode(&self) -> String {
+        let schema = self
+            .schema_version
+            .map(|schema| format!("schema_version={schema}\n"))
+            .unwrap_or_default();
         format!(
-            "version={MANIFEST_VERSION}\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n",
+            "version={MANIFEST_VERSION}\nblock={}\nimage_keccak={:#x}\ngenesis_digest={:#x}\n{schema}",
             self.block, self.image_keccak, self.genesis_digest
         )
     }
@@ -70,6 +89,7 @@ impl CheckpointManifest {
                 block,
                 image_keccak,
                 genesis_digest,
+                schema_version: fields.schema_version,
             }),
             _ => Err(StateError::Recovery(
                 "checkpoint manifest is malformed (need block, image_keccak, genesis_digest)"
@@ -86,6 +106,7 @@ struct ManifestFields {
     block: Option<u64>,
     image_keccak: Option<B256>,
     genesis_digest: Option<B256>,
+    schema_version: ImageSchema,
 }
 
 impl ManifestFields {
@@ -98,6 +119,7 @@ impl ManifestFields {
             "block" => self.block = v.parse::<u64>().ok(),
             "image_keccak" => self.image_keccak = v.parse::<B256>().ok(),
             "genesis_digest" => self.genesis_digest = v.parse::<B256>().ok(),
+            "schema_version" => self.schema_version = v.parse::<u32>().ok(),
             _ => {}
         }
         self
@@ -217,6 +239,34 @@ pub(crate) fn check_image_identity(
     Ok(())
 }
 
+/// Refuse an image whose state schema this release does not read, before
+/// the image is copied or opened. The disk-restore path checks the
+/// manifest, and the peer-fetch path checks the peer's header, through
+/// this one function. An image with no stated schema passes: the image
+/// says its schema when it opens.
+///
+/// # Errors
+///
+/// Returns [`StateError::UnreadableCheckpointSchema`], after a log line
+/// and a count, when `schema` is stated and is not this release's.
+pub(crate) fn check_image_schema(image: &str, schema: ImageSchema) -> Result<(), StateError> {
+    let Some(schema) = schema.filter(|schema| *schema != SCHEMA_VERSION) else {
+        return Ok(());
+    };
+    metrics::counter!(UNREADABLE_SCHEMA_SKIPS).increment(1);
+    tracing::warn!(
+        image,
+        schema,
+        supported = SCHEMA_VERSION,
+        "checkpoint holds a state schema this release does not read; skipping it"
+    );
+    Err(StateError::UnreadableCheckpointSchema {
+        image: image.into(),
+        schema,
+        supported: SCHEMA_VERSION,
+    })
+}
+
 /// Publish a staged checkpoint. Write the manifest inside the temp
 /// entry, then do one rename. The image and manifest become visible
 /// atomically, so an observable checkpoint is always verifiable and
@@ -240,7 +290,9 @@ pub(crate) fn publish_checkpoint(
 /// # Errors
 ///
 /// Returns [`StateError::Recovery`] if the manifest is missing, unreadable,
-/// or malformed; [`StateError::CorruptCheckpointImage`] if the image bytes
+/// or malformed; [`StateError::UnreadableCheckpointSchema`] if the manifest
+/// states a schema this release does not read;
+/// [`StateError::CorruptCheckpointImage`] if the image bytes
 /// do not hash to the manifest's `image_keccak`; and
 /// [`StateError::ForeignChainCheckpoint`] if `expected_genesis` is set and
 /// disagrees with the manifest's `genesis_digest`.
@@ -256,6 +308,7 @@ pub(crate) fn verify_checkpoint(
             mpath.display()
         )
     })?;
+    check_image_schema(&checkpoint.display().to_string(), manifest.schema_version)?;
     let data = checkpoint_data_file(checkpoint)?;
     let got = file_keccak(&data)?;
     check_image_identity(

@@ -41,10 +41,10 @@ code = [
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
 # to 7. The sealer itself writes kind 8 into its log. The sealer reads
 # kind 9 (the recorded cursor), but no service sends it in this release:
-# the executor does not start its publisher. The sealer orders an unknown
-# kind of 85 bytes or more as a user record, and drops a shorter one. Thus
-# a new kind that changes the replicated state can fork members that run
-# different versions.
+# the executor does not start its publisher. Every member drops a frame of
+# a kind it does not know, counts it, and never orders it. A new kind that
+# changes the replicated state is sent only after every member reads it:
+# members of two releases decide alike until then.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
@@ -124,8 +124,12 @@ shared = false
 code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
 
 # The checkpoint manifest. The reader ignores the version key and unknown
-# keys. The image inside the checkpoint is a state database, so the
-# state-db entry also applies to a checkpoint.
+# keys. The optional `schema_version` key states the state-db schema of the
+# image, and the peer-fetch header `x-checkpoint-schema` carries the same
+# value. An adopter skips, with a log line and a count, an image whose
+# schema it does not read. A manifest without the key passes, and the
+# image says its schema when it opens. The image inside the checkpoint is
+# a state database, so the state-db entry also applies to a checkpoint.
 [format.checkpoint-manifest]
 writes = 1
 reads_min = 1
@@ -144,15 +148,19 @@ shared = true
 permanent = true
 code = ["crates/batcher/src/frame.rs#BlockLayout"]
 
-# Frozen layout. The batcher spool: one rkyv ClosedBlock per file. A spool
-# that does not decode stops the batcher at start.
+# Frozen layout. The batcher spool: one rkyv ClosedBlock per file, in the
+# directory `spool/v<N>` of its version. A release opens only its own
+# version directory. It drops every other entry of the spool root, and a
+# spool whose block file does not decode, with a warning and a count. The
+# dropped range is read again from the sealer, which keeps every frame
+# above the posted head. A spool never stops the batcher.
 [format.batcher-spool]
 writes = 1
 reads_min = 1
 reads_max = 1
 shared = false
 code = [
-    "crates/batcher/src/live/spool.rs#ClosedBlock",
+    "crates/batcher/src/live/spool.rs#SPOOL_VERSION",
     "crates/batcher/src/batch.rs#pub struct ClosedBlock",
 ]
 [format.batcher-spool.layout]
@@ -172,8 +180,10 @@ code = ["crates/batcher/src/live/cursor.rs#pub struct BatchCursor"]
 [format.batcher-cursor.layout]
 BatchCursor = '{"next_index":1,"next_block":2,"last_batch_index":3}'
 
-# Frozen layout. The da-watcher L1 cursor: exactly two fields on one line.
-# Any other line is an operator halt (L1CursorUnreadable).
+# Frozen layout. The da-watcher L1 cursor: the block number and the block
+# hash on one line. The reader ignores any field after the hash, so a
+# later release can add one at the tail. A line with fewer fields, or a
+# field that does not parse, is an operator halt (L1CursorUnreadable).
 [format.l1-cursor]
 writes = 1
 reads_min = 1

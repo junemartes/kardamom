@@ -167,6 +167,22 @@ each finding by hand.
 - A state database schema change is both. There is no migration, so the
   new release cannot read an old database.
 
+## Reader hardening
+
+A rollback is safe only when the old release reads what the new release
+wrote, and a rolling deploy is safe only when a mixed fleet decides alike.
+Each reader below holds one of these rules. A test of the owning crate
+proves each one.
+
+| Reader | Rule | What it makes safe |
+|---|---|---|
+| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Only kind 0 is a user record. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
+| Sealer `/status` | The admin endpoint reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, and `snapshotLatest`, the version of the newest snapshot the member restored or took. | A deploy preflight refuses a target whose `reads_max` is below `snapshotLatest` of any member. That member could not restore its own snapshot after the roll. |
+| Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |
+| Checkpoint manifest and peer fetch | The manifest states `schema_version`, and the peer header `x-checkpoint-schema` carries it. An adopter skips an image of a schema it does not read, before the copy, with a log line and `kardamom_checkpoint_unreadable_schema_skips_total`. An image without a stated schema passes, and says its schema when it opens. | After a schema bump, an executor or a validator of the old release does not adopt a checkpoint of the new release, from its own disk or from a peer. It takes the next checkpoint that it reads. |
+| da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |
+| Batcher cursor | serde JSON. The reader ignores a field it does not know. A new field gets `#[serde(default)]`. | The cursor of either release reads in the other. |
+
 ## Not in the registry
 
 These settings have the same risk, but they are not formats. The deploy

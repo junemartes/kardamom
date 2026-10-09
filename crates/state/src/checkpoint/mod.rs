@@ -37,7 +37,9 @@ pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
 use manifest::stored_genesis_digest;
-pub(crate) use manifest::{check_image_identity, file_keccak, publish_checkpoint};
+pub(crate) use manifest::{
+    ImageSchema, check_image_identity, check_image_schema, file_keccak, publish_checkpoint,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -189,6 +191,7 @@ pub fn create_checkpoint(
         block,
         image_keccak: file_keccak(&tmp_data)?,
         genesis_digest: stored_genesis_digest(env)?,
+        schema_version: Some(crate::meta::SCHEMA_VERSION),
     };
     publish_checkpoint(&tmp, &dest, &manifest)?;
     info!(block, path = %dest.display(), "created state checkpoint");

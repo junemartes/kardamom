@@ -10,6 +10,23 @@ fn write_checkpoint(dir: &Path, block: u64, contents: &[u8]) -> PathBuf {
 /// Write an image and a manifest that correctly describes it, under a
 /// given chain identity.
 fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
+    write_checkpoint_of_schema(
+        dir,
+        block,
+        contents,
+        genesis,
+        Some(crate::meta::SCHEMA_VERSION),
+    )
+}
+
+/// [`write_checkpoint_as`] with the state schema the manifest states.
+fn write_checkpoint_of_schema(
+    dir: &Path,
+    block: u64,
+    contents: &[u8],
+    genesis: B256,
+    schema: ImageSchema,
+) -> PathBuf {
     let p = dir.join(checkpoint_name(block));
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("mdbx.dat"), contents).unwrap();
@@ -17,9 +34,69 @@ fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -
         block,
         image_keccak: alloy_primitives::keccak256(contents),
         genesis_digest: genesis,
+        schema_version: schema,
     };
     std::fs::write(crate::checkpoint::manifest_path(&p), manifest.encode()).unwrap();
     p
+}
+
+/// A peer that holds an image of another state schema is skipped before
+/// the download, and a fleet scan takes the next peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_image_of_another_schema_is_skipped() {
+    let later = tempfile::tempdir().unwrap();
+    let current = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let genesis = B256::repeat_byte(0x6E);
+    let unreadable = crate::meta::SCHEMA_VERSION + 1;
+    write_checkpoint_of_schema(later.path(), 90, b"later schema", genesis, Some(unreadable));
+    write_checkpoint(current.path(), 40, b"current schema");
+    let later_addr = serve_ephemeral(later.path().to_path_buf());
+    let current_addr = serve_ephemeral(current.path().to_path_buf());
+
+    let err = fetch(later_addr, local.path().to_path_buf(), 0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StateError::UnreadableCheckpointSchema { schema, .. } if schema == unreadable),
+        "{err}"
+    );
+    assert!(
+        latest_checkpoint(local.path()).unwrap().is_none(),
+        "nothing was downloaded"
+    );
+
+    let peers = vec![later_addr.to_string(), current_addr.to_string()];
+    let local_dir = local.path().to_path_buf();
+    let best =
+        tokio::task::spawn_blocking(move || fetch_best_checkpoint(&peers, &local_dir, 0, None))
+            .await
+            .unwrap()
+            .expect("the readable peer serves");
+    assert_eq!(best.block, 40);
+}
+
+/// A peer of an older release sends no schema header. Its image is
+/// fetched, and the stored manifest states no schema either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_without_a_schema_header_is_fetched() {
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    write_checkpoint_of_schema(
+        remote.path(),
+        12,
+        b"old release",
+        B256::repeat_byte(0x6E),
+        None,
+    );
+    let addr = serve_ephemeral(remote.path().to_path_buf());
+    let got = fetch(addr, local.path().to_path_buf(), 0)
+        .await
+        .unwrap()
+        .expect("fetched");
+    assert_eq!(got.block, 12);
+    let manifest = crate::checkpoint::read_manifest(&got.path).unwrap();
+    assert_eq!(manifest.schema_version, None);
 }
 
 /// Read the image bytes of a dir-mode checkpoint.

@@ -14,16 +14,32 @@
 //! not a source of truth: the cursor file still binds the last confirmed
 //! post to L1, and a spool that does not continue the confirmed cursor is
 //! dropped.
+//!
+//! The files of one layout version live in their own directory,
+//! `spool/v<N>`. A release reads only the layout it knows. Every other
+//! entry of the spool root is a spool of another release: it is dropped,
+//! with a warning and a count, and the range is read again from the
+//! sealer, which keeps every frame above the posted head. A block file
+//! that does not decode drops the spool the same way. A spool never
+//! stops the batcher.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use metrics::counter;
+use tracing::warn;
 
 use crate::batch::ClosedBlock;
 
-/// The spool directory.
+use super::live_metric_names;
+
+/// The version of the spool layout: one rkyv `ClosedBlock` per file. The
+/// spool of this version lives in `spool/v<SPOOL_VERSION>`.
+pub(crate) const SPOOL_VERSION: u32 = 1;
+
+/// The spool directory of this release's layout version.
 #[derive(Clone, Debug)]
 pub(crate) struct Spool {
     dir: PathBuf,
@@ -36,15 +52,55 @@ pub(crate) struct Restored {
     pub(crate) oldest_written: Option<SystemTime>,
 }
 
+impl Restored {
+    /// No block: the reader resumes at the confirmed cursor.
+    pub(crate) fn empty() -> Self {
+        Self {
+            blocks: Vec::new(),
+            oldest_written: None,
+        }
+    }
+}
+
 impl Spool {
-    /// Open the spool at `dir`; create it.
+    /// Count one dropped spool. `reason` is the metric label.
+    pub(crate) fn count_dropped(reason: &'static str) {
+        counter!(live_metric_names::SPOOL_DROPPED, "reason" => reason).increment(1);
+    }
+
+    /// Open the spool of this release under `root`; create it. Every
+    /// other entry of `root` is a spool of another version: drop it.
     ///
     /// # Errors
-    /// Returns an error when the directory cannot be created.
-    pub(crate) fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
+    /// Returns an error when the directory cannot be created or read, or
+    /// a spool of another version cannot be removed.
+    pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let dir = root.join(format!("v{SPOOL_VERSION}"));
         fs::create_dir_all(&dir).with_context(|| format!("create spool {}", dir.display()))?;
+        fs::read_dir(root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| *path != dir)
+            .try_for_each(|path| Self::drop_other_version(&path))?;
         Ok(Self { dir })
+    }
+
+    /// Remove `path`, a spool of another version, with a warning and a
+    /// count. Its blocks are read again from the sealer.
+    fn drop_other_version(path: &Path) -> Result<()> {
+        warn!(
+            path = %path.display(),
+            spool_version = SPOOL_VERSION,
+            "spool of another version; dropping it; the range is read again from the sealer"
+        );
+        Self::count_dropped("other-version");
+        if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+        .with_context(|| format!("remove spool {}", path.display()))
     }
 
     fn path_of(&self, block_number: u64) -> PathBuf {
@@ -77,13 +133,32 @@ impl Spool {
         Ok(())
     }
 
-    /// Every block, in block order.
+    /// Every block, in block order. A spool that does not read back is
+    /// dropped, with a warning and a count, and the result is empty: the
+    /// reader then resumes at the confirmed cursor.
     ///
     /// # Errors
-    /// Returns an error when the directory cannot be read or a block does
-    /// not deserialize.
+    /// Returns an error when the directory cannot be read or an unreadable
+    /// spool cannot be removed.
     pub(crate) fn load(&self) -> Result<Restored> {
         let entries = self.entries()?;
+        match Self::decode(&entries) {
+            Ok(restored) => Ok(restored),
+            Err(error) => {
+                warn!(
+                    spool = %self.dir.display(),
+                    error = %format!("{error:#}"),
+                    "spool does not read back; dropping it; the range is read again from the sealer"
+                );
+                Self::count_dropped("unreadable");
+                self.clear_through(u64::MAX)?;
+                Ok(Restored::empty())
+            }
+        }
+    }
+
+    /// The blocks behind `entries`, and the write time of the oldest.
+    fn decode(entries: &[(u64, PathBuf)]) -> Result<Restored> {
         let oldest_written = entries
             .first()
             .map(|(_, path)| fs::metadata(path).and_then(|m| m.modified()))
@@ -137,6 +212,16 @@ mod tests {
         }
     }
 
+    fn numbers(spool: &Spool) -> Vec<u64> {
+        spool
+            .load()
+            .unwrap()
+            .blocks
+            .iter()
+            .map(|b| b.block_number)
+            .collect()
+    }
+
     #[test]
     fn blocks_round_trip_in_order_and_clear_through_a_post() {
         let dir = tempfile::tempdir().unwrap();
@@ -157,8 +242,57 @@ mod tests {
         assert_eq!(restored.blocks[2], block(12));
         assert!(restored.oldest_written.is_some());
         spool.clear_through(11).unwrap();
-        let left = spool.load().unwrap().blocks;
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].block_number, 12);
+        assert_eq!(numbers(&spool), vec![12]);
+    }
+
+    #[test]
+    fn the_spool_lives_in_its_version_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        spool.append(&block(3)).unwrap();
+        let versioned = dir.path().join(format!("v{SPOOL_VERSION}"));
+        assert!(versioned.join("00000000000000000003.block").is_file());
+        let reopened = Spool::open(dir.path()).unwrap();
+        assert_eq!(numbers(&reopened), vec![3]);
+    }
+
+    #[test]
+    fn a_spool_of_another_version_is_dropped_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        // A spool with no version directory, and one of a later version.
+        std::fs::write(dir.path().join("00000000000000000005.block"), b"old").unwrap();
+        let later = dir.path().join(format!("v{}", SPOOL_VERSION + 1));
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(later.join("00000000000000000006.block"), b"new").unwrap();
+
+        let spool = Spool::open(dir.path()).unwrap();
+        assert!(spool.load().unwrap().blocks.is_empty());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec![format!("v{SPOOL_VERSION}")]);
+    }
+
+    #[test]
+    fn a_block_that_does_not_decode_drops_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Spool::open(dir.path()).unwrap();
+        spool.append(&block(10)).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("v{SPOOL_VERSION}"))
+                .join("00000000000000000011.block"),
+            b"not a block",
+        )
+        .unwrap();
+        let restored = spool.load().unwrap();
+        assert!(restored.blocks.is_empty());
+        assert!(restored.oldest_written.is_none());
+        assert_eq!(
+            numbers(&spool),
+            Vec::<u64>::new(),
+            "the spool is empty after the drop"
+        );
     }
 }
