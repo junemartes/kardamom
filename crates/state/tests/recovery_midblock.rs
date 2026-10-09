@@ -37,10 +37,9 @@ fn recovery_point_matches_last_committed_block() {
                 ))
                 .unwrap();
         }
-        // Drain three snapshots so we know the commits landed.
-        for _ in 0..3 {
-            writer.snapshot_rx.recv().unwrap();
-        }
+        // Wait for block 3, so the three commits landed. Three commits
+        // can arrive as fewer than three wakes.
+        common::wait_for_block(&writer, 3);
         // Submit a 4th delta, then immediately shut down. The writer may
         // or may not have committed it. This test asserts resilience
         // either way.

@@ -33,12 +33,8 @@ pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
 pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_mins(3);
 
 /// The three sealer nodes, by member id.
-fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
+pub(crate) fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
     (0..3).map(|id| sealer(h, id)).collect()
-}
-
-fn names(nodes: &[String]) -> Vec<&str> {
-    nodes.iter().map(String::as_str).collect()
 }
 
 /// Kill all three sealer nodes. No member is left, so the pipeline
@@ -49,11 +45,7 @@ fn names(nodes: &[String]) -> Vec<&str> {
 pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "cluster-total-loss-recover";
     let nodes = sealers(h)?;
-    crate::log(format!(
-        "{ctx}: docker kill ALL sealer nodes ({}) → no member left",
-        nodes.join(" ")
-    ));
-    h.kill_nodes(&names(&nodes)).await?;
+    h.kill_all_nodes(ctx, "sealer", &nodes).await?;
     h.assert_executor_stalled(Duration::from_secs(15)).await?;
     crate::log(format!("{ctx}: docker start all three sealer nodes"));
     h.start_nodes(&nodes).await?;
@@ -71,11 +63,7 @@ pub(crate) async fn cluster_total_loss_recover(h: &mut Harness) -> anyhow::Resul
 pub(crate) async fn executor_fleet_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "executor-fleet-loss-recover";
     let nodes = executor_containers(h);
-    crate::log(format!(
-        "{ctx}: docker kill ALL executor nodes ({})",
-        nodes.join(" ")
-    ));
-    h.kill_nodes(&names(&nodes)).await?;
+    h.kill_all_nodes(ctx, "executor", &nodes).await?;
     await_exporters_dark(h, ctx).await?;
     crate::log(format!("{ctx}: docker start all three executor nodes"));
     h.start_nodes(&nodes).await?;
@@ -101,15 +89,12 @@ pub(crate) async fn executor_fleet_wipe_recover(h: &mut Harness) -> anyhow::Resu
     for node in &nodes {
         wait_peer_checkpoint(h, node, ctx).await?;
     }
-    let job = SavedJob::capture(&h.nomad, "executor").await?;
     crate::log(format!(
         "{ctx}: kill ALL executor tasks ({}) and wipe every state DB (checkpoints kept)",
         nodes.join(" ")
     ));
-    for node in &nodes {
-        h.inject_hard(&[node], "executor").await?;
-    }
-    job.stop().await?;
+    let tasks: Vec<(String, &str)> = nodes.iter().map(|n| (n.clone(), "executor")).collect();
+    let job = h.kill_tasks_and_stop("executor", &tasks).await?;
     // The job starts again even when the wipe fails.
     let wiped = wipe_stopped_fleet(h, ctx, &nodes).await;
     let restored = job.restore().await;

@@ -57,8 +57,9 @@ jobs:
     name: nomad job validate
     runs-on: ubuntu-latest
     # The isolated suite runs full Ansible deployments, then image and
-    # signing tests. This job budget is separate from deployment SLOs.
-    timeout-minutes: 30
+    # signing tests, in parallel processes. This job budget is separate
+    # from deployment SLOs.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -100,8 +101,30 @@ jobs:
             nomad job validate "$j" || rc=1
           done
           exit $rc
+      # Each deploy test runs a full play against the fake API, so the
+      # deploy classes run in their own processes, beside the other
+      # modules. Every process runs from the repository root, as the
+      # single discover did: deploy/cluster/ansible/ansible.cfg turns
+      # become on, and a render under it is not readable by the runner.
       - name: Test Ansible workloads, images, and signing in isolation
-        run: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
+        run: |
+          tests=deploy/cluster/ansible/tests
+          pids=()
+          for class in DeployTest SealerTest RecordTest RollbackTest; do
+            python3 -m unittest discover -s "$tests" -p test_deploy.py -k "$class" -v > "/tmp/$class.log" 2>&1 &
+            pids+=($!)
+          done
+          (
+            for module in "$tests"/test_*.py; do
+              [ "$(basename "$module")" = test_deploy.py ] && continue
+              python3 -m unittest discover -s "$tests" -p "$(basename "$module")" -v || exit 1
+            done
+          ) > /tmp/others.log 2>&1 &
+          pids+=($!)
+          rc=0
+          for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+          cat /tmp/DeployTest.log /tmp/SealerTest.log /tmp/RecordTest.log /tmp/RollbackTest.log /tmp/others.log
+          exit "$rc"
 
   terraform-validate:
     name: tofu fmt + validate + test (${{ matrix.root }} root)

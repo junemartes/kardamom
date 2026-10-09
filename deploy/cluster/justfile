@@ -32,22 +32,33 @@ images:
 deploy:
     ansible-playbook -i localhost, ansible/deploy.yml
 
-# Deploy the previous manifest of an environment: the one the last
-# successful deploy replaced (deployed/<env>/images.digests.previous,
-# written by the deploy). It is a normal rolling deploy of older images,
-# under the same checks. The environment's NOMAD_ADDR and the other
-# deploy settings come from the caller's environment, as for `deploy`.
+# Roll an environment back one release: every job of the last release
+# goes to its Nomad job version before that release, in reverse deploy
+# order, under the waits of the deploy. The deploy record (the Nomad
+# variable kardamom/deploys/<env>) names the release and the versions.
+# The rollback refuses a rollback floor and a second rollback. The
+# environment's NOMAD_ADDR and the other deploy settings come from the
+# caller's environment, as for `deploy`. docs/runbooks/deploy-rollback.md
+# is the runbook.
 rollback env:
+    KARDAMOM_ENV="{{ env }}" ansible-playbook -i localhost, ansible/rollback.yml
+
+# Re-render the release before the last one when Nomad dropped the job
+# versions to revert to: a normal rolling deploy of the older images,
+# under the same checks, from the manifest that a refused `just rollback`
+# wrote (deployed/<env>/rollback.digests). The old binaries run with the
+# job files of this checkout.
+rollback-rerender env:
     #!/usr/bin/env bash
     set -euo pipefail
-    previous="deployed/{{ env }}/images.digests.previous"
-    if [[ ! -f "$previous" ]]; then
-        echo "no previous manifest for {{ env }}: $previous is missing" >&2
+    manifest="deployed/{{ env }}/rollback.digests"
+    if [[ ! -f "$manifest" ]]; then
+        echo "no re-render manifest for {{ env }}: $manifest is missing; run \`just rollback {{ env }}\` first" >&2
         exit 1
     fi
-    echo ">> rolling {{ env }} back to:"
-    cat "$previous"
-    KARDAMOM_ENV="{{ env }}" DIGEST_MANIFEST="$previous" ansible-playbook -i localhost, ansible/deploy.yml
+    echo ">> re-rendering {{ env }} from:"
+    cat "$manifest"
+    KARDAMOM_ENV="{{ env }}" DIGEST_MANIFEST="$manifest" ansible-playbook -i localhost, ansible/deploy.yml
 
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:
@@ -81,7 +92,7 @@ clean:
     -docker image rm "$REGISTRY/kardamom-aeron:$TAG"
     -docker image rm "$REGISTRY/kardamom-cluster:$TAG"
     rm -f docker/kardamom-cluster-node.jar
-    for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
+    for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
 
 # Create nodes, provision them, publish prebuilt images and deploy workloads.
 # CLUSTER_VARS is a JSON object passed as a single Ansible extra-vars argument.
@@ -104,8 +115,8 @@ container-up:
 
 # Run a shard against an existing cluster; KARDAMOM_CHAOS_CASES narrows cases.
 # Shards: load, semantics, chaos-executor, chaos-ingress, chaos-sequencer,
-# chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache,
-# chaos-l1.
+# chaos-cluster, chaos-fleet, chaos-coordinated, chaos-combined-ordering,
+# chaos-retention, chaos-cache, chaos-l1.
 container-test $shard=env('SHARD', 'load'):
     KARDAMOM_CHAOS_REUSE=1 AERON_STALL_TOLERANCE_MS="{{container_stall_ms}}" $RUN_SHARDS --ignored --exact "${shard//-/_}" --nocapture
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Sender, bounded};
+use kardamom_cluster_adapter::LiveIngress;
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::aeron_live::{AeronRuntime, ExecTxsPublisherHandle, PubHandle};
 use kardamom_log::config::AeronConfig;
@@ -19,6 +20,7 @@ use rkyv::util::AlignedVec;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use super::cadence::CursorHandoff;
 use super::locators::LocatorLog;
 use super::publisher::{ExecStreamPublisher, PublisherInputs, StreamPublications};
 
@@ -46,6 +48,8 @@ struct AeronPublications {
 }
 
 impl StreamPublications for AeronPublications {
+    type CursorIngress = LiveIngress;
+
     fn session_id(&self) -> i32 {
         self.recorded.session_id()
     }
@@ -76,10 +80,13 @@ pub struct ExecStreamConfig<'a> {
     pub stop: CancellationToken,
 }
 
-/// The open executor stream: the reader's sink, and the threads behind it.
+/// The open executor stream: the reader's sink, the hand-off of the
+/// recorded cursor, and the threads behind them.
 pub struct ExecStream {
     /// The sink of the `tx_ordering` reader.
     pub sink: Sender<ExecStreamItem>,
+    /// Starts the recorded cursor once the cluster session is up.
+    pub cursor: CursorHandoff<LiveIngress>,
     pub threads: ExecStreamThreads,
 }
 
@@ -134,6 +141,7 @@ impl ExecStream {
         let locators = LocatorLog::open(&cfg.state_dir.join("exec_stream").join("locators.log"))
             .context("open the exec stream locator log")?;
         let (sink, items) = bounded(ITEMS_DEPTH);
+        let (cursor, cursor_sender) = CursorHandoff::new();
         let publisher = ExecStreamPublisher::spawn(PublisherInputs {
             items,
             positions,
@@ -143,10 +151,12 @@ impl ExecStream {
             },
             locators,
             stop: cfg.stop,
+            cursor: cursor_sender,
         })
         .context("spawn the exec stream publisher")?;
         Ok(Self {
             sink,
+            cursor,
             threads: ExecStreamThreads {
                 publisher,
                 recorder,

@@ -24,6 +24,7 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-validator` | `127.0.0.1:9007` | `0.0.0.0:9006` | `kardamom-validator` |
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
 | `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
+| `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
 Notes on the table:
@@ -161,6 +162,7 @@ It answers 503 with the failed conditions when the rule does not hold.
 | `kardamom-da-watcher` | The last tick (`kardamom_da_watcher_last_tick_unix_seconds`) is fresher than two poll periods plus 10 s. |
 | `kardamom-l1-indexer` | Now is before the planned wake time (`kardamom_l1_follower_next_wake_seconds`) plus one poll interval and 10 s. A follower sleeps between finality steps, so a rule on the last tick would fail between steps. |
 | `kardamom-notifier` | Liveness only. |
+| `kardamom-canary` | Liveness only. A failed probe is a metric, not a readiness failure. |
 
 - `--ready-lag-blocks` (env `KARDAMOM_READY_LAG_BLOCKS`, default 8) is a flag of the executor and the validator.
 - The sealer has its own admin server. It is off by default.
@@ -221,6 +223,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-validator` | The validator. |
 | `kardamom-state-mirror` | The account-state mirror. |
 | `kardamom-notifier` | The status feed and the webhooks. |
+| `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
 - The test `crates/obs/tests/dashboards.rs` checks that each dashboard in `EXPECTED_DASHBOARDS` parses, uses schema 38,
@@ -388,6 +391,7 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 | `kardamom_executor_exec_stream_publish_blocked_ms_total` | Milliseconds that the publisher waited for the archive to take a record. The executor stalls while it grows. |
 
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
+- With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the recorded cursor to the sealer. It sends a cursor that moved when 100 ms passed, or at once when it moved by 1024 records. A sent cursor never moves down. The ingress shows the best cursor of the executors in `kardamom_ingress_cluster_recorded_head`.
 
 ### L1 follower (inbox indexer)
 
@@ -425,7 +429,7 @@ The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](fail
 ### Ingress cluster status
 
 The ingress reads the status frame of the sealer and exports it on port 9006. The frame carries the posted head, the sealed head,
-and the replay retention of the sealer. See [l1-data-path.md](l1-data-path.md).
+the replay retention of the sealer, and the record-lag guard. See [l1-data-path.md](l1-data-path.md).
 
 | Metric | Meaning |
 | --- | --- |
@@ -433,9 +437,12 @@ and the replay retention of the sealer. See [l1-data-path.md](l1-data-path.md).
 | `kardamom_ingress_cluster_sealed_head` | The last sealed block. |
 | `kardamom_ingress_cluster_retained_frames` | The egress frames that the sealer keeps for replay. The count is above the retention window while unposted blocks hold it there. |
 | `kardamom_ingress_cluster_floor_block` | The oldest boundary block that the sealer still keeps. This is the replay floor. |
+| `kardamom_ingress_cluster_recorded_head` | The best recorded cursor of the executors: the highest canonical index that one executor or more recorded. `-1` while no executor sent a cursor, and for a status frame of a sealer that sends no record-lag tail. |
+| `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
+- The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.
 
 ### Receipt cache and lookups
 
@@ -452,6 +459,21 @@ and the replay retention of the sealer. See [l1-data-path.md](l1-data-path.md).
   and `state_error` when the query fails.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
+
+### Transaction canary
+
+All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-canary`. The canary uses the chain as a user does. See "Transaction canary" in [failure-modes.md](failure-modes.md#transaction-canary).
+
+| Metric | Meaning |
+| --- | --- |
+| `probe_total{probe,endpoint,outcome}` | Probe runs. A failure outcome adds one detail label: `code` (`rpc_error`), `reason` (`rejected`), `stage` (`timeout`) or `field` (`fee_mismatch`). |
+| `stage_seconds{probe,endpoint,stage}` | Stage latencies. `transfer`: `submit` (submit to hash), `offered`, `sealed`, `executed` and `receipt` (hash to each). `contract`: `receipt` (submit to receipt) and `read` (receipt to read). The buckets go from 5 ms to one hour. |
+| `last_success_timestamp_seconds{probe}` | The unix time of the last success. |
+| `balance_wei{layer,account}` | The balance of each canary account. |
+| `balance_floor_wei{layer}` | The balance under which an account is unfunded. |
+| `account_stalled{account}`, `account_stalled_nonce{account}` | 1, and the nonce, while a ring account holds a transaction that the canary cannot resolve. |
+| `feed_gaps_total{kind}` | Status feed gaps: `lagged`, `disconnect`, or `missing_<stage>` for a stage that never came though the receipt did. A gap is not a transaction failure. |
+| `feed_connected` | 1 while the status feed session is open. |
 
 ### Notifier
 

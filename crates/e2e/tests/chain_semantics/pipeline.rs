@@ -150,3 +150,41 @@ async fn s18_tx_status_feed_shows_every_stage() {
         panic!("S18: {e:#}");
     }
 }
+
+/// S19: the transaction canary on the local stack. The binary's probes
+/// all succeed through the ingress and the notifier; the ring's nonce
+/// owner resolves a lost submit answer and a restart with an unsent
+/// transaction from its journal, and serves concurrent leases on one
+/// account with contiguous nonces. The canary rings are dev accounts
+/// #34 to #37, which the cluster genesis funds for the canary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s19_canary_probes_succeed_and_the_ring_resolves_in_flight() {
+    let stack = LocalStack::launch(StackConfig {
+        notifier: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = target(&stack);
+    let ws_url = stack.notifier_ws_url().expect("the stack runs a notifier");
+    let root = stack.root();
+    let canary = e2e::harness::services::spawn_canary(&e2e::harness::services::CanarySpec {
+        root: &root,
+        ingress_url: &t.rpc.url,
+        notifier_ws: ws_url,
+        ring_offset: 34,
+        ring_size: 1,
+    })
+    .expect("spawn the canary");
+    if let Err(e) = canary::probes_succeed(canary.metrics_addr, 3.0).await {
+        stack.dump_tails();
+        let log = std::fs::read_to_string(root.join("canary.log")).unwrap_or_default();
+        eprintln!("canary.log:\n{log}");
+        panic!("S19 probes: {e:#}");
+    }
+    if let Err(e) = canary::ring_resolves_in_flight(&t, &root.join("ring-cases"), 35).await {
+        stack.dump_tails();
+        panic!("S19 ring: {e:#}");
+    }
+}

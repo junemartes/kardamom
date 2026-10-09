@@ -17,7 +17,13 @@ use crate::poll::{self, Budget};
 use crate::probes::{CLUSTER_TASK, Probed};
 
 /// The time the chain gets to run again after the audit, for all the
-/// steps together.
+/// steps together. The clock starts when the stage registers the jobs
+/// again. Measured over 20 full restarts under load on a host with two
+/// cores for the node containers: the chain ran again 33 s to 299 s
+/// after the register (median 48 s), and 20 s to 56 s after the first
+/// sealer start. The gap between the two is Nomad's placement under
+/// load, so the budget keeps the placement in. The first leader
+/// heartbeat line can come up to 30 ticks (60 s) after the election.
 const RECOVERY_BUDGET: Duration = Duration::from_mins(5);
 /// How often a step reads its signal.
 const POLL: Duration = Duration::from_secs(5);
@@ -175,13 +181,9 @@ impl<'a> StepWait<'a> {
         refusals.is_empty().then_some(())
     }
 
-    /// Why the ingress on `node` refuses a submit. A chain status that
-    /// does not answer is a refusal.
+    /// Why the ingress on `node` refuses a submit.
     async fn refusal_of(&self, node: &Probed) -> Option<String> {
-        let why = match ChainView::read_at(&node.rpc_url(), self.harness.knobs.chain_id).await {
-            Ok(view) => view.refusal(),
-            Err(e) => Some(format!("no chain status ({e:#})")),
-        };
+        let why = ChainView::refusal_at(&node.rpc_url(), self.harness.knobs.chain_id).await;
         why.map(|why| format!("{}: {why}", node.container))
     }
 }

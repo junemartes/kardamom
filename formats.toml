@@ -39,12 +39,13 @@ code = [
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
-# to 7. The sealer itself writes kind 8 into its log. The sealer reads
-# kind 9 (the recorded cursor), but no service sends it in this release:
-# the executor does not start its publisher. Every member drops a frame of
-# a kind it does not know, counts it, and never orders it. A new kind that
+# to 7. The sealer itself writes kind 8 into its log. The executor sends
+# kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
+# (--exec-cursor); the default is off. Every member drops a frame of a
+# kind it does not know, counts it, and never orders it. A new kind that
 # changes the replicated state is sent only after every member reads it:
-# members of two releases decide alike until then.
+# members of two releases decide alike until then. So switch the flag on
+# only after every member reads kind 9.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
@@ -53,7 +54,9 @@ shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_RECORDED_CURSOR",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
+    "crates/executor/src/bin/kardamom-executor/args.rs#KARDAMOM_EXEC_CURSOR",
 ]
+activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
@@ -267,3 +270,27 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 [coordinated]
 
 [retired]
+
+# Frozen layout. The canary's nonce journal: one serde JSON file per ring
+# account. A file that does not parse stops the canary at start; the
+# operator removes it after checking the account's nonce.
+[format.canary-journal]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/canary/src/ring/journal.rs#pub struct InFlight"]
+[format.canary-journal.layout]
+InFlight = '{"nonce":1,"hash":"0x0202020202020202020202020202020202020202020202020202020202020202","raw":"0x03","published":true}'
+
+# Frozen layout. The canary's data directory: the contract addresses and
+# the anchor hash, as serde JSON. A new field has a serde default.
+[format.canary-store]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/canary/src/store.rs#pub struct Contracts"]
+[format.canary-store.layout]
+Contracts = '{"counter":"0x0404040404040404040404040404040404040404"}'
+anchor = '"0x0505050505050505050505050505050505050505050505050505050505050505"'

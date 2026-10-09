@@ -1,13 +1,20 @@
 ---
-# The record of this deploy: the manifest it deployed becomes the
-# environment's current one, and the one it replaced becomes the
-# previous one, with their signature bundles. `just rollback <env>`
-# deploys the previous one through the normal path.
-- name: Create the record directory
-  ansible.builtin.file:
-    path: "{{ workloads_record_dir }}"
-    state: directory
-    mode: "0755"
+# The record of this deploy. The attempt becomes the accepted release.
+# The manifest it deployed becomes the environment's current one, and the
+# one it replaced becomes the previous one, with their signature bundles:
+# the re-render path of `just rollback-rerender <env>` deploys a manifest
+# through the normal path when Nomad dropped the versions to revert to.
+- name: Accept the release
+  ansible.builtin.set_fact:
+    workloads_attempt: >-
+      {{ workloads_attempt | combine({'status': 'accepted', 'accepted_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')}) }}
+
+- name: Keep the accepted release
+  ansible.builtin.set_fact:
+    workloads_accepted: "{{ workloads_attempt }}"
+
+- name: Write the accepted record
+  ansible.builtin.import_tasks: record_write.yml
 
 - name: Read the recorded manifest
   ansible.builtin.stat:

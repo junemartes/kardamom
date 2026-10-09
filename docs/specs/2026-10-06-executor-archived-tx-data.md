@@ -853,6 +853,25 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
 - Chaos: `hard-executor` asserts that the sealer's best recorded cursor keeps moving while one
   executor is down.
 - Docs: `docs/observability.md`, `cluster/sealer-service/README.md` log lines.
+- Deviations in P4:
+  - The executor sends the cursor only with `--exec-cursor` (`KARDAMOM_EXEC_CURSOR`), off by
+    default. The Nomad job variable `exec_cursor` sets it. `formats.toml` lists the flag as the
+    activation of ingress kind 9. Switch it on only after every sealer member reads kind 9.
+  - The publisher thread starts before the cluster session. The `RecordedCursorPublisher`
+    reaches it through a hand-off (`CursorHandoff`). A hand-off with no publisher leaves the
+    cursor off.
+  - The first cursor goes out at once. A refused send retries on the 100 ms cadence.
+  - The ingress egress observer (`crates/ingress/src/cluster.rs`) sets the two gauges, not
+    `chain.rs`: the lag needs the durable canonical count that only the observer holds. The lag
+    is `count - (best_recorded + 1)`. Before the first cursor, and for a 50-byte status frame,
+    `recorded_head` is -1 and the lag is 0. `kardamom_chainStatus` shows `best_recorded`,
+    `record_lag_budget` and `record_lag_halted`.
+  - The sealer line is `cluster RECORDED-CURSOR memberId executorId through best halted
+    totalAdvances`. It prints at power-of-two counts of the moves of the best cursor, not on
+    each change: the best cursor moves at the cadence of the executors.
+  - The `chaos-executor` shard deploys the cursor on. `hard-executor` waits 20 s from the kill
+    for `kardamom_ingress_cluster_recorded_head` to move, and skips the check with a log line
+    when `KARDAMOM_EXEC_CURSOR` is off.
 
 ### P5. The executor peer step
 

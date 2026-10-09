@@ -84,7 +84,7 @@ pub(crate) async fn sequencer_lane_loss_recover(h: &mut Harness) -> anyhow::Resu
 }
 
 /// No replica of lane 0 holds a buffered ref below its sender's floor.
-async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn assert_no_ref_below_floor(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     for i in 0..h.probes.sequencers.len() {
         let stranded = h.probes.seq_lane0_metric(i, REF_BELOW_FLOOR).await;
         anyhow::ensure!(

@@ -178,6 +178,8 @@ public final class SealerClusteredService implements ClusteredService {
     private long daLagRejectCount = 0;
     /** Record-lag rejects emitted (logged at power-of-two counts). */
     private long recordLagRejectCount = 0;
+    /** Moves up of the best recorded cursor (logged at power-of-two counts). */
+    private long recordedAdvanceCount = 0;
     /**
      * The priority window in front of the record path. Replicated
      * configuration: its size decides the relay order, so every member runs
@@ -890,7 +892,9 @@ public final class SealerClusteredService implements ClusteredService {
      * session learns the new status. A frame of another length, from an
      * executor id that is not a configured voter, or with a cursor at or
      * past the canonical count, drops as malformed. Every member drops it
-     * the same way, because the checks read only replicated state.
+     * the same way, because the checks read only replicated state. The
+     * best cursor moves up at the cadence of the executors, so the log line
+     * prints at power-of-two counts of the moves.
      */
     private void onRecordedCursor(final DirectBuffer buffer, final int offset, final int length) {
         if (length != SealerWire.RECORDED_CURSOR_LEN) {
@@ -907,9 +911,19 @@ public final class SealerClusteredService implements ClusteredService {
             onMalformedFrame("recorded-cursor-refused", length);
             return;
         }
-        if (advanced) {
-            egress.offerStatus(status());
+        if (!advanced) {
+            return;
         }
+        recordedAdvanceCount++;
+        if (Long.bitCount(recordedAdvanceCount) == 1) {
+            System.out.println("cluster RECORDED-CURSOR memberId=" + memberId
+                + " executorId=" + executorId
+                + " through=" + Long.toUnsignedString(recordedThrough)
+                + " best=" + state.bestRecorded()
+                + " halted=" + state.recordLagHalted()
+                + " totalAdvances=" + recordedAdvanceCount);
+        }
+        egress.offerStatus(status());
     }
 
     /**

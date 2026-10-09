@@ -189,7 +189,7 @@ The `update` stanza of each job:
 | `ingress`, `sequencer` | 1 | `checks` | 15s | `true` | `canary = var.canary`, `auto_promote = false` |
 | `cluster` (sealer) | 1 | `checks` | 60s | `false` | One task group for each member |
 | `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | |
-| `notifier` | 1 | `checks` | 10s | `false` | |
+| `notifier`, `canary` | 1 | `checks` | 10s | `false` | |
 | `da-watcher`, `l1-indexer`, `l1-light-client`, `da-proxy`, `da-store` | 1 | `task_states` | 10s | `false` | |
 | `aeron` (system job) | 1 | `task_states` | 15s | not set | `stagger = "30s"` |
 
@@ -208,13 +208,43 @@ The canary:
 - A failed smoke fails the play. The deployment stays unpromoted, and the old instances keep serving. `nomad deployment fail` removes the canary.
 - `auto_revert` is on for these two stateless classes only.
 
-The deployment record and rollback:
+The deploy record and the rollback:
 
-- A successful deploy records its manifest under `deployed/<env>/`. `KARDAMOM_ENV` selects `<env>` (default `local`).
-- `images.digests` is what runs. `images.digests.previous` is what it replaced.
-- `just rollback <env>` deploys the previous manifest. It is a normal rolling deploy of older images under the same checks. It fails if `deployed/<env>/images.digests.previous` is missing.
+- Before the first registration, the role writes the attempt record: the target, the version of every job, and the rollback floor. Each registration adds the job to the record. A deploy that succeeds makes the attempt the accepted release. See [The deploy record](#the-deploy-record).
+- `just rollback <env>` reverts every job of the last release to its version before that release, in reverse deploy order, under the waits of the deploy (`/v1/job/<id>/revert` with `EnforcePriorVersion`). The sealer rolls back member by member. The runbook is [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md).
+  - After a failed attempt, the rollback goes to the accepted release. After a successful deploy, it goes to the release before it.
+  - A job that Nomad already reverted (`auto_revert`), or that an earlier run reverted, is done. A rollback that stops resumes after the jobs in `rolled_back`.
+  - It refuses a rollback floor, and a second rollback.
+  - When Nomad dropped the versions to revert to, it writes `deployed/<env>/rollback.digests` and names `just rollback-rerender <env>`: a normal rolling deploy of the older images with the job files of the checkout.
+- A successful deploy also records its manifest under `deployed/<env>/`. `KARDAMOM_ENV` selects `<env>` (default `local`). `images.digests` is what the last deploy registered. `images.digests.previous` is what it replaced.
 - The validator keeps a divergence verdict in a file beside its state. The verdict survives a restart and a deploy, and `/ready` keeps failing. An operator clears it with `kardamom-validator --state-dir <dir> --clear-verdict` inside the allocation.
 - The smoke, load and chaos gates of `crates/chaos` follow in CI.
+
+### The deploy record
+
+The deploy record of an environment lives in the Nomad variable `kardamom/deploys/<env>`. The role mirrors it to `deployed/<env>/attempt.json`, `accepted.json` and `accepted.formats.toml`. The variable is the record that every operator and the rollout tooling read. The mirror is for an operator without the Nomad token. The variable has two items, `attempt` and `accepted`, each one JSON document of this shape:
+
+| Field | Meaning |
+|---|---|
+| `env` | The environment name. |
+| `status` | `started` while the attempt runs or after it failed. `accepted` after the deploy succeeded. `rolled_back` after `just rollback`. |
+| `started_at`, `accepted_at`, `rolled_back_at` | UTC times. |
+| `operator` | `KARDAMOM_OPERATOR`, else `GITHUB_ACTOR`, else `USER`. |
+| `target.revision` | The revision of the deployed tree: `KARDAMOM_REVISION`, else `GITHUB_SHA`, else git, else jj. |
+| `target.manifest` | The image manifest, by service: `{"ingress": "<registry>/kardamom-ingress@sha256:..."}`. |
+| `target.formats` | The text of `formats.toml` of the deployed tree. |
+| `before.revision`, `before.manifest`, `before.formats` | The same three fields of the accepted release at the start of the attempt. |
+| `before.jobs` | The Nomad job version of every job the namespace knows at the start: `{"ingress": {"before": 3}}`. A registration adds `after`, the version the attempt registered. A job that the attempt adds has `before: null`. |
+| `changed` | The jobs the attempt registered, in registration order. A job joins before its registration. The rollback reverts them in reverse order. |
+| `rolled_back` | The jobs a rollback reverted so far, in that order. A rollback that stops resumes after them. |
+| `floor` | `{}`, or `{"formats": {"<id>": <version>}, "revision": "..."}` when `KARDAMOM_ALLOW_ONE_WAY` accepted a one-way format change. `just rollback` does not cross a floor. |
+| `restored_from` | On an `accepted` record that a rollback restored: the `started_at` of the rolled-back release. |
+
+- `attempt` is always the last attempt. `accepted` is the last release that a deploy completed, or that a rollback restored. A failed attempt never becomes `accepted`.
+- The gate refuses a deploy while the last attempt is `started`: it runs, or it died. `KARDAMOM_REPLACE_ATTEMPT=1` deploys over a dead one. The record then holds the mixed versions that run, so a rollback of it goes to that mixed state. Roll a failed attempt back before you deploy the fix.
+- Every write of the record is a check-and-set on the modify index of the variable. Two controllers cannot write over each other: the second one stops.
+- The deploy token needs `write`, `read` and `list` on `kardamom/deploys/*` in its namespace. The items stay under the 64 KiB limit of a Nomad variable: the two registries are the largest part.
+- An environment name has letters, digits, `-` and `_` only. The Nomad variable path admits no other character.
 
 ### Sealer bootstrap
 
@@ -272,7 +302,13 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `NOMAD_TOKEN` | empty | The Nomad ACL token. |
 | Controller | `NOMAD_NAMESPACE` | `default` | The Nomad namespace. |
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
-| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary. |
+| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary and compares the format registries. |
+| Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
+| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. |
+| Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
+| Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
+| Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
+| Controller | `KARDAMOM_ROLLBACK_BELOW_FLOOR` | empty | The format ids of a floor that `just rollback` crosses on purpose, after a check that no writer wrote the new version. |
 | Signing | `DIGEST_MANIFEST` | `images.digests` | The image manifest. A relative path starts in `deploy/cluster/`. |
 | Signing | `KARDAMOM_REQUIRE_SIGNED` | `0` | `1` requires the signature of the manifest and of each image. |
 | Signing | `KARDAMOM_CERT_IDENTITY_RE` | the workflows of the project repository | A regex for the signer identity. |
@@ -315,6 +351,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Sealer | `KARDAMOM_CLUSTER_LOG_PURGE_KEEP` | empty (`3` in the job) | How many of the newest Raft snapshots keep their log. `0` turns the log purge off. See [Sealer log purge](#sealer-log-purge). |
 | Sealer | `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the Raft log and the archive. `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs data and metadata. At `0`, a power loss that takes the members together can drop an entry that a quorum acknowledged. |
 | Sealer | `KARDAMOM_REMOTE_ORIGINS` | empty (`412347,412399` in the job) | The peer chain ids whose cross-chain records the sealer seals. All members use the same list. |
+| Executor | `KARDAMOM_EXEC_CURSOR` (job variable `exec_cursor`) | empty (`off` in the job) | `on` or `off`. On, each executor sends its recorded cursor to the sealer, the floor of the record-lag guard. Switch it on only after every sealer member reads ingress kind 9. A sealer member that does not read it drops the frame. |
 | Fees | `PRIORITY_FEES` | empty (`off`) | `on` or `off`. One value sets the sequencer tip, the sealer ordering window and the executor and validator fee schedule. Turning it on for an existing chain is a chain upgrade. See [`../../docs/priority-fees.md`](../../docs/priority-fees.md). |
 | Aeron | `KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL` | empty (`1` in the job) | The sync level of the `tx_data`, `tx_deposits` and `exec_txs` recordings and of the archive catalog (job variable `archive_file_sync_level`). `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` also syncs the metadata. Level 1 costs throughput on the recording path. |
 | Aeron | `AERON_STALL_TOLERANCE_MS` | `10000` | How long every Aeron party waits through a stalled peer, in ms. The container recipes and CI use `30000`. See "Aeron stall tolerance" in [`../../docs/failure-modes.md`](../../docs/failure-modes.md#substrate-the-shared-failure-domain). |
@@ -326,6 +363,20 @@ Preflight checks fail the deploy before it changes a job:
 - The light client needs the execution RPC, the consensus RPC, the checkpoint and the lockbox address together.
 - A supplied settlement address must be a non-zero 20-byte hex address.
 - Without a settlement address, `kardamom-deploy` must exist and support `addresses --contract --json`.
+
+The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it changes a job. Each refusal names its cause:
+
+| Refusal | Check | What to do |
+|---|---|---|
+| The last attempt is still started | The record's `attempt.status`. | Let it finish. If it died, `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1`. |
+| The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without the ingress job has no chain to check; an ingress job without a running allocation is refused. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
+| An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. `off` skips it in the local profile only. | Push the images, or fix the manifest. |
+| A coordinated format change | `kardamom-cluster formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. | Stop the writers, or follow the runbook of the format. |
+| A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
+| A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
+| A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
+
+The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.
 
 ### Secrets
 
@@ -340,7 +391,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
   - A task reads `nomad/jobs/<job>` with its workload identity. That needs no ACL policy.
   - The `secrets/` directory does not show in `nomad alloc fs`.
   - A `nomad job inspect` shows the template, not the values.
-- The deploy token needs `write`, `read` and `list` on `nomad/jobs/*` in its namespace.
+- The deploy token needs `write`, `read` and `list` on `nomad/jobs/*` and on `kardamom/deploys/*` in its namespace.
 - A job that renders its variable waits for it. Without the role, write it first: `nomad var put nomad/jobs/<job> KEY=value`.
 
 | Job | Variable item | The task reads it as |
@@ -394,7 +445,7 @@ ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
 
 - `aeron`, `redis` and `cluster` (the Java sealer).
 - `l1-light-client`, built from the pinned helios release binary (`docker/helios/Dockerfile`). The build checks the SHA-256 of the release asset.
-- The 11 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy` and `notifier`.
+- The 12 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy`, `notifier` and `canary`.
 
 The build:
 
@@ -457,11 +508,12 @@ deploy/cluster/
   DESIGN.md                 design record
   PRODUCTION.md             the production profile
   justfile                  container-up / container-test / shard / container-down /
-                            images / deploy / rollback / smoke / validate / check-contract
+                            images / deploy / rollback / rollback-rerender / smoke / validate / check-contract
   ansible/
     ansible.cfg
     containers.yml          inventory from the node contract, host preparation
     cluster.yml             containers.yml + images.yml + deploy.yml
+    rollback.yml            revert the last release by the deploy record
     group_vars/all.yml      the contract (classes, ports, versions, profile)
     bootstrap.yml           configure a host and join it to the substrate
     deploy.yml              workload deployment, signature and readiness gates
@@ -484,6 +536,7 @@ deploy/cluster/
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
     state-mirror.nomad.hcl  redis.nomad.hcl  monitoring.nomad.hcl
     notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
+    canary.nomad.hcl        the transaction canary, on the monitoring node
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one
     l1-light-client.nomad.hcl  l1-indexer.nomad.hcl  (real L1, or the chaos-l1 shard)
@@ -582,7 +635,7 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in `crates/chaos/tests/shards.rs`.
 - A shard test brings the cluster up itself. `container-test` runs it with `KARDAMOM_CHAOS_REUSE=1` against the cluster that `container-up` made.
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
-- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
+- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers | formats` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). `formats` prints the format findings of this tree against a `--base` registry as JSON; the release gate reads them.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 

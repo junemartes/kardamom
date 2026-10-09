@@ -28,6 +28,13 @@ impl Scrape {
     /// genuine 0 sample.
     #[must_use]
     pub fn value_where(&self, name: &str, label: &str) -> Option<f64> {
+        self.value_where_all(name, &[label])
+    }
+
+    /// Sum every sample of `name` whose label block contains every one
+    /// of `labels`. Returns `None` when no sample matches.
+    #[must_use]
+    pub fn value_where_all(&self, name: &str, labels: &[&str]) -> Option<f64> {
         self.0
             .lines()
             .filter(|line| !line.starts_with('#') && line.starts_with(name))
@@ -36,7 +43,9 @@ impl Scrape {
                 // the metric name (a label block or a sample separator), so
                 // `foo` never matches `foo_total`.
                 let rest = &line[name.len()..];
-                if !(rest.starts_with('{') || rest.starts_with(' ')) || !rest.contains(label) {
+                if !(rest.starts_with('{') || rest.starts_with(' '))
+                    || !labels.iter().all(|label| rest.contains(label))
+                {
                     return None;
                 }
                 line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok())

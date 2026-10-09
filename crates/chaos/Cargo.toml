@@ -27,6 +27,7 @@ alloy-network.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+kardamom-formats = { path = "../formats" }
 kardamom-l1-fault-proxy = { path = "../l1_fault_proxy" }
 kardamom-state = { path = "../state" }
 kardamom-types = { path = "../types" }

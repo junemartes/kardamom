@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusRecorder};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusRecorder};
 
 pub mod bin;
 pub mod events;
@@ -116,6 +116,17 @@ const DURATION_BUCKETS: &[f64] = &[
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
 
+/// The buckets of the transaction canary's histograms (seconds), 5 ms to
+/// one hour. A canary stage spans a block close, an L1 post, or an L1
+/// deposit, far past the service buckets' 5 s top.
+const CANARY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0,
+    300.0, 600.0, 1200.0, 1800.0, 3600.0,
+];
+
+/// The name prefix of the canary's metrics.
+const CANARY_PREFIX: &str = "kardamom_canary_";
+
 /// Build-info gauge name. The overview dashboard reads this exact name.
 const BUILD_INFO: &str = "kardamom_build_info";
 
@@ -179,6 +190,8 @@ impl Exporter {
         let recorder = PrometheusBuilder::new()
             .set_buckets(DURATION_BUCKETS)
             .context("set_buckets")?
+            .set_buckets_for_metric(Matcher::Prefix(CANARY_PREFIX.to_string()), CANARY_BUCKETS)
+            .context("set the canary buckets")?
             .add_global_label("service", self.service)
             .add_global_label("host_id", self.host_id.as_str())
             .build_recorder();

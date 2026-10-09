@@ -13,6 +13,7 @@ pub(crate) mod archive;
 pub(crate) mod cache;
 pub(crate) mod chain_status;
 pub(crate) mod cluster;
+pub(crate) mod combined;
 pub(crate) mod component;
 pub(crate) mod coordinated;
 pub(crate) mod da_lag;
@@ -21,6 +22,7 @@ pub(crate) mod deploy;
 pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
+pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
@@ -54,6 +56,11 @@ pub enum Case {
     IngressPairLossRecover,
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
+    IngressSequencerLossRecover,
+    IngressSealerLossRecover,
+    SequencerSealerLossRecover,
+    IngressSequencerSealerLossRecover,
+    IngressSequencerSealerReverse,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -78,7 +85,7 @@ pub enum Case {
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 47] = [
+const ALL: [Case; 52] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -104,6 +111,11 @@ const ALL: [Case; 47] = [
     Case::IngressPairLossRecover,
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
+    Case::IngressSequencerLossRecover,
+    Case::IngressSealerLossRecover,
+    Case::SequencerSealerLossRecover,
+    Case::IngressSequencerSealerLossRecover,
+    Case::IngressSequencerSealerReverse,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -170,6 +182,11 @@ impl Case {
             Self::IngressPairLossRecover => "ingress-pair-loss-recover",
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
+            Self::IngressSequencerLossRecover => "ingress-sequencer-loss-recover",
+            Self::IngressSealerLossRecover => "ingress-sealer-loss-recover",
+            Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
+            Self::IngressSequencerSealerLossRecover => "ingress-sequencer-sealer-loss-recover",
+            Self::IngressSequencerSealerReverse => "ingress-sequencer-sealer-reverse",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -265,6 +282,15 @@ impl Case {
             Self::SealerFleetTotalWipeRecover => {
                 inject + k.reschedule_slo + Duration::from_mins(15)
             }
+            // The hold, the staggered return of up to three classes, a
+            // full-restart election, and the ingress bind after it.
+            Self::IngressSequencerLossRecover
+            | Self::IngressSealerLossRecover
+            | Self::SequencerSealerLossRecover
+            | Self::IngressSequencerSealerLossRecover
+            | Self::IngressSequencerSealerReverse => {
+                inject + k.reschedule_slo + Duration::from_mins(5)
+            }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
                 inject + cycle * k.squeeze.cycles.get() + Duration::from_secs(90)
@@ -312,6 +338,15 @@ impl Case {
             // wipe stops the ingresses for the whole rebuild, and a refused
             // submit would leave a nonce hole in the load's sender.
             Self::DaLagHalt | Self::SealerFleetTotalWipeRecover => 120,
+            // The submit ingress is dead for the hold and the staggered
+            // return, about five minutes, and a dead ingress refuses a
+            // connection at once. The retry delay grows by 200 ms per
+            // attempt, so ninety attempts span about fourteen minutes.
+            Self::IngressSequencerLossRecover
+            | Self::IngressSealerLossRecover
+            | Self::SequencerSealerLossRecover
+            | Self::IngressSequencerSealerLossRecover
+            | Self::IngressSequencerSealerReverse => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -360,6 +395,11 @@ impl Case {
             Self::IngressPairLossRecover => coordinated::ingress_pair_loss_recover(h).await,
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
+            Self::IngressSequencerLossRecover => combined::INGRESS_SEQUENCER.run(h).await,
+            Self::IngressSealerLossRecover => combined::INGRESS_SEALER.run(h).await,
+            Self::SequencerSealerLossRecover => combined::SEQUENCER_SEALER.run(h).await,
+            Self::IngressSequencerSealerLossRecover => combined::ALL_THREE.run(h).await,
+            Self::IngressSequencerSealerReverse => combined::ALL_THREE_REVERSE.run(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -403,6 +443,7 @@ mod tests {
             crate::Shard::Cluster,
             crate::Shard::Fleet,
             crate::Shard::Coordinated,
+            crate::Shard::CombinedOrdering,
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,

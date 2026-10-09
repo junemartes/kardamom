@@ -221,4 +221,32 @@ fn the_chain_status_names_the_roots_and_the_rows_that_only_report() {
     assert_eq!(json["batcher_halted"]["cause"], "l1_unreachable");
     assert_eq!(json["deposits_delayed"], true);
     assert_eq!(json["services"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        json["best_recorded"],
+        serde_json::Value::Null,
+        "no cursor yet"
+    );
+    assert_eq!(json["record_lag_budget"], 0);
+    assert_eq!(json["record_lag_halted"], false);
+}
+
+#[test]
+fn the_chain_status_shows_the_record_lag_guard() {
+    let json = ChainStatus {
+        cluster: ClusterStatus {
+            record_lag: RecordLagStatus {
+                best_recorded: Some(70),
+                budget: 16_384,
+                halted: true,
+            },
+            ..ClusterStatus::default()
+        },
+        sealer: &Slots::default(),
+        ingress: &Slots::default(),
+        board: &board(vec![]),
+    }
+    .to_json();
+    assert_eq!(json["best_recorded"], 70);
+    assert_eq!(json["record_lag_budget"], 16_384);
+    assert_eq!(json["record_lag_halted"], true);
 }
