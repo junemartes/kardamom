@@ -65,7 +65,8 @@ deploy succeeded and the release degrades the chain after it.
    It is a normal rolling deploy of the older images with the job files of
    the checkout. An old binary may not accept a flag that the checkout adds.
    Check out the revision of `before.revision` first when the job files
-   changed.
+   changed. After a dead attempt the re-render is a deploy over an attempt
+   that is still `started`, so it needs `KARDAMOM_REPLACE_ATTEMPT=1`.
 3. When it refuses with `A rollback below this release is not safe`, the
    release has a rollback floor: it writes a format version that the release
    before cannot read. Confirm, for each format in `floor.formats`, that no
@@ -92,7 +93,16 @@ deploy succeeded and the release degrades the chain after it.
    release`. Read the record and `nomad job history <job>` before you
    continue.
 7. A rollback that stops resumes. Each job joins `rolled_back` in the record
-   when it is done; the next `just rollback <env>` skips those jobs.
+   when it is done; the next `just rollback <env>` skips those jobs. The
+   sealer is the exception: a reverse roll that stops between two members
+   leaves the groups mixed, so `cluster` is neither at the release nor at
+   the pre-release definition, and the resume refuses it with `Another
+   change moved the job`. Finish the roll by hand: register the pre-release
+   definition (`nomad job history -p -version <before> cluster`) one group
+   at a time, as `sealer_step.yml` does, followers first and the leader
+   last, and wait for each member's `/ready`. Never revert the whole job:
+   the members would restart at once. Then run `just rollback <env>` again
+   for the jobs that remain.
 8. When it refuses with `The deploy record ... changed under this run`,
    another controller writes the record of the environment at the same
    time. Let it finish, then read the record again.
