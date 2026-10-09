@@ -133,6 +133,12 @@ pub(crate) async fn exec_peer_fetch(h: &mut Harness) -> anyhow::Result<()> {
         archives: &archives,
         sources: &sources,
     };
+    if !window.u32_match_works(h).await {
+        crate::log(format!(
+            "{ctx}: SKIP: iptables u32 match unavailable on the node kernel"
+        ));
+        return Ok(());
+    }
     let held = window.run(h, before.fetched).await;
     window.end(h).await;
     held?;
@@ -156,6 +162,10 @@ pub(crate) async fn exec_peer_fetch(h: &mut Harness) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A source address that no node uses (TEST-NET-1), for the probe of the
+/// `u32` match.
+const PROBE_SOURCE: &str = "192.0.2.1";
 
 /// One change of the rule that drops the `tx_data` frames from one source.
 #[derive(Clone, Copy)]
@@ -234,6 +244,24 @@ impl Window<'_> {
             elapsed.as_secs()
         ));
         Ok(())
+    }
+
+    /// Whether the kernel of every node of the case has the iptables
+    /// `u32` match: insert and lift the drop rule for a source that no
+    /// node uses. The lift runs also after a failed insert, so the probe
+    /// leaves no rule behind.
+    async fn u32_match_works(&self, h: &Harness) -> bool {
+        let mut works = true;
+        for node in std::iter::once(self.victim).chain(self.archives.iter().map(String::as_str)) {
+            works &= Self::probe(h, node).await;
+        }
+        works
+    }
+
+    async fn probe(h: &Harness, node: &str) -> bool {
+        let inserted = Op::Insert.apply(h, node, PROBE_SOURCE).await.is_ok();
+        let lifted = Op::Lift.apply(h, node, PROBE_SOURCE).await.is_ok();
+        inserted && lifted
     }
 
     /// The cleanup: lift every rule, also after a failed step. The lift
