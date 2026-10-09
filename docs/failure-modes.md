@@ -419,7 +419,7 @@ The join order of an executor is: live `tx_data`, then the ingress `tx_data` arc
 
 | Answer | Meaning | Effect |
 |---|---|---|
-| `located` | The peer joined the entry. The answer names its archive (`archive_id`), the session and a position at or before the record. | The executor replays that archive from the position and checks the record. |
+| `located` | The peer joined the entry. The answer names its archive (`archive_id`), the session and a position at or before the record. | The executor replays that archive from the position and checks the record. A replay that the archive refuses is no answer: the peer's node can die between the locator and the record. Ask again after 1 s. |
 | `not_held` | The peer reached the entry with no record: it parks there, it dropped the entry, or its state shows the slot vacant. | Final for this park. |
 | `not_reached` | The peer has not reached the entry. | Ask again after 1 s. |
 | `lost` | The peer executed the entry, and no locator or no retained recording covers it. | Final for this park. No vote. |
@@ -432,7 +432,7 @@ The join order of an executor is: live `tx_data`, then the ingress `tx_data` arc
 - **Determinism**: an executor executes at `i` only bytes whose keccak equals the hash of `TxRef(i)` from the canonical order. An executor that joined `i` never votes, so `Void(i)` exists only when no executor joined `i`.
 - **Forged sender**: a record whose signature does not recover its sender fails the check on the fetching executor. That executor stalls at the entry, and the validator halts on the record identity. This is out of the crash-fault model.
 - `kardamom_engine_peer_fetch_total{outcome}` counts the asks. See [observability.md](observability.md).
-- Proof: `exec-peer-fetch` makes both ingress recordings miss a 60 s window of `tx_data`, and makes executor-2 miss it live. Executors 0 and 1 join the window live. Both archives refuse the window to executor-2, which fetches it from a peer's archive. Executor-2 converges, no executor votes, and no restart loop occurs. `archive-driver-loss` prints the peer fetches and the votes, and fails on a restart loop.
+- Proof: `exec-peer-fetch` makes both ingress recordings miss a 60 s window of `tx_data`, and makes executor-2 miss it live. Executors 0 and 1 join the window live. Both archives refuse the window to executor-2, which fetches it from a peer's archive. The case asserts that the park follows a join that every archive refused, that no join timed out, that executor-2 converges, that no executor votes, and that no restart loop occurs. `archive-driver-loss` prints the peer fetches and the votes, and fails on a restart loop.
 
 ## Ingress (xN, active/active)
 

@@ -419,10 +419,8 @@ fn a_record_with_a_forged_sender_counts_as_no_answer() {
 fn a_lost_record_blocks_the_vote_and_ends_the_wait_at_the_entry_block() {
     let a = FakePeer::start(vec![not_held()]);
     let b = FakePeer::start(vec![Reply::Answer(ExecLocatorAnswer::Lost)]);
-    // A peer names an archive that holds no byte of the range: also lost.
-    let c = FakePeer::start(vec![located("executor-9", 4)]);
     let mut rig = ParkRig {
-        peers: peers(&[&a, &b, &c]),
+        peers: peers(&[&a, &b]),
         ..ParkRig::default()
     };
     // The first boundary closes block 6 before the entry; block 7 holds it.
@@ -432,7 +430,27 @@ fn a_lost_record_blocks_the_vote_and_ends_the_wait_at_the_entry_block() {
     assert!(matches!(outcome, ParkOutcome::Lost { block: 7 }));
     assert!(sub.votes.lock().unwrap().is_empty());
     // Every answer was final: one ask each.
-    assert_eq!((a.asked(), b.asked(), c.asked()), (1, 1, 1));
+    assert_eq!((a.asked(), b.asked()), (1, 1));
+}
+
+#[test]
+fn a_located_answer_whose_archive_holds_no_record_is_no_answer() {
+    // The peer's publisher appended the locator, then its node died
+    // before the recorder wrote the record. The recording ends at the
+    // locator, so the replay finds no byte of the range. The restarted
+    // peer answers "not held", and the vote goes out: a void is right.
+    let gone = FakePeer::start(vec![located("executor-9", 4), not_held()]);
+    let mut rig = ParkRig {
+        peers: peers(&[&gone]),
+        ..ParkRig::default()
+    };
+    let mut sub = VotingSub::new(1, vec![boundary(1), void(0, LOST)]);
+    let mut backlog = ReadAhead::new();
+    let outcome = rig.park(&mut sub, &mut backlog, 0).run().expect("voided");
+    assert!(matches!(outcome, ParkOutcome::Voided));
+    // The refused replay was no final answer: the peer was asked again.
+    assert_eq!(gone.asked(), 2);
+    assert_eq!(sub.votes.lock().unwrap().len(), 1);
 }
 
 #[test]

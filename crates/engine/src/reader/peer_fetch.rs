@@ -11,13 +11,15 @@
 //! - A peer that reached the entry and holds no record answers `not_held`.
 //!   That answer is final for this park.
 //! - A peer that executed the entry and holds no record of it answers
-//!   `lost`, or names an archive that holds no byte of the range. That
-//!   answer is final for this park, and it is never "absent": the reader
-//!   sends no vote while it stands.
+//!   `lost`. That answer is final for this park, and it is never "absent":
+//!   the reader sends no vote while it stands.
 //! - A peer that has not reached the entry, gives no answer, or names a
 //!   record that the replay does not deliver or that fails the check, can
 //!   still serve the entry. The reader asks it again, and sends no vote
-//!   while such a peer is left.
+//!   while such a peer is left. Only the peer's own answer is final: a
+//!   `located` answer whose archive holds no byte of the range is no
+//!   answer. The peer's node can die between the locator and the record,
+//!   and its restart answers `not_held` or `lost` itself.
 //!
 //! A peer answer never makes a reader skip an entry. It only chooses
 //! between "execute the fetched bytes", "vote" and "repair". The sealer
@@ -35,13 +37,12 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use kardamom_log::error::LogError;
 use kardamom_state::{ExecLocatorAnswer, ExecPeer, ExecPeers};
 use kardamom_types::{ExecTxRecord, TxEnvelope, TxRef};
 
 use crate::metrics::PEER_FETCH_TOTAL;
 
-use super::ports::{ExecRecordReplay, ExecRecordsFrom, JoinRecoveryError};
+use super::ports::{ExecRecordReplay, ExecRecordsFrom};
 
 /// The interval between two rounds of asks to the peers that gave no
 /// final answer.
@@ -310,7 +311,9 @@ impl<'a, R: ExecRecordReplay> PeerFetch<'a, R> {
     }
 
     /// Replay the peer's archive from `from`, keep the records after the
-    /// entry, and check the record of the entry.
+    /// entry, and check the record of the entry. A replay that fails, also
+    /// one that the archive refuses, is no answer: the reader asks the
+    /// peer again.
     fn fetch(&mut self, peer: &ExecPeer, from: ExecRecordsFrom<'_>) -> Asked {
         let Some(replay) = self.replay.as_deref_mut() else {
             self.warn(
@@ -324,14 +327,6 @@ impl<'a, R: ExecRecordReplay> PeerFetch<'a, R> {
         let replayed = replay.replay_exec_records(from, |record| records.push(record));
         match replayed {
             Ok(_) => self.take_entry(peer, records),
-            Err(JoinRecoveryError::Archive(e @ LogError::RangeAbsent { .. })) => {
-                self.warn(
-                    peer,
-                    &e.to_string(),
-                    "peer fetch: the peer's archive lost the entry",
-                );
-                Asked::Lost
-            }
             Err(e) => {
                 self.warn(peer, &e.to_string(), "peer fetch: the replay failed");
                 Asked::Unreachable

@@ -883,7 +883,8 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
   - The answers state keeps no joined set. In the current run, an index below the reached bound
     with no park is joined. Below the run, the state DB decides: a receipt at the index is
     joined (`located`, or `lost` with no locator at or below it), no receipt is `not_held`.
-  - A replay that the named archive refuses (`RangeAbsent`) counts as `lost`.
+  - A replay that the named archive refuses (`RangeAbsent`) is no answer: the reader asks the
+    peer again. Only the peer's own `lost` answer is final.
   - A replay keeps the records after the entry by canonical index (at most 65 536), and the
     reader checks each one at its turn. The own-tail preload uses the same store.
   - `lost` from a peer, with every other peer final, stops the reader with `PeerRecordLost` at

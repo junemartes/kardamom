@@ -428,6 +428,13 @@ where
             index: position.as_index(),
             tx_hash: tx_ref.tx_hash,
         };
+        info!(
+            target: "kardamom_executor::reader",
+            index = void.index,
+            tx_hash = ?void.tx_hash,
+            every_archive_refused,
+            "every tx_data source failed the entry: parking to ask the peers"
+        );
         self.tell_answers(|answers| answers.parked(void.index));
         let plan = ParkPlan {
             voter_id,
