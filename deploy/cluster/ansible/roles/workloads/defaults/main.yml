@@ -20,7 +20,7 @@ workloads_cert_identity: >-
   {{ lookup('env', 'KARDAMOM_CERT_IDENTITY_RE') |
      default('^https://github\.com/junemartes/kardamom/\.github/workflows/[^@]+@refs/', true) }}
 workloads_cert_issuer: "{{ lookup('env', 'KARDAMOM_CERT_OIDC_ISSUER') | default('https://token.actions.githubusercontent.com', true) }}"
-workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier]
+workloads_image_services: [aeron, cluster, redis, sequencer, ingress, executor, validator, da-watcher, batcher, state-mirror, notifier, canary]
 # The variables every job derives its placement and its peer lists from.
 # A job receives the ones its file declares (tasks/job.yml).
 # The Nomad node pool of a job, by job name: the pool id of an elastic
@@ -86,6 +86,17 @@ workloads_monitoring_secrets: >-
       'rules': lookup('file', workloads_prometheus_rules_file) if workloads_prometheus_rules_file | length > 0
                else 'groups: []'} }}
 workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
+# The transaction canary's ring: its BIP-39 mnemonic (CANARY_MNEMONIC) and
+# the derivation index of its first account (CANARY_RING_OFFSET, default
+# 0). The mnemonic reaches the task only through the job's Nomad Variable
+# (tasks/secrets.yml). Empty: the local profile runs the canary on the
+# public anvil mnemonic from index 34, the four accounts the dev genesis
+# funds for it, and the production profile runs no canary.
+workloads_canary_mnemonic: "{{ lookup('env', 'CANARY_MNEMONIC') }}"
+workloads_canary_ring_offset: "{{ lookup('env', 'CANARY_RING_OFFSET') | default('0', true) }}"
+workloads_canary_dev_mnemonic: "test test test test test test test test test test test junk"
+workloads_canary_dev_ring_offset: "34"
+workloads_canary_deployed: "{{ workloads_canary_mnemonic | length > 0 or deployment_profile == 'local' }}"
 # The EigenDA network the DA proxy disperses to (sepolia_testnet,
 # mainnet). Empty: the file-backed stand-in (nomad/da-store.nomad.hcl),
 # for a deployment without EigenDA. The proxy signs with the batcher's key and verifies against

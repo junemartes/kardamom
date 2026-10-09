@@ -137,6 +137,9 @@ ports:
   # its Prometheus exporter, on the ingress nodes (nomad/notifier.nomad.hcl).
   notifier_feed: 8547
   notifier_metrics: 9008
+  # The transaction canary's Prometheus exporter, on the monitoring node
+  # (nomad/canary.nomad.hcl).
+  canary_metrics: 9012
   anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
   l1_fault_proxy: 8547        # the lying L1 proxy of the chaos-l1 shard, in front of anvil
   # Base UDP port for kardamom data/ordering channels; per-channel offsets
@@ -152,6 +155,7 @@ paths:
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
   mirror_dir: /opt/kardamom/mirror         # state mirror head file + rebuild scratch
   notifier_dir: /opt/kardamom/notifier     # webhook subscriptions, outboxes and cursors
+  canary_dir: /opt/kardamom/canary         # the canary's nonce journal and contract addresses
   batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store
   da_watcher_dir: /opt/kardamom/da-watcher # the da-watcher's L1 cursor file
   l1_indexer_dir: /opt/kardamom/l1-indexer # inbox archive: batches, payloads, epochs, cursor

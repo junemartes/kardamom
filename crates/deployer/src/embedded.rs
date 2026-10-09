@@ -48,6 +48,13 @@ pub fn withdrawal_output_oracle_creation() -> Bytes {
     Bytes::from_static(WITHDRAWAL_OUTPUT_ORACLE_CREATION)
 }
 
+/// Creation bytecode of `CanaryCounter`, the counter of the transaction
+/// canary's `contract` probe. The constructor arguments follow it.
+#[must_use]
+pub fn canary_counter_creation() -> Bytes {
+    Bytes::from_static(CANARY_COUNTER_CREATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

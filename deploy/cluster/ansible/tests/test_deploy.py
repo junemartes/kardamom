@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
-            'batcher', 'state-mirror', 'notifier', 'da-store']
+            'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
 # The images the manifest pins beyond the default deployment: the jobs a
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
@@ -257,6 +257,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
+                    'canary',
                     'da-store', 'batcher']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
@@ -270,10 +271,15 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(variables['nomad/jobs/da-watcher'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
-        self.assertEqual(sorted(self.api.state['variable_writes']), ['nomad/jobs/batcher', 'nomad/jobs/da-watcher'])
+        self.assertEqual(variables['nomad/jobs/canary'], {
+            'KARDAMOM_CANARY_MNEMONIC': 'test test test test test test test test test test test junk'})
+        canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
+        self.assertEqual(sorted(self.api.state['variable_writes']),
+                         ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/da-watcher'])
         self.run_deploy()
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
-        self.assertEqual(len(self.api.state['variable_writes']), 2, 'unchanged redeploy must not write secrets')
+        self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
 
     def test_secrets_reach_tasks_only_through_nomad_variables(self):
         # Every keyed URL and key the deploy gets, by the environment the
@@ -291,6 +297,7 @@ class DeployTest(unittest.TestCase):
         output = self.run_deploy(environ={
             'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
             'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
+            'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
             'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
         self.assertNotIn(SENTINEL, output)
         state = self.api.state
@@ -302,6 +309,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
         self.assertEqual(state['variables'], {
             'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
+            'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC'},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
                                     'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
             'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},
