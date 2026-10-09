@@ -124,6 +124,9 @@ workloads_cluster_file_sync_level: "{{ lookup('env', 'KARDAMOM_CLUSTER_FILE_SYNC
 workloads_archive_file_sync_level: "{{ lookup('env', 'KARDAMOM_ARCHIVE_FILE_SYNC_LEVEL') }}"
 workloads_remote_origins: "{{ lookup('env', 'KARDAMOM_REMOTE_ORIGINS') }}"
 workloads_priority_fees: "{{ lookup('env', 'PRIORITY_FEES') }}"
+# The recorded cursor of the executors (nomad/executor.nomad.hcl): "on" or
+# "off". Empty keeps the job's "off" default.
+workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
 # The Aeron stall tolerance, in milliseconds (nomad/aeron.system.nomad.hcl).
 # 10000 is Aeron's default, and production keeps it: a longer value delays
 # the detection of a dead process. CI raises it, so a host stall does not

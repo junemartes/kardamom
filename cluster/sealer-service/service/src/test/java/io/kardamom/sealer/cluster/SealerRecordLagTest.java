@@ -104,6 +104,40 @@ class SealerRecordLagTest {
             "a cursor below the best sends no status");
     }
 
+    /** The lines that {@code run} prints on stdout. */
+    private static List<String> printed(final Runnable run) {
+        final java.io.PrintStream out = System.out;
+        final java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        System.setOut(new java.io.PrintStream(bytes, true, java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            run.run();
+        } finally {
+            System.setOut(out);
+        }
+        return bytes.toString(java.nio.charset.StandardCharsets.UTF_8).lines()
+            .filter(l -> l.startsWith("cluster RECORDED-CURSOR"))
+            .toList();
+    }
+
+    @Test
+    void a_move_of_the_best_cursor_prints_the_log_line_at_power_of_two_counts() {
+        start(0L);
+        users(0, 8);
+        final List<String> lines = printed(() -> {
+            deliver(executor, IngressFrames.recordedCursorFrame(1, 0L));
+            deliver(executor, IngressFrames.recordedCursorFrame(0, 1L));
+            deliver(executor, IngressFrames.recordedCursorFrame(1, 1L));
+            deliver(executor, IngressFrames.recordedCursorFrame(1, 2L));
+            deliver(executor, IngressFrames.recordedCursorFrame(0, 3L));
+        });
+        assertEquals(List.of(
+                "cluster RECORDED-CURSOR memberId=0 executorId=1 through=0 best=0 halted=false totalAdvances=1",
+                "cluster RECORDED-CURSOR memberId=0 executorId=0 through=1 best=1 halted=false totalAdvances=2",
+                "cluster RECORDED-CURSOR memberId=0 executorId=0 through=3 best=3 halted=false totalAdvances=4"),
+            lines,
+            "a cursor that does not move the best prints nothing; the third move prints nothing");
+    }
+
     @Test
     void a_short_frame_a_stranger_and_a_cursor_past_the_head_are_dropped() {
         start(BUDGET);

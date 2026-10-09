@@ -307,6 +307,9 @@ struct Boot {
     /// it before it starts, so a signal that lands during the repair
     /// between two revolutions ends the process instead of being lost.
     stop: tokio_util::sync::CancellationToken,
+    /// The executor id of the recorded cursor; `None` while the cursor is
+    /// off.
+    cursor_id: Option<u8>,
 }
 
 impl Boot {
@@ -351,6 +354,7 @@ impl Boot {
         kardamom_engine::metrics::describe();
         kardamom_executor::exec_stream::ExecStreamMetrics::describe();
         let file_cfg = load_file_config(&args)?;
+        let cursor_id = args.recorded_cursor_id()?;
         tracing::info!(
             lanes = kardamom_types::shard_map::LANE_COUNT,
             chain_id = args.chain_id,
@@ -377,6 +381,7 @@ impl Boot {
             file_cfg,
             _checkpoints: checkpoints,
             stop,
+            cursor_id,
         })
     }
 }
@@ -479,6 +484,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     let exec_stream_threads = outputs.exec_stream.threads;
 
     let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
+    outputs.exec_stream.cursor.start(
+        boot.cursor_id
+            .map(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
+    );
 
     let WriterAdapters {
         mut writer,

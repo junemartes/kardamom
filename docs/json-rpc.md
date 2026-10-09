@@ -87,6 +87,9 @@ receipt fields, the errors and the limits.
 | `posted_head` | The last block that the batcher confirmed on L1. |
 | `sealed_head` | The last block that the sealer closed. |
 | `da_lag_budget_blocks` | The DA-lag budget. `0` means the guard is off. |
+| `best_recorded` | The best recorded cursor of the executors: the highest canonical index that one executor or more recorded. `null` while no executor sent a cursor. |
+| `record_lag_budget` | The record-lag budget, in canonical records. `0` means the guard is off. |
+| `record_lag_halted` | `true` while the record-lag guard refuses user transactions. |
 | `roots` | The live halts that a pause waits on. Each entry has `service`, `instance`, `cause` and `runbook`. |
 | `sealer` | The sealer as this ingress observes it. A `/halt` record with `state`, `halted` and `pause`. |
 | `ingress` | The state of this ingress. The same shape as `sealer`. |
@@ -105,6 +108,9 @@ Example, abridged. The sealer is halted on a DA lag.
   "posted_head": 1200,
   "sealed_head": 11300,
   "da_lag_budget_blocks": 10000,
+  "best_recorded": 48210,
+  "record_lag_budget": 0,
+  "record_lag_halted": false,
   "roots": [{"service":"sealer","instance":"cluster","cause":"da_lag","runbook":"docs/runbooks/da_lag.md"}],
   "sealer": {"cause":"da_lag","state":"halted","halted":true,"pause":null},
   "ingress": {"state":"paused","halted":false,"pause":{"reason":"upstream"}},

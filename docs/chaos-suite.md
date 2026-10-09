@@ -55,7 +55,7 @@ There are twelve shards. `just container-test` lists their names.
 |---|---|---|
 | `load` | Sustained load: transfers, then the DeFi mix | `LOAD_DURATION_S=300`, `LOAD_TARGET_TPS=300`, `LOAD_SENDERS=6` |
 | `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | `RUN_LOAD=0` |
-| `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `replay-window-resync`, `deploy-broken-image` | `RUN_LOAD=0` |
+| `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `replay-window-resync`, `deploy-broken-image` | `RUN_LOAD=0`, the recorded cursor on (`KARDAMOM_EXEC_CURSOR=on`) |
 | `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | `RUN_LOAD=0` |
 | `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout`, `resize-scale-out-in` | `RUN_LOAD=0` |
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
@@ -86,7 +86,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 **Executor shard**
 
 - [`graceful-executor`](failure-modes.md#executor): stops one executor allocation with a graceful stop. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
-- [`hard-executor`](failure-modes.md#executor): kills one executor task. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
+- [`hard-executor`](failure-modes.md#executor): kills one executor task. While it is down, the sealer's best recorded cursor (`kardamom_ingress_cluster_recorded_head`) must move within 20 s. With `KARDAMOM_EXEC_CURSOR` off, the case skips this check with a log line. The job returns to three replicas. The restarted executor records a new `exec_txs` session, and its recorded cursor advances.
 - [`node-failure-executor`](failure-modes.md#executor): kills a whole executor node. The fleet keeps progressing with two replicas. The node returns.
 - [`node-replace-executor`](failure-modes.md#executor): replaces an executor node through the Terraform root. The new node has a new address and empty volumes.
 - [`state-checkpoint-restore`](failure-modes.md#executor): wipes the state of executor-0. It restores from the checkpoint of executor-1.
@@ -424,6 +424,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `SEQ_LAPSE_S` | the tolerance plus 20 s | The freeze window of `sequencer-lapse`. It must pass the tolerance, so the driver evicts the frozen client. |
 | `LAPSE_S` | the tolerance plus 20 s | The freeze window of `validator-lapse`. |
 | `KARDAMOM_CLUSTER_RETENTION` | unset | The egress retention of the deployed cluster, in frames. The retention cases need it. It must be a positive number. |
+| `KARDAMOM_EXEC_CURSOR` | `off` (`on` in `chaos-executor`) | `on` when the deployed executors send their recorded cursor to the sealer. The bring-up of `chaos-executor` deploys it on. `hard-executor` checks the sealer's best cursor only when it is `on`. |
 | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | unset | The DA-lag budget of the deployed sealer, in blocks. `da-lag-halt` needs it. It must be a positive number, so the knob cannot pass 0. |
 | `RETENTION_FREEZE_CAP_S` | `600` | The hard cap of the adaptive retention freeze. |
 | `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` cases stays active. |

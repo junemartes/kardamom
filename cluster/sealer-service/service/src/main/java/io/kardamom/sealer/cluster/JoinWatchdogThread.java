@@ -2,11 +2,17 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.ElectionState;
+import io.aeron.cluster.service.ClusteredServiceContainer;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Stream;
 import org.agrona.concurrent.status.AtomicCounter;
 
 /**
  * Samples the election state and the commit position for the
- * {@link JoinWatchdog}, once a second, and acts on its verdict.
+ * {@link JoinWatchdog}, once a second, and acts on its verdict. It also
+ * watches the two components of the member, and ends the process when one
+ * of them closes with no stop request.
  *
  * <p>Each action ends the process with {@link Runtime#halt}, not
  * {@link System#exit}. A graceful close joins the stuck agent thread and
@@ -23,6 +29,13 @@ import org.agrona.concurrent.status.AtomicCounter;
  *       snapshot. The member loses no data that the cluster needs: it
  *       reached a catch-up state, so a leader holds a longer log, and the
  *       leader's log holds every committed entry.</li>
+ *   <li>A closed component exits with code {@link #COMPONENT_CLOSED_EXIT_CODE}.
+ *       An agent that throws in its start, for example on an archive
+ *       request that times out while it loads its snapshot, records the
+ *       error in its error log and closes. Aeron calls no termination hook
+ *       for it, and the media driver and the archive keep the process
+ *       alive. The member then never joins, and it takes no snapshot. The
+ *       relaunch starts from the member's own state.</li>
  * </ul>
  */
 final class JoinWatchdogThread {
@@ -33,8 +46,34 @@ final class JoinWatchdogThread {
     static final int JOIN_WEDGE_EXIT_CODE = 3;
     /** Process exit code when the catch-up stalls. */
     static final int CATCHUP_STALL_EXIT_CODE = 4;
+    /** Process exit code when a component closes with no stop request. */
+    static final int COMPONENT_CLOSED_EXIT_CODE = 5;
 
-    private final int memberId;
+    /**
+     * The member that the thread watches: its id, its two components, and
+     * its stop request.
+     */
+    record Member(
+            int memberId,
+            ConsensusModule.Context consensus,
+            ClusteredServiceContainer.Context service,
+            StopRequest stop) {
+
+        /**
+         * The name of the first closed component, or empty while both run.
+         * A component closes its own Aeron client when its agent closes.
+         */
+        Optional<String> closedComponent() {
+            return Stream.of(
+                    Map.entry("CONSENSUS_MODULE", consensus.aeron()),
+                    Map.entry("SERVICE_CONTAINER", service.aeron()))
+                .filter(component -> component.getValue().isClosed())
+                .map(Map.Entry::getKey)
+                .findFirst();
+        }
+    }
+
+    private final Member member;
     private final JoinWatchdog watchdog;
     private final AtomicCounter electionState;
     private final AtomicCounter commitPosition;
@@ -44,35 +83,54 @@ final class JoinWatchdogThread {
     private final long stallWindowS;
 
     JoinWatchdogThread(
-            final int memberId,
-            final ConsensusModule.Context consensus,
+            final Member member,
             final StateDir clusterDir,
             final long windowS,
             final long stallWindowS) {
-        this.memberId = memberId;
+        this.member = member;
         this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L);
-        this.electionState = consensus.electionStateCounter();
-        this.commitPosition = consensus.commitPositionCounter();
+        this.electionState = member.consensus().electionStateCounter();
+        this.commitPosition = member.consensus().commitPositionCounter();
         this.clusterDir = clusterDir;
         this.windowS = windowS;
         this.stallWindowS = stallWindowS;
     }
 
     void start() {
-        final Thread thread = new Thread(this::runWhileOpen, "kardamom-join-watchdog");
+        final Thread thread = new Thread(this::runUntilStop, "kardamom-join-watchdog");
         thread.setDaemon(true);
         thread.start();
-        System.out.println("cluster join watchdog up memberId=" + memberId + " windowS=" + windowS
+        System.out.println("cluster join watchdog up memberId=" + member.memberId() + " windowS=" + windowS
             + " catchupStallS=" + stallWindowS);
     }
 
-    private void runWhileOpen() {
-        while (POLL.await() && !electionState.isClosed()) {
+    private void runUntilStop() {
+        while (POLL.await() && !member.stop().isRequested()) {
             sample();
         }
     }
 
+    /**
+     * One sample. The closed state is read before the stop request: a
+     * requested stop sets the request before any component closes, so a
+     * closed component with no request is a failure.
+     */
     private void sample() {
+        member.closedComponent().ifPresentOrElse(this::componentClosed, this::observe);
+    }
+
+    private void componentClosed(final String component) {
+        if (member.stop().isRequested()) {
+            return;
+        }
+        System.out.println("cluster COMPONENT CLOSED memberId=" + member.memberId()
+            + " component=" + component
+            + " closed with no stop request (its error log in the cluster dir holds the cause);"
+            + " exiting for a clean relaunch");
+        halt(COMPONENT_CLOSED_EXIT_CODE);
+    }
+
+    private void observe() {
         final long nowMs = System.currentTimeMillis();
         final long commit = commitPosition.get();
         switch (watchdog.observe(ElectionState.get(electionState), commit, nowMs)) {
@@ -83,14 +141,14 @@ final class JoinWatchdogThread {
     }
 
     private void initWedge(final long nowMs) {
-        System.out.println("cluster JOIN WEDGE memberId=" + memberId
+        System.out.println("cluster JOIN WEDGE memberId=" + member.memberId()
             + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
             + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
         halt(JOIN_WEDGE_EXIT_CODE);
     }
 
     private void catchupStall(final long commit, final long nowMs) {
-        System.out.println("cluster CATCHUP STALL memberId=" + memberId
+        System.out.println("cluster CATCHUP STALL memberId=" + member.memberId()
             + " commitPosition=" + commit
             + " no commit progress for " + watchdog.stallForMs(nowMs) / 1000L
             + "s while the election cycles through catch-up (window " + stallWindowS

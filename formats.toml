@@ -39,12 +39,13 @@ code = [
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
-# to 7. The sealer itself writes kind 8 into its log. The sealer reads
-# kind 9 (the recorded cursor), but no service sends it in this release:
-# the executor does not start its publisher. The sealer orders an unknown
-# kind of 85 bytes or more as a user record, and drops a shorter one. Thus
-# a new kind that changes the replicated state can fork members that run
-# different versions.
+# to 7. The sealer itself writes kind 8 into its log. The executor sends
+# kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
+# (--exec-cursor); the default is off. The sealer orders an unknown kind
+# of 85 bytes or more as a user record, and drops a shorter one. Thus a
+# new kind that changes the replicated state can fork members that run
+# different versions. The 10-byte kind 9 drops on an older member, but
+# switch the flag on only after every member reads kind 9.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
@@ -53,7 +54,9 @@ shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_RECORDED_CURSOR",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
+    "crates/executor/src/bin/kardamom-executor/args.rs#KARDAMOM_EXEC_CURSOR",
 ]
+activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
