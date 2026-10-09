@@ -196,7 +196,14 @@ fn leader_from_last_role_line(logs: &str) -> Option<u32> {
 /// The `memberId=<N>` value of a log line.
 #[must_use]
 pub fn member_id_of(line: &str) -> Option<u32> {
-    let rest = line.split("memberId=").nth(1)?;
+    u32::try_from(number_after(line, "memberId=")?).ok()
+}
+
+/// The number that follows the first `key` of a log line, such as the
+/// `7` of `leadershipTermId=7`.
+#[must_use]
+pub fn number_after(line: &str, key: &str) -> Option<u64> {
+    let rest = line.split(key).nth(1)?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }

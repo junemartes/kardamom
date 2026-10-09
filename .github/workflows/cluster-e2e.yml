@@ -172,11 +172,14 @@ jobs:
         # rebuilt from L1.
         # chaos-coordinated crosses the redundancy of a role: both ingresses,
         # and both replicas of a sequencer lane.
+        # chaos-combined-ordering takes two or three classes down at once
+        # (ingresses, sequencers, sealers) and brings them back in
+        # dependency order and against it.
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the
         # staging incident's faults, the batcher's resume through them, and
         # an outage past the sealer's retention.
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache, chaos-l1, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-coordinated, chaos-combined-ordering, chaos-retention, chaos-cache, chaos-l1, semantics]
     steps:
       - uses: actions/checkout@v4
 
