@@ -7,9 +7,10 @@
 //! again.
 //!
 //! The case needs a cluster deployed with a small DA-lag budget
-//! (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`), as `da-lag-halt` does, so it runs by
-//! name and in no shard: a small budget for a whole shard refuses the
-//! load of the other cases.
+//! (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`), as `da-lag-halt` does, and with the
+//! local canary (`CANARY_LOCAL=1`). So it runs by name and in no shard: a
+//! small budget for a whole shard refuses the load of the other cases,
+//! and the shards count transactions that the canary's would add to.
 
 use std::time::Duration;
 

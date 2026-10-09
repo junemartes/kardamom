@@ -205,7 +205,7 @@ The DA cases freeze the batcher with SIGSTOP, so nothing posts to L1 while the c
   - Alertmanager must hold a canary page as inhibited by the halt's page.
   - After the thaw, the halt must clear, and the canary's transfers must succeed again.
 - No DA case is in a shard. Run them by name with `KARDAMOM_CHAOS_CASES` against a cluster that has the small setting that the case needs.
-- `da-lag-halt` and `canary-da-lag` need `KARDAMOM_DA_LAG_BUDGET_BLOCKS`. `prune-floor` needs `KARDAMOM_CLUSTER_RETENTION`.
+- `da-lag-halt` and `canary-da-lag` need `KARDAMOM_DA_LAG_BUDGET_BLOCKS`. `canary-da-lag` also needs a cluster deployed with `CANARY_LOCAL=1`. `prune-floor` needs `KARDAMOM_CLUSTER_RETENTION`.
 - The case window is `INJECT_DELAY` plus `RETENTION_FREEZE_CAP_S` plus 2 minutes. `da-lag-halt` and `canary-da-lag` retry their load up to 120 times.
 
 ## Gates
