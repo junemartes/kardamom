@@ -34,14 +34,29 @@ use journal::{InFlight, Journal};
 /// chain with no fee schedule answers a zero gas price.
 const MIN_FEE_CAP: u128 = 1_000_000_000;
 
-/// What a transaction does: the target, the value, the input, and the
-/// gas limit.
+/// What a transaction does: the target, the value, the input, the gas
+/// limit, and the tip rate in wei per gas.
 #[derive(Debug, Clone)]
 pub struct Call {
     pub to: TxKind,
     pub value: U256,
     pub input: Bytes,
     pub gas_limit: u64,
+    pub tip: u128,
+}
+
+impl Call {
+    /// A call with no tip.
+    #[must_use]
+    pub fn new(to: TxKind, value: U256, input: Bytes, gas_limit: u64) -> Self {
+        Self {
+            to,
+            value,
+            input,
+            gas_limit,
+            tip: 0,
+        }
+    }
 }
 
 /// A transaction the ingress published.
@@ -210,6 +225,30 @@ impl Ring {
         .unwrap_or(Err(Outcome::AccountStalled))
     }
 
+    /// Lease ring account `index`, waiting up to `wait` while another
+    /// probe holds it.
+    ///
+    /// # Errors
+    ///
+    /// The outcome a user would see when the account cannot send.
+    pub async fn lease_index(&self, index: usize, rpc: &Rpc, wait: Poll) -> Result<Lease, Outcome> {
+        let index = index % self.slots.len();
+        wait.until(|| async {
+            match self.try_slot(index, rpc).await {
+                Err(Miss::Busy) => None,
+                tried => Some(tried.map_err(|miss| Misses::default().with(miss).outcome())),
+            }
+        })
+        .await
+        .unwrap_or(Err(Outcome::AccountStalled))
+    }
+
+    /// The number of ring accounts.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.slots.len()
+    }
+
     async fn lease_once(&self, rpc: &Rpc) -> Result<Lease, Misses> {
         let count = self.slots.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
@@ -330,8 +369,11 @@ impl Lease {
             chain_id: self.chain_id,
             nonce,
             gas_limit: call.gas_limit,
-            max_fee_per_gas: price.saturating_mul(2).max(MIN_FEE_CAP),
-            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: price
+                .saturating_mul(2)
+                .max(MIN_FEE_CAP)
+                .saturating_add(call.tip),
+            max_priority_fee_per_gas: call.tip,
             to: call.to,
             value: call.value,
             access_list: alloy_eips::eip2930::AccessList::default(),

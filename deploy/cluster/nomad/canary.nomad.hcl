@@ -7,18 +7,22 @@
 #     the receipt;
 #   - read: the head of each ingress instance moves, and the receipt of
 #     an old canary transaction still answers;
-#   - contract: a write to the canary counter and a read that shows it.
+#   - contract: a write to the canary counter and a read that shows it;
+#   - safe, fees, deposit, rwa, swap, liquidity: the safe head, the fee
+#     rules, an L1 deposit, the test RWA token and the canary pool.
 #
 # The ingress instances come from their Consul node records, one per
 # ingress node, never the load balancer: a stopped ingress shows as the
 # failures of its own endpoint. The status feed is the notifier's
 # service record.
 #
-# The ring's mnemonic (KARDAMOM_CANARY_MNEMONIC) comes from the Nomad
-# Variable nomad/jobs/canary, which the workloads role writes: the key
-# never appears in the job. Without a real one, and with CANARY_LOCAL=1,
-# the role writes the public anvil mnemonic with ring_offset 34, the
-# accounts the dev genesis funds for the canary.
+# The ring's mnemonic (KARDAMOM_CANARY_MNEMONIC), the L1 key of the
+# deposit probe (KARDAMOM_CANARY_L1_KEY) and its L1 endpoint
+# (KARDAMOM_L1_RPC) come from the Nomad Variable nomad/jobs/canary, which
+# the workloads role writes: a key never appears in the job. Without a
+# real mnemonic, and with CANARY_LOCAL=1, the role writes the public
+# anvil mnemonic with ring_offset 34, the accounts the dev genesis funds
+# for the canary.
 #
 # Placement: the node whose role set holds monitoring (the aux node by
 # default), outside the chaos suite's blast radius, beside the
@@ -56,6 +60,18 @@ variable "ring_offset" {
   type        = number
   description = "The derivation index of the first ring account."
   default     = 0
+}
+
+variable "lockbox_address" {
+  type        = string
+  description = "The L1 ETHLockbox of the deposit probe. Empty: no deposit probe."
+  default     = ""
+}
+
+variable "safe_timeout_ms" {
+  type        = string
+  description = "The longest wait, in milliseconds, for a sampled transaction to reach the safe head: twice the batcher's idle flush."
+  default     = "120000"
 }
 
 locals {
@@ -120,15 +136,16 @@ job "canary" {
         volumes = [
           "/opt/kardamom/canary:/opt/kardamom/canary",
         ]
-        args = [
+        args = concat([
           "--ingress", local.ingress,
           "--notifier-ws", "ws://kardamom-notifier.service.consul:8547",
           "--ring-size", "${var.ring_size}",
           "--ring-offset", "${var.ring_offset}",
           "--dir", "/opt/kardamom/canary",
+          "--safe-timeout-ms", var.safe_timeout_ms,
           "--host-id", "canary-${NOMAD_ALLOC_INDEX}",
           "--metrics-addr", "0.0.0.0:9012",
-        ]
+        ], var.lockbox_address != "" ? ["--lockbox", var.lockbox_address] : [])
       }
 
       # The ring's mnemonic (KARDAMOM_CANARY_MNEMONIC), from the job's

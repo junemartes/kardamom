@@ -8,6 +8,10 @@ pub enum Stage {
     Submit,
     Receipt,
     Read,
+    Safe,
+    L1Inclusion,
+    L1Finality,
+    L2Credit,
 }
 
 impl Stage {
@@ -17,6 +21,10 @@ impl Stage {
             Self::Submit => "submit",
             Self::Receipt => "receipt",
             Self::Read => "read",
+            Self::Safe => "safe",
+            Self::L1Inclusion => "l1_inclusion",
+            Self::L1Finality => "l1_finality",
+            Self::L2Credit => "l2_credit",
         }
     }
 }
@@ -48,6 +56,23 @@ pub enum Outcome {
     HeadStalled,
     /// The receipt of an old canary transaction does not answer.
     ReceiptLost,
+    /// A receipt breaks a fee rule, or a fee method does not answer. The
+    /// field names the check.
+    FeeMismatch(&'static str),
+    /// An L1 call failed or the L1 deposit reverted.
+    L1Error,
+    /// The token's total supply is not the canary's mints less its burns.
+    SupplyMismatch,
+    /// A transfer to an address off the allowlist succeeded.
+    AllowlistBreach,
+    /// A swap's output is not the constant-product formula's.
+    SwapMismatch,
+    /// The product of the pool's reserves fell in a swap.
+    InvariantBroken,
+    /// The pool's ETH reserve is above its balance.
+    ReserveMismatch,
+    /// A liquidity change's shares or amounts are not the formula's.
+    LiquidityMismatch,
 }
 
 impl From<RpcError> for Outcome {
@@ -75,6 +100,14 @@ impl Outcome {
             Self::StateMismatch => "state_mismatch",
             Self::HeadStalled => "head_stalled",
             Self::ReceiptLost => "receipt_lost",
+            Self::FeeMismatch(_) => "fee_mismatch",
+            Self::L1Error => "l1_error",
+            Self::SupplyMismatch => "supply_mismatch",
+            Self::AllowlistBreach => "allowlist_breach",
+            Self::SwapMismatch => "swap_mismatch",
+            Self::InvariantBroken => "invariant_broken",
+            Self::ReserveMismatch => "reserve_mismatch",
+            Self::LiquidityMismatch => "liquidity_mismatch",
         }
     }
 
@@ -85,6 +118,7 @@ impl Outcome {
             Self::RpcError(code) => Some(("code", code.clone())),
             Self::Rejected(reason) => Some(("reason", reason.clone())),
             Self::Timeout(stage) => Some(("stage", stage.label().to_string())),
+            Self::FeeMismatch(field) => Some(("field", (*field).to_string())),
             _ => None,
         }
     }

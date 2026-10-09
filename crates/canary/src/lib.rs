@@ -15,6 +15,7 @@ pub mod config;
 pub mod contracts;
 pub mod feed;
 pub mod funds;
+pub mod market;
 pub mod metrics;
 pub mod outcome;
 pub mod probes;

@@ -101,6 +101,15 @@ workloads_canary_local: "{{ lookup('env', 'CANARY_LOCAL') | default('0', true) |
 workloads_canary_deployed: >-
   {{ workloads_canary_mnemonic | length > 0
      or (deployment_profile == 'local' and workloads_canary_local | bool) }}
+# The canary's L1 key (CANARY_L1_KEY): the account of its deposit probe.
+# The probe runs when the key and LOCKBOX_ADDRESS are both given.
+workloads_canary_l1_key: "{{ lookup('env', 'CANARY_L1_KEY') }}"
+# A sampled canary transaction must reach the safe head within twice the
+# batcher's idle flush (which defaults to its flush, 3 s in the job), and
+# never under two minutes: the post also waits for its L1 inclusion.
+workloads_canary_safe_timeout_ms: >-
+  {{ [2 * (workloads_batcher_idle_flush_ms | default(workloads_batcher_flush_ms, true) | default('3000', true) | int),
+      120000] | max }}
 # The EigenDA network the DA proxy disperses to (sepolia_testnet,
 # mainnet). Empty: the file-backed stand-in (nomad/da-store.nomad.hcl),
 # for a deployment without EigenDA. The proxy signs with the batcher's key and verifies against

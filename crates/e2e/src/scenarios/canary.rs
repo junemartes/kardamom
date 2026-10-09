@@ -34,9 +34,27 @@ const PROBE_TOTAL: &str = "kardamom_canary_probe_total";
 const LAND: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(100);
 
-/// Wait until every probe has `runs` successes on the canary at
-/// `canary`, then require that no `transfer` or `contract` run failed
-/// and that the feed reported the `executed` stage.
+/// The probes that run on short timers in the scenario.
+const PROBES: [&str; 6] = [
+    "probe=\"transfer\"",
+    "probe=\"read\"",
+    "probe=\"contract\"",
+    "probe=\"fees\"",
+    "probe=\"rwa\"",
+    "probe=\"swap\"",
+];
+/// The probes that must succeed once in the scenario's time: the
+/// liquidity add and the deposit.
+const ONCE: [&str; 2] = ["probe=\"liquidity\"", "probe=\"deposit\""];
+/// The L1 key of the canary in the scenario: anvil account #9, which no
+/// other part of the stack uses.
+pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6";
+
+/// Wait until every probe has `runs` successes (the liquidity and the
+/// deposit probes one) on the canary at `canary`, then require that no
+/// probe but `read` failed, and that the feed reported the `executed`
+/// stage. A `read` run can see the head not move between two runs on an
+/// idle local chain.
 ///
 /// # Errors
 /// Returns an error when the successes do not come within the patience,
@@ -45,16 +63,19 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
     let success = |probe: &'static str| [probe, "outcome=\"success\""];
     metrics::poll_until(
         "every canary probe succeeds",
-        Duration::from_secs(180),
+        Duration::from_secs(300),
         Duration::from_millis(500),
         async || {
             // The exporter binds a moment after the process starts.
             let Ok(s) = metrics::scrape(canary).await else {
                 return Ok(None);
             };
-            let done = ["probe=\"transfer\"", "probe=\"read\"", "probe=\"contract\""]
-                .into_iter()
-                .all(|p| s.value_where_all(PROBE_TOTAL, &success(p)).unwrap_or(0.0) >= runs);
+            let count = |probe| {
+                s.value_where_all(PROBE_TOTAL, &success(probe))
+                    .unwrap_or(0.0)
+            };
+            let done =
+                PROBES.iter().all(|p| count(p) >= runs) && ONCE.iter().all(|p| count(p) >= 1.0);
             Ok(done.then_some(()))
         },
     )
@@ -65,7 +86,11 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
         .lines()
         .filter(|l| l.starts_with(PROBE_TOTAL) && !l.contains("outcome=\"success\""))
         .collect();
-    for probe in ["probe=\"transfer\"", "probe=\"contract\""] {
+    for probe in PROBES
+        .iter()
+        .chain(ONCE.iter())
+        .filter(|p| !p.contains("read"))
+    {
         let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0);
         let ok = s
             .value_where_all(PROBE_TOTAL, &success(probe))
@@ -84,6 +109,27 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
         .unwrap_or(0.0);
     anyhow::ensure!(executed > 0.0, "no transfer saw the executed stage");
     Ok(())
+}
+
+/// Mine an L1 block every second until the task is aborted: the
+/// da-watcher and the `deposit` probe follow L1 finality.
+#[must_use]
+pub fn keep_mining(rpc_url: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(client) = jsonrpsee::http_client::HttpClientBuilder::default().build(&rpc_url)
+        else {
+            return;
+        };
+        loop {
+            let _: Result<serde_json::Value, _> = jsonrpsee::core::client::ClientT::request(
+                &client,
+                "evm_mine",
+                jsonrpsee::rpc_params![],
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
 }
 
 /// The ring's nonce owner on the stack: a lost answer, a restart with an
@@ -205,12 +251,12 @@ async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<u64> {
     let sent = lease
         .send(
             rpc,
-            Call {
-                to: TxKind::Call(Address::repeat_byte(0x5d)),
-                value: U256::from(1),
-                input: Bytes::new(),
-                gas_limit: 21_000,
-            },
+            Call::new(
+                TxKind::Call(Address::repeat_byte(0x5d)),
+                U256::from(1),
+                Bytes::new(),
+                21_000,
+            ),
         )
         .await
         .map_err(|o| anyhow::anyhow!("send: {o:?}"))?;
