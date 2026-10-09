@@ -529,12 +529,12 @@ The coordinated cases take one class down, or every node. These cases take two o
 - **The sequencers and the sealers**
   - Trigger: all four sequencer tasks die and the job stops. All three sealer nodes die.
   - Effect: the pipeline stalls. Both ingresses refuse a submit on `sealer_no_quorum` within 60 s.
-  - Recovery: both classes return at once. The restarted sequencers hold no epoch, so the da-watcher publishes the unconfirmed epochs again, or a sequencer offers its epochs again on an origin-gap reject. The sealer's L1 origin reaches the last published epoch.
+  - Recovery: both classes return at once: the sequencer job is posted and the sealer nodes are started before the first wait. The restarted sequencers hold no epoch, so the da-watcher publishes the unconfirmed epochs again; its re-publish counter must rise. The sealer's L1 origin reaches the last published epoch.
   - Proof: `sequencer-sealer-loss-recover`.
 - **All three classes**
   - Trigger: the ingresses, the sequencers and the sealers die.
   - Effect: the pipeline stalls.
-  - Recovery, in dependency order: the sealers, the sequencers 30 s later, the ingresses 30 s after that. Each class finds what it needs when it starts.
+  - Recovery, in dependency order: the sealers, the sequencers 30 s after the cluster job reaches its count, the ingresses 30 s after the sequencer allocations run. Each class finds what it needs when it starts.
   - Recovery, against the order: the ingresses, the sequencers 45 s later, the sealers 45 s after that. Each class must wait for the next with no restart.
   - In both orders: every member names the same leader for a term, and no origin gap remains.
   - Proof: `ingress-sequencer-sealer-loss-recover` and `ingress-sequencer-sealer-reverse`.

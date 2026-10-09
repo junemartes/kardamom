@@ -11,58 +11,42 @@ use crate::harness::Harness;
 use crate::poll::{self, Budget, Outcome};
 use crate::probes::DA_WATCHER_PORT;
 
-/// The da-watcher's count of epochs it published again, and the
-/// sequencer's count of origin-gap rejects. A lost epoch moves one of
-/// them when it is filled.
+/// The da-watcher's count of epochs it published again. A lost epoch
+/// moves it when the da-watcher fills the gap. The sequencer's
+/// origin-gap counter is not a baseline: it resets with the sequencer.
 const EPOCHS_REPUBLISHED: &str = "kardamom_da_watcher_epochs_republished_total";
-const ORIGIN_GAP_TOTAL: &str = "kardamom_sequencer_origin_gap_total";
 
-/// The counters that rise when a lost epoch is filled again. `None` when
-/// an exporter did not answer.
+/// The counter that rises when a lost epoch is filled again. `None` when
+/// the exporter did not answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Refills {
     pub(super) republished: Option<i64>,
-    pub(super) origin_gaps: Option<i64>,
 }
 
 impl Refills {
     pub(super) async fn read(h: &Harness) -> Self {
-        let republished = h
-            .probes
-            .aux_metric_where(DA_WATCHER_PORT, EPOCHS_REPUBLISHED, "")
-            .await;
-        let mut origin_gaps: Option<i64> = Some(0);
-        for i in 0..h.probes.sequencers.len() {
-            let lane = h
-                .probes
-                .seq_lane0_metric_where(i, ORIGIN_GAP_TOTAL, "")
-                .await;
-            origin_gaps = origin_gaps.zip(lane).map(|(a, b)| a.saturating_add(b));
-        }
         Self {
-            republished,
-            origin_gaps,
+            republished: h
+                .probes
+                .aux_metric_where(DA_WATCHER_PORT, EPOCHS_REPUBLISHED, "")
+                .await,
         }
     }
 
-    /// Whether a counter rose from `self` to `now`.
+    /// Whether the counter rose from `self` to `now`.
     pub(super) fn rose_to(self, now: Self) -> bool {
-        let rose = |a: Option<i64>, b: Option<i64>| a.zip(b).is_some_and(|(a, b)| b > a);
-        rose(self.republished, now.republished) || rose(self.origin_gaps, now.origin_gaps)
+        self.republished
+            .zip(now.republished)
+            .is_some_and(|(a, b)| b > a)
     }
 
     pub(super) fn describe(self) -> String {
-        let show = |v: Option<i64>| v.map_or("?".to_string(), |v| v.to_string());
-        format!(
-            "republished {}, origin gaps {}",
-            show(self.republished),
-            show(self.origin_gaps)
-        )
+        self.republished
+            .map_or("republished ?".to_string(), |v| format!("republished {v}"))
     }
 
-    /// A counter rises past this baseline within the budget: the
-    /// da-watcher published a lost epoch again, or the sealer rejected an
-    /// origin gap and the lane offered its epochs again.
+    /// The counter rises past this baseline within the budget: the
+    /// da-watcher published a lost epoch again.
     async fn assert_rose(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(60, 3), |_| async move {
             let now = Self::read(h).await;
@@ -73,7 +57,7 @@ impl Refills {
             Outcome::Ready { value, .. } => value,
             Outcome::TimedOut { elapsed } => {
                 return Err(crate::chaos_fail!(
-                    "{ctx}: no epoch was filled again within {}s ({} -> {})",
+                    "{ctx}: no epoch was published again within {}s ({} -> {})",
                     elapsed.as_secs(),
                     self.describe(),
                     Self::read(h).await.describe()
@@ -92,39 +76,50 @@ impl Refills {
 /// The members that led each leadership term, from the `cluster TERM`
 /// lines of every member. The members replay the same log, so every
 /// member names the same leader for a term.
-pub(super) fn leaders_by_term(logs: &str) -> BTreeMap<u64, BTreeSet<u64>> {
-    logs.lines()
-        .filter(|l| l.contains("cluster TERM "))
-        .filter_map(|l| {
-            number_after(l, "leadershipTermId=").zip(number_after(l, "leaderMemberId="))
-        })
-        .fold(BTreeMap::new(), |mut terms, (term, leader)| {
-            terms
-                .entry(term)
-                .or_insert_with(BTreeSet::new)
-                .insert(leader);
-            terms
-        })
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Terms(pub(super) BTreeMap<u64, BTreeSet<u64>>);
 
-/// The terms that more than one member led.
-pub(super) fn split_terms(terms: &BTreeMap<u64, BTreeSet<u64>>) -> Vec<String> {
-    terms
-        .iter()
-        .filter(|(_, leaders)| leaders.len() > 1)
-        .map(|(term, leaders)| format!("term {term}: members {leaders:?}"))
-        .collect()
+impl Terms {
+    pub(super) fn parse(logs: &str) -> Self {
+        Self(
+            logs.lines()
+                .filter(|l| l.contains("cluster TERM "))
+                .filter_map(|l| {
+                    number_after(l, "leadershipTermId=").zip(number_after(l, "leaderMemberId="))
+                })
+                .fold(BTreeMap::new(), |mut terms, (term, leader)| {
+                    terms
+                        .entry(term)
+                        .or_insert_with(BTreeSet::new)
+                        .insert(leader);
+                    terms
+                }),
+        )
+    }
+
+    /// The terms that more than one member led.
+    pub(super) fn split(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|(_, leaders)| leaders.len() > 1)
+            .map(|(term, leaders)| format!("term {term}: members {leaders:?}"))
+            .collect()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// At most one member led each leadership term, over at least one term.
 async fn assert_one_leader_per_term(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let terms = leaders_by_term(&h.evidence.cluster_logs().await?);
+    let terms = Terms::parse(&h.evidence.cluster_logs().await?);
     anyhow::ensure!(
-        !terms.is_empty(),
+        terms.len() > 0,
         "{}: {ctx}: no member logged a leadership term",
         crate::FAIL_PREFIX
     );
-    let split = split_terms(&terms);
+    let split = terms.split();
     anyhow::ensure!(
         split.is_empty(),
         "{}: {ctx}: two members led one leadership term ({})",

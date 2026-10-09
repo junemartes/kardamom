@@ -86,6 +86,16 @@ impl Alloc {
     pub fn short_id(&self) -> &str {
         self.id.get(..8).unwrap_or(&self.id)
     }
+
+    /// The restarts of every task of the allocation, as Nomad counts
+    /// them. A task that Nomad restarts in place keeps its allocation.
+    #[must_use]
+    pub fn task_restarts(&self) -> u64 {
+        self.task_states
+            .values()
+            .filter_map(|state| state["Restarts"].as_u64())
+            .sum()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,5 +430,14 @@ mod tests {
             allocs[2].task_states.is_empty(),
             "a pending alloc has no task states"
         );
+        assert_eq!(allocs[0].task_restarts(), 0);
+        let restarted: Alloc = serde_json::from_str(
+            r#"{"ID":"a","TaskGroup":"ingress","ClientStatus":"running","JobVersion":1,
+            "DesiredStatus":"run","NodeName":"ingress-0","NodeID":"n","TaskStates":{
+            "ingress":{"State":"running","Restarts":2,"Failed":false},
+            "sidecar":{"State":"running","Restarts":1,"Failed":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(restarted.task_restarts(), 3);
     }
 }
