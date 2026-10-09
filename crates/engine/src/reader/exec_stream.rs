@@ -53,8 +53,9 @@ pub use archive::{
 };
 use copies::RecordBuffer;
 pub(crate) use locator::LocatorClient;
-pub use locator::{ArchiveLocator, LocatorAnswer, LocatorError};
+pub use locator::{ArchiveLocator, LocatorAnswer};
 
+use super::join::ReaderConfig;
 use super::ports::TxOrderingSubscription;
 use super::source::{FeedHandle, JoinAt, JoinSeed, Joined, SourceStart, TxJoin, TxSource};
 use super::void::{MAX_READ_AHEAD, ReadAhead};
@@ -140,7 +141,7 @@ pub struct ExecStreamSeed<A> {
 impl<A: ExecArchiveSeed> JoinSeed for ExecStreamSeed<A> {
     type Join = ExecStreamJoin<A::Archive>;
 
-    fn build(self) -> Self::Join {
+    fn build(self, _cfg: &ReaderConfig) -> Self::Join {
         ExecStreamJoin {
             buffer: self.buffer,
             archive: self.archive.build(),

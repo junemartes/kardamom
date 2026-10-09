@@ -91,7 +91,11 @@ pub fn open_exec_stream(cfg: ExecStreamConfig<'_>) -> Result<LiveExecStreamSourc
     let sub = plane
         .subscriber::<kardamom_log::aeron_live::ExecTxsSubscriberHandle>(rt)
         .context("open exec_txs subscription")?;
-    let locator = LocatorClient::new(executor_query_endpoints).map_err(anyhow::Error::msg)?;
+    let locator = LocatorClient::new(
+        executor_query_endpoints,
+        kardamom_state::exec_peers::DEFAULT_PEER_TIMEOUT,
+    )
+    .map_err(anyhow::Error::msg)?;
     let stream_id = plane.channels().exec_txs_stream_id;
     let sources = ArchiveSources::of(plane, aeron_cfg);
     let local = LocalRefetch::new(

@@ -70,6 +70,11 @@ pub(crate) const TX_DATA_QUEUE_DEPTH: &str = "kardamom_executor_tx_data_queue_de
 // event is rare by design. Any non-zero rate is worth an alert. It means a
 // node fell behind the retention window.
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
+/// Asks to a peer executor for an entry that every archive failed, by
+/// `outcome`: `located` (the peer's archive served a good record),
+/// `not_held`, `not_reached`, `lost`, `unreachable` (no answer, or no
+/// record in the replay), or `mismatch` (the record failed the check).
+pub const PEER_FETCH_TOTAL: &str = "kardamom_engine_peer_fetch_total";
 // The invalid-tx-skip counter comes from inside the `no_std` exec core
 // (`invalid_skip`). The constant and its `record_` helper live there. This
 // re-export keeps the metric namespace browsable in one place.
@@ -113,6 +118,10 @@ pub fn describe() {
     metrics::describe_counter!(
         RESYNC_TOTAL,
         "full-resync fallbacks after a cluster replay-window overrun, by outcome"
+    );
+    metrics::describe_counter!(
+        PEER_FETCH_TOTAL,
+        "asks to a peer executor for an entry that every archive failed, by outcome"
     );
     metrics::describe_counter!(
         FOOTPRINT_BLOCKS_TOTAL,

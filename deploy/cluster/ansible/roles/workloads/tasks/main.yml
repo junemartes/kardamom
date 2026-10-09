@@ -72,7 +72,10 @@
     # the state mirror writes it.
     - {name: redis}
     - {name: ingress}
-    - {name: executor, wait: false}
+    - name: executor
+      wait: false
+      vars:
+        exec_cursor: "{{ workloads_exec_cursor }}"
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.

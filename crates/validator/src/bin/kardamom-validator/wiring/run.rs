@@ -255,7 +255,7 @@ impl Ready {
         // ends, and its end is awaited, before a revolution parks the env.
         let query_server = args
             .nonce_query_addr
-            .map(|addr| kardamom_state::serve_nonce_queries(addr, state_env_for_rpc))
+            .map(|addr| kardamom_state::serve_nonce_queries(addr, state_env_for_rpc, None))
             .transpose()
             .context("bind nonce query address")?;
 

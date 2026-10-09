@@ -5,6 +5,8 @@
 //! The default no-op recorder works for tests. Production binaries wire
 //! `metrics-exporter-prometheus` through `kardamom_obs::init`.
 
+use kardamom_types::cluster_status::RecordLagStatus;
+
 pub const TX_RECEIVED_TOTAL: &str = "kardamom_ingress_tx_received_total";
 /// The installed shard map version. 0 is the identity map.
 pub const SHARD_MAP_VERSION: &str = "kardamom_ingress_shard_map_version";
@@ -37,6 +39,15 @@ pub const CLUSTER_SEALED_HEAD: &str = "kardamom_ingress_cluster_sealed_head";
 pub const CLUSTER_RETAINED_FRAMES: &str = "kardamom_ingress_cluster_retained_frames";
 /// The oldest boundary block the sealer still retains: its replay floor.
 pub const CLUSTER_FLOOR_BLOCK: &str = "kardamom_ingress_cluster_floor_block";
+/// The best recorded cursor of the executors, from the record-lag tail of
+/// the status frame. -1 while no executor sent a cursor, and for a frame
+/// with no tail.
+pub const CLUSTER_RECORDED_HEAD: &str = "kardamom_ingress_cluster_recorded_head";
+/// The canonical records past the best recorded cursor when the status
+/// frame arrived: the value that the record-lag guard compares with its
+/// budget. 0 while no executor sent a cursor: the guard then refuses
+/// nothing.
+pub const CLUSTER_RECORD_LAG: &str = "kardamom_ingress_cluster_record_lag";
 /// 0 while the proxy serves, 1 from the first moment of the shutdown
 /// drain. The readiness rule requires 0: a draining replica refuses new
 /// submits, so a health check must take it out of rotation at once. The
@@ -92,6 +103,50 @@ pub fn describe() {
         CLUSTER_FLOOR_BLOCK,
         "the oldest boundary block the sealer still retains"
     );
+    metrics::describe_gauge!(
+        CLUSTER_RECORDED_HEAD,
+        "the best recorded cursor of the executors, from the cluster's status frame; -1 before the first"
+    );
+    metrics::describe_gauge!(
+        CLUSTER_RECORD_LAG,
+        "canonical records past the best recorded cursor; the record-lag guard compares it with its budget"
+    );
+}
+
+/// The record-lag gauges of one status frame: the frame's record-lag
+/// tail, and the durable canonical count that the ingress observed when
+/// the frame arrived. The sealer sends a status frame in the order of its
+/// log, so that count is the sealer's canonical count at the frame.
+pub(crate) struct RecordLagGauges {
+    pub(crate) lag: RecordLagStatus,
+    pub(crate) durable_count: u64,
+}
+
+impl RecordLagGauges {
+    /// Export the best recorded cursor and the lag. A count that is not
+    /// yet past the cursor means that this session has not seen the
+    /// records up to the cursor: the lag gauge then keeps its value.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric values; a canonical index never nears 2^52"
+    )]
+    pub(crate) fn record(&self) {
+        let Some(best) = self.lag.best_recorded else {
+            metrics::gauge!(CLUSTER_RECORDED_HEAD).set(-1.0);
+            metrics::gauge!(CLUSTER_RECORD_LAG).set(0.0);
+            return;
+        };
+        metrics::gauge!(CLUSTER_RECORDED_HEAD).set(best as f64);
+        if let Some(lag) = self.lag() {
+            metrics::gauge!(CLUSTER_RECORD_LAG).set(lag as f64);
+        }
+    }
+
+    /// The records ordered past the best cursor: `count - (best + 1)`.
+    fn lag(&self) -> Option<u64> {
+        let best = self.lag.best_recorded?;
+        self.durable_count.checked_sub(best.checked_add(1)?)
+    }
 }
 
 /// Export one cluster status: the heads and the retention floors.
@@ -132,6 +187,8 @@ mod tests {
             CLUSTER_SEALED_HEAD,
             CLUSTER_RETAINED_FRAMES,
             CLUSTER_FLOOR_BLOCK,
+            CLUSTER_RECORDED_HEAD,
+            CLUSTER_RECORD_LAG,
             RECEIPT_DUPLICATE_TOTAL,
             TX_ERROR_DUPLICATE_TOTAL,
             CLUSTER_FRAME_DROPPED_TOTAL,

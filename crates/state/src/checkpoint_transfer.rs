@@ -33,7 +33,7 @@
 //! is always a full, consistent snapshot.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -46,6 +46,7 @@ use alloy_primitives::B256;
 
 use crate::checkpoint::{CheckpointInfo, checkpoint_data_file, checkpoint_name, latest_checkpoint};
 use crate::error::StateError;
+use crate::exec_peers::{Authority, ConnectError};
 
 /// The read/write timeout for each socket. Transfers stream in bounded
 /// chunks, so this caps per-syscall stalls, such as a dead peer. It does
@@ -389,20 +390,17 @@ impl<'a> CheckpointFetch<'a> {
     /// The host part may be a name, such as a Consul node record; every
     /// address it resolves to is tried in order.
     fn open(peer: &str) -> Result<TcpStream, StateError> {
-        let addrs = peer.to_socket_addrs().map_err(|e| {
-            StateError::Recovery(format!("bad checkpoint peer address {peer}: {e}"))
-        })?;
-        let mut refused = None;
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => refused = Some(e),
-            }
-        }
-        Err(refused.map_or_else(
-            || StateError::Recovery(format!("checkpoint peer {peer} resolves to no address")),
-            StateError::from,
-        ))
+        Authority(peer)
+            .connect(CONNECT_TIMEOUT)
+            .map_err(|e| match e {
+                ConnectError::Resolve { source, .. } => {
+                    StateError::Recovery(format!("bad checkpoint peer address {peer}: {source}"))
+                }
+                ConnectError::NoAddress { .. } => {
+                    StateError::Recovery(format!("checkpoint peer {peer} resolves to no address"))
+                }
+                ConnectError::Refused(e) => StateError::from(e),
+            })
     }
 
     /// Read and parse the response head.

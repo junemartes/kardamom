@@ -17,7 +17,13 @@ use crate::poll::{self, Budget};
 use crate::probes::{CLUSTER_TASK, Probed};
 
 /// The time the chain gets to run again after the audit, for all the
-/// steps together.
+/// steps together. The clock starts when the stage registers the jobs
+/// again. Measured over 20 full restarts under load on a host with two
+/// cores for the node containers: the chain ran again 33 s to 299 s
+/// after the register (median 48 s), and 20 s to 56 s after the first
+/// sealer start. The gap between the two is Nomad's placement under
+/// load, so the budget keeps the placement in. The first leader
+/// heartbeat line can come up to 30 ticks (60 s) after the election.
 const RECOVERY_BUDGET: Duration = Duration::from_mins(5);
 /// How often a step reads its signal.
 const POLL: Duration = Duration::from_secs(5);

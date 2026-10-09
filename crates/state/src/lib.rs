@@ -7,6 +7,8 @@ pub mod checkpoint_transfer;
 pub mod compaction;
 pub mod env;
 pub mod error;
+pub mod exec_answers;
+pub mod exec_peers;
 pub mod genesis;
 pub mod geometry;
 pub mod integrity;
@@ -29,6 +31,10 @@ pub use checkpoint_transfer::{CheckpointServer, fetch_best_checkpoint, serve_che
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::{NoRefsCause, StateError};
+pub use exec_answers::{
+    ExecAnswers, ExecAnswersFeed, ExecAnswersLookup, ExecLocator, ExecLocatorAnswer, Locators,
+};
+pub use exec_peers::{ExecPeer, ExecPeers, PeerError};
 pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, deep_compare_to, sweep};
 pub use nonce_query::{

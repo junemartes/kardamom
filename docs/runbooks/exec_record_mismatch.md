@@ -1,7 +1,10 @@
 # exec_record_mismatch
 
-This halt occurs only on a validator that reads the executor stream
-(`--tx-source exec-stream`).
+This halt occurs only on a validator or a batcher that reads the executor
+stream (`--tx-source exec-stream`, deploy switches
+`KARDAMOM_VALIDATOR_TX_SOURCE` and `KARDAMOM_BATCHER_TX_SOURCE`). The steps below
+name the validator. On the batcher, read its `/halt` on port 9002: it posts
+nothing past the entry.
 
 ## Cause
 
