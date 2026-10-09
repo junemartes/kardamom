@@ -65,7 +65,7 @@ There are fourteen shards. `just container-test` lists their names. Thirteen run
 | `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `follower-disagreement`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
 Case order matters in five places.
@@ -192,6 +192,7 @@ The executors are dark in every case, so the head the judgement reads is the hig
   - Each one resumes by itself when the lie stops. No operator step.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`follower-instance-loss`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0` for the fault window, during load. The da-watcher must not pause or wait, must publish past its start, and must publish one epoch for each block. The batcher must post, and no origin gap may remain.
+- [`follower-disagreement`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0`, then serves it a fork that is consistent in itself (`Fault::ForkedChain`, scoped to that node's address). The honest instance leads past the fork's first block; the thawed liar's records must halt the da-watcher on `l1_follower_disagreement`. The validator's own L1 read must verify epochs with no epoch fault. The case then runs the runbook: the fault ends, the liar's archive is wiped, the follower restarts, the da-watcher's halt is cleared. The da-watcher must publish again, and no origin gap may remain.
 - [`follower-total-loss`](failure-modes.md#l1-follower): stops the `l1-indexer` job for 75 s, past the da-watcher's silence window. The da-watcher must pause with the follower as its root. After the restart, it must resume with one epoch for each block since the start, and no origin gap may remain.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.

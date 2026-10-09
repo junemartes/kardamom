@@ -644,6 +644,16 @@ The failure philosophy is inverted here: **halting is the feature**. A divergenc
   - A divergence that replica results proved is not checked again. The resumed run opens new buffers, and the streams do not replay. The halted block, and every block published during the halt, commit unverified. The runbook says what to do before the clear.
 - Proof: the chain-semantics test `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta` on the real `tx_bal` channel. The executor is stopped with SIGSTOP, so nothing competes. The test asserts the halting log line and the halt record with the divergence cause.
 - The validator exits on SIGTERM. The graceful shutdown of the chain-semantics suite bounds it at 20 s.
+**The epoch check, an independent L1 read.** With `--l1-rpc-url` and `--lockbox`, the validator checks every epoch on the canonical stream against L1. It never reads the L1 follower's `l1_blocks` stream: a lie that passed the follower would pass the check too.
+
+- It checks one range of epochs at a time: the epochs that arrive together, about one finality step, at most 64.
+- The anchor, `--l1-rpc-url` (the light client), gives the hash of the range's last block. The range's last epoch must name it.
+- The logs source, `--l1-logs-rpc-url` (default: the anchor), gives the headers of the range in one batch and the lockbox logs in chunks of `--l1-max-log-range` blocks. It must not be the follower's first source.
+- Each header names the one before it as its parent; the first names the last verified epoch's block. Each epoch's hash is its header's, and each epoch derives from its block's logs through the producer's own rule.
+- A mismatch is an epoch fault: `validator_epoch_faults_total` and the `validator_divergence` halt. An L1 that does not answer through the retries leaves the range unverified (`validator_epochs_unverified_total`).
+- Every minute the validator reads the anchor's finalized tip, `validator_l1_finalized_block_number`. The follower-lag alert compares the newest `l1_blocks` record with it.
+- Proof: the unit tests of `epoch_verify_tests.rs` (a forked range that does not end at the anchor, an epoch that names another hash, a range that does not descend from the last epoch). The `chaos-l1` case `follower-disagreement` serves one follower instance a consistent fork: the da-watcher halts on `l1_follower_disagreement`, and the validator's own read verifies the true epochs with no fault.
+
 - The attester is on only when `--output-oracle` and `--attester-key` are both set. It then needs `--l1-rpc-url`.
   - `--l1-rpc-url` serves two features: the epoch check (with `--lockbox`) and the attester. `--l1-rpc-url` alone, or with `--lockbox`, leaves the attester off.
   - Only one of `--output-oracle` and `--attester-key`, or both without `--l1-rpc-url`, stops the start.
@@ -1085,6 +1095,7 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - The follower is the one reader of L1. With two sources, a lie of one is a disagreement: the follower halts (`l1_source_disagreement`), publishes none of it, and resumes by itself when the sources agree again. The da-watcher pauses on it.
 - With one source, the follower chains every header of a range, to its cursor, and halts on a break (`l1_chain_break`). A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores and publishes its hash. A light client anchor closes this case at the finalized tip; two sources close it everywhere.
 - A swallowed log is invisible to one source. Two sources see it.
+- After an operator clears `l1_follower_disagreement`, the archives still hold both instances' records. A history read keeps the chain that descends from the da-watcher's head, so the lie is never taken, and the old conflict does not halt it again.
 - Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 
 ## Notifier

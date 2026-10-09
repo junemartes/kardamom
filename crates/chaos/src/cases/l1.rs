@@ -12,6 +12,7 @@
 //! it.
 
 mod batcher;
+mod disagreement;
 mod follower_loss;
 mod followers;
 mod halt;
@@ -20,6 +21,7 @@ mod null_receipts;
 mod outage;
 mod two_day;
 
+pub(crate) use disagreement::follower_disagreement;
 pub(crate) use follower_loss::{
     instance_loss as follower_instance_loss, total_loss as follower_total_loss,
 };

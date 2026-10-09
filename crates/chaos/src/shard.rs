@@ -153,6 +153,7 @@ impl Shard {
                 "l1-null-receipts",
                 "follower-instance-loss",
                 "follower-total-loss",
+                "follower-disagreement",
                 "two-day-outage",
                 "batcher-outage-past-retention",
             ],

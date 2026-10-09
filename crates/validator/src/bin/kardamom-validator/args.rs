@@ -165,6 +165,15 @@ pub(crate) struct Args {
     /// 1-2, which need no L1) but cannot check an epoch's contents.
     #[arg(long, env = "KARDAMOM_LOCKBOX")]
     pub(crate) lockbox: Option<alloy_primitives::Address>,
+    /// The L1 endpoint of the epoch check's headers and lockbox logs: a
+    /// source that is not the L1 follower's first source. Without it,
+    /// the anchor (`--l1-rpc-url`, the light client) serves them too.
+    #[arg(long, env = "KARDAMOM_L1_LOGS_RPC_URL", hide_env_values = true, value_parser = parse_l1_rpc_url)]
+    pub(crate) l1_logs_rpc_url: Option<reqwest::Url>,
+    /// The most blocks one lockbox log query of the epoch check spans: the
+    /// provider's cap.
+    #[arg(long, default_value = "10")]
+    pub(crate) l1_max_log_range: std::num::NonZeroU64,
     /// Attester private key: raw hex, or `env:VAR` to read it from the
     /// environment, the deployer's key convention. Must be the oracle's
     /// permissioned `attester`. Resolved into a signer at parse time.
