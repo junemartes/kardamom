@@ -3,13 +3,26 @@
 # (the manifest, the formats, the revision), the version of every job
 # Nomad knows (the release that runs), and the rollback floor of the
 # gate. Each registration adds the job to `changed`; the acceptance
-# copies the attempt to `accepted`. README.md documents the schema.
-- name: Read the version of every job
+# copies the attempt to `accepted`; a rollback fills `rolled_back`.
+# README.md documents the schema.
+# The job list gives only stubs, without the version. Each job's own
+# record has it.
+- name: List the jobs of the namespace
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   register: workloads_record_jobs
+
+- name: Read the version of every job
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ item.ID }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  loop: "{{ workloads_record_jobs.json }}"
+  loop_control:
+    label: "{{ item.ID }}"
+  register: workloads_record_versions
 
 - name: Compose the attempt record
   ansible.builtin.set_fact:
@@ -27,11 +40,14 @@
         manifest: "{{ workloads_accepted.target.manifest | default({}) }}"
         formats: "{{ workloads_accepted.target.formats | default('') }}"
         jobs: >-
-          {{ workloads_record_jobs.json | map(attribute='ID')
-             | zip(workloads_record_jobs.json | map(attribute='Version') | map('community.general.dict_kv', 'before'))
+          {{ workloads_record_versions.results | map(attribute='json.ID')
+             | zip(workloads_record_versions.results | map(attribute='json.Version') | map('community.general.dict_kv', 'before'))
              | community.general.dict }}
       changed: []
+      rolled_back: []
       floor: "{{ workloads_floor }}"
+    # The registrations of this play record themselves; a rollback's do not.
+    workloads_recording: true
 
 - name: Write the attempt record
   ansible.builtin.import_tasks: record_write.yml
