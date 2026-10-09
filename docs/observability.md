@@ -344,7 +344,7 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_pending_blocks` | Closed blocks that wait for the group to fill or flush. |
 | `kardamom_batcher_l1_post_retries_total` | Retries of L1 posts. It flags a flaky L1. |
 | `kardamom_batcher_skipped_posted_blocks_total` | Blocks that were seen again and dropped because L1 covers them. A restart causes a few. Growth means the cursor file is not persisted. |
-| `kardamom_batcher_last_post_age_seconds` | Age of the last `BatchPosted` block as L1 serves it. The batcher reads it from L1 every 10 seconds, not from its memory. It grows when the batcher stops posting and when the L1 endpoint hides its posts. |
+| `kardamom_batcher_last_post_age_seconds` | Age of the newest L1 block that carried a `BatchPosted` event, as the L1 follower's `l1_blocks` stream shows it. At start, the follower's archive gives the last post. The value never comes from the batcher's memory. It grows when the batcher stops posting, when the follower's sources hide its posts, and while the follower is down. |
 | `kardamom_batcher_idle_flush_seconds` | The idle flush wait. The alert compares the post age with twice this value. |
 | `kardamom_batcher_resume_failures_total` | Starts whose L1 read failed. The start retries in the process, so the counter stays scrapeable. |
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |

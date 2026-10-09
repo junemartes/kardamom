@@ -1,6 +1,6 @@
 //! The followers' evidence: the L1 follower's (the indexer's) tick
-//! outcomes and progress gauges, the da-watcher's pause on it and its
-//! progress, the resume they prove, and the operator step a poisoned
+//! outcomes and progress gauges, the da-watcher's and the batcher's pause
+//! on it, the da-watcher's progress, the resume they prove, and the operator step a poisoned
 //! single-source follower needs. The halt judgment lives in `halt`.
 //!
 //! The L1 follower is the one reader of L1: a lie halts it, and the
@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::harness::Harness;
 use crate::l1::L1;
 use crate::poll::{self, Budget};
-use crate::probes::{DA_WATCHER_PORT, INDEXER_PORT};
+use crate::probes::{BATCHER_PORT, DA_WATCHER_PORT, INDEXER_PORT};
 
 /// The pause gauge; the da-watcher's pause on the follower carries
 /// `root_service="l1-indexer"`.
@@ -36,6 +36,7 @@ const ARCHIVE_BUDGET: Duration = Duration::from_secs(240);
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Followers {
     watcher_paused: Option<i64>,
+    batcher_paused: Option<i64>,
     watcher_origin: Option<i64>,
     indexer_errors: Option<i64>,
     indexer_block: Option<i64>,
@@ -49,6 +50,7 @@ impl Followers {
             watcher_paused: p
                 .aux_metric_where(DA_WATCHER_PORT, PAUSED, ON_FOLLOWER)
                 .await,
+            batcher_paused: p.aux_metric_where(BATCHER_PORT, PAUSED, ON_FOLLOWER).await,
             watcher_origin: p.aux_metric(DA_WATCHER_PORT, WATCHER_EPOCH_ORIGIN).await,
             indexer_errors: p
                 .aux_metric_where(INDEXER_PORT, INDEXER_TICKS, "outcome=\"error\"")
@@ -105,6 +107,7 @@ impl Followers {
     fn or(self, earlier: Self) -> Self {
         Self {
             watcher_paused: self.watcher_paused.or(earlier.watcher_paused),
+            batcher_paused: self.batcher_paused.or(earlier.batcher_paused),
             watcher_origin: self.watcher_origin.or(earlier.watcher_origin),
             indexer_errors: self.indexer_errors.or(earlier.indexer_errors),
             indexer_block: self.indexer_block.or(earlier.indexer_block),
@@ -112,10 +115,12 @@ impl Followers {
         }
     }
 
-    /// The L1 follower failed ticks since `base`, and the da-watcher is
-    /// paused with the follower as its root.
+    /// The L1 follower failed ticks since `base`, and the da-watcher and
+    /// the batcher are paused with the follower as their root.
     pub(super) fn halted_since(self, base: Self) -> bool {
-        self.watcher_paused == Some(1) && rose(self.indexer_errors, base.indexer_errors)
+        self.watcher_paused == Some(1)
+            && self.batcher_paused == Some(1)
+            && rose(self.indexer_errors, base.indexer_errors)
     }
 
     /// The da-watcher is paused with the follower as its root.
@@ -138,8 +143,9 @@ impl Followers {
     pub(super) fn show(self) -> String {
         let s = |v: Option<i64>| v.map_or("?".to_string(), |x| x.to_string());
         format!(
-            "watcher paused_on_follower={} epoch_origin={} indexer errors={} block={} last_batch={}",
+            "watcher paused_on_follower={} batcher paused_on_follower={} epoch_origin={} indexer errors={} block={} last_batch={}",
             s(self.watcher_paused),
+            s(self.batcher_paused),
             s(self.watcher_origin),
             s(self.indexer_errors),
             s(self.indexer_block),
@@ -217,6 +223,7 @@ mod tests {
     fn a_halt_needs_the_follower_s_errors_and_the_watcher_s_pause() {
         let base = Followers {
             watcher_paused: Some(0),
+            batcher_paused: Some(0),
             watcher_origin: Some(10),
             indexer_errors: Some(0),
             indexer_block: Some(20),
@@ -224,11 +231,12 @@ mod tests {
         };
         let one = Followers {
             watcher_paused: Some(1),
+            indexer_errors: Some(2),
             ..base
         };
-        assert!(!one.halted_since(base));
+        assert!(!one.halted_since(base), "the batcher must pause too");
         let both = Followers {
-            indexer_errors: Some(2),
+            batcher_paused: Some(1),
             ..one
         };
         assert!(both.halted_since(base));

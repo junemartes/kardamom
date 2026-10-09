@@ -60,8 +60,8 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
 | `--l1-retries` | — | `5` | Retries for each L1 post. When all fail, the batcher halts with `l1_unreachable`. |
 | `--cursor-file` | `KARDAMOM_BATCHER_CURSOR` | none | Durable cursor: the ordering position of the last confirmed post. Live mode needs it. |
 | `--spool-dir` | `KARDAMOM_BATCHER_SPOOL` | `spool` beside the cursor file | Directory of consumed blocks that are not yet posted. |
-| `--indexer-url` | `KARDAMOM_INDEXER_URL` | none | API of the inbox indexer. |
-| `--settlement-deploy-block` | `KARDAMOM_SETTLEMENT_DEPLOY_BLOCK` | `0` | L1 block of the settlement deploy. It bounds the `BatchPosted` scan. |
+| `--indexer-url` | `KARDAMOM_INDEXER_URL` | none | API of the L1 follower (the inbox indexer). |
+| `--l1-silence-secs` | — | `1152` | Seconds with no `l1_blocks` record before the batcher pauses with the follower as its root. |
 | `--block-refs-source` | `KARDAMOM_BLOCK_REFS_SOURCES` | none | Query endpoints of the executors and the validator. Repeat the flag, or separate the values with commas. |
 | `--blocks-per-batch` | — | `1` | A group posts when it holds this many blocks. |
 | `--flush-ms` | — | `2000` | A group with a transaction or a remote-epoch record posts when its oldest block waited this long. Must not be zero. |
@@ -77,7 +77,10 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
 - Each endpoint of `--l1-rpc` is a fallback for the others.
   - A request goes to the best endpoint first.
   - An error or an HTTP 429 moves the request to the next endpoint.
-  - The batcher does not compare the answers of the endpoints. The followers do (see below).
+  - The batcher does not compare the answers of the endpoints. The L1 follower does (see below).
+- The batcher uses `--l1-rpc` for its own writes only: the nonce, the fees, `eth_sendRawTransaction`,
+  the receipt of its own transaction, the contract read at start, and the read that checks whether a
+  failed send landed. It reads no `BatchPosted` log: it learns its posts from the `l1_blocks` stream.
 
 ### Posting cadence
 
@@ -97,7 +100,7 @@ The batcher checks the timers at every boundary and once each second.
 
 ### Start sources
 
-At start, the batcher reads the contract. It does not scan events and does not wait for the indexer.
+At start, the batcher reads the contract. It does not scan events.
 
 - It calls `lastBatchIndex`, and then `batches(index)` for `l2BlockEnd`.
 - A failed read counts in `kardamom_batcher_resume_failures_total`.
@@ -108,12 +111,10 @@ At start, the batcher reads the contract. It does not scan events and does not w
   - A cursor ahead of L1 stops the batcher. The L1 chain went back under a cursor that survived.
     The operator decides which side is real. Delete the cursor file to derive the state from this L1.
 - Without a cursor file and with posted batches, the batcher rebuilds the cursor from the last batch.
-  Each block in the payload carries its own cursor. The batcher reads the payload from these sources, in order:
-  1. The indexer, when `--indexer-url` is set and the indexer holds the batch.
-  2. The `BatchPosted` log, scanned from `--settlement-deploy-block`, and the EigenDA proxy.
-- An indexer that is behind answers at once. The batcher then goes on to the second source.
-- A public endpoint can refuse a scan from block 0. Set `--settlement-deploy-block` on a real L1.
-  The post-age probe also uses it as the floor of its scan.
+  Each block in the payload carries its own cursor. The batcher reads the payload from the L1 follower's archive
+  (`--indexer-url`).
+- The archive holds a batch once its block is finalized. Until then the start fails, counts a resume failure,
+  and retries. This case needs a lost cursor file and a batch posted in the last finality window.
 - A batch with a payload that has no block cursor gives a replay from genesis, with a warning.
 
 ### Posted cursor and halts

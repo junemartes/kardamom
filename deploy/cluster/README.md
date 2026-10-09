@@ -319,7 +319,6 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Settlement | `L1_OWNER`, `L1_OWNER_KEY` | the Anvil dev account 0 | The owner address and key that the deployer uses. |
 | Settlement | `BATCHER_EOA` | the Anvil dev account 2 | The batcher address that the deployer registers. |
 | Settlement | `L2_CHAIN_ID` | `chain_id` of `all.yml` (412346) | The L2 chain id. |
-| Settlement | `SETTLEMENT_DEPLOY_BLOCK` | empty (0) | The L1 block of the settlement deployment. A `BatchPosted` scan starts here. |
 | Real L1 | `L1_RPC` | empty | The L1 endpoint. Empty: the in-cluster anvil, found through the Nomad API. Set: the batcher uses it. |
 | Real L1 | `BATCHER_KEY` | the Anvil dev key | The L1 key of the batcher. The DA proxy signs with it. |
 | Real L1 | `LOCKBOX_ADDRESS` | empty | The lockbox contract. Empty: a placeholder address, and the deposit path is idle. The light client needs it. |
@@ -337,7 +336,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Monitoring | `ALERTMANAGER_CONFIG_FILE` | empty | A file with the Alertmanager routes and receivers of the environment. Set: the role writes it, with the inhibit rules of `deploy/alertmanager-inhibit.yml` added, to the item `alertmanager` of `nomad/jobs/monitoring`. The file must not hold `inhibit_rules`. Empty: the role leaves the variable as it is. |
 | Monitoring | `PROMETHEUS_RULES_FILE` | empty (`groups: []`) | The extra Prometheus rule file of the environment, the item `rules`. The role writes it only with `ALERTMANAGER_CONFIG_FILE`. Prometheus loads `deploy/alerts.yml` in all cases. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the indexer (the L1 follower) reads. A comma-separated list. With two or more entries, a block counts only when two agree. The da-watcher reads the follower's stream, not L1. |
-| da-watcher | `L1_SILENCE_S` | empty (`1152` in the binary) | Seconds with no `l1_blocks` record before the da-watcher pauses with the follower as its root. |
+| da-watcher, batcher | `L1_SILENCE_S` | empty (`1152` in the binaries) | Seconds with no `l1_blocks` record before the da-watcher and the batcher pause with the follower as their root. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
 | Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
 | Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |

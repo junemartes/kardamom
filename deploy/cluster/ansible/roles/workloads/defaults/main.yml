@@ -133,7 +133,6 @@ workloads_batcher_flush_ms: "{{ lookup('env', 'BATCHER_FLUSH_MS') }}"
 workloads_batcher_idle_flush_ms: "{{ lookup('env', 'BATCHER_IDLE_FLUSH_MS') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 # The settlement's deployment block on L1: where a BatchPosted scan starts.
-workloads_settlement_deploy_block: "{{ lookup('env', 'SETTLEMENT_DEPLOY_BLOCK') }}"
 workloads_deploy_binary: "{{ lookup('env', 'DEPLOY_BIN') | default(workloads_cluster_dir ~ '/../../target/release/kardamom-deploy', true) }}"
 workloads_l1_owner: "{{ lookup('env', 'L1_OWNER') | default('0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', true) }}"
 workloads_l1_owner_key: >-
@@ -214,9 +213,9 @@ workloads_indexer_max_log_range: "{{ lookup('env', 'L1_MAX_LOG_RANGE') }}"
 # Follower instances, each on its own node with the indexer role. Empty:
 # the job's default, two.
 workloads_indexer_count: "{{ lookup('env', 'L1_INDEXER_COUNT') }}"
-# How long l1_blocks may carry no record before the da-watcher pauses
+# How long l1_blocks may carry no record before the da-watcher and the batcher pause
 # with the follower as its root. Empty: three finality steps (1152 s).
-workloads_da_watcher_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
+workloads_l1_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3

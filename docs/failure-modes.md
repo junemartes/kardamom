@@ -106,7 +106,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
   - A cluster session that sees no boundary for 10 s calls the sealer halted on a lost quorum.
 - **Publishers.** The ingress, the sequencer, the executor, the validator, the batcher, the da-watcher, the l1-indexer and the state-mirror.
   - The validator also publishes the attester as `service="attester"`.
-- **Subscribers.** The ingress, the validator and the da-watcher. Other services do not subscribe.
+- **Subscribers.** The ingress, the validator, the da-watcher and the batcher. Other services do not subscribe.
 - **The sealer is not on the stream.** The ingress observes it from the status frame (see "DA-lag guard") and from silence. It publishes the sealer as `sealer/cluster`.
 - **The l1-indexer is on the stream** as `l1-indexer/l1-indexer-<n>`. Its halt is also on its own `/halt` route and on the `indexer_halt` JSON-RPC method.
 
@@ -119,7 +119,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |
 | da-watcher halted | The chain status shows `deposits_delayed`. |
-| Every l1-indexer instance halted, or `l1_blocks` silent | The da-watcher pauses with the follower as its root. |
+| Every l1-indexer instance halted, or `l1_blocks` silent | The da-watcher and the batcher pause with the follower as their root. The batcher keeps posting. |
 | l1-indexer halted | `kardamom-reconstruct` refuses to rebuild from that indexer. |
 
 - No executor raises a halt yet. The executor publishes only its lifecycle. The row "every executor halted" has a reaction in the ingress and a unit test, and it has no producer.
@@ -731,17 +731,18 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 
 **A lying or absent L1 endpoint.**
 
-- The batcher start reads the settlement contract with two `eth_call`s: `lastBatchIndex`, and the `l2BlockEnd` that the contract stores with that batch. There is no event scan. There is no wait on the inbox indexer.
-- An endpoint that swallows the `BatchPosted` logs cannot stall a start. An indexer that is behind the head cannot stall a start either.
-  - With no cursor file, the indexer serves only the payload of the last batch.
-  - The `BatchPosted` log plus the DA proxy serve the payload when the indexer has not reached the batch.
+- The batcher reads L1 for its own writes only: the start's contract read, the nonce, the fees, the send, its own receipt, and the read that checks whether a failed send landed. It reads no `BatchPosted` log.
+- The batcher start reads the settlement contract with two `eth_call`s: `lastBatchIndex`, and the `l2BlockEnd` that the contract stores with that batch. There is no event scan.
+- An endpoint that swallows the `BatchPosted` logs cannot stall a start with a cursor file.
+  - With no cursor file, the L1 follower's archive serves the payload of the last batch. It holds the batch once the batch's block is finalized; until then the start retries, and counts each failure.
 - An L1 that does not answer at start is retried in the same process with a bounded backoff.
   - The batcher holds the `l1_unreachable` halt until the start succeeds.
   - The exporter stays up.
   - `kardamom_batcher_resume_failures_total` counts every failure.
   - The alert `KardamomBatcherResumeFailures` pages on the first failure.
-- One signal of a lying endpoint cannot hide: the age of the last post as L1 serves it.
-  - `kardamom_batcher_last_post_age_seconds` is read from L1 on every probe tick. It is never read from the memory of the batcher.
+- One signal of a lying endpoint cannot hide: the age of the last post as L1 shows it.
+  - `kardamom_batcher_last_post_age_seconds` comes from the `batches` of the L1 follower's `l1_blocks` records, and at start from the follower's archive. It is never read from the memory of the batcher.
+  - Every follower instance halted, or a silent stream, pauses the batcher with the follower as its root. The batcher keeps posting; only its view of its posts waits.
   - `KardamomBatcherLastPostStale` pages when the age passes twice the idle flush wait.
 - Proof: the `chaos-l1` shard.
   - `l1-liar`: a wrong block hash, a broken parent chain, swallowed settlement logs.

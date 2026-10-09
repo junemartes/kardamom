@@ -36,18 +36,11 @@ use super::cursor::{BatchCursor, L1Truth, reconcile};
 use super::events::EventsBeacon;
 use super::feed::{FeedConfig, FeedLoop};
 use super::live_metric_names;
-use super::post_age::PostAge;
 use super::posted_cursor::PostedCursor;
 use super::rebuild::{ArchiveRebuilder, Rebuilder};
 use super::refs_store::RefsStore;
 use super::sender::{LiveSender, PostExhausted};
 use super::spool::{Restored, Spool};
-
-/// How often the post-age probe asks L1 for the last `BatchPosted` log.
-/// Its own cadence, apart from the feed loop's tick: one log query and
-/// one block read per probe, which a public endpoint tolerates at this
-/// rate and not at the feed's one-second tick.
-const POST_AGE_EVERY: Duration = Duration::from_secs(10);
 
 /// How long an `l1_unreachable` halt waits before the batcher starts
 /// again: long enough for a rate limit to lift, short enough that a post
@@ -153,14 +146,13 @@ pub struct LiveArgs {
     /// See [`FeedConfig::target_payload_bytes`].
     pub target_payload_bytes: NonZeroUsize,
     pub l1_retries: u32,
-    /// The inbox indexer's API. A batcher without a cursor file reads the
-    /// last posted batch's blobs from it, when it holds them; a start
-    /// never waits on it.
+    /// The L1 follower's API. A batcher without a cursor file reads the
+    /// last posted batch's payload from its archive, and the post age
+    /// starts from the last post it holds.
     pub indexer_url: Option<String>,
-    /// The settlement contract's deployment block: where a `BatchPosted`
-    /// scan starts, for the post-age probe and for a start without a
-    /// cursor file that the indexer cannot serve.
-    pub settlement_deploy_block: u64,
+    /// How long `l1_blocks` may carry no record before the batcher pauses
+    /// with the follower as its root.
+    pub l1_silence: Duration,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
     /// references of the gap up to its floor are read from here, and the
@@ -209,7 +201,7 @@ impl LiveArgs {
         let provider = connect_l1(&self.rpcs, &self.key).map_err(StartError::L1)?;
         let da = DaProxy::new(&self.da_proxy).map_err(|e| StartError::Resume(e.into()))?;
         let loaded = BatchCursor::load(&self.cursor_file).map_err(StartError::Resume)?;
-        let resumed = self.resume_until_l1_answers(&provider, &da, loaded).await;
+        let resumed = self.resume_until_l1_answers(&provider, loaded).await;
         let l1_truth = resumed.l1_truth;
         let (cursor, skip_through_block) = match resumed.rebuilt {
             Some(rebuilt) => rebuilt,
@@ -594,15 +586,6 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
 
     gauge!(live_metric_names::IDLE_FLUSH_SECONDS)
         .set(Duration::from_millis(args.idle_flush_ms.get()).as_secs_f64());
-    let age_probe = tokio::spawn(
-        PostAge::new(
-            l1.provider.clone(),
-            args.settlement,
-            args.settlement_deploy_block,
-            POST_AGE_EVERY,
-        )
-        .run(),
-    );
     let sender = LiveSender::new(
         l1.provider,
         args.settlement,
@@ -638,7 +621,6 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
         }
         served => served.into_end(),
     };
-    age_probe.abort();
     service.run_cfg.plane.shutdown().await;
     if matches!(end, RunEnd::Shutdown) {
         // The cursor is reconciled against L1 truth on every restart, so
