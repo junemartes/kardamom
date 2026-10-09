@@ -1,7 +1,8 @@
 //! The block references as a resume source: the executors and the
 //! validator keep, with every receipt, where the transaction's bytes are
 //! on a `tx_data` archive, and serve a block's list of them as
-//! `kardamom_getBlockRefs(number)`.
+//! `kardamom_getBlockRefs(number)`. An executor can also name where its
+//! own archive holds the block's records (`exec_locator`).
 //!
 //! The sealer retains a bounded window of the canonical stream. A
 //! batcher that was down for longer asks for a replay the sealer refuses
@@ -17,6 +18,7 @@ use std::ops::ControlFlow;
 
 use alloy_primitives::B256;
 use anyhow::{Context, Result, bail};
+use kardamom_engine::reader::ArchiveLocator;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -33,6 +35,12 @@ pub(crate) struct BlockRefs {
     pub(crate) l1_origin: u64,
     pub(crate) l2_timestamp: u64,
     pub(crate) refs: Vec<BlockTxRef>,
+    /// Where the archive of the answering executor holds the records of
+    /// the block: a position at or before the first one. A validator
+    /// answers without it. The rebuild from the executor archives replays
+    /// from it first, and asks the executors for a record it still lacks.
+    #[serde(default)]
+    pub(crate) exec_locator: Option<ArchiveLocator>,
 }
 
 /// One transaction of a block: its hash, its canonical position, and

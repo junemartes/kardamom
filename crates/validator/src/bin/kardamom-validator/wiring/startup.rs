@@ -268,20 +268,24 @@ impl Opened {
         // observation point, so `open_inbound` suppresses it here.
         let (inbound, cluster_guard) =
             bin_support::open_inbound::<super::run::ValidatorWiring>(bin_support::InboundConfig {
-                rt: &self.base.rt,
-                plane: &mut self.base.plane,
-                aeron_cfg: &self.base.aeron_cfg,
-                aeron_dir: args.aeron_dir.as_deref(),
-                archive_control_response_endpoint: args
-                    .archive_control_response_endpoint
-                    .as_deref(),
-                replay_destination_endpoint: args.replay_destination_endpoint.as_deref(),
+                source: bin_support::TxSourceConfig {
+                    rt: &self.base.rt,
+                    archives: bin_support::ArchiveAccess {
+                        plane: &mut self.base.plane,
+                        aeron_cfg: &self.base.aeron_cfg,
+                        aeron_dir: args.aeron_dir.as_deref(),
+                        archive_control_response_endpoint: args
+                            .archive_control_response_endpoint
+                            .as_deref(),
+                        replay_destination_endpoint: args.replay_destination_endpoint.as_deref(),
+                    },
+                    tx_source: args.tx_source,
+                    executor_query_endpoints: &args.executor_query_endpoints,
+                    bin_name: "kardamom-validator",
+                },
                 cluster_cfg,
                 cursor: bin_support::cluster_replay_cursor(&self.state.start),
-                bin_name: "kardamom-validator",
                 suppress_sealer_metrics: true,
-                tx_source: args.tx_source,
-                executor_query_endpoints: &args.executor_query_endpoints,
             })?;
 
         // --- Verification streams: tx_bal (BAL) and tx_receipts. ---

@@ -3,7 +3,6 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use alloy_network::EthereumWallet;
@@ -16,19 +15,10 @@ use alloy_transport_http::Http;
 use anyhow::{Context, Result, bail};
 use kardamom_obs::halt::{self, Clears, Halt, HaltCause};
 use metrics::gauge;
-use tokio::sync::mpsc::Receiver;
 use tower::Layer;
 use tracing::{info, warn};
 
-use kardamom_engine::ExecutorError;
-use kardamom_engine::bin_support;
-use kardamom_engine::reader::{
-    JoinRecoveryFactory, NoExecStream, ReaderConfig, ReaderToExec, SourceStart, TxDataSource,
-    TxOrderingInputs, TxOrderingReader, TxSource,
-};
-use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::config::{AeronConfig, LogConfig};
-use kardamom_log::discovery::StreamPlane;
+use kardamom_engine::bin_support::{self, TxSourceArg};
 
 use crate::da::DaProxy;
 
@@ -37,11 +27,11 @@ use super::events::EventsBeacon;
 use super::feed::{FeedConfig, FeedLoop};
 use super::live_metric_names;
 use super::post_age::PostAge;
-use super::posted_cursor::PostedCursor;
-use super::rebuild::{ArchiveRebuilder, Rebuilder};
+use super::rebuild::Rebuilder;
 use super::refs_store::RefsStore;
-use super::sender::{LiveSender, PostExhausted};
+use super::sender::LiveSender;
 use super::spool::{Restored, Spool};
+use super::stack::{ReaderEnd, ReaderStack, RunConfig};
 
 /// How often the post-age probe asks L1 for the last `BatchPosted` log.
 /// Its own cadence, apart from the feed loop's tick: one log query and
@@ -137,8 +127,18 @@ pub struct LiveArgs {
     pub chain_id: u64,
     pub cluster_egress_endpoint: Option<String>,
     /// This batcher's voter id at the sealer; see
-    /// [`ReaderConfig::voter_id`]. `None` never votes.
+    /// [`ReaderConfig::voter_id`]. `None` never votes. The executor
+    /// stream source never reads it.
+    ///
+    /// [`ReaderConfig::voter_id`]: kardamom_engine::reader::ReaderConfig::voter_id
     pub void_voter_id: Option<u8>,
+    /// Where the batcher reads the transaction bytes: the `tx_data`
+    /// lanes, or the executor stream.
+    pub tx_source: TxSourceArg,
+    /// The executor query endpoints (`http://host:port`) of the locator
+    /// query, in the order the executor stream source asks them. Unused
+    /// on the `tx_data` source.
+    pub executor_query_endpoints: Vec<String>,
     pub replay_destination_endpoint: Option<String>,
     pub archive_control_response_endpoint: Option<String>,
     pub blocks_per_batch: NonZeroUsize,
@@ -164,8 +164,8 @@ pub struct LiveArgs {
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
     /// references of the gap up to its floor are read from here, and the
-    /// bytes from the `tx_data` archives. Empty: a refused replay raises the
-    /// `replay_unavailable` halt.
+    /// bytes from the archives of the transaction source. Empty: a refused
+    /// replay raises the `replay_unavailable` halt.
     pub block_refs_sources: Vec<String>,
 }
 
@@ -235,229 +235,6 @@ impl LiveArgs {
     }
 }
 
-/// The batcher's `[cluster]` config, and the log's channel/Aeron config,
-/// resolved from `--config` and the CLI overrides.
-struct RunConfig {
-    file_cfg: BatcherFileConfig,
-    aeron_cfg: AeronConfig,
-    /// The plane the `tx_data` lanes open through.
-    plane: StreamPlane,
-}
-
-impl RunConfig {
-    /// Resolve the batcher's `[cluster]` config and the log's
-    /// channel/Aeron config, applying the `--cluster-egress-endpoint` and
-    /// `--aeron-dir` overrides.
-    fn resolve(args: &LiveArgs) -> Result<Self> {
-        let raw = std::fs::read_to_string(&args.config).context("read batcher config")?;
-        let mut file_cfg: BatcherFileConfig =
-            toml::from_str(&raw).context("parse batcher config")?;
-        file_cfg
-            .cluster
-            .set_egress_endpoint(args.cluster_egress_endpoint.as_deref());
-        let log_cfg =
-            LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
-        let plane =
-            StreamPlane::from_config(&log_cfg, "batcher").context("build the stream plane")?;
-        let mut aeron_cfg = log_cfg.aeron;
-        if let Some(dir) = args.aeron_dir.as_ref() {
-            aeron_cfg.aeron_dir.clone_from(dir);
-        }
-        Ok(Self {
-            file_cfg,
-            aeron_cfg,
-            plane,
-        })
-    }
-
-    /// Open the `tx_data` and cluster `tx_ordering` subscriptions, and
-    /// spawn their reader threads.
-    /// Replace the static `[cluster]` ingress endpoints with the members
-    /// the catalog lists, when discovery is on and lists any.
-    async fn resolve_cluster_ingress(&mut self) -> Result<()> {
-        if let Some(endpoints) = self.plane.cluster_ingress_endpoints().await? {
-            self.file_cfg.cluster.ingress_endpoints = endpoints;
-        }
-        Ok(())
-    }
-
-    /// The join-miss refetch factory: the `tx_data` archives, reached
-    /// from this node's refetch endpoints. `None` when the deployment
-    /// configures no archive or no local endpoint.
-    fn join_recovery(&mut self, args: &LiveArgs) -> Option<JoinRecoveryFactory> {
-        bin_support::archive_join_recovery(
-            &mut self.plane,
-            &self.aeron_cfg,
-            args.aeron_dir.as_deref(),
-            args.archive_control_response_endpoint.as_deref(),
-            args.replay_destination_endpoint.as_deref(),
-        )
-    }
-
-    fn spawn_reader_stack(
-        &mut self,
-        args: &LiveArgs,
-        cursor: BatchCursor,
-    ) -> Result<ReaderStack<impl Send + use<>>> {
-        let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-        let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut self.plane)?;
-        let join_recovery = self.join_recovery(args);
-
-        // A dedicated cluster runtime, exactly as in the executor and
-        // validator. The cluster session must never contend with the
-        // tx_data work on `rt`.
-        let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
-            args.aeron_dir.as_deref(),
-            self.file_cfg.cluster.to_live(),
-            kardamom_engine::reader::cluster::ReplayCursor::new(
-                cursor.next_index,
-                cursor.next_block,
-            ),
-        )?;
-        // The kardamom_sealer_* re-export is the executor's job.
-        let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
-        let posted_cursor = PostedCursor::new(tx_ordering_sub.posted_cursor_publisher());
-        info!("kardamom-batcher: tx_ordering via Aeron Cluster");
-
-        let SourceStart {
-            feeds: join_handles,
-            seed,
-        } = TxDataSource::new(tx_data_subs, join_recovery).start();
-        // There is no tx_deposits reader. Deposits ride inside the epoch
-        // record on the canonical stream, so there is nothing to join
-        // against. The channel is bounded. The reader thread calls
-        // `blocking_send`. The feed task calls `recv`.
-        let (feed_tx, feed_rx) = tokio::sync::mpsc::channel(1 << 14);
-        // The default 100 ms join timeout assumes IPC locality. On the
-        // cluster's UDP multicast, a transient frame drop needs the
-        // archive refetch to repair it, and refetch only engages after
-        // `join_refetch_after` (10 s). Use the same bounded budget here as
-        // the executor and validator, or the batcher dies before refetch
-        // can fire.
-        let reader_cfg = ReaderConfig {
-            join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
-            voter_id: args.void_voter_id,
-            ..ReaderConfig::default()
-        };
-        let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
-            sub: tx_ordering_sub,
-            cfg: reader_cfg,
-            exec_out: feed_tx,
-            exec_stream: NoExecStream,
-            join: seed,
-        });
-
-        Ok(ReaderStack {
-            handles: ReaderHandles {
-                rt,
-                cluster_guard,
-                join_handles,
-                ordering_handle,
-            },
-            feed_rx,
-            posted_cursor,
-        })
-    }
-}
-
-/// The engine reader stack: the `tx_data` join-buffer readers, the cluster
-/// ordering subscription, the channel the feed loop reads from, and the
-/// posted-cursor publisher over the same cluster session.
-struct ReaderStack<G> {
-    handles: ReaderHandles<G>,
-    feed_rx: Receiver<ReaderToExec>,
-    posted_cursor: PostedCursor,
-}
-
-/// The reader-thread handles, kept for post-failure diagnosis. The cluster
-/// guard (`G`, kept opaque so this module names no direct dependency on
-/// `kardamom-cluster-adapter`) must outlive the feed loop.
-struct ReaderHandles<G> {
-    // The `tx_data` runtime. Its Aeron thread owns the eight lane
-    // subscriptions, and ends when the last `AeronRuntime` clone drops:
-    // the discovery reconciler holds a command-only handle, which keeps
-    // nothing alive. Without this field the runtime ends when the setup
-    // function returns, every lane closes, and the batcher joins every
-    // TxRef through the archive refetch alone, which fails when an
-    // ingress archive is lost. Declared first so the lanes close before
-    // the cluster session does, the order `LiveStreams` uses. Never read.
-    #[allow(
-        dead_code,
-        reason = "held only for its Drop impl, which ends the Aeron thread"
-    )]
-    rt: AeronRuntime,
-    // Held only for its Drop impl (closes the Aeron cluster session when
-    // the handles are dropped after a feed failure); its value is never
-    // read.
-    #[allow(
-        dead_code,
-        reason = "held only for its Drop impl, which closes the Aeron cluster session"
-    )]
-    cluster_guard: G,
-    join_handles: Vec<JoinHandle<Result<(), ExecutorError>>>,
-    ordering_handle: JoinHandle<Result<(), ExecutorError>>,
-}
-
-/// Why a reader stack ended, as [`ReaderHandles::end`] classifies it.
-enum ReaderEnd {
-    /// The sealer refused the replay: the cursor is below its retention
-    /// floor, and `oldest_block` is the oldest block it still holds.
-    ReplayRefused { oldest_block: u64 },
-    /// A post failed on every attempt: the `l1_unreachable` halt.
-    Halted(Halt),
-    /// Every other failure, with the reader thread's error for context.
-    Failed(anyhow::Error),
-}
-
-impl<G> ReaderHandles<G> {
-    /// The feed loop returns only on failure (channel closed, or a post
-    /// that stopped it). Classify the end from the reader threads'
-    /// errors: the channel-closed case's root cause lives there. A post
-    /// that failed on every attempt is a halt, not an end. The handles
-    /// drop here, so the cluster session and the runtime close before a
-    /// new stack opens.
-    fn end(self, feed_err: anyhow::Error) -> ReaderEnd {
-        warn!(error = %format!("{feed_err:#}"), "feed loop exited");
-        if self.ordering_handle.is_finished()
-            && let Ok(Err(re)) = self.ordering_handle.join()
-        {
-            if let ExecutorError::ClusterReplayUnavailable { oldest_block, .. } = re {
-                return ReaderEnd::ReplayRefused { oldest_block };
-            }
-            return ReaderEnd::Failed(anyhow::anyhow!(
-                "tx_ordering reader failed: {re:#} (feed loop: {feed_err:#})"
-            ));
-        }
-        if feed_err
-            .chain()
-            .any(|c| c.downcast_ref::<PostExhausted>().is_some())
-        {
-            return ReaderEnd::Halted(Halt::new(HaltCause::L1Unreachable, format!("{feed_err:#}")));
-        }
-        ReaderEnd::Failed(
-            self.join_handles
-                .into_iter()
-                .find_map(|h| Self::stream_reader_failure(h, &feed_err))
-                .unwrap_or(feed_err),
-        )
-    }
-
-    /// `h`'s error, if it already finished and failed.
-    fn stream_reader_failure(
-        h: JoinHandle<Result<(), ExecutorError>>,
-        feed_err: &anyhow::Error,
-    ) -> Option<anyhow::Error> {
-        if h.is_finished()
-            && let Ok(Err(re)) = h.join()
-        {
-            return Some(anyhow::anyhow!(
-                "stream reader failed: {re:#} (feed loop: {feed_err:#})"
-            ));
-        }
-        None
-    }
-}
-
 /// Live service mode: the batcher as a third cluster-egress consumer.
 /// Front-end wiring mirrors the validator: M `tx_data` subscriptions and
 /// `tx_deposits` feed the join buffers, archive refetch runs on a join miss,
@@ -513,7 +290,8 @@ fn continue_from_spool(
 ///
 /// The resume sources, in order: the spool, the sealer's replay from the
 /// cursor, and a rebuild from the state databases' references and the
-/// `tx_data` archives for a gap the sealer no longer retains. A refused
+/// archives of the transaction source for a gap the sealer no longer
+/// retains. A refused
 /// replay is answered once: the rebuild fills the gap up to the sealer's
 /// floor, and the stack starts again at the floor.
 ///
@@ -788,28 +566,17 @@ impl Service<'_> {
         }
     }
 
-    /// The rebuild of [`Self::recover_and_serve`]: the archive client,
-    /// then [`recover_from_refs`].
+    /// The rebuild of [`Self::recover_and_serve`]: the archive client of
+    /// the transaction source, then [`recover_from_refs`].
     async fn rebuild<P: Provider>(
         &mut self,
         feed: &mut FeedLoop<P>,
         resume: BatchCursor,
         oldest_block: u64,
     ) -> Result<BatchCursor> {
-        let factory = self.run_cfg.join_recovery(self.args).context(
-            "the sealer refused the replay, and the rebuild from references needs the \
-             tx_data archives: --replay-destination-endpoint, \
-             --archive-control-response-endpoint and the archive endpoints of channels.toml",
-        )?;
+        let rebuilder = self.run_cfg.rebuilder(self.args)?;
         let store = RefsStore::new(self.args.block_refs_sources.clone());
-        recover_from_refs(
-            &store,
-            ArchiveRebuilder { factory },
-            feed,
-            resume,
-            oldest_block,
-        )
-        .await
+        recover_from_refs(&store, rebuilder, feed, resume, oldest_block).await
     }
 }
 

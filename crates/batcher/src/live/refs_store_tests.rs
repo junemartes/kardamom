@@ -166,3 +166,30 @@ async fn a_down_endpoint_is_skipped_and_a_floor_behind_the_cursor_is_refused() {
     let err = none.blocks(cursor(11, 11), 11).await.unwrap_err();
     assert!(err.to_string().contains("holds block 11"), "{err:#}");
 }
+
+/// An executor's answer can carry the `exec_locator` of the block; the
+/// validator's answer has none, and the block still reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_exec_locator_of_a_block_is_read_when_present() {
+    let mut located = block_json(12, 13, 1);
+    located["exec_locator"] = serde_json::json!({
+        "archive_id": "executor-1",
+        "session_id": 5,
+        "position": 4096,
+    });
+    let rows = [(11, block_json(11, 12, 0)), (12, located)]
+        .into_iter()
+        .collect();
+    let store = FakeStore::serve(rows).await;
+    let client = RefsStore::new(vec![store.url()]);
+    let blocks = client.blocks(cursor(12, 11), 12).await.unwrap();
+    assert_eq!(blocks[0].exec_locator, None);
+    assert_eq!(
+        blocks[1].exec_locator,
+        Some(ArchiveLocator {
+            archive_id: "executor-1".to_owned(),
+            session_id: 5,
+            position: 4096,
+        })
+    );
+}

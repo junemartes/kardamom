@@ -107,6 +107,9 @@ workloads_da_job: "{{ 'da-proxy' if workloads_eigenda_network | length > 0 else 
 workloads_batcher_blocks_per_batch: "{{ lookup('env', 'BATCHER_BLOCKS_PER_BATCH') }}"
 workloads_batcher_flush_ms: "{{ lookup('env', 'BATCHER_FLUSH_MS') }}"
 workloads_batcher_idle_flush_ms: "{{ lookup('env', 'BATCHER_IDLE_FLUSH_MS') }}"
+# The batcher's transaction source: "tx-data" or "exec-stream". Empty
+# keeps the job default, "tx-data".
+workloads_batcher_tx_source: "{{ lookup('env', 'KARDAMOM_BATCHER_TX_SOURCE') }}"
 workloads_lockbox_address: "{{ lookup('env', 'LOCKBOX_ADDRESS') }}"
 # The settlement's deployment block on L1: where a BatchPosted scan starts.
 workloads_settlement_deploy_block: "{{ lookup('env', 'SETTLEMENT_DEPLOY_BLOCK') }}"

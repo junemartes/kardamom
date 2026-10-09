@@ -24,6 +24,77 @@ pub(super) const REBUILDING_LINE: &str = "sealer replay refused; rebuilding the 
 /// The line of a rebuilt gap: the reader resumes at the sealers' floor.
 pub(super) const REBUILT_LINE: &str = "gap rebuilt; resuming at the sealer's floor";
 
+/// The line of a batcher start on the executor stream.
+const EXEC_SOURCE_LINE: &str = "kardamom-batcher: transaction source exec-stream";
+/// The line of a rebuild that reads the executor archives, with the count
+/// of wanted records (`wanted=`).
+const EXEC_REBUILD_LINE: &str = "rebuild: reading the executor archives";
+/// The line of one replay of an executor archive during a rebuild.
+const EXEC_REPLAY_LINE: &str = "rebuild: executor archive replay";
+
+/// The executor stream evidence of the batcher, when the deploy runs it on
+/// that source: the replay lines before a rebuild.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExecSource {
+    replays: usize,
+}
+
+impl ExecSource {
+    /// `None` when the deploy runs the batcher on `tx_data`. Else fail
+    /// unless the batcher logged a start on the executor stream, and keep
+    /// the count of replay lines.
+    pub(super) async fn read(h: &Harness, ctx: &str) -> anyhow::Result<Option<Self>> {
+        if !h.knobs.batcher_exec_stream {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            count(h, EXEC_SOURCE_LINE).await? > 0,
+            "{}: {ctx}: the deploy runs the batcher on the executor stream, but it never logged '{EXEC_SOURCE_LINE}'",
+            crate::FAIL_PREFIX
+        );
+        crate::log(format!("{ctx}: the batcher reads the executor stream"));
+        Ok(Some(Self {
+            replays: count(h, EXEC_REPLAY_LINE).await?,
+        }))
+    }
+
+    /// Fail unless the rebuild read the executor archives: a replay line
+    /// past the baseline, or a rebuild that wanted no record.
+    pub(super) async fn require_rebuild_read(&self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
+        let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
+        let replays = logs
+            .lines()
+            .filter(|l| l.contains(EXEC_REPLAY_LINE))
+            .count();
+        let wanted = field_in_last(&logs, EXEC_REBUILD_LINE, "wanted");
+        self.judge(replays, wanted, ctx)
+    }
+
+    /// The verdict of [`Self::require_rebuild_read`] on the counts read.
+    fn judge(self, replays: usize, wanted: Option<u64>, ctx: &str) -> anyhow::Result<()> {
+        // Saturating: a log that the job rotated holds fewer lines, which
+        // counts as no new line.
+        let new = replays.saturating_sub(self.replays);
+        match (new, wanted) {
+            (0, Some(0)) => {
+                crate::log(format!(
+                    "{ctx}: the rebuilt gap held no transaction; no executor archive replay was due"
+                ));
+                Ok(())
+            }
+            (0, _) => Err(crate::chaos_fail!(
+                "{ctx}: the batcher runs on the executor stream, but its rebuild logged no '{EXEC_REPLAY_LINE}' (wanted records: {wanted:?}) — it did not read the executor archives"
+            )),
+            (new, _) => {
+                crate::log(format!(
+                    "{ctx}: the rebuild read the executor archives ({new} replays)"
+                ));
+                Ok(())
+            }
+        }
+    }
+}
+
 /// The post counter moves past `base` within `budget`; the new value.
 pub(super) async fn await_posting(
     h: &Harness,
@@ -222,5 +293,20 @@ mod tests {
             field_in_last(colored, START_LINE, "covered_through_block"),
             Some(7)
         );
+    }
+
+    #[test]
+    fn a_rebuild_on_the_executor_stream_must_replay_an_executor_archive() {
+        let ctx = "batcher-outage-past-retention";
+        let before = ExecSource { replays: 2 };
+        before.judge(3, Some(40), ctx).unwrap();
+        before.judge(2, Some(0), ctx).unwrap();
+        let err = before.judge(2, Some(40), ctx).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("did not read the executor archives"),
+            "{err}"
+        );
+        assert!(before.judge(2, None, ctx).is_err());
     }
 }

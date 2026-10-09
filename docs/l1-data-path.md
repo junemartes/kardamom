@@ -46,12 +46,14 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
 | `--live` | — | off | Run the live service. Without it, the binary runs the offline archive scan. |
 | `--dry-run` | — | `true` | Skip the L1 broadcast. Live mode needs `--dry-run=false`. |
 | `--config` | `KARDAMOM_BATCHER_CONFIG` | none | TOML file with the `[cluster]` section. Live mode needs it. |
-| `--log-config` | `KARDAMOM_LOG_CONFIG` | none | Channel layout of `tx_data` and `tx_deposits`. |
+| `--log-config` | `KARDAMOM_LOG_CONFIG` | none | Channel layout of `tx_data`, `tx_deposits` and `exec_txs`. |
 | `--aeron-dir` | `KARDAMOM_AERON_DIR` | none | Directory of the Aeron media driver. |
 | `--cluster-egress-endpoint` | `KARDAMOM_CLUSTER_EGRESS_ENDPOINT` | none | `ip:port` of this node for the cluster egress. It overrides `egress_channel` of the config. |
-| `--replay-destination-endpoint` | `KARDAMOM_REPLAY_DESTINATION` | none | UDP endpoint for refetched `tx_data` and `tx_deposits`. Without it, refetch is off. |
+| `--replay-destination-endpoint` | `KARDAMOM_REPLAY_DESTINATION` | none | UDP endpoint for refetched `tx_data` and `tx_deposits`, or for a replay of an executor archive. Without it, refetch is off. |
 | `--archive-control-response-endpoint` | `KARDAMOM_ARCHIVE_CONTROL_RESPONSE` | none | UDP endpoint for the archive-control responses. Required with the replay destination. |
-| `--void-voter-id` | `KARDAMOM_VOID_VOTER_ID` | none | Voter id at the sealer. Without an id, the batcher stops at an entry that no archive serves. |
+| `--void-voter-id` | `KARDAMOM_VOID_VOTER_ID` | none | Voter id at the sealer. Without an id, the batcher stops at an entry that no archive serves. The `exec-stream` source does not read it. |
+| `--tx-source` | `KARDAMOM_TX_SOURCE` | `tx-data` | Where the batcher reads the transaction bytes: `tx-data` (the `tx_data` lanes) or `exec-stream` (the executor stream). See [Transaction source](#transaction-source). |
+| `--executor-query-endpoints` | `KARDAMOM_EXECUTOR_QUERY_ENDPOINTS` | none | Query endpoints of the executors (`http://host:port`, comma-separated). The `exec-stream` source asks them for a locator (`kardamom_getExecLocator`) on a miss and in a rebuild. Without them, the archive refetch of that source is off. |
 | `--chain-id` | `KARDAMOM_CHAIN_ID` | `1` | L2 chain id. The records commitment contains it. |
 | `--l1-rpc` | `KARDAMOM_L1_RPC` | none | L1 endpoints. Repeat the flag, or separate the values with commas. |
 | `--l1-key` | `KARDAMOM_L1_KEY` | none | Hex key of the batcher account. It must equal `l1Batcher` of the settlement. |
@@ -78,6 +80,29 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
   - A request goes to the best endpoint first.
   - An error or an HTTP 429 moves the request to the next endpoint.
   - The batcher does not compare the answers of the endpoints. The followers do (see below).
+
+### Transaction source
+
+`--tx-source` picks where the batcher reads the bytes of each transaction. The default is `tx-data` in this release.
+
+- `tx-data`: the batcher joins the eight `tx_data` lanes, as an executor does. A miss refetches from the `tx_data` archives.
+  With `--void-voter-id`, the batcher votes to void an entry that no archive serves.
+- `exec-stream`: the batcher reads the executor stream (`exec_txs`), with one destination for each executor.
+  - The batcher keys each record by its canonical index and keeps one copy of the three.
+  - It takes a record only when its `tx_ref` equals the canonical `TxRef` and `keccak256(raw_tx)` equals its hash.
+    It posts only bytes that an executor joined and that pass this check.
+  - A miss asks each executor `kardamom_getExecLocator(i, tx_hash)` and replays the executor archive that answers `located`.
+  - The batcher never votes on this source. It drops an entry only on its void record, and it waits with no deadline.
+    The sealer still counts the voter id of the batcher. So a void cannot complete while the batcher runs on this source: a lost entry waits.
+  - A copy that fails the check counts in `kardamom_exec_stream_record_rejected_total` and drops. The batcher waits for another copy.
+  - When every executor archive holds a record at the index and no record passes the check, the batcher raises the
+    `exec_record_mismatch` halt. It posts the blocks it closed before the entry, stays up, posts nothing past the entry,
+    and waits for an operator. See [`exec_record_mismatch`](runbooks/exec_record_mismatch.md).
+- The packed bytes do not depend on the source. The same blocks pack to the same payload and records commitment.
+- The executors must serve `kardamom_getExecLocator`. An executor without the method answers with an error,
+  and a miss, a restart past the live stream, or a rebuild then waits or fails.
+- The deploy sets the source with the job variable `tx_source` (`KARDAMOM_BATCHER_TX_SOURCE`, see `deploy/cluster/README.md`).
+  The rollback is `tx-data`.
 
 ### Posting cadence
 
@@ -154,7 +179,14 @@ After the start, the batcher needs the blocks that follow the cursor. It takes t
    - The sealer answers `REPLAY_UNAVAILABLE` when the cursor is below its replay floor.
    - The batcher then reads each missing block from `--block-refs-source`. The method is `kardamom_getBlockRefs`.
      The answer lists the references of the transactions of the block.
-   - The batcher fetches the bytes from the `tx_data` archives. It checks each hash, closes the blocks, and fills the spool.
+   - The batcher fetches the bytes from the archives of its transaction source. It checks each hash, closes the blocks, and fills the spool.
+     - On `tx-data` it replays the `tx_data` archives by the archive location of each reference.
+     - On `exec-stream` it reads the executor archives by canonical index. It replays from the `exec_locator` of a block when
+       the answer has one. For each index it still lacks, it asks each executor `kardamom_getExecLocator` in turn
+       and replays the first archive that answers `located`. One replay delivers a run of records.
+       A copy that fails the hash check stays out, and the next executor can fill the index.
+       It logs `rebuild: reading the executor archives` and one `rebuild: executor archive replay` line for each replay.
+     - A transaction that no archive serves stops the rebuild. The error names the transaction, its canonical index and its block.
    - It resumes at the floor of the sealer. The metric `kardamom_batcher_rebuilt_blocks_total` counts the blocks.
    - A block with a cross-chain message cannot be rebuilt this way. The endpoint refuses it.
    - Without an endpoint, a refused replay raises the `replay_unavailable` halt.

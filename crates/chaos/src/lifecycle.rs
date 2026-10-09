@@ -33,6 +33,10 @@ const APPLY_ATTEMPTS: u32 = 3;
 /// The pause between two apply attempts.
 const APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The environment variable of the batcher's transaction source. Ansible
+/// reads it at deploy time, and the knobs read it for the cases.
+pub const BATCHER_TX_SOURCE_ENV: &str = "KARDAMOM_BATCHER_TX_SOURCE";
+
 /// The deploy-time settings a shard passes to the workloads. Ansible
 /// reads them from the environment, and a case reads the same values
 /// from its knobs, so one setting drives both sides.
@@ -50,6 +54,9 @@ pub struct DeployVars {
     pub l1_fault_proxy: bool,
     /// The indexer's poll cadence, in seconds.
     pub indexer_poll_s: Option<u64>,
+    /// The batcher's transaction source, `tx-data` or `exec-stream`.
+    /// `None` keeps the job default.
+    pub batcher_tx_source: Option<&'static str>,
 }
 
 impl DeployVars {
@@ -69,12 +76,16 @@ impl DeployVars {
         let poll = self
             .indexer_poll_s
             .map(|v| ("L1_INDEXER_POLL_S", v.to_string()));
+        let batcher_source = self
+            .batcher_tx_source
+            .map(|v| (BATCHER_TX_SOURCE_ENV, v.to_string()));
         snapshot
             .into_iter()
             .chain(retention)
             .chain(budget)
             .chain(proxy)
             .chain(poll)
+            .chain(batcher_source)
             .collect()
     }
 }

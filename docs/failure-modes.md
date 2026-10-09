@@ -587,7 +587,7 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 
 - The batcher is a long-lived service. It is the third cluster-egress consumer, next to the executor and the validator.
 - It tails the canonical ordering from the Aeron Cluster egress.
-- It joins `tx_data` through the same engine reader stack (the join-miss archive refetch is included).
+- It gets the transaction bytes through the same engine reader stack. `--tx-source` picks the source: the `tx_data` lanes (the default in this release, with the join-miss archive refetch) or the executor stream.
 - It posts each packed batch to L1 as the batch closes.
 - A restart replays the canonical stream from the durable cursor. The batcher writes that cursor only after a confirmed post. It skips the blocks that L1 already covers.
 - The failure mode is a growing L1-posting lag. It is not data loss. It is never a double post, because the contract CAS rejects a double post loudly.
@@ -602,18 +602,30 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 2. **The sealer replay** from the cursor. The sealer keeps every frame above the posted head, and the batcher publishes its cursor as that head.
 3. **A rebuild from what the nodes already keep.**
    - The state DB of every executor and of the validator holds the ordering. The `headers` table maps a block to its canonical end and its L1 origin. The `receipts` table holds one row per canonical position with the hash of the transaction.
-   - The `tx_data` archives hold every raw transaction that the ingress accepted, on both ingress nodes.
+   - The `tx_data` archives hold every raw transaction that the ingress accepted, on both ingress nodes. The executor archives hold every transaction that their executor joined, keyed by canonical index.
    - The link between them is the `TxRef` that the egress record carried. The state writer keeps it with the receipt. The `tx_hash_index` row holds the shard id, the publisher session and the archive position (13 bytes). A row of 8 bytes still decodes.
    - When the sealer answers `REPLAY_UNAVAILABLE` past the cursor, the batcher reads the references of each missing block from the query endpoints that `--block-refs-source` names.
      - The method is `kardamom_getBlockRefs`. It returns the canonical end of the block, its L1 origin and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)` for each transaction in canonical order. Deposits are excluded.
-     - The batcher fetches the bytes from the archives through the join-miss refetch of the engine.
+     - On `tx-data` the batcher fetches the bytes from the `tx_data` archives through the join-miss refetch of the engine.
+     - On `exec-stream` the batcher fetches the bytes from the executor archives. It replays from the `exec_locator` of a block when the answer has one, and asks each executor `kardamom_getExecLocator` for an index that it still lacks. A copy that fails the hash check stays out, and the next executor can fill the index. It logs `rebuild: executor archive replay` for each replay.
+     - A transaction that no archive serves stops the rebuild with an error that names the transaction, its canonical index and its block.
      - It checks each hash against its bytes. It checks the end of each block against the end of its predecessor.
      - It closes the blocks as the live feed closes them. It fills the spool and the pending group. It resumes at the floor of the sealer.
    - The rebuilt range packs to the bytes that the live path posts.
-   - A second refusal after the rebuild is the `replay_unavailable` halt. So is a refusal with no query endpoint, or with no refetch endpoints, and a rebuild that fails.
+   - A second refusal after the rebuild is the `replay_unavailable` halt. So is a refusal with no query endpoint, or with no refetch endpoints (on `exec-stream`, also no `--executor-query-endpoints`), and a rebuild that fails.
    - The halt clears only by an operator. See the runbook [`replay_unavailable`](runbooks/replay_unavailable.md) and "Halts and service events".
    - A block that carried a cross-chain message cannot be rebuilt this way. Its remote-epoch record is in no archive. The query endpoint refuses the block. It does not answer with a shorter list.
    - Nothing is pruned below the posted head. The reference rows live with the receipts, and nothing deletes receipts. The rebuild never touches the retention of the archives.
+
+**The executor stream source (`--tx-source exec-stream`).** The batcher reads the transaction bytes from the executor stream, not from `tx_data`. The default is `tx-data` in this release. The deploy flips it with the job variable `tx_source` (`KARDAMOM_BATCHER_TX_SOURCE`).
+
+- **Live read and dedup**: one `exec_txs` subscription with one destination for each executor. The record buffer keys each record by its canonical index and keeps one of the identical copies.
+- **The check**: the batcher takes the copy at index `i` only when its `tx_ref` equals the canonical `TxRef(i)` and `keccak256(raw_tx)` equals `TxRef(i).tx_hash`. So it posts only bytes that an executor joined, and L1 and the executors cannot disagree on an entry. A copy that fails counts in `kardamom_exec_stream_record_rejected_total{reason}` and drops.
+- **A gap**: the batcher asks each executor `kardamom_getExecLocator(i, tx_hash)` (`--executor-query-endpoints`) and replays the archive of the first executor that answers `located`.
+- **No executor serves the record**: the batcher waits with no deadline and exports `kardamom_exec_stream_wait_seconds`. It never votes. It drops `i` only on `Void(i)`. Until the voter set changes, the sealer still counts the voter id of the batcher, so a void cannot complete while the batcher runs on this source: a lost entry waits.
+- **Every copy fails**: when every executor archive holds a record at `i` and no record passes the check, the batcher raises the `exec_record_mismatch` halt. It posts the blocks that it closed before `i`, stays up, posts nothing past `i`, and waits for `POST /halt/clear`. It posts only checked bytes. Follow the runbook [`exec_record_mismatch`](runbooks/exec_record_mismatch.md).
+- **Executors that do not serve the locator query**: each ask counts `no_answer`, and a gap, a restart past the live stream, or a rebuild waits or fails. Run `exec-stream` only on executors that serve `kardamom_getExecLocator`.
+- Proof: `crates/batcher/src/live/stack_tests.rs` packs one group from both sources to the same payload and records commitment. `crates/batcher/src/live/rebuild_tests.rs` rebuilds a range from fake executor archives, names a record that no archive holds, fills a failed copy from the next executor, and replays from the `exec_locator` with no query. The chaos shard `chaos-l1` runs the batcher on this source. `batcher-outage-past-retention` then asserts that the batcher reads the executor stream, and that a rebuild reads the executor archives.
 
 **L1 endpoints.**
 

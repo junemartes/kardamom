@@ -1,6 +1,6 @@
 # kardamom-batcher is a live service. It tails the canonical ordering
-# from the Aeron Cluster egress, joining tx_data exactly like the
-# validator's front end. It packs KAR1 into zstd payloads as boundaries
+# from the Aeron Cluster egress, and reads the transaction bytes like
+# the validator's front end: the tx_data lanes or the executor stream. It packs KAR1 into zstd payloads as boundaries
 # arrive, disperses each through the EigenDA proxy
 # (nomad/da-proxy.nomad.hcl), and posts the certificate to L1
 # (`KardamomL2Settlement.postBatch`); `kardamom-reconstruct` reads the
@@ -15,9 +15,11 @@
 #
 # A restart past the sealer's retention rebuilds the gap: the query
 # endpoints of the executors and the validator (--block-refs-source)
-# serve each block's transaction references, and the tx_data archives
-# serve the bytes through the join-miss refetch. Retention is a latency
-# while one state database and one archive survive.
+# serve each block's transaction references, and the archives of the
+# transaction source (var.tx_source) serve the bytes: the tx_data archives
+# through the join-miss refetch, or the executor archives by locator.
+# Retention is a latency while one state database and one archive
+# survive.
 #
 # Placement: the aux node, next to the validator and da-watcher,
 # outside the chaos suite's blast radius. Ports on the aux node:
@@ -141,6 +143,20 @@ variable "validator_query_port" {
   default = 9025
 }
 
+# Where the batcher reads the transaction bytes: "tx-data" (the tx_data
+# lanes, as an executor does) or "exec-stream" (the executor stream, with
+# the executor archives for a miss and for the rebuild of a refused
+# replay). Ansible deployment passes -var from KARDAMOM_BATCHER_TX_SOURCE.
+# Rollback: set it back to "tx-data".
+variable "tx_source" {
+  type    = string
+  default = "tx-data"
+  validation {
+    condition     = contains(["tx-data", "exec-stream"], var.tx_source)
+    error_message = "The tx_source value must be tx-data or exec-stream."
+  }
+}
+
 job "batcher" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -242,9 +258,15 @@ job "batcher" {
             # The void voter id: the second id after the executors'
             # (cluster.nomad.hcl builds the sealer's voter list the same way).
             "--void-voter-id", format("%d", var.executor_count + 1),
-            # Join-miss archive refetch (tx_data and tx_deposits). Same
-            # contract as the validator's flags, on this allocation's
-            # dynamic ports.
+            # The transaction source. On exec-stream the batcher never
+            # votes: it drops an entry only on the void record, and it asks
+            # the executors where their archives hold a lost record and the
+            # records of a rebuilt gap.
+            "--tx-source", var.tx_source,
+            "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
+            # Archive refetch: the tx_data and tx_deposits join miss, or
+            # the exec_txs replay. Same contract as the validator's flags,
+            # on this allocation's dynamic ports.
             "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
             "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
             "--settlement", "${var.settlement_address}",

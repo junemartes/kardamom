@@ -909,6 +909,26 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
 - Chaos: `batcher-outage-past-retention` runs on the new source. Its rebuild must read the
   executor archives.
 - Docs: `docs/l1-data-path.md`, `docs/failure-modes.md` batcher section.
+- Deviations in P7:
+  - The flag opening moved to `crates/engine/src/bin_support/tx_source.rs`: `TxSourceConfig`
+    opens the source for the validator and the batcher, and `ArchiveAccess` gives the
+    `tx_data` refetch and the executor archives. `InboundConfig` holds a `TxSourceConfig`.
+    The batcher reader stack moved to `crates/batcher/src/live/stack.rs`.
+  - The batcher takes `--executor-query-endpoints`, as the validator does. The job passes the
+    executor query endpoints. The deploy switch is `KARDAMOM_BATCHER_TX_SOURCE` (job variable
+    `tx_source`). The `chaos-l1` shard deploys `exec-stream`.
+  - The `EnvelopeSource` seam keys the envelopes by canonical index for both sources.
+    `ExecArchiveEnvelopes` reuses the `ExecArchive` trait of the consumer (locator query,
+    then `fetch_exec_records`). It replays from the `exec_locator` of a block first, then asks
+    each executor `kardamom_getExecLocator` for the lowest index still missing. A copy that
+    fails the hash check stays out, so the next executor can fill the index.
+  - `exec_locator` in `BlockRefs` is optional, with the shape of a locator answer
+    (`archive_id`, `session_id`, `position`). No query endpoint serves it yet, and no
+    executor serves `kardamom_getExecLocator` yet. Until P5 merges, the `exec-stream`
+    source has no miss path and no rebuild source on a live cluster.
+  - When every executor archive holds a record that fails the check, the batcher raises the
+    `exec_record_mismatch` halt (operator clear), the cause the validator raises. It stays up
+    and posts nothing past the entry: section 5.5 "waits and alerts".
 
 ### P8. The guard reject path and the halt
 

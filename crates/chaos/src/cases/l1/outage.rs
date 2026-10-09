@@ -6,14 +6,17 @@
 //! posts the group it restores from its spool. The group lands right
 //! after the covered block. The batcher then gets the rest of the gap
 //! replayed, or rebuilds it from the state databases' block references
-//! and the `tx_data` archives, and posts on past the sealers' floor.
+//! and the archives of its transaction source, and posts on past the
+//! sealers' floor. When the deploy runs the batcher on the executor
+//! stream, the case asserts that it reads that stream, and that a rebuild
+//! reads the executor archives.
 
 use std::cell::Cell;
 use std::time::Duration;
 
 use super::batcher::{
-    AERON_EXIT_LINE, REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, START_LINE, count,
-    field_in_last, require_posting,
+    AERON_EXIT_LINE, ExecSource, REBUILDING_LINE, REBUILT_LINE, SPOOL_RESTORED_LINE, START_LINE,
+    count, field_in_last, require_posting,
 };
 use crate::harness::Harness;
 use crate::l1::{L1, Posted};
@@ -357,6 +360,7 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     // The baselines follow the freeze: a restart on a retried freeze
     // logs its own lines, which must not count for the final thaw.
     let lines = Lines::read(h).await?;
+    let exec_source = ExecSource::read(h, ctx).await?;
     let rebuilding0 = count(h, REBUILDING_LINE).await?;
     let rebuilt0 = count(h, REBUILT_LINE).await?;
     // A post in flight at the freeze still lands: read the covered
@@ -399,6 +403,9 @@ pub(crate) async fn batcher_outage_past_retention(h: &mut Harness) -> anyhow::Re
     };
     if !await_rebuilt_or_served(h, &l1, lines, sealed, budget + REBUILD_BUDGET, ctx).await? {
         return l1.assert_contiguous(ctx).await;
+    }
+    if let Some(exec_source) = exec_source {
+        exec_source.require_rebuild_read(h, ctx).await?;
     }
     let logs = h.nomad.job_logs("batcher", Streams::Both).await?;
     let floor = field_in_last(&logs, REBUILDING_LINE, "oldest_block").ok_or_else(|| {

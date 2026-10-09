@@ -132,7 +132,9 @@ impl Shard {
     /// shard deploys the sealer with a short snapshot interval so the
     /// follower-kill case sees a snapshot; the retention shard deploys a
     /// small egress retention so a freeze can overrun it; the L1 shard
-    /// takes both, plus the fault proxy in front of the followers.
+    /// takes both, plus the fault proxy in front of the followers, and
+    /// runs the batcher on the executor stream, so CI exercises the
+    /// switch before it flips.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
@@ -149,6 +151,7 @@ impl Shard {
                 cluster_retention: Some(6144),
                 l1_fault_proxy: true,
                 indexer_poll_s: Some(2),
+                batcher_tx_source: Some("exec-stream"),
                 ..DeployVars::default()
             },
             Self::Executor
@@ -183,6 +186,7 @@ impl Shard {
                 ("KARDAMOM_CLUSTER_RETENTION", "6144"),
                 ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
                 ("L1_FAULT_S", "60"),
+                ("KARDAMOM_BATCHER_TX_SOURCE", "exec-stream"),
             ],
             Self::Executor
             | Self::Ingress
@@ -241,6 +245,15 @@ mod tests {
             );
         }
         assert!(Shard::L1.deploy_vars().l1_fault_proxy);
+        assert_eq!(
+            Shard::L1.deploy_vars().batcher_tx_source,
+            Some("exec-stream")
+        );
+        assert!(
+            Shard::L1
+                .env()
+                .contains(&(crate::lifecycle::BATCHER_TX_SOURCE_ENV, "exec-stream"))
+        );
         assert!(Shard::L1.audits_each_case() && !Shard::Retention.audits_each_case());
         assert_eq!(
             Shard::L1.cases().last(),

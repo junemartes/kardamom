@@ -1,7 +1,8 @@
 # exec_record_mismatch
 
-This halt occurs only on a validator that reads the executor stream
-(`--tx-source exec-stream`).
+This halt occurs only on a validator or a batcher that reads the executor
+stream (`--tx-source exec-stream`). The steps name the validator. On the
+batcher, read `/halt` on port 9002, and see "The batcher" below.
 
 ## Cause
 
@@ -59,3 +60,13 @@ This halt waits for an operator (`operator`).
   again.
 - No file keeps this halt. A restart of the validator meets the same index
   and halts again.
+
+## The batcher
+
+- The batcher posts only checked bytes. It posts the blocks that it closed
+  before the index, then stays up and posts nothing past it.
+- The cause and the steps are the same. The executors and the batcher must run
+  one release.
+- Clear it with `POST /halt/clear` on the batcher node. The batcher then starts
+  again from its cursor. If every archive still holds a mismatched record, it
+  halts again.

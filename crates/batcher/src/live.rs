@@ -1,10 +1,14 @@
 //! Live batcher: tails the canonical ordering from the Aeron Cluster
-//! egress, joins `tx_data`, packs batches, and posts them to L1 as a
-//! long-lived service.
+//! egress, gets the bytes of each transaction from its transaction source,
+//! packs batches, and posts them to L1 as a long-lived service.
 //!
 //! The batcher is a third cluster-egress consumer, next to the executor and
 //! the validator. It reuses the `kardamom-engine` reader stack (cluster
-//! `tx_ordering` subscription, `tx_data` join buffer, archive refetch) as-is.
+//! `tx_ordering` subscription, the transaction source, archive refetch)
+//! as-is. `--tx-source` picks the source: the `tx_data` lanes, joined as an
+//! executor joins them, or the executor stream, keyed by canonical index
+//! and checked against the canonical hash. On the executor stream the
+//! batcher never votes: it drops an entry only on its void record.
 //! Only the sink differs: `ReaderToExec` records feed a [`BatchAccumulator`]
 //! instead of an execution pipeline. `Deposit` records are skipped, because
 //! deposits are absent from DA by design. A reconstructor re-derives them
@@ -14,8 +18,9 @@
 //! posted), the sealer's replay from the cursor, and, when the sealer no
 //! longer retains the cursor, a rebuild of the gap up to the sealer's
 //! floor from the references an executor or the validator keeps and the
-//! bytes the `tx_data` archives hold. Retention is a latency, not a loss,
-//! while one state database and one archive survive.
+//! bytes the archives of the source hold: the `tx_data` archives, or the
+//! executor archives. Retention is a latency, not a loss, while one state
+//! database and one archive survive.
 //!
 //! Durability model:
 //! - L1 (`lastBatchIndex` and the `BatchPosted` event) is the authoritative
@@ -44,6 +49,7 @@ mod resume;
 mod run;
 mod sender;
 mod spool;
+mod stack;
 
 pub use cursor::{BatchCursor, L1Truth, read_last_batch_index};
 pub use run::{LiveArgs, connect_l1, run};

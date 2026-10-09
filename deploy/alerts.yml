@@ -295,7 +295,7 @@ groups:
           cause: exec_record_mismatch
         annotations:
           summary: "{{ $labels.service }} halted: exec_record_mismatch ({{ $labels.host_id }})"
-          description: "At one canonical index every executor archive holds a record that fails the validator's check against the canonical TxRef. The validator does not execute or drop the entry, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/exec_record_mismatch.md (recovery id {{ $labels.recovery }})."
+          description: "At one canonical index every executor archive holds a record that fails the check of a validator or a batcher against the canonical TxRef. The service does not execute, post or drop the entry, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/exec_record_mismatch.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/exec_record_mismatch.md"
 
       # A restarted sequencer can miss the epoch the sealer expects while
