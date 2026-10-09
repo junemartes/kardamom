@@ -132,10 +132,16 @@ impl Shard {
     /// shard deploys the sealer with a short snapshot interval so the
     /// follower-kill case sees a snapshot; the retention shard deploys a
     /// small egress retention so a freeze can overrun it; the L1 shard
-    /// takes both, plus the fault proxy in front of the followers.
+    /// takes both, plus the fault proxy in front of the followers. The
+    /// executor shard turns the recorded cursor on, so `hard-executor`
+    /// checks the sealer's best cursor while one executor is down.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
+            Self::Executor => DeployVars {
+                exec_cursor: true,
+                ..DeployVars::default()
+            },
             Self::Cluster => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
                 ..DeployVars::default()
@@ -151,12 +157,9 @@ impl Shard {
                 indexer_poll_s: Some(2),
                 ..DeployVars::default()
             },
-            Self::Executor
-            | Self::Ingress
-            | Self::Sequencer
-            | Self::Fleet
-            | Self::Coordinated
-            | Self::Cache => DeployVars::default(),
+            Self::Ingress | Self::Sequencer | Self::Fleet | Self::Coordinated | Self::Cache => {
+                DeployVars::default()
+            }
         }
     }
 
@@ -184,12 +187,10 @@ impl Shard {
                 ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
                 ("L1_FAULT_S", "60"),
             ],
-            Self::Executor
-            | Self::Ingress
-            | Self::Sequencer
-            | Self::Fleet
-            | Self::Coordinated
-            | Self::Cache => &[("RUN_LOAD", "0")],
+            Self::Executor => &[("RUN_LOAD", "0"), ("KARDAMOM_EXEC_CURSOR", "on")],
+            Self::Ingress | Self::Sequencer | Self::Fleet | Self::Coordinated | Self::Cache => {
+                &[("RUN_LOAD", "0")]
+            }
         }
     }
 }
@@ -241,6 +242,14 @@ mod tests {
             );
         }
         assert!(Shard::L1.deploy_vars().l1_fault_proxy);
+        // The executor shard deploys the recorded cursor and tells its
+        // cases so through the knob of the same name.
+        assert!(Shard::Executor.deploy_vars().exec_cursor);
+        assert!(
+            Shard::Executor
+                .env()
+                .contains(&("KARDAMOM_EXEC_CURSOR", "on"))
+        );
         assert!(Shard::L1.audits_each_case() && !Shard::Retention.audits_each_case());
         assert_eq!(
             Shard::L1.cases().last(),

@@ -491,6 +491,13 @@ class DeployTest(unittest.TestCase):
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
 
+    def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
+        for switch, expected in (('', 'false'), ('on', 'true')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_exec_cursor': switch}, check=True)
+                env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
+
     def test_every_aeron_party_takes_the_stall_tolerance(self):
         for tolerance in (10000, 30000):
             with self.subTest(tolerance=tolerance):
