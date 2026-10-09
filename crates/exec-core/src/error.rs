@@ -83,6 +83,26 @@ pub enum ExecutorError {
     #[error("tx_receipts publication closed")]
     TxReceiptsClosed,
 
+    /// A must-deliver publication has no connected subscriber. The commit
+    /// thread retries the publish and runs its escalation clock on this
+    /// error alone: any other transient error means a subscriber exists.
+    #[error("{topic} publication not connected: {detail}")]
+    NotConnected { topic: String, detail: String },
+
+    /// A must-deliver publication stayed unconnected past the exit
+    /// threshold of the escalation, after one reopen on a new session.
+    /// The process exits with a distinct code, so the supervisor restarts
+    /// it. The receipts of this replica that are not yet delivered are
+    /// lost here; the other replicas deliver theirs.
+    #[error(
+        "{topic} publication unconnected for {unconnected_s} s, reopened after {reopen_after_s} s: the process exits so the supervisor restarts it"
+    )]
+    PublicationDead {
+        topic: String,
+        unconnected_s: u64,
+        reopen_after_s: u64,
+    },
+
     /// The executor-local `TxIndex` counter reached `u64::MAX` and cannot
     /// advance. This would need more than `u64::MAX` transactions in one
     /// process lifetime.

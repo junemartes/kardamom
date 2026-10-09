@@ -239,6 +239,7 @@ No job configures a publication control port.
 - The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
 - The publisher record carries the address that the driver bound.
 - The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
+- A publisher can open a publication again (`StreamPlane::tx_receipts_reopen`). The new publication binds a new port. The record of the same service id moves to it, and the heartbeat of the first registration keeps passing its check. The subscribers detach the old control endpoint and attach the new one. The executor does this for a `tx_receipts` publication that stays unconnected for one Aeron stall budget. See "Dead `tx_receipts` publication" in [failure-modes.md](failure-modes.md#executor).
 
 | Job | Publications |
 | --- | --- |

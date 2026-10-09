@@ -30,7 +30,9 @@ pub mod watch;
 pub use catalog::{Catalog, Query, QueryResult, RegistrationSpec};
 pub use endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, destination_uri, publication_uri};
 pub use own_recording::OwnRecording;
-pub use plane::{DiscoveredPublisher, DiscoveredSubscriber, StreamPlane};
+pub use plane::{
+    DiscoveredPublisher, DiscoveredSubscriber, PublisherReopen, StreamPlane, TxReceiptsReopen,
+};
 pub use reconcile::{DestinationPort, Plan, Reconciler};
 pub use record::{
     ARCHIVE_SERVICE, ArchiveRecord, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, DISCOVERY_VERSION,

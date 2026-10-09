@@ -70,6 +70,7 @@ use crate::error::ExecutorError;
 use crate::reader::{JoinBuffer, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
 
 mod commit_thread;
+mod escalation;
 mod exec_block;
 mod exec_boundary;
 mod exec_markers;
@@ -106,6 +107,7 @@ mod test_hooks;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use escalation::{Escalation, PUBLICATION_DEAD_EXIT_CODE, PublicationHealth, Step};
 pub use ports::{Either, StateWriterQueue, StateWriterSignal, TxReceiptsPublication, publish_each};
 pub use tx_hook::{NoTxHook, TxContext, TxHook, TxOutcome, VerifyRecordIdentity};
 pub use types::{
@@ -201,6 +203,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
 
         let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth.get());
+        let escalation = Escalation::from_stall_budget(cfg.stall_budget);
 
         let exec = ExecState::<W>::spawn(ExecInputs {
             cfg,
@@ -219,7 +222,9 @@ impl<W: EngineWiring + 'static> Executor<W> {
                 tx_hook,
             },
         });
-        let commit = CommitLoop::new(tx_receipts, rx_e2c).spawn();
+        let commit = CommitLoop::new(tx_receipts, rx_e2c)
+            .escalating(escalation)
+            .spawn();
 
         Threads {
             tx_data: tx_data_handles,

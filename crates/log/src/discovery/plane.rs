@@ -304,10 +304,13 @@ impl ReconcileTask {
     }
 }
 
+mod reopen;
 mod streams;
 
 #[cfg(test)]
 mod tests;
+
+pub use reopen::{PublisherReopen, TxReceiptsReopen};
 
 /// The seam every service opens its channels through. See the module
 /// doc.

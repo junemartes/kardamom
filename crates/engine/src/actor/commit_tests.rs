@@ -10,7 +10,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
 
 use super::test_support::{feed_commits, pos};
-use super::{CommitLoop, ExecToCommit, TxReceiptsPublication};
+use super::{CommitLoop, Escalation, ExecToCommit, TxReceiptsPublication};
 
 struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
 impl TxReceiptsPublication for RecordPub {
@@ -274,4 +274,103 @@ fn commit_thread_fail_stops_on_divergence() {
         matches!(res, Err(ExecutorError::Divergence(_))),
         "divergence must propagate, not be retried: {res:?}"
     );
+}
+
+/// A publication with no subscriber: every publish fails with
+/// `NotConnected` until `reopen` runs `connects_after_reopen` times,
+/// then every publish lands. Counts the reopens.
+struct UnconnectedPub {
+    reopens: Arc<Mutex<u32>>,
+    connects_after_reopen: u32,
+    log: Arc<Mutex<Vec<CMessage>>>,
+}
+
+impl UnconnectedPub {
+    fn connected(&self) -> bool {
+        *self.reopens.lock().unwrap() >= self.connects_after_reopen
+    }
+}
+
+impl TxReceiptsPublication for UnconnectedPub {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        if !self.connected() {
+            return Err(ExecutorError::NotConnected {
+                topic: "tx_receipts".into(),
+                detail: "aeron offer failed: NOT_CONNECTED (-1)".into(),
+            });
+        }
+        self.log.lock().unwrap().push(msg);
+        Ok(())
+    }
+
+    fn reopen(&mut self) -> Result<(), ExecutorError> {
+        *self.reopens.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+/// A tiny budget, so a test runs its whole escalation in under a second:
+/// the reopen after 100 ms, the exit after 400 ms.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn one_receipt() -> crossbeam_channel::Receiver<ExecToCommit> {
+    feed_commits(vec![ExecToCommit::Receipt(receipt(0xAC, 0))])
+}
+
+// A publication that connects after its reopen delivers the receipt: the
+// escalation reopens once, and the retry carries the receipt across.
+#[test]
+fn commit_thread_reopens_an_unconnected_publication_once_and_delivers() {
+    let reopens = Arc::new(Mutex::new(0));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let h = CommitLoop::new(
+        UnconnectedPub {
+            reopens: reopens.clone(),
+            connects_after_reopen: 1,
+            log: log.clone(),
+        },
+        one_receipt(),
+    )
+    .escalating(Escalation::from_stall_budget(TEST_BUDGET))
+    .spawn();
+    h.join()
+        .expect("no panic")
+        .expect("delivered after the reopen");
+    assert_eq!(
+        *reopens.lock().unwrap(),
+        1,
+        "one reopen per unconnected period"
+    );
+    assert_eq!(log.lock().unwrap().len(), 1, "the receipt was not dropped");
+}
+
+// A publication that stays unconnected after its reopen ends the thread
+// with `PublicationDead` after the total budget, with one reopen only.
+#[test]
+fn commit_thread_exits_after_the_total_budget_without_a_subscriber() {
+    let reopens = Arc::new(Mutex::new(0));
+    let started = std::time::Instant::now();
+    let h = CommitLoop::new(
+        UnconnectedPub {
+            reopens: reopens.clone(),
+            connects_after_reopen: u32::MAX,
+            log: Arc::new(Mutex::new(Vec::new())),
+        },
+        one_receipt(),
+    )
+    .escalating(Escalation::from_stall_budget(TEST_BUDGET))
+    .spawn();
+    let res = h.join().expect("no panic");
+    assert!(
+        matches!(
+            &res,
+            Err(ExecutorError::PublicationDead { topic, reopen_after_s: 0, .. }) if topic == "tx_receipts"
+        ),
+        "the thread must end with PublicationDead: {res:?}"
+    );
+    assert!(
+        started.elapsed() >= TEST_BUDGET * 4,
+        "the exit waits the whole budget"
+    );
+    assert_eq!(*reopens.lock().unwrap(), 1, "one reopen, then the exit");
 }

@@ -14,10 +14,11 @@ use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError
 use tracing::warn;
 
 use super::bound::BoundControl;
+use super::image_log::{ImageLog, OpenedSub};
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
 use super::table_pub::TablePub;
-use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
+use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame};
 use crate::error::LogError;
 use crate::offer_retry::OFFER_TIMEOUT;
 use crate::term_layout::TermLayout;
@@ -62,7 +63,7 @@ enum CmdStep {
 
 /// One row in the Aeron thread's subscription table.
 struct SubEntry {
-    sub: Sub,
+    opened: OpenedSub,
     /// Assembler-wrapped handler passed to `poll` (owns per-session
     /// assembly buffers). Delegates complete messages to `inner`.
     assembler: rusteron_client::Handler<rusteron_client::AeronFragmentAssembler>,
@@ -79,6 +80,8 @@ impl Drop for SubEntry {
     fn drop(&mut self) {
         self.assembler.release();
         self.inner.release();
+        self.opened.available.release();
+        self.opened.unavailable.release();
     }
 }
 
@@ -89,7 +92,7 @@ impl SubEntry {
     /// once on the transition into the error state, not on every failed
     /// poll, since this runs on every pass of the thread's hot loop.
     fn poll_once(&mut self) -> bool {
-        match self.sub.poll(Some(&self.assembler), 64) {
+        match self.opened.sub.poll(Some(&self.assembler), 64) {
             Ok(fragments) => {
                 self.poll_failed = false;
                 fragments > 0
@@ -151,7 +154,9 @@ struct Destination {
 struct AeronThread {
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
-    pubs: Vec<PubEntry>,
+    /// Indexed by `pub_id`. A closed publication leaves a `None` slot,
+    /// so the ids of the open ones stay valid.
+    pubs: Vec<Option<PubEntry>>,
     /// Declared before `subs`: a destination detaches through its
     /// subscription, so every destination must drop while its
     /// subscription is still open.
@@ -334,7 +339,7 @@ impl AeronThread {
         ack: Option<CbSender<Result<BPosition, LogError>>>,
     ) {
         self.pending.push_back(PendingPublish {
-            stream_id: self.pubs.get(pub_id as usize).map(|e| e.stream_id),
+            stream_id: self.pub_entry(pub_id).map(|e| e.stream_id),
             pub_id,
             bytes,
             ack,
@@ -345,7 +350,7 @@ impl AeronThread {
     /// Make one offer of a lossy frame. A refused offer, or an unknown
     /// publication, drops the frame and counts it under the stream id.
     fn offer_lossy(&self, pub_id: u32, bytes: &rkyv::util::AlignedVec) {
-        let Some(entry) = self.pubs.get(pub_id as usize) else {
+        let Some(entry) = self.pub_entry(pub_id) else {
             return;
         };
         let code = entry.publication.offer(bytes.as_slice());
@@ -356,6 +361,23 @@ impl AeronThread {
             )
             .increment(1);
         }
+    }
+
+    /// The open publication at `pub_id`, if any.
+    fn pub_entry(&self, pub_id: u32) -> Option<&PubEntry> {
+        self.pubs.get(pub_id as usize).and_then(Option::as_ref)
+    }
+
+    /// Close a publication: drop the row, which closes the Aeron
+    /// publication. The slot stays `None`.
+    fn cmd_close_publication(&mut self, pub_id: u32) -> Result<(), LogError> {
+        let slot = self.pubs.get_mut(pub_id as usize).ok_or_else(|| {
+            LogError::Aeron(format!("close publication: unknown pub_id {pub_id}"))
+        })?;
+        slot.take().ok_or_else(|| {
+            LogError::Aeron(format!("close publication: pub_id {pub_id} is closed"))
+        })?;
+        Ok(())
     }
 
     /// Open a publication and append it to `pubs`, replying with its
@@ -407,11 +429,11 @@ impl AeronThread {
         let session_id = constants.session_id();
         let pub_id = u32::try_from(self.pubs.len())
             .map_err(|_| LogError::Aeron("publication table exceeds u32::MAX entries".into()))?;
-        self.pubs.push(PubEntry {
+        self.pubs.push(Some(PubEntry {
             publication,
             layout,
             stream_id,
-        });
+        }));
         Ok(OpenedPub {
             pub_id,
             session_id,
@@ -427,14 +449,14 @@ impl AeronThread {
         stream_id: i32,
         sink: FrameSink,
     ) -> Result<u32, LogError> {
-        let sub = self.open_sub(uri, stream_id)?;
+        let opened = self.open_sub(uri, stream_id)?;
         let (assembler, inner) =
             rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { sink })
                 .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
         let id = u32::try_from(self.subs.len())
             .map_err(|_| LogError::Aeron("subscription table exceeds u32::MAX entries".into()))?;
         self.subs.push(Some(SubEntry {
-            sub,
+            opened,
             assembler,
             inner,
             poll_failed: false,
@@ -522,6 +544,9 @@ impl AeronThread {
             RuntimeCmd::CloseSubscription { sub_id, ack } => {
                 let _ = ack.send(self.cmd_close_subscription(sub_id));
             }
+            RuntimeCmd::ClosePublication { pub_id, ack } => {
+                let _ = ack.send(self.cmd_close_publication(pub_id));
+            }
             RuntimeCmd::Shutdown => {}
         }
     }
@@ -533,17 +558,35 @@ impl AeronThread {
             .map_err(|e| LogError::Aeron(format!("add_publication {uri}: {e}")))
     }
 
-    fn open_sub(&self, uri: &str, stream_id: i32) -> Result<Sub, LogError> {
+    /// Open a subscription with its image log. A failed open releases
+    /// the two handlers again.
+    fn open_sub(&self, uri: &str, stream_id: i32) -> Result<OpenedSub, LogError> {
         let c = crate::ffi::c_uri(uri, "uri")?;
-        self.aeron
-            .add_subscription(
-                c.as_c_str(),
-                stream_id,
-                rusteron_client::Handlers::no_available_image_handler(),
-                rusteron_client::Handlers::no_unavailable_image_handler(),
-                ADD_SUB_TIMEOUT,
-            )
-            .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))
+        let log = || ImageLog {
+            stream_id,
+            uri: uri.to_string(),
+        };
+        let mut available = rusteron_client::Handler::leak(log());
+        let mut unavailable = rusteron_client::Handler::leak(log());
+        let added = self.aeron.add_subscription(
+            c.as_c_str(),
+            stream_id,
+            Some(&available),
+            Some(&unavailable),
+            ADD_SUB_TIMEOUT,
+        );
+        match added {
+            Ok(sub) => Ok(OpenedSub {
+                sub,
+                available,
+                unavailable,
+            }),
+            Err(e) => {
+                available.release();
+                unavailable.release();
+                Err(LogError::Aeron(format!("add_subscription {uri}: {e}")))
+            }
+        }
     }
 
     /// Attach a source endpoint (`uri`, for example
@@ -570,7 +613,7 @@ impl AeronThread {
         let dest =
             rusteron_client::AeronAsyncDestination::aeron_subscription_async_add_destination(
                 &self.aeron,
-                &sub.sub,
+                &sub.opened.sub,
                 c.as_c_str(),
             )
             .map_err(|e| LogError::Aeron(format!("add destination {uri}: {e}")))?;

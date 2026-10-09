@@ -22,6 +22,10 @@ name: cluster-e2e
 # to ~one shard instead of running everything serially. Opt out with the
 # `skip-cluster-e2e` label for changes that can't affect the cluster.
 #
+# The nightly shards (`chaos-integrity`) hold the long repetition cases. The
+# schedule runs them alone. A pull request with the `chaos-nightly` label runs
+# them beside the regular shards. The build job picks the shard list.
+#
 # One `build` job compiles the service binaries, the shard test executable,
 # the operator binary and the sealer jar once, and hands them to the shards
 # as one artifact (`just stage-dist`). A shard runner carries
@@ -34,9 +38,14 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # The nightly shards, at 03:17 UTC.
+    - cron: "17 3 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The nightly run has its own group, so it never cancels a push run on
+  # main, and a push never cancels it.
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: true
 
 env:
@@ -57,8 +66,32 @@ jobs:
     # base (see deploy/cluster/docker/ci-service.Dockerfile).
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
+
+      # The shard list of this run. The regular shards run on every
+      # trigger but the schedule. The nightly shards run on the schedule,
+      # and beside the regular ones on a pull request with the
+      # `chaos-nightly` label. The names are the `Shard` names of
+      # crates/chaos/src/shard.rs plus the two stages of tests/shards.rs.
+      - name: Pick the shards
+        id: shards
+        env:
+          NIGHTLY_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'chaos-nightly') }}
+        run: |
+          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-retention","chaos-cache","chaos-l1","semantics"'
+          nightly='"chaos-integrity"'
+          if [ "${{ github.event_name }}" = schedule ]; then
+            shards="[$nightly]"
+          elif [ "$NIGHTLY_LABEL" = true ]; then
+            shards="[$regular,$nightly]"
+          else
+            shards="[$regular]"
+          fi
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shards: $shards"
 
       - uses: extractions/setup-just@v4
         with:
@@ -175,8 +208,10 @@ jobs:
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the
         # staging incident's faults, the batcher's resume through them, and
         # an outage past the sealer's retention.
-        shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-fleet, chaos-coordinated, chaos-retention, chaos-cache, chaos-l1, semantics]
+        # chaos-integrity (nightly) stops and restores the executor job ten
+        # times under load; every executor must advance after each round.
+        # The build job picks the list (see "Pick the shards").
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
     steps:
       - uses: actions/checkout@v4
 
