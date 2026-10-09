@@ -92,6 +92,17 @@ variable "indexer_url" {
   default     = ""
 }
 
+# The sealer's DA-lag budget, in blocks: the same deploy value as the
+# cluster job's (KARDAMOM_DA_LAG_BUDGET_BLOCKS). The batcher posts once
+# the sealed head is half of it past the posted head, so the sealer's
+# guard stays a backstop. Empty: the binary's default, 10000, the
+# cluster job's default.
+variable "da_lag_budget_blocks" {
+  type        = string
+  description = "The sealer's DA-lag budget in blocks; the batcher posts at half of it. Empty: 10000."
+  default     = ""
+}
+
 # Seconds with no l1_blocks record before the batcher pauses with the
 # follower as its root. Empty: the binary's default, 1152.
 variable "l1_silence_secs" {
@@ -273,6 +284,7 @@ job "batcher" {
           var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
           var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
           var.l1_silence_secs != "" ? ["--l1-silence-secs", var.l1_silence_secs] : [],
+          var.da_lag_budget_blocks != "" ? ["--da-lag-budget-blocks", var.da_lag_budget_blocks] : [],
         )
       }
 

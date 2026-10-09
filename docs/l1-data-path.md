@@ -61,6 +61,7 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
 | `--cursor-file` | `KARDAMOM_BATCHER_CURSOR` | none | Durable cursor: the ordering position of the last confirmed post. Live mode needs it. |
 | `--spool-dir` | `KARDAMOM_BATCHER_SPOOL` | `spool` beside the cursor file | Directory of consumed blocks that are not yet posted. |
 | `--indexer-url` | `KARDAMOM_INDEXER_URL` | none | API of the L1 follower (the inbox indexer). |
+| `--da-lag-budget-blocks` | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | `10000` | The sealer's DA-lag budget. A group is due at half of it. `0` matches a sealer with the guard off. |
 | `--l1-silence-secs` | — | `1152` | Seconds with no `l1_blocks` record before the batcher pauses with the follower as its root. |
 | `--block-refs-source` | `KARDAMOM_BLOCK_REFS_SOURCES` | none | Query endpoints of the executors and the validator. Repeat the flag, or separate the values with commas. |
 | `--blocks-per-batch` | — | `1` | A group posts when it holds this many blocks. |
@@ -90,6 +91,11 @@ A group of closed blocks posts when the first of these conditions holds:
 - The group holds `--blocks-per-batch` blocks.
 - The oldest block waited `--flush-ms`, and the group has a transaction or a remote-epoch record.
 - The oldest block waited `--idle-flush-ms`, and the group has neither.
+- The group's last block is half the sealer's DA-lag budget (`--da-lag-budget-blocks`) past the posted head.
+  The deploy passes the batcher the same value as the sealer (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`), so the guard
+  stays a backstop and never halts an idle chain between two posts.
+- The deploy refuses an idle flush longer, in seconds, than the budget in blocks: an idle chain seals about one
+  block a second.
 
 The batcher checks the timers at every boundary and once each second.
 

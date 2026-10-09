@@ -162,6 +162,12 @@ struct Cli {
     /// on Ethereum and Sepolia.
     #[arg(long, default_value = "1152")]
     l1_silence_secs: std::num::NonZeroU64,
+    /// The sealer's DA-lag budget, in blocks: the value the cluster job
+    /// passes to the sealer. The batcher posts once the sealed head is
+    /// half of it past the posted head, so the guard never halts an idle
+    /// chain between posts. 0 matches a sealer with the guard off.
+    #[arg(long, env = "KARDAMOM_DA_LAG_BUDGET_BLOCKS", default_value_t = 10_000)]
+    da_lag_budget_blocks: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`): repeat the flag, or separate them with
     /// commas. They keep, with every receipt, where the transaction's
@@ -396,6 +402,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         chain_id: cli.chain_id,
         indexer_url: cli.indexer_url.clone(),
         l1_silence: std::time::Duration::from_secs(cli.l1_silence_secs.get()),
+        da_lag_budget_blocks: cli.da_lag_budget_blocks,
         block_refs_sources: cli.block_refs_source.clone(),
     })
     .await

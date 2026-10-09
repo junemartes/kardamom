@@ -210,6 +210,7 @@
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'l1_silence_secs': workloads_l1_silence_s} if workloads_l1_silence_s | length > 0 else {})
+           | combine({'da_lag_budget_blocks': workloads_da_lag_budget_blocks} if workloads_da_lag_budget_blocks | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}) }}
       # The fault proxy when it is deployed, else the real L1 when one is
       # given, else the in-cluster anvil. The batcher's own key when one

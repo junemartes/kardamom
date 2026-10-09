@@ -152,6 +152,8 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The sealer answers the refused record with a reject frame. The sequencer maps it to the transaction error `DaLag`.
   - The default budget is 10,000 blocks. A budget of 0 turns the guard off.
   - The setting is `-Dkardamom.cluster.daLagBudgetBlocks`, or the env var `DA_LAG_BUDGET_BLOCKS`. The property wins. Every member must use the same value.
+  - The batcher gets the same value (`--da-lag-budget-blocks`) and posts its pending group once the sealed head is half the budget past the posted head. So the guard is a backstop: it halts only a batcher that cannot post, never an idle chain between two posts.
+  - The deploy refuses an idle flush interval, in seconds, at or above the budget in blocks: an idle chain seals about one block a second.
 - **Status frame.** The sealer sends a status frame to every session. The frame has the posted head, the sealed head, the budget, a halted flag, the retained frame count and the floor.
   - The ingress mirrors the frame in the gauges `kardamom_ingress_cluster_posted_head`, `_sealed_head`, `_retained_frames` and `_floor_block`.
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.

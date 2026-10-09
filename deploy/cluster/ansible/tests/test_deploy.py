@@ -620,6 +620,22 @@ class DeployTest(Deploys):
         args = group['Tasks'][0]['Config']['args']
         self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
 
+    def test_the_batcher_posts_before_the_da_lag_guard_halts_an_idle_chain(self):
+        # The role's defaults: a 3 s idle flush under the 10000-block budget.
+        self.run_deploy(check=True)
+        # Staging-like: a 12 h idle flush needs a budget above 43200 blocks;
+        # the batcher gets the cluster's budget and posts at half of it.
+        self.run_deploy({'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000),
+                         'workloads_da_lag_budget_blocks': '100000'}, check=True)
+        args = self.api.state['plans']['batcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(args[args.index('--da-lag-budget-blocks') + 1], '100000')
+        self.assertIn('-Dkardamom.cluster.daLagBudgetBlocks=100000', json.dumps(self.api.state['plans']['cluster']))
+        # The budget below the idle interval in blocks halts an idle chain:
+        # the role refuses it before any job.
+        output = self.run_deploy({'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000)},
+                                 check=True, success=False)
+        self.assertIn('must be below the DA-lag budget', output)
+
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the
         # cursor file outlives the container.

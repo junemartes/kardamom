@@ -153,6 +153,9 @@ pub struct LiveArgs {
     /// How long `l1_blocks` may carry no record before the batcher pauses
     /// with the follower as its root.
     pub l1_silence: Duration,
+    /// The sealer's DA-lag budget, in blocks; 0 turns the guard off. A
+    /// group is due at half of it.
+    pub da_lag_budget_blocks: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`). When the sealer refuses the replay, the
     /// references of the gap up to its floor are read from here, and the
@@ -602,6 +605,7 @@ async fn run_once(args: &LiveArgs) -> Result<RunEnd> {
         idle_flush: Duration::from_millis(args.idle_flush_ms.get()),
         target_payload_bytes: args.target_payload_bytes,
         skip_through_block: resume.skip_through(l1.skip_through_block),
+        da_lag_due: NonZeroU64::new(args.da_lag_budget_blocks / 2),
     };
     // The sealer and the ingress learn the confirmed cursor before the
     // first post: each reader stack publishes the current value first.
