@@ -257,8 +257,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
-                    'canary',
-                    'da-store', 'batcher']
+                    'da-store', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
