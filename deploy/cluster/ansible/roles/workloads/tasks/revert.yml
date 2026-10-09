@@ -1,0 +1,134 @@
+---
+# Revert one job to its version before the release, and wait for it as
+# the deploy does. A job that the release added stops. A job whose
+# registered definition already equals the pre-release version is done:
+# Nomad reverted it itself (auto_revert), or an earlier run of this
+# rollback did. The sealer, when it has one group per member, rolls back
+# member by member through the roll of the deploy: a revert of the whole
+# job would replace the members at once and lose the quorum. Each job
+# joins `rolled_back` in the record when it is done, so a rollback that
+# stops resumes after it.
+- name: Keep the versions of {{ workloads_revert_job }}
+  ansible.builtin.set_fact:
+    workloads_revert_before: "{{ workloads_last_attempt.before.jobs[workloads_revert_job].before }}"
+    workloads_revert_after: "{{ workloads_last_attempt.before.jobs[workloads_revert_job].after }}"
+
+- name: Stop the job that the release added, {{ workloads_revert_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_revert_job }}?namespace={{ workloads_namespace | urlencode }}"
+    method: DELETE
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  changed_when: true
+  when: workloads_revert_before is none
+
+- name: Read the registered {{ workloads_revert_job }}
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: "{{ workloads_revert_job }}"
+  when: workloads_revert_before is not none
+
+# The attempt may hold no `after` when the controller died between the
+# registration and its record; the registered version then stands for it.
+- name: Keep the pre-release definition of {{ workloads_revert_job }}
+  ansible.builtin.set_fact:
+    workloads_revert_current: "{{ workloads_registered_job }}"
+    workloads_revert_definition: "{{ workloads_revert_version_definition | combine({'Namespace': workloads_namespace}) }}"
+    workloads_revert_done: "{{ workloads_registered_job.json.TaskGroups == workloads_revert_version_definition.TaskGroups }}"
+    workloads_revert_enforce: >-
+      {{ workloads_revert_after if workloads_revert_after is not none else workloads_registered_job.json.Version }}
+    workloads_revert_staged: >-
+      {{ workloads_revert_job == 'cluster'
+         and (workloads_registered_job.json.TaskGroups | map(attribute='Name') | select('match', '^cluster-') | list | length > 0) }}
+  vars:
+    workloads_revert_version_definition: >-
+      {{ (workloads_rollback_versions.results | selectattr('item', 'equalto', workloads_revert_job) | first).json.Versions
+         | selectattr('Version', 'equalto', workloads_revert_before) | first }}
+  when: workloads_revert_before is not none
+
+- name: Refuse a job that another change moved
+  ansible.builtin.assert:
+    that: workloads_revert_done | bool or workloads_registered_job.json.Version == workloads_revert_enforce | int
+    fail_msg: >-
+      {{ workloads_revert_job }} is at version {{ workloads_registered_job.json.Version }}, the release registered
+      version {{ workloads_revert_enforce }}, and the registered definition is not the pre-release version
+      {{ workloads_revert_before }}. Another change moved the job after the release. Read the record and
+      `nomad job history {{ workloads_revert_job }}` before you continue.
+  when: workloads_revert_before is not none
+
+- name: Report a job that is already at its pre-release version, {{ workloads_revert_job }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ workloads_revert_job }} is at version {{ workloads_registered_job.json.Version }}, the pre-release
+      definition: Nomad reverted it, or an earlier rollback did. Nothing to revert.
+  when:
+    - workloads_revert_before is not none
+    - workloads_revert_done | bool
+
+- name: Keep the desired groups for the readiness checks of {{ workloads_revert_job }}
+  ansible.builtin.set_fact:
+    workloads_jobs: "{{ workloads_jobs | combine({workloads_revert_job: workloads_revert_definition}) }}"
+  when: workloads_revert_before is not none
+
+# The body is one expression, so the versions stay integers.
+- name: Revert to the pre-release version {{ workloads_revert_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_revert_job }}/revert?namespace={{ workloads_namespace | urlencode }}"
+    method: POST
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body: >-
+      {{ {'JobID': workloads_revert_job,
+          'JobVersion': workloads_revert_before,
+          'EnforcePriorVersion': workloads_revert_enforce | int,
+          'Namespace': workloads_namespace} }}
+  changed_when: true
+  when:
+    - workloads_revert_before is not none
+    - not workloads_revert_done | bool
+    - not workloads_revert_staged | bool
+
+- name: Wait for {{ workloads_revert_job }}
+  ansible.builtin.include_tasks: wait.yml
+  vars:
+    workloads_wait_job: "{{ workloads_revert_job }}"
+    workloads_job: {name: "{{ workloads_revert_job }}"}
+  when:
+    - workloads_revert_before is not none
+    - not workloads_revert_done | bool
+    - not workloads_revert_staged | bool
+
+- name: Roll the sealer back one member at a time
+  when:
+    - workloads_revert_before is not none
+    - not workloads_revert_done | bool
+    - workloads_revert_staged | bool
+  block:
+    - name: Keep the sealer definitions of the reverse roll
+      ansible.builtin.set_fact:
+        workloads_sealer_new: "{{ workloads_revert_definition }}"
+        workloads_sealer_current: "{{ workloads_revert_current }}"
+
+    - name: Order the members for the reverse roll
+      ansible.builtin.include_tasks: sealer_order.yml
+
+    - name: Roll the sealer back one member at a time
+      ansible.builtin.include_tasks: sealer_step.yml
+      loop: "{{ workloads_sealer_order }}"
+      loop_control:
+        loop_var: workloads_sealer_group
+        index_var: workloads_sealer_index
+
+- name: Record the rollback of {{ workloads_revert_job }}
+  ansible.builtin.set_fact:
+    workloads_last_attempt: >-
+      {{ workloads_last_attempt
+         | combine({'rolled_back': workloads_last_attempt.rolled_back | default([]) + [workloads_revert_job]}) }}
+
+- name: Keep the attempt record of the rollback
+  ansible.builtin.set_fact:
+    workloads_attempt: "{{ workloads_last_attempt }}"
+
+- name: Write the attempt record
+  ansible.builtin.import_tasks: record_write.yml

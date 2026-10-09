@@ -1,0 +1,20 @@
+---
+# One registration in the attempt record, in two writes. Before the
+# registration, the job joins `changed` in registration order with no
+# `after` version: a controller that dies between the two writes leaves
+# the job in the record. After the registration, the entry gets the
+# version Nomad registered (workloads_record_after). The sealer roll
+# registers the cluster job once per member, so a job joins `changed`
+# once and keeps its first `before`.
+- name: Add to the attempt record {{ workloads_register_job }}
+  ansible.builtin.set_fact:
+    workloads_attempt: >-
+      {{ workloads_attempt
+         | combine({'changed': workloads_attempt.changed + ([workloads_register_job] if workloads_register_job not in workloads_attempt.changed else []),
+                    'before': {'jobs': {workloads_register_job: {
+                      'before': (workloads_attempt.before.jobs[workloads_register_job] | default({})).before | default(none),
+                      'after': workloads_record_after | default(none)}}}},
+                   recursive=true) }}
+
+- name: Write the attempt record
+  ansible.builtin.import_tasks: record_write.yml

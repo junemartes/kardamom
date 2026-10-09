@@ -124,12 +124,14 @@ let head = Registry::read(target_path)?;
 let report = Comparison::new(&base, &head).report();
 ```
 
-The deploy preflight is not in the repository yet. Until it is, the
-operator runs the same check by hand before a deploy:
-`just check-formats <deployed revision>`. When the deployed release is more
-than one change behind, the waivers of the earlier changes are in the base
-of that comparison too, and they do not count. The operator then confirms
-each finding by hand.
+The deploy preflight is the release gate of the workloads role
+(`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`). It reads the
+registry of the accepted release from the deploy record, runs
+`kardamom-cluster formats --base <that registry>` for the findings, and
+decides by the findings alone: a waiver in `formats.toml` does not cover a
+finding at deploy time, because the waiver was given against a pull
+request base, not against the release that runs. The gate rules are in
+"The release gate" of `deploy/cluster/README.md`.
 
 ## Rules for a format change
 
@@ -153,12 +155,12 @@ each finding by hand.
 
 - **One-way.** The head writes a version that the base cannot read. After
   the first write, a rollback is not safe.
-  - The deploy must refuse a one-way release unless `KARDAMOM_ALLOW_ONE_WAY`
+  - The deploy refuses a one-way release unless `KARDAMOM_ALLOW_ONE_WAY`
     names its format ids.
-  - The deploy must then record a rollback floor and turn off the automatic
-    revert for the jobs that write the format.
-  - The deploy preflight that does this is not in the repository yet.
-    Until it is, the operator does these steps.
+  - The deploy then records a rollback floor in the deploy record, and
+    `just rollback` does not cross it.
+  - The automatic revert that the floor must turn off is not in the
+    repository yet.
 - **Coordinated.** A mixed fleet cannot run. Either the head cannot read
   what the base writes, or the format is shared and the base cannot read
   what the head writes. Do not roll the release member by member. Stop the
@@ -169,8 +171,8 @@ each finding by hand.
 
 ## Not in the registry
 
-These settings have the same risk, but they are not formats. The deploy
-preflight must refuse to roll them:
+These settings have the same risk, but they are not formats. The release
+gate refuses to roll them:
 
 - The sealer settings that every member must match. See `cluster/sealer-service/README.md`.
 - The shard map. Use the resize playbook.

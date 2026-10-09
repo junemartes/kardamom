@@ -74,3 +74,6 @@
       - workloads_map.table | select('integer') | list | length == 256
       - workloads_map.table | min >= 0
       - workloads_map.table | max < 8
+
+- name: Gate the release
+  ansible.builtin.import_tasks: gate.yml

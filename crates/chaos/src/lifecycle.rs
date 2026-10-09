@@ -92,6 +92,28 @@ pub struct Lifecycle {
     cluster_dir: PathBuf,
 }
 
+/// The last attempt of the environment when a deploy starts. The release
+/// gate refuses a deploy over an attempt that is still `started` unless
+/// the deploy says that the attempt died.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastAttempt {
+    /// Accepted or rolled back: the gate's default.
+    Settled,
+    /// Failed, and this deploy replaces it on purpose
+    /// (`KARDAMOM_REPLACE_ATTEMPT=1`): the broken-image case heals the
+    /// executor job with the real manifest.
+    Dead,
+}
+
+impl LastAttempt {
+    fn env(self) -> Option<(&'static str, String)> {
+        match self {
+            Self::Settled => None,
+            Self::Dead => Some(("KARDAMOM_REPLACE_ATTEMPT", "1".to_string())),
+        }
+    }
+}
+
 impl Lifecycle {
     /// The lifecycle of the `deploy/cluster` tree of `repo_root`.
     #[must_use]
@@ -194,12 +216,18 @@ impl Lifecycle {
     /// # Errors
     ///
     /// Returns an error if the playbook cannot be spawned.
-    pub async fn deploy(&self, nomad_addr: &str, manifest: &str) -> anyhow::Result<bool> {
-        let env = vec![
+    pub async fn deploy(
+        &self,
+        nomad_addr: &str,
+        manifest: &str,
+        last: LastAttempt,
+    ) -> anyhow::Result<bool> {
+        let mut env = vec![
             ("NOMAD_ADDR", nomad_addr.to_string()),
             ("DIGEST_MANIFEST", manifest.to_string()),
             ("KARDAMOM_ENV", "chaos".to_string()),
         ];
+        env.extend(last.env());
         let mut cmd = self.command("ansible-playbook", &env);
         cmd.args(["-i", "localhost,", "ansible/deploy.yml"]);
         if let Ok(extra) = std::env::var(CLUSTER_VARS_ENV) {

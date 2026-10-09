@@ -206,6 +206,36 @@ workloads_canary: "{{ lookup('env', 'KARDAMOM_CANARY') | default('0', true) }}"
 # The sealer members' admin port (cluster_ports.admin): the role reads
 # the leader from it for the staged roll.
 workloads_sealer_admin_port: "{{ cluster_ports.admin }}"
+# The sealer job of the deploy (nomad/cluster.nomad.hcl). The release gate
+# compiles it before any job changes and compares its member settings
+# with the registered cluster.
+workloads_sealer_job:
+  name: cluster
+  retries: 100
+  vars:
+    cluster_retention: "{{ workloads_cluster_retention }}"
+    cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
+    cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
+    cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
+    cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
+    cluster_remote_origins: "{{ workloads_remote_origins }}"
+# The sealer settings that every member must match (the Settings table of
+# cluster/sealer-service/README.md), as the deploy passes them in
+# JAVA_TOOL_OPTIONS. A rolling deploy cannot change one: members on two
+# values decide differently and fork the replicated state. The release
+# gate refuses the change.
+workloads_sealer_must_match:
+  - members
+  - ingressStreamId
+  - dedupCapacity
+  - inclusionHorizonBlocks
+  - orderingWindow
+  - remoteOrigins
+  - voidVoters
+  - voidWindow
+  - daLagBudgetBlocks
+  - recordLagBudget
+  - seedSnapshot
 # The bootstrap of a new sealer cluster (KARDAMOM_CLUSTER_BOOTSTRAP=1).
 # Only a blank member that starts while the bootstrap is open starts at
 # log position 0; every other blank member copies a peer's snapshot. The
@@ -217,8 +247,52 @@ workloads_cluster_bootstrap: "{{ lookup('env', 'KARDAMOM_CLUSTER_BOOTSTRAP') | d
 workloads_cluster_binary: >-
   {{ lookup('env', 'KARDAMOM_CLUSTER_BIN')
      | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
-# The record of the deployed manifests, by environment: deployed/<env>/
-# images.digests is the last successful deploy, .previous the one before.
-# `just rollback <env>` deploys the previous one.
+# The deploy record, by environment. The Nomad variable
+# kardamom/deploys/<env> holds the current attempt and the last accepted
+# release; deployed/<env>/ mirrors it (attempt.json, accepted.json,
+# accepted.formats.toml) and keeps the manifests: images.digests is the
+# last successful deploy, .previous the one before. README.md documents
+# the record. An environment name has letters, digits, `-` and `_` only:
+# the Nomad variable path admits no other character.
 workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
 workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"
+workloads_record_path: "kardamom/deploys/{{ workloads_env }}"
+workloads_record_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_record_path }}?namespace={{ workloads_namespace | urlencode }}"
+# The repository root and its format registry: the formats of the target.
+workloads_repo_root: "{{ workloads_cluster_dir ~ '/../..' }}"
+workloads_formats_file: "{{ workloads_repo_root }}/formats.toml"
+# The revision of the target tree, for the record. Empty: the gate reads
+# it from git or jj.
+workloads_revision: "{{ lookup('env', 'KARDAMOM_REVISION') | default(lookup('env', 'GITHUB_SHA'), true) }}"
+workloads_operator: >-
+  {{ lookup('env', 'KARDAMOM_OPERATOR') | default(lookup('env', 'GITHUB_ACTOR'), true)
+     | default(lookup('env', 'USER'), true) }}
+# The format ids whose one-way change the operator accepts
+# (KARDAMOM_ALLOW_ONE_WAY, comma-separated). The record then carries a
+# rollback floor. A one-way change that the list does not name is refused.
+workloads_allow_one_way: "{{ lookup('env', 'KARDAMOM_ALLOW_ONE_WAY') | split(',') | map('trim') | reject('equalto', '') | list }}"
+# The sealer settings of workloads_sealer_must_match that a documented
+# procedure changes in the rolling path (KARDAMOM_ALLOW_MUST_MATCH,
+# comma-separated): the return from a seeded start changes seedSnapshot
+# and remoteOrigins. A change that the list does not name is refused.
+workloads_allow_must_match: >-
+  {{ lookup('env', 'KARDAMOM_ALLOW_MUST_MATCH') | split(',') | map('trim') | reject('equalto', '') | list }}
+# A deploy over an attempt that is still `started` (KARDAMOM_REPLACE_ATTEMPT=1):
+# the operator says that the attempt died. The gate refuses it otherwise.
+workloads_replace_attempt: "{{ lookup('env', 'KARDAMOM_REPLACE_ATTEMPT') | default('0', true) | bool }}"
+# The format ids of a floor that the operator crosses on purpose
+# (KARDAMOM_ROLLBACK_BELOW_FLOOR), after a check that no writer wrote the
+# new version. The rollback refuses a floor otherwise.
+workloads_rollback_below_floor: >-
+  {{ lookup('env', 'KARDAMOM_ROLLBACK_BELOW_FLOOR') | split(',') | map('trim') | reject('equalto', '') | list }}
+# The ingress JSON-RPC port the gate reads kardamom_chainStatus from.
+workloads_ingress_rpc_port: "{{ ports.ingress_rpc }}"
+# The registry API that holds the images of the manifest, as the
+# controller reaches it (KARDAMOM_REGISTRY_URL). The controller runs
+# outside the cluster resolver, so the Consul name of the registry does
+# not resolve for it. Empty: the node that serves the Nomad API, on the
+# registry port, which is the control node of the local profile. `off`
+# skips the check; only the local profile allows that.
+workloads_registry_url: >-
+  {{ lookup('env', 'KARDAMOM_REGISTRY_URL')
+     | default(workloads_nomad_addr | regex_replace(':[0-9]+$', '') ~ ':' ~ ports.registry, true) }}

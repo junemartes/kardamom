@@ -1057,7 +1057,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The role waits for each Nomad deployment and requires `successful`. A deployment that Nomad marks `failed` fails the play at that job, before the next job is touched.
 - The ingress and the sequencer can deploy a canary (`KARDAMOM_CANARY=1`, default 0). `auto_revert` is on for those two jobs. The other jobs set `auto_revert = false`.
 - A validator with a standing divergence verdict keeps `/ready` failing, so a deploy cannot pass over it.
-- `just rollback <env>` deploys the previous manifest of the environment. It is a normal rolling deploy of older images under the same checks.
+- The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
+- The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
   - The case deploys a manifest whose executor image is a real image that is not an executor.
   - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
