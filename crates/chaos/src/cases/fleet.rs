@@ -33,11 +33,11 @@ pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
 pub(crate) const FULL_RESTART_ELECTION: Duration = Duration::from_mins(3);
 
 /// The three sealer nodes, by member id.
-fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
+pub(crate) fn sealers(h: &Harness) -> anyhow::Result<Vec<String>> {
     (0..3).map(|id| sealer(h, id)).collect()
 }
 
-fn names(nodes: &[String]) -> Vec<&str> {
+pub(crate) fn names(nodes: &[String]) -> Vec<&str> {
     nodes.iter().map(String::as_str).collect()
 }
 

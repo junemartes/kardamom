@@ -175,13 +175,9 @@ impl<'a> StepWait<'a> {
         refusals.is_empty().then_some(())
     }
 
-    /// Why the ingress on `node` refuses a submit. A chain status that
-    /// does not answer is a refusal.
+    /// Why the ingress on `node` refuses a submit.
     async fn refusal_of(&self, node: &Probed) -> Option<String> {
-        let why = match ChainView::read_at(&node.rpc_url(), self.harness.knobs.chain_id).await {
-            Ok(view) => view.refusal(),
-            Err(e) => Some(format!("no chain status ({e:#})")),
-        };
+        let why = ChainView::refusal_at(&node.rpc_url(), self.harness.knobs.chain_id).await;
         why.map(|why| format!("{}: {why}", node.container))
     }
 }
