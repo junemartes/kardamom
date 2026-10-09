@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::exec_stream::ExecStreamSessions;
+use super::recorded_cursor::BestRecorded;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::nomad::Streams;
@@ -23,15 +24,20 @@ pub(crate) async fn graceful_executor(h: &mut Harness) -> anyhow::Result<()> {
         .await
 }
 
-/// The restarted executor must also record a new session of its stream
-/// and move its recorded cursor (see [`ExecStreamSessions`]).
+/// While the killed executor is down, the sealer's best recorded cursor
+/// keeps moving (see [`BestRecorded`]). The restarted executor must also
+/// record a new session of its stream and move its recorded cursor (see
+/// [`ExecStreamSessions`]).
 pub(crate) async fn hard_executor(h: &mut Harness) -> anyhow::Result<()> {
+    let ctx = "hard-executor";
     let sessions = ExecStreamSessions::read(h).await;
+    let best = BestRecorded::read(h, ctx).await?;
     let nodes = executor_containers(h);
     let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
     h.inject_hard(&refs, "executor").await?;
+    best.assert_moves(h, ctx).await?;
     h.assert_count("executor", 3, h.knobs.restart_slo).await?;
-    sessions.assert_restart_records(h, "hard-executor").await
+    sessions.assert_restart_records(h, ctx).await
 }
 
 /// A count of 2, not 1: with a killed marker set, the replacement check

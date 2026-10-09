@@ -20,7 +20,8 @@
 //! count into the proxy's watermark broadcast bus as a `QuorumWatermark`,
 //! each sealed hash onto `tx_status`, and each cluster status (the posted
 //! head, the DA-lag flag, the retention floors) into the proxy's status
-//! channel.
+//! channel. The observer exports the record-lag gauges of each status
+//! itself: the lag needs the durable count that only it holds.
 
 use std::ops::ControlFlow;
 
@@ -102,6 +103,11 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 None,
             ),
             Ok(EgressItem::Status(status)) => {
+                crate::metrics::RecordLagGauges {
+                    lag: status.record_lag,
+                    durable_count: self.watermark.position(),
+                }
+                .record();
                 return ControlFlow::Break(Some(Observed::Status(status)));
             }
             // Replay control frames are per-session responses to a
@@ -280,6 +286,125 @@ mod tests {
         };
         assert_eq!(durable(obs.next_event()), Some(BPosition::from_index(41)));
         assert_eq!(durable(obs.next_event()), Some(BPosition::from_index(41)));
+    }
+
+    /// A recorder that keeps the last value of each gauge, and ignores
+    /// every other metric.
+    #[derive(Clone, Default)]
+    struct Gauges(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>);
+
+    /// One gauge of [`Gauges`].
+    struct GaugeSlot {
+        name: String,
+        gauges: Gauges,
+    }
+
+    impl metrics::GaugeFn for GaugeSlot {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, value: f64) {
+            self.gauges
+                .0
+                .lock()
+                .expect("lock")
+                .insert(self.name.clone(), value);
+        }
+    }
+
+    impl metrics::Recorder for Gauges {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::from_arc(std::sync::Arc::new(GaugeSlot {
+                name: key.name().to_string(),
+                gauges: self.clone(),
+            }))
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    impl Gauges {
+        /// The recorded head and the record lag after one poll of `obs`.
+        fn record_lag_after(obs: &mut ClusterWatermarkObserver<FakeEgress>) -> (f64, f64) {
+            let gauges = Self::default();
+            metrics::with_local_recorder(&gauges, || obs.next_event());
+            let values = gauges.0.lock().expect("lock");
+            (
+                values[crate::metrics::CLUSTER_RECORDED_HEAD],
+                values[crate::metrics::CLUSTER_RECORD_LAG],
+            )
+        }
+    }
+
+    /// The 67-byte status frame carries the best recorded cursor; the lag
+    /// counts the records past it. The 50-byte frame of a sealer with no
+    /// record-lag tail reads as no cursor.
+    #[test]
+    fn the_record_lag_gauges_follow_the_status_tail() {
+        use kardamom_cluster_adapter::wire::{
+            STATUS_LEN, STATUS_WITH_RECORD_LAG_LEN, encode_status,
+        };
+        use kardamom_types::cluster_status::RecordLagStatus;
+
+        let status = ClusterStatus {
+            record_lag: RecordLagStatus {
+                best_recorded: Some(30),
+                budget: 16_384,
+                halted: false,
+            },
+            ..ClusterStatus::default()
+        };
+        let full = encode_status(&status);
+        assert_eq!(full.len(), STATUS_WITH_RECORD_LAG_LEN);
+        let egress = FakeEgress::new();
+        egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250, 0));
+        egress.push(full.clone());
+        egress.push(full[..STATUS_LEN].to_vec());
+        egress.close();
+        let mut obs = ClusterWatermarkObserver::new(egress);
+        assert!(matches!(obs.next_event(), Some(Observed::Progress(_))));
+        assert_eq!(
+            Gauges::record_lag_after(&mut obs),
+            (30.0, 11.0),
+            "42 records, the best cursor at index 30"
+        );
+        assert_eq!(
+            Gauges::record_lag_after(&mut obs),
+            (-1.0, 0.0),
+            "a frame with no tail has no cursor"
+        );
     }
 
     #[test]

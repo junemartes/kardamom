@@ -384,6 +384,7 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 | `kardamom_executor_exec_stream_publish_blocked_ms_total` | Milliseconds that the publisher waited for the archive to take a record. The executor stalls while it grows. |
 
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
+- With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the recorded cursor to the sealer. It sends a cursor that moved when 100 ms passed, or at once when it moved by 1024 records. A sent cursor never moves down. The ingress shows the best cursor of the executors in `kardamom_ingress_cluster_recorded_head`.
 
 ### L1 follower (inbox indexer)
 
@@ -421,7 +422,7 @@ The epoch lane exports these metrics. See "Sequencer" in [failure-modes.md](fail
 ### Ingress cluster status
 
 The ingress reads the status frame of the sealer and exports it on port 9006. The frame carries the posted head, the sealed head,
-and the replay retention of the sealer. See [l1-data-path.md](l1-data-path.md).
+the replay retention of the sealer, and the record-lag guard. See [l1-data-path.md](l1-data-path.md).
 
 | Metric | Meaning |
 | --- | --- |
@@ -429,9 +430,12 @@ and the replay retention of the sealer. See [l1-data-path.md](l1-data-path.md).
 | `kardamom_ingress_cluster_sealed_head` | The last sealed block. |
 | `kardamom_ingress_cluster_retained_frames` | The egress frames that the sealer keeps for replay. The count is above the retention window while unposted blocks hold it there. |
 | `kardamom_ingress_cluster_floor_block` | The oldest boundary block that the sealer still keeps. This is the replay floor. |
+| `kardamom_ingress_cluster_recorded_head` | The best recorded cursor of the executors: the highest canonical index that one executor or more recorded. `-1` while no executor sent a cursor, and for a status frame of a sealer that sends no record-lag tail. |
+| `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
+- The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.
 
 ### Receipt cache and lookups
 

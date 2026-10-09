@@ -14,12 +14,15 @@
 //! - the locator log ([`LocatorLog`]), which maps a canonical index to a
 //!   position in a recording;
 //! - the recorded cursor, the highest canonical index whose records the
-//!   archive has written. It never passes the recording position.
+//!   archive has written. It never passes the recording position. With
+//!   the cursor on, the thread sends it to the sealer on a fixed cadence
+//!   ([`CursorHandoff`]).
 //!
 //! A recorder thread holds the local recording of this session and reads
 //! its recording position. The executor serves only after that recording
 //! is active.
 
+mod cadence;
 mod cursor;
 mod locators;
 mod metrics;
@@ -27,8 +30,11 @@ mod open;
 mod publisher;
 
 #[cfg(test)]
+mod cadence_tests;
+#[cfg(test)]
 mod tests;
 
+pub use cadence::CursorHandoff;
 pub use locators::{Locator, LocatorLog};
 pub use metrics::ExecStreamMetrics;
 pub use open::{ExecStream, ExecStreamConfig, ExecStreamThreads};
