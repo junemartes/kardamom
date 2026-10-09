@@ -53,10 +53,12 @@ use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
 
+mod exec;
 mod recording;
+pub use exec::ExecReplay;
 #[cfg(any(test, feature = "testing"))]
 pub use recording::FakeArchiveCatalog;
-use recording::{FoundRecording, Located, RecordedLimit, Unresolved, Wanted};
+use recording::{FoundRecording, Located, Origin, RecordedLimit, Unresolved, Wanted};
 
 /// How long a single archive control connect may take before the endpoint is
 /// declared down and rotated. This is short, because it runs inside a
@@ -95,6 +97,19 @@ impl EndpointSource {
     /// The endpoints to try now, as `host:port`.
     #[must_use]
     pub fn current(&self) -> Vec<String> {
+        self.matching(|_| true)
+    }
+
+    /// The endpoints of the archive `archive_id`, as `host:port`. A static
+    /// list names no archive id, so it gives every endpoint.
+    #[must_use]
+    pub fn of_archive(&self, archive_id: &str) -> Vec<String> {
+        self.matching(|a| a.archive_id == archive_id)
+    }
+
+    /// The endpoints of the discovered archives of the topic that `keep`
+    /// accepts, or the whole static list.
+    fn matching(&self, keep: impl Fn(&ArchiveRecord) -> bool) -> Vec<String> {
         match self {
             Self::Static(list) => list.clone(),
             Self::Discovered { topic, archives } => archives
@@ -102,7 +117,7 @@ impl EndpointSource {
                 .entries
                 .values()
                 .filter_map(|e| ArchiveRecord::from_entry(e).ok())
-                .filter(|a| a.records(*topic))
+                .filter(|a| a.records(*topic) && keep(a))
                 .map(|a| a.control.to_string())
                 .collect(),
         }
@@ -125,6 +140,9 @@ pub struct RefetchConfig {
     pub tx_data_endpoints: EndpointSource,
     /// Remote archive control endpoints recording `tx_deposits`.
     pub tx_deposits_endpoints: EndpointSource,
+    /// Remote archive control endpoints recording `exec_txs`: the
+    /// archives on the executor nodes.
+    pub exec_txs_endpoints: EndpointSource,
     /// This node's UDP endpoint (`host:port`) for archive control responses.
     pub response_endpoint: String,
     /// This node's UDP endpoint (`host:port`) that replayed fragments land
@@ -260,7 +278,7 @@ impl ArchiveRefetcher {
         let wanted = Wanted {
             stream_id,
             session_id,
-            from,
+            from: Origin::Term(from),
         };
         let found = wanted.resolve(recs).map_err(|u| self.refuse(u))?;
         let Some(plan) = self.prepare_replay(&endpoints, &found, wanted)? else {

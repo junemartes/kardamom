@@ -22,12 +22,12 @@ use super::void::{MAX_READ_AHEAD, ParkOutcome, ReadAhead, VoidPark};
 use super::*;
 use crate::error::ExecutorError;
 
-type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
+pub(super) type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
 
 /// An ordering subscription over a fixed queue. It records every vote.
-struct VotingSub {
+pub(super) struct VotingSub {
     queue: VecDeque<(BPosition, TxOrderingMessage)>,
-    votes: Votes,
+    pub(super) votes: Votes,
     outcome: OfferOutcome,
 }
 
@@ -35,7 +35,7 @@ impl VotingSub {
     /// The queue, numbered from `start` the way the cluster subscription
     /// numbers its deliveries: each record takes one canonical index, and a
     /// boundary carries the index of the record that follows it.
-    fn new(start: u64, queue: Vec<TxOrderingMessage>) -> Self {
+    pub(super) fn new(start: u64, queue: Vec<TxOrderingMessage>) -> Self {
         let mut next = start;
         let numbered = queue
             .into_iter()
@@ -94,7 +94,7 @@ fn voter_cfg() -> ReaderConfig {
 }
 
 type TestReader =
-    TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream>;
+    TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream, TxDataJoin>;
 
 /// A reader over `sub`, with its exec sink's far end.
 fn reader(
@@ -105,11 +105,13 @@ fn reader(
     let (exec_out, rx) = unbounded();
     let reader = TxOrderingReader::new(TxOrderingInputs {
         sub,
-        buffer,
         cfg,
         exec_out,
         exec_stream: NoExecStream,
-        recovery_factory: None,
+        join: TxDataSeed {
+            buffer,
+            recovery: None,
+        },
     });
     (reader, rx)
 }

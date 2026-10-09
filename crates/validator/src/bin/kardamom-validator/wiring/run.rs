@@ -126,7 +126,7 @@ impl ExecPorts for ValidatorWiring {
 }
 
 impl EngineWiring for ValidatorWiring {
-    type TxData = bin_support::LiveTxDataSub;
+    type TxSource = bin_support::LiveTxSource;
     type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = TxReceiptsChain;
     // The validator publishes no executor stream.

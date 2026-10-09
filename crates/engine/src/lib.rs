@@ -17,6 +17,7 @@
 
 pub mod actor;
 pub mod bin_support;
+pub mod keyed_buffer;
 pub mod metrics;
 pub mod persist;
 pub mod reader;

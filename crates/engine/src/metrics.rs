@@ -159,3 +159,22 @@ pub fn describe() {
         "per-block gas / true critical-path gas — the bound no predictor beats"
     );
 }
+
+/// The executor stream of a consumer outside the executors
+/// (`reader::ExecStreamSource`).
+///
+/// Records the buffer refused, by `reason`: `repeat` is the dedup of the
+/// copies of the other executors, `late` an index the reader passed,
+/// `bound`, `evicted` and `ahead` the limits of the buffer.
+pub const EXEC_STREAM_DROPPED_TOTAL: &str = "kardamom_exec_stream_dropped_total";
+/// Records that failed the check against the canonical `TxRef`, by
+/// `reason`: `tx_ref` (the reference differs) or `hash` (the keccak of the
+/// bytes is not the canonical hash).
+pub const EXEC_STREAM_RECORD_REJECTED_TOTAL: &str = "kardamom_exec_stream_record_rejected_total";
+/// Asks of one executor on a miss, by `outcome`: `located` (a good copy),
+/// `mismatch`, `absent` (the replay held no record at the index),
+/// `not_reached`, `not_held`, `lost`, `no_answer`, `replay_failed`.
+pub const EXEC_STREAM_REFETCH_TOTAL: &str = "kardamom_exec_stream_refetch_total";
+/// How long the reader has waited for the record at one index. Zero when
+/// no wait runs.
+pub const EXEC_STREAM_WAIT_SECONDS: &str = "kardamom_exec_stream_wait_seconds";

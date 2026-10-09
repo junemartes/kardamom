@@ -287,6 +287,17 @@ groups:
           description: "Two records of one L1 block number with different hashes arrived on l1_blocks: one follower instance read a lie its two-source check did not catch. The consumer takes nothing more from the stream until an operator clears the halt. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/l1_follower_disagreement.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/l1_follower_disagreement.md"
 
+      - alert: KardamomHaltExecRecordMismatch
+        expr: kardamom_halt{cause="exec_record_mismatch"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          cause: exec_record_mismatch
+        annotations:
+          summary: "{{ $labels.service }} halted: exec_record_mismatch ({{ $labels.host_id }})"
+          description: "At one canonical index every executor archive holds a record that fails the validator's check against the canonical TxRef. The validator does not execute or drop the entry, and waits for an operator after the investigation. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/exec_record_mismatch.md (recovery id {{ $labels.recovery }})."
+          runbook: "docs/runbooks/exec_record_mismatch.md"
+
       # A restarted sequencer can miss the epoch the sealer expects while
       # its twin offers it again within milliseconds. The rule waits one
       # minute, so only a gap that no replica fills pages.

@@ -79,35 +79,9 @@ impl Check {
     }
 }
 
-/// Why a replica result does not count as checked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Skip {
-    /// It arrived below the check window, or its key has no checked
-    /// result left.
-    Late,
-    /// The same session already published the same result for the key.
-    Repeat,
-    /// Its key already holds the bound of distinct results, or its result
-    /// already names the bound of sessions.
-    Bound,
-    /// The buffer was full, and its key was the highest one.
-    Evicted,
-    /// Its key is more than the reach above the consumer's cursor.
-    Ahead,
-}
-
-impl Skip {
-    /// The stable id: the `reason` label of the unchecked metric.
-    pub(crate) const fn id(self) -> &'static str {
-        match self {
-            Self::Late => "late",
-            Self::Repeat => "repeat",
-            Self::Bound => "bound",
-            Self::Evicted => "evicted",
-            Self::Ahead => "ahead",
-        }
-    }
-}
+/// Why a replica result does not count as checked. The `reason` label
+/// of the unchecked metric is [`Skip::id`].
+pub(crate) use kardamom_engine::keyed_buffer::Skip;
 
 /// One distinct result for one key, and the sessions that published it.
 #[derive(Clone, Debug, PartialEq, Eq)]

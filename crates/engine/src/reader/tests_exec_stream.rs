@@ -101,14 +101,16 @@ fn run(
     let log = SharedLog::default();
     let reader = TxOrderingReader::new(TxOrderingInputs {
         sub: QueueSub(queue.into()),
-        buffer,
         cfg: ReaderConfig::default(),
         exec_out: log.clone(),
         exec_stream: StreamLog {
             log: log.clone(),
             open,
         },
-        recovery_factory: None,
+        join: TxDataSeed {
+            buffer,
+            recovery: None,
+        },
     });
     let outcome = reader.run();
     (outcome, log.take())

@@ -66,7 +66,7 @@ where
     O: crate::TxOrderingSubscription + 'static,
     R: crate::TxReceiptsPublication + 'static,
 {
-    type TxData = D;
+    type TxSource = crate::reader::TxDataSource<D>;
     type TxOrdering = O;
     type TxReceipts = R;
     type ExecStream = crate::reader::NoExecStream;
@@ -196,9 +196,8 @@ impl ChannelHarness {
         let threads = crate::Executor::<HarnessWiring>::new(
             cfg,
             crate::Inbound {
-                tx_data: tx_data_subs,
+                tx_source: crate::reader::TxDataSource::new(tx_data_subs, None),
                 tx_ordering: ChanTxOrderingSub(b_rx),
-                join_recovery: None,
                 exec_stream: crate::reader::NoExecStream,
             },
             crate::Outbound {

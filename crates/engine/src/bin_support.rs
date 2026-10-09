@@ -24,8 +24,12 @@ use kardamom_log::refetch::{EndpointSource, RefetchConfig};
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
+use crate::actor::Either;
 use crate::error::ExecutorError;
-use crate::reader::{JoinRecoveryFactory, TxDataSubscription};
+use crate::reader::{
+    ExecRecordSubscription, ExecStreamSource, JoinRecoveryFactory, LiveExecArchiveSeed,
+    LocatorClient, TxDataSource, TxDataSubscription,
+};
 
 /// CLI mirror of [`kardamom_state::Durability`]. Clap renders the variants
 /// as `durable` and `safe-no-sync`.
@@ -225,11 +229,11 @@ pub fn archive_join_recovery(
     replay_endpoint: Option<&str>,
 ) -> Option<JoinRecoveryFactory> {
     let channels = plane.channels().clone();
-    let (tx_data_endpoints, tx_deposits_endpoints) = archive_endpoints(plane, aeron_cfg);
-    if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
+    let sources = ArchiveSources::of(plane, aeron_cfg);
+    if !sources.tx_data.is_configured() && !sources.tx_deposits.is_configured() {
         return None;
     }
-    let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
+    let Some(local) = LocalRefetch::new(aeron_cfg, aeron_dir, response_endpoint, replay_endpoint)
     else {
         tracing::warn!(
             "durability-archive endpoints configured but no local refetch endpoints \
@@ -238,42 +242,191 @@ pub fn archive_join_recovery(
         );
         return None;
     };
-    let cfg = RefetchConfig {
-        tx_data_endpoints,
-        tx_deposits_endpoints,
-        response_endpoint: response_endpoint.to_string(),
-        replay_endpoint: replay_endpoint.to_string(),
-        aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
-        aeron: aeron_cfg.clone(),
-    };
     Some(JoinRecoveryFactory {
-        cfg,
+        cfg: local.config(sources),
         tx_data_stream_base: channels.tx_data_stream_id_base,
     })
 }
 
-/// The archive endpoint sources of the two refetched topics: the live
-/// archive records on a discovered plane, else the static lists.
-fn archive_endpoints(
-    plane: &mut kardamom_log::discovery::StreamPlane,
-    aeron_cfg: &AeronConfig,
-) -> (EndpointSource, EndpointSource) {
-    match plane.watch_archives() {
-        Some(archives) => (
-            EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxData,
-                archives: archives.clone(),
+/// The archive endpoint sources of the three refetched topics: the live
+/// archive records on a discovered plane, else the static lists. The
+/// static config lists no executor archive.
+struct ArchiveSources {
+    tx_data: EndpointSource,
+    tx_deposits: EndpointSource,
+    exec_txs: EndpointSource,
+}
+
+impl ArchiveSources {
+    fn of(plane: &mut kardamom_log::discovery::StreamPlane, aeron_cfg: &AeronConfig) -> Self {
+        use kardamom_log::discovery::Topic;
+        match plane.watch_archives() {
+            Some(archives) => {
+                let [tx_data, tx_deposits, exec_txs] =
+                    [Topic::TxData, Topic::TxDeposits, Topic::ExecTxs].map(|topic| {
+                        EndpointSource::Discovered {
+                            topic,
+                            archives: archives.clone(),
+                        }
+                    });
+                Self {
+                    tx_data,
+                    tx_deposits,
+                    exec_txs,
+                }
+            }
+            None => Self {
+                tx_data: EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
+                tx_deposits: EndpointSource::Static(
+                    aeron_cfg.tx_deposits_archive_endpoints.clone(),
+                ),
+                exec_txs: EndpointSource::Static(Vec::new()),
             },
-            EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxDeposits,
-                archives,
-            },
-        ),
-        None => (
-            EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
-            EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
-        ),
+        }
     }
+}
+
+/// This node's side of an archive refetch: the two local endpoints, the
+/// media-driver dir, and the base Aeron config.
+struct LocalRefetch {
+    response_endpoint: String,
+    replay_endpoint: String,
+    aeron_dir: Option<std::path::PathBuf>,
+    aeron: AeronConfig,
+}
+
+impl LocalRefetch {
+    /// `None` when a local endpoint is missing.
+    fn new(
+        aeron_cfg: &AeronConfig,
+        aeron_dir: Option<&Path>,
+        response_endpoint: Option<&str>,
+        replay_endpoint: Option<&str>,
+    ) -> Option<Self> {
+        Some(Self {
+            response_endpoint: response_endpoint?.to_string(),
+            replay_endpoint: replay_endpoint?.to_string(),
+            aeron_dir: aeron_dir.map(Path::to_path_buf),
+            aeron: aeron_cfg.clone(),
+        })
+    }
+
+    fn config(self, sources: ArchiveSources) -> RefetchConfig {
+        RefetchConfig {
+            tx_data_endpoints: sources.tx_data,
+            tx_deposits_endpoints: sources.tx_deposits,
+            exec_txs_endpoints: sources.exec_txs,
+            response_endpoint: self.response_endpoint,
+            replay_endpoint: self.replay_endpoint,
+            aeron_dir: self.aeron_dir,
+            aeron: self.aeron,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The executor stream source of a consumer outside the executors.
+// ---------------------------------------------------------------------------
+
+/// Which transaction source a consumer outside the executors reads. Clap
+/// renders the variants as `tx-data` and `exec-stream`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TxSourceArg {
+    /// Join the `tx_data` lanes, as the executor does.
+    TxData,
+    /// Read the executor stream, and refetch a miss from the executor
+    /// archives. The consumer never votes.
+    ExecStream,
+}
+
+impl TxSourceArg {
+    /// The flag value, for the log line.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::TxData => "tx-data",
+            Self::ExecStream => "exec-stream",
+        }
+    }
+}
+
+/// The live `exec_txs` subscription of a consumer. One destination per
+/// executor. The feed thread blocks on it, off the tokio runtime.
+pub struct LiveExecTxsSub(kardamom_log::aeron_live::ExecTxsSubscriberHandle);
+
+impl ExecRecordSubscription for LiveExecTxsSub {
+    fn next(&mut self) -> Option<kardamom_types::ExecTxRecord> {
+        self.0.blocking_recv().map(|(_, record)| record)
+    }
+}
+
+/// The executor stream source of a live consumer: the live subscription,
+/// and the executor archives when the locator and the refetch are wired.
+pub type LiveExecStreamSource = ExecStreamSource<LiveExecTxsSub, Option<LiveExecArchiveSeed>>;
+
+/// The transaction source a flag picks: the `tx_data` lanes or the
+/// executor stream.
+pub type LiveTxSource = Either<TxDataSource<LiveTxDataSub>, LiveExecStreamSource>;
+
+/// Everything [`open_exec_stream`] needs.
+pub struct ExecStreamConfig<'a> {
+    pub rt: &'a AeronRuntime,
+    pub plane: &'a mut kardamom_log::discovery::StreamPlane,
+    pub aeron_cfg: &'a AeronConfig,
+    pub aeron_dir: Option<&'a Path>,
+    pub archive_control_response_endpoint: Option<&'a str>,
+    pub replay_destination_endpoint: Option<&'a str>,
+    /// The query endpoints of the executors, as `http://host:port`. The
+    /// locator query of a miss asks them in this order.
+    pub executor_query_endpoints: &'a [String],
+}
+
+/// Open the executor stream source: the live `exec_txs` subscription, and
+/// the miss path when the executor query endpoints and the local refetch
+/// endpoints are set. Without the miss path a lost live record waits for
+/// a void record, and a warning says so.
+///
+/// # Errors
+///
+/// Returns `Err` when the subscription fails to open, or an executor
+/// query endpoint names no `host:port`.
+pub fn open_exec_stream(cfg: ExecStreamConfig<'_>) -> Result<LiveExecStreamSource> {
+    let ExecStreamConfig {
+        rt,
+        plane,
+        aeron_cfg,
+        aeron_dir,
+        archive_control_response_endpoint,
+        replay_destination_endpoint,
+        executor_query_endpoints,
+    } = cfg;
+    let sub = plane
+        .subscriber::<kardamom_log::aeron_live::ExecTxsSubscriberHandle>(rt)
+        .context("open exec_txs subscription")?;
+    let locator = LocatorClient::new(executor_query_endpoints).map_err(anyhow::Error::msg)?;
+    let stream_id = plane.channels().exec_txs_stream_id;
+    let sources = ArchiveSources::of(plane, aeron_cfg);
+    let local = LocalRefetch::new(
+        aeron_cfg,
+        aeron_dir,
+        archive_control_response_endpoint,
+        replay_destination_endpoint,
+    );
+    let archive = if let (Some(local), false) = (local, locator.is_empty()) {
+        Some(LiveExecArchiveSeed {
+            locator,
+            refetch: local.config(sources),
+            stream_id,
+        })
+    } else {
+        tracing::warn!(
+            "executor stream refetch DISABLED (needs --executor-query-endpoints, \
+             --archive-control-response-endpoint and --replay-destination-endpoint); \
+             a lost exec_txs record waits for the live stream or a void record"
+        );
+        None
+    };
+    Ok(ExecStreamSource::new(LiveExecTxsSub(sub), archive))
 }
 
 // ---------------------------------------------------------------------------
@@ -394,38 +547,72 @@ pub struct InboundConfig<'a> {
     /// re-export; the validator suppresses its own copy to avoid a
     /// second, lagging series.
     pub suppress_sealer_metrics: bool,
+    /// The transaction source: the `tx_data` lanes, or the executor
+    /// stream.
+    pub tx_source: TxSourceArg,
+    /// The executor query endpoints of the executor stream's miss path.
+    /// Unused on the `tx_data` source.
+    pub executor_query_endpoints: &'a [String],
 }
 
-/// Open the shared inbound side of the engine, both role binaries run
-/// unchanged: the M `tx_data` streams (bridged async-to-sync, always live
-/// multicast, join-miss gaps recovered in-band by archive refetch), and
-/// the one `tx_ordering` subscription (always the Aeron Cluster egress).
-/// Returns the ready-to-run [`Inbound`] plus the
+impl InboundConfig<'_> {
+    /// Open the transaction source that [`Self::tx_source`] names: the M
+    /// `tx_data` streams (always live multicast, join-miss gaps recovered
+    /// in-band by archive refetch), or the executor stream.
+    fn open_tx_source(&mut self) -> Result<LiveTxSource> {
+        tracing::info!(
+            tx_source = self.tx_source.id(),
+            "{}: transaction source",
+            self.bin_name
+        );
+        match self.tx_source {
+            TxSourceArg::TxData => {
+                let tx_data = open_tx_data_subs(self.rt, self.plane)?;
+                let join_recovery = archive_join_recovery(
+                    self.plane,
+                    self.aeron_cfg,
+                    self.aeron_dir,
+                    self.archive_control_response_endpoint,
+                    self.replay_destination_endpoint,
+                );
+                Ok(Either::Left(TxDataSource::new(tx_data, join_recovery)))
+            }
+            TxSourceArg::ExecStream => open_exec_stream(ExecStreamConfig {
+                rt: self.rt,
+                plane: self.plane,
+                aeron_cfg: self.aeron_cfg,
+                aeron_dir: self.aeron_dir,
+                archive_control_response_endpoint: self.archive_control_response_endpoint,
+                replay_destination_endpoint: self.replay_destination_endpoint,
+                executor_query_endpoints: self.executor_query_endpoints,
+            })
+            .map(Either::Right),
+        }
+    }
+}
+
+/// Open the shared inbound side of the engine for a consumer that reads
+/// the transaction source a flag picks (see [`InboundConfig::tx_source`]),
+/// and the one `tx_ordering` subscription (always the Aeron Cluster
+/// egress). Returns the ready-to-run [`Inbound`] plus the
 /// [`kardamom_cluster_adapter::LiveCluster`] guard, which the caller
 /// holds until shutdown.
 ///
 /// # Errors
 ///
-/// Returns `Err` when opening the `tx_data` subscriptions or the cluster
+/// Returns `Err` when opening the transaction source or the cluster
 /// ordering connection fails.
 pub fn open_inbound<W>(
-    cfg: InboundConfig<'_>,
+    mut cfg: InboundConfig<'_>,
 ) -> Result<(crate::Inbound<W>, kardamom_cluster_adapter::LiveCluster)>
 where
     W: crate::EngineWiring<
-            TxData = LiveTxDataSub,
+            TxSource = LiveTxSource,
             TxOrdering = LiveTxOrderingSub,
             ExecStream = crate::reader::NoExecStream,
         >,
 {
-    let tx_data = open_tx_data_subs(cfg.rt, cfg.plane)?;
-    let join_recovery = archive_join_recovery(
-        cfg.plane,
-        cfg.aeron_cfg,
-        cfg.aeron_dir,
-        cfg.archive_control_response_endpoint,
-        cfg.replay_destination_endpoint,
-    );
+    let tx_source = cfg.open_tx_source()?;
     let (cluster_guard, cluster_sub) =
         connect_cluster_ordering(cfg.aeron_dir, cfg.cluster_cfg, cfg.cursor)?;
     tracing::info!("{}: tx_ordering via Aeron Cluster", cfg.bin_name);
@@ -436,9 +623,8 @@ where
     };
     Ok((
         crate::Inbound {
-            tx_data,
+            tx_source,
             tx_ordering,
-            join_recovery,
             exec_stream: crate::reader::NoExecStream,
         },
         cluster_guard,

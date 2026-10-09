@@ -109,6 +109,20 @@ pub enum ExecutorError {
     /// peers. There is no local repair: the replica stops.
     #[error("void record for executed entry: index={index} tx_hash={tx_hash:?}")]
     VoidOfExecutedEntry { index: u64, tx_hash: B256 },
+
+    /// Every executor archive holds a record at this canonical index, and
+    /// no record passes the check against the canonical `TxRef`: its
+    /// reference differs, or the keccak of its bytes is not the canonical
+    /// hash. A consumer outside the executors does not execute the entry and
+    /// does not drop it. It is an integrity fault for an operator.
+    #[error(
+        "every executor archive holds a mismatched record: index={index} tx_hash={tx_hash:?} executors={executors}"
+    )]
+    ExecRecordMismatch {
+        index: u64,
+        tx_hash: B256,
+        executors: usize,
+    },
 }
 
 /// Role-agnostic alias for the engine error. New engine and validator code

@@ -44,18 +44,28 @@
 //! on this.
 
 pub mod cluster;
+mod exec_stream;
 mod join;
 mod ports;
+mod source;
 mod threads;
+mod tx_data;
 mod void;
 
+pub use exec_stream::{
+    ArchiveLocator, ExecArchive, ExecArchiveSeed, ExecFetchError, ExecRecordSubscription,
+    ExecStreamJoin, ExecStreamSeed, ExecStreamSource, LiveExecArchive, LiveExecArchiveSeed,
+    LocatorAnswer, LocatorClient, LocatorError, QueryEndpoint, RecordBuffer,
+};
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{
     EpochObserver, ExecSink, ExecStreamItem, ExecStreamSink, JoinRecovery, JoinRecoveryError,
     JoinRecoveryFactory, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, RemoteEpochObserver,
     SinkClosed, TxDataSubscription, TxOrderingSubscription,
 };
+pub use source::{FeedHandle, JoinAt, JoinSeed, Joined, SourceStart, TxJoin, TxSource};
 pub use threads::{ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
+pub use tx_data::{TxDataJoin, TxDataSeed, TxDataSource};
 
 #[cfg(test)]
 mod tests;

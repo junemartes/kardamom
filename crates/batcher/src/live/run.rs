@@ -23,8 +23,8 @@ use tracing::{info, warn};
 use kardamom_engine::ExecutorError;
 use kardamom_engine::bin_support;
 use kardamom_engine::reader::{
-    JoinBuffer, JoinRecoveryFactory, NoExecStream, ReaderConfig, ReaderToExec, TxDataReader,
-    TxOrderingInputs, TxOrderingReader,
+    JoinRecoveryFactory, NoExecStream, ReaderConfig, ReaderToExec, SourceStart, TxDataSource,
+    TxOrderingInputs, TxOrderingReader, TxSource,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::{AeronConfig, LogConfig};
@@ -319,11 +319,10 @@ impl RunConfig {
         let posted_cursor = PostedCursor::new(tx_ordering_sub.posted_cursor_publisher());
         info!("kardamom-batcher: tx_ordering via Aeron Cluster");
 
-        let join_buffer = JoinBuffer::new();
-        let join_handles = tx_data_subs
-            .into_iter()
-            .map(|sub| TxDataReader::new(sub, join_buffer.clone()).spawn())
-            .collect();
+        let SourceStart {
+            feeds: join_handles,
+            seed,
+        } = TxDataSource::new(tx_data_subs, join_recovery).start();
         // There is no tx_deposits reader. Deposits ride inside the epoch
         // record on the canonical stream, so there is nothing to join
         // against. The channel is bounded. The reader thread calls
@@ -342,11 +341,10 @@ impl RunConfig {
         };
         let ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
             sub: tx_ordering_sub,
-            buffer: join_buffer,
             cfg: reader_cfg,
             exec_out: feed_tx,
             exec_stream: NoExecStream,
-            recovery_factory: join_recovery,
+            join: seed,
         });
 
         Ok(ReaderStack {

@@ -80,8 +80,11 @@ impl FoundRecording {
             .map_err(|e| LogError::Aeron(format!("refetch: recording {}: {e}", self.recording_id)))
     }
 
-    fn locate(self, from: BPosition) -> Result<Located, LogError> {
-        let from_raw = self.raw_position(from)?;
+    fn locate(self, from: Origin) -> Result<Located, LogError> {
+        let from_raw = match from {
+            Origin::Term(pos) => self.raw_position(pos)?,
+            Origin::Raw(raw) => raw,
+        };
         Ok(Located {
             rec: self,
             from_raw,
@@ -147,13 +150,22 @@ impl Unresolved {
     }
 }
 
+/// Where a wanted range starts: a fragment-start [`BPosition`], which the
+/// term layout of each recording places, or a raw position of the
+/// recording's position space, as a locator names it.
+#[derive(Clone, Copy)]
+pub(super) enum Origin {
+    Term(BPosition),
+    Raw(i64),
+}
+
 /// The range that a refetch asks for: a publisher session on one stream,
 /// from one position.
 #[derive(Clone, Copy)]
 pub(super) struct Wanted {
     pub(super) stream_id: i32,
     pub(super) session_id: i32,
-    pub(super) from: BPosition,
+    pub(super) from: Origin,
 }
 
 impl Wanted {
@@ -241,7 +253,7 @@ impl FakeArchiveCatalog {
         let wanted = Wanted {
             stream_id: 0,
             session_id: 0,
-            from,
+            from: Origin::Term(from),
         };
         wanted
             .resolve(recs)

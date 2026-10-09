@@ -59,11 +59,16 @@ pub enum HaltCause {
     /// L1 block number with inconsistent payloads: one follower instance read
     /// a lie that its cross-check did not catch.
     L1FollowerDisagreement,
+    /// Every executor archive holds a record at one canonical index, and
+    /// no record passes the validator's check against the canonical
+    /// `TxRef`. A new variant goes last, for the reason [`RecoveryId`]
+    /// gives.
+    ExecRecordMismatch,
 }
 
 impl HaltCause {
     /// Every cause, for the tests that check the rules and the runbooks.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -76,6 +81,7 @@ impl HaltCause {
         Self::RecordLag,
         Self::L1LightClientMismatch,
         Self::L1FollowerDisagreement,
+        Self::ExecRecordMismatch,
     ];
 
     /// The stable id: the `cause` label of the gauge and the alert.
@@ -101,6 +107,7 @@ impl HaltCause {
             Self::RecordLag => RecoveryId::RecordLag,
             Self::L1LightClientMismatch => RecoveryId::L1LightClientMismatch,
             Self::L1FollowerDisagreement => RecoveryId::L1FollowerDisagreement,
+            Self::ExecRecordMismatch => RecoveryId::ExecRecordMismatch,
         }
     }
 
@@ -113,7 +120,9 @@ impl HaltCause {
     /// be recovered or the chain reverted, a verdict must be examined, or a
     /// resume block must be chosen. A light client that disagrees with
     /// two agreeing sources, and two follower instances that disagree,
-    /// need an operator to decide which side lies.
+    /// need an operator to decide which side lies. A record that no
+    /// executor archive holds with the canonical hash is an integrity
+    /// fault: an operator finds the cause before the validator goes on.
     #[must_use]
     pub fn clears(self) -> Clears {
         match self {
@@ -128,7 +137,8 @@ impl HaltCause {
             | Self::ValidatorDivergence
             | Self::L1CursorUnreadable
             | Self::L1LightClientMismatch
-            | Self::L1FollowerDisagreement => Clears::Operator,
+            | Self::L1FollowerDisagreement
+            | Self::ExecRecordMismatch => Clears::Operator,
         }
     }
 }
@@ -162,11 +172,14 @@ pub enum RecoveryId {
     L1LightClientMismatch,
     /// Two follower instances published inconsistent records for one block.
     L1FollowerDisagreement,
+    /// The validator's executor stream check: every executor archive holds
+    /// a mismatched record.
+    ExecRecordMismatch,
 }
 
 impl RecoveryId {
     /// Every runbook, for the test that checks each file exists.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::L1SourceDisagreement,
         Self::L1ChainBreak,
         Self::L1Unreachable,
@@ -179,6 +192,7 @@ impl RecoveryId {
         Self::RecordLag,
         Self::L1LightClientMismatch,
         Self::L1FollowerDisagreement,
+        Self::ExecRecordMismatch,
         Self::RevertToPostedHead,
     ];
 
@@ -199,6 +213,7 @@ impl RecoveryId {
             Self::RecordLag => "record_lag",
             Self::L1LightClientMismatch => "l1_light_client_mismatch",
             Self::L1FollowerDisagreement => "l1_follower_disagreement",
+            Self::ExecRecordMismatch => "exec_record_mismatch",
             Self::RevertToPostedHead => "revert_to_posted_head",
         }
     }

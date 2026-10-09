@@ -18,6 +18,7 @@
 use std::ops::ControlFlow;
 
 use anyhow::Result;
+use kardamom_engine::ExecutorError;
 
 use super::run::{EngineOutcome, RunEnd};
 use super::startup::{Boot, Startup};
@@ -34,6 +35,11 @@ pub(crate) enum Verdict {
     /// until an operator clears it, then runs the pipeline again from
     /// its cursor.
     Halt(String),
+    /// Every executor archive holds a record that fails the check at one
+    /// index, with the reason: the process holds, halted on
+    /// `exec_record_mismatch`, until an operator clears it, then runs the
+    /// pipeline again from its cursor.
+    Mismatch(String),
     /// Leave the process with this status: 1, an availability failure
     /// the process cannot repair, for the orchestrator to restart.
     Exit(i32),
@@ -51,6 +57,13 @@ pub(crate) fn verdict(outcome: &EngineOutcome, repaired: Option<&str>) -> Verdic
         // fault. Any other engine failure is an availability problem,
         // not an integrity one, and must not look like one.
         EngineOutcome::Diverged(reason) => Verdict::Halt(reason.clone()),
+        // A record that no executor archive holds with the canonical hash
+        // is an integrity fault in the executor stream. The chain state is
+        // not in doubt, so no divergence verdict is recorded, but a
+        // restart would only meet the same index again.
+        EngineOutcome::Failed(e @ ExecutorError::ExecRecordMismatch { .. }) => {
+            Verdict::Mismatch(e.to_string())
+        }
         EngineOutcome::Failed(_) | EngineOutcome::Panicked => match repaired {
             Some("peer-checkpoint") => Verdict::Revolve,
             _ => Verdict::Exit(1),
@@ -135,19 +148,12 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
         Verdict::Done => return Ok(ControlFlow::Break(())),
         Verdict::Exit(status) => exit(status),
         Verdict::Halt(reason) => {
-            if super::halted::Halted::of(boot)
-                .hold_on(boot, reason)
-                .await
-                .is_break()
-            {
-                return Ok(ControlFlow::Break(()));
-            }
-            *revolutions += 1;
-            tracing::info!(
-                revolutions,
-                "divergence halt cleared; the pipeline starts again from its cursor"
-            );
-            return Ok(ControlFlow::Continue(()));
+            let held = super::halted::Halted::of(boot).hold_on(boot, reason).await;
+            return Ok(resume_after(held, revolutions));
+        }
+        Verdict::Mismatch(reason) => {
+            let held = super::halted::Halted::hold_mismatch(boot, reason).await;
+            return Ok(resume_after(held, revolutions));
         }
         Verdict::Revolve => (),
     }
@@ -161,6 +167,20 @@ pub(crate) async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<ControlFl
         "resync: the pipeline starts again in-process and adopts the staged peer checkpoint"
     );
     Ok(ControlFlow::Continue(()))
+}
+
+/// The turn after an operator halt ends: `Break` on the shutdown signal,
+/// else one more revolution from the cursor.
+fn resume_after(held: ControlFlow<()>, revolutions: &mut u32) -> ControlFlow<()> {
+    if held.is_break() {
+        return ControlFlow::Break(());
+    }
+    *revolutions += 1;
+    tracing::info!(
+        revolutions,
+        "operator halt cleared; the pipeline starts again from its cursor"
+    );
+    ControlFlow::Continue(())
 }
 
 /// Leave the process with status 1: an availability problem, for the
@@ -177,7 +197,6 @@ fn exit(status: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kardamom_engine::ExecutorError;
 
     #[test]
     fn verdict_revolves_only_on_a_staged_checkpoint() {
@@ -202,5 +221,19 @@ mod tests {
             Verdict::Halt("mismatch".into())
         );
         assert_eq!(verdict(&EngineOutcome::Clean, None), Verdict::Done);
+    }
+
+    #[test]
+    fn an_all_copies_mismatch_holds_for_the_operator() {
+        let mismatch = EngineOutcome::Failed(ExecutorError::ExecRecordMismatch {
+            index: 7,
+            tx_hash: alloy_primitives::B256::repeat_byte(0x11),
+            executors: 3,
+        });
+        let Verdict::Mismatch(reason) = verdict(&mismatch, Some("peer-checkpoint")) else {
+            panic!("a mismatch does not revolve or exit");
+        };
+        assert!(reason.contains("index=7"), "{reason}");
+        assert!(reason.contains("executors=3"), "{reason}");
     }
 }

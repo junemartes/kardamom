@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::thread::{self, JoinHandle};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
@@ -15,12 +15,10 @@ use kardamom_types::{
 use crate::error::ExecutorError;
 
 use super::cluster::slot_width;
-use super::join::{JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
-use super::ports::{
-    ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription,
-    TxOrderingSubscription,
-};
-use super::void::{ParkOutcome, ReadAhead, VoidPark};
+use super::join::{JoinBuffer, ReaderConfig, TxDataKey};
+use super::ports::{ExecSink, ExecStreamSink, TxDataSubscription, TxOrderingSubscription};
+use super::source::{JoinAt, JoinSeed, Joined, TxJoin};
+use super::void::ReadAhead;
 
 /// Message routed from the `tx_ordering` reader to the executor's exec thread.
 ///
@@ -143,22 +141,20 @@ pub(super) enum Flow {
     Stop,
 }
 
-/// The `tx_ordering` reader thread's state: the subscription, the join
-/// buffer and its optional archive recovery, the exec sink, and the
-/// executor-stream sink. One instance lives for the reader thread's whole
-/// life.
+/// The `tx_ordering` reader thread's state: the subscription, the join of
+/// its transaction source, the exec sink, and the executor-stream sink.
+/// One instance lives for the reader thread's whole life.
 ///
 /// The reader forwards every record it receives. The canonical stream is
 /// the sealer's egress, which is already deduplicated and totally
 /// ordered, and the cluster subscription drops any replay overlap by
 /// canonical index. So there is no dedup here.
-pub struct TxOrderingReader<O, S, E> {
+pub struct TxOrderingReader<O, S, E, J> {
     sub: O,
-    buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: S,
     exec_stream: E,
-    recovery: Option<JoinRecovery>,
+    join: J,
     /// The canonical index of the first record this reader read. A void
     /// record for an entry below it names an entry that an earlier run of
     /// this consumer already passed.
@@ -169,32 +165,30 @@ pub struct TxOrderingReader<O, S, E> {
     /// Indices of entries this reader dropped, whose void record is still
     /// in the backlog. The record's own slot counts when its turn comes.
     dropped: BTreeSet<u64>,
-    last_warn_len: usize,
 }
 
 /// Everything [`TxOrderingReader::spawn`] needs.
 ///
-/// `recovery_factory`, when wired, turns a join miss into an archive
-/// refetch instead of an immediate death; see [`JoinRecovery`]. The reader
-/// builds it once, inside its own thread, because the recovery's Aeron
-/// resources are thread-bound.
+/// `join` is the seed of the transaction source's join. The reader builds
+/// the join once, inside its own thread, because a join can hold Aeron
+/// resources that are bound to one thread.
 ///
 /// `exec_stream` gets each joined record before the exec thread does, and
 /// a progress mark after each message that takes a slot.
-pub struct TxOrderingInputs<O, S, E> {
+pub struct TxOrderingInputs<O, S, E, D> {
     pub sub: O,
-    pub buffer: JoinBuffer,
     pub cfg: ReaderConfig,
     pub exec_out: S,
     pub exec_stream: E,
-    pub recovery_factory: Option<JoinRecoveryFactory>,
+    pub join: D,
 }
 
-impl<O, S, E> TxOrderingReader<O, S, E>
+impl<O, S, E, J> TxOrderingReader<O, S, E, J>
 where
     O: TxOrderingSubscription + 'static,
     S: ExecSink,
     E: ExecStreamSink,
+    J: TxJoin,
 {
     /// Spawn the single `tx_ordering` reader thread. It pulls
     /// [`TxOrderingMessage`] records in canonical order. For each `TxRef`,
@@ -208,36 +202,35 @@ where
     /// # Panics
     ///
     /// Panics if the OS refuses to spawn the thread.
-    pub fn spawn(inputs: TxOrderingInputs<O, S, E>) -> JoinHandle<Result<(), ExecutorError>> {
+    pub fn spawn<D>(inputs: TxOrderingInputs<O, S, E, D>) -> JoinHandle<Result<(), ExecutorError>>
+    where
+        D: JoinSeed<Join = J>,
+    {
         thread::Builder::new()
             .name("executor-reader-b".into())
             .spawn(move || Self::new(inputs).run())
             .expect("spawn tx_ordering reader")
     }
 
-    /// Build the loop state. Runs on the reader thread, so the recovery
-    /// factory builds its Aeron resources there.
-    pub(super) fn new(inputs: TxOrderingInputs<O, S, E>) -> Self {
+    /// Build the loop state. Runs on the reader thread, so the join
+    /// builds its Aeron resources there.
+    pub(super) fn new<D: JoinSeed<Join = J>>(inputs: TxOrderingInputs<O, S, E, D>) -> Self {
         let TxOrderingInputs {
             sub,
-            buffer,
             cfg,
             exec_out,
             exec_stream,
-            recovery_factory,
+            join,
         } = inputs;
-        let recovery = recovery_factory.map(JoinRecoveryFactory::build);
         Self {
             sub,
-            buffer,
             cfg,
             exec_out,
             exec_stream,
-            recovery,
+            join: join.build(),
             first_index: None,
             backlog: ReadAhead::new(),
             dropped: BTreeSet::new(),
-            last_warn_len: 0,
         }
     }
 
@@ -267,34 +260,6 @@ where
         }
     }
 
-    /// Log a join that used its whole budget, and make its error. The line
-    /// says whether every archive refused the range: then the data is gone
-    /// and a restart meets the same entry again, otherwise an archive was
-    /// unreachable and a restart can still recover.
-    fn join_timeout(
-        &self,
-        tx_ref: &kardamom_types::TxRef,
-        every_archive_refused: bool,
-    ) -> ExecutorError {
-        // `Duration::as_millis` already returns `u128`, so this needs no
-        // fallible narrowing to a smaller integer.
-        let timeout_ms = self.cfg.join_timeout.as_millis();
-        warn!(
-            target: "kardamom_executor::reader",
-            sequencer_id = tx_ref.shard_id,
-            session_id = tx_ref.tx_data_session_id,
-            tx_data_position = ?tx_ref.tx_data_position,
-            timeout_ms,
-            every_archive_refused,
-            "join timeout: TxRef has no envelope on tx_data (archive refetch exhausted); aborting"
-        );
-        ExecutorError::JoinTimeout {
-            sequencer_id: tx_ref.shard_id,
-            tx_data_position: tx_ref.tx_data_position,
-            timeout_ms,
-        }
-    }
-
     /// The error of a reader whose executor-stream publisher is gone. The
     /// reader stops, because it must not execute a record that the stream
     /// did not take.
@@ -302,20 +267,39 @@ where
         ExecutorError::State("the executor stream publisher stopped".into())
     }
 
-    /// A `TxRef`: join against the buffer, warn on buffer growth, send the
-    /// joined record to the executor stream, then dispatch the envelope.
+    /// A `TxRef`: get its bytes from the source, send the joined record
+    /// to the executor stream, then dispatch the envelope. An entry that
+    /// the canonical order voided goes to the executor as a vacant slot.
     fn on_tx_ref(
         &mut self,
         tx_ref: kardamom_types::TxRef,
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
-        let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
-        let env = match wait.run() {
-            JoinOutcome::Joined(env) => env,
-            JoinOutcome::Unjoinable => return self.on_unjoinable(&tx_ref, position),
-            JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
+        let at = JoinAt {
+            tx_ref: &tx_ref,
+            position,
+            cfg: &self.cfg,
+            order: &mut self.sub,
+            backlog: &mut self.backlog,
         };
-        self.warn_on_buffer_growth();
+        let joined = self.join.join(at)?;
+        self.on_joined(joined, tx_ref, position)
+    }
+
+    /// Dispatch the outcome of one join: the record goes to the executor
+    /// stream and then to the exec thread, a voided entry becomes a vacant
+    /// slot, and a closed order stops the loop.
+    fn on_joined(
+        &mut self,
+        joined: Joined,
+        tx_ref: kardamom_types::TxRef,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        let env = match joined {
+            Joined::Tx(env) => env,
+            Joined::Voided => return Ok(self.vacate(&tx_ref, position)),
+            Joined::Closed => return Ok(Flow::Stop),
+        };
         self.exec_stream
             .record(position.as_index(), &tx_ref, &env)
             .map_err(|_| Self::stream_closed())?;
@@ -326,45 +310,19 @@ where
         }))
     }
 
-    /// An entry whose `tx_data` every archive refused. A voter asks the
-    /// sealer to void it and waits for the void record; see [`VoidPark`].
-    /// Then the entry's slot goes to the executor as a vacant slot. The
-    /// vote names the entry by its canonical index, which is the position
-    /// the cluster subscription delivers. A consumer that is no voter
-    /// stops, as it did before the void rule.
-    pub(super) fn on_unjoinable(
-        &mut self,
-        tx_ref: &kardamom_types::TxRef,
-        position: BPosition,
-    ) -> Result<Flow, ExecutorError> {
-        let Some(voter_id) = self.cfg.voter_id else {
-            return Err(self.join_timeout(tx_ref, true));
-        };
-        let void = VoidRecord {
-            index: position.as_index(),
-            tx_hash: tx_ref.tx_hash,
-        };
-        let park = VoidPark::new(
-            &mut self.sub,
-            &mut self.backlog,
-            voter_id,
-            void,
-            self.cfg.void_wait,
-        );
-        match park.run() {
-            Ok(ParkOutcome::Voided) => (),
-            Ok(ParkOutcome::GaveUp) => return Err(self.join_timeout(tx_ref, true)),
-            Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
-            Err(e) => return Err(e),
-        }
+    /// Drop a voided entry: its slot goes to the executor as a vacant
+    /// slot, and its void record, still ahead in the backlog, counts its
+    /// own slot when its turn comes.
+    fn vacate(&mut self, tx_ref: &kardamom_types::TxRef, position: BPosition) -> Flow {
+        let index = position.as_index();
         info!(
             target: "kardamom_executor::reader",
-            index = void.index,
-            tx_hash = ?void.tx_hash,
+            index,
+            tx_hash = ?tx_ref.tx_hash,
             "the sealer voided the entry: dropping it"
         );
-        self.dropped.insert(void.index);
-        Ok(self.send(ReaderToExec::Vacant { position }))
+        self.dropped.insert(index);
+        self.send(ReaderToExec::Vacant { position })
     }
 
     /// A void record. Its entry is one this reader dropped, or one below the
@@ -380,22 +338,6 @@ where
             });
         }
         Ok(self.send(ReaderToExec::Vacant { position }))
-    }
-
-    /// Periodic warning. If the join buffer keeps growing, either the
-    /// `tx_data` publisher is racing far ahead of `tx_ordering`, a
-    /// back-pressure issue, or there is a leak.
-    fn warn_on_buffer_growth(&mut self) {
-        let cur = self.buffer.len();
-        if cur >= self.cfg.buffer_warn_threshold && cur > self.last_warn_len * 2 {
-            warn!(
-                target: "kardamom_executor::reader",
-                join_buffer_len = cur,
-                threshold = self.cfg.buffer_warn_threshold,
-                "join buffer growth: tx_data publisher likely outrunning tx_ordering"
-            );
-            self.last_warn_len = cur;
-        }
     }
 
     /// An L1 epoch: dispatch the marker, then dispatch its deposits. An
@@ -520,5 +462,32 @@ where
                 Ok(self.send(ReaderToExec::Boundary(b)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl<O, S, E> TxOrderingReader<O, S, E, super::tx_data::TxDataJoin>
+where
+    O: TxOrderingSubscription + 'static,
+    S: ExecSink,
+    E: ExecStreamSink,
+{
+    /// The reader at the point a `tx_data` join reaches when every archive
+    /// refused the entry. No unit test can make an archive refuse a
+    /// range, so the void tests enter here.
+    pub(super) fn on_unjoinable(
+        &mut self,
+        tx_ref: &kardamom_types::TxRef,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        let at = JoinAt {
+            tx_ref,
+            position,
+            cfg: &self.cfg,
+            order: &mut self.sub,
+            backlog: &mut self.backlog,
+        };
+        let joined = super::tx_data::TxDataJoin::on_unjoinable(at)?;
+        self.on_joined(joined, *tx_ref, position)
     }
 }
