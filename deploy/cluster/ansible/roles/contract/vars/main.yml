@@ -170,6 +170,14 @@ contract_mirrors:
       - static = {{ ports.notifier_metrics }}
       - --log-config
     forbidden: []
+  - path: deploy/cluster/nomad/canary.nomad.hcl
+    required:
+      - '{{ registry_host }}:{{ registry_port }}/kardamom-canary:{{ image_tag }}'
+      - static = {{ ports.canary_metrics }}
+      - '"{{ paths.canary_dir }}:{{ paths.canary_dir }}"'
+      - .consul:{{ ports.ingress_rpc }}
+      - .consul:{{ ports.notifier_feed }}
+    forbidden: []
   - path: deploy/cluster/nomad/redis.nomad.hcl
     required:
       - static = {{ ports.redis_sentinel }}

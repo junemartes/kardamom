@@ -77,8 +77,7 @@ pub fn bin(name: &str) -> Result<ExistingFile> {
         bin_dir()?.join(name),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct \
-         -p kardamom-notifier` (or just \
+         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary` (or just \
          `just test-e2e-local`)",
     )
 }
@@ -336,6 +335,56 @@ pub fn spawn_notifier(spec: &ServiceSpec<'_>) -> Result<SpawnedNotifier> {
         service,
         ws_url: format!("ws://127.0.0.1:{feed_port}"),
     })
+}
+
+/// What a spawned canary probes, and its ring.
+pub struct CanarySpec<'a> {
+    /// The directory of the canary's data and log.
+    pub root: &'a Path,
+    pub ingress_url: &'a str,
+    pub notifier_ws: &'a str,
+    /// The first dev-mnemonic account of the ring, and the ring size.
+    pub ring_offset: u32,
+    pub ring_size: u32,
+}
+
+/// Spawn `kardamom-canary` against one ingress and the notifier, on the
+/// dev mnemonic, with short cadences so a scenario sees every probe run
+/// within seconds.
+///
+/// # Errors
+/// Returns an error when the binary is not built or the process fails to
+/// spawn.
+pub fn spawn_canary(spec: &CanarySpec<'_>) -> Result<Spawned> {
+    let metrics_port = free_port().port();
+    let mut cmd = Command::new(bin("kardamom-canary")?);
+    cmd.args(["--ingress", &format!("e2e-ingress={}", spec.ingress_url)])
+        .args(["--notifier-ws", spec.notifier_ws])
+        .args(["--ring-offset", &spec.ring_offset.to_string()])
+        .args(["--ring-size", &spec.ring_size.to_string()])
+        .arg("--dir")
+        .arg(spec.root.join("canary"))
+        .args([
+            "--transfer-ms",
+            "1000",
+            "--read-ms",
+            "3000",
+            "--contract-ms",
+            "2000",
+        ])
+        .args(["--balance-ms", "2000"])
+        .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-canary"])
+        .env("KARDAMOM_CANARY_MNEMONIC", super::l2::DEV_MNEMONIC);
+    common_service_env(&mut cmd);
+    SpawnPlan {
+        name: "canary".to_string(),
+        cmd,
+        log: spec.root.join("canary.log"),
+        metrics_port,
+        state_dir: None,
+    }
+    .spawn()
 }
 
 /// Spawn `kardamom-da-watcher` in INTEROP mode: no L1 flags, one peer pair

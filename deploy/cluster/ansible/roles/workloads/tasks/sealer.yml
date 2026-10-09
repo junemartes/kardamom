@@ -28,11 +28,14 @@
          and not ansible_check_mode }}
 
 - name: Read the registered sealer
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/cluster?namespace={{ workloads_namespace | urlencode }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-  register: workloads_sealer_current
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
+  when: workloads_sealer_diff == 'Edited'
+
+- name: Keep the registered sealer
+  ansible.builtin.set_fact:
+    workloads_sealer_current: "{{ workloads_registered_job }}"
   when: workloads_sealer_diff == 'Edited'
 
 - name: Decide the sealer roll

@@ -16,7 +16,7 @@ use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
 
-const JOBS: [&str; 16] = [
+const JOBS: [&str; 17] = [
     "aeron",
     "anvil",
     "cluster",
@@ -32,6 +32,7 @@ const JOBS: [&str; 16] = [
     "redis",
     "state-mirror",
     "notifier",
+    "canary",
     "monitoring",
 ];
 /// A throwaway group and port, so the probe never collides with the
@@ -76,6 +77,7 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "cluster node up",
     "cluster JOIN WEDGE",
     "cluster CATCHUP STALL",
+    "cluster COMPONENT CLOSED",
     "cluster LOG PURGE",
     "cluster SEED",
 ];

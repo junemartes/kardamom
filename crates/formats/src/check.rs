@@ -7,10 +7,14 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 use crate::{Format, Registry, Waiver, Waivers};
 
-/// A rule between two releases of one format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A rule between two releases of one format. It serializes as its
+/// `snake_case` name, for the deploy gate that reads the findings as JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rule {
     /// The base read range contains the version that the head writes.
     /// When it holds, a rollback from the head to the base is safe.
@@ -38,7 +42,7 @@ impl Rule {
 }
 
 /// A rule that the head breaks for one format.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Finding {
     pub rule: Rule,
     pub id: String,

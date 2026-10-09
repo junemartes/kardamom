@@ -19,7 +19,6 @@ import java.util.EnumSet;
 import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.agrona.concurrent.ShutdownSignalBarrier;
 
 /**
  * Boots an all-in-one Aeron Cluster member: a media driver, an archive, and
@@ -170,7 +169,7 @@ public final class ClusterNode {
         // whole fragment are this member's own unacknowledged tail; the
         // leader's log fills the gap on rejoin, as on any intact-directory
         // restart. So the repair runs in-process, then the launch retries.
-        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
+        final StopRequest stop = new StopRequest();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
         SealerClusteredService service = null;
@@ -179,7 +178,7 @@ public final class ClusterNode {
                 driver = ClusteredMediaDriver.launch(
                     contexts.driver(),
                     contexts.archive(),
-                    consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
+                    consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, stop));
                 // Aeron contexts are single-use, and so is the service they
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
@@ -188,7 +187,7 @@ public final class ClusterNode {
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
                 container = ClusteredServiceContainer.launch(
-                    serviceContext(aeronDir, clusterDir, memberId, service, barrier));
+                    serviceContext(aeronDir, clusterDir, memberId, service, stop));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);
@@ -220,9 +219,13 @@ public final class ClusterNode {
              AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
-            startJoinWatchdog(consensus, contexts.clusterState(), memberId);
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
-            barrier.await();
+            // The watchdog starts last. A start-up step that throws before it
+            // closes the components through this block, and the watchdog must
+            // not read that close as a failed component.
+            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop),
+                contexts.clusterState());
+            stop.await();
         }
     }
 
@@ -362,7 +365,7 @@ public final class ClusterNode {
     /**
      * Exits the process when the member never joins the cluster
      * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it),
-     * or when its catch-up stalls
+     * when a component closes with no stop request, or when its catch-up stalls
      * ({@code -Dkardamom.cluster.catchupStallS}, default 300, 0 disables
      * that rule only).
      *
@@ -372,18 +375,19 @@ public final class ClusterNode {
      * module spins in {@code Election.init} forever while the container
      * reports healthy to Nomad. A follower whose log ends below the
      * leader's purge point cycles through its catch-up forever, also while
-     * the container runs. See {@link JoinWatchdog} for the two rules, and
-     * {@link JoinWatchdogThread} for the exits.</p>
+     * the container runs. A consensus module or a service container that
+     * fails in its start closes, while the process runs on. See
+     * {@link JoinWatchdog} for the two rules, and {@link JoinWatchdogThread}
+     * for the exits.</p>
      */
-    private static void startJoinWatchdog(
-            final ConsensusModule.Context consensus, final StateDir clusterDir, final int memberId) {
+    private static void startJoinWatchdog(final JoinWatchdogThread.Member member, final StateDir clusterDir) {
         final long windowS = Long.getLong("kardamom.cluster.joinWatchdogS", 60L);
         if (windowS <= 0) {
-            System.out.println("cluster join watchdog DISABLED memberId=" + memberId);
+            System.out.println("cluster join watchdog DISABLED memberId=" + member.memberId());
             return;
         }
         final long stallWindowS = Long.getLong("kardamom.cluster.catchupStallS", JoinWatchdog.DEFAULT_STALL_WINDOW_S);
-        new JoinWatchdogThread(memberId, consensus, clusterDir, windowS, stallWindowS).start();
+        new JoinWatchdogThread(member, clusterDir, windowS, stallWindowS).start();
     }
 
     /**
@@ -468,7 +472,7 @@ public final class ClusterNode {
     private static ConsensusModule.Context consensusContext(
             final String aeronDir, final String clusterDir, final String clusterMembers,
             final int memberId, final int ingressStreamId, final String[] me,
-            final ShutdownSignalBarrier barrier) {
+            final StopRequest stop) {
         final ConsensusModule.Context ctx = new ConsensusModule.Context()
             .clusterMemberId(memberId)
             .clusterMembers(clusterMembers)
@@ -540,7 +544,7 @@ public final class ClusterNode {
         ctx.terminationHook(() -> {
             System.out.println("cluster TERMINATION memberId=" + memberId
                 + " component=CONSENSUS_MODULE (requested shutdown — e.g. election/state conflict on rejoin)");
-            barrier.signal();
+            stop.signal();
         });
         return ctx;
     }
@@ -670,7 +674,7 @@ public final class ClusterNode {
             final String clusterDir,
             final int memberId,
             final SealerClusteredService service,
-            final ShutdownSignalBarrier barrier) {
+            final StopRequest stop) {
         final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
@@ -682,7 +686,7 @@ public final class ClusterNode {
         ctx.terminationHook(() -> {
             System.out.println("cluster TERMINATION memberId=" + memberId
                 + " component=SERVICE_CONTAINER (requested shutdown)");
-            barrier.signal();
+            stop.signal();
         });
         return ctx;
     }

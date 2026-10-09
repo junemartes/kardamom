@@ -191,11 +191,22 @@ variable "datacenter" {
 #   keepalive every 500 ms, far below it.
 # - aeron.publication.unblock.timeout (ns): Aeron requires it above the
 #   client liveness timeout. It keeps Aeron's default ratio, 3/2.
+# - aeron.archive.message.timeout: the archive clients of the consensus
+#   module and the service wait this long for an archive response.
+#   Aeron's default is 10 s, the same as the stall tolerance default.
+# - aeron.archive.connect.timeout: the archive waits this long for the
+#   subscriber of a replay. It keeps Aeron's default ratio to the message
+#   timeout, 1/2.
+# At a start, each member loads its snapshots through these two waits.
+# When one of them expires, the component closes and the member never
+# joins. A slow host must not turn a start into that failure.
 locals {
   aeron_stall_opts = join(" ", [
     "-Daeron.driver.timeout=${var.aeron_stall_tolerance_ms}",
     "-Daeron.client.liveness.timeout=${var.aeron_stall_tolerance_ms * 1000000}",
     "-Daeron.publication.unblock.timeout=${floor(var.aeron_stall_tolerance_ms * 3 / 2) * 1000000}",
+    "-Daeron.archive.message.timeout=${var.aeron_stall_tolerance_ms}ms",
+    "-Daeron.archive.connect.timeout=${floor(var.aeron_stall_tolerance_ms / 2)}ms",
   ])
 }
 

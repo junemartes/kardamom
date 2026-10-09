@@ -175,3 +175,16 @@ fn a_pause_has_an_info_rule_muted_by_its_root() {
     );
     assert!(inhibit.contains("equal:\n      - cause"), "{inhibit}");
 }
+
+#[test]
+fn a_canary_page_is_muted_by_a_root_halt() {
+    let rules = std::fs::read_to_string(repo_root().join("deploy/alerts.yml")).unwrap();
+    assert!(rules.contains("alert: KardamomCanaryFailing"));
+    assert!(rules.contains("alert: KardamomCanaryStalled"));
+    let inhibit =
+        std::fs::read_to_string(repo_root().join("deploy/alertmanager-inhibit.yml")).unwrap();
+    assert!(
+        inhibit.contains(r#"'alertname =~ "KardamomCanary.*"'"#),
+        "{inhibit}"
+    );
+}

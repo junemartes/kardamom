@@ -83,7 +83,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - Every canonical index at or below `recorded_through` is joined and recorded by the executor, or voided. `executor_id` is the void voter id of the executor.
   - The sealer keeps the cursor of each executor in the replicated state. A cursor never moves down.
   - A frame that is not 10 bytes, an `executor_id` that is not a configured voter, or a cursor at or above the canonical count is malformed. The service drops it.
-  - When the best cursor moves up, the sealer sends an egress kind 9 to every session.
+  - When the best cursor moves up, the sealer sends an egress kind 9 to every session. It prints `cluster RECORDED-CURSOR` at power-of-two counts of these moves.
   - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
 
 ### Relayed record types
@@ -236,7 +236,9 @@ The DA-lag guard stops the chain from sealing far ahead of the data that the bat
 
 The record-lag guard stops the chain from ordering far ahead of the transaction data that the executors recorded.
 
-- Each executor sends its recorded cursor (ingress kind 9). The sealer keeps the cursor of each executor in the replicated state.
+- Each executor with `--exec-cursor` on sends its recorded cursor (ingress kind 9). The sealer keeps the cursor of each executor in the replicated state.
+  - The executor sends a cursor that moved when 100 ms passed since the last send, or at once when it moved by 1024 records. It never sends a lower cursor than the last one that the session took.
+  - The flag is off by default. Switch it on only after every member reads kind 9.
 - The best cursor is the maximum over the configured executors. One recorded copy is enough for the other executors and the consumers. One dead or slow executor does not stop the chain.
 - The sealer refuses a user record when `budget > 0` and `sealed_index - best_recorded > budget`. `sealed_index` is the last ordered canonical index.
   - The code default budget is `0`: the guard is off.
@@ -357,7 +359,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
 | `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
-| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. `0` turns it off. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. `0` turns the join watchdog off, and with it the exit on a closed component. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
@@ -425,6 +427,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster DA-LAG-REJECT` | The DA-lag guard refused a record (`nonce`, `sealedHead`, `postedHead`, `budget`, `totalDaLagRejected`). |
 | `cluster RECORD-LAG-REJECT` | The record-lag guard refused a record (`nonce`, `sealedIndex`, `bestRecorded`, `budget`, `totalRecordLagRejected`). |
 | `cluster POSTED-CURSOR` | The posted head moved up (`postedHead`, `sealedHead`, `retained`, `halted`). |
+| `cluster RECORDED-CURSOR` | The best recorded cursor moved up (`executorId`, `through`, `best`, `halted`, `totalAdvances`). It prints at power-of-two counts of the moves, because the best cursor moves at the cadence of the executors. `halted` is the record-lag flag. |
 | `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
 | `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
 | `cluster VOID-VOTE` | A void vote changed the count (`voter`, `index`, `result`, `votes` as `n/total`). A repeated vote prints nothing. |
@@ -447,6 +450,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
+| `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 

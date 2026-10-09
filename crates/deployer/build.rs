@@ -41,6 +41,7 @@ const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
         "WITHDRAWAL_OUTPUT_ORACLE_CREATION",
         "WithdrawalOutputOracle",
     ),
+    ("CANARY_COUNTER_CREATION", "CanaryCounter"),
 ];
 
 fn main() -> Result<()> {

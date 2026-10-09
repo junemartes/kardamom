@@ -40,6 +40,7 @@ pub mod nodes;
 pub mod nomad;
 pub mod poll;
 pub mod probes;
+pub mod release;
 pub mod replace;
 pub mod rpc;
 pub mod scale;
@@ -49,7 +50,7 @@ pub mod stages;
 pub use contract::{Node, NodeContract};
 pub use harness::Harness;
 pub use knobs::Knobs;
-pub use lifecycle::{DeployVars, Lifecycle};
+pub use lifecycle::{DeployVars, LastAttempt, Lifecycle};
 pub use shard::Shard;
 
 /// Print one progress line, in the `==> ...` shape the CI logs grep for.
