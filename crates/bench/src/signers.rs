@@ -1,9 +1,9 @@
 //! Pre-signed-transaction queue built from mnemonic-derived signers.
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, Signed, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 
 /// The signer count a `--senders` count of derived signers plus one
@@ -58,19 +58,23 @@ impl DerivedSigner {
 
     /// Sign `tx` and return its EIP-2718-encoded raw bytes and its hash,
     /// without an envelope wrapper. Used where only the wire bytes are
-    /// needed, such as a pre-signed submit queue.
+    /// needed, such as a pre-signed submit queue. `tx` is any typed
+    /// transaction an envelope holds: a legacy one or an EIP-1559 one.
     ///
     /// # Errors
     ///
     /// Returns an error if signing fails with a k256 signer error.
-    pub fn sign_raw(&self, mut tx: TxLegacy) -> anyhow::Result<SignedRaw> {
+    pub fn sign_raw<T>(&self, mut tx: T) -> anyhow::Result<SignedRaw>
+    where
+        T: SignableTransaction<Signature>,
+        Signed<T>: Into<TxEnvelope>,
+    {
         let sig = self
             .signer
             .sign_transaction_sync(&mut tx)
             .map_err(|e| anyhow::anyhow!("signing tx: {e}"))?;
-        let signed = tx.into_signed(sig);
-        let hash = *signed.hash();
-        let envelope: TxEnvelope = signed.into();
+        let envelope: TxEnvelope = tx.into_signed(sig).into();
+        let hash = *envelope.tx_hash();
         let mut bytes = Vec::with_capacity(110);
         envelope.encode_2718(&mut bytes);
         Ok(SignedRaw {

@@ -28,6 +28,7 @@ The repository has these parts.
 | `kardamom-da-watcher` | Tails finalized L1 blocks. It republishes deposits into the pipeline. |
 | `kardamom-validator` | Re-executes every block. On a divergence, it halts and stays up. |
 | `kardamom-notifier` | Serves transaction status events to clients. |
+| `kardamom-canary` | Uses the chain as a user does and reports each success and each failure as a metric. |
 | `kardamom-state-mirror` | Writes the Redis projection of the account state, next to each executor. |
 | `kardamom-l1-indexer` | The L1 follower. It reads the finalized L1 once per finality step, publishes each block on the `l1_blocks` stream, and archives the batches and the epoch inputs. |
 

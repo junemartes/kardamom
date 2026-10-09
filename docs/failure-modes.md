@@ -981,6 +981,27 @@ The notifier is off the hot path by construction. It reads `tx_status`, `tx_rece
 - The two instances shard subscriptions by a rendezvous hash of the id. Both store every registration. The shard of a lost instance moves to the twin when the instance count changes.
 - The `Sealed` stage needs an egress channel on the ingress. See [`tx-status-events.md`](tx-status-events.md) for the API, the settings and the metrics.
 
+## Transaction canary
+
+The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses the chain as a user does and reports each result as a metric. It does not use the halt record and does not publish on the `events` stream. The spec is [`specs/2026-10-07-tx-canary.md`](specs/2026-10-07-tx-canary.md).
+
+- **Probes.**
+  - `transfer`, every 5 s: an EIP-1559 transfer between two ring accounts, through each ingress instance in turn (`kardamom_sendRawTransactionAsync`). The status feed times `offered`, `sealed` and `executed`; the receipt ends the run.
+  - `read`, every 15 s: the head of each ingress instance must move between two runs (`head_stalled`), and the receipt of the first canary transfer must still answer (`receipt_lost`).
+  - `contract`, every 60 s: a write to the canary counter, then a read. The chain serves no `eth_call`, so the read is `eth_getBalance` of the counter, which holds one wei per write. It must equal the count in the write's receipt (`state_mismatch`, or `timeout{stage="read"}` while the read lags).
+- **Nonce ownership.** Each ring account has one owner at a time: a lease. The lease writes the signed transaction to the journal (`<dir>/ring/<address>.json`) before the submit.
+  - A refused first submit frees the nonce: the ingress answered and did not publish.
+  - A submit with no answer, or an accepted one, stays in flight. The next lease asks for its receipt and the committed nonce. If neither shows it, the lease sends the same bytes again, and the account stays blocked. The other accounts serve the probes.
+  - A restart reads the journal, so the rule holds across a restart.
+  - Proof: S19 (`s19_canary_probes_succeed_and_the_ring_resolves_in_flight`) in the chain-semantics suite: a lost submit answer, a restart with an unsent transaction, and six concurrent leases on one account.
+- **Feed gaps.** A stage that a later stage implies is no failure. A missing `executed` with a receipt is a feed gap (`kardamom_canary_feed_gaps_total`), not a transaction failure.
+- **Funds.** An account under the floor is unfunded. The probes skip it, and report `unfunded` when every account is under the floor. `KardamomCanaryLowFunds` is an info alert.
+- **Pages.** `KardamomCanaryFailing`, `KardamomCanaryStalled`, `KardamomCanaryNotSafe`, `KardamomCanaryDepositLate` and `KardamomCanaryFeeMismatch` page. The inhibit file mutes every canary page while a `KardamomHalt*` alert fires: the halt names the cause.
+  - A canary page with no halt beside it means that users fail while every internal signal says the chain is fine.
+- **Known limits.**
+  - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
+  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
+
 ## Redis account cache
 
 Redis is a cache with no persistence. The state of the executors is the truth. The cache layer has five cases.

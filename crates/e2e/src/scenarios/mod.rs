@@ -9,6 +9,7 @@
 
 pub mod account_layer;
 pub mod bridge;
+pub mod canary;
 pub mod consistency;
 pub mod crash_recovery;
 pub mod da_parity;

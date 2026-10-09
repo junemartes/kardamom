@@ -117,6 +117,9 @@ locals {
       - job_name: kardamom-notifier
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-notifier-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      - job_name: kardamom-canary
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-canary" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
       # and the metrics of every Nomad agent, discovered through the local
       # Consul agent. The node label is the Consul node name.
@@ -165,6 +168,7 @@ locals {
     "kardamom-chain-status", "kardamom-hosts", "kardamom-nomad", "kardamom-aeron",
     "kardamom-da",
     "kardamom-l1-follower",
+    "kardamom-canary",
   ]
 }
 

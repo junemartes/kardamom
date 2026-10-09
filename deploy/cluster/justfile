@@ -92,7 +92,7 @@ clean:
     -docker image rm "$REGISTRY/kardamom-aeron:$TAG"
     -docker image rm "$REGISTRY/kardamom-cluster:$TAG"
     rm -f docker/kardamom-cluster-node.jar
-    for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
+    for svc in ingress sequencer executor validator da-watcher batcher state-mirror l1-indexer da-store l1-fault-proxy notifier canary; do docker image rm "$REGISTRY/kardamom-$svc:$TAG" || true; done
 
 # Create nodes, provision them, publish prebuilt images and deploy workloads.
 # CLUSTER_VARS is a JSON object passed as a single Ansible extra-vars argument.
