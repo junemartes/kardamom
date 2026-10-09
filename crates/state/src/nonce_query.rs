@@ -47,6 +47,18 @@
 //! with the cause: this node rebuilt the block from L1, or a transaction
 //! other than a deposit has no reference.
 //!
+//! A block's references carry `exec_locator` on an executor:
+//! `{"archive_id","session_id","position"}`, the newest locator of its
+//! stream at or before the block's first transaction. A replay of that
+//! session from that position reaches the block's records.
+//!
+//! A peer executor whose archives all failed for an entry asks
+//! `kardamom_getExecLocator` with `[index]` or `[index, tx_hash]`, the
+//! canonical index as a JSON integer or a `0x` quantity. The result is the
+//! answer of [`crate::exec_answers`]: `located` with the archive, the
+//! session and a raw position, `not_held`, `not_reached`, or `lost`. A node
+//! with no executor stream answers the JSON-RPC error -32601.
+//!
 //! `x-state-tx-idx` is the canonical end position of the snapshot's last
 //! committed block, as an index. A cache writes the answer back tagged
 //! with it, so the answer never outranks a newer row.
@@ -70,6 +82,8 @@ use tracing::{info, warn};
 
 use crate::env::StateEnv;
 use crate::error::StateError;
+use crate::exec_answers::{ExecAnswersLookup, ExecLocatorAnswer};
+use crate::exec_peers::EXEC_LOCATOR_METHOD;
 use crate::snapshot::{BlockRefs, StateSnapshot};
 
 const MAX_HEAD: usize = 8 * 1024;
@@ -96,18 +110,26 @@ impl Drop for NonceQueryServer {
 
 /// Serve account nonce queries on `addr`, forever. Binding happens before
 /// the task spawns, so a bad address fails startup with a clear error.
-/// Call this inside a tokio runtime.
+/// `answers` is the executor stream's answers state, or `None` for a node
+/// with no executor stream. Call this inside a tokio runtime.
 ///
 /// # Errors
 ///
 /// Returns the bind error when `addr` cannot be bound.
-pub fn serve_nonce_queries(addr: SocketAddr, env: StateEnv) -> std::io::Result<NonceQueryServer> {
+pub fn serve_nonce_queries(
+    addr: SocketAddr,
+    env: StateEnv,
+    answers: Option<ExecAnswersLookup>,
+) -> std::io::Result<NonceQueryServer> {
     let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let addr = listener.local_addr()?;
     info!(%addr, "serving account nonce queries");
-    let server = QueryServer { listener, env };
+    let server = QueryServer {
+        listener,
+        sources: Sources { env, answers },
+    };
     let task = tokio::spawn(server.run());
     Ok(NonceQueryServer { addr, task })
 }
@@ -115,7 +137,15 @@ pub fn serve_nonce_queries(addr: SocketAddr, env: StateEnv) -> std::io::Result<N
 /// The accept loop: one task per connection.
 struct QueryServer {
     listener: TcpListener,
+    sources: Sources,
+}
+
+/// What a request reads: the committed state, and the answers of the
+/// executor stream.
+#[derive(Clone)]
+struct Sources {
     env: StateEnv,
+    answers: Option<ExecAnswersLookup>,
 }
 
 impl QueryServer {
@@ -135,9 +165,9 @@ impl QueryServer {
                 return;
             }
         };
-        let env = self.env.clone();
+        let sources = self.sources.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_one(stream, env).await {
+            if let Err(e) = sources.serve_one(stream).await {
                 warn!(error = %e, "nonce query connection failed");
             }
         });
@@ -254,14 +284,31 @@ const REFS_METHOD: &str = "kardamom_getBlockRefs";
 /// rebuild its payload. The message names the cause.
 const NO_BLOCK_REFS: i64 = -32001;
 
-/// A block number parameter: a JSON integer, or a `0x` quantity.
-fn block_number_param(value: &serde_json::Value) -> Option<u64> {
-    value.as_u64().or_else(|| {
-        value
-            .as_str()
-            .and_then(|s| s.strip_prefix("0x"))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-    })
+impl Request {
+    /// The `n`th parameter as a number: a JSON integer, or a `0x` quantity.
+    fn number_param(&self, n: usize) -> Option<u64> {
+        let value = self.params.get(n)?;
+        value.as_u64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|s| s.strip_prefix("0x"))
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        })
+    }
+
+    /// The `n`th parameter as a 32-byte hash.
+    fn hash_param(&self, n: usize) -> Option<B256> {
+        self.params.get(n)?.as_str()?.parse().ok()
+    }
+
+    /// The index of an exec locator request: `[index]`, or
+    /// `[index, tx_hash]` with a valid hash. The asker checks the record
+    /// against its own hash, so the server needs only the index.
+    fn exec_locator_index(&self) -> Option<u64> {
+        let hash_ok = self.params.len() < 2 || self.hash_param(1).is_some();
+        self.number_param(0)
+            .filter(|_| hash_ok && self.params.len() <= 2)
+    }
 }
 
 impl Query {
@@ -269,21 +316,21 @@ impl Query {
     fn parse(request: &Request) -> Result<Self, (i64, &'static str)> {
         if request.method == REFS_METHOD {
             return request
-                .params
-                .first()
-                .and_then(block_number_param)
+                .number_param(0)
                 .map(Self::Refs)
                 .ok_or((-32602, "invalid params: expected [number]"));
         }
-        let first = request.params.first().and_then(serde_json::Value::as_str);
         if request.method == RECEIPT_METHOD {
-            return first
-                .and_then(|s| s.parse::<B256>().ok())
+            return request
+                .hash_param(0)
                 .map(Self::Receipt)
                 .ok_or((-32602, "invalid params: expected [hash]"));
         }
         let method = Method::parse(&request.method).ok_or((-32601, "method not found"))?;
-        first
+        request
+            .params
+            .first()
+            .and_then(serde_json::Value::as_str)
             .and_then(|s| s.parse::<Address>().ok())
             .map(|address| Self::Account(method, address))
             .ok_or((-32602, "invalid params: expected [address, tag]"))
@@ -410,15 +457,35 @@ impl Reply {
     }
 
     /// The block's references as JSON, or `null`, with the snapshot's
-    /// position.
-    fn refs(id: &serde_json::Value, found: &CommittedRefs) -> Self {
+    /// position. `exec_locator` joins the references when it is known.
+    fn refs(
+        id: &serde_json::Value,
+        found: &CommittedRefs,
+        exec_locator: Option<serde_json::Value>,
+    ) -> Self {
         metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "refs").increment(1);
-        let body =
-            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": found.refs}).to_string();
+        let mut result = serde_json::json!(found.refs);
+        if let (Some(refs), Some(locator)) = (result.as_object_mut(), exec_locator) {
+            refs.insert("exec_locator".to_owned(), locator);
+        }
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
         Self {
             status: "200 OK",
             body,
             state: Some((found.block, found.tx_idx)),
+        }
+    }
+
+    /// The answer of the executor stream for one entry. It carries no
+    /// state position: most answers read no snapshot.
+    fn exec_locator(id: &serde_json::Value, answer: &ExecLocatorAnswer) -> Self {
+        metrics::counter!(NONCE_QUERIES, "outcome" => "ok", "method" => "exec_locator")
+            .increment(1);
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": answer}).to_string();
+        Self {
+            status: "200 OK",
+            body,
+            state: None,
         }
     }
 
@@ -461,28 +528,98 @@ impl Reply {
     }
 }
 
-/// Answer one request body.
-async fn answer(env: &StateEnv, body: &[u8]) -> Reply {
-    let Ok(request) = serde_json::from_slice::<Request>(body) else {
-        return Reply::bad_request(-32700, "parse error");
-    };
-    let query = match Query::parse(&request) {
-        Ok(query) => query,
-        Err((code, message)) => return Reply::rpc_error(&request.id, code, message),
-    };
-    let env = env.clone();
-    let looked_up = tokio::task::spawn_blocking(move || query.read(&env)).await;
-    match looked_up {
-        Ok(Ok(found)) => found.reply(&request.id),
-        Ok(Err(e @ StateError::NoBlockRefs { .. })) => Reply::refused(&request.id, &e.to_string()),
-        Ok(Err(e)) => {
-            warn!(error = %e, ?query, "state query: state read failed");
-            Reply::internal(&request.id, "state read failed")
+impl Sources {
+    /// Answer one request body.
+    async fn answer(&self, body: &[u8]) -> Reply {
+        let Ok(request) = serde_json::from_slice::<Request>(body) else {
+            return Reply::bad_request(-32700, "parse error");
+        };
+        if request.method == EXEC_LOCATOR_METHOD {
+            return self.exec_locator(&request).await;
         }
-        Err(e) => {
-            warn!(error = %e, "state query: blocking task failed");
-            Reply::internal(&request.id, "internal error")
+        match Query::parse(&request) {
+            Ok(query) => self.state(&request.id, query).await,
+            Err((code, message)) => Reply::rpc_error(&request.id, code, message),
         }
+    }
+
+    /// Answer an exec locator request from the answers state.
+    async fn exec_locator(&self, request: &Request) -> Reply {
+        let id = &request.id;
+        let Some(answers) = &self.answers else {
+            return Reply::rpc_error(id, -32601, "method not found: this node has no exec stream");
+        };
+        let Some(index) = request.exec_locator_index() else {
+            return Reply::rpc_error(
+                id,
+                -32602,
+                "invalid params: expected [index] or [index, hash]",
+            );
+        };
+        match answers.answer(&self.env, index).await {
+            Ok(Some(answer)) => Reply::exec_locator(id, &answer),
+            Ok(None) => Reply::internal(id, "the exec answers thread is busy"),
+            Err(e) => {
+                warn!(error = %e, index, "state query: exec locator read failed");
+                Reply::internal(id, "state read failed")
+            }
+        }
+    }
+
+    /// Answer a state query from a fresh snapshot.
+    async fn state(&self, id: &serde_json::Value, query: Query) -> Reply {
+        let env = self.env.clone();
+        let looked_up = tokio::task::spawn_blocking(move || query.read(&env)).await;
+        match looked_up {
+            Ok(Ok(Found::Refs(found))) => {
+                let locator = self.block_locator(&found).await;
+                Reply::refs(id, &found, locator)
+            }
+            Ok(Ok(found)) => found.reply(id),
+            Ok(Err(e @ StateError::NoBlockRefs { .. })) => Reply::refused(id, &e.to_string()),
+            Ok(Err(e)) => {
+                warn!(error = %e, ?query, "state query: state read failed");
+                Reply::internal(id, "state read failed")
+            }
+            Err(e) => {
+                warn!(error = %e, "state query: blocking task failed");
+                Reply::internal(id, "internal error")
+            }
+        }
+    }
+
+    /// The locator of the first transaction of a block, as JSON, when this
+    /// node has an executor stream that names one.
+    async fn block_locator(&self, found: &CommittedRefs) -> Option<serde_json::Value> {
+        let answers = self.answers.as_ref()?;
+        let first = found.refs.as_ref()?.refs.first()?.tx_idx;
+        let locator = answers.locate(first).await?;
+        Some(serde_json::json!({
+            "archive_id": answers.archive_id(),
+            "session_id": locator.session_id,
+            "position": locator.position,
+        }))
+    }
+
+    async fn serve_one(&self, stream: TcpStream) -> std::io::Result<()> {
+        let (rd, mut wr) = stream.into_split();
+        let mut reader = BufReader::new(rd).take(usize_to_u64(MAX_HEAD.saturating_add(MAX_BODY)));
+        let head = match RequestHead::read(&mut reader).await? {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                return Reply {
+                    status: "404 Not Found",
+                    body: String::new(),
+                    state: None,
+                }
+                .write(&mut wr)
+                .await;
+            }
+            Err(reply) => return reply.write(&mut wr).await,
+        };
+        let mut body = vec![0u8; head.content_length.get()];
+        timeout(IO_TIMEOUT, reader.read_exact(&mut body)).await??;
+        self.answer(&body).await.write(&mut wr).await
     }
 }
 
@@ -514,7 +651,7 @@ impl Found {
         match self {
             Self::Account(method, account) => Reply::ok(id, *method, account),
             Self::Receipt(found) => Reply::receipt(id, found),
-            Self::Refs(found) => Reply::refs(id, found),
+            Self::Refs(found) => Reply::refs(id, found, None),
         }
     }
 }
@@ -573,27 +710,6 @@ impl RequestHead {
     }
 }
 
-async fn serve_one(stream: TcpStream, env: StateEnv) -> std::io::Result<()> {
-    let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd).take(usize_to_u64(MAX_HEAD.saturating_add(MAX_BODY)));
-    let head = match RequestHead::read(&mut reader).await? {
-        Ok(Some(head)) => head,
-        Ok(None) => {
-            return Reply {
-                status: "404 Not Found",
-                body: String::new(),
-                state: None,
-            }
-            .write(&mut wr)
-            .await;
-        }
-        Err(reply) => return reply.write(&mut wr).await,
-    };
-    let mut body = vec![0u8; head.content_length.get()];
-    timeout(IO_TIMEOUT, reader.read_exact(&mut body)).await??;
-    answer(&env, &body).await.write(&mut wr).await
-}
-
 #[cfg(test)]
 #[path = "nonce_query_tests.rs"]
-mod tests;
+pub(crate) mod tests;

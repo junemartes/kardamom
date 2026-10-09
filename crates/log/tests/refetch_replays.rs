@@ -259,6 +259,7 @@ async fn replays_in_a_row_each_deliver_their_first_frame() {
     let refetch_cfg = RefetchConfig {
         tx_data_endpoints: EndpointSource::Static(vec![ARCHIVE_CONTROL.to_string()]),
         tx_deposits_endpoints: EndpointSource::Static(Vec::new()),
+        exec_txs_endpoints: EndpointSource::Static(Vec::new()),
         response_endpoint: REFETCH_RESPONSE.to_string(),
         replay_endpoint: REFETCH_REPLAY.to_string(),
         aeron_dir: Some(aeron_dir.clone()),

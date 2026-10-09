@@ -21,6 +21,7 @@ pub(crate) mod deploy;
 pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
+pub(crate) mod peer_fetch;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
@@ -55,6 +56,7 @@ pub enum Case {
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
     ArchiveDriverLoss,
+    ExecPeerFetch,
     ArchiveTxDataWipe,
     ArchiveCorruption,
     SequencerLapse,
@@ -78,7 +80,7 @@ pub enum Case {
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 47] = [
+const ALL: [Case; 48] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -105,6 +107,7 @@ const ALL: [Case; 47] = [
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
     Case::ArchiveDriverLoss,
+    Case::ExecPeerFetch,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
     Case::SequencerLapse,
@@ -171,6 +174,7 @@ impl Case {
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
+            Self::ExecPeerFetch => "exec-peer-fetch",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
             Self::SequencerLapse => "sequencer-lapse",
@@ -361,6 +365,7 @@ impl Case {
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
+            Self::ExecPeerFetch => peer_fetch::exec_peer_fetch(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
             Self::SequencerLapse => seq_retention::sequencer_lapse(h).await,

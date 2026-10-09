@@ -124,6 +124,7 @@ impl Rig {
             positions: positions_rx,
             publications: pubs.clone(),
             locators: LocatorLog::open(&path).expect("open the locator log"),
+            answers: None,
             stop: CancellationToken::new(),
         })
         .expect("spawn");

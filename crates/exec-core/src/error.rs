@@ -109,6 +109,20 @@ pub enum ExecutorError {
     /// peers. There is no local repair: the replica stops.
     #[error("void record for executed entry: index={index} tx_hash={tx_hash:?}")]
     VoidOfExecutedEntry { index: u64, tx_hash: B256 },
+
+    /// Every archive failed for an entry, and every peer executor answered
+    /// that it holds no record of the entry, with at least one peer that
+    /// executed the entry and lost its record. No vote can void the entry,
+    /// because that peer never votes. The repair is a peer checkpoint at or
+    /// above `block`, the block that holds the entry.
+    #[error(
+        "peer record lost: index={index} tx_hash={tx_hash:?} block={block} — a peer checkpoint at or above the block is required"
+    )]
+    PeerRecordLost {
+        index: u64,
+        tx_hash: B256,
+        block: u64,
+    },
 }
 
 /// Role-agnostic alias for the engine error. New engine and validator code

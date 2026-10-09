@@ -34,11 +34,10 @@
 //! so a dead archive node (for example the chaos suite killing an ingress
 //! driver) costs one short attempt before the mirror serves the range.
 
-use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
+use kardamom_types::{BPosition, Deposit, ExecTxRecord, TxDataLoc, TxEnvelope};
 use rusteron_archive::AeronArchiveReplayParams;
 use rusteron_archive::bindings::{AERON_NULL_COUNTER_ID, AERON_NULL_VALUE};
 use tracing::{info, warn};
@@ -53,10 +52,11 @@ use crate::error::LogError;
 use crate::recorder::{ArchiveSession, connect_archive_with_timeout};
 use crate::term_layout::TermLayout;
 
+mod drain;
 mod recording;
 #[cfg(any(test, feature = "testing"))]
 pub use recording::FakeArchiveCatalog;
-use recording::{FoundRecording, Located, RecordedLimit, Unresolved, Wanted};
+use recording::{FoundRecording, Located, RecordedLimit, ReplayFrom, Unresolved, Wanted};
 
 /// How long a single archive control connect may take before the endpoint is
 /// declared down and rotated. This is short, because it runs inside a
@@ -97,15 +97,38 @@ impl EndpointSource {
     pub fn current(&self) -> Vec<String> {
         match self {
             Self::Static(list) => list.clone(),
-            Self::Discovered { topic, archives } => archives
-                .borrow()
-                .entries
-                .values()
-                .filter_map(|e| ArchiveRecord::from_entry(e).ok())
-                .filter(|a| a.records(*topic))
+            Self::Discovered { .. } => self
+                .discovered()
+                .into_iter()
                 .map(|a| a.control.to_string())
                 .collect(),
         }
+    }
+
+    /// The control endpoint of the archive `archive_id`, as `host:port`.
+    /// Only a discovered source names its archives, so a static list
+    /// gives `None`.
+    #[must_use]
+    pub fn archive(&self, archive_id: &str) -> Option<String> {
+        self.discovered()
+            .into_iter()
+            .find(|a| a.archive_id == archive_id)
+            .map(|a| a.control.to_string())
+    }
+
+    /// The live archive records that record the topic. Empty for a
+    /// static list.
+    fn discovered(&self) -> Vec<ArchiveRecord> {
+        let Self::Discovered { topic, archives } = self else {
+            return Vec::new();
+        };
+        archives
+            .borrow()
+            .entries
+            .values()
+            .filter_map(|e| ArchiveRecord::from_entry(e).ok())
+            .filter(|a| a.records(*topic))
+            .collect()
     }
 
     /// Whether this source can ever name an endpoint: a non-empty static
@@ -125,6 +148,9 @@ pub struct RefetchConfig {
     pub tx_data_endpoints: EndpointSource,
     /// Remote archive control endpoints recording `tx_deposits`.
     pub tx_deposits_endpoints: EndpointSource,
+    /// The archives that record an executor stream. A replay names one
+    /// of them by its archive id.
+    pub exec_txs_endpoints: EndpointSource,
     /// This node's UDP endpoint (`host:port`) for archive control responses.
     pub response_endpoint: String,
     /// This node's UDP endpoint (`host:port`) that replayed fragments land
@@ -197,6 +223,25 @@ impl ReplayPlan {
     }
 }
 
+/// Where a replay of an executor stream starts: the archive that records
+/// it, by its archive id, the stream, the Aeron session of the recorded
+/// publication, and a raw stream position at or before the first wanted
+/// record.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecRecordsAt<'a> {
+    pub archive_id: &'a str,
+    pub stream_id: i32,
+    pub session_id: i32,
+    pub position: i64,
+}
+
+/// What one drained replay delivered, and the range it asked for.
+struct Drained {
+    delivered: u64,
+    from_raw: i64,
+    len: i64,
+}
+
 /// Spawn the dedicated replay runtime, pointed at `aeron_dir` when given.
 fn spawn_runtime(aeron_dir: Option<&std::path::Path>) -> Result<AeronRuntime, LogError> {
     match aeron_dir {
@@ -256,15 +301,95 @@ impl ArchiveRefetcher {
         mut sink: impl FnMut(TxDataLoc, TxEnvelope),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.current();
-        let recs = self.list_or_rotate(&endpoints, stream_id)?;
         let wanted = Wanted {
             stream_id,
             session_id,
-            from,
+            from: ReplayFrom::Fragment(from),
         };
-        let found = wanted.resolve(recs).map_err(|u| self.refuse(u))?;
-        let Some(plan) = self.prepare_replay(&endpoints, &found, wanted)? else {
+        let Some(drained) = self.replay_session(
+            &endpoints,
+            wanted,
+            AeronRuntime::open_tx_data_subscription_with_id,
+            |(loc, env)| sink(loc, env),
+        )?
+        else {
             return Ok(0);
+        };
+        info!(
+            stream_id,
+            session_id,
+            from_raw = drained.from_raw,
+            replay_len = drained.len,
+            delivered = drained.delivered,
+            "tx_data refetch drained"
+        );
+        Ok(drained.delivered)
+    }
+
+    /// Replay the executor stream records of session `at.session_id` from
+    /// the archive `at.archive_id`, from the raw position `at.position` to
+    /// the recorded position. Delivers each record to `sink`, in stream
+    /// order. Returns the delivered count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no archive record names `at.archive_id`, when
+    /// the archive is not reachable, or when the replay fails to start.
+    /// Returns [`LogError::RangeAbsent`] when the archive holds no byte of
+    /// the range: it has no recording of the session, or the recording
+    /// ended at or before the position.
+    pub fn fetch_exec_records(
+        &mut self,
+        at: &ExecRecordsAt<'_>,
+        mut sink: impl FnMut(ExecTxRecord),
+    ) -> Result<u64, LogError> {
+        let endpoint = self
+            .cfg
+            .exec_txs_endpoints
+            .archive(at.archive_id)
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "refetch: no exec_txs archive record names archive {}",
+                    at.archive_id
+                ))
+            })?;
+        let wanted = Wanted {
+            stream_id: at.stream_id,
+            session_id: at.session_id,
+            from: ReplayFrom::Raw(at.position),
+        };
+        let drained = self.replay_session(
+            &[endpoint],
+            wanted,
+            AeronRuntime::open_subscription_with_id::<ExecTxRecord>,
+            |(_, record)| sink(record),
+        )?;
+        Ok(drained.map_or(0, |d| d.delivered))
+    }
+
+    /// One bounded replay of one publisher session from the archives
+    /// `endpoints`: resolve the recording that holds the start, bound the
+    /// replay by the recorded position, open the replay subscription with
+    /// `open`, start the replay, and drain it into `deliver`. Returns
+    /// `None` when a live recording does not reach the start yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the listing, the bound, the subscription or
+    /// the replay start, after a rotation to the next endpoint. Returns
+    /// [`LogError::RangeAbsent`] when the archive holds no byte of the
+    /// range.
+    fn replay_session<S: PollRecv>(
+        &mut self,
+        endpoints: &[String],
+        wanted: Wanted,
+        open: impl FnOnce(&AeronRuntime, &str, i32) -> Result<(u32, S), LogError>,
+        deliver: impl FnMut(S::Item),
+    ) -> Result<Option<Drained>, LogError> {
+        let recs = self.list_or_rotate(endpoints, wanted.stream_id)?;
+        let found = wanted.resolve(recs).map_err(|u| self.refuse(u))?;
+        let Some(plan) = self.prepare_replay(endpoints, &found, wanted)? else {
+            return Ok(None);
         };
         let rec = &found.rec;
 
@@ -275,14 +400,12 @@ impl ArchiveRefetcher {
         // and closes once the drain ends.
         let replay_stream = self.replay_stream_id();
         let sub_uri = replay_sub_uri(&plan.endpoint, rec.session_id);
-        let (sub_id, mut rx) = self
-            .ensure_runtime()?
-            .open_tx_data_subscription_with_id(&sub_uri, replay_stream)?;
+        let (sub_id, mut rx) = open(self.ensure_runtime()?, &sub_uri, replay_stream)?;
 
-        let session = self.ensure_session(&endpoints)?;
+        let session = self.ensure_session(endpoints)?;
         let replay_result = Self::start_bounded_replay(session, rec, replay_stream, &plan);
         let delivered = if replay_result.is_ok() {
-            Self::drain(&mut rx, |(loc, env)| sink(loc, env))
+            Self::drain(&mut rx, deliver)
         } else {
             0
         };
@@ -300,23 +423,19 @@ impl ArchiveRefetcher {
             // loop's next refetch attempt reads the mirror archive instead of
             // staying pinned to the bad copy.
             warn!(
-                stream_id,
-                session_id,
+                stream_id = wanted.stream_id,
+                session_id = wanted.session_id,
                 from_raw = plan.from_raw,
                 replay_len = plan.len,
                 "refetch: replay produced no fragments (corrupt recording?); rotating endpoint"
             );
             self.rotate();
         }
-        info!(
-            stream_id,
-            session_id,
-            from_raw = plan.from_raw,
-            replay_len = plan.len,
+        Ok(Some(Drained {
             delivered,
-            "tx_data refetch drained"
-        );
-        Ok(delivered)
+            from_raw: plan.from_raw,
+            len: plan.len,
+        }))
     }
 
     /// Refetch `tx_deposits` from `from`, best effort across all recordings of
@@ -642,103 +761,6 @@ impl ArchiveRefetcher {
                     rec.recording_id, plan.from_raw, plan.len, plan.limit.position, plan.limit.active
                 ))
             })
-    }
-
-    /// Drain a replay subscription: deliver until [`DRAIN_IDLE`] of
-    /// silence after the last fragment (bounded replay exhausted) or the
-    /// [`DRAIN_CAP`].
-    ///
-    /// The refetcher runs on the `tx_ordering` reader thread — a plain
-    /// std thread with no tokio runtime entered — so each wait is a
-    /// blocking receive with an idle timeout via [`recv_timeout`]: the
-    /// thread parks on the channel and wakes on the next fragment. No
-    /// `try_recv` + sleep busy loop, and no runtime of its own.
-    fn drain<S: PollRecv>(rx: &mut S, mut deliver: impl FnMut(S::Item)) -> u64 {
-        let deadline = Instant::now() + DRAIN_CAP;
-        let mut delivered = 0u64;
-        loop {
-            let ControlFlow::Continue(item) = drain_step(rx, deadline) else {
-                return delivered;
-            };
-            deliver(item);
-            delivered += 1;
-        }
-    }
-}
-
-/// One [`ArchiveRefetcher::drain`] step: `Break` means the idle budget ran out
-/// or the source ended (replay exhausted, or the runtime is gone); either
-/// way the caller stops. `Continue` carries one item the caller delivers
-/// and counts.
-fn drain_step<S: PollRecv>(rx: &mut S, deadline: Instant) -> ControlFlow<(), S::Item> {
-    let budget = DRAIN_IDLE.min(deadline.saturating_duration_since(Instant::now()));
-    if budget.is_zero() {
-        return ControlFlow::Break(());
-    }
-    match recv_timeout(rx, budget) {
-        Ok(Some(item)) => ControlFlow::Continue(item),
-        // Idle timeout (replay exhausted) or channel closed (runtime gone).
-        Err(RecvTimeout) | Ok(None) => ControlFlow::Break(()),
-    }
-}
-
-/// The wait in [`recv_timeout`] elapsed with nothing received.
-struct RecvTimeout;
-
-/// Blocking receive with a timeout on a [`PollRecv`] subscription from a
-/// thread that is NOT inside a tokio runtime. Both `PollRecv`
-/// implementations wrap a tokio `UnboundedReceiver`, which only offers
-/// `blocking_recv` (no timeout) and async `recv` (needs a timer for
-/// `timeout`), so this drives `poll_recv` by hand with a waker that unparks
-/// the calling thread: park until woken or the deadline, re-poll, repeat.
-/// Spurious unparks just cause an extra poll.
-///
-/// `Ok(None)` means the channel closed; `Err(RecvTimeout)` means the deadline
-/// passed.
-fn recv_timeout<S: PollRecv>(
-    rx: &mut S,
-    timeout: Duration,
-) -> Result<Option<S::Item>, RecvTimeout> {
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct Unpark(std::thread::Thread);
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    /// One poll-and-maybe-park step. `Break` carries [`recv_timeout`]'s
-    /// answer: a ready item, or a timeout past `deadline`. `Continue`
-    /// means the poll was pending and this thread parked until either
-    /// woken or `deadline`; the caller polls again.
-    fn step<S: PollRecv>(
-        rx: &mut S,
-        cx: &mut Context<'_>,
-        deadline: Instant,
-    ) -> ControlFlow<Result<Option<S::Item>, RecvTimeout>> {
-        if let Poll::Ready(item) = rx.poll_recv(cx) {
-            return ControlFlow::Break(Ok(item));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return ControlFlow::Break(Err(RecvTimeout));
-        }
-        std::thread::park_timeout(deadline - now);
-        ControlFlow::Continue(())
-    }
-
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let ControlFlow::Break(result) = step(rx, &mut cx, deadline) {
-            return result;
-        }
     }
 }
 

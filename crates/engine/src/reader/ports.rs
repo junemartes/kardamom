@@ -85,6 +85,7 @@ pub trait TxOrderingSubscription: Send {
 pub struct JoinRecovery {
     refetcher: kardamom_log::refetch::ArchiveRefetcher,
     tx_data_stream_base: i32,
+    exec_txs_stream_id: i32,
 }
 
 /// A join-miss archive recovery attempt failed.
@@ -135,6 +136,49 @@ impl JoinRecovery {
     }
 }
 
+/// Where a replay of an executor stream starts: the archive that records
+/// it, the session of the recorded publication, and a raw stream position
+/// at or before the first wanted record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecRecordsFrom<'a> {
+    pub(crate) archive_id: &'a str,
+    pub(crate) session_id: i32,
+    pub(crate) position: i64,
+}
+
+/// The replay of executor stream records from an executor archive. The
+/// production replay is [`JoinRecovery`]. A test replays from memory.
+pub(crate) trait ExecRecordReplay {
+    /// Replay the records of `from` to the recorded position, in stream
+    /// order, into `sink`. Returns the delivered count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the archive error. [`kardamom_log::error::LogError::RangeAbsent`]
+    /// means that the archive holds no byte of the range.
+    fn replay_exec_records(
+        &mut self,
+        from: ExecRecordsFrom<'_>,
+        sink: impl FnMut(ExecTxRecord),
+    ) -> Result<u64, JoinRecoveryError>;
+}
+
+impl ExecRecordReplay for JoinRecovery {
+    fn replay_exec_records(
+        &mut self,
+        from: ExecRecordsFrom<'_>,
+        sink: impl FnMut(ExecTxRecord),
+    ) -> Result<u64, JoinRecoveryError> {
+        let at = kardamom_log::refetch::ExecRecordsAt {
+            archive_id: from.archive_id,
+            stream_id: self.exec_txs_stream_id,
+            session_id: from.session_id,
+            position: from.position,
+        };
+        Ok(self.refetcher.fetch_exec_records(&at, sink)?)
+    }
+}
+
 /// Builds the thread-bound [`JoinRecovery`] inside the reader thread. A
 /// value, not a closure: a wiring seam needs to name a concrete type, and
 /// a closure has none. Fields are `pub(crate)`: `bin_support::archive_join_recovery`
@@ -142,6 +186,7 @@ impl JoinRecovery {
 pub struct JoinRecoveryFactory {
     pub(crate) cfg: kardamom_log::refetch::RefetchConfig,
     pub(crate) tx_data_stream_base: i32,
+    pub(crate) exec_txs_stream_id: i32,
 }
 
 impl JoinRecoveryFactory {
@@ -150,6 +195,7 @@ impl JoinRecoveryFactory {
         JoinRecovery {
             refetcher: kardamom_log::refetch::ArchiveRefetcher::new(self.cfg),
             tx_data_stream_base: self.tx_data_stream_base,
+            exec_txs_stream_id: self.exec_txs_stream_id,
         }
     }
 }

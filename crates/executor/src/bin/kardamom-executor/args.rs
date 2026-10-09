@@ -158,6 +158,24 @@ pub(crate) struct Args {
     /// (`REPLAY_UNAVAILABLE`). Requires `--checkpoint-dir`.
     #[arg(long, env = "KARDAMOM_CHECKPOINT_PEERS", value_delimiter = ',')]
     pub(crate) checkpoint_peers: Vec<String>,
+    /// The query endpoints of the peer executors (`http://host:port`,
+    /// comma-separated). When every `tx_data` archive fails for an entry,
+    /// the executor asks these peers where the entry is, and replays it
+    /// from the archive of a peer that holds it, before it votes to void
+    /// the entry. It votes only after every archive refused the range and
+    /// every peer answered `not_held`.
+    #[arg(long, env = "KARDAMOM_EXEC_PEERS", value_delimiter = ',')]
+    pub(crate) exec_peers: Vec<kardamom_state::ExecPeer>,
+    /// This executor's own entry in `--exec-peers`. The executor does not
+    /// ask itself.
+    #[arg(long, env = "KARDAMOM_EXEC_SELF")]
+    pub(crate) exec_self: Option<kardamom_state::ExecPeer>,
+    /// The archive id of the Aeron archive on this node, as its archive
+    /// record names it. The query endpoint answers `kardamom_getExecLocator`
+    /// only when this is set: a `located` answer names the archive by this
+    /// id. Requires `--nonce-query-addr`.
+    #[arg(long, env = "KARDAMOM_EXEC_ARCHIVE_ID")]
+    pub(crate) exec_archive_id: Option<String>,
     /// Serve read-only account nonce queries (`eth_getTransactionCount`)
     /// on this address. The sequencers ask it for the committed nonce of a
     /// cold sender. Off when unset. See
@@ -176,6 +194,39 @@ pub(crate) struct Args {
     pub(crate) ready_lag_blocks: u32,
 }
 
+impl Args {
+    /// The peer executors to ask, without this executor.
+    pub(crate) fn exec_peers(&self) -> kardamom_state::ExecPeers {
+        kardamom_state::ExecPeers::new(
+            self.exec_peers.clone(),
+            self.exec_self.as_ref(),
+            kardamom_state::exec_peers::DEFAULT_PEER_TIMEOUT,
+        )
+    }
+
+    /// Start the answers state of the executor stream, when the query
+    /// endpoint serves it: with `--nonce-query-addr` and
+    /// `--exec-archive-id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when the OS refuses the thread.
+    pub(crate) fn exec_answers(
+        &self,
+    ) -> std::io::Result<
+        Option<(
+            kardamom_state::ExecAnswersFeed,
+            kardamom_state::ExecAnswersLookup,
+        )>,
+    > {
+        let (Some(_), Some(archive_id)) = (self.nonce_query_addr, self.exec_archive_id.clone())
+        else {
+            return Ok(None);
+        };
+        kardamom_state::ExecAnswers::spawn(archive_id).map(Some)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -189,6 +240,44 @@ mod tests {
     fn args_parse_with_only_the_required_flag() {
         Args::try_parse_from(["kardamom-executor", "--config", "executor.toml"])
             .expect("Args parses with just --config");
+    }
+
+    #[test]
+    fn exec_peers_parse_and_exclude_this_executor() {
+        let a = Args::try_parse_from([
+            "kardamom-executor",
+            "--config",
+            "executor.toml",
+            "--exec-peers",
+            "http://executor-0.node.dc1.consul:9024,http://executor-1.node.dc1.consul:9024",
+            "--exec-self",
+            "http://executor-1.node.dc1.consul:9024",
+            "--exec-archive-id",
+            "executor-1",
+        ])
+        .expect("parses");
+        let peers = kardamom_state::ExecPeers::new(
+            a.exec_peers,
+            a.exec_self.as_ref(),
+            kardamom_state::exec_peers::DEFAULT_PEER_TIMEOUT,
+        );
+        let urls: Vec<&str> = peers
+            .peers()
+            .iter()
+            .map(kardamom_state::ExecPeer::url)
+            .collect();
+        assert_eq!(urls, vec!["http://executor-0.node.dc1.consul:9024"]);
+        assert_eq!(a.exec_archive_id.as_deref(), Some("executor-1"));
+        assert!(
+            Args::try_parse_from([
+                "kardamom-executor",
+                "--config",
+                "executor.toml",
+                "--exec-peers",
+                "executor-0:9024",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

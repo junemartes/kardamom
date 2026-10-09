@@ -69,6 +69,7 @@ async fn spawn_writer_and_bal(
     genesis: Option<&kardamom_types::Genesis>,
     rt_pub: &AeronRuntime,
     plane: &mut StreamPlane,
+    answers: Option<kardamom_state::ExecAnswersLookup>,
 ) -> Result<WriterAdapters> {
     // Seed genesis once into a fresh env (a no-op if already seeded, for
     // example on recovery). This must run before `StateWriter::spawn`, so
@@ -86,9 +87,11 @@ async fn spawn_writer_and_bal(
 
     // The nonce query endpoint reads the committed state through its own
     // short-lived snapshots. It must exist before the writer takes `env`.
+    // It also answers the peer executors where an entry is on this
+    // executor's stream.
     let nonce_query = args
         .nonce_query_addr
-        .map(|addr| kardamom_state::serve_nonce_queries(addr, env.clone()))
+        .map(|addr| kardamom_state::serve_nonce_queries(addr, env.clone(), answers))
         .transpose()
         .context("bind nonce query address")?;
 
@@ -244,6 +247,24 @@ async fn connect_cluster(
 struct Outputs {
     tx_receipts_pub: wiring::LiveTxReceiptsPub,
     exec_stream: kardamom_executor::exec_stream::ExecStream,
+    /// The query endpoint's side of the answers state, when it runs.
+    answers_lookup: Option<kardamom_state::ExecAnswersLookup>,
+    /// What the reader needs for the peer step beside the peers.
+    peer_step: PeerStep,
+}
+
+/// The reader's side of the peer step: the answers feed, and the records
+/// of an earlier run on this executor's archive.
+struct PeerStep {
+    answers: Option<kardamom_state::ExecAnswersFeed>,
+    own_tail: Option<kardamom_engine::OwnTail>,
+}
+
+impl PeerStep {
+    fn apply(self, reader: &mut kardamom_engine::ReaderConfig) {
+        reader.exec_answers = self.answers;
+        reader.own_tail = self.own_tail;
+    }
 }
 
 /// What [`Outputs::open`] needs.
@@ -252,19 +273,24 @@ struct OutputsConfig<'a> {
     rt_pub: &'a AeronRuntime,
     plane: &'a mut StreamPlane,
     aeron_cfg: &'a kardamom_log::config::AeronConfig,
+    /// The persisted cursor that this run resumes from.
+    start: &'a kardamom_engine::ResumePoint,
     stop: tokio_util::sync::CancellationToken,
 }
 
 impl Outputs {
     /// Open the outputs on the publication runtime. The executor stream
     /// opens last: its local recording must be active before the engine
-    /// joins anything.
+    /// joins anything. The answers state of the executor stream starts
+    /// first: the stream publisher and the reader feed it, and the query
+    /// endpoint asks it.
     async fn open(cfg: OutputsConfig<'_>) -> Result<Self> {
         let OutputsConfig {
             args,
             rt_pub,
             plane,
             aeron_cfg,
+            start,
             stop,
         } = cfg;
         let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args).await?;
@@ -275,6 +301,10 @@ impl Outputs {
             .await
             .context("open events")?
             .spawn_process_beacon();
+        let (answers, answers_lookup) = args
+            .exec_answers()
+            .context("spawn the exec answers thread")?
+            .unzip();
         let exec_stream = kardamom_executor::exec_stream::ExecStream::open(
             kardamom_executor::exec_stream::ExecStreamConfig {
                 rt_pub,
@@ -282,13 +312,27 @@ impl Outputs {
                 aeron_dir: args.aeron_dir.as_deref(),
                 aeron_cfg,
                 state_dir: &args.state_dir,
+                answers: answers.clone(),
+                resume_index: start.is_resume().then_some(start.record_count),
                 stop,
             },
         )
         .await?;
+        let own_tail =
+            exec_stream
+                .tail
+                .zip(args.exec_archive_id.clone())
+                .map(|(locator, archive_id)| kardamom_engine::OwnTail {
+                    archive_id,
+                    session_id: locator.session_id,
+                    position: locator.position,
+                    from_index: start.record_count,
+                });
         Ok(Self {
             tx_receipts_pub,
             exec_stream,
+            answers_lookup,
+            peer_step: PeerStep { answers, own_tail },
         })
     }
 }
@@ -332,6 +376,7 @@ impl Boot {
         // resume's.
         cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume);
         cfg.reader.voter_id = self.args.void_voter_id;
+        cfg.reader.exec_peers = self.args.exec_peers();
         cfg
     }
 
@@ -473,10 +518,12 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         rt_pub: &rt_pub,
         plane: &mut plane,
         aeron_cfg: &aeron_cfg,
+        start: &start,
         stop: shutdown.clone(),
     })
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
+    let answers = outputs.answers_lookup;
 
     let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
 
@@ -489,9 +536,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         footprint_shadow,
         _bal_publisher,
         _nonce_query: nonce_query,
-    } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
+    } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane, answers).await?;
 
-    let cfg = boot.engine_config(chain_id, genesis.as_ref(), start.is_resume());
+    let mut cfg = boot.engine_config(chain_id, genesis.as_ref(), start.is_resume());
+    outputs.peer_step.apply(&mut cfg.reader);
 
     let block_exec = wiring::build_block_exec(args);
 

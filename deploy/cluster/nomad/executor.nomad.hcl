@@ -253,6 +253,17 @@ job "executor" {
           # The account nonce query for the sequencers
           # (ports.executor_nonce_query in group_vars/all.yml).
           "--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}",
+          # The peer step of the join: when every tx_data archive fails
+          # for an entry, ask the other executors' query endpoints where
+          # the entry is, and replay it from that executor's exec_txs
+          # archive, before the void vote. The list names every executor
+          # node; --exec-self names this node's entry, which the executor
+          # does not ask. --exec-archive-id is the archive_id of this
+          # node's archive record (aeron.system.nomad.hcl), which a
+          # "located" answer names.
+          "--exec-peers", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
+          "--exec-self", "http://${node.unique.name}.node.${var.datacenter}.consul:${var.executor_query_port}",
+          "--exec-archive-id", "${node.unique.name}",
           "--checkpoint-peers", join(",", [for i in range(var.executor_count) : "executor-${i}.node.${var.datacenter}.consul:9014"]),
           # Bind the Prometheus exporter on all interfaces; the
           # default is loopback. The chaos suite probes it directly

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
+use super::peer_fetch::PeerFetchEvidence;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
@@ -31,7 +32,16 @@ async fn aeron_baseline(h: &Harness, case: &str) -> anyhow::Result<usize> {
 /// node shares that driver, so the local ingress loses its transport
 /// and its recorder in one blow. The pipeline rides on ingress-1, Nomad
 /// restarts the system task, and the collocated ingress recovers.
+///
+/// The kill can end both `tx_data` recordings before the last frames of an
+/// entry that some executors got live. The other executors then fetch the
+/// entry from the `exec_txs` archives of those peers, and nobody votes:
+/// the executors that joined the entry never vote. The case prints the
+/// peer fetches and the votes as evidence, and fails on a restart loop.
+/// It does not assert the number of fetches: a kill between two frames
+/// loses nothing.
 pub(crate) async fn driver_loss(h: &mut Harness) -> anyhow::Result<()> {
+    let evidence = PeerFetchEvidence::read(h).await?;
     let base = aeron_baseline(h, "archive-driver-loss").await?;
     let node = h.container("ingress-0")?;
     crate::log(format!(
@@ -42,7 +52,8 @@ pub(crate) async fn driver_loss(h: &mut Harness) -> anyhow::Result<()> {
     h.assert_count("aeron", base, h.knobs.driver_restart_slo())
         .await?;
     h.assert_count("ingress", 2, h.knobs.reschedule_slo).await?;
-    h.assert_ingress_pair_live("archive-driver-loss").await
+    h.assert_ingress_pair_live("archive-driver-loss").await?;
+    evidence.report(h, "archive-driver-loss").await.map(|_| ())
 }
 
 /// The data-loss drill: wipe ingress-0's `tx_data` archive while its

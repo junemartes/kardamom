@@ -1,6 +1,6 @@
 use kardamom_types::BPosition;
 
-use super::{FakeArchiveCatalog, FoundRecording, RecordedLimit, ReplayPlan, Wanted};
+use super::{FakeArchiveCatalog, FoundRecording, RecordedLimit, ReplayFrom, ReplayPlan, Wanted};
 use crate::error::LogError;
 
 /// The raw position `term_id * 65536 + term_offset` of the fake layout.
@@ -21,7 +21,7 @@ fn pick(recordings: &[(i64, i64, Option<i64>)], raw: i64) -> Option<i64> {
     let wanted = Wanted {
         stream_id: 0,
         session_id: 0,
-        from: at(raw),
+        from: ReplayFrom::Fragment(at(raw)),
     };
     wanted.resolve(recs).ok().map(|l| l.rec.recording_id)
 }
@@ -109,7 +109,7 @@ fn only_the_recordings_of_the_session_count() {
     let wanted = Wanted {
         stream_id: 0,
         session_id: 0,
-        from: at(250_000),
+        from: ReplayFrom::Fragment(at(250_000)),
     };
     assert!(wanted.resolve(recs).is_err());
 }

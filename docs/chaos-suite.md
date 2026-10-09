@@ -56,7 +56,7 @@ There are eleven shards. `just container-test` lists their names.
 | `load` | Sustained load: transfers, then the DeFi mix | `LOAD_DURATION_S=300`, `LOAD_TARGET_TPS=300`, `LOAD_SENDERS=6` |
 | `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | `RUN_LOAD=0` |
 | `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `replay-window-resync`, `deploy-broken-image` | `RUN_LOAD=0` |
-| `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | `RUN_LOAD=0` |
+| `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `exec-peer-fetch`, `archive-tx-data-wipe`, `archive-corruption` | `RUN_LOAD=0` |
 | `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout`, `resize-scale-out-in` | `RUN_LOAD=0` |
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
@@ -96,7 +96,8 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 
 - [`graceful-ingress`](failure-modes.md#ingress-xn-activeactive): stops one ingress allocation with a graceful stop. The job returns to two replicas.
 - [`hard-ingress`](failure-modes.md#ingress-xn-activeactive): kills one ingress. The victim rotates with the CI run id (`INGRESS_VICTIM`).
-- [`archive-driver-loss`](failure-modes.md#substrate-the-shared-failure-domain): kills the Aeron media driver under ingress-0.
+- [`archive-driver-loss`](failure-modes.md#substrate-the-shared-failure-domain): kills the Aeron media driver under ingress-0. The case prints the peer fetches and the void votes in the executor logs. It fails when the executors abort a join more than once: a restart loop.
+- [`exec-peer-fetch`](failure-modes.md#the-peer-step-an-executor-fetches-an-entry-from-a-peers-archive): the ingress archives and executor-2 drop the `tx_data` data frames from the ingress addresses (iptables `u32` matches on the Aeron stream id). The archives drop them for 60 s, so both recordings miss that window and refuse it. Executor-2 drops them until an executor joins an entry from a peer's `exec_txs` archive. Executors 0 and 1 join the window live. Executor-2 must converge, no executor may vote, and no restart loop may occur.
 - [`archive-tx-data-wipe`](failure-modes.md#substrate-the-shared-failure-domain): wipes the `tx_data` archive of ingress-0. The case restores it from ingress-1 and verifies it.
 - [`archive-corruption`](failure-modes.md#substrate-the-shared-failure-domain): flips bytes in an archive segment. A CRC verify must find it, and a targeted heal must fix it.
 
