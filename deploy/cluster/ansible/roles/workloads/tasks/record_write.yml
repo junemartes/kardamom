@@ -1,0 +1,22 @@
+---
+# Write the deploy record: the attempt and the accepted release to the
+# Nomad variable, and the mirror under deployed/<env>/. The variable is
+# the record that every operator and the rollout tooling read; the mirror
+# is for an operator without the Nomad token.
+- name: Write the deploy record of {{ workloads_env }}
+  ansible.builtin.uri:
+    url: "{{ workloads_record_url }}"
+    method: PUT
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Namespace: "{{ workloads_namespace }}"
+      Path: "{{ workloads_record_path }}"
+      Items: >-
+        {{ {'attempt': workloads_attempt | to_json}
+           | combine({'accepted': workloads_accepted | to_json} if workloads_accepted | length > 0 else {}) }}
+  changed_when: true
+
+- name: Mirror the deploy record
+  ansible.builtin.import_tasks: record_mirror.yml

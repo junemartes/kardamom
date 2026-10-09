@@ -674,9 +674,13 @@ images:
 deploy:
     @just --justfile deploy/cluster/justfile deploy
 
-# Deploy the manifest the last successful deploy of <env> replaced.
+# Roll <env> back one release by the deploy record (docs/runbooks/deploy-rollback.md).
 rollback env:
     @just --justfile deploy/cluster/justfile rollback {{ env }}
+
+# Re-render the release before the last one when Nomad dropped its job versions.
+rollback-rerender env:
+    @just --justfile deploy/cluster/justfile rollback-rerender {{ env }}
 
 # Submit a signed transfer; RPC_URL overrides the node contract address.
 smoke:

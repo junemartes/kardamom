@@ -1,0 +1,24 @@
+---
+# One registration in the attempt record: the job joins `changed` in
+# registration order, and its entry gets the version Nomad registered.
+# The sealer roll registers the cluster job once per member, so a job
+# joins `changed` once and keeps its first `before`.
+- name: Read the registered version of {{ workloads_register_job }}
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_register_job }}?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_record_registered
+
+- name: Add to the attempt record {{ workloads_register_job }}
+  ansible.builtin.set_fact:
+    workloads_attempt: >-
+      {{ workloads_attempt
+         | combine({'changed': workloads_attempt.changed + ([workloads_register_job] if workloads_register_job not in workloads_attempt.changed else []),
+                    'before': {'jobs': {workloads_register_job: {
+                      'before': (workloads_attempt.before.jobs[workloads_register_job] | default({})).before | default(none),
+                      'after': workloads_record_registered.json.Version}}}},
+                   recursive=true) }}
+
+- name: Write the attempt record
+  ansible.builtin.import_tasks: record_write.yml

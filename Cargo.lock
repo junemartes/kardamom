@@ -3876,6 +3876,7 @@ dependencies = [
  "humantime",
  "jsonrpsee",
  "kardamom-bench",
+ "kardamom-formats",
  "kardamom-l1-fault-proxy",
  "kardamom-reconstruct",
  "kardamom-state",

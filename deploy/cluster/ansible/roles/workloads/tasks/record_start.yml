@@ -1,0 +1,37 @@
+---
+# The attempt record, before the first registration. It holds the target
+# (the manifest, the formats, the revision), the version of every job
+# Nomad knows (the release that runs), and the rollback floor of the
+# gate. Each registration adds the job to `changed`; the acceptance
+# copies the attempt to `accepted`. README.md documents the schema.
+- name: Read the version of every job
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/jobs?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_record_jobs
+
+- name: Compose the attempt record
+  ansible.builtin.set_fact:
+    workloads_attempt:
+      env: "{{ workloads_env }}"
+      status: started
+      started_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+      operator: "{{ workloads_operator }}"
+      target:
+        revision: "{{ workloads_target_revision }}"
+        manifest: "{{ workloads_image_refs }}"
+        formats: "{{ lookup('file', workloads_formats_file, rstrip=false) }}"
+      before:
+        revision: "{{ workloads_accepted.target.revision | default('') }}"
+        manifest: "{{ workloads_accepted.target.manifest | default({}) }}"
+        formats: "{{ workloads_accepted.target.formats | default('') }}"
+        jobs: >-
+          {{ workloads_record_jobs.json | map(attribute='ID')
+             | zip(workloads_record_jobs.json | map(attribute='Version') | map('community.general.dict_kv', 'before'))
+             | community.general.dict }}
+      changed: []
+      floor: "{{ workloads_floor }}"
+
+- name: Write the attempt record
+  ansible.builtin.import_tasks: record_write.yml

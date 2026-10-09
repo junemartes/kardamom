@@ -37,6 +37,14 @@
     - workloads_plan.json.Diff.Type != 'None'
   changed_when: true
 
+- name: Record the registration of {{ workloads_register_job }}
+  ansible.builtin.include_tasks: record_change.yml
+  when:
+    - not ansible_check_mode
+    - workloads_register_submit | bool
+    - workloads_plan.json.Diff.Type != 'None'
+    - workloads_attempt is defined
+
 - name: Report planned change for {{ workloads_register_job }}
   ansible.builtin.debug:
     msg: "{{ workloads_plan.json.Diff.Type }}"

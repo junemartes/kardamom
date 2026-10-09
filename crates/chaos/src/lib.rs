@@ -40,6 +40,7 @@ pub mod nodes;
 pub mod nomad;
 pub mod poll;
 pub mod probes;
+pub mod release;
 pub mod replace;
 pub mod rpc;
 pub mod scale;
