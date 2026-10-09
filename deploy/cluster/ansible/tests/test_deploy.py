@@ -424,8 +424,11 @@ class DeployTest(unittest.TestCase):
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
-        for job in ('batcher', 'l1-indexer'):
-            self.assertEqual(self.api.state['variables'][f'nomad/jobs/{job}']['KARDAMOM_L1_RPC'], proxy, job)
+        variables = self.api.state['variables']
+        self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], proxy)
+        # The follower reads the proxy and its second source, so a lie of
+        # the first is a disagreement.
+        self.assertEqual(variables['nomad/jobs/l1-indexer']['KARDAMOM_L1_RPC'], f'{proxy},{proxy}/second')
         indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
         self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')

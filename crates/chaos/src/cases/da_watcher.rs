@@ -8,13 +8,11 @@
 //! origin by hand: these checks assert that it got there by itself.
 
 use crate::harness::Harness;
-use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::probes::DA_WATCHER_PORT;
 
 /// The cursor file on the aux node: one line, `<number> <hash>`.
 const CURSOR_FILE: &str = "/opt/kardamom/da-watcher/l1-cursor";
-const JOB: &str = "da-watcher";
 /// The L1 block of the last epoch the da-watcher published.
 const PUBLISHED_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 
@@ -40,26 +38,6 @@ async fn cursor_line(h: &Harness) -> anyhow::Result<Option<String>> {
 /// The block number of a cursor line.
 fn cursor_number(line: &str) -> Option<u64> {
     line.split_ascii_whitespace().next()?.parse().ok()
-}
-
-/// Restart the da-watcher from its registered job, with no extra flag.
-/// The start resumes after the sealer's L1 origin, and takes that block's
-/// hash from its `l1_blocks` record. This replaces a wrong hash in the
-/// cursor file. Then assert that it stands at or before the sealer.
-///
-/// # Errors
-///
-/// Returns an error when a job step fails, or when the cursor stands past
-/// the sealer's origin.
-pub(crate) async fn restart_and_follow_sealer(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
-    crate::log(format!(
-        "{ctx}: restart the da-watcher; it resumes after the sealer's L1 origin by itself"
-    ));
-    let saved = SavedJob::capture(&h.nomad, JOB).await?;
-    saved.stop().await?;
-    saved.restore().await?;
-    h.assert_count(JOB, 1, h.knobs.restart_slo).await?;
-    assert_not_past_sealer(h, ctx).await
 }
 
 /// Assert that the da-watcher's cursor file does not stand past the

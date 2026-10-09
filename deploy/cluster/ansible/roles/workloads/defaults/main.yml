@@ -151,7 +151,7 @@ workloads_fault_proxy_url: "http://kardamom-l1-fault-proxy.service.{{ datacenter
 # L1_FOLLOWERS_RPC then names the real L1 endpoints, and the light client
 # settles the reads it serves (workloads_followers_light_client).
 workloads_followers_rpc: >-
-  {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
+  {{ workloads_fault_proxy_url ~ ',' ~ workloads_fault_proxy_url ~ '/second' if workloads_l1_fault_proxy | bool
      else lookup('env', 'L1_FOLLOWERS_RPC')
      | default('http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
                if workloads_light_execution_rpc | length > 0 else workloads_l1_rpc, true) }}

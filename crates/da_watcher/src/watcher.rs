@@ -434,14 +434,20 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
     }
 
     /// A live record arrived: it waits in the inbox for its turn.
+    fn arrived(&mut self, record: L1Block) {
+        self.upstream.saw_record();
+        Self::mark_finalized(record.number);
+        self.inbox.push_back(record);
+    }
+
+    /// Export the newest finalized block the stream carried, live or from
+    /// the archives.
     #[allow(
         clippy::cast_precision_loss,
         reason = "metric value; never nears 2^52 for an L1 block number"
     )]
-    fn arrived(&mut self, record: L1Block) {
-        self.upstream.saw_record();
-        ::metrics::gauge!(metrics::L1_FINALIZED).set(record.number as f64);
-        self.inbox.push_back(record);
+    fn mark_finalized(number: u64) {
+        ::metrics::gauge!(metrics::L1_FINALIZED).set(number as f64);
     }
 
     /// The operator cleared the halt: read the records after the head
@@ -544,8 +550,9 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
         }
         self.history_at = now.checked_add(self.tick);
         let history = self.feed.history(wanted.number).await;
-        if !history.is_empty() {
+        if let Some(newest) = history.iter().map(|record| record.number).max() {
             self.upstream.saw_record();
+            Self::mark_finalized(newest);
         }
         let live = std::mem::take(&mut self.inbox);
         self.inbox = history.into_iter().chain(live).collect();

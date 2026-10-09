@@ -968,8 +968,8 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 
 **A lying L1 endpoint.**
 
-- The follower is the one reader of L1. It chains every header of a range by the parent hashes, to its cursor, and halts on a break (`l1_chain_break`). The da-watcher pauses on it.
-- A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores its hash; the next range then breaks against the cursor, and the follower stays halted until an operator re-indexes it (see [`l1_chain_break`](runbooks/l1_chain_break.md)). A light client anchor closes this case at the finalized tip.
+- The follower is the one reader of L1. With two sources, a lie of one is a disagreement: the follower halts (`l1_source_disagreement`), publishes none of it, and resumes by itself when the sources agree again. The da-watcher pauses on it.
+- With one source, the follower chains every header of a range, to its cursor, and halts on a break (`l1_chain_break`). A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores and publishes its hash. A light client anchor closes this case at the finalized tip; two sources close it everywhere.
 - A swallowed log is invisible to one source. Two sources see it.
 - Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 

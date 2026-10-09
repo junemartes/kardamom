@@ -9,11 +9,8 @@
 
 use std::time::Duration;
 
-use crate::cases::component::wipe_dirs;
-use crate::cases::da_watcher::restart_and_follow_sealer;
 use crate::harness::Harness;
 use crate::l1::L1;
-use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 use crate::probes::{DA_WATCHER_PORT, INDEXER_PORT};
 
@@ -210,32 +207,6 @@ pub(super) async fn await_archive_complete(h: &Harness, l1: &L1, ctx: &str) -> a
         elapsed.as_secs()
     ));
     Ok(())
-}
-
-/// The step a single-source follower needs after a wrong hash reached
-/// its anchor. Both cursors are on disk with the wrong hash. The
-/// da-watcher restarts from its registered job: the start resumes after
-/// the sealer's L1 origin and reads that block's hash again, so it skips
-/// no epoch and needs no resume flag. The archive of each follower
-/// instance is re-indexed from the chain's first block. The two-source
-/// followers never store an unagreed hash, which removes this step.
-pub(super) async fn heal_single_source_followers(h: &mut Harness, ctx: &str) -> anyhow::Result<()> {
-    crate::log(format!(
-        "{ctx}: OPERATOR STEP (removed by the two-source followers): restart the da-watcher, re-index the archive"
-    ));
-    restart_and_follow_sealer(h, ctx).await?;
-    let indexer = SavedJob::capture(&h.nomad, "l1-indexer").await?;
-    indexer.stop().await?;
-    let nodes: Vec<String> = h
-        .probes
-        .follower_nodes()
-        .iter()
-        .map(|node| node.container.clone())
-        .collect();
-    for node in nodes {
-        wipe_dirs(h, &node, ctx, "rm -rf /opt/kardamom/l1-indexer/*").await?;
-    }
-    indexer.restore().await
 }
 
 #[cfg(test)]
