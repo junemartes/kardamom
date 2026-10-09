@@ -219,9 +219,12 @@ public final class ClusterNode {
              AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
+            startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
+            // The watchdog starts last. A start-up step that throws before it
+            // closes the components through this block, and the watchdog must
+            // not read that close as a failed component.
             startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop),
                 contexts.clusterState());
-            startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             stop.await();
         }
     }
