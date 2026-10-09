@@ -16,9 +16,9 @@
 #
 # The ring's mnemonic (KARDAMOM_CANARY_MNEMONIC) comes from the Nomad
 # Variable nomad/jobs/canary, which the workloads role writes: the key
-# never appears in the job. Without a real one the role writes the
-# public anvil mnemonic with ring_offset 34, the accounts the dev
-# genesis funds for the canary.
+# never appears in the job. Without a real one, and with CANARY_LOCAL=1,
+# the role writes the public anvil mnemonic with ring_offset 34, the
+# accounts the dev genesis funds for the canary.
 #
 # Placement: the node whose role set holds monitoring (the aux node by
 # default), outside the chaos suite's blast radius, beside the

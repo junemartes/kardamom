@@ -89,14 +89,18 @@ workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # The transaction canary's ring: its BIP-39 mnemonic (CANARY_MNEMONIC) and
 # the derivation index of its first account (CANARY_RING_OFFSET, default
 # 0). The mnemonic reaches the task only through the job's Nomad Variable
-# (tasks/secrets.yml). Empty: the local profile runs the canary on the
-# public anvil mnemonic from index 34, the four accounts the dev genesis
-# funds for it, and the production profile runs no canary.
+# (tasks/secrets.yml). Without a mnemonic, CANARY_LOCAL=1 runs the canary
+# of the local profile on the public anvil mnemonic from index 34, the
+# four accounts the dev genesis funds for it. Otherwise no canary runs:
+# the CI shards count transactions, and the canary's would add to them.
 workloads_canary_mnemonic: "{{ lookup('env', 'CANARY_MNEMONIC') }}"
 workloads_canary_ring_offset: "{{ lookup('env', 'CANARY_RING_OFFSET') | default('0', true) }}"
 workloads_canary_dev_mnemonic: "test test test test test test test test test test test junk"
 workloads_canary_dev_ring_offset: "34"
-workloads_canary_deployed: "{{ workloads_canary_mnemonic | length > 0 or deployment_profile == 'local' }}"
+workloads_canary_local: "{{ lookup('env', 'CANARY_LOCAL') | default('0', true) | bool }}"
+workloads_canary_deployed: >-
+  {{ workloads_canary_mnemonic | length > 0
+     or (deployment_profile == 'local' and workloads_canary_local | bool) }}
 # The EigenDA network the DA proxy disperses to (sepolia_testnet,
 # mainnet). Empty: the file-backed stand-in (nomad/da-store.nomad.hcl),
 # for a deployment without EigenDA. The proxy signs with the batcher's key and verifies against

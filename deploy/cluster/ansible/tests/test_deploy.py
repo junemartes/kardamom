@@ -253,7 +253,10 @@ class DeployTest(unittest.TestCase):
         return result.stdout
 
     def test_deploy_order_pinning_and_repeat(self):
-        self.run_deploy()
+        # The local canary runs only on request: the CI shards count
+        # transactions.
+        local_canary = {'CANARY_LOCAL': '1'}
+        self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
@@ -276,9 +279,13 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
         self.assertEqual(sorted(self.api.state['variable_writes']),
                          ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/da-watcher'])
-        self.run_deploy()
+        self.run_deploy(environ=local_canary)
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
         self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
+
+    def test_the_local_profile_runs_no_canary_by_default(self):
+        self.run_deploy(check=True)
+        self.assertNotIn('canary', self.api.state['plans'])
 
     def test_secrets_reach_tasks_only_through_nomad_variables(self):
         # Every keyed URL and key the deploy gets, by the environment the

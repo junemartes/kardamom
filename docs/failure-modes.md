@@ -992,7 +992,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - A canary page with no halt beside it means that users fail while every internal signal says the chain is fine.
 - **Known limits.**
   - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
-  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile. A real chain gets its ring from `CANARY_MNEMONIC`.
+  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
 
 ## Redis account cache
 
