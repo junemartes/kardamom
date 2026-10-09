@@ -136,6 +136,16 @@ async fn a_log_that_no_agent_has_reads_as_empty() {
 }
 
 #[tokio::test]
+async fn a_collected_allocation_reads_as_empty() {
+    // The client removed the directory of a collected allocation that
+    // the server still lists. Both agents answer 500 with the cause.
+    let gone = "failed to list entries: open /opt/nomad/alloc/504528f1/alloc/logs: no such file or directory";
+    let node = FakeAgent::default().route(LOGS, 500, gone).spawn().await;
+    let control = control_agent(&node).route(LOGS, 500, gone).spawn().await;
+    assert_eq!(read(&nomad(&control)).await.unwrap(), "");
+}
+
+#[tokio::test]
 async fn a_5xx_from_both_agents_fails_with_both_bodies() {
     let node = FakeAgent::default()
         .route(LOGS, 500, "failed to stream")

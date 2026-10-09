@@ -22,6 +22,11 @@ pub(super) const LOG_READ_BUDGET: Budget = Budget {
     interval: Duration::from_secs(5),
 };
 
+/// The cause a client agent names in a 5xx when the directory of an
+/// allocation is gone: the client collected the allocation, and the
+/// server still lists it. The log is gone for good, as with a 404.
+const ALLOC_DIR_GONE: &str = "no such file or directory";
+
 /// One answer of the fs/logs endpoint of one agent.
 enum LogRead {
     /// The log text. It is empty for a log that the agent does not have.
@@ -147,9 +152,10 @@ impl Nomad {
         Ok(format!("{scheme}://{}", node.http_addr))
     }
 
-    /// One read of a task log from one agent. A 404 reads as empty text.
-    /// A 5xx is a failed read, with its body: the body names the cause,
-    /// and the status alone does not.
+    /// One read of a task log from one agent. A 404 reads as empty text,
+    /// and so does a 5xx that says the allocation directory is gone. Any
+    /// other 5xx is a failed read, with its body: the body names the
+    /// cause, and the status alone does not.
     async fn read_log_once(&self, url: &str) -> anyhow::Result<LogRead> {
         let response = self
             .http
@@ -163,6 +169,9 @@ impl Nomad {
         }
         if status.is_server_error() {
             let body = response.text().await.unwrap_or_default();
+            if body.contains(ALLOC_DIR_GONE) {
+                return Ok(LogRead::Text(String::new()));
+            }
             return Ok(LogRead::Failed(format!("{status}: {}", body.trim())));
         }
         let text = response

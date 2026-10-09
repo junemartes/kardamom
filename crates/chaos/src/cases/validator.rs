@@ -8,7 +8,7 @@ use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
 const VERIFIED: &str = "validator_blocks_verified_total";
-const COMMITTED: &str = "validator_committed_block";
+pub(crate) const COMMITTED: &str = "validator_committed_block";
 pub(crate) const DIVERGENCE: &str = "validator_divergence_total";
 const BAL_MISSING: &str = "validator_bal_missing_total";
 

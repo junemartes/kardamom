@@ -216,6 +216,22 @@ impl Rpc {
         nonce: u64,
         budget: Duration,
     ) -> anyhow::Result<()> {
+        self.transfer_hash(account, nonce, budget).await.map(|_| ())
+    }
+
+    /// [`Self::transfer_at`], with the hash of the receipted transfer, for
+    /// a case that asks for its receipt again later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signer cannot derive, the submit fails,
+    /// no receipt arrives in time, or the receipt status is not `0x1`.
+    pub async fn transfer_hash(
+        &self,
+        account: u32,
+        nonce: u64,
+        budget: Duration,
+    ) -> anyhow::Result<String> {
         let hash = self.send_transfer(account, nonce).await?.map_err(|e| {
             anyhow::anyhow!("eth_sendRawTransaction error: {} ({})", e.message, e.code)
         })?;
@@ -223,7 +239,8 @@ impl Rpc {
             "smoke: account #{account} sent {hash} through {}",
             self.url
         ));
-        self.await_receipt(&hash, budget).await
+        self.await_receipt(&hash, budget).await?;
+        Ok(hash)
     }
 
     /// Sign and submit a one-wei transfer from genesis account `account`
@@ -282,7 +299,13 @@ impl Rpc {
         }
     }
 
-    async fn receipt_status(&self, hash: &str) -> anyhow::Result<Option<String>> {
+    /// The status of the receipt of `hash`, or `None` while the ingress
+    /// serves no receipt for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub async fn receipt_status(&self, hash: &str) -> anyhow::Result<Option<String>> {
         let receipt = self
             .call("eth_getTransactionReceipt", serde_json::json!([hash]))
             .await?;

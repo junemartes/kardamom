@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::checks::{Refills, Terms};
+use super::checks::{Lookups, Refills, Terms};
 use super::*;
 use crate::Shard;
 
-/// Every combined case, in the shard's run order.
+/// Every ordering case, in the shard's run order.
 const ALL: [Combined; 5] = [
     INGRESS_SEQUENCER,
     INGRESS_SEALER,
@@ -13,12 +13,36 @@ const ALL: [Combined; 5] = [
     ALL_THREE_REVERSE,
 ];
 
+/// Every exec case, in the shard's run order.
+const ALL_EXEC: [Combined; 5] = [
+    EXECUTOR_SEALER,
+    EXECUTOR_SEALER_VALIDATOR,
+    INGRESS_EXECUTOR,
+    READ_PATH,
+    SEQUENCER_EXECUTOR_REDIS,
+];
+
 fn classes(plan: &[Wave]) -> Vec<Vec<Class>> {
     plan.iter().map(|w| w.classes.clone()).collect()
 }
 
 fn pauses(plan: &[Wave]) -> Vec<u64> {
     plan.iter().map(|w| w.after.as_secs()).collect()
+}
+
+/// The classes of a case's return, one wave after the other.
+fn order(c: Combined) -> Vec<Class> {
+    c.recovery.plan(c.down).into_iter().flatten_classes()
+}
+
+trait FlattenClasses {
+    fn flatten_classes(self) -> Vec<Class>;
+}
+
+impl<I: Iterator<Item = Wave>> FlattenClasses for I {
+    fn flatten_classes(self) -> Vec<Class> {
+        self.flat_map(|w| w.classes).collect()
+    }
 }
 
 #[test]
@@ -51,6 +75,35 @@ fn the_return_follows_the_dependency_order_and_the_stagger() {
 }
 
 #[test]
+fn the_exec_rows_return_in_the_order_the_plan_names() {
+    // The executors a minute before the sealers.
+    assert_eq!(
+        order(EXECUTOR_SEALER),
+        [Class::ExecutorNodes, Class::Sealer]
+    );
+    // The sealers, then the executors, then the validator.
+    assert_eq!(
+        order(EXECUTOR_SEALER_VALIDATOR),
+        [Class::Sealer, Class::Executor, Class::Validator]
+    );
+    // The executors, then the ingresses.
+    assert_eq!(
+        order(INGRESS_EXECUTOR),
+        [Class::ExecutorNodes, Class::Ingress]
+    );
+    // Redis, then the mirrors, then the executors.
+    assert_eq!(
+        order(READ_PATH),
+        [Class::Redis, Class::StateMirror, Class::Executor]
+    );
+    // The sequencers, then Redis, then the executors.
+    assert_eq!(
+        order(SEQUENCER_EXECUTOR_REDIS),
+        [Class::Sequencer, Class::Redis, Class::Executor]
+    );
+}
+
+#[test]
 fn all_at_once_posts_every_class_before_it_waits() {
     // One wave holds every class, so every job is posted and every node
     // is started before the first wait on any of them.
@@ -73,8 +126,17 @@ fn started_nodes_count_as_back_when_their_job_reaches_its_count() {
         }
     ));
     assert_eq!(Class::Sealer.fault_kind(), FaultKind::KillNodes);
-    assert_eq!(Class::Sequencer.fault_kind(), FaultKind::KillTasks);
-    assert_eq!(Class::Ingress.fault_kind(), FaultKind::KillTasks);
+    assert_eq!(Class::ExecutorNodes.fault_kind(), FaultKind::KillNodes);
+    assert_eq!(Class::Redis.fault_kind(), FaultKind::StopJob);
+    for class in [
+        Class::Executor,
+        Class::Validator,
+        Class::StateMirror,
+        Class::Sequencer,
+        Class::Ingress,
+    ] {
+        assert_eq!(class.fault_kind(), FaultKind::KillTasks, "{class:?}");
+    }
 }
 
 #[test]
@@ -88,23 +150,41 @@ fn every_job_that_returned_is_checked_for_a_restart_at_the_end() {
         INGRESS_SEQUENCER.restart_proofs(),
         [Class::Ingress, Class::Sequencer]
     );
+    // A stopped job is a restored job, so it is checked too; killed
+    // nodes are judged by their count.
+    assert_eq!(
+        READ_PATH.restart_proofs(),
+        [Class::Executor, Class::Redis, Class::StateMirror]
+    );
+    assert_eq!(EXECUTOR_SEALER.restart_proofs(), Vec::<Class>::new());
+    assert_eq!(INGRESS_EXECUTOR.restart_proofs(), [Class::Ingress]);
 }
 
 #[test]
 fn the_expectations_judge_two_readings() {
     let flat = Progress {
         block: 100,
-        applied: 5000,
+        applied: Some(5000),
     };
     let sealed = Progress {
         block: 103,
-        applied: 5000,
+        applied: Some(5000),
     };
     let applied = Progress {
         block: 103,
-        applied: 5010,
+        applied: Some(5010),
+    };
+    // No executor answers: nothing is applied, and the head still tells
+    // a stall from a seal.
+    let dark = Progress {
+        block: 103,
+        applied: None,
     };
     assert!(Expect::Stall.judge(flat, flat).is_ok());
+    assert!(Expect::SealOnly.judge(flat, dark).is_ok());
+    assert!(Expect::Stall.judge(dark, dark).is_ok());
+    assert!(Expect::Stall.judge(flat, dark).is_err());
+    assert_eq!(dark.describe(), "head 103, applied ?");
     assert!(
         Expect::Stall
             .judge(flat, sealed)
@@ -165,10 +245,38 @@ fn a_refill_is_a_rise_of_the_republish_counter() {
 }
 
 #[test]
-fn the_table_is_the_shard() {
-    let names: Vec<&str> = ALL.iter().map(|c| c.case.name()).collect();
-    assert_eq!(names, Shard::CombinedOrdering.cases());
-    for c in &ALL {
+fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
+    let asked_and_answered = Lookups {
+        asked: 2,
+        answered: 1,
+    };
+    assert!(asked_and_answered.looked_up());
+    // Never asked: the sender never parked, or the replica guessed.
+    assert!(
+        !Lookups {
+            asked: 0,
+            answered: 0
+        }
+        .looked_up()
+    );
+    // Asked, no source answered yet.
+    assert!(
+        !Lookups {
+            asked: 3,
+            answered: 0
+        }
+        .looked_up()
+    );
+}
+
+#[test]
+fn the_tables_are_the_shards() {
+    let names = |table: &[Combined]| -> Vec<&str> { table.iter().map(|c| c.case.name()).collect() };
+    assert_eq!(names(&ALL), Shard::CombinedOrdering.cases());
+    // The read-path and the sequencer-and-Redis rows run by name only,
+    // until the defects they found are fixed.
+    assert_eq!(names(&ALL_EXEC[..3]), Shard::CombinedExec.cases());
+    for c in ALL.iter().chain(&ALL_EXEC) {
         // A stall needs the sealers down; a seal-only case keeps them.
         assert_eq!(
             c.expect == Expect::Stall,
@@ -178,9 +286,23 @@ fn the_table_is_the_shard() {
         );
         assert!(!c.checks.is_empty(), "{}", c.case.name());
     }
+    // The mirrors live on the executor nodes, so a case that brings them
+    // back before the executors stops the executor job and keeps the
+    // nodes.
+    assert!(!READ_PATH.down.contains(&Class::ExecutorNodes));
     assert_eq!(Class::Sealer.job(), "cluster");
+    assert_eq!(Class::ExecutorNodes.job(), Class::Executor.job());
     assert_eq!(
-        [Class::Sealer, Class::Sequencer, Class::Ingress].map(Class::count),
-        [3, 4, 2]
+        [
+            Class::Sealer,
+            Class::Executor,
+            Class::Validator,
+            Class::StateMirror,
+            Class::Redis,
+            Class::Sequencer,
+            Class::Ingress
+        ]
+        .map(Class::count),
+        [3, 3, 1, 3, 5, 4, 2]
     );
 }

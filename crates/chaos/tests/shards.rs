@@ -16,8 +16,8 @@
 //! `KARDAMOM_CHAOS_CASES` (space-separated) overrides the shard's case
 //! list, `KARDAMOM_CHAOS_GATE_ACCOUNT` the smoke gate's funded account,
 //! and `CHAOS_ACCT_BASE` the first case account. A case load starts its
-//! account at nonce 0, so a reuse run on a used chain takes unused case
-//! accounts. `KARDAMOM_CHAOS_CLUSTER_VARS` passes extra Ansible variables to
+//! account at its live nonce, so a reuse run on a used chain spends used
+//! accounts again. `KARDAMOM_CHAOS_CLUSTER_VARS` passes extra Ansible variables to
 //! the convergence playbook as one JSON object. On a host without
 //! passwordless sudo, set the host sysctls and the bridge's multicast
 //! snooping once by hand and pass `{"ansible_become": false}` in
@@ -112,7 +112,7 @@ async fn run_shard(shard: Shard) -> anyhow::Result<()> {
         harness.knobs.case_window.as_secs()
     ));
     for (i, case) in cases.iter().enumerate() {
-        let audit = shard.audits_each_case() && i + 1 < cases.len();
+        let audit = i + 1 < cases.len() && shard.audits_after(case);
         run_audited(&mut harness, case, audit).await?;
     }
     kardamom_chaos::log(format!("chaos suite PASSED ({})", cases.join(" ")));
@@ -234,6 +234,12 @@ async fn chaos_coordinated() {
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_combined_ordering() {
     shard_test(Shard::CombinedOrdering).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_combined_exec() {
+    shard_test(Shard::CombinedExec).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
