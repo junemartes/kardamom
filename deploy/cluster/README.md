@@ -213,6 +213,7 @@ The deploy record and the rollback:
 - Before the first registration, the role writes the attempt record: the target, the version of every job, and the rollback floor. Each registration adds the job to the record. A deploy that succeeds makes the attempt the accepted release. See [The deploy record](#the-deploy-record).
 - `just rollback <env>` reverts every job of the last release to its version before that release, in reverse deploy order, under the waits of the deploy (`/v1/job/<id>/revert` with `EnforcePriorVersion`). The sealer rolls back member by member. The runbook is [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md).
   - After a failed attempt, the rollback goes to the accepted release. After a successful deploy, it goes to the release before it.
+  - A job that Nomad already reverted (`auto_revert`), or that an earlier run reverted, is done. A rollback that stops resumes after the jobs in `rolled_back`.
   - It refuses a rollback floor, and a second rollback.
   - When Nomad dropped the versions to revert to, it writes `deployed/<env>/rollback.digests` and names `just rollback-rerender <env>`: a normal rolling deploy of the older images with the job files of the checkout.
 - A successful deploy also records its manifest under `deployed/<env>/`. `KARDAMOM_ENV` selects `<env>` (default `local`). `images.digests` is what the last deploy registered. `images.digests.previous` is what it replaced.
@@ -234,12 +235,14 @@ The deploy record of an environment lives in the Nomad variable `kardamom/deploy
 | `target.formats` | The text of `formats.toml` of the deployed tree. |
 | `before.revision`, `before.manifest`, `before.formats` | The same three fields of the accepted release at the start of the attempt. |
 | `before.jobs` | The Nomad job version of every job the namespace knows at the start: `{"ingress": {"before": 3}}`. A registration adds `after`, the version the attempt registered. A job that the attempt adds has `before: null`. |
-| `changed` | The jobs the attempt registered, in registration order. The rollback reverts them in reverse order. |
+| `changed` | The jobs the attempt registered, in registration order. A job joins before its registration. The rollback reverts them in reverse order. |
+| `rolled_back` | The jobs a rollback reverted so far, in that order. A rollback that stops resumes after them. |
 | `floor` | `{}`, or `{"formats": {"<id>": <version>}, "revision": "..."}` when `KARDAMOM_ALLOW_ONE_WAY` accepted a one-way format change. `just rollback` does not cross a floor. |
 | `restored_from` | On an `accepted` record that a rollback restored: the `started_at` of the rolled-back release. |
 
 - `attempt` is always the last attempt. `accepted` is the last release that a deploy completed, or that a rollback restored. A failed attempt never becomes `accepted`.
-- A deploy over a failed attempt records the versions that run, so a rollback of it goes to that mixed state. Roll a failed attempt back before you deploy the fix.
+- The gate refuses a deploy while the last attempt is `started`: it runs, or it died. `KARDAMOM_REPLACE_ATTEMPT=1` deploys over a dead one. The record then holds the mixed versions that run, so a rollback of it goes to that mixed state. Roll a failed attempt back before you deploy the fix.
+- Every write of the record is a check-and-set on the modify index of the variable. Two controllers cannot write over each other: the second one stops.
 - The deploy token needs `write`, `read` and `list` on `kardamom/deploys/*` in its namespace. The items stay under the 64 KiB limit of a Nomad variable: the two registries are the largest part.
 - An environment name has letters, digits, `-` and `_` only. The Nomad variable path admits no other character.
 
@@ -301,8 +304,10 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
 | Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary and compares the format registries. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
-| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check. |
+| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
+| Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
+| Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
 | Controller | `KARDAMOM_ROLLBACK_BELOW_FLOOR` | empty | The format ids of a floor that `just rollback` crosses on purpose, after a check that no writer wrote the new version. |
 | Signing | `DIGEST_MANIFEST` | `images.digests` | The image manifest. A relative path starts in `deploy/cluster/`. |
 | Signing | `KARDAMOM_REQUIRE_SIGNED` | `0` | `1` requires the signature of the manifest and of each image. |
@@ -362,11 +367,12 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 
 | Refusal | Check | What to do |
 |---|---|---|
-| The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without an ingress has no chain to check. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
-| An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. | Push the images, or fix the manifest. |
+| The last attempt is still started | The record's `attempt.status`. | Let it finish. If it died, `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1`. |
+| The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without the ingress job has no chain to check; an ingress job without a running allocation is refused. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
+| An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. `off` skips it in the local profile only. | Push the images, or fix the manifest. |
 | A coordinated format change | `kardamom-cluster formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. | Stop the writers, or follow the runbook of the format. |
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
-| A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. |
+| A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
 
 The gate reads only, so it also runs in check mode. A cluster without an accepted release has no formats to compare with.

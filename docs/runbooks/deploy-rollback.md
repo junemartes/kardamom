@@ -24,6 +24,7 @@ deploy succeeded and the release degrades the chain after it.
      release. `after` is the version the release registered.
    - `floor` is not `{}` when the release wrote a one-way format. A rollback
      below it is not safe.
+   - `rolled_back` lists the jobs a rollback has reverted so far.
 2. Read `kardamom_chainStatus` on an ingress. A root or a pause names the
    failing service. Follow its runbook when the cause is the environment and
    not the release. A deploy cannot tell the two apart; neither can a
@@ -83,9 +84,18 @@ deploy succeeded and the release degrades the chain after it.
    needs every member and one leader. Do not revert the whole cluster job:
    it replaces the members at once and the cluster loses its quorum. Bring
    the member back, or follow `sealer-fleet-rebuild.md`.
-6. If the EnforcePriorVersion check fails (`400` from Nomad), another deploy
-   changed the job after the release. Read the record and the job versions
-   again before you continue.
+6. A job whose registered definition already equals the pre-release
+   version is done: Nomad reverted it itself (`auto_revert` on the ingress
+   and the sequencer), or an earlier run of the rollback did. The play
+   reports it and moves on. When the job is at another version and another
+   content, the play refuses with `Another change moved the job after the
+   release`. Read the record and `nomad job history <job>` before you
+   continue.
+7. A rollback that stops resumes. Each job joins `rolled_back` in the record
+   when it is done; the next `just rollback <env>` skips those jobs.
+8. When it refuses with `The deploy record ... changed under this run`,
+   another controller writes the record of the environment at the same
+   time. Let it finish, then read the record again.
 
 ## Clear
 
@@ -105,10 +115,13 @@ with `Refused:`.
 
 | Message | Cause | What to do |
 |---|---|---|
+| `the attempt of <time> by <operator> is still started` | The last attempt runs, or died. | Let it finish. If it died: `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1 just deploy` to deploy over it. |
 | `the chain stands on a halt or a pause` | `kardamom_chainStatus` lists a root, or a pause stands on the sealer, the ingress or a service. | Follow the runbook of the root. Resume the paused service. |
+| `the ingress job is registered and no allocation of it runs` | The chain status cannot be read: a failed release left the ingress down. | Bring the ingress back, or `just rollback <env>`. |
+| `KARDAMOM_REGISTRY_URL=off skips the image check, and the <profile> profile does not allow that` | Only the local profile skips the image check. | Set `KARDAMOM_REGISTRY_URL` to the registry API. |
 | `the registry ... does not hold the image of <services>` | A digest of the manifest is not in the registry. | `just images`, or fix the manifest. |
 | `a rolling deploy cannot carry a coordinated format change: <ids>` | The accepted release and the target cannot run as a mixed fleet. | Stop the writers, or follow the runbook of the format in `docs/formats.md`. |
 | `the release writes a version that the accepted release cannot read: <ids>` | A one-way format change. A rollback is not safe after the first write. | `KARDAMOM_ALLOW_ONE_WAY=<ids> just deploy`. The record then carries the floor. |
 | `KARDAMOM_ALLOW_ONE_WAY names <ids>, and the release has no one-way change of it` | A stale allowance. | Unset it. |
-| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow` or another setting of the list. | A coordinated restart of the sealer. |
+| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow` or another setting of the list. | A coordinated restart of the sealer. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
 | `config/shard-map.toml ... differs from the shard map of the registered ingress` | A routing change in the rolling path. | `kardamom-cluster scale-sequencers`. |

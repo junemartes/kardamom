@@ -188,10 +188,13 @@ impl Lifecycle {
     ///
     /// Returns an error if the playbook cannot be spawned.
     pub async fn deploy(&self, nomad_addr: &str, manifest: &str) -> anyhow::Result<bool> {
+        // A case deploys over its own failed attempt on purpose: the
+        // broken-image case heals the executor job with the real manifest.
         let env = vec![
             ("NOMAD_ADDR", nomad_addr.to_string()),
             ("DIGEST_MANIFEST", manifest.to_string()),
             ("KARDAMOM_ENV", "chaos".to_string()),
+            ("KARDAMOM_REPLACE_ATTEMPT", "1".to_string()),
         ];
         let mut cmd = self.command("ansible-playbook", &env);
         cmd.args(["-i", "localhost,", "ansible/deploy.yml"]);

@@ -4,7 +4,8 @@
 # The record names the release: a failed attempt, or the accepted release
 # when the last attempt succeeded. The rollback goes back one release. It
 # does not cross a rollback floor, and it does not reach a version that
-# Nomad dropped. docs/runbooks/deploy-rollback.md is the runbook.
+# Nomad dropped. A rollback that stops resumes: the jobs in `rolled_back`
+# are done. docs/runbooks/deploy-rollback.md is the runbook.
 - name: Read the deploy record
   ansible.builtin.import_tasks: record_read.yml
 
@@ -31,15 +32,10 @@
   vars:
     workloads_rollback_floor: "{{ (workloads_last_attempt.floor.formats | default({})) | list }}"
 
-- name: Create the record directory
-  ansible.builtin.file:
-    path: "{{ workloads_record_dir }}"
-    state: directory
-    mode: "0755"
-
 - name: Name the release and its jobs
   ansible.builtin.set_fact:
-    workloads_rollback_jobs: "{{ workloads_last_attempt.changed | reverse | list }}"
+    workloads_rollback_jobs: >-
+      {{ workloads_last_attempt.changed | reverse | reject('in', workloads_last_attempt.rolled_back | default([])) | list }}
 
 - name: Report the rollback
   ansible.builtin.debug:
@@ -47,9 +43,10 @@
       Rolling {{ workloads_env }} back from the release of {{ workloads_last_attempt.started_at }}
       ({{ workloads_last_attempt.status }}, revision {{ workloads_last_attempt.target.revision }}):
       {{ workloads_rollback_jobs | join(', ') }} go to their versions before it.
+      Done already: {{ workloads_last_attempt.rolled_back | default([]) | join(', ') }}.
 
 # The versions to revert to must still be in Nomad, for every job, before
-# the first revert.
+# the first revert. The reverts read the same answers.
 - name: Read the versions Nomad holds of every changed job
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/{{ item }}/versions?namespace={{ workloads_namespace | urlencode }}"
@@ -113,6 +110,7 @@
         formats: "{{ workloads_last_attempt.before.formats }}"
       before: {manifest: {}, jobs: {}}
       changed: []
+      rolled_back: []
       floor: {}
   vars:
     workloads_rollback_now: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"

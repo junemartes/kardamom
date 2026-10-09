@@ -1,11 +1,14 @@
 ---
 # The release gate: the checks that refuse a release before any job
 # changes. Each refusal is distinct and names its cause:
-# 1. The chain stands on no halt and no pause.
-# 2. The registry holds every image of the manifest.
-# 3. The formats of the target are safe against the accepted release.
-# 4. No sealer setting that every member must match changes, and the
-#    shard map does not change, in the rolling path.
+# 1. The last attempt is not still running.
+# 2. The chain stands on no halt and no pause.
+# 3. The registry holds every image of the manifest.
+# 4. The formats of the target are safe against the accepted release.
+# 5. No sealer setting that every member must match changes in the
+#    rolling path.
+# 6. The shard map does not change in the rolling path.
+# The gate also reads the revision of the target tree, for the record.
 # The gate reads only, so it also runs in check mode.
 
 # The revision of the target tree, for the record and the floor.
@@ -37,22 +40,59 @@
          else workloads_gate_jj.stdout if workloads_gate_jj.rc | default(1) == 0
          else 'unknown' }}
 
-# 1. The chain status, from a running ingress. A fresh cluster has none,
-# and then there is no chain to stand on a halt.
+# 1. The last attempt. One that is still `started` runs, or died. A deploy
+# over a dead attempt records the mixed versions that run, so the operator
+# names that choice.
+- name: Read the deploy record
+  ansible.builtin.import_tasks: record_read.yml
+
+- name: Mirror the accepted release
+  ansible.builtin.import_tasks: record_mirror.yml
+
+- name: Refuse a release while the last attempt is still started
+  ansible.builtin.assert:
+    that: workloads_last_attempt.status | default('') != 'started' or workloads_replace_attempt | bool
+    fail_msg: >-
+      Refused: the attempt of {{ workloads_last_attempt.started_at | default('') }} by
+      {{ workloads_last_attempt.operator | default('') }} is still started: it runs, or it died.
+      Let it finish. If it died, roll it back (`just rollback {{ workloads_env }}`), or set
+      KARDAMOM_REPLACE_ATTEMPT=1 to deploy over it; the record then holds the mixed versions that run.
+
+# 2. The chain status, from a running ingress. A cluster without the
+# ingress job has no chain to stand on a halt. An ingress job without a
+# running allocation is what a failed release leaves, and no deploy goes
+# over it unseen.
+- name: Read the registered ingress
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: ingress
+
+- name: Keep the registered ingress
+  ansible.builtin.set_fact:
+    workloads_gate_ingress_job: "{{ workloads_registered_job }}"
+
 - name: Read the running ingress allocations
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/ingress/allocations?namespace={{ workloads_namespace | urlencode }}"
     headers:
       X-Nomad-Token: "{{ workloads_nomad_token }}"
-    status_code: [200, 404]
   register: workloads_gate_ingress
   check_mode: false
+  when: workloads_gate_ingress_job.status == 200
 
 - name: Keep a node that runs the ingress
   ansible.builtin.set_fact:
     workloads_gate_ingress_node: >-
-      {{ ((workloads_gate_ingress.json if workloads_gate_ingress.status == 200 else [])
+      {{ ((workloads_gate_ingress.json if workloads_gate_ingress_job.status == 200 else [])
           | selectattr('ClientStatus', 'equalto', 'running') | map(attribute='NodeID') | list + ['']) | first }}
+
+- name: Refuse a release while no ingress runs
+  ansible.builtin.assert:
+    that: workloads_gate_ingress_node | length > 0
+    fail_msg: >-
+      Refused: the ingress job is registered and no allocation of it runs, so the chain status cannot be read.
+      Bring the ingress back, or roll the last release back (`just rollback {{ workloads_env }}`).
+  when: workloads_gate_ingress_job.status == 200
 
 - name: Read the node of the ingress
   ansible.builtin.uri:
@@ -92,8 +132,16 @@
       Clear them first (docs/runbooks/). A deploy cannot tell a failed release from a halted environment.
   when: workloads_gate_ingress_node | length > 0
 
-# 2. The images. A digest that the registry does not hold fails the first
-# pull, after the first job changed.
+# 3. The images. A digest that the registry does not hold fails the first
+# pull, after the first job changed. Only the local profile may skip the
+# check: its registry has no credentials to need.
+- name: Refuse to skip the image check outside the local profile
+  ansible.builtin.assert:
+    that: workloads_registry_url != 'off' or deployment_profile == 'local'
+    fail_msg: >-
+      Refused: KARDAMOM_REGISTRY_URL=off skips the image check, and the {{ deployment_profile }} profile
+      does not allow that. Set KARDAMOM_REGISTRY_URL to the registry API.
+
 - name: Check every image of the manifest in the registry
   ansible.builtin.uri:
     url: >-
@@ -121,21 +169,8 @@
       Push the images (`just images`) or fix the manifest.
   when: workloads_registry_url != 'off'
 
-# 3. The formats, against the accepted release (docs/formats.md). Without
+# 4. The formats, against the accepted release (docs/formats.md). Without
 # an accepted release there is no base to compare with.
-- name: Read the deploy record
-  ansible.builtin.import_tasks: record_read.yml
-
-- name: Create the record directory
-  ansible.builtin.file:
-    path: "{{ workloads_record_dir }}"
-    state: directory
-    mode: "0755"
-  check_mode: false
-
-- name: Mirror the accepted release
-  ansible.builtin.import_tasks: record_mirror.yml
-
 - name: Keep whether the accepted release has formats to compare with
   ansible.builtin.set_fact:
     workloads_gate_has_base: "{{ workloads_accepted.target.formats | default('') | length > 0 }}"
@@ -195,50 +230,51 @@
          {'formats': workloads_one_way | items2dict(key_name='id', value_name='head'),
           'revision': workloads_target_revision} }}
 
-# 4. The sealer settings that every member must match, by the registered
-# cluster, and the shard map, by the registered ingress.
+# 5. The sealer settings that every member must match, by the registered
+# cluster. KARDAMOM_ALLOW_MUST_MATCH names the settings of a documented
+# procedure, such as the return from a seeded start.
 - name: Compile the sealer for the member settings check
   ansible.builtin.include_tasks: compile.yml
   vars:
     workloads_job: "{{ workloads_sealer_job }}"
 
 - name: Read the registered sealer
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/cluster?namespace={{ workloads_namespace | urlencode }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    status_code: [200, 404]
-  register: workloads_gate_sealer
-  check_mode: false
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
 
-- name: Refuse a rolling change of a sealer setting that every member must match
-  ansible.builtin.assert:
-    that: workloads_gate_sealer_changed | length == 0
-    fail_msg: >-
-      Refused: a rolling deploy cannot change a sealer setting that every member must match:
-      {{ workloads_gate_sealer_changed | map('regex_replace', '=.*$', '') | unique | join(', ') }}.
-      Members on two values decide differently and fork the replicated state.
-      Change it through a coordinated restart of the sealer.
+- name: Keep the sealer settings that change
+  ansible.builtin.set_fact:
+    workloads_gate_sealer_changed: >-
+      {{ ([] if workloads_registered_job.status != 200 else
+          workloads_registered_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+          | map(attribute='Env.JAVA_TOOL_OPTIONS') | map('regex_findall', workloads_gate_pattern)
+          | map('map', 'join', '=') | map('symmetric_difference', workloads_gate_new) | flatten)
+         | map('regex_replace', '=.*$', '') | unique }}
   vars:
     workloads_gate_pattern: '-Dkardamom\.cluster\.({{ workloads_sealer_must_match | join("|") }})=(\S*)'
     workloads_gate_new: >-
       {{ workloads_job_definition.TaskGroups[0].Tasks[0].Env.JAVA_TOOL_OPTIONS
          | regex_findall(workloads_gate_pattern) | map('join', '=') | list }}
-    workloads_gate_sealer_changed: >-
-      {{ workloads_gate_sealer.json.TaskGroups | map(attribute='Tasks') | map('first')
-         | map(attribute='Env.JAVA_TOOL_OPTIONS') | map('regex_findall', workloads_gate_pattern)
-         | map('map', 'join', '=') | map('symmetric_difference', workloads_gate_new) | flatten | unique }}
-  when: workloads_gate_sealer.status == 200
 
-- name: Read the registered ingress
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/ingress?namespace={{ workloads_namespace | urlencode }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    status_code: [200, 404]
-  register: workloads_gate_ingress_job
-  check_mode: false
+- name: Refuse a rolling change of a sealer setting that every member must match
+  ansible.builtin.assert:
+    that: workloads_gate_sealer_changed | difference(workloads_allow_must_match) | length == 0
+    fail_msg: >-
+      Refused: a rolling deploy cannot change a sealer setting that every member must match:
+      {{ workloads_gate_sealer_changed | join(', ') }}.
+      Members on two values decide differently and fork the replicated state.
+      Change it through a coordinated restart of the sealer. A documented procedure names the settings in
+      KARDAMOM_ALLOW_MUST_MATCH={{ workloads_gate_sealer_changed | join(',') }}.
 
+- name: Refuse an allowance that covers no sealer setting change
+  ansible.builtin.assert:
+    that: workloads_allow_must_match | difference(workloads_gate_sealer_changed) | length == 0
+    fail_msg: >-
+      Refused: KARDAMOM_ALLOW_MUST_MATCH names {{ workloads_allow_must_match | difference(workloads_gate_sealer_changed) | join(', ') }},
+      and the release does not change it. Unset it.
+
+# 6. The shard map, by the registered ingress.
 - name: Refuse a shard map change in the rolling path
   ansible.builtin.assert:
     that:

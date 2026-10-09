@@ -1,7 +1,9 @@
 ---
 # The deploy record of the environment, from its Nomad variable: the last
-# attempt and the last accepted release, each a JSON document. An
-# environment without a record gives two empty documents.
+# attempt and the last accepted release, each a JSON document, and the
+# modify index that the next write must match. An environment without a
+# record gives two empty documents and index 0. The mirror directory is
+# created here, for every path that writes the mirror.
 - name: Read the deploy record of {{ workloads_env }}
   ansible.builtin.uri:
     url: "{{ workloads_record_url }}"
@@ -15,5 +17,13 @@
   ansible.builtin.set_fact:
     workloads_last_attempt: "{{ workloads_record_items.attempt | default('{}') | from_json }}"
     workloads_accepted: "{{ workloads_record_items.accepted | default('{}') | from_json }}"
+    workloads_record_index: "{{ workloads_record_read.json.ModifyIndex if workloads_record_read.status == 200 else 0 }}"
   vars:
     workloads_record_items: "{{ workloads_record_read.json.Items if workloads_record_read.status == 200 else {} }}"
+
+- name: Create the record directory
+  ansible.builtin.file:
+    path: "{{ workloads_record_dir }}"
+    state: directory
+    mode: "0755"
+  check_mode: false

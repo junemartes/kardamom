@@ -268,6 +268,15 @@ workloads_operator: >-
 # (KARDAMOM_ALLOW_ONE_WAY, comma-separated). The record then carries a
 # rollback floor. A one-way change that the list does not name is refused.
 workloads_allow_one_way: "{{ lookup('env', 'KARDAMOM_ALLOW_ONE_WAY') | split(',') | map('trim') | reject('equalto', '') | list }}"
+# The sealer settings of workloads_sealer_must_match that a documented
+# procedure changes in the rolling path (KARDAMOM_ALLOW_MUST_MATCH,
+# comma-separated): the return from a seeded start changes seedSnapshot
+# and remoteOrigins. A change that the list does not name is refused.
+workloads_allow_must_match: >-
+  {{ lookup('env', 'KARDAMOM_ALLOW_MUST_MATCH') | split(',') | map('trim') | reject('equalto', '') | list }}
+# A deploy over an attempt that is still `started` (KARDAMOM_REPLACE_ATTEMPT=1):
+# the operator says that the attempt died. The gate refuses it otherwise.
+workloads_replace_attempt: "{{ lookup('env', 'KARDAMOM_REPLACE_ATTEMPT') | default('0', true) | bool }}"
 # The format ids of a floor that the operator crosses on purpose
 # (KARDAMOM_ROLLBACK_BELOW_FLOOR), after a check that no writer wrote the
 # new version. The rollback refuses a floor otherwise.
@@ -280,7 +289,7 @@ workloads_ingress_rpc_port: "{{ ports.ingress_rpc }}"
 # outside the cluster resolver, so the Consul name of the registry does
 # not resolve for it. Empty: the node that serves the Nomad API, on the
 # registry port, which is the control node of the local profile. `off`
-# skips the check, for a registry that needs credentials.
+# skips the check; only the local profile allows that.
 workloads_registry_url: >-
   {{ lookup('env', 'KARDAMOM_REGISTRY_URL')
      | default(workloads_nomad_addr | regex_replace(':[0-9]+$', '') ~ ':' ~ ports.registry, true) }}

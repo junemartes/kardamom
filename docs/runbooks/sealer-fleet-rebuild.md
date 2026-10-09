@@ -282,7 +282,10 @@ ssh aux-0 'rm -f /opt/kardamom/state/validator/mdbx.lck &&
 This procedure has no halt to clear. After the members log
 `sealer snapshot TAKEN`, the next `just deploy` registers the cluster job
 without the seed property, and the da-watcher job without the fallback
-`--l1-resume-after`. The deploy rolls the sealer members one at a time; each
+`--l1-resume-after`. The seed property and the empty remote-origin list are
+settings that every member must match, so the release gate refuses the
+rolling change unless the deploy names them:
+`KARDAMOM_ALLOW_MUST_MATCH=seedSnapshot,remoteOrigins just deploy`. The deploy rolls the sealer members one at a time; each
 one restores the snapshot. A da-watcher restart resumes after the sealer's L1
 origin. A da-watcher that restarts with a stale `--l1-resume-after` sends
 epochs that the sealer already holds; the sealer drops them as a regression,
