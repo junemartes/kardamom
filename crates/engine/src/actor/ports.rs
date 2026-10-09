@@ -59,6 +59,15 @@ pub trait TxReceiptsPublication: Send {
     fn reopen(&mut self) -> Result<(), ExecutorError> {
         Ok(())
     }
+
+    /// Whether a subscriber of the publication is known. The escalation
+    /// clock of a not-connected publication runs only while one is: a
+    /// stream without a subscriber has nothing to reopen for. The live
+    /// transport reads the subscriber records of discovery. A sink with
+    /// no transport, the default, always has its consumer.
+    fn subscribers_listed(&mut self) -> bool {
+        true
+    }
 }
 
 /// Run `publish_one` over `items` in order and stop at the first error.
@@ -151,6 +160,13 @@ impl<A: TxReceiptsPublication, B: TxReceiptsPublication> TxReceiptsPublication f
         match self {
             Self::Left(a) => a.reopen(),
             Self::Right(b) => b.reopen(),
+        }
+    }
+
+    fn subscribers_listed(&mut self) -> bool {
+        match self {
+            Self::Left(a) => a.subscribers_listed(),
+            Self::Right(b) => b.subscribers_listed(),
         }
     }
 }

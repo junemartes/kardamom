@@ -79,7 +79,7 @@ After each of these audits, the next case waits until the chain runs again. See 
 
 `KARDAMOM_CHAOS_CASES` narrows a run to a space-separated list of case names. An unknown name fails before any load starts.
 
-The nightly shard holds the long repetition cases. The `cluster-e2e` workflow runs it on its schedule (03:17 UTC), alone. A pull request with the `chaos-nightly` label runs it beside the regular shards. The build job of the workflow picks the shard list. The nightly run has its own concurrency group, so it never cancels a run on `main`.
+The nightly shard holds the long repetition cases. The `cluster-e2e` workflow runs it on its schedule (03:17 UTC), alone. Adding the `chaos-nightly` label to a pull request runs it alone too, in a run of its own: the `labeled` event starts the run, and no other label starts one. The build job of the workflow picks the shard list. A nightly run has its own concurrency group, so it never cancels the regular run of the ref. A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard.
 
 ### Cases
 

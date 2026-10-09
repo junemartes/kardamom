@@ -292,9 +292,11 @@ impl Case {
             }
             // Every round: a job stop, a restart within the SLO, and the
             // convergence of the fleet.
-            Self::ExecutorRestartStorm => {
-                inject + (k.restart_slo + Duration::from_mins(1)) * fleet::ROUNDS
-            }
+            Self::ExecutorRestartStorm => inject.saturating_add(
+                k.restart_slo
+                    .saturating_add(Duration::from_mins(1))
+                    .saturating_mul(fleet::ROUNDS),
+            ),
             _ => Duration::ZERO,
         };
         k.case_window.max(floor)

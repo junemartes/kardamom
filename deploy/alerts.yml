@@ -319,10 +319,10 @@ groups:
 
   # A must-deliver publication with no connected subscriber holds its
   # publisher: the executor retries the receipt until the ingress takes
-  # it. The executor reopens the publication after one Aeron stall budget
-  # and exits with code 3 after four, so Nomad restarts it. The alert
-  # pages the minute in between: a subscriber is down, or a publication
-  # is dead on the publisher side.
+  # it. While discovery lists a subscriber, the executor reopens the
+  # publication after one Aeron stall budget and exits with code 3 after
+  # five, so Nomad restarts it. The alert pages the minute in between: a
+  # subscriber is down, or a publication is dead on the publisher side.
   - name: kardamom-publications
     rules:
       - alert: KardamomPublicationNotConnected
@@ -332,4 +332,4 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.service }} {{ $labels.topic }} publication has no subscriber ({{ $labels.host_id }})"
-          description: "The must-deliver {{ $labels.topic }} publication of {{ $labels.service }} has had no connected subscriber for {{ $value }} s (kardamom_publication_not_connected_seconds). The publisher holds its receipts and retries. It reopens the publication after one stall budget and exits with code 3 after four. Check the subscribers of the topic (the ingress and the state mirror for tx_receipts) and the image lines of their logs (`aeron: image available`)."
+          description: "The must-deliver {{ $labels.topic }} publication of {{ $labels.service }} has had no connected subscriber for {{ $value }} s (kardamom_publication_not_connected_seconds). The publisher holds its receipts and retries. While discovery lists a subscriber of the topic, it reopens the publication after one stall budget and exits with code 3 after five. Check the subscribers of the topic (the ingress and the state mirror for tx_receipts) and the image lines of their logs (`aeron: image available`)."

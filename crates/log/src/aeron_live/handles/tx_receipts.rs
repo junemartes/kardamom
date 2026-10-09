@@ -199,12 +199,13 @@ impl TxReceiptsPublisherHandle {
     }
 
     /// The channel of the receipt stream of `replica_idx`: its own
-    /// unicast MDS endpoint when MDS is on, else the shared channel.
+    /// unicast MDS endpoint when MDS is on, else the shared channel. A
+    /// reopen of the stream opens an exclusive publication on it.
     ///
     /// # Errors
     ///
     /// Returns an error if MDS is on and the replica has no endpoint.
-    fn receipts_channel(ch: &ChannelsConfig, replica_idx: u32) -> Result<String, LogError> {
+    pub fn receipts_channel(ch: &ChannelsConfig, replica_idx: u32) -> Result<String, LogError> {
         if !ch.tx_receipts_mds_enabled() {
             return Ok(ch.tx_receipts_channel.as_str().to_string());
         }
@@ -213,23 +214,6 @@ impl TxReceiptsPublisherHandle {
                 "open_mds: tx_receipts MDS not configured (replica {replica_idx})"
             ))
         })
-    }
-
-    /// Open the receipt stream of `replica_idx` again, as an exclusive
-    /// publication on its static channel: a new session on the same
-    /// channel, which the subscriber takes as a new image. The caller
-    /// installs it with [`Self::replace_receipts`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error as [`Self::open_mds`] does.
-    pub fn reopen_receipts(
-        rt: &AeronRuntime,
-        ch: &ChannelsConfig,
-        replica_idx: u32,
-    ) -> Result<PubHandle, LogError> {
-        let channel = Self::receipts_channel(ch, replica_idx)?;
-        rt.open_exclusive_publication(&channel, ch.tx_receipts_stream_id)
     }
 
     /// Install `inner` as the receipt stream and return the publication

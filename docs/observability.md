@@ -282,7 +282,7 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltRecordLag` | critical | `kardamom_halt{cause="record_lag"} == 1`. The record-lag guard is off by default, so this alert cannot fire until a later release turns the guard on. |
 | `KardamomHaltL1LightClientMismatch` | critical | `kardamom_halt{cause="l1_light_client_mismatch"} == 1`. |
 | `KardamomHaltL1FollowerDisagreement` | critical | `kardamom_halt{cause="l1_follower_disagreement"} == 1`. |
-| `KardamomPublicationNotConnected` | warning | `kardamom_publication_connected == 0` for 1 minute. A must-deliver publication has no connected subscriber. The publisher holds its receipts, reopens the publication after one stall budget, and exits with code 3 after four. See "Publications". |
+| `KardamomPublicationNotConnected` | warning | `kardamom_publication_connected == 0` for 1 minute. A must-deliver publication has no connected subscriber. The publisher holds its receipts. While discovery lists a subscriber, it reopens the publication after one stall budget and exits with code 3 after five. See "Publications". |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
@@ -381,7 +381,7 @@ The executor exports the state of its must-deliver `tx_receipts` publication. Th
 | Metric | Meaning |
 | --- | --- |
 | `kardamom_publication_connected{topic}` | 1 while the publishes of the topic land. 0 while they fail with `NOT_CONNECTED`: no subscriber has an image of the publication. The commit thread writes it on each change. |
-| `kardamom_publication_not_connected_seconds{topic}` | How long the current unconnected period has lasted. 0 while the publication is connected. The executor reopens the publication when it passes one Aeron stall budget (`AERON_STALL_TOLERANCE_MS` plus 5 s, 35 s in CI), and exits with code 3 when it passes four. |
+| `kardamom_publication_not_connected_seconds{topic}` | How long the escalation clock has counted in the current unconnected period. 0 while the publication is connected, and 0 while discovery lists no subscriber of the topic. The executor reopens the publication when the clock passes one Aeron stall budget (`AERON_STALL_TOLERANCE_MS` plus 5 s, 35 s in CI), and exits with code 3 when it passes five. |
 
 - Every subscription logs `aeron: image available` and `aeron: image unavailable` with the stream id, the channel, the session id and the source address. A subscriber that attached a publisher and shows no `available` line for its session has no image of it.
 - The executor logs `tx_receipts publication reopened on a new session` with the old and the new session id at the reopen. The exit line is `the publication stayed unconnected past its budget; the process exits so the supervisor restarts it`, with the topic, the durations and the exit code.

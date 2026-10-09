@@ -23,8 +23,10 @@ name: cluster-e2e
 # `skip-cluster-e2e` label for changes that can't affect the cluster.
 #
 # The nightly shards (`chaos-integrity`) hold the long repetition cases. The
-# schedule runs them alone. A pull request with the `chaos-nightly` label runs
-# them beside the regular shards. The build job picks the shard list.
+# schedule runs them alone, and a failed shard of a nightly run opens or
+# updates one issue per shard. Adding the `chaos-nightly` label to a pull
+# request runs them alone too, in a run of its own that cancels nothing. The
+# build job picks the shard list.
 #
 # One `build` job compiles the service binaries, the shard test executable,
 # the operator binary and the sealer jar once, and hands them to the shards
@@ -36,6 +38,8 @@ name: cluster-e2e
 on:
   workflow_dispatch:
   pull_request:
+    # `labeled` is the trigger of the nightly shards on a pull request.
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   schedule:
@@ -43,9 +47,10 @@ on:
     - cron: "17 3 * * *"
 
 concurrency:
-  # The nightly run has its own group, so it never cancels a push run on
-  # main, and a push never cancels it.
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  # A nightly run (the schedule, or the label on a pull request) has its
+  # own group, so it never cancels the regular run of the ref, and the
+  # regular run never cancels it.
+  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event_name == 'schedule' || github.event.action == 'labeled') && '-nightly' || '' }}
   cancel-in-progress: true
 
 env:
@@ -58,8 +63,11 @@ env:
 
 jobs:
   build:
+    # A `labeled` event runs only for the `chaos-nightly` label: any other
+    # label starts no run.
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
+      && (github.event.action != 'labeled' || github.event.label.name == 'chaos-nightly')
     name: build cluster artifact
     # Pinned (not ubuntu-latest): the binaries + libaeron.so built here run in
     # the ubuntu:24.04 ci-service image, so the runner glibc must match that
@@ -71,22 +79,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The shard list of this run. The regular shards run on every
-      # trigger but the schedule. The nightly shards run on the schedule,
-      # and beside the regular ones on a pull request with the
-      # `chaos-nightly` label. The names are the `Shard` names of
-      # crates/chaos/src/shard.rs plus the two stages of tests/shards.rs.
+      # The shard list of this run. The nightly shards run alone on the
+      # schedule and on the `labeled` event of the `chaos-nightly` label.
+      # The regular shards run on every other trigger. The names are the
+      # `Shard` names of crates/chaos/src/shard.rs plus the two stages of
+      # tests/shards.rs.
       - name: Pick the shards
         id: shards
         env:
-          NIGHTLY_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'chaos-nightly') }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
         run: |
           regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-retention","chaos-cache","chaos-l1","semantics"'
           nightly='"chaos-integrity"'
-          if [ "${{ github.event_name }}" = schedule ]; then
+          if [ "$NIGHTLY" = true ]; then
             shards="[$nightly]"
-          elif [ "$NIGHTLY_LABEL" = true ]; then
-            shards="[$regular,$nightly]"
           else
             shards="[$regular]"
           fi
@@ -330,3 +336,44 @@ jobs:
             /tmp/chaos-*.json
           if-no-files-found: ignore
           retention-days: 3
+
+  # One issue per failed shard of a nightly run. The issue carries the
+  # `chaos-nightly` label and the shard name in its title. A later failure
+  # of the same shard adds a comment with the run, so one open issue
+  # tracks one shard.
+  nightly-report:
+    needs: cluster-e2e
+    if: always() && github.event_name == 'schedule' && needs.cluster-e2e.result != 'skipped'
+    name: open an issue per failed nightly shard
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or update the issue of each failed shard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          failed=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure" and (.name | startswith("container cluster e2e ("))) | .name | capture("\\((?<shard>[^)]+)\\)") | .shard')
+          if [ -z "$failed" ]; then
+            echo "every nightly shard passed"
+            exit 0
+          fi
+          for shard in $failed; do
+            title="nightly: the $shard shard failed"
+            body="The nightly run $RUN_URL failed the \`$shard\` shard. The job log and the chaos evidence artifact of the run hold the details."
+            number=$(gh issue list --repo "$GH_REPO" --label chaos-nightly --state open --search "\"$title\" in:title" --json number,title \
+              --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+            if [ -n "$number" ]; then
+              gh issue comment "$number" --repo "$GH_REPO" --body "$body"
+              echo "updated #$number for $shard"
+            else
+              gh issue create --repo "$GH_REPO" --title "$title" --label chaos-nightly --body "$body"
+              echo "opened an issue for $shard"
+            fi
+          done

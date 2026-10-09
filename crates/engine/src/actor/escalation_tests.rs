@@ -16,29 +16,61 @@ fn at(start: Instant, secs: u64) -> Instant {
 fn the_thresholds_derive_from_the_stall_budget() {
     let e = Escalation::from_stall_budget(BUDGET);
     assert_eq!(e.reopen_after(), Duration::from_secs(35));
-    assert_eq!(e.exit_after(), Duration::from_secs(140));
+    assert_eq!(e.exit_after(), Duration::from_secs(175));
     let production = Escalation::from_stall_budget(Duration::from_secs(15));
     assert_eq!(production.reopen_after(), Duration::from_secs(15));
-    assert_eq!(production.exit_after(), Duration::from_secs(60));
+    assert_eq!(production.exit_after(), Duration::from_secs(75));
     assert_eq!(PUBLICATION_DEAD_EXIT_CODE, 3);
 }
 
 #[test]
-fn the_reopen_comes_once_after_one_budget_and_the_exit_after_four() {
+fn the_reopen_comes_once_after_one_budget_and_the_exit_after_five() {
     let start = Instant::now();
     let mut e = Escalation::from_stall_budget(BUDGET);
     assert_eq!(e.unconnected(start), Step::Wait);
     assert_eq!(e.unconnected(at(start, 34)), Step::Wait);
     assert_eq!(e.unconnected(at(start, 35)), Step::Reopen);
     assert_eq!(e.unconnected(at(start, 36)), Step::Wait, "one reopen only");
-    assert_eq!(e.unconnected(at(start, 139)), Step::Wait);
+    assert_eq!(e.unconnected(at(start, 174)), Step::Wait);
     assert_eq!(
-        e.unconnected(at(start, 140)),
+        e.unconnected(at(start, 175)),
         Step::Exit {
-            unconnected: Duration::from_secs(140)
+            unconnected: Duration::from_secs(175)
         }
     );
-    assert_eq!(e.unconnected_for(at(start, 140)), Duration::from_secs(140));
+    assert_eq!(e.unconnected_for(at(start, 175)), Duration::from_secs(175));
+}
+
+/// The recording start bounds each attempt by the budget and starts the
+/// clock before the first attempt. At the production budget the attempts
+/// end at 15, 30, 45, 60 and 75 s: the reopen comes at the first end, the
+/// exit at the fifth, so a reopen always comes before the exit.
+#[test]
+fn budget_bounded_attempts_reopen_before_the_exit_at_the_production_budget() {
+    let budget = Duration::from_secs(15);
+    let start = Instant::now();
+    let mut e = Escalation::from_stall_budget(budget);
+    e.start(start);
+    let steps: Vec<Step> = (1..=5)
+        .map(|attempt| e.unconnected(start + budget * attempt))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            Step::Reopen,
+            Step::Wait,
+            Step::Wait,
+            Step::Wait,
+            Step::Exit {
+                unconnected: Duration::from_secs(75)
+            }
+        ]
+    );
+    // A second start inside the period moves nothing.
+    let mut again = Escalation::from_stall_budget(budget);
+    again.start(start);
+    again.start(start + budget);
+    assert_eq!(again.unconnected_for(start + budget), budget);
 }
 
 #[test]
@@ -81,18 +113,20 @@ fn the_health_gauges_follow_the_reports() {
     let labels = [("topic", "tx_receipts")];
     metrics::with_local_recorder(&recorder, || {
         let mut health = super::PublicationHealth::new("tx_receipts");
-        health.report(Duration::from_secs(3));
+        // The first unconnected report: the clock has counted nothing
+        // yet, and the gauge still reads unconnected.
+        health.report(false, Duration::ZERO);
         assert_eq!(recorder.gauge(PUBLICATION_CONNECTED, &labels), Some(0.0));
         assert_eq!(
             recorder.gauge(PUBLICATION_NOT_CONNECTED_SECONDS, &labels),
-            Some(3.0)
+            Some(0.0)
         );
-        health.report(Duration::from_secs(7));
+        health.report(false, Duration::from_secs(7));
         assert_eq!(
             recorder.gauge(PUBLICATION_NOT_CONNECTED_SECONDS, &labels),
             Some(7.0)
         );
-        health.report(Duration::ZERO);
+        health.report(true, Duration::ZERO);
         assert_eq!(recorder.gauge(PUBLICATION_CONNECTED, &labels), Some(1.0));
         assert_eq!(
             recorder.gauge(PUBLICATION_NOT_CONNECTED_SECONDS, &labels),
@@ -103,7 +137,7 @@ fn the_health_gauges_follow_the_reports() {
     let counting = super::super::test_hooks::GaugeRecorder::default();
     metrics::with_local_recorder(&counting, || {
         let mut health = super::PublicationHealth::new("tx_receipts");
-        health.report(Duration::ZERO);
+        health.report(true, Duration::ZERO);
         assert_eq!(counting.gauge(PUBLICATION_CONNECTED, &labels), Some(1.0));
     });
 }

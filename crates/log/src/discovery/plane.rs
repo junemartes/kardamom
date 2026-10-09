@@ -25,7 +25,7 @@ use super::endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, publication_uri};
 use super::reconcile::{DestinationPort, Reconciler};
 use super::record::{
     ARCHIVE_SERVICE, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, PUBLISHER_SERVICE,
-    PublisherRecord, Scope, Topic,
+    PublisherRecord, SUBSCRIBER_SERVICE, Scope, SubscriberRecord, Topic,
 };
 use super::registration::Registration;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
@@ -153,6 +153,7 @@ impl Discovered {
         let (sub_id, rx) =
             rt.open_subscription_with_id::<T>(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
         self.start_reconcile(rt.destinations(sub_id), key);
+        self.hold_subscriber_record(key);
         Ok(rx)
     }
 
@@ -165,7 +166,40 @@ impl Discovered {
     ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
         let (sub_id, rx) = rt.open_subscription_raw(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
         self.start_reconcile(rt.destinations(sub_id), key);
+        self.hold_subscriber_record(key);
         Ok(rx)
+    }
+
+    /// Register the subscriber record of `key` and hold it until the
+    /// plane shuts down. The task owns the registration: it deregisters
+    /// on cancel. A failed registration leaves the publishers of the
+    /// stream without the record, and they then treat the stream as one
+    /// without a subscriber.
+    fn hold_subscriber_record(&mut self, key: StreamKey) {
+        let record = SubscriberRecord {
+            id: self.instance.subscriber_id(key.topic, key.stream_id),
+            address: IpAddr::V4(self.ip),
+            topic: key.topic,
+            stream_id: key.stream_id,
+            lane: key.lane,
+            subscriber_id: self.label.clone(),
+        };
+        let held = SubscriberRegistration {
+            catalog: self.catalog.clone(),
+            spec: RegistrationSpec {
+                entry: record.entry(&self.scope),
+                ttl: self.cfg.check_ttl(),
+                deregister_after: self.cfg.deregister_after(),
+            },
+            cancel: self.cancel.clone(),
+        };
+        self.tasks.push(tokio::spawn(held.run()));
+    }
+
+    /// Watch the subscriber records of the stream of `key`.
+    fn subscribers(&mut self, key: StreamKey) -> watch::Receiver<Membership> {
+        let filter = key.filter(&self.scope);
+        self.watch_service(SUBSCRIBER_SERVICE, filter)
     }
 
     /// Start a watch over the publisher records matching `filter`, and
@@ -229,6 +263,31 @@ impl Discovered {
             if let Err(e) = registration.deregister().await {
                 warn!(error = %e, "discovery: deregistration failed at shutdown");
             }
+        }
+    }
+}
+
+/// The catalog record of one discovered subscription, for the life of
+/// the plane. See [`Discovered::hold_subscriber_record`].
+struct SubscriberRegistration {
+    catalog: Catalog,
+    spec: RegistrationSpec,
+    cancel: CancellationToken,
+}
+
+impl SubscriberRegistration {
+    async fn run(self) {
+        let id = self.spec.entry.id.clone();
+        let registration = match Registration::register(self.catalog, self.spec).await {
+            Ok(registration) => registration,
+            Err(e) => {
+                warn!(service = %id, error = %e, "discovery: subscriber registration failed");
+                return;
+            }
+        };
+        self.cancel.cancelled().await;
+        if let Err(e) = registration.deregister().await {
+            warn!(service = %id, error = %e, "discovery: subscriber deregistration failed at shutdown");
         }
     }
 }

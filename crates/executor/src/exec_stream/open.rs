@@ -19,6 +19,7 @@ use kardamom_log::error::LogError;
 use kardamom_log::recorder::{
     PositionReport, RecordedStream, RecorderKind, RecorderThreads, record_stream_reporting,
 };
+
 use rkyv::util::AlignedVec;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -39,10 +40,6 @@ const POSITION_EVERY: Duration = Duration::from_millis(20);
 /// The depth of the channel from the reader to the publisher. A full
 /// channel blocks the reader.
 const ITEMS_DEPTH: usize = 4096;
-
-/// The time the executor waits for its recording before it gives up on
-/// one attempt.
-const READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// The pause between two attempts to start the recording.
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
@@ -146,6 +143,7 @@ impl ExecStream {
             cfg: &cfg,
             stream_id,
             ipc,
+            budget: cfg.rt_pub.stall_budget(),
             escalation: Escalation::from_stall_budget(cfg.rt_pub.stall_budget()),
         }
         .run()
@@ -199,13 +197,14 @@ impl ExecStream {
         Ok(Some(live))
     }
 
-    /// Wait until the recorder reports an active recording of this
-    /// session.
+    /// Wait up to `within` until the recorder reports an active recording
+    /// of this session.
     async fn wait_ready(
         ready: oneshot::Receiver<Result<i64, String>>,
         session_id: i32,
+        within: Duration,
     ) -> Result<()> {
-        match tokio::time::timeout(READY_TIMEOUT, ready).await {
+        match tokio::time::timeout(within, ready).await {
             Ok(Ok(Ok(recording_id))) => {
                 tracing::info!(
                     session_id,
@@ -219,7 +218,7 @@ impl ExecStream {
             }
             Ok(Err(_)) => anyhow::bail!("the exec_txs recorder thread ended before readiness"),
             Err(_) => anyhow::bail!(
-                "timed out ({READY_TIMEOUT:?}) waiting for the exec_txs recording to become active"
+                "timed out ({within:?}) waiting for the exec_txs recording to become active"
             ),
         }
     }
@@ -236,19 +235,24 @@ struct Recording {
 /// The start of the recording, under the escalation of the stall budget.
 /// A media driver that crashed under the executor leaves the archive
 /// unreachable for a while, and a recording of a stale session never
-/// starts. Each attempt connects the archive again. After one stall
-/// budget the start opens a new session. After four, it ends with
-/// [`ExecutorError::PublicationDead`], and the process exits with
-/// [`PUBLICATION_DEAD_EXIT_CODE`] so the supervisor restarts it.
+/// starts. Each attempt connects the archive again, and each attempt is
+/// bounded by the budget, the archive connect included. The clock starts
+/// with the first attempt. After one budget the start opens a new
+/// session. After five, it ends with [`ExecutorError::PublicationDead`],
+/// and the process exits with [`PUBLICATION_DEAD_EXIT_CODE`] so the
+/// supervisor restarts it.
 struct RecordingStart<'a> {
     cfg: &'a ExecStreamConfig<'a>,
     stream_id: i32,
     ipc: PubHandle,
+    /// The stall budget: the bound of one attempt.
+    budget: Duration,
     escalation: Escalation,
 }
 
 impl RecordingStart<'_> {
     async fn run(mut self) -> Result<Recording> {
+        self.escalation.start(Instant::now());
         loop {
             if let ControlFlow::Break(done) = self.attempt().await {
                 return done;
@@ -269,13 +273,14 @@ impl RecordingStart<'_> {
             aeron_cfg: self.cfg.aeron_cfg.clone(),
             stream_id: self.stream_id,
             session_id,
+            connect_timeout: self.budget,
         }
         .spawn(ready_tx, positions_tx);
         let recorder = match spawned {
             Ok(recorder) => recorder,
             Err(e) => return ControlFlow::Break(Err(e)),
         };
-        match ExecStream::wait_ready(ready_rx, session_id).await {
+        match ExecStream::wait_ready(ready_rx, session_id, self.budget).await {
             Ok(()) => ControlFlow::Break(Ok(Recording {
                 ipc: self.ipc.clone(),
                 recorder,
@@ -360,6 +365,8 @@ struct RecorderBody {
     aeron_cfg: AeronConfig,
     stream_id: i32,
     session_id: i32,
+    /// The bound of the archive connect: the stall budget.
+    connect_timeout: Duration,
 }
 
 impl RecorderBody {
@@ -394,6 +401,7 @@ impl RecorderBody {
                 kind: RecorderKind::ExecTxs {
                     session_id: self.session_id,
                 },
+                connect_timeout: self.connect_timeout,
             },
             stop,
             |outcome| {

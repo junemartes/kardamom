@@ -39,7 +39,9 @@ pub(crate) async fn open_tx_receipts_pub(
     );
     Ok(LiveTxReceiptsPub {
         handle,
-        reopen: plane.tx_receipts_reopen(args.recorder_id),
+        reopen: plane
+            .tx_receipts_reopen(args.recorder_id)
+            .context("the tx_receipts reopen")?,
         rt_pub: rt_pub.clone(),
         tokio: tokio::runtime::Handle::current(),
     })
@@ -140,6 +142,10 @@ impl LiveTxReceiptsPub {
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {
+    fn subscribers_listed(&mut self) -> bool {
+        self.reopen.subscribers_listed()
+    }
+
     /// Open the receipt stream again on a new session, move the discovery
     /// record to it, and close the old publication. A failed close only
     /// leaves the old session to the driver's own timeout.

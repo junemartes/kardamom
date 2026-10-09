@@ -5,8 +5,14 @@
 //! hold in two steps. After one stall budget without a connected
 //! subscriber, the publisher opens the publication again: a new session
 //! on a new control port, which every subscriber attaches afresh. After
-//! four stall budgets in total, the process exits with
+//! five stall budgets in total, the process exits with
 //! [`PUBLICATION_DEAD_EXIT_CODE`], so the supervisor restarts it.
+//!
+//! The clock runs only while a subscriber of the publication is known. A
+//! stream without a subscriber (a cluster bootstrap where the executor
+//! comes up first, an ingress pair down) has nothing to reopen for, and
+//! an exit would only restart the publisher against the same empty
+//! stream. The publisher reports that knowledge with each failure.
 //!
 //! The stall budget is the driver timeout of the Aeron client plus a
 //! margin (`AeronRuntime::stall_budget`): the wait after which a silent
@@ -25,9 +31,11 @@ use crate::metrics::{PUBLICATION_CONNECTED, PUBLICATION_NOT_CONNECTED_SECONDS};
 pub const PUBLICATION_DEAD_EXIT_CODE: u8 = 3;
 
 /// How many stall budgets an unconnected publication gets in total
-/// before the process exits: one until the reopen, and three more for
-/// the new publication to connect.
-const EXIT_BUDGETS: u32 = 4;
+/// before the process exits: one until the reopen, and four more for
+/// the new publication to connect. At the production default (a 15 s
+/// budget) the exit comes after 75 s, above the 60 s restart SLO of a
+/// subscriber, so a restarting subscriber never exits its publishers.
+const EXIT_BUDGETS: u32 = 5;
 
 /// What the publisher does after one more unconnected attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +64,7 @@ pub struct Escalation {
 
 impl Escalation {
     /// The escalation for a client with the stall budget `budget`: the
-    /// reopen after one budget, the exit after [`EXIT_BUDGETS`].
+    /// reopen after one budget, the exit after [`EXIT_BUDGETS`] budgets.
     #[must_use]
     pub fn from_stall_budget(budget: Duration) -> Self {
         Self {
@@ -85,6 +93,13 @@ impl Escalation {
         self.reopened = false;
     }
 
+    /// Start the unconnected period at `now` when none runs. A user whose
+    /// first attempt is itself the start of the period calls this before
+    /// the attempt, so the attempt's own duration counts.
+    pub fn start(&mut self, now: Instant) {
+        self.since.get_or_insert(now);
+    }
+
     /// One more unconnected attempt at `now`. The first one starts the
     /// clock.
     pub fn unconnected(&mut self, now: Instant) -> Step {
@@ -110,9 +125,10 @@ impl Escalation {
 }
 
 /// The two gauges of one publication: whether it is connected, and how
-/// long the current unconnected period has lasted. A report writes the
-/// gauges on a change of the connected state and on every unconnected
-/// report, so a connected hot path pays no gauge write per batch.
+/// long the escalation clock has counted in the current unconnected
+/// period. A report writes the gauges on a change of the connected state
+/// and on every unconnected report, so a connected hot path pays no gauge
+/// write per batch.
 #[derive(Debug)]
 pub struct PublicationHealth {
     topic: &'static str,
@@ -129,10 +145,10 @@ impl PublicationHealth {
         }
     }
 
-    /// Report the length of the current unconnected period. Zero means
-    /// connected.
-    pub fn report(&mut self, unconnected: Duration) {
-        let connected = unconnected.is_zero();
+    /// Report the state: whether the last publish found a subscriber, and
+    /// how long the escalation clock has counted (zero while connected,
+    /// and zero while no subscriber is known).
+    pub fn report(&mut self, connected: bool, counted: Duration) {
         if connected && self.connected == Some(true) {
             return;
         }
@@ -140,7 +156,7 @@ impl PublicationHealth {
         metrics::gauge!(PUBLICATION_CONNECTED, "topic" => self.topic)
             .set(f64::from(u8::from(connected)));
         metrics::gauge!(PUBLICATION_NOT_CONNECTED_SECONDS, "topic" => self.topic)
-            .set(unconnected.as_secs_f64());
+            .set(counted.as_secs_f64());
     }
 }
 

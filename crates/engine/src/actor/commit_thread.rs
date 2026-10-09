@@ -50,10 +50,12 @@ const RETRY_PAUSE: Duration = Duration::from_millis(50);
 ///
 /// Any other error is transient. Warn on attempt 1 and then every 20th
 /// attempt. Sleep [`RETRY_PAUSE`] and let the caller retry. A
-/// not-connected error also runs the [`Escalation`] clock: a reopen of
-/// the publication after one stall budget, and a [`Step::Exit`] after
-/// four, which this thread turns into [`ExecutorError::PublicationDead`].
-/// Any other transient error proves a subscriber and resets the clock.
+/// not-connected error while a subscriber is known also runs the
+/// [`Escalation`] clock: a reopen of the publication after one stall
+/// budget, and a [`Step::Exit`] after five, which this thread turns into
+/// [`ExecutorError::PublicationDead`]. Any other transient error proves a
+/// subscriber and resets the clock. A not-connected error while no
+/// subscriber is known resets it too: nothing to reopen for.
 struct MustDeliver {
     attempts: u32,
     escalation: Escalation,
@@ -69,9 +71,15 @@ impl MustDeliver {
         }
     }
 
-    /// One failed attempt. Returns the step the caller takes next:
-    /// [`Step::Wait`] after the pause, or [`Step::Reopen`].
-    fn failed(&mut self, e: ExecutorError, msg: &'static str) -> Result<Step, ExecutorError> {
+    /// One failed attempt, with `listed` saying whether a subscriber is
+    /// known. Returns the step the caller takes next: [`Step::Wait`]
+    /// after the pause, or [`Step::Reopen`].
+    fn failed(
+        &mut self,
+        e: ExecutorError,
+        listed: bool,
+        msg: &'static str,
+    ) -> Result<Step, ExecutorError> {
         if matches!(e, ExecutorError::Divergence(_)) {
             return Err(e);
         }
@@ -81,7 +89,7 @@ impl MustDeliver {
         if self.attempts == 1 || self.attempts.is_multiple_of(20) {
             warn!(error = %e, attempts = self.attempts, "{msg}");
         }
-        let step = self.escalate(&e);
+        let step = self.escalate(&e, listed);
         if let Step::Exit { unconnected } = step {
             return Err(self.dead(unconnected));
         }
@@ -89,16 +97,20 @@ impl MustDeliver {
         Ok(step)
     }
 
-    /// The escalation step of one failure, with the gauges updated.
-    fn escalate(&mut self, e: &ExecutorError) -> Step {
+    /// The escalation step of one failure, with the gauges updated. The
+    /// clock runs on a not-connected failure while a subscriber is
+    /// known.
+    fn escalate(&mut self, e: &ExecutorError, listed: bool) -> Step {
         let now = Instant::now();
-        let step = if matches!(e, ExecutorError::NotConnected { .. }) {
+        let not_connected = matches!(e, ExecutorError::NotConnected { .. });
+        let step = if not_connected && listed {
             self.escalation.unconnected(now)
         } else {
             self.escalation.connected();
             Step::Wait
         };
-        self.health.report(self.escalation.unconnected_for(now));
+        self.health
+            .report(!not_connected, self.escalation.unconnected_for(now));
         step
     }
 
@@ -127,7 +139,7 @@ impl MustDeliver {
     fn delivered(&mut self) {
         self.attempts = 0;
         self.escalation.connected();
-        self.health.report(Duration::ZERO);
+        self.health.report(true, Duration::ZERO);
     }
 }
 
@@ -314,7 +326,8 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// in [`Self::publish_batch`] and [`Self::publish_boundary`] stay free
     /// of a branch.
     fn recover(&mut self, e: ExecutorError, msg: &'static str) -> Result<(), ExecutorError> {
-        if self.retry.failed(e, msg)? == Step::Reopen {
+        let listed = self.tx_receipts_pub.subscribers_listed();
+        if self.retry.failed(e, listed, msg)? == Step::Reopen {
             self.reopen()?;
         }
         Ok(())
