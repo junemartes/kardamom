@@ -52,10 +52,11 @@ mod threads;
 mod tx_data;
 mod void;
 
+pub(crate) use exec_stream::LocatorClient;
 pub use exec_stream::{
     ArchiveLocator, ExecArchive, ExecArchiveSeed, ExecFetchError, ExecRecordSubscription,
     ExecStreamJoin, ExecStreamSeed, ExecStreamSource, LiveExecArchive, LiveExecArchiveSeed,
-    LocatorAnswer, LocatorClient, LocatorError, QueryEndpoint, RecordBuffer,
+    LocatorAnswer, LocatorError,
 };
 pub use join::{JoinBuffer, ReaderConfig};
 pub use ports::{

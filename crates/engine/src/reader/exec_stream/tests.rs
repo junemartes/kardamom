@@ -16,6 +16,7 @@ use kardamom_types::{
 };
 
 use super::super::tests_void::VotingSub;
+use super::locator::QueryEndpoint;
 use super::*;
 use crate::reader::{NoExecStream, ReaderConfig, ReaderToExec, TxOrderingInputs, TxOrderingReader};
 
@@ -143,17 +144,13 @@ impl Chain {
         record
     }
 
-    /// The canonical order: a `TxRef` at each of `indices`.
-    fn order(&self, indices: impl IntoIterator<Item = u64>) -> Vec<(BPosition, TxOrderingMessage)> {
-        indices
-            .into_iter()
-            .map(|i| {
-                (
-                    BPosition::from_index(i),
-                    TxOrderingMessage::TxRef(self.tx_ref(i)),
-                )
-            })
-            .collect()
+    /// The canonical order from `start`: a `TxRef` at each of the `count`
+    /// indices.
+    fn order(&self, start: u64, count: u64) -> VotingSub {
+        let refs = (start..start + count)
+            .map(|i| TxOrderingMessage::TxRef(self.tx_ref(i)))
+            .collect();
+        VotingSub::new(start, refs)
     }
 }
 
@@ -218,15 +215,6 @@ impl Run {
 /// Close the feed, so its thread ends.
 fn drop_sender(_feed: Sender<ExecTxRecord>) {}
 
-/// A fixed order that closes when empty.
-struct Order(std::collections::VecDeque<(BPosition, TxOrderingMessage)>);
-
-impl TxOrderingSubscription for Order {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.pop_front().ok_or(ExecutorError::TxOrderingClosed)
-    }
-}
-
 /// The transactions the exec thread got, as `(index, tx_hash)`.
 fn txs(out: &[ReaderToExec]) -> Vec<(u64, B256)> {
     out.iter()
@@ -257,7 +245,7 @@ fn three_copies_of_each_record_reach_the_exec_thread_once() {
         .flat_map(|i| [chain.record(i), chain.record(i), chain.record(i)])
         .collect();
     let run = Run::start(
-        Order(chain.order(0..3).into()),
+        chain.order(0, 3),
         live,
         FakeArchive::default(),
         cfg(Duration::from_secs(5)),
@@ -282,7 +270,7 @@ fn a_copy_that_fails_the_check_drops_and_the_good_copy_wins() {
     assert_eq!(canonical.reject(&chain.record(2)), None);
 
     let run = Run::start(
-        Order(chain.order([2]).into()),
+        chain.order(2, 1),
         vec![chain.forged(2), chain.record(2)],
         FakeArchive::default(),
         cfg(Duration::from_secs(5)),
@@ -305,7 +293,7 @@ fn a_gap_in_the_live_stream_fills_from_an_executor_archive() {
     let replays = archive.replays.clone();
     // The live stream lost 5 and 6, and delivered 7.
     let run = Run::start(
-        Order(chain.order(5..8).into()),
+        chain.order(5, 3),
         vec![chain.record(7)],
         archive,
         cfg(Duration::from_millis(50)),
@@ -388,7 +376,7 @@ fn a_restart_refetches_its_cursor_range_without_the_live_wait() {
     let replays = archive.replays.clone();
     let began = Instant::now();
     let run = Run::start(
-        Order(chain.order(start..start + 4).into()),
+        chain.order(start, 4),
         live,
         archive,
         cfg(Duration::from_secs(30)),
@@ -416,7 +404,7 @@ fn every_archive_with_a_mismatched_record_stops_the_reader() {
         ..FakeArchive::default()
     };
     let run = Run::start(
-        Order(chain.order([9]).into()),
+        chain.order(9, 1),
         vec![chain.forged(9)],
         archive,
         cfg(Duration::from_millis(50)),

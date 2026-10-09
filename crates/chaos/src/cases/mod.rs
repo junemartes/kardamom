@@ -25,6 +25,7 @@ pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
+pub(crate) mod validator_catchup;
 
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub enum Case {
     RetentionOverrunValidator,
     ValidatorLapse,
     ValidatorJoin,
+    ValidatorExecArchiveCatchup,
     CpuSqueeze,
     ResizeScaleOutIn,
     LookupBlackout,
@@ -78,7 +80,7 @@ pub enum Case {
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 47] = [
+const ALL: [Case; 48] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -112,6 +114,7 @@ const ALL: [Case; 47] = [
     Case::RetentionOverrunValidator,
     Case::ValidatorLapse,
     Case::ValidatorJoin,
+    Case::ValidatorExecArchiveCatchup,
     Case::CpuSqueeze,
     Case::ResizeScaleOutIn,
     Case::LookupBlackout,
@@ -178,6 +181,7 @@ impl Case {
             Self::RetentionOverrunValidator => "retention-overrun-validator",
             Self::ValidatorLapse => "validator-lapse",
             Self::ValidatorJoin => "validator-join",
+            Self::ValidatorExecArchiveCatchup => "validator-exec-archive-catchup",
             Self::CpuSqueeze => "cpu-squeeze",
             Self::ResizeScaleOutIn => "resize-scale-out-in",
             Self::LookupBlackout => "lookup-blackout",
@@ -234,6 +238,10 @@ impl Case {
             Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
+            // The stop, the restart of the job, and the catch-up polls.
+            Self::ValidatorExecArchiveCatchup => {
+                inject + k.validator_catchup_stop + Duration::from_mins(6)
+            }
             Self::RetentionOverrun
             | Self::RetentionOverrunValidator
             | Self::DaLagHalt
@@ -372,6 +380,7 @@ impl Case {
             }
             Self::ValidatorLapse => validator::lapse(h).await,
             Self::ValidatorJoin => validator::join(h).await,
+            Self::ValidatorExecArchiveCatchup => validator_catchup::exec_archive_catchup(h).await,
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
             Self::LookupBlackout => resize::lookup_blackout(h).await,

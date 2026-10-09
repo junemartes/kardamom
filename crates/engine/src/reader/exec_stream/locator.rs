@@ -75,7 +75,7 @@ pub struct LocatorError {
 /// name, such as a Consul node record; each address it resolves to is
 /// tried in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QueryEndpoint(String);
+pub(crate) struct QueryEndpoint(String);
 
 impl QueryEndpoint {
     /// Parse `http://host:port`, `http://host:port/` or `host:port`.
@@ -83,7 +83,7 @@ impl QueryEndpoint {
     /// # Errors
     ///
     /// Returns the raw value when it names no `host:port`.
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         let bare = raw.strip_prefix("http://").unwrap_or(raw);
         let bare = bare.strip_suffix('/').unwrap_or(bare);
         match bare.rsplit_once(':') {
@@ -180,7 +180,7 @@ struct RpcResponse {
 /// The locator client: the query endpoints of the executors, in a fixed
 /// order. The index of an endpoint names its executor in the wait.
 #[derive(Clone, Debug, Default)]
-pub struct LocatorClient {
+pub(crate) struct LocatorClient {
     endpoints: Vec<QueryEndpoint>,
 }
 
@@ -190,7 +190,7 @@ impl LocatorClient {
     /// # Errors
     ///
     /// Returns the first endpoint that names no `host:port`.
-    pub fn new(endpoints: &[String]) -> Result<Self, String> {
+    pub(crate) fn new(endpoints: &[String]) -> Result<Self, String> {
         let endpoints = endpoints
             .iter()
             .map(|raw| QueryEndpoint::parse(raw))
@@ -200,13 +200,13 @@ impl LocatorClient {
 
     /// The count of executors the client asks.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.endpoints.len()
     }
 
     /// Whether the client asks no executor.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
     }
 
@@ -216,7 +216,7 @@ impl LocatorClient {
     ///
     /// Returns the failure of the query: no such executor, no
     /// connection, no answer in time, or an answer that does not parse.
-    pub fn ask(
+    pub(crate) fn ask(
         &self,
         executor: usize,
         index: u64,

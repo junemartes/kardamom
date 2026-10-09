@@ -894,6 +894,30 @@ The open change that sets `archive_file_sync_level` in the aeron job is a prereq
   `validator-exec-archive-catchup`: stop the validator past the live window, start it, assert
   `blocks_verified` rises with no checkpoint adoption.
 - Docs: `docs/failure-modes.md` validator section, `docs/observability.md`.
+- Deviations in P6:
+  - The source seam is three traits in `crates/engine/src/reader/source.rs`: `TxSource`
+    (`start` spawns the feed threads), `JoinSeed` (crosses into the reader thread), and
+    `TxJoin` (one join on the reader thread). `EngineWiring::TxSource` names the source.
+    The validator names `Either<TxDataSource<_>, ExecStreamSource<_, _>>`, so the flag picks
+    the source with no `dyn`. The `tx_data` join, its refetch and its vote moved from
+    `threads.rs` to `crates/engine/src/reader/tx_data.rs` unchanged.
+  - The shared buffer is the validator's whole `KeyedBuffer` core, moved to
+    `crates/engine/src/keyed_buffer.rs` with `Skip`. The executor stream keeps every distinct
+    copy of an index (at most 8), not only the first, because the check needs `TxRef(i)`,
+    which a live record can reach before the order does. The take keeps the first copy that
+    passes.
+  - The archive replay is `ArchiveRefetcher::fetch_exec_records` in
+    `crates/log/src/refetch/exec.rs`, from a raw locator position (`Origin::Raw`) on the
+    archive that `archive_id` names (`EndpointSource::of_archive`). The locator client is a
+    blocking HTTP/1.0 JSON-RPC client in `crates/engine/src/reader/exec_stream/locator.rs`.
+    P5's peer step can share both.
+  - The halt is `HaltCause::ExecRecordMismatch` (id `exec_record_mismatch`), appended last.
+    The validator halts when every executor in `--executor-query-endpoints` answered
+    `located` with a record at `i` that fails the check. A live copy alone never halts: the
+    live stream does not name its executor. No verdict file keeps the halt; a restart meets
+    the same index again.
+  - The validator flag for the locator query is `--executor-query-endpoints`, the name the
+    sequencer uses for the same endpoints.
 
 ### P7. The batcher reads the executor stream
 

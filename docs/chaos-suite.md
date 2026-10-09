@@ -57,7 +57,7 @@ There are eleven shards. `just container-test` lists their names.
 | `semantics` | The chain-semantics suite (`SEMANTICS_CASES`) | `RUN_LOAD=0` |
 | `chaos-executor` | `graceful-executor`, `hard-executor`, `node-failure-executor`, `node-replace-executor`, `state-checkpoint-restore`, `replay-window-resync`, `deploy-broken-image` | `RUN_LOAD=0` |
 | `chaos-ingress` | `graceful-ingress`, `hard-ingress`, `archive-driver-loss`, `archive-tx-data-wipe`, `archive-corruption` | `RUN_LOAD=0` |
-| `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `sequencer-lapse`, `validator-lapse`, `validator-join`, `lookup-blackout`, `resize-scale-out-in` | `RUN_LOAD=0` |
+| `chaos-sequencer` | `graceful-sequencer`, `hard-sequencer`, `sequencer-replica-kill`, `validator-lapse`, `sequencer-lapse`, `validator-join`, `validator-exec-archive-catchup`, `lookup-blackout`, `resize-scale-out-in` | `RUN_LOAD=0`, the validator on the executor stream (`KARDAMOM_VALIDATOR_TX_SOURCE=exec-stream`) |
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
@@ -67,7 +67,7 @@ There are eleven shards. `just container-test` lists their names.
 
 Case order matters in four places.
 
-- `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version.
+- `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version. The other cases of the shard alternate between the cases that need a shard-0 account and the cases that take any account, so no funded account is skipped and the nine cases fit the funded accounts.
 - `sealer-fleet-total-wipe-recover` runs last in `chaos-fleet`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the other cases.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. It can leave an entry that no archive serves.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
@@ -108,6 +108,9 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`sequencer-lapse`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): freezes a replica for `SEQ_LAPSE_S`. The replica must detect the lapse and resync.
 - [`validator-lapse`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): pauses the validator for `LAPSE_S`. It must catch up and verify with no divergence.
 - [`validator-join`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): kills the validator and wipes its state. The new validator adopts a peer checkpoint and verifies live.
+- [`validator-exec-archive-catchup`](failure-modes.md#validator-off-the-hot-path-halts-on-divergence): stops the validator job for `VALIDATOR_CATCHUP_STOP_S` under load, then starts it. The live executor stream holds nothing for the stop window, so the validator must refetch the window from the executor archives. It must verify past its old head with no peer-checkpoint adoption (no `adopted state from checkpoint` line, no `validator_resync_total{outcome="peer-checkpoint"}`) and no divergence. The case logs `kardamom_exec_stream_refetch_total{outcome="located"}`. It reads `--tx-source` from the registered validator job, and it skips with a log line on `tx-data`.
+
+The shard deploys the validator with `--tx-source exec-stream`, so `validator-lapse` and `validator-join` also run on the executor stream. Each one logs the source it found.
 - [`lookup-blackout`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): cuts the executor and Redis traffic of a sequencer node. It kills the lane-0 replica there.
 - [`resize-scale-out-in`](failure-modes.md#sequencer-2-shards-x-2-racing-replicas): grows the sequencer from two lanes to three under load, kills a replica of the new lane, and shrinks back.
 
@@ -409,6 +412,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `AERON_STALL_TOLERANCE_MS` | `30000` | The Aeron stall tolerance of the deployed cluster. The lapse freezes and the waits after a driver loss derive from it. |
 | `SEQ_LAPSE_S` | the tolerance plus 20 s | The freeze window of `sequencer-lapse`. It must pass the tolerance, so the driver evicts the frozen client. |
 | `LAPSE_S` | the tolerance plus 20 s | The freeze window of `validator-lapse`. |
+| `VALIDATOR_CATCHUP_STOP_S` | `90` | How long `validator-exec-archive-catchup` keeps the validator job stopped. |
 | `KARDAMOM_CLUSTER_RETENTION` | unset | The egress retention of the deployed cluster, in frames. The retention cases need it. It must be a positive number. |
 | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | unset | The DA-lag budget of the deployed sealer, in blocks. `da-lag-halt` needs it. It must be a positive number, so the knob cannot pass 0. |
 | `RETENTION_FREEZE_CAP_S` | `600` | The hard cap of the adaptive retention freeze. |

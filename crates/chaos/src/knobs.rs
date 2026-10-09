@@ -130,6 +130,11 @@ pub struct Knobs {
     /// The validator-lapse freeze window. The default is the evicting
     /// freeze of the stall tolerance.
     pub validator_lapse: Duration,
+    /// How long validator-exec-archive-catchup keeps the validator job
+    /// stopped. The live executor stream holds nothing for a validator
+    /// that was away, so every record of the window comes from an
+    /// executor archive.
+    pub validator_catchup_stop: Duration,
     /// The cluster egress retention the cluster was deployed with, in
     /// frames. The retention cases need it; other cases ignore it.
     pub cluster_retention: Option<NonZeroU64>,
@@ -283,6 +288,7 @@ impl Knobs {
             aeron_stall,
             seq_lapse: env.secs("SEQ_LAPSE_S", lapse_s)?,
             validator_lapse: env.secs("LAPSE_S", lapse_s)?,
+            validator_catchup_stop: env.secs("VALIDATOR_CATCHUP_STOP_S", 90)?,
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
