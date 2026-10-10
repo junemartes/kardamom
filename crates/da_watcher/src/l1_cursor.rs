@@ -18,7 +18,9 @@ use alloy_primitives::B256;
 /// The file form is one line: the decimal number, one space, and the hash
 /// as `0x` and 64 hex digits. An operator can read it and write it by hand.
 /// The reader ignores any field after the hash, so a later release can add
-/// one at the tail and this release still reads its file.
+/// one at the tail of the line and this release still reads its file. The
+/// file holds one line: a second non-empty line is a refusal, never a
+/// silent pick of one of the two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L1Cursor {
     /// The L1 block number.
@@ -30,6 +32,9 @@ pub struct L1Cursor {
 /// Why a cursor line does not parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum L1CursorError {
+    /// The file holds more than one non-empty line.
+    #[error("an L1 cursor is one line; got {0} non-empty lines")]
+    Lines(usize),
     /// The line holds fewer than the two required fields.
     #[error("an L1 cursor starts with `<number> <hash>`; got {0} fields")]
     Fields(usize),
@@ -51,7 +56,13 @@ impl FromStr for L1Cursor {
     type Err = L1CursorError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let fields: Vec<&str> = s.split_ascii_whitespace().collect();
+        let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+        let line = match lines.as_slice() {
+            [] => "",
+            [line] => line,
+            more => return Err(L1CursorError::Lines(more.len())),
+        };
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
         let [number, hash, ..] = fields.as_slice() else {
             return Err(L1CursorError::Fields(fields.len()));
         };

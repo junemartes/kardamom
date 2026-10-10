@@ -45,7 +45,11 @@ code = [
 # kind it does not know, counts it, and never orders it. A new kind that
 # changes the replicated state is sent only after every member reads it:
 # members of two releases decide alike until then. So switch the flag on
-# only after every member reads kind 9.
+# only after every member reads kind 9. The release before this one orders
+# an unknown kind of 85 bytes or more as a user record. So during the first
+# roll to this release, no client may send an unknown kind: an old member
+# orders such a frame and a new member drops it. No client sends one today
+# (the Rust writers send kinds 0 to 7).
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0

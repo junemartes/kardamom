@@ -42,3 +42,22 @@ fn a_missing_or_malformed_required_field_is_refused() {
         Err(L1CursorError::Hash(_))
     ));
 }
+
+/// The file holds one line. An appended second line is a refusal, so the
+/// watcher never takes the older line by accident. A trailing newline or
+/// a blank line is not a second line.
+#[test]
+fn a_second_non_empty_line_is_refused() {
+    let later = L1Cursor {
+        number: 8,
+        hash: B256::repeat_byte(0x08),
+    };
+    assert_eq!(
+        format!("{}\n{later}\n", sample()).parse::<L1Cursor>(),
+        Err(L1CursorError::Lines(2))
+    );
+    assert_eq!(
+        format!("{}\n\n  \n", sample()).parse::<L1Cursor>(),
+        Ok(sample())
+    );
+}

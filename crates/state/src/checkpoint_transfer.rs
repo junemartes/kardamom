@@ -48,8 +48,7 @@ use tracing::{info, warn};
 use alloy_primitives::B256;
 
 use crate::checkpoint::{
-    CheckpointInfo, ImageSchema, check_image_schema, checkpoint_data_file, checkpoint_name,
-    latest_checkpoint,
+    CheckpointInfo, ImageSchema, checkpoint_data_file, checkpoint_name, latest_checkpoint,
 };
 use crate::error::StateError;
 
@@ -199,6 +198,7 @@ fn prepare_response(
     };
     let schema = manifest
         .schema_version
+        .stated()
         .map(|schema| format!("{}: {schema}\r\n", framing::HDR_SCHEMA))
         .unwrap_or_default();
     let head = format!(
@@ -276,7 +276,7 @@ pub(crate) fn fetch_latest_checkpoint(
         return Ok(None);
     }
     // An image this release cannot open is refused before the download.
-    check_image_schema(&format!("from peer {peer}"), head.schema)?;
+    head.schema.check(&format!("from peer {peer}"))?;
 
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(head.block));
@@ -521,7 +521,8 @@ struct CheckpointHead {
     len: u64,
     keccak: B256,
     genesis: B256,
-    /// The image's state schema; `None` from a peer of an older release.
+    /// The image's state schema; none stated from a peer of an older
+    /// release.
     schema: ImageSchema,
 }
 
@@ -619,7 +620,7 @@ impl ParsedHeaders {
             "content-length" => self.content_length = v.parse().ok(),
             framing::HDR_KECCAK => self.keccak = v.parse().ok(),
             framing::HDR_GENESIS => self.genesis = v.parse().ok(),
-            framing::HDR_SCHEMA => self.schema = v.parse().ok(),
+            framing::HDR_SCHEMA => self.schema = ImageSchema::parse(v),
             _ => {}
         }
         self

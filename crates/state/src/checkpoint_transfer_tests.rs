@@ -10,13 +10,7 @@ fn write_checkpoint(dir: &Path, block: u64, contents: &[u8]) -> PathBuf {
 /// Write an image and a manifest that correctly describes it, under a
 /// given chain identity.
 fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
-    write_checkpoint_of_schema(
-        dir,
-        block,
-        contents,
-        genesis,
-        Some(crate::meta::SCHEMA_VERSION),
-    )
+    write_checkpoint_of_schema(dir, block, contents, genesis, ImageSchema::CURRENT)
 }
 
 /// [`write_checkpoint_as`] with the state schema the manifest states.
@@ -49,7 +43,13 @@ async fn a_peer_image_of_another_schema_is_skipped() {
     let local = tempfile::tempdir().unwrap();
     let genesis = B256::repeat_byte(0x6E);
     let unreadable = crate::meta::SCHEMA_VERSION + 1;
-    write_checkpoint_of_schema(later.path(), 90, b"later schema", genesis, Some(unreadable));
+    write_checkpoint_of_schema(
+        later.path(),
+        90,
+        b"later schema",
+        genesis,
+        ImageSchema::of(unreadable),
+    );
     write_checkpoint(current.path(), 40, b"current schema");
     let later_addr = serve_ephemeral(later.path().to_path_buf());
     let current_addr = serve_ephemeral(current.path().to_path_buf());
@@ -87,7 +87,7 @@ async fn a_peer_without_a_schema_header_is_fetched() {
         12,
         b"old release",
         B256::repeat_byte(0x6E),
-        None,
+        ImageSchema::default(),
     );
     let addr = serve_ephemeral(remote.path().to_path_buf());
     let got = fetch(addr, local.path().to_path_buf(), 0)
@@ -96,7 +96,7 @@ async fn a_peer_without_a_schema_header_is_fetched() {
         .expect("fetched");
     assert_eq!(got.block, 12);
     let manifest = crate::checkpoint::read_manifest(&got.path).unwrap();
-    assert_eq!(manifest.schema_version, None);
+    assert_eq!(manifest.schema_version, ImageSchema::default());
 }
 
 /// Read the image bytes of a dir-mode checkpoint.

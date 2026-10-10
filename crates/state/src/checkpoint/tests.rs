@@ -378,7 +378,7 @@ fn manifest_round_trips_the_schema_version() {
         block: 9,
         image_keccak: B256::repeat_byte(0x11),
         genesis_digest: B256::repeat_byte(0x22),
-        schema_version: Some(crate::meta::SCHEMA_VERSION),
+        schema_version: ImageSchema::CURRENT,
     };
     let text = manifest.encode();
     assert!(text.contains(&format!("schema_version={}\n", crate::meta::SCHEMA_VERSION)));
@@ -387,13 +387,10 @@ fn manifest_round_trips_the_schema_version() {
     let old = text
         .lines()
         .filter(|l| !l.starts_with("schema_version"))
-        .fold(String::new(), |mut acc, l| {
-            acc.push_str(l);
-            acc.push('\n');
-            acc
-        });
+        .flat_map(|l| [l, "\n"])
+        .collect::<String>();
     let parsed = CheckpointManifest::parse(&format!("{old}later_key=1\n")).unwrap();
-    assert_eq!(parsed.schema_version, None);
+    assert_eq!(parsed.schema_version, ImageSchema::default());
     assert_eq!(parsed.block, 9);
 }
 
@@ -415,7 +412,7 @@ fn restore_skips_a_checkpoint_of_another_schema() {
 
     // The newer checkpoint comes from a release with the next schema.
     let mut manifest = read_manifest(&later.path).unwrap();
-    manifest.schema_version = Some(crate::meta::SCHEMA_VERSION + 1);
+    manifest.schema_version = ImageSchema::of(crate::meta::SCHEMA_VERSION + 1);
     std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
 
     let err = restore_checkpoint(&later.path, dst.path(), None).unwrap_err();
@@ -431,6 +428,41 @@ fn restore_skips_a_checkpoint_of_another_schema() {
     assert_eq!(block, readable.block);
     assert_eq!(path, readable.path);
     assert!(later.path.exists(), "the skipped checkpoint stays put");
+}
+
+/// The engine path, `restore_best_checkpoint`, skips a checkpoint of a
+/// schema this release does not read and restores the next-newest. The
+/// skipped checkpoint keeps its name, so a later release still finds it,
+/// and nothing is quarantined.
+#[test]
+fn restore_best_skips_a_checkpoint_of_another_schema_without_quarantine() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x28; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let readable = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 5);
+    let later = create_checkpoint(&env, ckpt.path()).unwrap();
+    drop(env);
+
+    let mut manifest = read_manifest(&later.path).unwrap();
+    manifest.schema_version = ImageSchema::of(crate::meta::SCHEMA_VERSION + 1);
+    std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
+
+    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), None)
+        .unwrap()
+        .expect("the readable checkpoint restores");
+    assert_eq!(block, readable.block);
+    assert_eq!(path, readable.path);
+    assert!(later.path.exists(), "the skipped checkpoint keeps its name");
+    let hidden: Vec<_> = std::fs::read_dir(ckpt.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(hidden.is_empty(), "nothing is quarantined: {hidden:?}");
 }
 
 #[test]

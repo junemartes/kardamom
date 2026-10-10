@@ -22,9 +22,59 @@ pub(crate) const MANIFEST_VERSION: u32 = 1;
 const UNREADABLE_SCHEMA_SKIPS: &str = "kardamom_checkpoint_unreadable_schema_skips_total";
 
 /// The state schema of a checkpoint image, as its manifest or its serving
-/// peer states it. `None` when the source predates the key; the image
-/// itself then says its schema when it opens.
-pub(crate) type ImageSchema = Option<u32>;
+/// peer states it. A source from before the key states no schema, the
+/// `Default`; the image itself then says its schema when it opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImageSchema(Option<u32>);
+
+impl ImageSchema {
+    /// The schema this release writes and reads.
+    pub(crate) const CURRENT: Self = Self::of(SCHEMA_VERSION);
+
+    /// The stated schema `schema`.
+    pub(crate) const fn of(schema: u32) -> Self {
+        Self(Some(schema))
+    }
+
+    /// The schema in a manifest value or a header value. A value that does
+    /// not parse states no schema.
+    pub(crate) fn parse(value: &str) -> Self {
+        Self(value.parse().ok())
+    }
+
+    /// The stated schema, or `None` when the source states none.
+    pub(crate) const fn stated(self) -> Option<u32> {
+        self.0
+    }
+
+    /// Refuse an image of a schema this release does not read, before the
+    /// image is copied or opened. The disk-restore path checks the
+    /// manifest, and the peer-fetch path checks the peer's header, through
+    /// this one method. An image with no stated schema passes: the image
+    /// says its schema when it opens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::UnreadableCheckpointSchema`], after a log line
+    /// and a count, when the schema is stated and is not this release's.
+    pub(crate) fn check(self, image: &str) -> Result<(), StateError> {
+        let Some(schema) = self.0.filter(|schema| *schema != SCHEMA_VERSION) else {
+            return Ok(());
+        };
+        metrics::counter!(UNREADABLE_SCHEMA_SKIPS).increment(1);
+        tracing::warn!(
+            image,
+            schema,
+            supported = SCHEMA_VERSION,
+            "checkpoint holds a state schema this release does not read; skipping it"
+        );
+        Err(StateError::UnreadableCheckpointSchema {
+            image: image.into(),
+            schema,
+            supported: SCHEMA_VERSION,
+        })
+    }
+}
 
 /// A sidecar file written next to every checkpoint: it says what these
 /// bytes are.
@@ -55,8 +105,8 @@ pub(crate) struct CheckpointManifest {
     /// chain identity.
     pub genesis_digest: B256,
     /// The state schema of the image, so an adopter skips an image it
-    /// cannot read before it copies it. `None` in a manifest from before
-    /// the key.
+    /// cannot read before it copies it. No stated schema in a manifest
+    /// from before the key.
     pub schema_version: ImageSchema,
 }
 
@@ -65,6 +115,7 @@ impl CheckpointManifest {
     pub(crate) fn encode(&self) -> String {
         let schema = self
             .schema_version
+            .stated()
             .map(|schema| format!("schema_version={schema}\n"))
             .unwrap_or_default();
         format!(
@@ -119,7 +170,7 @@ impl ManifestFields {
             "block" => self.block = v.parse::<u64>().ok(),
             "image_keccak" => self.image_keccak = v.parse::<B256>().ok(),
             "genesis_digest" => self.genesis_digest = v.parse::<B256>().ok(),
-            "schema_version" => self.schema_version = v.parse::<u32>().ok(),
+            "schema_version" => self.schema_version = ImageSchema::parse(v),
             _ => {}
         }
         self
@@ -239,34 +290,6 @@ pub(crate) fn check_image_identity(
     Ok(())
 }
 
-/// Refuse an image whose state schema this release does not read, before
-/// the image is copied or opened. The disk-restore path checks the
-/// manifest, and the peer-fetch path checks the peer's header, through
-/// this one function. An image with no stated schema passes: the image
-/// says its schema when it opens.
-///
-/// # Errors
-///
-/// Returns [`StateError::UnreadableCheckpointSchema`], after a log line
-/// and a count, when `schema` is stated and is not this release's.
-pub(crate) fn check_image_schema(image: &str, schema: ImageSchema) -> Result<(), StateError> {
-    let Some(schema) = schema.filter(|schema| *schema != SCHEMA_VERSION) else {
-        return Ok(());
-    };
-    metrics::counter!(UNREADABLE_SCHEMA_SKIPS).increment(1);
-    tracing::warn!(
-        image,
-        schema,
-        supported = SCHEMA_VERSION,
-        "checkpoint holds a state schema this release does not read; skipping it"
-    );
-    Err(StateError::UnreadableCheckpointSchema {
-        image: image.into(),
-        schema,
-        supported: SCHEMA_VERSION,
-    })
-}
-
 /// Publish a staged checkpoint. Write the manifest inside the temp
 /// entry, then do one rename. The image and manifest become visible
 /// atomically, so an observable checkpoint is always verifiable and
@@ -308,7 +331,9 @@ pub(crate) fn verify_checkpoint(
             mpath.display()
         )
     })?;
-    check_image_schema(&checkpoint.display().to_string(), manifest.schema_version)?;
+    manifest
+        .schema_version
+        .check(&checkpoint.display().to_string())?;
     let data = checkpoint_data_file(checkpoint)?;
     let got = file_keccak(&data)?;
     check_image_identity(
