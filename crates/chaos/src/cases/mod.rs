@@ -62,6 +62,11 @@ pub enum Case {
     SequencerSealerLossRecover,
     IngressSequencerSealerLossRecover,
     IngressSequencerSealerReverse,
+    ExecutorSealerLossRecover,
+    ExecutorSealerValidatorRecover,
+    IngressExecutorLossRecover,
+    ReadPathLossRecover,
+    SequencerExecutorRedisLoss,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -88,7 +93,7 @@ pub enum Case {
     ExecutorRestartStorm,
 }
 
-const ALL: [Case; 53] = [
+const ALL: [Case; 58] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -119,6 +124,11 @@ const ALL: [Case; 53] = [
     Case::SequencerSealerLossRecover,
     Case::IngressSequencerSealerLossRecover,
     Case::IngressSequencerSealerReverse,
+    Case::ExecutorSealerLossRecover,
+    Case::ExecutorSealerValidatorRecover,
+    Case::IngressExecutorLossRecover,
+    Case::ReadPathLossRecover,
+    Case::SequencerExecutorRedisLoss,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -192,6 +202,11 @@ impl Case {
             Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
             Self::IngressSequencerSealerLossRecover => "ingress-sequencer-sealer-loss-recover",
             Self::IngressSequencerSealerReverse => "ingress-sequencer-sealer-reverse",
+            Self::ExecutorSealerLossRecover => "executor-sealer-loss-recover",
+            Self::ExecutorSealerValidatorRecover => "executor-sealer-validator-recover",
+            Self::IngressExecutorLossRecover => "ingress-executor-loss-recover",
+            Self::ReadPathLossRecover => "read-path-loss-recover",
+            Self::SequencerExecutorRedisLoss => "sequencer-executor-redis-loss",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -242,7 +257,8 @@ impl Case {
             | Self::GracefulSequencer
             | Self::HardSequencer
             | Self::SequencerLaneLossRecover
-            | Self::LookupBlackout => Pin::Shard0,
+            | Self::LookupBlackout
+            | Self::SequencerExecutorRedisLoss => Pin::Shard0,
             Self::ResizeScaleOutIn => Pin::MovesOnScaleOut,
             _ => Pin::Any,
         }
@@ -298,6 +314,15 @@ impl Case {
             | Self::IngressSequencerSealerLossRecover
             | Self::IngressSequencerSealerReverse => {
                 inject + k.reschedule_slo + Duration::from_mins(5)
+            }
+            // The same, plus the replay of the executors after their
+            // return.
+            Self::ExecutorSealerLossRecover
+            | Self::ExecutorSealerValidatorRecover
+            | Self::IngressExecutorLossRecover
+            | Self::ReadPathLossRecover
+            | Self::SequencerExecutorRedisLoss => {
+                inject + k.reschedule_slo + Duration::from_mins(6)
             }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
@@ -357,11 +382,18 @@ impl Case {
             // return, about five minutes, and a dead ingress refuses a
             // connection at once. The retry delay grows by 200 ms per
             // attempt, so ninety attempts span about fourteen minutes.
+            // With the executors down and the ingress up, each attempt
+            // parks 30 s at the ingress instead, for about the same time.
             Self::IngressSequencerLossRecover
             | Self::IngressSealerLossRecover
             | Self::SequencerSealerLossRecover
             | Self::IngressSequencerSealerLossRecover
-            | Self::IngressSequencerSealerReverse => 90,
+            | Self::IngressSequencerSealerReverse
+            | Self::ExecutorSealerLossRecover
+            | Self::ExecutorSealerValidatorRecover
+            | Self::IngressExecutorLossRecover
+            | Self::ReadPathLossRecover
+            | Self::SequencerExecutorRedisLoss => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -416,6 +448,13 @@ impl Case {
             Self::SequencerSealerLossRecover => combined::SEQUENCER_SEALER.run(h).await,
             Self::IngressSequencerSealerLossRecover => combined::ALL_THREE.run(h).await,
             Self::IngressSequencerSealerReverse => combined::ALL_THREE_REVERSE.run(h).await,
+            Self::ExecutorSealerLossRecover => combined::EXECUTOR_SEALER.run(h).await,
+            Self::ExecutorSealerValidatorRecover => {
+                combined::EXECUTOR_SEALER_VALIDATOR.run(h).await
+            }
+            Self::IngressExecutorLossRecover => combined::INGRESS_EXECUTOR.run(h).await,
+            Self::ReadPathLossRecover => combined::READ_PATH.run(h).await,
+            Self::SequencerExecutorRedisLoss => combined::SEQUENCER_EXECUTOR_REDIS.run(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -462,6 +501,7 @@ mod tests {
             crate::Shard::Fleet,
             crate::Shard::Coordinated,
             crate::Shard::CombinedOrdering,
+            crate::Shard::CombinedExec,
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,
