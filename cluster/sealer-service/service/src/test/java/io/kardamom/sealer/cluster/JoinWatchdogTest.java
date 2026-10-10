@@ -117,7 +117,8 @@ final class JoinWatchdogTest {
         assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 1_000L, INACTIVE));
         assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, 0L, 2_000L, INACTIVE));
         assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, COMMIT, 3_000L, INACTIVE));
-        assertEquals(Verdict.CATCHUP_STALL, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS, INACTIVE));
+        assertEquals(Verdict.CATCHUP_STALL,
+                w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS, INACTIVE));
     }
 
     @Test

@@ -78,7 +78,9 @@ final class PeerNameResolver implements NameResolver {
         final InetAddress kept = lastAddress.get(name);
         if (failing.add(name)) {
             System.out.println("cluster DNS FAILED memberId=" + memberId + " name=" + name
-                + (kept == null ? " no last address; the add fails" : " using the last address " + kept.getHostAddress()));
+                + (kept == null
+                    ? " no last address; the add fails"
+                    : " using the last address " + kept.getHostAddress()));
         }
         return kept;
     }

@@ -78,6 +78,19 @@ final class JoinWatchdogThread {
                 .map(Map.Entry::getKey)
                 .findFirst();
         }
+
+        /**
+         * The half-elected limit of the leader wedge: longer than the two
+         * blocking waits of an election completion that succeeds. The
+         * archive requests of the recovery plan wait up to the archive
+         * message timeout, and the ingress add waits up to the driver
+         * timeout. Both come from the member's configuration, which the job
+         * scales with the Aeron stall tolerance.
+         */
+        long halfElectedLimitMs() {
+            return TimeUnit.NANOSECONDS.toMillis(consensus.archiveContext().messageTimeoutNs())
+                + consensus.aeron().context().driverTimeoutMs();
+        }
     }
 
     private final Member member;
@@ -98,26 +111,13 @@ final class JoinWatchdogThread {
             final long windowS,
             final long stallWindowS) {
         this.member = member;
-        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L, halfElectedLimitMs(member.consensus()));
+        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L, member.halfElectedLimitMs());
         this.electionState = member.consensus().electionStateCounter();
         this.commitPosition = member.consensus().commitPositionCounter();
         this.controlToggle = member.consensus().controlToggleCounter();
         this.clusterDir = clusterDir;
         this.windowS = windowS;
         this.stallWindowS = stallWindowS;
-    }
-
-    /**
-     * The half-elected limit of the leader wedge: longer than the two
-     * blocking waits of an election completion that succeeds. The archive
-     * requests of the recovery plan wait up to the archive message timeout,
-     * and the ingress add waits up to the driver timeout. Both come from the
-     * member's configuration, which the job scales with the Aeron stall
-     * tolerance.
-     */
-    static long halfElectedLimitMs(final ConsensusModule.Context consensus) {
-        return TimeUnit.NANOSECONDS.toMillis(consensus.archiveContext().messageTimeoutNs())
-            + consensus.aeron().context().driverTimeoutMs();
     }
 
     void start() {

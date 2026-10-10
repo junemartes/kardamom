@@ -157,7 +157,8 @@ class ClusterLogPurgeTest {
      */
     private static long awaitStall(final TestNode member) {
         final JoinWatchdog watchdog = new JoinWatchdog(STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4);
-        while (watchdog.observe(member.electionState(), member.commitPosition(), System.currentTimeMillis(), ClusterControl.ToggleState.INACTIVE.code())
+        final long inactive = ClusterControl.ToggleState.INACTIVE.code();
+        while (watchdog.observe(member.electionState(), member.commitPosition(), System.currentTimeMillis(), inactive)
                 != JoinWatchdog.Verdict.CATCHUP_STALL) {
             Tests.sleep(100);
         }

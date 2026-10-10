@@ -55,10 +55,11 @@ final class PeerNameResolverTest {
     void thePinnedOwnNameResolvesWithNoLookup() throws Exception {
         final List<String> lookups = new ArrayList<>();
         final InetAddress peer = address(99);
-        final PeerNameResolver own = new PeerNameResolver(0, Map.of(PEER, address(17)), (name, param, isReResolution) -> {
-            lookups.add(name);
-            return peer;
-        });
+        final PeerNameResolver own = new PeerNameResolver(0, Map.of(PEER, address(17)),
+            (name, param, isReResolution) -> {
+                lookups.add(name);
+                return peer;
+            });
         assertEquals(address(17), own.resolve(PEER, "endpoint", false));
         assertEquals(address(17), own.resolve(PEER, "endpoint", true));
         assertEquals(List.of(), lookups, "a slow DNS agent must not delay the own name");

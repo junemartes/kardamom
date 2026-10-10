@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.driver.NameResolver;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.file.Files;
@@ -192,18 +193,21 @@ final class ClusterNodeTest {
             + "sealer-0.invalid:40204|1,sealer-1.invalid:40200,sealer-1.invalid:40201,sealer-1.invalid:40202,"
             + "sealer-1.invalid:40203,sealer-1.invalid:40204";
 
+    private static MemberContexts namedContexts() {
+        return new MemberContexts("aeron", "cluster", "archive", ClusterNode.memberEndpoints(NAMED_MEMBERS, 0));
+    }
+
     @Test
     void theNameResolverMapsTheOwnNameToTheNodeAddress() throws Exception {
-        final PeerNameResolver resolver =
-            ClusterNode.nameResolver(0, ClusterNode.memberEndpoints(NAMED_MEMBERS, 0), "192.168.56.17");
-        assertEquals(InetAddress.getByName("192.168.56.17"), resolver.resolve("sealer-0.invalid", "endpoint", false));
+        final NameResolver resolver = namedContexts().withPeerNames(0, "192.168.56.17").driver().nameResolver();
+        assertEquals(InetAddress.getByName("192.168.56.17"),
+            resolver.resolve("sealer-0.invalid", "endpoint", false));
         assertNull(resolver.resolve("sealer-1.invalid", "endpoint", false), "a peer name still needs a lookup");
     }
 
     @Test
     void theNameResolverWithNoNodeAddressKnowsNoName() {
-        final PeerNameResolver resolver =
-            ClusterNode.nameResolver(0, ClusterNode.memberEndpoints(NAMED_MEMBERS, 0), null);
+        final NameResolver resolver = namedContexts().withPeerNames(0, null).driver().nameResolver();
         assertNull(resolver.resolve("sealer-0.invalid", "endpoint", false));
     }
 }
