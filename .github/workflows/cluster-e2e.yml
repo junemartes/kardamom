@@ -164,9 +164,16 @@ jobs:
           cargo test -p kardamom-chaos --release --features cluster-e2e --locked --no-run
           cargo build --release -p kardamom-chaos --locked --bin kardamom-cluster
 
+      # One download of the Aeron jar for the whole run. The artifact
+      # carries it to every shard, where the images role builds the Aeron
+      # image from that context with no request to Maven Central.
+      - uses: ./.github/actions/aeron-jar
+
       - name: Stage the artifact
         run: |
           just stage-dist dist
+          install -D -m 0644 crates/log/docker/aeron/aeron-all.jar \
+            dist/crates/log/docker/aeron/aeron-all.jar
           tar -C dist -czf cluster-dist.tgz .
           ls -l cluster-dist.tgz
 

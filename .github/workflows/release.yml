@@ -137,6 +137,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
+      # The images role builds the Aeron image from this context, so the
+      # signed image set does not depend on Maven Central.
+      - uses: ./.github/actions/aeron-jar
+
       # REGISTRY, TAG and DIGEST_MANIFEST come from the environment. No
       # REGISTRY_PUSH_NODE: this runner pushes directly.
       - name: Build, push and sign the image set; sign the manifest

@@ -1,0 +1,40 @@
+---
+name: aeron-jar
+description: >-
+  Put a verified aeron-all.jar into the build context of the Aeron image
+  (crates/log/docker/aeron), so the image build does not reach Maven
+  Central. The version and the SHA-256 come from the two ARG lines of the
+  Dockerfile. A cache hit restores the jar; a miss downloads it with
+  retries and saves it at once. The script checks the SHA-256 in both
+  cases.
+runs:
+  using: composite
+  steps:
+    - name: Read the Aeron pin from the Dockerfile
+      id: pin
+      shell: bash
+      run: |
+        dockerfile=crates/log/docker/aeron/Dockerfile
+        version="$(sed -n 's/^ARG AERON_VERSION=//p' "${dockerfile}")"
+        sha256="$(sed -n 's/^ARG AERON_JAR_SHA256=//p' "${dockerfile}")"
+        test -n "${version}" && test -n "${sha256}"
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
+        echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
+    - uses: actions/cache/restore@v4
+      id: cache
+      with:
+        path: crates/log/docker/aeron/aeron-all.jar
+        key: aeron-all-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.sha256 }}
+    - name: Download the jar on a cache miss, and check it
+      shell: bash
+      env:
+        AERON_VERSION: ${{ steps.pin.outputs.version }}
+        AERON_JAR_SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: >-
+        sh crates/log/docker/aeron/aeron-jar.sh "${AERON_VERSION}" "${AERON_JAR_SHA256}"
+        crates/log/docker/aeron/aeron-all.jar
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: crates/log/docker/aeron/aeron-all.jar
+        key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -64,6 +64,10 @@ jobs:
       - name: docker info
         run: docker info
 
+      # The smoke builds the Aeron image from crates/log/docker/aeron. The
+      # jar in that context keeps the build off Maven Central.
+      - uses: ./.github/actions/aeron-jar
+
       # Build the kardamom-log docker-e2e test surface (the tx_data Aeron smoke
       # below). The full IPC-pipeline e2e (the in-process + multi-process
       # proof-of-pipeline + deposit round-trips) was REMOVED in the cluster-only
