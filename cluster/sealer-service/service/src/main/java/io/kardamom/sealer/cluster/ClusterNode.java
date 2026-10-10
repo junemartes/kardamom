@@ -18,6 +18,7 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.Map;
 import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -155,7 +156,7 @@ public final class ClusterNode {
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
         // The driver keeps the last address of each member name, so a short
         // outage of the node's DNS agent does not fail an add in an election.
-        // The member's own name starts with the node address.
+        // The member's own name resolves to the node address with no lookup.
         final MemberContexts contexts =
             new MemberContexts(aeronDir, clusterDir, archiveDir, me, nameResolver(memberId, me, nodeIp));
         prepareState(contexts, clusterMembers, memberId);
@@ -244,15 +245,14 @@ public final class ClusterNode {
 
     /**
      * The name resolver of the member's media driver. With a node address,
-     * the member's own name resolves to it before any lookup.
+     * the member's own name resolves to it with no lookup.
      */
     static PeerNameResolver nameResolver(final int memberId, final String[] me, final String nodeIp) {
-        final PeerNameResolver resolver = new PeerNameResolver(memberId);
         if (nodeIp == null || nodeIp.isBlank()) {
-            return resolver;
+            return new PeerNameResolver(memberId, Map.of());
         }
         try {
-            return resolver.knowing(me[0].split(":")[0], InetAddress.getByName(nodeIp.trim()));
+            return new PeerNameResolver(memberId, Map.of(me[0].split(":")[0], InetAddress.getByName(nodeIp.trim())));
         } catch (final UnknownHostException e) {
             throw new IllegalArgumentException("kardamom.cluster.nodeIp is not an address: " + nodeIp, e);
         }

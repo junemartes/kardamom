@@ -1,11 +1,11 @@
 package io.kardamom.sealer.cluster;
 
-import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import org.agrona.concurrent.status.AtomicCounter;
 
@@ -98,13 +98,26 @@ final class JoinWatchdogThread {
             final long windowS,
             final long stallWindowS) {
         this.member = member;
-        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L);
+        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L, halfElectedLimitMs(member.consensus()));
         this.electionState = member.consensus().electionStateCounter();
         this.commitPosition = member.consensus().commitPositionCounter();
         this.controlToggle = member.consensus().controlToggleCounter();
         this.clusterDir = clusterDir;
         this.windowS = windowS;
         this.stallWindowS = stallWindowS;
+    }
+
+    /**
+     * The half-elected limit of the leader wedge: longer than the two
+     * blocking waits of an election completion that succeeds. The archive
+     * requests of the recovery plan wait up to the archive message timeout,
+     * and the ingress add waits up to the driver timeout. Both come from the
+     * member's configuration, which the job scales with the Aeron stall
+     * tolerance.
+     */
+    static long halfElectedLimitMs(final ConsensusModule.Context consensus) {
+        return TimeUnit.NANOSECONDS.toMillis(consensus.archiveContext().messageTimeoutNs())
+            + consensus.aeron().context().driverTimeoutMs();
     }
 
     void start() {
@@ -146,8 +159,7 @@ final class JoinWatchdogThread {
         final long commit = commitPosition.get();
         final ElectionState state = ElectionState.get(electionState);
         logStateChange(state, commit);
-        final boolean toggleActive = controlToggle.get() != ClusterControl.ToggleState.INACTIVE.code();
-        switch (watchdog.observe(state, commit, nowMs, toggleActive)) {
+        switch (watchdog.observe(state, commit, nowMs, controlToggle.get())) {
             case INIT_WEDGE -> initWedge(nowMs);
             case CATCHUP_STALL -> catchupStall(commit, nowMs);
             case LEADER_WEDGE -> leaderWedge(nowMs);
