@@ -18,6 +18,9 @@ pub const EXECUTOR_TX_APPLIED_METRIC: &str = "kardamom_executor_tx_applied_total
 /// egress; the Java cluster node has no exporter of its own.
 pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
 pub const INGRESS_RECEIVED_METRIC: &str = "kardamom_ingress_tx_received_total";
+/// The sealed head an ingress reads from the sealer's status frames: a
+/// head signal that lives while every executor is dark.
+pub const INGRESS_SEALED_HEAD_METRIC: &str = "kardamom_ingress_cluster_sealed_head";
 pub const EXECUTOR_PORT: u16 = 9004;
 /// The state mirror's exporter, on every executor node.
 pub const MIRROR_PORT: u16 = 9007;
@@ -144,6 +147,12 @@ impl Probes {
             .chain(self.ingresses.first())
             .map(|node| node.container.clone())
             .collect()
+    }
+
+    /// The host container names of the ingress nodes.
+    #[must_use]
+    pub fn ingress_containers(&self) -> Vec<String> {
+        self.ingresses.iter().map(|n| n.container.clone()).collect()
     }
 
     /// The scraper, for probes a case builds itself.
@@ -355,6 +364,17 @@ impl Probes {
             counts.push((node.container.clone(), self.ingress_sum(node).await));
         }
         IngressCounts(counts)
+    }
+
+    /// The highest sealed head any ingress reports. `None` when no
+    /// ingress exporter answers with the gauge.
+    pub async fn ingress_sealed_head(&self) -> Option<i64> {
+        let mut best = None;
+        for node in &self.ingresses {
+            let body = self.scrape.fetch(&self.ingress_target(node)).await;
+            best = best.max(body.and_then(|b| metrics::first(&b, INGRESS_SEALED_HEAD_METRIC)));
+        }
+        best
     }
 
     /// The submit counter of one ingress. An exporter that answers

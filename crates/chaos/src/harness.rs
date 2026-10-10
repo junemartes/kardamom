@@ -158,7 +158,13 @@ impl Harness {
         let account = self.pick_account(case)?;
         let window = case.window(&self.knobs);
         let rx0 = self.probes.ingress_counts().await;
-        let load = LoadRun::start(&self.load_spec(case, account, window))?;
+        let nonce = Rpc::new(&self.rpc_url, self.knobs.chain_id)?
+            .nonce_of(account)
+            .await?;
+        crate::log(format!(
+            "{name}: the case load spends account #{account} from nonce {nonce}"
+        ));
+        let load = LoadRun::start(&self.load_spec(case, account, window, nonce))?;
         let outcome = self.run_body(case, &load, &rx0).await;
         if let Err(e) = outcome {
             load.abort();
@@ -213,14 +219,13 @@ impl Harness {
 
     fn probe_spec(&self, case: Case, account: u32, nonce: u64, leg: &str) -> LoadSpec {
         LoadSpec {
-            nonce_start: nonce,
             completeness: Completeness::Offered,
             fixed_rate: true,
             duration: PROBE_WINDOW,
             tps: self.probe_tps(),
             retry_submit: self.knobs.load_retry,
             report_path: Self::report_path(&format!("{}-probe-{leg}", case.name())),
-            ..self.load_spec(case, account, PROBE_WINDOW)
+            ..self.load_spec(case, account, PROBE_WINDOW, nonce)
         }
     }
 
@@ -298,13 +303,15 @@ impl Harness {
             .collect()
     }
 
-    fn load_spec(&self, case: Case, account: u32, window: Duration) -> LoadSpec {
+    /// The case load of `account` from `nonce_start`, the account's live
+    /// nonce: a reuse run on a used chain spends a used account again.
+    fn load_spec(&self, case: Case, account: u32, window: Duration, nonce_start: u64) -> LoadSpec {
         LoadSpec {
             rpc_url: self.rpc_url.clone(),
             receipt_rpcs: self.receipt_rpcs(),
             chain_id: self.knobs.chain_id,
             account,
-            nonce_start: 0,
+            nonce_start,
             completeness: Completeness::Accepted,
             fixed_rate: false,
             duration: window,

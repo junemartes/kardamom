@@ -33,12 +33,7 @@ const PIPELINE_JOBS: [(&str, usize); 6] = [
 /// then submits through each ingress.
 pub(crate) async fn ingress_pair_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "ingress-pair-loss-recover";
-    let nodes: Vec<String> = h
-        .probes
-        .ingresses
-        .iter()
-        .map(|n| n.container.clone())
-        .collect();
+    let nodes = h.probes.ingress_containers();
     crate::log(format!(
         "{ctx}: hard-kill BOTH ingress tasks ({})",
         nodes.join(" ")

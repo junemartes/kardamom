@@ -163,7 +163,7 @@ pub(crate) async fn da_lag_halt(h: &mut Harness) -> anyhow::Result<()> {
     );
     let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
     let gate = h.knobs.gate_account;
-    rpc.transfer_at(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
+    rpc.transfer_hash(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: a transfer after the resume failed: {e:#}"))?;
     await_all_running(h, ctx).await?;
