@@ -58,8 +58,10 @@ jobs:
     runs-on: ubuntu-latest
     # The isolated suite runs full Ansible deployments, then image and
     # signing tests, in parallel processes. This job budget is separate
-    # from deployment SLOs.
-    timeout-minutes: 45
+    # from deployment SLOs. The suite grew with the deploy record, the
+    # release gate and the redis tests: runs of 29 to 45 min were seen, and
+    # 45 min cut both main and a pull request. 75 min keeps a margin.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
