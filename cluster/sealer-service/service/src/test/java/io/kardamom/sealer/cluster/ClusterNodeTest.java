@@ -158,4 +158,14 @@ final class ClusterNodeTest {
         assertThrows(IllegalStateException.class, () -> ClusterNode.requireRecordLagBudgetAllowed(
             1L, io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors()));
     }
+
+    @Test
+    void theDecisionVersionMustBeTheVersionOfTheImage() {
+        final int image = io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION;
+        assertEquals(image, ClusterNode.requireDecisionVersion(null), "an absent setting is the image version");
+        assertEquals(image, ClusterNode.requireDecisionVersion(Integer.toString(image)));
+        assertThrows(IllegalStateException.class,
+            () -> ClusterNode.requireDecisionVersion(Integer.toString(image - 1)));
+        assertThrows(NumberFormatException.class, () -> ClusterNode.requireDecisionVersion(""));
+    }
 }

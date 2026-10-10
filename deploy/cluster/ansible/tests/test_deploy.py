@@ -919,6 +919,16 @@ class RecordTest(Deploys):
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
         self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
 
+    def test_a_new_sealer_decision_version_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=2', '')
+        output = self.run_deploy(success=False)
+        self.assertIn('every member must match: decisionVersion.', output)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()
         self.api.state['writes'] = []

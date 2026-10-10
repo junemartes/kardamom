@@ -292,7 +292,13 @@ The sealer orders a transaction reference before the archives make its data dura
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
-- On a void, the sealer removes the hash from its dedup window. It sets the expected nonce of the sender back. The sender can submit the same bytes again.
+- On a void, the sealer removes the hash from its dedup window. The sender can submit the same bytes again.
+- On a void, the sealer sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce.
+  - Two voids of one sender, in either order, leave the lowest voided nonce open. The sender fills the nonces again from there, in order.
+  - A void of nonce `n` below a later ordered nonce of the sender also opens `n`. The consumers drop the voided entry, so the later entries of the sender get a skip receipt.
+  - A later entry that is still in the dedup window absorbs the same bytes as a duplicate. The sender signs that nonce again with other bytes, or waits for the deadline of the entry.
+  - An expected nonce below the nonce of the executors costs the sender one skipped transaction. An expected nonce above it is never filled, and every later transaction of the sender gets a skip receipt. The lower value is the safe side.
+  - The rule is part of the decision version of the sealer. A change to it needs the coordinated restart of the sealer (`cluster/sealer-service/README.md`, "Decision version").
 - A sender gets no notice of a void. The receipt never comes, and the sender submits again.
 
 Three constants bound the rule. Every sealer member must run the same values.
