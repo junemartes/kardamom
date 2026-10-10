@@ -573,8 +573,16 @@ class DeployTest(Deploys):
             self.assertIn('base_fee_initial', self.genesis_template(plans[name]), name)
 
     def test_fault_proxy_routes_the_followers_through_it(self):
-        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'})
+        # Staging-like batcher values ride on this run: a 12 h idle flush
+        # needs a budget above 43200 blocks.
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2',
+                         'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000),
+                         'workloads_da_lag_budget_blocks': '100000'})
         plans = self.api.state['plans']
+        # The batcher gets the cluster's budget and posts at half of it.
+        batcher = plans['batcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(batcher[batcher.index('--da-lag-budget-blocks') + 1], '100000')
+        self.assertIn('-Dkardamom.cluster.daLagBudgetBlocks=100000', json.dumps(plans['cluster']))
         proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
@@ -621,17 +629,9 @@ class DeployTest(Deploys):
         self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
 
     def test_the_batcher_posts_before_the_da_lag_guard_halts_an_idle_chain(self):
-        # The role's defaults: a 3 s idle flush under the 10000-block budget.
-        self.run_deploy(check=True)
-        # Staging-like: a 12 h idle flush needs a budget above 43200 blocks;
-        # the batcher gets the cluster's budget and posts at half of it.
-        self.run_deploy({'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000),
-                         'workloads_da_lag_budget_blocks': '100000'}, check=True)
-        args = self.api.state['plans']['batcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
-        self.assertEqual(args[args.index('--da-lag-budget-blocks') + 1], '100000')
-        self.assertIn('-Dkardamom.cluster.daLagBudgetBlocks=100000', json.dumps(self.api.state['plans']['cluster']))
         # The budget below the idle interval in blocks halts an idle chain:
-        # the role refuses it before any job.
+        # the role refuses it before any job. The accepted case rides on
+        # the fault proxy test's deploy run.
         output = self.run_deploy({'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000)},
                                  check=True, success=False)
         self.assertIn('must be below the DA-lag budget', output)
