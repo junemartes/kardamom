@@ -13,11 +13,26 @@ cluster.
 
 Every application stream is a dynamic Aeron MDC publication. A publisher
 binds one control endpoint per publication on the advertised interface and
-registers it. A consumer opens one multi-destination subscription per
-stream and attaches one destination per publisher the catalog lists. The
-publishers stay separate Aeron images, so a transaction keeps its
+registers it. A consumer opens one subscription per stream and attaches
+one destination per publisher the catalog lists. The publishers stay
+separate Aeron images, so a transaction keeps its
 `(shard, session, position)` identity at the publisher, at every live
 consumer, and in the recording refetch reads.
+
+A destination is its own Aeron subscription on the destination URI. All
+the destinations of a stream feed one frame stream. A detach closes the
+subscription of the destination. The runtime never uses an Aeron
+multi-destination subscription:
+
+- The Java media driver sizes the connection table of an image from the
+  destination index of that image. It grows the table only for a
+  destination that is added after the image forms.
+- The removal of a destination with a higher index than that table throws
+  `ArrayIndexOutOfBoundsException` in `PublicationImage.removeDestination`.
+  The other images of the subscription then keep a stale connection.
+- An image usually forms after the destinations of a stream attach, so each
+  detach after a publisher leaves hits this fault. Aeron 1.45 to 1.53 have
+  the fault.
 
 Consul is the discovery control plane only. Messages travel between Aeron
 media drivers. Consul never relays a message, answers a per-message

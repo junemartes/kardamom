@@ -103,23 +103,23 @@ pub(super) enum RuntimeCmd {
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and sends
     /// each assembled fragment to `sink` as a [`RawFrame`]. Replies with
-    /// the assigned `sub_id` (needed to attach MDS destinations).
+    /// the assigned `sub_id` (needed to attach source endpoints).
     OpenSubscription {
         uri: String,
         stream_id: i32,
         sink: FrameSink,
         ack: CbSender<Result<u32, LogError>>,
     },
-    /// Attach a source endpoint to a multi-destination
-    /// (`control-mode=manual`) subscription. Used to aggregate
-    /// per-publisher streams, for example one ingress MDS subscription
-    /// pulling receipts from every executor replica.
+    /// Attach a source endpoint to a subscription: the Aeron thread opens
+    /// a subscription on the endpoint that feeds the sink of `sub_id`.
+    /// Used to aggregate per-publisher streams, for example one ingress
+    /// receipt stream from every executor replica.
     SubAddDestination {
         sub_id: u32,
         uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
-    /// Detach a previously-attached source endpoint from an MDS subscription.
+    /// Detach a source endpoint: close the subscription of the endpoint.
     SubRemoveDestination {
         sub_id: u32,
         uri: String,
@@ -291,8 +291,8 @@ impl AeronRuntime {
     }
 
     /// Open a subscription, returning its raw undecoded fragment stream
-    /// (as [`RawFrame`]s) plus the assigned `sub_id` (used to attach MDS
-    /// destinations; most callers ignore it). Used by adapters that
+    /// (as [`RawFrame`]s) plus the assigned `sub_id` (used to attach source
+    /// endpoints; most callers ignore it). Used by adapters that
     /// decode or demultiplex fragments themselves, on the consumer side
     /// rather than on the Aeron thread — see [`FrameSink`].
     ///
@@ -357,9 +357,12 @@ impl AeronRuntime {
         )
     }
 
-    /// Attach a source endpoint to a multi-destination subscription (one
-    /// opened `control-mode=manual`). Blocks until the driver confirms the
-    /// attach. Idempotent: re-adding an already-attached `uri` is a no-op.
+    /// Attach a source endpoint to the subscription `sub_id`. The endpoint
+    /// gets its own Aeron subscription, which feeds the frame stream of
+    /// `sub_id`. No Aeron multi-destination subscription is used: the
+    /// Java media driver fails the removal of some of its destinations.
+    /// Blocks until the driver confirms the subscription. Idempotent:
+    /// re-adding an already-attached `uri` is a no-op.
     ///
     /// # Errors
     ///
@@ -375,7 +378,8 @@ impl AeronRuntime {
         )
     }
 
-    /// Detach a previously-attached source endpoint from an MDS subscription.
+    /// Detach a previously-attached source endpoint: close its own Aeron
+    /// subscription.
     ///
     /// # Errors
     ///
@@ -464,10 +468,10 @@ impl AeronRuntime {
     }
 
     /// Like [`open_subscription`](Self::open_subscription), but also
-    /// returns the `sub_id`, so the caller can attach MDS source endpoints
-    /// with [`add_destination`](Self::add_destination). Open the
-    /// subscription on a `control-mode=manual` channel to make it
-    /// multi-destination.
+    /// returns the `sub_id`, so the caller can attach source endpoints
+    /// with [`add_destination`](Self::add_destination). A
+    /// `control-mode=manual` channel opens a subscription that receives
+    /// only through its attached endpoints.
     ///
     /// # Errors
     ///
@@ -768,7 +772,7 @@ fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, L
     Ok(Rc::new(aeron))
 }
 
-/// The attach and detach commands of one multi-destination subscription,
+/// The attach and detach commands of the source endpoints of one subscription,
 /// without ownership of the Aeron thread. See
 /// [`AeronRuntime::destinations`].
 #[derive(Clone)]
