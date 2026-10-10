@@ -29,131 +29,93 @@ pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
 
-/// Every case, by its CI name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Case {
-    GracefulExecutor,
-    HardExecutor,
-    GracefulIngress,
-    HardIngress,
-    GracefulSequencer,
-    HardSequencer,
-    SequencerReplicaKill,
-    NodeFailureExecutor,
-    NodeReplaceExecutor,
-    StateCheckpointRestore,
-    ReplayWindowResync,
-    DeployBrokenImage,
-    ClusterLeaderKill,
-    ClusterFollowerKill,
-    ClusterMemberRejoin,
-    NodeReplaceSealer,
-    ClusterQuorumLossRecover,
-    ClusterTotalLossRecover,
-    ExecutorFleetLossRecover,
-    ExecutorFleetWipeRecover,
-    ExecutorFleetTotalWipeRecover,
-    SealerFleetTotalWipeRecover,
-    IngressPairLossRecover,
-    SequencerLaneLossRecover,
-    PipelineBlackoutRecover,
-    IngressSequencerLossRecover,
-    IngressSealerLossRecover,
-    SequencerSealerLossRecover,
-    IngressSequencerSealerLossRecover,
-    IngressSequencerSealerReverse,
-    ExecutorSealerLossRecover,
-    ExecutorSealerValidatorRecover,
-    IngressExecutorLossRecover,
-    ReadPathLossRecover,
-    SequencerExecutorRedisLoss,
-    ArchiveDriverLoss,
-    ArchiveTxDataWipe,
-    ArchiveCorruption,
-    SequencerLapse,
-    RetentionOverrun,
-    RetentionOverrunValidator,
-    ValidatorLapse,
-    ValidatorJoin,
-    CpuSqueeze,
-    ResizeScaleOutIn,
-    LookupBlackout,
-    RedisPrimaryFreeze,
-    RedisPrimaryKill,
-    RedisPartitionIngress,
-    RedisTotalLossRecover,
-    MirrorKillRebuild,
-    DaLagHalt,
-    CanaryDaLag,
-    PruneFloor,
-    L1Liar,
-    L1NullReceipts,
-    TwoDayOutage,
-    BatcherOutagePastRetention,
-    ExecutorRestartStorm,
+/// Declares `Case`, the CI name of each case, and `ALL`, from one table.
+/// A case cannot miss the list that `parse` searches, and the list has no
+/// size to keep in step.
+macro_rules! cases {
+    ($($case:ident => $name:literal,)+) => {
+        /// Every case, by its CI name.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Case {
+            $($case,)+
+        }
+
+        /// Every case, in the order of the table.
+        const ALL: &[Case] = &[$(Case::$case,)+];
+
+        impl Case {
+            /// The CI name.
+            #[must_use]
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Self::$case => $name,)+
+                }
+            }
+        }
+    };
 }
 
-const ALL: [Case; 58] = [
-    Case::GracefulExecutor,
-    Case::HardExecutor,
-    Case::GracefulIngress,
-    Case::HardIngress,
-    Case::GracefulSequencer,
-    Case::HardSequencer,
-    Case::SequencerReplicaKill,
-    Case::NodeFailureExecutor,
-    Case::NodeReplaceExecutor,
-    Case::StateCheckpointRestore,
-    Case::ReplayWindowResync,
-    Case::DeployBrokenImage,
-    Case::ClusterLeaderKill,
-    Case::ClusterFollowerKill,
-    Case::ClusterMemberRejoin,
-    Case::NodeReplaceSealer,
-    Case::ClusterQuorumLossRecover,
-    Case::ClusterTotalLossRecover,
-    Case::ExecutorFleetLossRecover,
-    Case::ExecutorFleetWipeRecover,
-    Case::ExecutorFleetTotalWipeRecover,
-    Case::SealerFleetTotalWipeRecover,
-    Case::IngressPairLossRecover,
-    Case::SequencerLaneLossRecover,
-    Case::PipelineBlackoutRecover,
-    Case::IngressSequencerLossRecover,
-    Case::IngressSealerLossRecover,
-    Case::SequencerSealerLossRecover,
-    Case::IngressSequencerSealerLossRecover,
-    Case::IngressSequencerSealerReverse,
-    Case::ExecutorSealerLossRecover,
-    Case::ExecutorSealerValidatorRecover,
-    Case::IngressExecutorLossRecover,
-    Case::ReadPathLossRecover,
-    Case::SequencerExecutorRedisLoss,
-    Case::ArchiveDriverLoss,
-    Case::ArchiveTxDataWipe,
-    Case::ArchiveCorruption,
-    Case::SequencerLapse,
-    Case::RetentionOverrun,
-    Case::RetentionOverrunValidator,
-    Case::ValidatorLapse,
-    Case::ValidatorJoin,
-    Case::CpuSqueeze,
-    Case::ResizeScaleOutIn,
-    Case::LookupBlackout,
-    Case::RedisPrimaryFreeze,
-    Case::RedisPrimaryKill,
-    Case::RedisPartitionIngress,
-    Case::RedisTotalLossRecover,
-    Case::MirrorKillRebuild,
-    Case::DaLagHalt,
-    Case::CanaryDaLag,
-    Case::PruneFloor,
-    Case::L1Liar,
-    Case::L1NullReceipts,
-    Case::TwoDayOutage,
-    Case::BatcherOutagePastRetention,
-    Case::ExecutorRestartStorm,
-];
+cases! {
+    GracefulExecutor => "graceful-executor",
+    HardExecutor => "hard-executor",
+    GracefulIngress => "graceful-ingress",
+    HardIngress => "hard-ingress",
+    GracefulSequencer => "graceful-sequencer",
+    HardSequencer => "hard-sequencer",
+    SequencerReplicaKill => "sequencer-replica-kill",
+    NodeFailureExecutor => "node-failure-executor",
+    NodeReplaceExecutor => "node-replace-executor",
+    StateCheckpointRestore => "state-checkpoint-restore",
+    ReplayWindowResync => "replay-window-resync",
+    DeployBrokenImage => "deploy-broken-image",
+    ClusterLeaderKill => "cluster-leader-kill",
+    ClusterFollowerKill => "cluster-follower-kill",
+    ClusterMemberRejoin => "cluster-member-rejoin",
+    NodeReplaceSealer => "node-replace-sealer",
+    ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
+    ClusterTotalLossRecover => "cluster-total-loss-recover",
+    ExecutorFleetLossRecover => "executor-fleet-loss-recover",
+    ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
+    ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
+    SealerFleetTotalWipeRecover => "sealer-fleet-total-wipe-recover",
+    IngressPairLossRecover => "ingress-pair-loss-recover",
+    SequencerLaneLossRecover => "sequencer-lane-loss-recover",
+    PipelineBlackoutRecover => "pipeline-blackout-recover",
+    IngressSequencerLossRecover => "ingress-sequencer-loss-recover",
+    IngressSealerLossRecover => "ingress-sealer-loss-recover",
+    SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
+    IngressSequencerSealerLossRecover => "ingress-sequencer-sealer-loss-recover",
+    IngressSequencerSealerReverse => "ingress-sequencer-sealer-reverse",
+    ExecutorSealerLossRecover => "executor-sealer-loss-recover",
+    ExecutorSealerValidatorRecover => "executor-sealer-validator-recover",
+    IngressExecutorLossRecover => "ingress-executor-loss-recover",
+    ReadPathLossRecover => "read-path-loss-recover",
+    SequencerExecutorRedisLoss => "sequencer-executor-redis-loss",
+    ArchiveDriverLoss => "archive-driver-loss",
+    ArchiveTxDataWipe => "archive-tx-data-wipe",
+    ArchiveCorruption => "archive-corruption",
+    SequencerLapse => "sequencer-lapse",
+    RetentionOverrun => "retention-overrun",
+    RetentionOverrunValidator => "retention-overrun-validator",
+    ValidatorLapse => "validator-lapse",
+    ValidatorJoin => "validator-join",
+    CpuSqueeze => "cpu-squeeze",
+    ResizeScaleOutIn => "resize-scale-out-in",
+    LookupBlackout => "lookup-blackout",
+    RedisPrimaryFreeze => "redis-primary-freeze",
+    RedisPrimaryKill => "redis-primary-kill",
+    RedisPartitionIngress => "redis-partition-ingress",
+    RedisTotalLossRecover => "redis-total-loss-recover",
+    MirrorKillRebuild => "mirror-kill-rebuild",
+    DaLagHalt => "da-lag-halt",
+    CanaryDaLag => "canary-da-lag",
+    PruneFloor => "prune-floor",
+    L1Liar => "l1-liar",
+    L1NullReceipts => "l1-null-receipts",
+    TwoDayOutage => "two-day-outage",
+    BatcherOutagePastRetention => "batcher-outage-past-retention",
+    ExecutorRestartStorm => "executor-restart-storm",
+}
 
 impl Case {
     /// The case named `name`.
@@ -163,75 +125,10 @@ impl Case {
     /// Returns an error for an unknown name, before any load or account
     /// is spent.
     pub fn parse(name: &str) -> anyhow::Result<Self> {
-        ALL.into_iter()
+        ALL.iter()
+            .copied()
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
-    }
-
-    /// The CI name.
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::GracefulExecutor => "graceful-executor",
-            Self::HardExecutor => "hard-executor",
-            Self::GracefulIngress => "graceful-ingress",
-            Self::HardIngress => "hard-ingress",
-            Self::GracefulSequencer => "graceful-sequencer",
-            Self::HardSequencer => "hard-sequencer",
-            Self::SequencerReplicaKill => "sequencer-replica-kill",
-            Self::NodeFailureExecutor => "node-failure-executor",
-            Self::NodeReplaceExecutor => "node-replace-executor",
-            Self::StateCheckpointRestore => "state-checkpoint-restore",
-            Self::ReplayWindowResync => "replay-window-resync",
-            Self::DeployBrokenImage => "deploy-broken-image",
-            Self::ClusterLeaderKill => "cluster-leader-kill",
-            Self::ClusterFollowerKill => "cluster-follower-kill",
-            Self::ClusterMemberRejoin => "cluster-member-rejoin",
-            Self::NodeReplaceSealer => "node-replace-sealer",
-            Self::ClusterQuorumLossRecover => "cluster-quorum-loss-recover",
-            Self::ClusterTotalLossRecover => "cluster-total-loss-recover",
-            Self::ExecutorFleetLossRecover => "executor-fleet-loss-recover",
-            Self::ExecutorFleetWipeRecover => "executor-fleet-wipe-recover",
-            Self::ExecutorFleetTotalWipeRecover => "executor-fleet-total-wipe-recover",
-            Self::SealerFleetTotalWipeRecover => "sealer-fleet-total-wipe-recover",
-            Self::IngressPairLossRecover => "ingress-pair-loss-recover",
-            Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
-            Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
-            Self::IngressSequencerLossRecover => "ingress-sequencer-loss-recover",
-            Self::IngressSealerLossRecover => "ingress-sealer-loss-recover",
-            Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
-            Self::IngressSequencerSealerLossRecover => "ingress-sequencer-sealer-loss-recover",
-            Self::IngressSequencerSealerReverse => "ingress-sequencer-sealer-reverse",
-            Self::ExecutorSealerLossRecover => "executor-sealer-loss-recover",
-            Self::ExecutorSealerValidatorRecover => "executor-sealer-validator-recover",
-            Self::IngressExecutorLossRecover => "ingress-executor-loss-recover",
-            Self::ReadPathLossRecover => "read-path-loss-recover",
-            Self::SequencerExecutorRedisLoss => "sequencer-executor-redis-loss",
-            Self::ArchiveDriverLoss => "archive-driver-loss",
-            Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
-            Self::ArchiveCorruption => "archive-corruption",
-            Self::SequencerLapse => "sequencer-lapse",
-            Self::RetentionOverrun => "retention-overrun",
-            Self::RetentionOverrunValidator => "retention-overrun-validator",
-            Self::ValidatorLapse => "validator-lapse",
-            Self::ValidatorJoin => "validator-join",
-            Self::CpuSqueeze => "cpu-squeeze",
-            Self::ResizeScaleOutIn => "resize-scale-out-in",
-            Self::LookupBlackout => "lookup-blackout",
-            Self::RedisPrimaryFreeze => "redis-primary-freeze",
-            Self::RedisPrimaryKill => "redis-primary-kill",
-            Self::RedisPartitionIngress => "redis-partition-ingress",
-            Self::RedisTotalLossRecover => "redis-total-loss-recover",
-            Self::MirrorKillRebuild => "mirror-kill-rebuild",
-            Self::DaLagHalt => "da-lag-halt",
-            Self::CanaryDaLag => "canary-da-lag",
-            Self::PruneFloor => "prune-floor",
-            Self::L1Liar => "l1-liar",
-            Self::L1NullReceipts => "l1-null-receipts",
-            Self::TwoDayOutage => "two-day-outage",
-            Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
-            Self::ExecutorRestartStorm => "executor-restart-storm",
-        }
     }
 
     /// The case load's rate. The L1 cases run below the steady rate: a
@@ -490,6 +387,17 @@ impl Case {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_case_is_listed_once_and_parses_back() {
+        // The table declares the enum and the list together, so every case
+        // is in the list. Each one must also have its own name.
+        let mut names: Vec<&str> = ALL.iter().map(|c| c.name()).collect();
+        assert!(ALL.iter().all(|c| Case::parse(c.name()).unwrap() == *c));
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL.len(), "two cases share a name");
+    }
 
     #[test]
     fn every_shard_case_parses_and_names_round_trip() {
