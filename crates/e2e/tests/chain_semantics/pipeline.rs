@@ -151,39 +151,53 @@ async fn s18_tx_status_feed_shows_every_stage() {
     }
 }
 
-/// S19: the transaction canary on the local stack. The binary's probes
-/// all succeed through the ingress and the notifier; the ring's nonce
-/// owner resolves a lost submit answer and a restart with an unsent
-/// transaction from its journal, and serves concurrent leases on one
-/// account with contiguous nonces. The canary rings are dev accounts
-/// #34 to #37, which the cluster genesis funds for the canary.
+/// S19: the transaction canary on the local stack with an L1. Every
+/// probe succeeds through the ingress, the notifier and the lockbox: the
+/// transfers, the reads, the counter, the fees, the RWA token, the pool's
+/// swaps and liquidity, and a deposit. The ring's nonce owner resolves a
+/// lost submit answer and a restart with an unsent transaction from its
+/// journal, and serves concurrent leases on one account with contiguous
+/// nonces. The canary ring is dev accounts #34 to #37, which the cluster
+/// genesis funds for the canary; the ring cases use #10 to #12.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s19_canary_probes_succeed_and_the_ring_resolves_in_flight() {
-    let stack = LocalStack::launch(StackConfig {
+    // With the fee schedule on, so the `fees` probe checks the base fee
+    // and the tip of a scheduled chain.
+    let stack = launch_l1_or_skip!(StackConfig {
         notifier: true,
+        l1: true,
+        priority_fees: true,
         ..StackConfig::default()
-    })
-    .await
-    .expect("stack");
+    });
     let t = target(&stack);
     let ws_url = stack.notifier_ws_url().expect("the stack runs a notifier");
+    let l1 = stack.l1().expect("l1");
     let root = stack.root();
     let canary = e2e::harness::services::spawn_canary(&e2e::harness::services::CanarySpec {
         root: &root,
         ingress_url: &t.rpc.url,
         notifier_ws: ws_url,
         ring_offset: 34,
-        ring_size: 1,
+        ring_size: 4,
+        l1: Some(e2e::harness::services::CanaryL1 {
+            rpc_url: l1.rpc_url(),
+            key: canary::L1_KEY.to_string(),
+            lockbox: l1.lockbox,
+        }),
     })
     .expect("spawn the canary");
-    if let Err(e) = canary::probes_succeed(canary.metrics_addr, 3.0).await {
+    // The da-watcher and the deposit probe follow L1 finality.
+    let miner = canary::keep_mining(l1.rpc_url());
+    let probes = canary::probes_succeed(canary.metrics_addr, 3.0).await;
+    miner.abort();
+    if let Err(e) = probes {
         stack.dump_tails();
         let log = std::fs::read_to_string(root.join("canary.log")).unwrap_or_default();
         eprintln!("canary.log:\n{log}");
         panic!("S19 probes: {e:#}");
     }
-    if let Err(e) = canary::ring_resolves_in_flight(&t, &root.join("ring-cases"), 35).await {
+    if let Err(e) = canary::ring_resolves_in_flight(&t, &root.join("ring-cases"), 10).await {
         stack.dump_tails();
         panic!("S19 ring: {e:#}");
     }

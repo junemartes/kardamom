@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use alloy_primitives::{TxKind, U256};
 
-use super::{Context, Landed, Probe};
+use super::{Context, Done, Probe};
 use crate::contracts::{Counter, DEPLOY_GAS, INCREMENT_GAS};
 use crate::metrics;
 use crate::outcome::{Outcome, Stage};
-use crate::ring::{Call, Lease};
+use crate::ring::Call;
 use crate::rpc::Rpc;
 use crate::store::Contracts;
 use crate::wait::Poll;
@@ -28,12 +28,6 @@ pub struct Contract {
     turn: usize,
 }
 
-/// A transaction of this probe that landed, and its lease's gap mark.
-struct Done {
-    landed: Landed,
-    gap: bool,
-}
-
 impl Contract {
     /// The probe, with the counter the data directory names, if any.
     #[must_use]
@@ -45,32 +39,23 @@ impl Contract {
         }
     }
 
-    /// Lease an account, send `call`, and wait for the receipt.
+    /// Lease an account, send `call`, and wait for a successful receipt.
     async fn transact(&self, rpc: &Rpc, call: Call) -> Result<Done, Outcome> {
-        let mut lease: Lease = self.ctx.lease(rpc).await?;
-        let sent = lease.send(rpc, call).await?;
-        let landed = self.ctx.landed(rpc, sent.hash).await?;
-        let gap = lease.found_gap();
-        lease.settle().await;
-        metrics::stage(
-            NAME,
-            &rpc.endpoint.name,
-            "receipt",
-            landed.at.saturating_duration_since(sent.at),
-        );
-        if !landed.receipt.succeeded() {
+        let lease = self.ctx.lease(rpc).await?;
+        let done = self.ctx.transact(NAME, rpc, lease, call).await?;
+        if !done.landed.receipt.succeeded() {
             return Err(Outcome::ReceiptStatus0);
         }
-        Ok(Done { landed, gap })
+        Ok(done)
     }
 
     async fn deploy(&mut self, rpc: &Rpc) -> Result<Done, Outcome> {
-        let call = Call {
-            to: TxKind::Create,
-            value: U256::ZERO,
-            input: Counter::creation(&self.ctx.ring.addresses()),
-            gas_limit: DEPLOY_GAS,
-        };
+        let call = Call::new(
+            TxKind::Create,
+            U256::ZERO,
+            Counter::creation(&self.ctx.ring.addresses()),
+            DEPLOY_GAS,
+        );
         let done = self.transact(rpc, call).await?;
         let address = done
             .landed
@@ -89,12 +74,12 @@ impl Contract {
     }
 
     async fn write_and_read(&self, rpc: &Rpc, counter: Counter) -> Result<Done, Outcome> {
-        let call = Call {
-            to: TxKind::Call(counter.0),
-            value: U256::from(1),
-            input: Counter::increment(),
-            gas_limit: INCREMENT_GAS,
-        };
+        let call = Call::new(
+            TxKind::Call(counter.0),
+            U256::from(1),
+            Counter::increment(),
+            INCREMENT_GAS,
+        );
         let done = self.transact(rpc, call).await?;
         let count = counter
             .count_in(&done.landed.receipt)

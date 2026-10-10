@@ -409,7 +409,8 @@ class DeployTest(Deploys):
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
         self.assertEqual(variables['nomad/jobs/canary'], {
-            'KARDAMOM_CANARY_MNEMONIC': 'test test test test test test test test test test test junk'})
+            'KARDAMOM_CANARY_MNEMONIC': 'test test test test test test test test test test test junk',
+            'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
         self.assertEqual(sorted(self.api.state['variable_writes']),
@@ -438,7 +439,7 @@ class DeployTest(Deploys):
         output = self.run_deploy(environ={
             'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
             'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
-            'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
+            'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC', 'CANARY_L1_KEY': f'0x{SENTINEL}-CANARY',
             'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
         self.assertNotIn(SENTINEL, output)
         state = self.api.state
@@ -450,7 +451,8 @@ class DeployTest(Deploys):
         self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
         self.assertEqual(state['variables'], {
             'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
-            'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC'},
+            'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
+                                  'KARDAMOM_CANARY_L1_KEY': f'0x{SENTINEL}-CANARY', 'KARDAMOM_L1_RPC': l1},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
                                     'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
             'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},

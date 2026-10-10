@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use clap::Parser;
 
 /// One ingress instance: a name for the metric labels and its URL.
@@ -129,6 +129,82 @@ pub struct Args {
         default_value = "100000000000000"
     )]
     pub l2_floor_wei: U256,
+    /// The time between two `rwa` runs.
+    #[arg(long, env = "KARDAMOM_CANARY_RWA_MS", default_value = "120000")]
+    pub rwa_ms: Millis,
+    /// The time between two `swap` runs.
+    #[arg(long, env = "KARDAMOM_CANARY_SWAP_MS", default_value = "60000")]
+    pub swap_ms: Millis,
+    /// The time between two `liquidity` runs.
+    #[arg(long, env = "KARDAMOM_CANARY_LIQUIDITY_MS", default_value = "21600000")]
+    pub liquidity_ms: Millis,
+    /// The time between two `fees` runs.
+    #[arg(long, env = "KARDAMOM_CANARY_FEES_MS", default_value = "300000")]
+    pub fees_ms: Millis,
+    /// One `transfer` in this many gets a `safe` check.
+    #[arg(long, env = "KARDAMOM_CANARY_SAFE_SAMPLE", default_value = "60")]
+    pub safe_sample: NonZeroU32,
+    /// The longest wait for a sampled transaction to reach the safe head:
+    /// twice the batcher's idle flush.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_SAFE_TIMEOUT_MS",
+        default_value = "120000"
+    )]
+    pub safe_timeout_ms: Millis,
+    /// The L2 amount the funds task sends to a ring account under the
+    /// floor, from the first ring account.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_TOPUP_WEI",
+        default_value = "400000000000000"
+    )]
+    pub topup_wei: U256,
+    /// The L1 endpoint of the `deposit` probe. Without it, or without the
+    /// L1 key or the lockbox, the probe does not run.
+    #[arg(long, env = "KARDAMOM_L1_RPC", hide_env_values = true)]
+    pub l1_rpc: Option<String>,
+    /// The private key of the canary's L1 account.
+    #[arg(long, env = "KARDAMOM_CANARY_L1_KEY", hide_env_values = true)]
+    pub l1_key: Option<String>,
+    /// The L1 `ETHLockbox` the deposits go through.
+    #[arg(long, env = "KARDAMOM_CANARY_LOCKBOX")]
+    pub lockbox: Option<Address>,
+    /// The time between two `deposit` runs.
+    #[arg(long, env = "KARDAMOM_CANARY_DEPOSIT_MS", default_value = "21600000")]
+    pub deposit_ms: Millis,
+    /// The amount of a deposit.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_DEPOSIT_WEI",
+        default_value = "100000000000000"
+    )]
+    pub deposit_wei: U256,
+    /// The amount of the first deposit, which funds the ring and the pool.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_FIRST_DEPOSIT_WEI",
+        default_value = "5000000000000000"
+    )]
+    pub first_deposit_wei: U256,
+    /// The lowest L1 balance, in wei, at which the canary still deposits.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_L1_FLOOR_WEI",
+        default_value = "1000000000000000"
+    )]
+    pub l1_floor_wei: U256,
+    /// The longest wait for each of the L1 inclusion and the L1 finality
+    /// of a deposit.
+    #[arg(long, env = "KARDAMOM_CANARY_L1_TIMEOUT_MS", default_value = "3600000")]
+    pub l1_timeout_ms: Millis,
+    /// The longest wait for the L2 credit after the deposit's L1 finality.
+    #[arg(
+        long,
+        env = "KARDAMOM_CANARY_CREDIT_TIMEOUT_MS",
+        default_value = "1800000"
+    )]
+    pub credit_timeout_ms: Millis,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9012")]
     pub metrics_addr: SocketAddr,
@@ -148,6 +224,14 @@ pub struct Timing {
     pub feed_grace: Duration,
     pub read_timeout: Duration,
     pub poll: Duration,
+    pub rwa: Duration,
+    pub swap: Duration,
+    pub liquidity: Duration,
+    pub fees: Duration,
+    pub safe_timeout: Duration,
+    pub deposit: Duration,
+    pub l1_timeout: Duration,
+    pub credit_timeout: Duration,
 }
 
 impl Args {
@@ -162,6 +246,14 @@ impl Args {
             feed_grace: self.feed_grace_ms.duration(),
             read_timeout: self.read_timeout_ms.duration(),
             poll: self.poll_ms.duration(),
+            rwa: self.rwa_ms.duration(),
+            swap: self.swap_ms.duration(),
+            liquidity: self.liquidity_ms.duration(),
+            fees: self.fees_ms.duration(),
+            safe_timeout: self.safe_timeout_ms.duration(),
+            deposit: self.deposit_ms.duration(),
+            l1_timeout: self.l1_timeout_ms.duration(),
+            credit_timeout: self.credit_timeout_ms.duration(),
         }
     }
 }

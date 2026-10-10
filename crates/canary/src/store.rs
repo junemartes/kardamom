@@ -1,10 +1,11 @@
 //! The canary's data directory: the files that outlive a restart. Each
 //! file has one writer: the `contract` probe writes the contract
-//! addresses, and the `transfer` probe writes the anchor.
+//! addresses, the `transfer` probe writes the anchor, and the market task
+//! writes the token and pool state.
 
 use std::path::{Path, PathBuf};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,42 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Contracts {
     pub counter: Option<Address>,
+}
+
+/// The state of the test RWA token and the pool, which the market task
+/// owns: the addresses, the setup progress, the canary's ledger of the
+/// token supply, and the liquidity shares its probe holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Market {
+    pub rwa: Option<Address>,
+    pub pool: Option<Address>,
+    /// The number of setup steps done.
+    pub setup: u8,
+    /// The canary's mints less its burns.
+    pub supply: U256,
+    /// A supply change that was sent and not yet seen landed.
+    pub pending: Option<SupplyChange>,
+    /// The shares the `liquidity` probe added and has not removed.
+    pub shares: Option<U256>,
+}
+
+/// One change of the token supply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SupplyChange {
+    Mint(U256),
+    Burn(U256),
+}
+
+impl SupplyChange {
+    /// The supply after this change of `supply`.
+    #[must_use]
+    pub fn apply(self, supply: U256) -> Option<U256> {
+        match self {
+            Self::Mint(amount) => supply.checked_add(amount),
+            Self::Burn(amount) => supply.checked_sub(amount),
+        }
+    }
 }
 
 /// The data directory.
@@ -53,6 +90,27 @@ impl Store {
     /// Returns an error when the write fails.
     pub async fn save_contracts(&self, contracts: &Contracts) -> anyhow::Result<()> {
         self.save("contracts.json", contracts).await
+    }
+
+    /// The state of the token and the pool; empty when the canary set up
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists and does not parse.
+    pub async fn market(&self) -> anyhow::Result<Market> {
+        self.load("market.json")
+            .await
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Store the state of the token and the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub async fn save_market(&self, market: &Market) -> anyhow::Result<()> {
+        self.save("market.json", market).await
     }
 
     /// The hash of the first transaction the canary saw land: the old
