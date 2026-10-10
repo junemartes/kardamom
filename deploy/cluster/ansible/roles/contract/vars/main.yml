@@ -60,6 +60,9 @@ contract_mirrors:
       - '{{ registry_host }}:{{ registry_port }}/kardamom-executor:{{ image_tag }}'
       - '"{{ chain_id }}"'
       - '"--nonce-query-addr", "${meta.node_ip}:${var.executor_query_port}"'
+      # The archive id that a "located" answer names: the archive_id of
+      # this node's archive record in aeron.system.nomad.hcl.
+      - '"--exec-archive-id", "${node.unique.name}"'
       - 'default     = {{ node_classes.executor.count }}
 
         }'
@@ -116,6 +119,8 @@ contract_mirrors:
       - tags = ["${meta.archive_topics}", "${meta.archive_topics_follower}"]
       - chain_id          = "{{ chain_id }}"
       - cluster_id        = "${meta.cluster_id}"
+      # The id that executor.nomad.hcl --exec-archive-id names.
+      - archive_id        = "${node.unique.name}"
     forbidden: []
   - path: deploy/cluster/nomad/l1-fault-proxy.nomad.hcl
     required:

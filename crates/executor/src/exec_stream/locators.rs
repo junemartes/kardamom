@@ -17,6 +17,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
+use kardamom_state::Locators;
+
 /// The publisher appends a locator for the first record of a session and
 /// then for every this many records.
 pub(crate) const LOCATOR_EVERY: u64 = 1024;
@@ -31,36 +33,32 @@ const ENTRY_LEN_U64: u64 = 24;
 const BODY_LEN: usize = 20;
 
 /// Where one record is: the session of its recording and a position at or
-/// before the start of the record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Locator {
-    /// The canonical index of the record.
-    pub index: u64,
-    /// The Aeron session id of the recorded publication.
-    pub session_id: i32,
-    /// A raw stream position at or before the start of the record.
-    pub position: i64,
-}
+/// before the start of the record. The answers state of the query endpoint
+/// keeps the same value.
+pub use kardamom_state::ExecLocator as Locator;
 
-impl Locator {
-    fn encode(self) -> [u8; ENTRY_LEN] {
+/// One entry on disk.
+struct Entry([u8; ENTRY_LEN]);
+
+impl Entry {
+    fn encode(locator: Locator) -> Self {
         let mut entry = [0u8; ENTRY_LEN];
-        entry[..8].copy_from_slice(&self.index.to_le_bytes());
-        entry[8..12].copy_from_slice(&self.session_id.to_le_bytes());
-        entry[12..BODY_LEN].copy_from_slice(&self.position.to_le_bytes());
+        entry[..8].copy_from_slice(&locator.index.to_le_bytes());
+        entry[8..12].copy_from_slice(&locator.session_id.to_le_bytes());
+        entry[12..BODY_LEN].copy_from_slice(&locator.position.to_le_bytes());
         let crc = crc32fast::hash(&entry[..BODY_LEN]);
         entry[BODY_LEN..].copy_from_slice(&crc.to_le_bytes());
-        entry
+        Self(entry)
     }
 
     /// Decode one whole entry. `None` when its CRC does not match.
-    fn decode(entry: &[u8; ENTRY_LEN]) -> Option<Self> {
+    fn decode(entry: &[u8; ENTRY_LEN]) -> Option<Locator> {
         let (body, crc) = entry.split_at(BODY_LEN);
         let crc = u32::from_le_bytes(crc.try_into().ok()?);
         if crc32fast::hash(body) != crc {
             return None;
         }
-        Some(Self {
+        Some(Locator {
             index: u64::from_le_bytes(body[..8].try_into().ok()?),
             session_id: i32::from_le_bytes(body[8..12].try_into().ok()?),
             position: i64::from_le_bytes(body[12..BODY_LEN].try_into().ok()?),
@@ -73,7 +71,7 @@ impl Locator {
 pub struct LocatorLog {
     file: File,
     /// Every good entry, in append order.
-    entries: Vec<Locator>,
+    entries: Locators,
     /// The length of the good prefix of the file, in bytes.
     len: u64,
 }
@@ -96,13 +94,14 @@ impl LocatorLog {
             .open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let entries: Vec<Locator> = bytes
+        let mut entries = Locators::default();
+        bytes
             .as_chunks::<ENTRY_LEN>()
             .0
             .iter()
-            .map_while(Locator::decode)
-            .collect();
-        let len = u64::try_from(entries.len())
+            .map_while(Entry::decode)
+            .for_each(|l| entries.push(l));
+        let len = u64::try_from(entries.entries().len())
             .ok()
             .and_then(|n| n.checked_mul(ENTRY_LEN_U64))
             .ok_or_else(|| std::io::Error::other("the locator log length overflows u64"))?;
@@ -122,7 +121,7 @@ impl LocatorLog {
             .len
             .checked_add(ENTRY_LEN_U64)
             .ok_or_else(|| std::io::Error::other("the locator log length overflows u64"))?;
-        match self.file.write_all(&locator.encode()) {
+        match self.file.write_all(&Entry::encode(locator).0) {
             Ok(()) => {
                 self.len = len;
                 self.entries.push(locator);
@@ -141,10 +140,12 @@ impl LocatorLog {
     /// record.
     #[must_use]
     pub fn lookup(&self, index: u64) -> Option<Locator> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|l| l.index <= index)
-            .copied()
+        self.entries.lookup(index)
+    }
+
+    /// Every good entry, in append order.
+    #[must_use]
+    pub fn entries(&self) -> &[Locator] {
+        self.entries.entries()
     }
 }

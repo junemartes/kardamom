@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, TryRecvError, select};
 use kardamom_cluster_adapter::gateway::ClusterIngress;
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::error::LogError;
+use kardamom_state::ExecAnswersFeed;
 use kardamom_types::ExecTxRecord;
 use rkyv::util::AlignedVec;
 use tokio_util::sync::CancellationToken;
@@ -64,6 +65,9 @@ pub(crate) struct PublisherInputs<P: StreamPublications> {
     pub(crate) positions: Receiver<i64>,
     pub(crate) publications: P,
     pub(crate) locators: LocatorLog,
+    /// The answers state of the query endpoint. It gets a copy of each
+    /// locator that the log takes.
+    pub(crate) answers: Option<ExecAnswersFeed>,
     /// Cancelled at shutdown. It ends a wait for a refused record.
     pub(crate) stop: CancellationToken,
     /// Sends the recorded cursor to the sealer, once the cluster session
@@ -258,16 +262,23 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
                 session_id: self.inputs.publications.session_id(),
                 position: start,
             };
-            let _ =
-                self.inputs.locators.append(locator).inspect_err(
-                    |e| warn!(index, error = %e, "exec stream: locator append failed"),
-                );
+            match self.inputs.locators.append(locator) {
+                Ok(()) => self.share_locator(locator),
+                Err(e) => warn!(index, error = %e, "exec stream: locator append failed"),
+            }
         }
         self.records = self
             .records
             .checked_add(1)
             .context("the exec stream record count overflows u64")?;
         Ok(())
+    }
+
+    /// Send a locator that the log took to the answers state.
+    fn share_locator(&self, locator: Locator) {
+        if let Some(answers) = &self.inputs.answers {
+            answers.located(locator);
+        }
     }
 }
 

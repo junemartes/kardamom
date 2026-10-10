@@ -15,12 +15,13 @@ use kardamom_types::{
 use crate::error::ExecutorError;
 
 use super::cluster::slot_width;
-use super::join::{JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
+use super::join::{JoinBuffer, JoinOutcome, JoinWait, OwnTail, ReaderConfig, TxDataKey};
+use super::peer_fetch::{Expected, FetchedRecords, PeerFetch, PeerFetchInputs};
 use super::ports::{
-    ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription,
-    TxOrderingSubscription,
+    ExecRecordReplay, ExecRecordsFrom, ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory,
+    TxDataSubscription, TxOrderingSubscription,
 };
-use super::void::{ParkOutcome, ReadAhead, VoidPark};
+use super::void::{ParkOutcome, ParkPlan, ReadAhead, VoidPark};
 
 /// Message routed from the `tx_ordering` reader to the executor's exec thread.
 ///
@@ -169,6 +170,10 @@ pub struct TxOrderingReader<O, S, E> {
     /// Indices of entries this reader dropped, whose void record is still
     /// in the backlog. The record's own slot counts when its turn comes.
     dropped: BTreeSet<u64>,
+    /// Executor stream records that a replay delivered ahead of the
+    /// reader: the tail of an earlier run of this executor, or the records
+    /// after an entry that a peer served. Each one is checked at its turn.
+    pub(super) fetched: FetchedRecords,
     last_warn_len: usize,
 }
 
@@ -226,7 +231,13 @@ where
             exec_stream,
             recovery_factory,
         } = inputs;
-        let recovery = recovery_factory.map(JoinRecoveryFactory::build);
+        let mut recovery = recovery_factory.map(JoinRecoveryFactory::build);
+        let fetched = cfg
+            .own_tail
+            .as_ref()
+            .zip(recovery.as_mut())
+            .map(|(tail, replay)| Self::preload(tail, replay))
+            .unwrap_or_default();
         Self {
             sub,
             buffer,
@@ -237,8 +248,44 @@ where
             first_index: None,
             backlog: ReadAhead::new(),
             dropped: BTreeSet::new(),
+            fetched,
             last_warn_len: 0,
         }
+    }
+
+    /// Replay the tail of an earlier run from this executor's own archive:
+    /// the records that it joined and published above the resume index
+    /// but did not commit. A failed replay costs only the preload: the
+    /// joins then use the live stream, the archives and the peers.
+    fn preload(tail: &OwnTail, replay: &mut impl ExecRecordReplay) -> FetchedRecords {
+        let mut records = Vec::new();
+        let from = ExecRecordsFrom {
+            archive_id: &tail.archive_id,
+            session_id: tail.session_id,
+            position: tail.position,
+        };
+        let mut fetched = FetchedRecords::default();
+        match replay.replay_exec_records(from, |record| records.push(record)) {
+            Ok(delivered) => {
+                fetched.keep(tail.from_index, records);
+                info!(
+                    target: "kardamom_executor::reader",
+                    session_id = tail.session_id,
+                    from_index = tail.from_index,
+                    delivered,
+                    kept = fetched.len(),
+                    "own tail: replayed the earlier run's records from this executor's archive"
+                );
+            }
+            Err(e) => warn!(
+                target: "kardamom_executor::reader",
+                session_id = tail.session_id,
+                from_index = tail.from_index,
+                error = %e,
+                "own tail: the replay failed; the joins go on without it"
+            ),
+        }
+        fetched
     }
 
     /// Send one message to the exec sink. `Stop` means the exec thread is
@@ -302,58 +349,121 @@ where
         ExecutorError::State("the executor stream publisher stopped".into())
     }
 
-    /// A `TxRef`: join against the buffer, warn on buffer growth, send the
-    /// joined record to the executor stream, then dispatch the envelope.
+    /// A `TxRef`: take a fetched record of the entry, or join against the
+    /// buffer; then send the joined record to the executor stream and
+    /// dispatch the envelope. A join that every archive failed parks.
     fn on_tx_ref(
         &mut self,
         tx_ref: kardamom_types::TxRef,
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
+        if let Some(env) = self.take_fetched(position.as_index(), tx_ref) {
+            return self.dispatch_joined(env, position, tx_ref);
+        }
         let wait = JoinWait::new(&self.buffer, &mut self.recovery, &tx_ref, &self.cfg)?;
-        let env = match wait.run() {
-            JoinOutcome::Joined(env) => env,
-            JoinOutcome::Unjoinable => return self.on_unjoinable(&tx_ref, position),
-            JoinOutcome::TimedOut => return Err(self.join_timeout(&tx_ref, false)),
-        };
+        match wait.run() {
+            JoinOutcome::Joined(env) => self.dispatch_joined(env, position, tx_ref),
+            JoinOutcome::Unjoinable => self.on_unjoined(&tx_ref, position, true),
+            JoinOutcome::TimedOut => self.on_unjoined(&tx_ref, position, false),
+        }
+    }
+
+    /// The envelope of the fetched record at `index`, when one is kept and
+    /// it passes the check against the canonical reference.
+    fn take_fetched(&mut self, index: u64, tx_ref: kardamom_types::TxRef) -> Option<TxEnvelope> {
+        let record = self.fetched.take(index)?;
+        Expected { index, tx_ref }
+            .check(record)
+            .inspect_err(|reason| {
+                warn!(
+                    target: "kardamom_executor::reader",
+                    index,
+                    tx_hash = ?tx_ref.tx_hash,
+                    reason,
+                    "a fetched record does not match the reference; joining the entry anew"
+                );
+            })
+            .ok()
+    }
+
+    /// Warn on buffer growth, send the joined record to the executor
+    /// stream, then dispatch the envelope.
+    fn dispatch_joined(
+        &mut self,
+        envelope: TxEnvelope,
+        position: BPosition,
+        tx_ref: kardamom_types::TxRef,
+    ) -> Result<Flow, ExecutorError> {
         self.warn_on_buffer_growth();
         self.exec_stream
-            .record(position.as_index(), &tx_ref, &env)
+            .record(position.as_index(), &tx_ref, &envelope)
             .map_err(|_| Self::stream_closed())?;
         Ok(self.send(ReaderToExec::Tx {
-            envelope: env,
+            envelope,
             position,
             tx_ref,
         }))
     }
 
-    /// An entry whose `tx_data` every archive refused. A voter asks the
-    /// sealer to void it and waits for the void record; see [`VoidPark`].
-    /// Then the entry's slot goes to the executor as a vacant slot. The
-    /// vote names the entry by its canonical index, which is the position
-    /// the cluster subscription delivers. A consumer that is no voter
-    /// stops, as it did before the void rule.
-    pub(super) fn on_unjoinable(
+    /// An entry whose `tx_data` every archive failed. The reader parks: it
+    /// asks its peer executors first, see [`PeerFetch`]. A peer's archive
+    /// that serves the entry joins it. A voter votes to void the entry
+    /// only when every archive refused the range and every peer answered
+    /// `not_held`; see [`VoidPark`]. Then the entry's slot goes to the
+    /// executor as a vacant slot. The vote names the entry by its
+    /// canonical index, which is the position the cluster subscription
+    /// delivers. A reader with no peer that may not vote stops, as before
+    /// the peer step.
+    pub(super) fn on_unjoined(
         &mut self,
         tx_ref: &kardamom_types::TxRef,
         position: BPosition,
+        every_archive_refused: bool,
     ) -> Result<Flow, ExecutorError> {
-        let Some(voter_id) = self.cfg.voter_id else {
-            return Err(self.join_timeout(tx_ref, true));
-        };
+        let voter_id = self.cfg.voter_id.filter(|_| every_archive_refused);
+        if voter_id.is_none() && self.cfg.exec_peers.is_empty() {
+            return Err(self.join_timeout(tx_ref, every_archive_refused));
+        }
         let void = VoidRecord {
             index: position.as_index(),
             tx_hash: tx_ref.tx_hash,
         };
-        let park = VoidPark::new(
-            &mut self.sub,
-            &mut self.backlog,
+        info!(
+            target: "kardamom_executor::reader",
+            index = void.index,
+            tx_hash = ?void.tx_hash,
+            every_archive_refused,
+            "every tx_data source failed the entry: parking to ask the peers"
+        );
+        self.tell_answers(|answers| answers.parked(void.index));
+        let plan = ParkPlan {
             voter_id,
             void,
-            self.cfg.void_wait,
-        );
-        match park.run() {
+            wait: self.cfg.void_wait,
+            peers: PeerFetch::new(PeerFetchInputs {
+                peers: &self.cfg.exec_peers,
+                replay: self.recovery.as_mut(),
+                fetched: &mut self.fetched,
+                expected: Expected {
+                    index: void.index,
+                    tx_ref: *tx_ref,
+                },
+            }),
+        };
+        match VoidPark::new(&mut self.sub, &mut self.backlog, plan).run() {
             Ok(ParkOutcome::Voided) => (),
-            Ok(ParkOutcome::GaveUp) => return Err(self.join_timeout(tx_ref, true)),
+            Ok(ParkOutcome::Fetched(envelope)) => {
+                self.tell_answers(|answers| answers.fetched(void.index));
+                return self.dispatch_joined(envelope, position, *tx_ref);
+            }
+            Ok(ParkOutcome::Lost { block }) => {
+                return Err(ExecutorError::PeerRecordLost {
+                    index: void.index,
+                    tx_hash: void.tx_hash,
+                    block,
+                });
+            }
+            Ok(ParkOutcome::GaveUp) => return Err(self.join_timeout(tx_ref, every_archive_refused)),
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
             Err(e) => return Err(e),
         }
@@ -365,6 +475,13 @@ where
         );
         self.dropped.insert(void.index);
         Ok(self.send(ReaderToExec::Vacant { position }))
+    }
+
+    /// Send one fact to the answers state, when the executor serves one.
+    fn tell_answers(&self, tell: impl FnOnce(&kardamom_state::ExecAnswersFeed)) {
+        if let Some(answers) = &self.cfg.exec_answers {
+            tell(answers);
+        }
     }
 
     /// A void record. Its entry is one this reader dropped, or one below the
@@ -453,7 +570,7 @@ where
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
             Err(e) => return Err(e),
         };
-        self.first_index.get_or_insert(position.as_index());
+        self.note_first(position.as_index());
         let through = Self::last_slot(position, &msg);
         match self.dispatch(position, msg)? {
             Flow::Continue => self.mark(through),
@@ -473,12 +590,24 @@ where
             .checked_add(slot_width(msg).checked_sub(1)?)
     }
 
+    /// Keep the index of the first message, and tell the answers state.
+    fn note_first(&mut self, index: u64) {
+        if self.first_index.is_some() {
+            return;
+        }
+        self.first_index = Some(index);
+        self.tell_answers(|answers| answers.first(index));
+    }
+
     /// Send the progress mark of a dispatched message, when it takes a
-    /// slot.
+    /// slot, to the executor stream and to the answers state.
     fn mark(&self, through: Option<u64>) -> Result<Flow, ExecutorError> {
         through
             .map_or(Ok(()), |t| self.exec_stream.passed(t))
             .map_err(|_| Self::stream_closed())?;
+        if let Some(t) = through {
+            self.tell_answers(|answers| answers.passed(t));
+        }
         Ok(Flow::Continue)
     }
 

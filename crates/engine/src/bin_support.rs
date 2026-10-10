@@ -225,7 +225,8 @@ pub fn archive_join_recovery(
     replay_endpoint: Option<&str>,
 ) -> Option<JoinRecoveryFactory> {
     let channels = plane.channels().clone();
-    let (tx_data_endpoints, tx_deposits_endpoints) = archive_endpoints(plane, aeron_cfg);
+    let [tx_data_endpoints, tx_deposits_endpoints, exec_txs_endpoints] =
+        archive_endpoints(plane, aeron_cfg);
     if !tx_data_endpoints.is_configured() && !tx_deposits_endpoints.is_configured() {
         return None;
     }
@@ -241,6 +242,7 @@ pub fn archive_join_recovery(
     let cfg = RefetchConfig {
         tx_data_endpoints,
         tx_deposits_endpoints,
+        exec_txs_endpoints,
         response_endpoint: response_endpoint.to_string(),
         replay_endpoint: replay_endpoint.to_string(),
         aeron_dir: aeron_dir.map(std::path::Path::to_path_buf),
@@ -249,30 +251,31 @@ pub fn archive_join_recovery(
     Some(JoinRecoveryFactory {
         cfg,
         tx_data_stream_base: channels.tx_data_stream_id_base,
+        exec_txs_stream_id: channels.exec_txs_stream_id,
     })
 }
 
-/// The archive endpoint sources of the two refetched topics: the live
-/// archive records on a discovered plane, else the static lists.
+/// The archive endpoint sources of the three refetched topics, `tx_data`,
+/// `tx_deposits` and `exec_txs`: the live archive records on a discovered
+/// plane, else the static lists. A static plane names no executor
+/// archive.
 fn archive_endpoints(
     plane: &mut kardamom_log::discovery::StreamPlane,
     aeron_cfg: &AeronConfig,
-) -> (EndpointSource, EndpointSource) {
+) -> [EndpointSource; 3] {
+    use kardamom_log::discovery::Topic;
     match plane.watch_archives() {
-        Some(archives) => (
+        Some(archives) => [Topic::TxData, Topic::TxDeposits, Topic::ExecTxs].map(|topic| {
             EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxData,
+                topic,
                 archives: archives.clone(),
-            },
-            EndpointSource::Discovered {
-                topic: kardamom_log::discovery::Topic::TxDeposits,
-                archives,
-            },
-        ),
-        None => (
+            }
+        }),
+        None => [
             EndpointSource::Static(aeron_cfg.tx_data_archive_endpoints.clone()),
             EndpointSource::Static(aeron_cfg.tx_deposits_archive_endpoints.clone()),
-        ),
+            EndpointSource::Static(Vec::new()),
+        ],
     }
 }
 
@@ -517,11 +520,16 @@ impl ResyncFallback<'_> {
 /// a revolution races the retention window, and a lost race must cost
 /// one fetch, not one restart attempt (issue #298).
 ///
+/// The same repair serves a [`ExecutorError::PeerRecordLost`]: a peer
+/// executed an entry that this node cannot fetch, so a peer checkpoint at
+/// or above the entry's block aligns this node with that peer.
+///
 /// `adopted_unverified` selects the validator's log wording, for its
 /// catch-up trust class (its adopted state is unverified through the
 /// checkpoint block). This returns the resync outcome label
 /// (`"peer-checkpoint"` or `"unrecoverable"`) for the caller's per-service
-/// metric, or `None` when `err` is not a `ClusterReplayUnavailable`.
+/// metric, or `None` when `err` is neither a `ClusterReplayUnavailable`
+/// nor a `PeerRecordLost`.
 ///
 /// # Errors
 ///
@@ -534,21 +542,35 @@ pub fn replay_unavailable_fallback(
     expected_genesis: Option<alloy_primitives::B256>,
     adopted_unverified: bool,
 ) -> Result<Option<&'static str>> {
-    let Some(ExecutorError::ClusterReplayUnavailable {
-        from_index,
-        oldest_index,
-        oldest_block,
-    }) = err
-    else {
-        return Ok(None);
+    let oldest_block = match err {
+        Some(ExecutorError::ClusterReplayUnavailable {
+            from_index,
+            oldest_index,
+            oldest_block,
+        }) => {
+            tracing::warn!(
+                from_index,
+                oldest_index,
+                oldest_block,
+                "cluster replay unavailable — attempting peer-checkpoint fallback"
+            );
+            *oldest_block
+        }
+        Some(ExecutorError::PeerRecordLost {
+            index,
+            tx_hash,
+            block,
+        }) => {
+            tracing::warn!(
+                index,
+                ?tx_hash,
+                block,
+                "a peer executed the entry and lost its record — attempting peer-checkpoint fallback"
+            );
+            *block
+        }
+        _ => return Ok(None),
     };
-    let oldest_block = *oldest_block;
-    tracing::warn!(
-        from_index,
-        oldest_index,
-        oldest_block,
-        "cluster replay unavailable — attempting peer-checkpoint fallback"
-    );
     if let (Some(ckpt_dir), false) = (checkpoint_dir, checkpoint_peers.is_empty()) {
         let fallback = ResyncFallback {
             checkpoint_peers,

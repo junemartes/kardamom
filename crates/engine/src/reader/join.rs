@@ -115,7 +115,35 @@ pub struct ReaderConfig {
     pub voter_id: Option<u8>,
     /// How long a voter waits for the void record after its first vote. The
     /// sealer keeps the vote, so a restart after this wait loses nothing.
+    /// The same bound ends a wait for a peer executor that gives no final
+    /// answer.
     pub void_wait: Duration,
+    /// The peer executors that this reader asks for an entry that every
+    /// `tx_data` archive failed. Empty: no peer step. Then a voter votes at
+    /// once when every archive refused, and a join that timed out stops
+    /// the reader.
+    pub exec_peers: kardamom_state::ExecPeers,
+    /// The answers state that the query endpoint serves to the peers. The
+    /// reader sends its progress and its parks. `None` for a reader with
+    /// no executor stream.
+    pub exec_answers: Option<kardamom_state::ExecAnswersFeed>,
+    /// The records of an earlier run that the reader replays from its own
+    /// archive at start. `None` on a fresh start.
+    pub own_tail: Option<OwnTail>,
+}
+
+/// The records of an earlier run of this executor above its resume index:
+/// they are on its own archive, from a locator of its locator log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnTail {
+    /// The archive id of this executor's archive.
+    pub archive_id: String,
+    /// The session of the recorded publication of the earlier run.
+    pub session_id: i32,
+    /// A raw stream position at or before the record at `from_index`.
+    pub position: i64,
+    /// The first canonical index that this run reads.
+    pub from_index: u64,
 }
 
 impl Default for ReaderConfig {
@@ -127,6 +155,9 @@ impl Default for ReaderConfig {
             buffer_warn_threshold: 10_000,
             voter_id: None,
             void_wait: Duration::from_mins(2),
+            exec_peers: kardamom_state::ExecPeers::default(),
+            exec_answers: None,
+            own_tail: None,
         }
     }
 }

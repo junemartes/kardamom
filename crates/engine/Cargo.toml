@@ -56,3 +56,5 @@ kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
 tempfile = { workspace = true }
+# The fake peer executors of `reader::tests_peer` write JSON-RPC replies.
+serde_json.workspace = true

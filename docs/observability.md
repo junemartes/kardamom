@@ -314,6 +314,16 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
+  - The executor also takes this repair when a peer answered `lost` for an entry that it cannot fetch.
+- `kardamom_engine_peer_fetch_total{outcome}` counts the asks of an executor to its peer executors, for an entry that every `tx_data` archive failed.
+  - `located`: the peer's `exec_txs` archive served a good record. The executor joined the entry with no vote.
+  - `not_held`: the peer reached the entry with no record. When every peer answers this after every archive refused the range, the executor votes.
+  - `not_reached`: the peer has not reached the entry. The executor asks again.
+  - `lost`: the peer executed the entry and holds no record of it. The executor sends no vote and repairs itself from a peer checkpoint.
+  - `unreachable`: no answer, a failed replay, or a replay with no record of the entry. The executor asks again.
+  - `mismatch`: the record failed the check (index, reference, keccak, sender). The executor asks again.
+  - `located` after an ingress death is the expected effect of the peer step. Growth of `unreachable`, `mismatch` or `lost` needs a look.
+    See "The peer step" in [failure-modes.md](failure-modes.md).
 - `validator_bal_sub_reopen_total` counts the reopens of the `tx_bal` subscription after 60 s of silence.
   - A few reopens on an idle cluster are noise.
   - Growth on a chain that progresses means the BAL delivery to that node is broken. The verification coverage drops.

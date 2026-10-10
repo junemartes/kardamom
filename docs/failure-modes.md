@@ -289,6 +289,11 @@ The sealer orders a transaction reference before the archives make its data dura
 - A consumer votes (`KIND_VOID_REQUEST`) only after the join budget ends and every archive refuses the range.
   - An archive refuses when it has no recording of the session, when each recording starts after the range, or when the range is in a gap or after an ended recording.
   - An archive that is down or slow does not refuse. A live recording that does not reach the range yet does not refuse.
+- An executor asks its peer executors before it votes. See [The peer step](#the-peer-step-an-executor-fetches-an-entry-from-a-peers-archive).
+  - It votes only when every `tx_data` archive refused the range **and** every peer answered `not_held`.
+  - A peer that does not answer, has not reached the entry, or serves a record that fails the check, blocks the vote. The executor asks it again every 1 s.
+  - A peer whose archive holds the entry ends the wait: the executor joins the entry and sends no vote.
+  - A join that timed out (an archive gave no definite answer) parks and asks the peers too, but it never votes.
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
@@ -321,7 +326,8 @@ The voter list must equal the set of consumers that execute.
 - A consumer outside the list cannot stop a void.
 - If that consumer executed the entry, it stops with `VoidOfExecutedEntry` when it reads the void record.
 - A consumer repeats its vote every 5 s.
-- A consumer waits 120 s for the void record and then restarts. The sealer keeps the vote.
+- A consumer waits 120 s for the void record and then restarts. The sealer keeps the vote. The same bound ends a wait for a peer that gives no final answer.
+- A consumer that sent a vote does not execute the entry in the same run. It waits for the void record.
 - When the join times out, the warning line has the field `every_archive_refused`. The value `true` means the data is gone. A restart meets the same entry again.
 
 ### Durability of the Raft log
@@ -406,10 +412,35 @@ Each executor publishes the transactions that it joins on the executor stream (`
 - **Archive back-pressure or archive loss**: the recorded publication refuses the record. The publisher offers it again until the archive takes it. The channel from the reader fills, and the reader blocks. This executor stalls. It drops no record, and it never executes a record that its archive did not take. The other executors carry the chain. `kardamom_executor_exec_stream_publish_blocked_ms_total` counts the wait.
 - **Restart**: a restarted executor gets a new Aeron session, so its archive makes a new recording. The recording of the earlier session stays in the archive. `kardamom_executor_exec_stream_session_id` shows the new session.
 - **Recorded cursor**: `kardamom_executor_exec_stream_recorded_index` is the highest canonical index whose records the local archive has written. It never passes the recording position. At archive sync level 1 it is durable on the node. At level 0 it survives a crash, not a power loss. With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the cursor to the sealer: a cursor that moved after 100 ms, or at once after 1024 records. The sealer keeps the best cursor of the executors as the floor of the record-lag guard. One dead executor does not stop that floor. With the flag off, which is the default, nothing reads the cursor.
-- **Locator log**: `<state_dir>/exec_stream/locators.log` maps a canonical index to a session and a position in a recording: one entry for the first record of each session, then one entry every 1024 records. A torn last entry is cut at the next start, and a lookup then takes the previous entry, a lower bound. A checkpoint restore or a parked state starts a new log. Nothing reads the log yet.
+- **Locator log**: `<state_dir>/exec_stream/locators.log` maps a canonical index to a session and a position in a recording: one entry for the first record of each session, then one entry every 1024 records. A torn last entry is cut at the next start, and a lookup then takes the previous entry, a lower bound. A checkpoint restore or a parked state starts a new log. The answers of the peer step and the own-tail preload read it.
 - **Recording loss**: the recorder thread reads the recording position every 20 ms. When no read succeeds for the loss wait, the driver timeout of the archive client (`AERON_DRIVER_TIMEOUT`, the Aeron stall tolerance: 10 s by default, 30 s in CI) plus 5 s, and at least 10 s (the recording stopped, or the archive no longer answers), the recorder thread ends and logs `exec_txs recorder ended: the local recording is lost`. The publisher then fails, also during a wait for a refused record. The reader stops with an error, and the process exits. Nomad restarts it, and the start waits for a recording of the new session. An executor never runs without a recorded copy of what it joins. A stall that every Aeron party survives does not end the recorder. The start budget of an Aeron client uses the same rule.
 - **Shared media driver**: the recorded publication is exclusive. Each executor has its own session and its own recording, also when several executors share one media driver (the single-host e2e stack).
 - Proof: `graceful-executor` and `hard-executor` assert that the restarted executor shows a new session and that its recorded cursor advances. The check does not apply, and logs that, when no executor exports the gauges, or when no recorded cursor moves in the window. The `chaos-executor` shard runs no load, so the L1 epochs move the cursor. The shard deploys `KARDAMOM_EXEC_CURSOR=on`, and `hard-executor` also asserts that the sealer's best recorded cursor (`kardamom_ingress_cluster_recorded_head`) moves while the killed executor is down.
+
+### The peer step: an executor fetches an entry from a peer's archive
+
+The join order of an executor is: live `tx_data`, then the ingress `tx_data` archives, then the `exec_txs` archives of the other executors, then the void vote.
+
+- **Trigger**: the join budget ends with no envelope. Every ingress archive refused the range (`Unjoinable`), or one of them gave no definite answer (`TimedOut`).
+- **Ask**: the executor parks at the entry and asks every peer (`--exec-peers`, without `--exec-self`) for `kardamom_getExecLocator [index, tx_hash]` on its query endpoint. Each ask has a 2 s bound.
+- **Answers**:
+
+| Answer | Meaning | Effect |
+|---|---|---|
+| `located` | The peer joined the entry. The answer names its archive (`archive_id`), the session and a position at or before the record. | The executor replays that archive from the position and checks the record. A replay that the archive refuses is no answer: the peer's node can die between the locator and the record. Ask again after 1 s. |
+| `not_held` | The peer reached the entry with no record: it parks there, it dropped the entry, or its state shows the slot vacant. | Final for this park. |
+| `not_reached` | The peer has not reached the entry. | Ask again after 1 s. |
+| `lost` | The peer executed the entry, and no locator or no retained recording covers it. | Final for this park. No vote. |
+
+- **Check**: the executor executes a fetched record only when its index and its reference equal the canonical ones, the keccak of the raw transaction equals the reference's hash, and the signature recovers the sender. A failed check counts as no answer (`outcome="mismatch"`), never as `not_held`.
+- **Join**: a good record ends the park. The executor sends it to execution and publishes it on its own stream. It sends no vote. The replay delivers the records after the entry too. The executor keeps them by canonical index (at most 65536) and checks each one at its own turn, so one replay heals a whole window.
+- **Vote**: only when the join was `Unjoinable` and every peer answered `not_held`. A `TimedOut` join never votes: after 120 s the reader stops, and the restart joins the entry again.
+- **Lost**: when every peer gave a final answer and one of them answered `lost`, no void can come, because that peer never votes. The executor stops with `PeerRecordLost` at the block that holds the entry. The process repairs itself as for a replay-window overrun: it fetches a peer checkpoint at or above that block, and the next revolution restores it. `kardamom_executor_resync_total` counts the repair.
+- **Own tail**: on a resume, the executor replays its own archive from the locator of its resume index. It keeps the records above the resume index, which the earlier run joined and published but did not commit, and checks each one at its turn.
+- **Determinism**: an executor executes at `i` only bytes whose keccak equals the hash of `TxRef(i)` from the canonical order. An executor that joined `i` never votes, so `Void(i)` exists only when no executor joined `i`.
+- **Forged sender**: a record whose signature does not recover its sender fails the check on the fetching executor. That executor stalls at the entry, and the validator halts on the record identity. This is out of the crash-fault model.
+- `kardamom_engine_peer_fetch_total{outcome}` counts the asks. See [observability.md](observability.md).
+- Proof: `exec-peer-fetch` makes both ingress recordings miss a 60 s window of `tx_data`, and makes executor-2 miss it live. Executors 0 and 1 join the window live. Both archives refuse the window to executor-2, which fetches it from a peer's archive. The case asserts that the park follows a join that every archive refused, that no join timed out, that executor-2 converges, that no executor votes, and that no restart loop occurs. `archive-driver-loss` prints the peer fetches and the votes, and fails on a restart loop.
 
 ## Ingress (xN, active/active)
 
@@ -641,7 +672,7 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
    - The `tx_data` archives hold every raw transaction that the ingress accepted, on both ingress nodes.
    - The link between them is the `TxRef` that the egress record carried. The state writer keeps it with the receipt. The `tx_hash_index` row holds the shard id, the publisher session and the archive position (13 bytes). A row of 8 bytes still decodes.
    - When the sealer answers `REPLAY_UNAVAILABLE` past the cursor, the batcher reads the references of each missing block from the query endpoints that `--block-refs-source` names.
-     - The method is `kardamom_getBlockRefs`. It returns the canonical end of the block, its L1 origin and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)` for each transaction in canonical order. Deposits are excluded.
+     - The method is `kardamom_getBlockRefs`. It returns the canonical end of the block, its L1 origin and timestamp, and `(tx_hash, tx_idx, shard_id, session_id, position)` for each transaction in canonical order. Deposits are excluded. An executor also returns `exec_locator` (`archive_id`, `session_id`, `position`): where a replay of its `exec_txs` archive reaches the first transaction of the block.
      - The batcher fetches the bytes from the archives through the join-miss refetch of the engine.
      - It checks each hash against its bytes. It checks the end of each block against the end of its predecessor.
      - It closes the blocks as the live feed closes them. It fills the spool and the pending group. It resumes at the floor of the sealer.
@@ -1123,6 +1154,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Effect: every service on that node stops at once. The node loses its transport and its durability recorder.
   - Recovery: the system task restarts. The archive segments persist on the node volume.
   - Proof: `archive-driver-loss` kills the driver under ingress-0. It asserts that the pipeline rides through (active/active), that the system task restarts within the SLO, and that the ingress job returns to full strength.
+  - The kill can end both `tx_data` recordings before the last frame of an entry that some executors got live. Both archives then refuse the range. The executors that hold the frame never vote, so a vote cannot complete. The other executors fetch the entry from the `exec_txs` archives of those peers instead, with no vote. The case prints the peer fetches and the votes, and fails on a restart loop.
 - **Archives**
   - The `tx_ordering` archive is folded into the Raft log and a per-member archive. Each sequencer has a `tx_data` archive. They underpin the resume of the executor and the batcher.
   - `tx_data` is **2x node-redundant**. It is a UDP-multicast stream. Both ingress replicas run an archive recorder that joins the group. The archive of each ingress node captures *every* publisher shard stream.
