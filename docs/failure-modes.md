@@ -181,6 +181,10 @@ Every chaos case ends with a **recovery probe**.
 - Two 30 s loads then run at the same time. Each load runs at half the case rate.
 - Load 1 runs on the account of the case, from its next nonce. It uses the ingress that the case load used. It stands for a sender that had transactions in flight during the outage.
 - Load 2 runs on the account of the smoke gate. No case load spends that account. It uses the other ingress. It stands for a sender with nothing in flight.
+- Each load starts at the next nonce of its account. The harness reads that nonce from the ingress.
+  - The read repeats on `account state unavailable` (`-32000`) for at most 60 s. Any other error fails the case at once.
+  - The ingress asks every executor before it gives this error. One dead executor therefore does not cause it.
+  - A stall of the shared CI runner can delay every executor past the 2 s query timeout at the same time. A wallet retries this error, so the harness retries it too.
 - Every offered transaction of both loads must get a receipt.
 - Each load must be accepted at a quarter of its rate or more.
 - If load 1 alone fails, a sender is stuck.

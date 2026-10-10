@@ -53,13 +53,19 @@ jobs:
       - name: Contract drift check (group_vars/all.yml vs mirrors)
         run: ansible-playbook -i localhost, ansible/contract.yml
 
-  nomad-validate:
-    name: nomad job validate
+  # The deploy tests run full Ansible plays against a fake Nomad API. On
+  # one 2-core runner the classes starved each other: three took about 40
+  # minutes each and the job hit its 45-minute limit. Each class now runs
+  # on its own runner. The job named `nomad job validate` is the required
+  # check; it waits for every part and passes only when all passed.
+  deploy-tests:
+    name: deploy tests (${{ matrix.part }})
     runs-on: ubuntu-latest
-    # The isolated suite runs full Ansible deployments, then image and
-    # signing tests, in parallel processes. This job budget is separate
-    # from deployment SLOs.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [specs, DeployTest, SealerTest, RecordTest, RollbackTest, others]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -91,6 +97,7 @@ jobs:
           cat /tmp/nomad-dev.log >&2
           exit 1
       - name: Validate job specs
+        if: matrix.part == 'specs'
         # Run from deploy/cluster: the specs resolve file("config/...") against
         # the CLI working directory.
         working-directory: deploy/cluster
@@ -101,30 +108,31 @@ jobs:
             nomad job validate "$j" || rc=1
           done
           exit $rc
-      # Each deploy test runs a full play against the fake API, so the
-      # deploy classes run in their own processes, beside the other
-      # modules. Every process runs from the repository root, as the
-      # single discover did: deploy/cluster/ansible/ansible.cfg turns
-      # become on, and a render under it is not readable by the runner.
-      - name: Test Ansible workloads, images, and signing in isolation
+      # Every process runs from the repository root: deploy/cluster/ansible/
+      # ansible.cfg turns become on, and a render under it is not readable
+      # by the runner.
+      - name: Test one deploy class in isolation
+        if: matrix.part != 'specs' && matrix.part != 'others'
+        run: |
+          python3 -m unittest discover -s deploy/cluster/ansible/tests -p test_deploy.py -k "${{ matrix.part }}" -v
+      - name: Test the other modules
+        if: matrix.part == 'others'
         run: |
           tests=deploy/cluster/ansible/tests
-          pids=()
-          for class in DeployTest SealerTest RecordTest RollbackTest; do
-            python3 -m unittest discover -s "$tests" -p test_deploy.py -k "$class" -v > "/tmp/$class.log" 2>&1 &
-            pids+=($!)
+          for module in "$tests"/test_*.py; do
+            [ "$(basename "$module")" = test_deploy.py ] && continue
+            python3 -m unittest discover -s "$tests" -p "$(basename "$module")" -v || exit 1
           done
-          (
-            for module in "$tests"/test_*.py; do
-              [ "$(basename "$module")" = test_deploy.py ] && continue
-              python3 -m unittest discover -s "$tests" -p "$(basename "$module")" -v || exit 1
-            done
-          ) > /tmp/others.log 2>&1 &
-          pids+=($!)
-          rc=0
-          for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
-          cat /tmp/DeployTest.log /tmp/SealerTest.log /tmp/RecordTest.log /tmp/RollbackTest.log /tmp/others.log
-          exit "$rc"
+
+  nomad-validate:
+    name: nomad job validate
+    runs-on: ubuntu-latest
+    needs: deploy-tests
+    if: always()
+    steps:
+      - name: Every part passed
+        run: |
+          [ "${{ needs.deploy-tests.result }}" = success ] || { echo "a deploy test part did not pass: ${{ needs.deploy-tests.result }}" >&2; exit 1; }
 
   terraform-validate:
     name: tofu fmt + validate + test (${{ matrix.root }} root)

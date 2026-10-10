@@ -16,6 +16,8 @@ use anyhow::Context;
 use kardamom_bench::mnemonic::derive_signers;
 use kardamom_bench::signers::DerivedSigner;
 
+use crate::poll::{self, Budget};
+
 /// The mnemonic the genesis accounts derive from.
 pub use kardamom_bench::ANVIL_MNEMONIC;
 
@@ -27,6 +29,24 @@ const GAS_LIMIT: u64 = 21_000;
 /// The JSON-RPC error code of a halted chain, as the ingress answers a
 /// submit with (`kardamom_ingress::error::CHAIN_HALTED_CODE`).
 pub const CHAIN_HALTED_CODE: i64 = -32010;
+
+/// The JSON-RPC error code of `account state unavailable`, as the
+/// ingress answers an account read with when no read layer answers.
+const STATE_UNAVAILABLE_CODE: i64 = -32000;
+
+/// The message prefix of `account state unavailable`. The code is shared
+/// with other refusals, so the prefix names this one.
+const STATE_UNAVAILABLE: &str = "account state unavailable";
+
+/// The bound of one nonce read through `account state unavailable`. The
+/// ingress tries every executor endpoint inside one call, so this refusal
+/// means that no executor answered in its timeout. A stall of the shared
+/// CI runner does that to every executor at once for some seconds. The
+/// refusal is retryable: a wallet retries it, and so does this read.
+const NONCE_READ: Budget = Budget {
+    timeout: Duration::from_secs(60),
+    interval: Duration::from_secs(1),
+};
 
 /// The error object of a refused call: its code and its message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +68,17 @@ impl RpcError {
                 .unwrap_or_default()
                 .to_string(),
         }
+    }
+
+    /// The refusal of `method` as an error.
+    fn into_error(self, method: &str) -> anyhow::Error {
+        anyhow::anyhow!("{method} error: {} ({})", self.message, self.code)
+    }
+
+    /// Whether no account read layer of the ingress answered: the local
+    /// layer and Redis missed, and every executor endpoint failed.
+    fn is_state_unavailable(&self) -> bool {
+        self.code == STATE_UNAVAILABLE_CODE && self.message.starts_with(STATE_UNAVAILABLE)
     }
 }
 
@@ -84,7 +115,7 @@ impl Rpc {
     ) -> anyhow::Result<serde_json::Value> {
         match self.call_typed(method, params).await? {
             Ok(result) => Ok(result),
-            Err(err) => anyhow::bail!("{method} error: {} ({})", err.message, err.code),
+            Err(err) => Err(err.into_error(method)),
         }
     }
 
@@ -173,15 +204,45 @@ impl Rpc {
     }
 
     /// The next nonce of `address`, from the latest block the ingress
-    /// serves.
+    /// serves. The read repeats on `account state unavailable` for at most
+    /// [`NONCE_READ`]; any other failure ends it at once.
     async fn nonce_at(&self, address: Address) -> anyhow::Result<u64> {
-        let nonce = self
-            .call(
+        let (nonce, _) = poll::until(NONCE_READ, |_| self.try_nonce_at(address))
+            .await?
+            .or_fail(|elapsed| {
+                anyhow::anyhow!(
+                    "eth_getTransactionCount of {address:#x}: {STATE_UNAVAILABLE} for {elapsed:?}; \
+                     no executor answered the ingress in that time"
+                )
+            })?;
+        Ok(nonce)
+    }
+
+    /// One nonce read. `None` is `account state unavailable`, which the
+    /// caller repeats; the refusal is logged with its reason.
+    async fn try_nonce_at(&self, address: Address) -> anyhow::Result<Option<u64>> {
+        let answer = self
+            .call_typed(
                 "eth_getTransactionCount",
                 serde_json::json!([format!("{address:#x}"), "latest"]),
             )
             .await?;
-        let nonce = nonce
+        match answer {
+            Ok(nonce) => Self::quantity(&nonce).map(Some),
+            Err(err) if err.is_state_unavailable() => {
+                crate::log(format!(
+                    "eth_getTransactionCount of {address:#x} through {}: {}; the read repeats",
+                    self.url, err.message
+                ));
+                Ok(None)
+            }
+            Err(err) => Err(err.into_error("eth_getTransactionCount")),
+        }
+    }
+
+    /// A `0x` quantity of a nonce answer as a `u64`.
+    fn quantity(value: &serde_json::Value) -> anyhow::Result<u64> {
+        let nonce = value
             .as_str()
             .context("eth_getTransactionCount returned no quantity")?;
         u64::from_str_radix(nonce.trim_start_matches("0x"), 16)
@@ -216,9 +277,10 @@ impl Rpc {
         nonce: u64,
         budget: Duration,
     ) -> anyhow::Result<String> {
-        let hash = self.send_transfer(account, nonce).await?.map_err(|e| {
-            anyhow::anyhow!("eth_sendRawTransaction error: {} ({})", e.message, e.code)
-        })?;
+        let hash = self
+            .send_transfer(account, nonce)
+            .await?
+            .map_err(|e| e.into_error("eth_sendRawTransaction"))?;
         crate::log(format!(
             "smoke: account #{account} sent {hash} through {}",
             self.url

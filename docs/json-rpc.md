@@ -61,7 +61,9 @@ receipt fields, the errors and the limits.
     - The ingress serves them only when the posted head equals the newest block.
     - Behind the head, the call fails with `-32602` and `not served: the ingress answers only the head`.
   - A block number is valid only if it equals the newest block. Any other number, and `earliest`, gives error `-32602`.
-- The ingress reads the local account layer first. On a miss it reads Redis, if the `[cache]` section is on. Then it asks one executor.
+- The ingress reads the local account layer first. On a miss it reads Redis, if the `[cache]` section is on. Then it asks the executors.
+  - The first executor rotates for each read. If an executor does not answer in 2 s, the ingress asks the next one.
+  - The read fails only when every executor failed. The error names the last executor that the ingress asked.
 - If no layer can answer, the call fails with `account state unavailable` (`-32000`).
 
 ### Block tags
