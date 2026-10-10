@@ -65,7 +65,7 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;
-use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
+use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult, RefusedRun};
 use crate::tx_decode::decode_fields;
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
 
@@ -560,8 +560,12 @@ impl Sequencer {
             return;
         };
         self.apply_receipt_drain(&mut r);
-        self.apply_contiguity_rejects(&mut r);
+        // The refusals go before the contiguity rejects. The sealer answers
+        // a refused ref with a refusal, and every later ref of the sender
+        // with a contiguity reject. A gap rewind applied first takes the
+        // refused ref back for republish, and the sender never frees it.
         self.apply_deadline_rejects(&mut r, ports);
+        self.apply_contiguity_rejects(&mut r);
         self.resync = Some(r);
         self.sweep_confirm_timeouts();
     }
@@ -632,8 +636,9 @@ impl Sequencer {
     /// Apply the terminal refusals the sealer answered this shard with: a
     /// ref past its inclusion deadline, or one the DA-lag guard or the
     /// record-lag guard refused. No republish can order it now: drop it from the unconfirmed
-    /// ledger, so it never republishes, and tell the client, so it can
-    /// resubmit instead of waiting out its timeout.
+    /// ledger, so it never republishes, free its nonce for the resubmit,
+    /// and tell the client, so it can resubmit instead of waiting out its
+    /// timeout.
     fn apply_deadline_rejects<P: SequencerPorts>(
         &mut self,
         r: &mut crate::resync::ResyncController,
@@ -655,8 +660,7 @@ impl Sequencer {
         refusal: crate::resync::SealerRefusal,
     ) {
         let tx_hash = self
-            .unconfirmed
-            .drop_committed(refusal.sender, refusal.nonce)
+            .free_refused_nonce(refusal.sender, refusal.nonce)
             .map(|meta| meta.tx_hash);
         warn!(
             sender = ?refusal.sender,
@@ -674,6 +678,41 @@ impl Sequencer {
             Some(tx_hash) => self.publish_rejection(rc, tx_hash, err),
             None => self.publish_error(rc, err),
         }
+    }
+
+    /// Drop the refused ref of `sender` at `nonce` from the ledger, and
+    /// free its nonce. The sealer refuses before its contiguity guard, so
+    /// its expected nonce for the sender stays at `nonce`. Every later ref
+    /// of the sender gets a contiguity reject until a ref at `nonce` is
+    /// ordered, and only the client can sign one. So the later refs leave
+    /// the ledger and park, and the floor goes back to `nonce`: a resubmit
+    /// at `nonce` publishes, and the parked refs drain behind it.
+    ///
+    /// Only a ref the ledger still holds frees its nonce. A ref with a
+    /// receipt at or above its nonce left the ledger, and a receipt floor
+    /// above `nonce` proves it executed: the refusal is then of a late
+    /// copy, and the floor stays. Returns the dropped ref's metadata.
+    fn free_refused_nonce(&mut self, sender: Address, nonce: u64) -> Option<RefMetadata> {
+        let refused = self.unconfirmed.drop_committed(sender, nonce)?;
+        if self.proven_executed(sender, nonce) {
+            return Some(refused);
+        }
+        let later = nonce
+            .checked_add(1)
+            .map(|next| self.unconfirmed.take_gap_rewinds(sender, next))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|((_, n), meta)| (n, meta))
+            .collect();
+        self.state.rewind_refused(
+            Instant::now(),
+            RefusedRun {
+                sender,
+                nonce,
+                later,
+            },
+        );
+        Some(refused)
     }
 
     /// One committed-proof contiguity reject, for

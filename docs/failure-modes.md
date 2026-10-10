@@ -483,7 +483,8 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
   - Proof: `crates/sequencer/tests/replicated_shard_racing.rs`.
 - **Late re-offer past the inclusion deadline**
-  - The ingress stamps every transaction with an inclusion deadline: the newest boundary plus the inclusion horizon (default 64 blocks). With no boundary seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The ingress stamps every transaction with an inclusion deadline: the newest sealed block plus the inclusion horizon (default 64 blocks). With no block seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The newest sealed block is the higher of two values: the newest executor boundary, and the sealed head in the status of the sealer. The sealer sends its status on every boundary tick. So the deadline moves while every executor is down, and an executor outage does not age new transactions past their deadline.
   - The sealer dedup window prunes by deadline, not by count. It drops the ids whose deadline is below the open block. It never evicts an id.
   - The sealer refuses a re-offer whose deadline has passed (`PAST_DEADLINE`). A refused re-offer cannot enter as a fresh transaction.
   - A full window (`kardamom.cluster.dedupCapacity`, default `1 << 17`) is a hard back-pressure cap. The sealer answers `WINDOW_FULL`.
@@ -492,6 +493,14 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - The sealer prints `cluster PAST-DEADLINE ...` and `cluster WINDOW-FULL ...` at power-of-two counts. No Prometheus counter exists for them.
   - The horizon must be equal on the ingress (`--inclusion-horizon-blocks`, env `KARDAMOM_INCLUSION_HORIZON_BLOCKS`) and on every sealer member (`-Dkardamom.cluster.inclusionHorizonBlocks`). The contract check (`just check-contract`, `just validate` and CI) fails if they differ.
   - Details of the sealer window: [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **A refused nonce stays free**
+  - The sealer refuses a ref past its deadline, on a DA lag, or on a record lag before its contiguity guard. Its expected nonce for the sender stays at the refused nonce. Every later nonce of the sender gets `CONTIGUITY-REJECT` until a ref at the refused nonce is ordered.
+  - The sequencer does the same. On a refusal of a ref that its publish ledger holds, it sets the floor of the sender back to the refused nonce. It takes the later refs of the sender out of the ledger and parks them above the floor. They do not republish.
+  - The resubmit of the refused nonce matches the floor and publishes. The parked refs drain behind it. A parked ref that is also past its deadline gets its own refusal, and its client resubmits it.
+  - A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
+  - A refusal of a ref with receipt proof (no ledger entry, or a receipt floor above the nonce) is of a late copy. The floor stays.
+  - The sequencer applies the refusals before the contiguity rejects of the same iteration. A gap rewind first would take the refused ref back for republish, and the sender would never get free.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.

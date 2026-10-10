@@ -155,18 +155,18 @@ impl<T> PendingBuffer<T> {
     /// transient and bounded to one drained batch; the next successful
     /// flush drains it back out.
     ///
-    /// A rebuffered entry has no deadline. It does not wait on a nonce
-    /// gap. It waits on the publisher, and it lives until the publisher
-    /// recovers. A stale deadline from its earlier life as a future-nonce
-    /// entry no longer matches, so [`Self::expire`] ignores it.
-    pub(crate) fn reinsert(&mut self, nonce: u64, value: T) {
-        self.inner.insert(
-            nonce,
-            Slot {
-                deadline: None,
-                value,
-            },
-        );
+    /// A rebuffered entry has no deadline (`None`). It does not wait on a
+    /// nonce gap. It waits on the publisher, and it lives until the
+    /// publisher recovers. A stale deadline from its earlier life as a
+    /// future-nonce entry no longer matches, so [`Self::expire`] ignores
+    /// it.
+    ///
+    /// The refusal rewind
+    /// ([`crate::state::PartitionState::rewind_refused`]) also uses this,
+    /// with a deadline. Its entries wait on a nonce gap that only the
+    /// client can fill, so they expire like fresh future-nonce entries.
+    pub(crate) fn reinsert(&mut self, nonce: u64, value: T, deadline: Option<Instant>) {
+        self.inner.insert(nonce, Slot { deadline, value });
     }
 
     /// Remove and return the entry at `nonce`, but only if it still
@@ -349,7 +349,7 @@ mod tests {
         b.insert(10, 1, d);
         assert_eq!(b.expire(10, far()), None, "a stale deadline is ignored");
         assert_eq!(b.expire(10, d), Some(1));
-        b.reinsert(11, 2);
+        b.reinsert(11, 2, None);
         assert_eq!(b.expire(11, d), None, "a rebuffered entry never expires");
         assert!(b.contains(11));
     }

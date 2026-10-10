@@ -58,6 +58,16 @@ struct ParkedDeadline {
     nonce: u64,
 }
 
+/// A ref the sealer refused for good, and the later refs of the same
+/// sender that the publish ledger gave back, as `(nonce, payload)`. The
+/// input of [`PartitionState::rewind_refused`].
+#[derive(Debug)]
+pub(crate) struct RefusedRun<T> {
+    pub(crate) sender: Address,
+    pub(crate) nonce: u64,
+    pub(crate) later: Vec<(u64, T)>,
+}
+
 #[derive(Debug)]
 pub(crate) struct PartitionState<T> {
     max_pending_per_sender: usize,
@@ -270,7 +280,43 @@ impl<T> PartitionState<T> {
         // floor already rewound below it: a permanent per-sender gap. This
         // buffer accounted for the rebuffered items moments ago. Capacity
         // applies only to fresh ingress.
-        buf.reinsert(nonce, payload);
+        buf.reinsert(nonce, payload, None);
+    }
+
+    /// Free the nonce of a ref the sealer refused for good. The sealer
+    /// refuses the ref before its contiguity guard, so its expected nonce
+    /// for the sender stays at `run.nonce`. This method does the same
+    /// here: the floor goes back to `run.nonce`, and a resubmit at that
+    /// nonce matches. The later refs in `run.later` park above the floor
+    /// and drain behind the resubmit. They wait on a gap that only the
+    /// client can fill, so each one gets a deadline of `now + tx_ttl`.
+    /// The rewind only lowers the floor, as in [`Self::reinsert_for_retry`].
+    pub(crate) fn rewind_refused(&mut self, now: Instant, run: RefusedRun<T>) {
+        let RefusedRun {
+            sender,
+            nonce,
+            later,
+        } = run;
+        let floor = self
+            .next_nonce_known(sender)
+            .map_or(nonce, |next| next.min(nonce));
+        self.next.insert(sender, floor);
+        let at = now + self.tx_ttl;
+        let buf = self
+            .pending
+            .entry(sender)
+            .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
+        // The insert is unbounded for the reason in
+        // `Self::reinsert_for_retry`: the refs left this buffer moments ago,
+        // and an eviction would lose one of them.
+        self.deadlines.extend(later.into_iter().map(|(n, payload)| {
+            buf.reinsert(n, payload, Some(at));
+            Reverse(ParkedDeadline {
+                at,
+                sender,
+                nonce: n,
+            })
+        }));
     }
 
     /// Expire the parked entries whose deadline is at or before `now`.
