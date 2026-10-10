@@ -530,6 +530,7 @@ mod tests {
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,
+            crate::Shard::Follower,
             crate::Shard::Integrity,
         ] {
             shard

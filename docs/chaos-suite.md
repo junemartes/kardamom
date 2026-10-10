@@ -65,7 +65,8 @@ There are fourteen shards. `just container-test` lists their names. Thirteen run
 | `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `follower-disagreement`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
 Case order matters in five places.
@@ -76,7 +77,7 @@ Case order matters in five places.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 
-`chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
+`chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
 
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
@@ -381,7 +382,7 @@ The steps share one budget of 300 s. A failure names the first step that did not
 
 ## The L1 fault proxy
 
-`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` shard uses it. The code is in `crates/l1_fault_proxy`.
+`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` and `chaos-follower` shards use it. The code is in `crates/l1_fault_proxy`.
 
 - The proxy forwards every call to the upstream L1 (`--upstream`, env `KARDAMOM_L1_UPSTREAM`).
 - It changes the reply as the active faults say.
@@ -421,7 +422,7 @@ Several faults can be active at once. They model one bad endpoint.
 - A lie of the proxy is therefore a disagreement for the follower: it halts and publishes none of it.
 - The in-cluster anvil finalizes two blocks behind its head (one slot in each epoch). The followers walk finalized blocks.
 - The inbox indexer starts at block 1, so its archive holds every batch.
-- The `chaos-l1` shard sets the switch itself. The default is `0`.
+- The `chaos-l1` and `chaos-follower` shards set the switch themselves. The default is `0`.
 
 [`failure-modes.md`](failure-modes.md#batcher-live-service-cluster-egress-driven) lists what the cases prove, and which two-source checks stay open.
 
@@ -463,8 +464,8 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `KARDAMOM_EXEC_CURSOR` | `off` (`on` in `chaos-executor`) | `on` when the deployed executors send their recorded cursor to the sealer. The bring-up of `chaos-executor` deploys it on. `hard-executor` checks the sealer's best cursor only when it is `on`. |
 | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | unset | The DA-lag budget of the deployed sealer, in blocks. `da-lag-halt` needs it. It must be a positive number, so the knob cannot pass 0. |
 | `RETENTION_FREEZE_CAP_S` | `600` | The hard cap of the adaptive retention freeze. |
-| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` cases stays active. |
-| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
+| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` and `chaos-follower` cases stays active. |
+| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` and `chaos-follower` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
 | `RUN_LOAD` | `1` | `1` when the load stage ran on this cluster. The chaos shards set `0`. The resize case then takes a load-reserve account. |
 
 ### CPU squeeze knobs
