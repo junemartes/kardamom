@@ -134,8 +134,9 @@ async fn register(agent: SocketAddr) -> Result<Registration, LogError> {
     };
     StartRetry::new(
         "record alloc-1:tx_errors:1015",
-        Duration::from_secs(1),
+        Duration::from_secs(2),
         timing,
+        tokio_util::sync::CancellationToken::new(),
     )
     .run(|| Registration::register(catalog.clone(), spec.clone()))
     .await

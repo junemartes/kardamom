@@ -231,6 +231,39 @@ impl AeronTestCluster {
         Ok(())
     }
 
+    /// The labels of the counters of the media driver of node `i`, read
+    /// with Aeron's `AeronStat` in the container: one label per counter,
+    /// for example `pub-lmt: <registration id> <session id> <stream id>
+    /// <channel>` for each publication. In external mode this returns no
+    /// label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails to run.
+    pub async fn driver_counter_labels(
+        &self,
+        i: usize,
+    ) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+        // `AeronStat` prints the counters every second until it ends, so
+        // `timeout` ends it after a few prints.
+        let script = "timeout 6 java -cp /opt/aeron/aeron-all.jar \
+            -Daeron.dir=\"$AERON_DIR\" io.aeron.samples.AeronStat";
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", c.container.id(), "sh", "-c", script])
+            .output()
+            .await?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" - ")
+                    .map(|(_, label)| label.trim().to_string())
+            })
+            .collect())
+    }
+
     /// Bring up a single-node cluster, spawn an [`AeronRuntime`] against
     /// its bind-mounted `aeron.dir`, and build a [`LogConfig`] whose
     /// `tx_data` channel is a plain IPC template rooted at

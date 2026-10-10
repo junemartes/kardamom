@@ -226,7 +226,7 @@ async fn a_discovered_subscription_registers_a_subscriber_record() {
         .discovered
         .as_mut()
         .unwrap()
-        .hold_subscriber_record(key, Duration::from_secs(10));
+        .hold_subscriber_record(key, Duration::from_secs(20));
     wait_until(|| reopen.subscribers_listed()).await;
     let listed = catalog
         .query(&Query {

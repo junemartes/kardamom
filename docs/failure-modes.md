@@ -1266,20 +1266,33 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - Proof: the `client_timeout_exit` test of `kardamom-log` stops a child process past a 1 s liveness timeout. The child must log the handler line on stdout and exit with status 1. One child holds a runtime client and an archive session, so both time out together.
   - The chaos cases that need an eviction read the same value (`StallTolerance` in `crates/chaos/src/knobs.rs`). The `sequencer-lapse` and `validator-lapse` freezes default to the tolerance plus 20 s. The retention-overrun freeze lasts at least that long. The waits after a driver loss grow by the tolerance.
   - The must-deliver escalation of the executor derives from the same value: the reopen of an unconnected publication after the tolerance plus 5 s, the exit after five times that. See "Dead `tx_receipts` publication".
-  - The start-up open of a discovered stream derives from the same value: it tries again for two stall budgets. See "Start-up open of a stream".
+  - The start-up open of a discovered stream derives from the same value: it waits for two stall budgets. See "Start-up open of a stream".
 - **Start-up open of a stream**
-  - Trigger: a service opens its streams through the discovery plane (`StreamPlane`) at start-up. A loaded host or a stalled media driver delays the driver answer past the 5 s add timeout (`add_publication`, `add_subscription`: `TimedOut`). Or the local Consul agent does not answer the registration of the record (no connection, no answer within `request_timeout_ms`, or a 5xx status).
-  - Effect without a retry: `main` ends with the open error, and Nomad restarts the service. A chaos case that asserts "no restart while waiting" then fails.
-  - Recovery: the plane tries the open again (`StartRetry` in `crates/log/src/discovery/start_retry.rs`).
-    - It retries each publication open, each subscription open and each record registration (publisher and subscriber records) on its own.
-    - Only a transient error starts a retry: an Aeron `TimedOut` of an add, or an unavailable catalog agent. A bad channel URI, a refused permission (a 4xx status, an ACL denial) or an invalid argument fails at once.
+  - Trigger: a service opens its streams through the discovery plane (`StreamPlane`) at start-up. A loaded host or a stalled media driver delays the answer of the driver to an add (`add_publication`, `add_subscription`). Or the local Consul agent does not answer the registration of a record (no connection, no answer within `request_timeout_ms`, or a 5xx status).
+  - Effect with the run-time add timeout of 5 s: the add fails with `TimedOut`, `main` ends with the open error, and Nomad restarts the service. A chaos case that asserts "no restart while waiting" then fails.
+  - The start-up limit is two Aeron stall budgets: 2 × max(`AERON_DRIVER_TIMEOUT` + 5 s, 10 s) (`AeronRuntime::start_open_limit`). That is 30 s at the default tolerance of 10 s, and 70 s at the CI tolerance of 30 s.
+  - Aeron add of a discovered publication or subscription: one add that waits the whole limit (`AddWait` in `crates/log/src/aeron_live/add_wait.rs`). There is no retry.
+    - The reason: an add that times out leaves its request with the driver. The Aeron client drops its poller with no cleanup, the driver completes the late add, and the publication or subscription stays registered on its own port and session until the process exits. A retry after each short timeout would leak one for each try. One long wait has the same bound and leaks nothing.
+    - A wait that ends with no answer (the limit, or a stop) cancels the add (`aeron_async_add_publication_cancel`, `aeron_async_add_subscription_cancel`), so the driver removes a late publication or subscription.
+    - The Aeron thread of the runtime polls the add, so the wait blocks the other work of that runtime: the subscriptions it already holds are not polled, and its other commands queue. This happens only at start-up, and only while the driver does not answer.
+    - An add at run time keeps the 5 s timeout: a reopen of a publication (`PublisherReopen`), and every static open.
+  - Consul registration of a record (publisher records and subscriber records): a retry with a bounded backoff (`StartRetry` in `crates/log/src/discovery/start_retry.rs`), for the same limit. A registration is idempotent and leaks nothing.
+    - Only an unavailable agent starts a retry: a connect error, a timeout, a broken transfer, or a 5xx status. A refused permission (a 4xx status, an ACL denial) or a malformed request fails at once.
     - The pauses follow the catalog backoff of `[discovery]` (`backoff_min_ms` to `backoff_max_ms`, doubling).
-    - Each failed try logs a WARN line `discovery: start-up open failed; trying again`. The line names the stream or the record (`open`) and the error.
-    - The limit is two Aeron stall budgets: 2 × (`AERON_DRIVER_TIMEOUT` + 5 s, and at least 10 s). That is 30 s at the default tolerance of 10 s, and 70 s at the CI tolerance of 30 s.
-  - After the limit, the open returns its last error. The service exits with the same error as without a retry, and Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
+    - Each failed try logs a WARN line `discovery: start-up open failed; trying again`. The line names the record (`open`) and gives the error.
+  - At the end of the limit, the open returns its last error. What happens next depends on the open:
+    - A publication open, a subscription open, or a publisher record registration: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
+    - A subscriber record registration: it runs in a background task, so its last error only logs the WARN line `discovery: subscriber registration failed`, and the service keeps running. The subscription itself is open and attaches its publishers. Without the record, the publishers of the stream treat the stream as one without a subscriber: a must-deliver publisher does not escalate for it.
+  - A stop ends the wait of an add and the retries of a registration at once, with the error `stopped during start-up open`.
+    - The executor and the validator handle SIGTERM before they open their streams, so they pass the token of that signal to the plane (`StreamPlane::stopping_opens_on`). Without the token, a SIGTERM during a stall waits for the end of the limit, and Nomad sends SIGKILL first.
+    - A service that does not handle SIGTERM during its start-up ends at the signal, as before.
   - The fail-fast handler of a live client does not change. A client error after the start still ends the process at once (see "Aeron stall tolerance").
-  - A static plane (discovery off) does not retry.
-  - Proof: the `start_retry` unit tests of `kardamom-log`; `consul_register_retry` (a fake Consul agent drops one request and answers 503 once, then accepts); `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e: the test freezes the driver for 7 s during a publication open).
+  - A static plane (discovery off) keeps the run-time add timeout and does not retry.
+  - Proof:
+    - The `add_wait` unit tests of `kardamom-log`: the start-up wait equals the limit; a wait with no answer times out once and cancels the add; a stop ends the wait at once and cancels the add.
+    - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
+    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
+    - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.

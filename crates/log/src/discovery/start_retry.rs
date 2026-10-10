@@ -1,104 +1,106 @@
-//! The bounded retry of a start-up open: a publication, a subscription,
-//! or a catalog registration that a service opens once before it serves.
+//! The bounded retry of a start-up registration: a catalog record that a
+//! service registers once before it serves.
 //!
-//! A loaded host can delay the media driver or the catalog agent past one
-//! request budget. Such a delay ends, so the open tries again after a
-//! pause. The pauses follow the catalog backoff of `[discovery]`. The
-//! tries stop at the limit: two Aeron stall budgets
-//! ([`AeronRuntime::stall_budget`]), so the stall tolerance of the deploy
-//! (`AERON_DRIVER_TIMEOUT`) sets it. After the limit, or at once on an
-//! error that no later try can clear, the open returns its last error.
-//! The service then exits as it does without a retry: a service that
-//! cannot open its streams has no state to serve.
+//! A loaded host or an agent restart can delay the Consul agent past one
+//! request budget. Such a delay ends, and a registration is idempotent,
+//! so the registration tries again after a pause. The pauses follow the
+//! catalog backoff of `[discovery]`. The tries stop at the limit that
+//! the caller gives: the start-up limit of the Aeron runtime
+//! ([`AeronRuntime::start_open_limit`]), so the stall tolerance of the
+//! deploy (`AERON_DRIVER_TIMEOUT`) sets it. After the limit, or at once
+//! on an error that no later try can clear, the registration returns its
+//! last error.
 //!
-//! [`AeronRuntime::stall_budget`]: crate::aeron_live::AeronRuntime::stall_budget
+//! An Aeron add does not use this retry. A second add during a stall
+//! only queues behind the first, so a start-up add waits the whole limit
+//! once ([`AddWait`]).
+//!
+//! A stop token ends the retries at once with a "stopped" error.
+//!
+//! [`AeronRuntime::start_open_limit`]: crate::aeron_live::AeronRuntime::start_open_limit
+//! [`AddWait`]: crate::aeron_live::AddWait
 
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::watch::WatchTiming;
 use crate::error::LogError;
 
-/// The retry state of one start-up open. See the module doc.
+/// The retry state of one start-up registration. See the module doc.
 pub struct StartRetry {
-    /// The stream, topic, or record that the open names, for the log.
+    /// The record that the registration names, for the log.
     what: String,
     limit: Duration,
     backoff: WatchTiming,
+    stop: CancellationToken,
     failures: u32,
 }
 
 impl StartRetry {
-    /// The number of Aeron stall budgets in the limit. One budget is the
-    /// wait through a stall that every Aeron party survives. The second
-    /// budget covers the tries that the stall delays.
-    const STALL_BUDGETS: u32 = 2;
-
-    /// The retry of the open of `what`, limited to two `stall_budget`s,
-    /// with the pauses of `backoff`.
+    /// The retry of the registration of `what` for up to `limit` after
+    /// the first try, with the pauses of `backoff`. A cancel of `stop`
+    /// ends the retries.
     #[must_use]
-    pub fn new(what: impl Display, stall_budget: Duration, backoff: WatchTiming) -> Self {
+    pub fn new(
+        what: impl Display,
+        limit: Duration,
+        backoff: WatchTiming,
+        stop: CancellationToken,
+    ) -> Self {
         Self {
             what: what.to_string(),
-            // A limit past `Duration::MAX` has no end, which is the
-            // meaning of so long a stall budget.
-            limit: stall_budget.saturating_mul(Self::STALL_BUDGETS),
+            limit,
             backoff,
+            stop,
             failures: 0,
         }
     }
 
-    /// The time after the first try at which the tries stop.
-    #[must_use]
-    pub fn limit(&self) -> Duration {
-        self.limit
-    }
-
-    /// Run `open` until it succeeds, fails with an error that is not
-    /// transient, or the limit passes.
+    /// Run `register` until it succeeds, fails with an error that is not
+    /// transient, the limit passes, or the stop token is cancelled. A
+    /// cancel during a pause ends the pause at once.
     ///
     /// # Errors
     ///
-    /// Returns the last error of `open`.
-    pub async fn run<T, F, Fut>(mut self, mut open: F) -> Result<T, LogError>
+    /// Returns the last error of `register`, or the "stopped" error after
+    /// a cancel.
+    pub async fn run<T, F, Fut>(mut self, mut register: F) -> Result<T, LogError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, LogError>>,
     {
         let start = tokio::time::Instant::now();
         loop {
-            match self.next(open().await, start.elapsed()) {
+            match self.next(register().await, start.elapsed()) {
                 ControlFlow::Break(done) => return done,
-                ControlFlow::Continue(pause) => tokio::time::sleep(pause).await,
+                ControlFlow::Continue(pause) => self.pause(pause).await?,
             }
         }
     }
 
-    /// [`Self::run`] for an open that blocks its thread. The pauses block
-    /// the thread too.
-    ///
-    /// # Errors
-    ///
-    /// Returns the last error of `open`.
-    pub fn run_blocking<T>(
-        mut self,
-        mut open: impl FnMut() -> Result<T, LogError>,
-    ) -> Result<T, LogError> {
-        let start = std::time::Instant::now();
-        loop {
-            match self.next(open(), start.elapsed()) {
-                ControlFlow::Break(done) => return done,
-                ControlFlow::Continue(pause) => std::thread::sleep(pause),
-            }
+    /// Sleep `pause`, or end with the "stopped" error when the stop token
+    /// is cancelled first.
+    async fn pause(&self, pause: Duration) -> Result<(), LogError> {
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => Err(self.stopped()),
+            () = tokio::time::sleep(pause) => Ok(()),
         }
+    }
+
+    /// The error of a registration that a stop ended.
+    fn stopped(&self) -> LogError {
+        LogError::Discovery(format!("stopped during start-up open of {}", self.what))
     }
 
     /// The step after one try that ended `elapsed` after the first try
-    /// started: the result, or the pause before the next try.
+    /// started: the result, or the pause before the next try. A cancelled
+    /// stop token ends the registration before the pause.
     fn next<T>(
         &mut self,
         outcome: Result<T, LogError>,
@@ -113,6 +115,10 @@ impl StartRetry {
         let left = self.limit.saturating_sub(elapsed);
         if !error.is_transient() || left.is_zero() {
             return ControlFlow::Break(Err(error));
+        }
+        if self.stop.is_cancelled() {
+            warn!(open = %self.what, error = %error, "discovery: start-up open stopped");
+            return ControlFlow::Break(Err(self.stopped()));
         }
         // The count only grows the pause, and the backoff cap stops that
         // growth long before `u32::MAX`.

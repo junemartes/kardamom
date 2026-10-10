@@ -6,12 +6,6 @@ pub enum LogError {
     #[error("aeron: {0}")]
     Aeron(String),
 
-    /// The media driver did not answer the add of a publication or a
-    /// subscription within the add timeout. A loaded host or a stalled
-    /// driver causes it, and the stall ends. See [`Self::is_transient`].
-    #[error("aeron: {0}")]
-    AeronTimedOut(String),
-
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -41,18 +35,6 @@ pub enum LogError {
 }
 
 impl LogError {
-    /// The error of a failed add of a publication or a subscription. `op`
-    /// names the add and `uri` its channel. A timeout of the add is
-    /// [`Self::AeronTimedOut`]. Every other error is [`Self::Aeron`].
-    pub(crate) fn aeron_add(op: &str, uri: &str, e: &rusteron_client::AeronCError) -> Self {
-        let msg = format!("{op} {uri}: {e}");
-        if e.kind() == rusteron_client::AeronErrorType::TimedOut {
-            Self::AeronTimedOut(msg)
-        } else {
-            Self::Aeron(msg)
-        }
-    }
-
     /// The error of a catalog request `what` that got no answer. A
     /// request that cannot be built (a bad address) is
     /// [`Self::Discovery`]. A failed connection, a timeout, or a broken
@@ -79,11 +61,11 @@ impl LogError {
         }
     }
 
-    /// Whether a later try of the same start-up open can succeed: the
-    /// driver or the catalog agent was slow, not wrong. A bad channel URI,
-    /// a refused permission, or an invalid argument fails every try.
+    /// Whether a later try of the same start-up registration can
+    /// succeed: the catalog agent was slow or down, not wrong. A refused
+    /// permission or a malformed request fails every try.
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::AeronTimedOut(_) | Self::CatalogUnavailable(_))
+        matches!(self, Self::CatalogUnavailable(_))
     }
 }

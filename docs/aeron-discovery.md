@@ -81,7 +81,7 @@ voting set.
 | `advertise_interface` | none | Interface name or IPv4 network in CIDR form. Required when enabled. Exactly one address must match. |
 | `request_timeout_ms` | `5000` | One HTTP request's connect plus response budget. |
 | `blocking_wait_ms` | `30000` | How long one blocking catalog query waits for a change. |
-| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read, and between the tries of a start-up open. |
+| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read, and between the tries of a start-up registration. |
 | `removal_grace_ms` | `5000` | A missing publisher is detached only after this long. |
 | `check_ttl_ms` | `10000` | The TTL of a publication's health check. |
 | `deregister_after_ms` | `60000` | Consul deletes a registration critical for this long. |
@@ -243,7 +243,12 @@ No job configures a publication control port.
 - The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
 - The publisher record carries the address that the driver bound.
 - The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
-- The start-up open of a publication, of a subscription and of a record registration tries again on a transient error: an Aeron `TimedOut` of an add, or a Consul agent that gives no answer or a 5xx status. The limit is two Aeron stall budgets (30 s at the default tolerance, 70 s in CI), and the pauses follow `backoff_min_ms` to `backoff_max_ms`. Each try logs a WARN line that names the stream or the record. After the limit the service exits with the open error. See "Start-up open of a stream" in [failure-modes.md](failure-modes.md#substrate-the-shared-failure-domain).
+- A start-up open waits for the start-up limit: two Aeron stall budgets (30 s at the default tolerance, 70 s in CI).
+  - The Aeron add of a publication or a subscription is one add that waits the whole limit, with no retry. An add that times out stays registered in the driver, so a retry would leak one publication or subscription for each try. A wait that ends with no answer cancels the add.
+  - The Consul registration of a record retries an unavailable agent (no answer, or a 5xx status) with the pauses of `backoff_min_ms` to `backoff_max_ms`. Each try logs a WARN line that names the record.
+  - After the limit, a failed publication open, subscription open or publisher record registration ends the start-up, and the service exits with the open error. A failed subscriber record registration only logs a WARN line, and the service runs without that record.
+  - A stop token (`StreamPlane::stopping_opens_on`) ends the wait and the retries at once.
+  - See "Start-up open of a stream" in [failure-modes.md](failure-modes.md#substrate-the-shared-failure-domain).
 - A publisher can open a publication again (`StreamPlane::tx_receipts_reopen`). The new publication binds a new port. The record of the same service id moves to it through the heartbeat of its registration (`RecordMover`), so every write of the id goes through one task, and a re-registration after a lost check writes the moved record. The subscribers detach the old control endpoint and attach the new one. The executor does this for a `tx_receipts` publication that stays unconnected for one Aeron stall budget while a subscriber record of the stream exists. See "Dead `tx_receipts` publication" in [failure-modes.md](failure-modes.md#executor).
 
 | Job | Publications |
