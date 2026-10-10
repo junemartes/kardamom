@@ -42,7 +42,7 @@ const REPLAY_REFUSED: &str = "cluster replay unavailable";
 const POST_CONFIRMED: &str = "batch confirmed on L1";
 
 /// The frozen batcher: its node, its inner container, and its exporter.
-struct FrozenBatcher {
+pub(super) struct FrozenBatcher {
     node: String,
     inner: String,
     target: Target,
@@ -50,7 +50,7 @@ struct FrozenBatcher {
 
 impl FrozenBatcher {
     /// Freeze the batcher on the aux node, verified by its dark exporter.
-    async fn freeze(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
+    pub(super) async fn freeze(h: &Harness, ctx: &str) -> anyhow::Result<Self> {
         let node = h.probes.validator.container.clone();
         let inner = h
             .nodes
@@ -67,7 +67,7 @@ impl FrozenBatcher {
         })
     }
 
-    async fn thaw(&self, h: &Harness, ctx: &str) {
+    pub(super) async fn thaw(&self, h: &Harness, ctx: &str) {
         if h.thaw(&self.node, &self.inner).await.is_err() {
             crate::log(format!(
                 "{ctx}: SIGCONT failed (container may have been replaced mid-freeze)"
@@ -84,7 +84,7 @@ impl FrozenBatcher {
 
 /// The cluster status as the first ingress mirrors it.
 #[derive(Debug, Clone, Copy)]
-struct Status {
+pub(super) struct Status {
     posted: i64,
     sealed: i64,
     retained: i64,
@@ -163,7 +163,7 @@ pub(crate) async fn da_lag_halt(h: &mut Harness) -> anyhow::Result<()> {
     );
     let rpc = Rpc::new(&h.rpc_url, h.knobs.chain_id)?;
     let gate = h.knobs.gate_account;
-    rpc.transfer_at(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
+    rpc.transfer_hash(gate, rpc.nonce_of(gate).await?, Duration::from_secs(60))
         .await
         .map_err(|e| crate::chaos_fail!("{ctx}: a transfer after the resume failed: {e:#}"))?;
     await_all_running(h, ctx).await?;
@@ -224,7 +224,12 @@ async fn await_all_running(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 
 /// Wait until the ingress reports the halt flag `halted`, within the
 /// freeze cap.
-async fn await_halt(h: &Harness, ctx: &str, budget: i64, halted: bool) -> anyhow::Result<Status> {
+pub(super) async fn await_halt(
+    h: &Harness,
+    ctx: &str,
+    budget: i64,
+    halted: bool,
+) -> anyhow::Result<Status> {
     let outcome = poll::until(
         Budget::new(h.knobs.retention_freeze_cap, Duration::from_secs(5)),
         |_| async move { Ok::<_, anyhow::Error>(status(h).await.filter(|s| s.halted == halted)) },

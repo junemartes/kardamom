@@ -237,8 +237,14 @@
         ring_offset: >-
           {{ workloads_canary_ring_offset if workloads_canary_mnemonic | length > 0
              else workloads_canary_dev_ring_offset }}
+        lockbox_address: "{{ workloads_lockbox_address if workloads_canary_l1_key | length > 0 else '' }}"
+        safe_timeout_ms: "{{ workloads_canary_safe_timeout_ms }}"
+      # The deposit probe's L1: the real L1 when one is given, else the
+      # in-cluster anvil. Its key only when one is given.
       secrets:
         KARDAMOM_CANARY_MNEMONIC: "{{ workloads_canary_mnemonic | default(workloads_canary_dev_mnemonic, true) }}"
+        KARDAMOM_CANARY_L1_KEY: "{{ workloads_canary_l1_key }}"
+        KARDAMOM_L1_RPC: "{{ workloads_l1_rpc_given | default(workloads_anvil_service_rpc, true) }}"
   when: workloads_canary_deployed | bool
 
 - name: Record the deployed manifest

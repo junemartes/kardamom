@@ -480,13 +480,17 @@ All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-can
 | Metric | Meaning |
 | --- | --- |
 | `probe_total{probe,endpoint,outcome}` | Probe runs. A failure outcome adds one detail label: `code` (`rpc_error`), `reason` (`rejected`), `stage` (`timeout`) or `field` (`fee_mismatch`). |
-| `stage_seconds{probe,endpoint,stage}` | Stage latencies. `transfer`: `submit` (submit to hash), `offered`, `sealed`, `executed` and `receipt` (hash to each). `contract`: `receipt` (submit to receipt) and `read` (receipt to read). The buckets go from 5 ms to one hour. |
+| `stage_seconds{probe,endpoint,stage}` | Stage latencies. `transfer`: `submit` (submit to hash), `offered`, `sealed`, `executed` and `receipt` (hash to each). `contract` and the market probes: `receipt` (submit to receipt); `contract` also `read`. `safe`: `safe` (receipt to the safe head). `deposit`: `l1_inclusion`, `l1_finality`, `l2_credit`. The buckets go from 5 ms to one hour. |
 | `last_success_timestamp_seconds{probe}` | The unix time of the last success. |
 | `balance_wei{layer,account}` | The balance of each canary account. |
 | `balance_floor_wei{layer}` | The balance under which an account is unfunded. |
 | `account_stalled{account}`, `account_stalled_nonce{account}` | 1, and the nonce, while a ring account holds a transaction that the canary cannot resolve. |
 | `feed_gaps_total{kind}` | Status feed gaps: `lagged`, `disconnect`, or `missing_<stage>` for a stage that never came though the receipt did. A gap is not a transaction failure. |
 | `feed_connected` | 1 while the status feed session is open. |
+| `pool_reserve{asset}`, `pool_price_eth` | The canary pool's reserves (`eth`, `kca`, in wei) and its price of one KCA in ETH, after the canary's last call. |
+| `pool_external_total` | Pool activity of another account between two canary calls. It is not a fault. |
+| `rwa_supply_tokens` | The test RWA token's total supply. |
+| `topups_total{outcome}` | Top-ups of ring accounts from the first one. |
 
 ### Notifier
 

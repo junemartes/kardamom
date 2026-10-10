@@ -61,7 +61,7 @@ The layout tests of the frozen formats:
 | `aeron-stream-records` | `kardamom-types` | rkyv archived size and alignment of the seven record types |
 | `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
 | `redis-cache` | `kardamom-cache` | the keys of fixed samples |
-| `canary-journal`, `canary-store` | `kardamom-canary` | the JSON of fixed samples |
+| `canary-journal`, `canary-store`, `canary-market` | `kardamom-canary` | the JSON of fixed samples |
 
 What the layout tests do not cover:
 
