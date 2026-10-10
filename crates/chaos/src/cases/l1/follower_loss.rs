@@ -33,6 +33,8 @@ const WAITING: &str = "kardamom_da_watcher_waiting_for_l1_block";
 const TOTAL_LOSS_HOLD: Duration = Duration::from_secs(75);
 /// How long the da-watcher may take to resume once the follower is back.
 const RESUME_BUDGET: Duration = Duration::from_secs(180);
+/// The most samples a read takes to find one with no publish inside it.
+const READ_ATTEMPTS: usize = 20;
 
 /// The da-watcher's view: its last published block, its published count,
 /// its pause on the follower, and whether it waits for a record.
@@ -44,13 +46,37 @@ struct Watcher {
 }
 
 impl Watcher {
+    /// A consistent sample: the published count is read before and after
+    /// the other values, and the sample counts only when the two match.
+    /// A publish sets the count and the origin together, so a match means
+    /// that no publish fell between the reads. After `READ_ATTEMPTS`
+    /// mismatches, the last sample stands.
     async fn read(h: &Harness) -> Self {
-        let p = &h.probes;
-        Self {
-            followers: Followers::read(h).await,
-            published: p.aux_metric(DA_WATCHER_PORT, PUBLISHED_TOTAL).await,
-            waiting: p.aux_metric(DA_WATCHER_PORT, WAITING).await,
+        let mut sample = Self::read_once(h).await;
+        let mut attempts = 1;
+        while !sample.1 && attempts < READ_ATTEMPTS {
+            sample = Self::read_once(h).await;
+            attempts = attempts.saturating_add(1);
         }
+        sample.0
+    }
+
+    /// One sample, and whether the count stood still through it.
+    async fn read_once(h: &Harness) -> (Self, bool) {
+        let p = &h.probes;
+        let before = p.aux_metric(DA_WATCHER_PORT, PUBLISHED_TOTAL).await;
+        let followers = Followers::read(h).await;
+        let waiting = p.aux_metric(DA_WATCHER_PORT, WAITING).await;
+        let published = p.aux_metric(DA_WATCHER_PORT, PUBLISHED_TOTAL).await;
+        let still = before.is_some() && before == published;
+        (
+            Self {
+                followers,
+                published,
+                waiting,
+            },
+            still,
+        )
     }
 
     fn origin(self) -> Option<i64> {
