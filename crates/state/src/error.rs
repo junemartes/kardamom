@@ -52,6 +52,16 @@ pub enum StateError {
         image_genesis: alloy_primitives::B256,
         expected: alloy_primitives::B256,
     },
+    /// A checkpoint image of a state schema that this release does not
+    /// read. The adopter skips it and takes the next checkpoint.
+    #[error(
+        "checkpoint {image} holds state schema {schema}; this release reads schema {supported} only"
+    )]
+    UnreadableCheckpointSchema {
+        image: String,
+        schema: u32,
+        supported: u32,
+    },
     #[error(
         "genesis mismatch: this env was seeded from a different genesis (stored digest {stored}, supplied {supplied}); refusing to run on divergent genesis state"
     )]

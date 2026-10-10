@@ -315,6 +315,9 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
+- `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
+  - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
+  - Growth on a steady fleet means a node runs a release of another schema.
 - `validator_bal_sub_reopen_total` counts the reopens of the `tx_bal` subscription after 60 s of silence.
   - A few reopens on an idle cluster are noise.
   - Growth on a chain that progresses means the BAL delivery to that node is broken. The verification coverage drops.
@@ -348,6 +351,7 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_idle_flush_seconds` | The idle flush wait. The alert compares the post age with twice this value. |
 | `kardamom_batcher_resume_failures_total` | Starts whose L1 read failed. The start retries in the process, so the counter stays scrapeable. |
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |
+| `kardamom_batcher_spool_dropped_total{reason}` | Spools dropped at start. `other-version`: a spool of another release. `unreadable`: a block file does not decode. `discontinuous`: the spool does not continue the confirmed cursor. The sealer serves the range again. One after a deploy is expected. Growth means the spool disk is bad. |
 | `kardamom_batcher_feed_running` | 1 when the feed loop runs over the restored spool. The readiness rule needs it. |
 
 ### L1 sources
