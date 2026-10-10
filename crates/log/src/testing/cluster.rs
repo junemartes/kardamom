@@ -205,6 +205,32 @@ impl AeronTestCluster {
         Ok(())
     }
 
+    /// Freeze node `i` with `docker pause`, or thaw it with `docker
+    /// unpause`. A frozen media driver answers no client command until it
+    /// thaws. In external mode this is a no-op, since the operator
+    /// manages the MD.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails.
+    pub async fn set_frozen(&self, i: usize, frozen: bool) -> anyhow::Result<()> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(());
+        };
+        let verb = if frozen { "pause" } else { "unpause" };
+        let out = tokio::process::Command::new("docker")
+            .args([verb, c.container.id()])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "docker {verb} failed with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+
     /// Bring up a single-node cluster, spawn an [`AeronRuntime`] against
     /// its bind-mounted `aeron.dir`, and build a [`LogConfig`] whose
     /// `tx_data` channel is a plain IPC template rooted at

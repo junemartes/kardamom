@@ -1,6 +1,7 @@
 //! Real-Aeron check of the executor stream over the in-memory catalog: a
 //! discovered `exec_txs` subscriber receives the record of a discovered
-//! `exec_txs` publisher unchanged.
+//! `exec_txs` publisher unchanged. A publication open that a frozen media
+//! driver times out tries again and succeeds after the driver thaws.
 //!
 //! Gated on the `docker-e2e` feature and on Docker availability.
 
@@ -10,6 +11,7 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kardamom_log::aeron_live::{ExecTxsPublisherHandle, ExecTxsSubscriberHandle};
@@ -92,4 +94,46 @@ async fn a_discovered_subscriber_receives_the_executor_record() {
 
     executor_plane.shutdown().await;
     validator_plane.shutdown().await;
+}
+
+/// How long the driver stays frozen: past the 5 s add timeout of the
+/// first try, and below the 10 s default driver timeout of the client.
+const FREEZE: Duration = Duration::from_secs(7);
+
+/// The add timeout of a publication on the Aeron thread.
+const ADD_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test discovered_exec_txs -- --ignored`"]
+async fn a_publication_open_outlasts_a_driver_stall() {
+    kardamom_log::testing::require_docker().await;
+    let SingleNodeRig { cluster, rt, cfg } = AeronTestCluster::single_node_runtime(5311).await;
+    let cfg = config(&cfg);
+    let catalog = MemoryCatalog::new();
+    let cluster = Arc::new(cluster);
+
+    cluster
+        .set_frozen(0, true)
+        .await
+        .expect("freeze the driver");
+    let thaw = {
+        let cluster = cluster.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(FREEZE).await;
+            cluster.set_frozen(0, false).await
+        })
+    };
+    let start = Instant::now();
+    let mut executor_plane = plane(&cfg, "executor", &catalog);
+    let opened = executor_plane
+        .publisher::<ExecTxsPublisherHandle>(&rt)
+        .await;
+    thaw.await.expect("thaw task").expect("thaw the driver");
+    opened.expect("the open outlasts the stall");
+    assert!(
+        start.elapsed() > ADD_TIMEOUT,
+        "the first add must time out, so a later try opened the publication"
+    );
+
+    executor_plane.shutdown().await;
 }

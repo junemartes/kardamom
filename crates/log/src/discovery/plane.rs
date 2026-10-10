@@ -28,6 +28,7 @@ use super::record::{
     PublisherRecord, SUBSCRIBER_SERVICE, Scope, SubscriberRecord, Topic,
 };
 use super::registration::Registration;
+use super::start_retry::StartRetry;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
 use super::{Instance, catalog_from_config, scope_from_config};
 use crate::aeron_live::{AeronRuntime, Destinations, PubHandle, RawFrame, TypedSubscription};
@@ -67,6 +68,16 @@ pub struct StreamKey {
 }
 
 impl StreamKey {
+    /// The name of the publication of this stream, for the log.
+    fn publication(self) -> String {
+        format!("{} publication on stream {}", self.topic, self.stream_id)
+    }
+
+    /// The name of the subscription of this stream, for the log.
+    fn subscription(self) -> String {
+        format!("{} subscription on stream {}", self.topic, self.stream_id)
+    }
+
     /// The catalog filter of every publisher of this stream in `scope`.
     fn filter(self, scope: &Scope) -> BTreeMap<String, String> {
         let mut meta = topic_filter(self.topic, scope);
@@ -112,17 +123,27 @@ struct Discovered {
 }
 
 impl Discovered {
+    /// The retry of one start-up open of `what` under the stall budget of
+    /// the Aeron runtime. See [`StartRetry`].
+    fn start_retry(&self, what: impl std::fmt::Display, stall_budget: Duration) -> StartRetry {
+        StartRetry::new(what, stall_budget, WatchTiming::from_config(&self.cfg))
+    }
+
     /// Open a dynamic MDC publication for `key` and register it. The
     /// driver binds the control port, and the record carries the address
     /// the driver bound, so no other socket can take the port between the
-    /// bind and the registration.
+    /// bind and the registration. The open and the registration each
+    /// retry a transient error ([`StartRetry`]).
     async fn open_publication(
         &mut self,
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<PubHandle, LogError> {
         let uri = publication_uri(IpAddr::V4(self.ip), &self.cfg.flow_control, key.topic);
-        let (publication, control) = rt.open_mdc_publication(&uri, key.stream_id)?;
+        let (publication, control) = self
+            .start_retry(key.publication(), rt.stall_budget())
+            .run(|| std::future::ready(rt.open_mdc_publication(&uri, key.stream_id)))
+            .await?;
         let record = PublisherRecord {
             id: self.instance.service_id(key.topic, key.stream_id),
             control,
@@ -137,7 +158,10 @@ impl Discovered {
             ttl: self.cfg.check_ttl(),
             deregister_after: self.cfg.deregister_after(),
         };
-        let registration = Registration::register(self.catalog.clone(), spec).await?;
+        let registration = self
+            .start_retry(format_args!("record {}", spec.entry.id), rt.stall_budget())
+            .run(|| Registration::register(self.catalog.clone(), spec.clone()))
+            .await?;
         info!(topic = %key.topic, stream_id = key.stream_id, %control, "discovery: publication open");
         self.registrations.push(registration);
         Ok(publication)
@@ -150,11 +174,9 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<TypedSubscription<T>, LogError> {
-        let (sub_id, rx) =
-            rt.open_subscription_with_id::<T>(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
-        self.start_reconcile(rt.destinations(sub_id), key);
-        self.hold_subscriber_record(key);
-        Ok(rx)
+        self.open_manual(rt, key, |rt| {
+            rt.open_subscription_with_id::<T>(MANUAL_SUBSCRIPTION_URI, key.stream_id)
+        })
     }
 
     /// Open a multi-destination subscription for `key` delivering raw
@@ -164,18 +186,36 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
-        let (sub_id, rx) = rt.open_subscription_raw(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
+        self.open_manual(rt, key, |rt| {
+            rt.open_subscription_raw(MANUAL_SUBSCRIPTION_URI, key.stream_id)
+        })
+    }
+
+    /// Open the multi-destination subscription of `key` with `open`,
+    /// which returns its `sub_id` and its receiver, and start its watch,
+    /// reconcile and record tasks. The open retries a transient error
+    /// ([`StartRetry`]).
+    fn open_manual<R>(
+        &mut self,
+        rt: &AeronRuntime,
+        key: StreamKey,
+        open: impl Fn(&AeronRuntime) -> Result<(u32, R), LogError>,
+    ) -> Result<R, LogError> {
+        let (sub_id, rx) = self
+            .start_retry(key.subscription(), rt.stall_budget())
+            .run_blocking(|| open(rt))?;
         self.start_reconcile(rt.destinations(sub_id), key);
-        self.hold_subscriber_record(key);
+        self.hold_subscriber_record(key, rt.stall_budget());
         Ok(rx)
     }
 
     /// Register the subscriber record of `key` and hold it until the
     /// plane shuts down. The task owns the registration: it deregisters
-    /// on cancel. A failed registration leaves the publishers of the
-    /// stream without the record, and they then treat the stream as one
-    /// without a subscriber.
-    fn hold_subscriber_record(&mut self, key: StreamKey) {
+    /// on cancel. The registration retries a transient error up to the
+    /// limit of `stall_budget` ([`StartRetry`]). A failed registration
+    /// leaves the publishers of the stream without the record, and they
+    /// then treat the stream as one without a subscriber.
+    fn hold_subscriber_record(&mut self, key: StreamKey, stall_budget: Duration) {
         let record = SubscriberRecord {
             id: self.instance.subscriber_id(key.topic, key.stream_id),
             address: IpAddr::V4(self.ip),
@@ -186,6 +226,7 @@ impl Discovered {
         };
         let held = SubscriberRegistration {
             catalog: self.catalog.clone(),
+            retry: self.start_retry(format_args!("record {}", record.id), stall_budget),
             spec: RegistrationSpec {
                 entry: record.entry(&self.scope),
                 ttl: self.cfg.check_ttl(),
@@ -271,21 +312,33 @@ impl Discovered {
 /// the plane. See [`Discovered::hold_subscriber_record`].
 struct SubscriberRegistration {
     catalog: Catalog,
+    retry: StartRetry,
     spec: RegistrationSpec,
     cancel: CancellationToken,
 }
 
 impl SubscriberRegistration {
     async fn run(self) {
-        let id = self.spec.entry.id.clone();
-        let registration = match Registration::register(self.catalog, self.spec).await {
+        let Self {
+            catalog,
+            retry,
+            spec,
+            cancel,
+        } = self;
+        let id = spec.entry.id.clone();
+        // A shutdown during the retries ends the task with no record.
+        let registered = tokio::select! {
+            () = cancel.cancelled() => return,
+            r = retry.run(|| Registration::register(catalog.clone(), spec.clone())) => r,
+        };
+        let registration = match registered {
             Ok(registration) => registration,
             Err(e) => {
                 warn!(service = %id, error = %e, "discovery: subscriber registration failed");
                 return;
             }
         };
-        self.cancel.cancelled().await;
+        cancel.cancelled().await;
         if let Err(e) = registration.deregister().await {
             warn!(service = %id, error = %e, "discovery: subscriber deregistration failed at shutdown");
         }

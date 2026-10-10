@@ -400,7 +400,7 @@ impl AeronThread {
         let publication = self
             .aeron
             .add_exclusive_publication(c.as_c_str(), stream_id, ADD_PUB_TIMEOUT)
-            .map_err(|e| LogError::Aeron(format!("add_exclusive_publication {uri}: {e}")))?;
+            .map_err(|e| LogError::aeron_add("add_exclusive_publication", uri, &e))?;
         self.push_pub(TablePub::Exclusive(publication), stream_id)
     }
 
@@ -557,7 +557,7 @@ impl AeronThread {
         let c = crate::ffi::c_uri(uri, "uri")?;
         self.aeron
             .add_publication(c.as_c_str(), stream_id, ADD_PUB_TIMEOUT)
-            .map_err(|e| LogError::Aeron(format!("add_publication {uri}: {e}")))
+            .map_err(|e| LogError::aeron_add("add_publication", uri, &e))
     }
 
     /// Open a subscription with the image log of this thread.
@@ -571,7 +571,7 @@ impl AeronThread {
                 Some(self.image_log.unavailable),
                 ADD_SUB_TIMEOUT,
             )
-            .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))
+            .map_err(|e| LogError::aeron_add("add_subscription", uri, &e))
     }
 
     /// Attach a source endpoint (`uri`, for example
