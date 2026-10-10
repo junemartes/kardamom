@@ -87,9 +87,11 @@ impl StartWait {
     /// of that context for the client start. The Aeron C client waits up
     /// to its driver timeout for a live driver: for the `CnC` file, and
     /// for a heartbeat younger than the timeout after a driver restart.
-    pub(super) fn wait(&self) -> Result<(), LogError> {
+    /// Returns the budget, which the runtime keeps for its users.
+    pub(super) fn wait(&self) -> Result<DriverBudget, LogError> {
         let budget = Self::recv(&self.budget, CONTEXT_BUDGET, "build its context")?;
-        Self::recv(&self.started, budget.duration(), "signal start")
+        Self::recv(&self.started, budget.duration(), "signal start")?;
+        Ok(budget)
     }
 
     /// One report, or an error that names the step and the wait.

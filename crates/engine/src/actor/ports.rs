@@ -47,6 +47,27 @@ pub trait TxReceiptsPublication: Send {
             self.publish(CMessage::Receipt(item.receipt.clone()))
         })
     }
+
+    /// Open the publication again, on a new session, after it stayed
+    /// unconnected for one stall budget. The live transport opens a new
+    /// Aeron publication and moves its discovery record. A sink with no
+    /// transport, the default, has nothing to open.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the new publication fails to open.
+    fn reopen(&mut self) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
+    /// Whether a subscriber of the publication is known. The escalation
+    /// clock of a not-connected publication runs only while one is: a
+    /// stream without a subscriber has nothing to reopen for. The live
+    /// transport reads the subscriber records of discovery. A sink with
+    /// no transport, the default, always has its consumer.
+    fn subscribers_listed(&mut self) -> bool {
+        true
+    }
 }
 
 /// Run `publish_one` over `items` in order and stop at the first error.
@@ -132,6 +153,20 @@ impl<A: TxReceiptsPublication, B: TxReceiptsPublication> TxReceiptsPublication f
         match self {
             Self::Left(a) => a.publish_receipts(items),
             Self::Right(b) => b.publish_receipts(items),
+        }
+    }
+
+    fn reopen(&mut self) -> Result<(), ExecutorError> {
+        match self {
+            Self::Left(a) => a.reopen(),
+            Self::Right(b) => b.reopen(),
+        }
+    }
+
+    fn subscribers_listed(&mut self) -> bool {
+        match self {
+            Self::Left(a) => a.subscribers_listed(),
+            Self::Right(b) => b.subscribers_listed(),
         }
     }
 }

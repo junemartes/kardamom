@@ -2,16 +2,19 @@
 //! bound, kept passing by a heartbeat, and deregistered on graceful exit.
 //! After a crash the TTL check turns critical, consumers detach after
 //! their grace, and the catalog deletes the record after the configured
-//! critical window.
+//! critical window. A record moves to a new entry through the heartbeat
+//! ([`RecordMover`]), so every write of the id goes through one task and
+//! a later re-registration writes the moved entry.
 
 use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::catalog::{Catalog, RegistrationSpec};
-use super::record::ServiceId;
+use super::record::{ServiceEntry, ServiceId};
 use crate::error::LogError;
 
 pub struct Registration {
@@ -19,6 +22,41 @@ pub struct Registration {
     id: ServiceId,
     cancel: CancellationToken,
     heartbeat: JoinHandle<()>,
+    moves: mpsc::UnboundedSender<RecordMove>,
+}
+
+/// One move of the record to `entry`, with the reply of the heartbeat.
+struct RecordMove {
+    entry: ServiceEntry,
+    ack: oneshot::Sender<Result<(), LogError>>,
+}
+
+/// Moves the record of a registration to a new entry of the same id. The
+/// heartbeat registers the entry and keeps it as the spec of every later
+/// pass, so a re-registration after a lost check writes the moved entry,
+/// not the first one.
+#[derive(Clone)]
+pub struct RecordMover {
+    moves: mpsc::UnboundedSender<RecordMove>,
+}
+
+impl RecordMover {
+    /// Register `entry` under the id of the registration and pass its
+    /// check. Returns once the catalog holds the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog refuses the entry, or if the
+    /// registration is gone.
+    pub async fn relocate(&self, entry: ServiceEntry) -> Result<(), LogError> {
+        let (ack, done) = oneshot::channel();
+        self.moves
+            .send(RecordMove { entry, ack })
+            .map_err(|_| LogError::Discovery("record move: the registration is gone".into()))?;
+        done.await.map_err(|_| {
+            LogError::Discovery("record move: the registration ended during the move".into())
+        })?
+    }
 }
 
 /// The heartbeat's per-tick state.
@@ -27,35 +65,61 @@ struct Heartbeat {
     spec: RegistrationSpec,
     cancel: CancellationToken,
     interval: Duration,
+    moves: mpsc::UnboundedReceiver<RecordMove>,
 }
 
 impl Heartbeat {
-    async fn run(self) {
+    async fn run(mut self) {
         while self.tick().await {}
     }
 
-    /// Wait one interval, then pass the check. A failed pass means the
-    /// agent forgot the check (an agent restart), so the registration is
-    /// repeated. `false` ends the loop.
-    async fn tick(&self) -> bool {
+    /// Wait for a move or one interval. A move registers the new entry. An
+    /// interval passes the check. A failed pass means the agent forgot the
+    /// check (an agent restart), so the registration is repeated. `false`
+    /// ends the loop.
+    async fn tick(&mut self) -> bool {
         tokio::select! {
-            () = self.cancel.cancelled() => return false,
-            () = tokio::time::sleep(self.interval) => {}
+            () = self.cancel.cancelled() => false,
+            Some(mv) = self.moves.recv() => {
+                self.relocate(mv).await;
+                true
+            }
+            () = tokio::time::sleep(self.interval) => {
+                self.pass().await;
+                true
+            }
         }
+    }
+
+    async fn pass(&self) {
         if let Err(e) = self.catalog.pass(&self.spec.entry.id).await {
             warn!(service = %self.spec.entry.id, error = %e, "discovery: check pass failed; re-registering");
             self.re_register().await;
         }
-        true
+    }
+
+    /// Take `mv.entry` as the spec of every later pass, register it, and
+    /// answer the mover.
+    async fn relocate(&mut self, mv: RecordMove) {
+        self.spec.entry = mv.entry;
+        let outcome = self.register_and_pass().await;
+        if outcome.is_ok() {
+            info!(
+                service = %self.spec.entry.id,
+                endpoint = %self.spec.entry.socket_addr(),
+                "discovery: record moved"
+            );
+        }
+        let _ = mv.ack.send(outcome);
+    }
+
+    async fn register_and_pass(&self) -> Result<(), LogError> {
+        self.catalog.register(&self.spec).await?;
+        self.catalog.pass(&self.spec.entry.id).await
     }
 
     async fn re_register(&self) {
-        let registered = self.catalog.register(&self.spec).await;
-        let passed = match registered {
-            Ok(()) => self.catalog.pass(&self.spec.entry.id).await,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = passed {
+        if let Err(e) = self.register_and_pass().await {
             warn!(service = %self.spec.entry.id, error = %e, "discovery: re-registration failed; retrying next tick");
         }
     }
@@ -79,12 +143,14 @@ impl Registration {
             "discovery: registered"
         );
         let cancel = CancellationToken::new();
+        let (moves, move_rx) = mpsc::unbounded_channel();
         let heartbeat = tokio::spawn(
             Heartbeat {
                 catalog: catalog.clone(),
                 interval: spec.ttl / 3,
                 spec: spec.clone(),
                 cancel: cancel.clone(),
+                moves: move_rx,
             }
             .run(),
         );
@@ -93,12 +159,21 @@ impl Registration {
             id: spec.entry.id,
             cancel,
             heartbeat,
+            moves,
         })
     }
 
     #[must_use]
     pub fn id(&self) -> &ServiceId {
         &self.id
+    }
+
+    /// The mover of this record. See [`RecordMover`].
+    #[must_use]
+    pub fn mover(&self) -> RecordMover {
+        RecordMover {
+            moves: self.moves.clone(),
+        }
     }
 
     /// Stop the heartbeat and delete the record. This is the graceful
@@ -123,3 +198,7 @@ impl Drop for Registration {
         self.cancel.cancel();
     }
 }
+
+#[cfg(test)]
+#[path = "registration_tests.rs"]
+mod tests;

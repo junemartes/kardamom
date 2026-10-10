@@ -254,7 +254,9 @@ pending = "pending:0x0000000000000000000000000000000000000000"
 index_tag = "00000000000000000007"
 
 # The service discovery records in Consul. A runtime ignores a record of
-# another version, so a mixed fleet does not find its peers.
+# another version, so a mixed fleet does not find its peers. The version
+# covers both runtime-owned record kinds: kardamom-mdc-publisher and
+# kardamom-mdc-subscriber.
 [format.discovery-record]
 writes = 1
 reads_min = 1

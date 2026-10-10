@@ -129,7 +129,7 @@ impl StreamPlane {
         }
     }
 
-    fn receipts_key(&self) -> StreamKey {
+    pub(super) fn receipts_key(&self) -> StreamKey {
         StreamKey {
             topic: Topic::TxReceipts,
             stream_id: self.channels.tx_receipts_stream_id,

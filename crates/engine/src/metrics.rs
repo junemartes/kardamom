@@ -70,6 +70,15 @@ pub(crate) const TX_DATA_QUEUE_DEPTH: &str = "kardamom_executor_tx_data_queue_de
 // event is rare by design. Any non-zero rate is worth an alert. It means a
 // node fell behind the retention window.
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
+
+/// Whether the must-deliver publication of `topic` has a connected
+/// subscriber: 1 while its publishes land, 0 while they fail with
+/// `NOT_CONNECTED`. The commit thread writes it on each change.
+pub const PUBLICATION_CONNECTED: &str = "kardamom_publication_connected";
+/// How long the current unconnected period of `topic` has lasted, in
+/// seconds. 0 while the publication is connected. The escalation reopens
+/// the publication after one stall budget and exits after four.
+pub const PUBLICATION_NOT_CONNECTED_SECONDS: &str = "kardamom_publication_not_connected_seconds";
 // The invalid-tx-skip counter comes from inside the `no_std` exec core
 // (`invalid_skip`). The constant and its `record_` helper live there. This
 // re-export keeps the metric namespace browsable in one place.
@@ -113,6 +122,14 @@ pub fn describe() {
     metrics::describe_counter!(
         RESYNC_TOTAL,
         "full-resync fallbacks after a cluster replay-window overrun, by outcome"
+    );
+    metrics::describe_gauge!(
+        PUBLICATION_CONNECTED,
+        "1 while the must-deliver publication of the topic has a connected subscriber"
+    );
+    metrics::describe_gauge!(
+        PUBLICATION_NOT_CONNECTED_SECONDS,
+        "seconds the current unconnected period of the topic has lasted; 0 while connected"
     );
     metrics::describe_counter!(
         FOOTPRINT_BLOCKS_TOTAL,

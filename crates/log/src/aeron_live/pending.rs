@@ -128,7 +128,7 @@ pub(super) struct PendingPublish {
 /// straight back to polling subscriptions. That is what stops a
 /// back-pressured publish from starving a subscription image (see
 /// [`PendingPublish`]).
-pub(super) fn drain_pending(pubs: &[PubEntry], pending: &mut VecDeque<PendingPublish>) {
+pub(super) fn drain_pending(pubs: &[Option<PubEntry>], pending: &mut VecDeque<PendingPublish>) {
     drain_pending_inner(pending, Instant::now(), |item| item.offer_on(pubs));
 }
 
@@ -136,8 +136,8 @@ impl PendingPublish {
     /// Attempt one offer against this item's entry in `pubs`. Reports
     /// [`OfferResult::UnknownPub`] when `pub_id` has no entry. Otherwise
     /// reports the raw Aeron status, or the decoded position on success.
-    fn offer_on(&self, pubs: &[PubEntry]) -> OfferResult {
-        let Some(entry) = pubs.get(self.pub_id as usize) else {
+    fn offer_on(&self, pubs: &[Option<PubEntry>]) -> OfferResult {
+        let Some(entry) = pubs.get(self.pub_id as usize).and_then(Option::as_ref) else {
             return OfferResult::UnknownPub;
         };
         let code = entry.publication.offer(self.bytes.as_slice());
