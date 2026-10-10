@@ -101,6 +101,14 @@ async fn read(nomad: &Nomad) -> anyhow::Result<String> {
     nomad.task_log(&alloc(), "executor", "stdout").await
 }
 
+/// The executor allocation after the client collected it.
+fn collected() -> Alloc {
+    Alloc {
+        client_status: "complete".into(),
+        ..alloc()
+    }
+}
+
 #[tokio::test]
 async fn the_control_agent_serves_the_log() {
     let control = control_agent(&closed_port().await)
@@ -133,6 +141,46 @@ async fn a_log_that_no_agent_has_reads_as_empty() {
         .spawn()
         .await;
     assert_eq!(read(&nomad(&control)).await.unwrap(), "");
+}
+
+/// The 500 a client agent answers for a log directory it removed.
+const GONE: &str =
+    "failed to list entries: open /opt/nomad/alloc/504528f1/alloc/logs: no such file or directory";
+
+#[tokio::test]
+async fn a_collected_allocation_reads_as_empty() {
+    // The client removed the directory of a collected allocation that
+    // the server still lists. Both agents answer 500 with the cause.
+    let node = FakeAgent::default().route(LOGS, 500, GONE).spawn().await;
+    let control = control_agent(&node).route(LOGS, 500, GONE).spawn().await;
+    let log = nomad(&control)
+        .task_log(&collected(), "executor", "stdout")
+        .await;
+    assert_eq!(log.unwrap(), "");
+}
+
+#[tokio::test]
+async fn a_live_allocation_with_no_log_directory_fails() {
+    // A live allocation must have its log: a check must never read a
+    // missing log as a clean one.
+    let node = FakeAgent::default().route(LOGS, 500, GONE).spawn().await;
+    let control = control_agent(&node).route(LOGS, 500, GONE).spawn().await;
+    let err = format!("{:#}", read(&nomad(&control)).await.unwrap_err());
+    assert!(err.contains("no such file or directory"), "{err}");
+    assert!(err.contains("of retries"), "{err}");
+}
+
+#[tokio::test]
+async fn only_the_log_directory_cause_counts_as_gone() {
+    // Another missing file is a failed read even for a collected
+    // allocation.
+    let other = "failed to open /opt/nomad/alloc/504528f1/alloc/data: no such file or directory";
+    let node = FakeAgent::default().route(LOGS, 500, other).spawn().await;
+    let control = control_agent(&node).route(LOGS, 500, other).spawn().await;
+    let log = nomad(&control)
+        .task_log(&collected(), "executor", "stdout")
+        .await;
+    assert!(log.is_err());
 }
 
 #[tokio::test]

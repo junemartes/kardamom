@@ -551,6 +551,37 @@ The coordinated cases take one class down, or every node. These cases take two o
   - Proof: `ingress-sequencer-sealer-loss-recover` and `ingress-sequencer-sealer-reverse`.
 - Every case ends with the common tail: the load verdict, the converged executors, the recovery probe and the validator verdict. The load verdict proves that no accepted transaction was lost, and the validator verdict proves the L1-origin sequence.
 
+## Combined outages with the executors (`chaos-combined-exec` shard)
+
+The ordering shard keeps the executors up. These cases take the executors down with another class. The executors are the source of every receipt, of the state the ingress reads on a cache miss, of the checkpoints the state mirrors rebuild from, and of the floors a restarted sequencer looks up. Each case proves what the other class does while that source is gone, and how it catches up when the source returns.
+
+- **The executors and the sealers**
+  - Trigger: the three executor nodes and the three sealer nodes die.
+  - Effect: the pipeline stalls. The sealed head an ingress reports stays flat, and both ingresses refuse a submit on `sealer_no_quorum`.
+  - Recovery: the executor nodes return first. An executor that starts without a sealer waits for its cluster session. The sealers return 60 s later. Every member names the same leader for a term. The executors replay the backlog from their own state.
+  - Proof: `executor-sealer-loss-recover`. The persisted-state audit runs after the case: both the ordering and the execution lost their process state at once, so the state every executor kept is compared with the validator's and rebuilt from L1 before the next case.
+- **The executors, the sealers and the validator**
+  - Trigger: the executor tasks, the sealer nodes and the validator task die, and the executor and validator jobs stop.
+  - Effect: the pipeline stalls.
+  - Recovery, in dependency order: the sealers, the executors 30 s later, the validator 30 s after that. The validator resumes from its own state and verifies live again: the validator verdict requires it.
+  - Proof: `executor-sealer-validator-recover`.
+- **The ingresses and the executors**
+  - Trigger: the executor nodes and both ingress tasks die, and the ingress job stops.
+  - Effect: the sealers keep ordering what reached them. The head advances. No receipt is published.
+  - Recovery: the executors return first and replay the ordered backlog. The receipts of that replay reach no ingress: both are down. The ingresses return 60 s later with empty receipt caches. A receipt a client asks for by hash comes from an executor's state DB (see "Receipts across an ingress restart"). A re-submit of a landed transaction gets its receipt from the Redis receipt index.
+  - Proof: `ingress-executor-loss-recover`. The case receipts one transfer through ingress-0 before the fault. After the return, every ingress serves it, and each one counts a `state_hit` of the receipt layer since its restart. The load's drain then asks every ingress for the receipts it misses.
+- **The read path**
+  - Trigger: the executor tasks, the redis job and the state-mirror tasks die, and all three jobs stop.
+  - Effect: the head advances. A cold balance read counts as degraded, and gets no answer: neither Redis nor an executor runs.
+  - Recovery: Redis returns empty. The mirrors return 30 s later, find Redis cold, and wait for the first live batch and a checkpoint at or beyond it. The executors return 30 s after that, replay, and checkpoint. Every mirror rebuilds the projection and logs `rebuild: done`. The readers use Redis again.
+  - Proof: `read-path-loss-recover`, by name only (see "Known gaps").
+- **The sequencers, the executors and Redis**
+  - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
+  - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
+  - Recovery: the sequencers return first with no floor. Each established sender parks, and the replica asks for its floor. The lookup misses Redis (down) and fails at the executors (down), so the sender stays parked and the replica asks again on its next park. It never seeds a floor. Redis returns empty 30 s later. The executors return 30 s after that and answer the lookups. The floors rise, the parked transactions drain in nonce order.
+  - Proof: `sequencer-executor-redis-loss`, by name only (see "Known gaps"). Every lane-0 replica shows a lookup request and an answer from an executor or from Redis, `kardamom_sequencer_ref_below_floor` reads zero, and the load verdict proves that no nonce gap remains.
+- Every case ends with the common tail. The load verdict proves that no accepted transaction was lost and that the receipts are in nonce order.
+
 ## Validator (off the hot path, halts on divergence)
 
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
@@ -1223,14 +1254,32 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Open: the chaos cluster deploys no output attester. No case proves the attester after a rollback.
 - **Combined outages**
   - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
-  - Open: the pairs with the executors (executors with the sealers, with the ingresses, with the sequencers and Redis), the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
+  - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, and with the ingresses (see "Combined outages with the executors").
+  - `read-path-loss-recover` (the executors with Redis and the state mirrors) and `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exist and run by name. They are in no shard: they fail on the defects below (#559, #560, and #545 for `sequencer-executor-redis-loss`).
+  - Open: the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
   - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
 - **Executor receipt publication that never connects after a job restart**
   - Seen once, on the local container cluster, by `ingress-sealer-loss-recover`. The persisted-state audit of the case before it had restarted the executor job. The restarted executor-1 registered its `tx_receipts` control endpoint in Consul (`192.168.56.13:48509`) and logged `tx_receipts publication open`. Its media driver held no socket on that port. Both ingresses attached that endpoint after their own restart, so the publication stayed `NOT_CONNECTED`.
   - Effect: `tx_receipts` is must-deliver. The commit thread of executor-1 retried `tx_receipts publish failed; retrying (must-deliver) ... NOT_CONNECTED` for ever, so executor-1 stayed at the block of the stall while its peers moved on. The converged-executors gate caught it: `executor fleet NOT fully recovered within 150s (head=756;kardamom-executor-1=lag:120)`.
   - The driver's error log on that node held ten `java.lang.ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1` at `io.aeron.driver.PublicationImage.removeDestination`, logged while the ingresses restarted. The other executor nodes held one or none.
   - A kill of the executor task cleared it: the restarted task opened a new publication, replayed and converged. The case passed on its next run.
+  - The driver error is #545.
+  - `sequencer-executor-redis-loss` hit #545 too. The drivers of ingress-0 and sequencer-1 logged the same error at `PublicationImage.removeDestination` as the case killed the sequencer tasks. After the return, the lane-0 replica on sequencer-1 ingested 257 transactions from `tx_data` and then none, while its twin ingested 23 844. It never parked again, so it never asked for a floor, and the floor check failed. A restart of that one allocation cured it. The twin carried the lane, so the lane lost its redundancy with no alert.
   - Open: the executor does not detect a publication that never connects, and the suite has no check of the registered control endpoints against the sockets of the driver.
+- **A sender sticks for good after an outage of every executor** (#559)
+  - Seen on the local container cluster by `read-path-loss-recover`: the executor tasks, the redis job and the state mirrors were down for about three minutes, and the ingresses, the sequencers and the sealers ran.
+  - The ingress stamps the inclusion deadline from its newest block, and it learns that block only from the `BlockBoundary` markers on `tx_receipts` (`BlockBoundaryWatcher`, `crates/ingress/src/proxy/watchers.rs`). The executors publish those markers. With every executor down, the newest block freezes. About 64 blocks later, every new submit carries a deadline the sealer has passed.
+  - The sealer refuses those refs (`cluster PAST-DEADLINE memberId=0 nonce=623360 maxInclusionBlock=29726 atBlock=29727`). One nonce of the case's sender, 623105, did not get ordered. The lane-0 sequencer does not offer it again. The sealer then rejects every higher nonce of the sender (`cluster CONTIGUITY-REJECT memberId=0 nonce=623312 expected=623105 totalRejected=4194304`), from 02:04 to 02:12 UTC, after the executors had returned.
+  - Effect: the sender is stuck after the outage. `eth_getTransactionCount` stays at 623105. A new transfer at nonce 623105 gets `duplicate (sender, nonce)` from the ingress, and the lane-0 sequencer counts it in `kardamom_sequencer_tx_dropped_past_total`. The recovery probe of the case's sender failed: 257 offered, 0 accepted (`a sender with transactions in flight during the outage cannot get new ones through`). A fresh sender passed the same probe.
+  - The case load still passed the chaos verdict (`missing=0`), because a submit refused during an outage does not count. It offered 1656 transactions in a 570 s window at 200 tx/s, and 59 never landed.
+  - Open: the ingress needs a deadline source that lives while every executor is dark, such as the sealed head of the sealer's status frames (`kardamom_ingress_cluster_sealed_head`). A refused nonce must be offered again, or its resubmit accepted, so that a sender cannot stick. `read-path-loss-recover` and `sequencer-executor-redis-loss` are not in a shard until this is fixed.
+- **Redis sentinels crash-loop on a cold start of the redis job** (#560)
+  - Seen on the local container cluster by `read-path-loss-recover`, on every cold start of the redis job.
+  - The sentinel config template (`deploy/cluster/nomad/redis.nomad.hcl`, task `sentinel`) renders `sentinel monitor kardamom ...` only inside `{{ with service "redis-primary" }}`. On a cold start the primary is not yet in Consul, so that line is missing. The next line, `sentinel down-after-milliseconds kardamom 5000`, then names an unknown master.
+  - Effect: each sentinel exits with `FATAL CONFIG FILE ERROR ... 'sentinel down-after-milliseconds kardamom 5000' No such master with specified name.` Nomad restarts it after 5 s, until the primary registers. One run counted 1, 2 and 1 restarts on the three sentinels, about 20 s in all. The readers find no primary in that time and degrade.
+  - The restart policy allows 3 attempts in 1 minute and then waits, so the job does not fail. A slower primary start can use up the attempts.
+  - `redis-total-loss-recover` checks only the allocation count, so it does not see the restarts. The combined cases require that a returned job runs with no restart, so `read-path-loss-recover` and `sequencer-executor-redis-loss` fail on it.
+  - Open: the sentinel template must not render a config that names an unknown master. `read-path-loss-recover` and `sequencer-executor-redis-loss` are not in a shard until this is fixed.
 - **Archive *data* loss**
   - Total loss has the rebuild from L1 (`reconstruct_l1_e2e`).
   - The loss of the `tx_data` archive of one node has the re-replication from the peer (`archive-tx-data-wipe` and `kardamom-archive-rereplicate`).

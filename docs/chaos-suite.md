@@ -49,7 +49,7 @@ Every chaos case follows the same steps.
 
 ## Shards
 
-There are thirteen shards. `just container-test` lists their names. Twelve run on every pull request. `chaos-integrity` runs nightly.
+There are fourteen shards. `just container-test` lists their names. Thirteen run on every pull request. `chaos-integrity` runs nightly.
 
 | Shard | Cases, in run order | Shard settings |
 |---|---|---|
@@ -62,19 +62,21 @@ There are thirteen shards. `just container-test` lists their names. Twelve run o
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
 | `chaos-combined-ordering` | `ingress-sequencer-loss-recover`, `ingress-sealer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | `RUN_LOAD=0` |
+| `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
-Case order matters in four places.
+Case order matters in five places.
 
 - `resize-scale-out-in` runs last in `chaos-sequencer`. A resize leaves the shard map at a later version.
 - `sealer-fleet-total-wipe-recover` runs last in `chaos-fleet`. It restarts the chain from a state rebuilt from L1, the longest recovery. A failure there must not hide the other cases.
 - `pipeline-blackout-recover` runs last in `chaos-coordinated`. It can leave an entry that no archive serves.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
+- `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 
-`chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in.
+`chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
 
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
@@ -155,6 +157,20 @@ Every case makes these checks after the return: every class is back at its count
 - [`ingress-sequencer-sealer-loss-recover`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): all three classes die. The executor gauge must stay flat. They return in dependency order, 30 s apart. One leader per term, no origin gap.
 - [`ingress-sequencer-sealer-reverse`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): all three classes die. They return against the dependency order, 45 s apart: the ingresses, then the sequencers, then the sealers. Each class must wait for the next with no restart. One leader per term, no origin gap.
 - The load of every combined case gets 90 submit retries. The submit ingress is dead for about five minutes, and a dead ingress refuses a connection at once.
+
+**Combined exec shard**
+
+Each case takes the executors down with one or two other classes: the executor nodes (`docker kill`), or the three executor tasks with their job stopped when a class on the executor nodes must return before them. The other classes are the sealers (the three nodes), the validator (its task, then the job stops), the state mirrors (the three tasks, then the job stops), Redis (the job stops) and the sequencers and the ingresses as in the ordering shard. The hold, the judgement while down, the staggered return and the common tail are the ordering shard's. See [Combined outages with the executors](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard).
+
+The executors are dark in every case, so the head the judgement reads is the highest head any live client reports: the executor block, the sealed head an ingress reads from the sealer's status frames, or the validator's committed block. A stall keeps that head flat. A seal-only case advances it with no applied transaction on a live executor. A case with Redis down also requires that a cold balance read counts as degraded while Redis is down.
+
+- [`executor-sealer-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor nodes and the sealer nodes die. The head must stay flat and both ingresses must refuse on `sealer_no_quorum`. The executors return first and wait 60 s for the sealers. At most one member led each leadership term. The persisted-state audit runs after the case.
+- [`executor-sealer-validator-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor tasks, the sealer nodes and the validator task die. The head must stay flat. The sealers return, then the executors 30 s later, then the validator 30 s after that. One leader per term. The validator verdict of the tail proves that the restarted validator verifies live.
+- [`ingress-executor-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor nodes and the ingress tasks die. The sealers order the transactions in flight, so the head advances. The executors return first and publish the receipts of their replay while no ingress listens; the ingresses return 60 s later. Before the fault, the case sends one transfer from the gate account through ingress-0 and waits for its receipt. After the return, every ingress must serve that receipt and must count a receipt served from an executor's state since its restart (`kardamom_cache_lookups_total{layer="receipt",outcome="state_hit"}` above zero; the counter starts at zero with the process): the restarted memory caches hold nothing, so the state query served it. The load's drain asks every ingress for the receipts it still misses, which drives the same path at scale.
+- [`read-path-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor tasks, the redis job and the state-mirror tasks die. The head advances, and a cold read degrades. Redis returns empty, the mirrors return 30 s later and wait for a checkpoint, the executors return 30 s after that. Every mirror must log `rebuild: done`, and the readers must use Redis again with no degraded read.
+- [`sequencer-executor-redis-loss`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the sequencer tasks, the executor tasks and the redis job die: no source of a sender floor is left. The head advances, and a cold read degrades. The sequencers return first and must park every established sender, Redis returns empty 30 s later, the executors 30 s after that. Every lane-0 replica must have asked for a floor (`kardamom_sequencer_nonce_lookup_requests_total`) and got one from an executor or from Redis (`kardamom_sequencer_nonce_lookups_total{outcome="ok"|"redis"}`), and no ref may sit below a floor. The load is pinned to shard 0. The load verdict proves that no nonce gap remains.
+- `read-path-loss-recover` and `sequencer-executor-redis-loss` are in no shard yet. Run them by name with `KARDAMOM_CHAOS_CASES`. They fail on open defects: a cold start of the redis job crash-loops the sentinels (#560), a sender sticks after an outage of every executor (#559), and `sequencer-executor-redis-loss` also hits the Aeron driver error (#545). See [Known gaps](failure-modes.md#known-gaps-untested-failure-surface).
+- The load of every exec case gets 90 submit retries. With the executors down and the ingress up, each attempt parks 30 s at the ingress and times out with no receipt.
 
 **Retention shard**
 
@@ -434,7 +450,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `LOAD_READY_TIMEOUT_S` | `600` | The time the load may take to sign its queues. |
 | `LOAD_FLOW_TIMEOUT_S` | `60` | The time the load may take to reach an ingress after `INJECT_DELAY`. |
 | `CHAOS_ACCT_BASE` | `7` | The first funded account that a case may use. |
-| `KARDAMOM_CHAOS_GATE_ACCOUNT` | `0` | The funded account of the smoke gate and of the fresh-sender probe. No case load spends it. A reuse run on a used chain passes an unused account. |
+| `KARDAMOM_CHAOS_GATE_ACCOUNT` | `0` | The funded account of the smoke gate and of the fresh-sender probe. No case load spends it. |
 | `INGRESS_VICTIM` | `GITHUB_RUN_ID % 2`, or `0` | The ingress replica that `hard-ingress` kills: 0 or 1. |
 | `EXEC_CONVERGE_SLO_S` | `150` | The convergence budget after every case. |
 | `EXEC_CONVERGE_LAG` | `50` | The block lag that every executor must be within at case end. |
@@ -486,7 +502,7 @@ The shard tests (`crates/chaos/tests/shards.rs`) read these variables.
 | `KARDAMOM_CHAOS_CASES` | A space-separated list that replaces the case list of the shard. |
 | `KARDAMOM_CHAOS_CLUSTER_VARS` | One JSON object of extra Ansible variables for the convergence playbook. |
 
-- A reuse run on a used chain needs unused accounts. Set `KARDAMOM_CHAOS_GATE_ACCOUNT` and `CHAOS_ACCT_BASE` to unused values.
+- Every load starts an account at its live nonce, so a reuse run on a used chain spends used accounts again. `CHAOS_ACCT_BASE` picks the first case account.
 - A host without passwordless sudo needs a one-time setup. Set the host sysctls and the bridge multicast snooping by hand. Then pass `{"ansible_become": false}` in `KARDAMOM_CHAOS_CLUSTER_VARS`.
 - `RUST_LOG` sets the tracing level of the harness libraries. The default is `warn`.
 
@@ -516,6 +532,8 @@ The harness reads each task log through the control agent of Nomad.
 - On a 5xx answer, the harness logs the status and the body. It then reads the same path from the agent of the node that runs the allocation.
 - It tries both reads again every 5 s for 30 s. If both agents fail for the whole time, the error has both bodies.
 - A 404 reads as an empty log. The allocation is collected, or the task never started.
+- A 5xx that says `/alloc/logs: no such file or directory` reads as an empty log only for a terminal allocation (complete, failed or lost). The client collected it and removed its directory, and the server still lists it. This happens after a node kill. For a live allocation the same answer is a failed read, so a check never reads a missing log as a clean one.
+- The one-leader-per-term check requires a `cluster TERM` line from every member. A member whose log reads empty fails the check.
 
 Other evidence on a failure:
 
