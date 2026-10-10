@@ -42,6 +42,8 @@ public final class ClusterNode {
     static final String DA_LAG_BUDGET_SETTING = "kardamom.cluster.daLagBudgetBlocks";
     /** The property of the record-lag budget, in canonical records. */
     static final String RECORD_LAG_BUDGET_SETTING = "kardamom.cluster.recordLagBudget";
+    /** The property of the decision version that the deploy expects this image to run. */
+    static final String DECISION_VERSION_SETTING = "kardamom.cluster.decisionVersion";
 
     public static void main(final String[] args) {
         // Every stdout line carries its time from here on (see the class).
@@ -99,6 +101,11 @@ public final class ClusterNode {
             CanonicalSealerState.snapshotKeepsRecordedCursors());
         System.out.println("cluster record-lag budget memberId=" + memberId
             + " records=" + (recordLagBudget == 0 ? "0 <guard off>" : Long.toString(recordLagBudget)));
+        // The decision version: a job that names another version than the
+        // image runs stops the start, so the setting that the release gate
+        // compares always names the rules that the member runs.
+        final int decisionVersion = requireDecisionVersion(System.getProperty(DECISION_VERSION_SETTING));
+        System.out.println("cluster decision version memberId=" + memberId + " version=" + decisionVersion);
         // The ordering window: 20 with priority fees on, 0 for first come,
         // first served. Replicated configuration like the two above: it
         // decides the relay order. The deploy sets it from the same value
@@ -645,6 +652,21 @@ public final class ClusterNode {
             throw new IllegalStateException(setting + ": " + budget + " is negative");
         }
         return budget;
+    }
+
+    /**
+     * The decision version of the job. An absent setting is the version of
+     * this image. A value that is not a number, or another version, stops
+     * the start.
+     */
+    static int requireDecisionVersion(final String value) {
+        final int version = value == null ? CanonicalSealerState.DECISION_VERSION : Integer.parseInt(value.trim());
+        if (version != CanonicalSealerState.DECISION_VERSION) {
+            throw new IllegalStateException(DECISION_VERSION_SETTING + ": the job names version " + version
+                + ", and this image runs version " + CanonicalSealerState.DECISION_VERSION
+                + ". Deploy the job and the image of one release.");
+        }
+        return version;
     }
 
     /**

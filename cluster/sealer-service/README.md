@@ -71,6 +71,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - A snapshot restore keeps only the votes of the configured voters. A vote of a voter that the configuration no longer names drops. The next vote of a configured voter then decides an entry that every configured voter voted for.
   - The service refuses a vote from a stranger, with a wrong hash, for a slot that is not a `TxRef`, outside the void window, or for an entry that is already voided.
   - The ledger holds at most 1024 indices with open votes. The voter id must be below 64.
+  - A void sets the expected nonce of the sender to the lower of the expected nonce and the nonce of the voided entry. Two voids of one sender, in either order, leave the lowest voided nonce open.
 - Kind 7: the posted cursor is the system record of the batcher. It has no guard header.
   - `posted_head` is the last L2 block that the batcher confirmed on L1. The batcher sends it at start and after each change.
   - The sealer keeps the head in the replicated state. It never lets the head move down.
@@ -346,6 +347,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.dir` | `/opt/kardamom/cluster` | no | The cluster (Raft log and mark file) directory. |
 | `kardamom.archive.dir` | `/opt/kardamom/archive` | no | The Aeron archive directory. |
 | `kardamom.cluster.ingressStreamId` | `101` | yes | The ingress stream id that clients offer to. |
+| `kardamom.cluster.decisionVersion` | `CanonicalSealerState.DECISION_VERSION` | yes | The version of the replicated decision rules that the job spec names. A value other than the version of the code, or not a number, stops the start. See [Decision version](#decision-version). |
 | `kardamom.cluster.tickMs` | `2000` | recommended | The block interval in ms. The leader arms the boundary timer with it. |
 | `kardamom.cluster.dedupCapacity` | `131072` | yes | The hard cap of the dedup window. |
 | `kardamom.cluster.inclusionHorizonBlocks` | `64` | yes | The deadline clamp. It must equal the ingress horizon. |
@@ -388,7 +390,35 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - When the variable is set, the deploy passes an empty `remoteOrigins`.
   - Every member mounts `/opt/kardamom/seed` read-only. The procedure is the runbook [`sealer-fleet-rebuild`](../../docs/runbooks/sealer-fleet-rebuild.md).
 - The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes` or `joinWatchdogS`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
+- `decisionVersion`: the sealer job spec (`deploy/cluster/nomad/cluster.nomad.hcl`) names the version as a literal. `ClusterNodeTest` checks that it equals `DECISION_VERSION`. The start-up line `cluster decision version` shows it.
 - The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, and the application version is 0.3.0.
+
+### Decision version
+
+Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks.
+
+- `CanonicalSealerState.DECISION_VERSION` is the version of the rules. A change that decides an ordered entry differently raises it.
+- The job spec names the version in `kardamom.cluster.decisionVersion`. A member stops at start when the job spec and the code disagree.
+- The setting is in the must-match list of the release gate. The gate refuses a rolling deploy that changes it.
+- A member replays the log after its snapshot with the rules of its code. Thus the log after the last snapshot must hold no decided void when the rules change.
+
+A new version needs the coordinated restart of the sealer, not a rolling deploy:
+
+1. Pause the submits on every ingress: `curl -s -X POST 'http://127.0.0.1:<port>/pause?note=decision-version'`. No new entry is ordered.
+2. Wait until no void vote is open. In the log of each member, each index of a `cluster VOID-VOTE` line also has a line with `result=DECIDED`. With the submits paused, no new entry can lose its data, so no new vote starts.
+3. Wait for a snapshot. In the log of each member, no `cluster VOID-VOTE` line with `result=DECIDED` comes after the last `sealer snapshot TAKEN` line.
+4. Stop all members: `nomad job stop -purge cluster`. The members keep their snapshots and logs on the host.
+5. Resume the submits on every ingress: `curl -s -X POST http://127.0.0.1:<port>/resume`. The gate refuses an operator pause. The ingress then halts on `sealer_no_quorum`.
+6. Run `just deploy`. The gate excuses the `sealer_no_quorum` halt, because Nomad does not know the sealer job. The role registers all members in one step. Each member starts from its own snapshot and log.
+
+- The purge removes the job history of the sealer from Nomad.
+- The deploy record then holds no sealer version before the release. A `just rollback` of the release stops the sealer job and does not start the release before. It also restarts the ingress before it stops the sealer, and the restart drops the pause.
+- Do not run `just rollback` across a decision version. Follow "Rollback across a decision version" in [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md): a coordinated restart into the release before.
+
+| Version | Rule change |
+|---|---|
+| 1 | The first rules. |
+| 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
 
 ## Admin server
 
@@ -455,7 +485,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
-| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.

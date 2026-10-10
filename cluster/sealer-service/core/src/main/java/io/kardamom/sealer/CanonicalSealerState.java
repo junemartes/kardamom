@@ -101,6 +101,16 @@ public final class CanonicalSealerState {
     public static final long DEFAULT_INCLUSION_HORIZON_BLOCKS = 64L;
 
     /**
+     * The version of the rules that decide the replicated state. Two members
+     * on two versions can decide one log entry differently, and the state
+     * forks. A change that decides an ordered entry differently raises the
+     * version. The deploy passes it in {@code kardamom.cluster.decisionVersion},
+     * a setting that every member must match, so a new version needs a
+     * coordinated restart of the sealer.
+     */
+    public static final int DECISION_VERSION = 2;
+
+    /**
      * Default ordering window: off. The deploy sets {@code 20} together with
      * the sequencer's priority-fee setting, and every member must run the
      * same value: the window decides the relay order inside the replicated
@@ -892,10 +902,14 @@ public final class CanonicalSealerState {
      *   <li>It removes the hash from the dedup window. The sender submits
      *       the same signed bytes again, and the window must not absorb them
      *       as a duplicate.</li>
-     *   <li>It sets the sender's expected nonce back to the nonce of the
-     *       entry. If it did not, the contiguity guard would refuse the new
-     *       submit. An evicted sender re-seeds on its next record, so it
-     *       needs no change.</li>
+     *   <li>It sets the sender's expected nonce to the lower of the
+     *       expected nonce and the nonce of the entry. If it did not, the
+     *       contiguity guard would refuse the new submit. The lower value
+     *       keeps the lowest voided nonce open when two entries of one
+     *       sender are voided in either order. An expected nonce below the
+     *       executor's nonce costs the sender one skipped transaction. An
+     *       expected nonce above it is never filled. An evicted sender
+     *       re-seeds on its next record, so it needs no change.</li>
      * </ul>
      *
      * <p>A void never waits on a clock. The decision is a function of the
@@ -911,7 +925,8 @@ public final class CanonicalSealerState {
     private Relayed appendVoid(VoidLedger.Entry entry) {
         forget(ByteBuffer.wrap(entry.id).asReadOnlyBuffer());
         expectedNonce.computeIfPresent(
-            ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(), (sender, expected) -> entry.nonce);
+            ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(),
+            (sender, expected) -> Math.min(expected, entry.nonce));
         long voidIndex = canonicalCount;
         canonicalCount++;
         return new Relayed(voidIndex, VoidLedger.payload(entry));

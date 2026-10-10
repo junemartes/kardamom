@@ -253,6 +253,7 @@ workloads_sealer_job:
 workloads_sealer_must_match:
   - members
   - ingressStreamId
+  - decisionVersion
   - dedupCapacity
   - inclusionHorizonBlocks
   - orderingWindow
