@@ -100,19 +100,13 @@
       vars:
         l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
-    # The watcher derives the epochs the validator checks. It walks the
-    # followers' L1 (workloads_followers_rpc): the fault proxy when it is
-    # deployed, else the light client when one runs and can serve every
-    # block, else the real L1; the in-cluster anvil otherwise.
+    # The watcher publishes the epochs the validator checks. It reads
+    # them from the L1 follower's l1_blocks stream and has no L1 access;
+    # it waits for the follower, deployed below, at its start.
     - name: da-watcher
       wait: false
-      vars: >-
-        {{ {'lockbox_address': workloads_lockbox_address}
-           | combine({'l1_light_client_rpc': workloads_followers_light_client} if workloads_followers_light_client | length > 0 else {}) }}
-      secrets:
-        KARDAMOM_L1_RPC: >-
-          {{ workloads_followers_rpc if workloads_l1_rpc_given | length > 0 or workloads_l1_fault_proxy | bool
-             else workloads_anvil_service_rpc }}
+      vars:
+        l1_silence_secs: "{{ workloads_da_watcher_silence_s }}"
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -175,7 +169,8 @@
 # The indexer is the L1 follower: it reads L1 once per finality step,
 # publishes each finalized block on l1_blocks, and archives the posted
 # batches and the epoch inputs; it reads the payloads from the DA proxy
-# (the job's default, by its service record). It comes up before the
+# (the job's default, by its service record). Every deployment runs it:
+# the da-watcher reads its stream. It comes up before the
 # batcher, which reads a lost cursor's batch from it. It follows
 # finality: a real L1, or the in-cluster anvil behind the fault proxy,
 # which finalizes two blocks behind its head.
@@ -194,9 +189,13 @@
         max_log_range: "{{ workloads_indexer_max_log_range }}"
         follower_count: "{{ workloads_indexer_count }}"
       secrets:
-        KARDAMOM_L1_RPC: "{{ workloads_followers_rpc }}"
+        # The followers' L1 when one is given or the fault proxy runs,
+        # else the in-cluster anvil.
+        KARDAMOM_L1_RPC: >-
+          {{ workloads_followers_rpc if workloads_l1_rpc_given | length > 0 or workloads_l1_fault_proxy | bool
+             or workloads_light_execution_rpc | length > 0
+             else workloads_anvil_service_rpc }}
         KARDAMOM_BEACON_API: "{{ workloads_indexer_beacon_api }}"
-  when: workloads_indexer_deployed | bool
 
 - name: Deploy the live batcher
   ansible.builtin.include_tasks: job.yml
@@ -211,8 +210,7 @@
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
            | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
-           | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}
-                     if workloads_indexer_deployed | bool else {}) }}
+           | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}) }}
       # The fault proxy when it is deployed, else the real L1 when one is
       # given, else the in-cluster anvil. The batcher's own key when one
       # is given, else the anvil dev key.

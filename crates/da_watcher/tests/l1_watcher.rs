@@ -1,79 +1,79 @@
-//! Integration tests for the L1 watcher's `process_once` pass, driven
-//! through the crate's public API with the `testing`-feature fakes.
+//! The L1 watcher's pass over the `l1_blocks` records, driven through the
+//! crate's public API with the `testing`-feature fakes: the anchor, the
+//! publish of each record's epoch, the copies of the second follower
+//! instance, a gap, a broken parent link, a second hash for one block,
+//! and a record no archive holds.
+//!
+//! No test here raises the process halt.
 
 use std::num::NonZeroU64;
+use std::time::Duration;
 
-use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
-use kardamom_da_watcher::source::fakes::MockL1Source;
+use alloy_primitives::{Address, B256};
+use kardamom_da_watcher::feed::fakes::{ScriptedFeed, ScriptedStream};
+use kardamom_da_watcher::publisher::fakes::{InMemoryEpochPublisher, PublisherTap};
 use kardamom_da_watcher::{
-    DaWatcherConfig, L1ResumeAfter, L1SourceError, L1Watcher, LockboxLog, MonitorError,
-    ResumeAfterError,
+    DaWatcherConfig, L1ResumeAfter, L1Watcher, MonitorError, ResumeAfterError,
 };
+use kardamom_obs::halt::{Clears, HaltCause};
+use kardamom_types::epoch::{DepositLog, LockboxLog, UpgradeLog, source_hash};
 
-use alloy_primitives::U256;
-use alloy_primitives::{Address, B256, address};
-use kardamom_types::epoch::{
-    DepositLog, UpgradeLog, alias_l1_address, source_hash, source_hash_system,
-};
+const TICK: Duration = Duration::from_millis(5);
 
-fn lockbox() -> Address {
-    address!("0000000000000000000000000000000000C0DE01")
-}
-
-/// A watcher over the scripted source, resumed after L1 block `cursor`.
-/// The test keeps the publisher's tap, to read the published records.
+/// A watcher over `stream`, resumed after `after` when given, with no
+/// cursor file. The test keeps the publisher's tap.
 fn watcher(
-    pub_: InMemoryEpochPublisher,
-    src: MockL1Source,
-    cursor: Option<u64>,
-) -> L1Watcher<MockL1Source, InMemoryEpochPublisher> {
-    L1Watcher::new(
-        pub_,
-        src,
-        DaWatcherConfig {
-            lockbox: lockbox(),
-            poll_interval: std::time::Duration::from_secs(1),
-            resume_after: cursor
-                .map(|c| L1ResumeAfter::from(NonZeroU64::new(c).expect("a test cursor is not 0"))),
-        },
-        None,
-    )
+    stream: &ScriptedStream,
+    after: Option<u64>,
+) -> (
+    L1Watcher<ScriptedFeed, InMemoryEpochPublisher>,
+    PublisherTap,
+) {
+    let (publisher, tap) = InMemoryEpochPublisher::new();
+    let config = DaWatcherConfig {
+        tick: TICK,
+        silence: Duration::from_secs(3600),
+        resume_after: after
+            .map(|b| L1ResumeAfter::from(NonZeroU64::new(b).expect("a test block is not 0"))),
+    };
+    (L1Watcher::new(publisher, stream.feed(), config, None), tap)
 }
 
-/// A log in L1 block `number`, whose hash is the mock's filler for that
-/// number. This is the hash the watcher will fetch on its own.
-fn dep_log(number: u64, log_index: u64, mint: u128) -> LockboxLog {
+fn numbers(tap: &PublisherTap) -> Vec<u64> {
+    tap.epochs().iter().map(|e| e.l1_number).collect()
+}
+
+fn deposit(number: u64, log_index: u64) -> LockboxLog {
     LockboxLog::Deposit(DepositLog {
         block_number: number,
-        block_hash: MockL1Source::filler_hash(number),
+        block_hash: ScriptedStream::hash(number),
         log_index,
         from: Address::repeat_byte(0x11),
         to: Address::repeat_byte(0x22),
-        mint,
+        mint: 1_000,
         gas_limit: 200_000,
         data: alloy_primitives::Bytes::new(),
     })
 }
 
-/// An upgrade-transaction log in L1 block `number`.
-fn upg_log(number: u64, log_index: u64, feature: u64, activation: u64) -> LockboxLog {
+fn upgrade(number: u64, log_index: u64) -> LockboxLog {
     LockboxLog::Upgrade(UpgradeLog {
         block_number: number,
-        block_hash: MockL1Source::filler_hash(number),
+        block_hash: ScriptedStream::hash(number),
         log_index,
-        feature_id: alloy_primitives::U256::from(feature),
-        activation_timestamp: activation,
+        feature_id: alloy_primitives::U256::from(3u64),
+        activation_timestamp: 9,
     })
 }
 
+/// The first record of a watcher with no position anchors it: nothing
+/// before it is published, and its own epoch is not either.
 #[tokio::test]
-async fn seed_call_returns_zero_and_advances_cursor() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(100));
-    let mut w = watcher(pub_, src, None);
-    let n = w.process_once().await.unwrap();
-    assert_eq!(n, 0);
+async fn the_first_record_anchors_the_watcher() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100]);
+    let (mut w, tap) = watcher(&stream, None);
+    assert_eq!(w.process_once().await.unwrap(), 0);
     assert_eq!(w.cursor(), Some(100));
     assert!(tap.epochs().is_empty());
 }
@@ -89,281 +89,187 @@ fn a_resume_block_is_a_nonzero_l1_block_number() {
         "-1".parse::<L1ResumeAfter>(),
         Err(ResumeAfterError::NotANumber(_))
     ));
-    assert!(matches!(
-        "0x29".parse::<L1ResumeAfter>(),
-        Err(ResumeAfterError::NotANumber(_))
-    ));
 }
 
-/// A watcher that starts after a sealer seed publishes every block after
-/// the seed's L1 origin on its first tick. It does not seed its cursor at
-/// the tip, which would lose the deposits of the blocks in between.
+/// A watcher that resumes after a block takes the block's hash from its
+/// record and publishes every block after it, from the archives and then
+/// live, with no gap and no repeat.
 #[tokio::test]
 async fn a_resumed_watcher_publishes_every_block_after_the_resume_block() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(45));
-    src.push_logs(Ok(vec![dep_log(43, 0, 700)]));
-    let mut w = watcher(pub_, src, Some(41));
-    assert_eq!(w.cursor(), Some(41));
-
-    let n = w.process_once().await.unwrap();
-
-    assert_eq!(n, 4);
-    assert_eq!(w.cursor(), Some(45));
-    let v = tap.epochs();
-    assert_eq!(
-        v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
-        vec![42, 43, 44, 45]
-    );
-    assert_eq!(v[1].deposits.len(), 1, "the deposit of block 43 is kept");
+    let stream = ScriptedStream::default();
+    stream.archive_up_to(108);
+    stream.tips(&[110]);
+    let (mut w, tap) = watcher(&stream, Some(100));
+    assert_eq!(w.process_once().await.unwrap(), 10);
+    assert_eq!(numbers(&tap), (101..=110).collect::<Vec<_>>());
 }
 
-/// The upgrade transaction rides the deposit path end to end: the same
-/// query, the same epoch, the same publish. If it ever needed its own
-/// plumbing, the sealer and slot accounting would need changes too.
+/// The watcher publishes each record's epoch unchanged: the follower
+/// derived it, with its deposits and upgrades in log order. A block with
+/// no deposit still has its epoch.
 #[tokio::test]
-async fn an_upgrade_log_becomes_a_system_deposit_in_its_epoch() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(201));
-    src.push_logs(Ok(vec![upg_log(201, 0, 1, 0)]));
-    let mut w = watcher(pub_, src, Some(200));
-
-    let n = w.process_once().await.unwrap();
-
-    assert_eq!(n, 1);
-    let v = tap.epochs();
-    assert_eq!(v[0].deposits.len(), 1);
-    let d = &v[0].deposits[0];
-    assert!(d.is_system_transaction);
-    assert_eq!(d.from, kardamom_types::upgrades::SYSTEM_UPGRADER);
-    assert_eq!(d.to, Some(kardamom_types::upgrades::CHAIN_STATE));
-    assert_eq!(
-        d.source_hash,
-        source_hash_system(MockL1Source::filler_hash(201), 0)
-    );
-    assert_eq!(d.mint, 0);
-}
-
-/// Deposits and upgrades arrive on one topic-filtered query, so they
-/// must stay in L1 log order within the epoch. An upgrade must not
-/// overtake a deposit that L1 sequenced first.
-#[tokio::test]
-async fn deposits_and_upgrades_share_one_epoch_in_log_order() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(301));
-    // Pushed out of order on purpose. The rule sorts by log_index.
-    src.push_logs(Ok(vec![
-        dep_log(301, 2, 500),
-        upg_log(301, 1, 7, 1_700_000_000_250),
-        dep_log(301, 0, 100),
-    ]));
-    let mut w = watcher(pub_, src, Some(300));
-
+async fn each_record_s_epoch_is_published_unchanged() {
+    let stream = ScriptedStream::default();
+    stream.set_logs(102, vec![deposit(102, 0), upgrade(102, 1), deposit(102, 2)]);
+    stream.tips(&[100, 104]);
+    let (mut w, tap) = watcher(&stream, None);
     w.process_once().await.unwrap();
-
-    let v = tap.epochs();
-    let kinds: Vec<bool> = v[0]
-        .deposits
-        .iter()
-        .map(|d| d.is_system_transaction)
-        .collect();
+    assert_eq!(w.process_once().await.unwrap(), 4);
+    let epochs = tap.epochs();
+    let expected: Vec<_> = (101..=104).map(|n| stream.epoch(n)).collect();
+    assert_eq!(epochs, expected);
+    assert_eq!(epochs[1].deposits.len(), 3);
     assert_eq!(
-        kinds,
-        vec![false, true, false],
-        "epoch must follow L1 log order, not arrival order"
+        epochs[1].deposits[0].source_hash,
+        source_hash(ScriptedStream::hash(102), 0)
     );
-    assert_eq!(v[0].deposits[0].mint, 100);
-    assert_eq!(v[0].deposits[2].mint, 500);
+    assert!(epochs[1].deposits[1].is_system_transaction);
+    assert!(epochs[0].deposits.is_empty() && epochs[3].deposits.is_empty());
 }
 
+/// The second follower instance publishes the same records: the copies
+/// are dropped, each epoch is published once.
 #[tokio::test]
-async fn one_epoch_per_l1_block_with_deposits_grouped_by_block() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(153));
-    // A single range query spans three blocks: two deposits in 151,
-    // none in 152, one in 153.
-    src.push_logs(Ok(vec![
-        dep_log(151, 0, 100),
-        dep_log(151, 1, 200),
-        dep_log(153, 5, 300),
-    ]));
-    let mut w = watcher(pub_, src, Some(150));
-
-    let n = w.process_once().await.unwrap();
-
-    assert_eq!(n, 3, "one epoch per block in (150, 153]");
-    assert_eq!(w.cursor(), Some(153));
-    let v = tap.epochs();
-    assert_eq!(
-        v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
-        vec![151, 152, 153],
-        "epochs are emitted in L1 order with no gaps"
-    );
-    assert_eq!(v[0].deposits.len(), 2);
-    assert!(v[1].deposits.is_empty(), "block 152 had no deposits");
-    assert_eq!(v[2].deposits.len(), 1);
-
-    // Deposit content is derived, not passed through: the sender is
-    // aliased, and source_hash comes from the L1 (block_hash, log_index).
-    assert_eq!(
-        v[0].deposits[0].from,
-        alias_l1_address(Address::repeat_byte(0x11))
-    );
-    assert_eq!(
-        v[0].deposits[0].source_hash,
-        source_hash(MockL1Source::filler_hash(151), 0)
-    );
-    assert_eq!(v[0].deposits[0].to, Some(Address::repeat_byte(0x22)));
-    assert_eq!(v[0].deposits[0].mint, 100);
-    assert_eq!(v[0].deposits[0].value, U256::from(100u64));
+async fn the_second_instance_s_copies_are_dropped() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 103]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    (101..=103).for_each(|n| stream.inject(stream.record(n)));
+    stream.tips(&[104]);
+    assert_eq!(w.process_once().await.unwrap(), 1);
+    assert_eq!(numbers(&tap), [101, 102, 103, 104]);
 }
 
-/// The no-skipping rule in miniature: a stretch of L1 with no deposits
-/// at all must still produce one epoch per block. Otherwise, the origin
-/// sequence gets a hole that a verifier would reject.
+/// A record past the next block is a gap on the subscription: the watcher
+/// reads the missing records from the archives, in order.
 #[tokio::test]
-async fn depositless_range_still_emits_every_epoch() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(105));
-    src.push_logs(Ok(vec![]));
-    let mut w = watcher(pub_, src, Some(100));
-
-    let n = w.process_once().await.unwrap();
-
-    assert_eq!(n, 5);
-    let v = tap.epochs();
-    assert_eq!(
-        v.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
-        vec![101, 102, 103, 104, 105]
-    );
-    assert!(v.iter().all(|e| e.deposits.is_empty()));
+async fn a_gap_on_the_live_stream_is_filled_from_the_archives() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    stream.archive_up_to(120);
+    stream.inject(stream.record(121));
+    assert_eq!(w.process_once().await.unwrap(), 0, "the gap is seen");
+    tokio::time::sleep(TICK * 2).await;
+    stream.archive_up_to(121);
+    assert_eq!(w.process_once().await.unwrap(), 21);
+    assert_eq!(numbers(&tap), (101..=121).collect::<Vec<_>>());
 }
 
+/// A record whose parent is not the head is a chain break: the watcher
+/// publishes nothing, keeps its head, and halts on `l1_chain_break`,
+/// which clears by itself once a record that descends arrives.
 #[tokio::test]
-async fn not_finalized_surfaces_distinct_error_no_cursor_advance() {
-    let (pub_, _tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Err(L1SourceError::NotFinalized));
-    let mut w = watcher(pub_, src, None);
-    let err = w.process_once().await.unwrap_err();
-    assert!(matches!(err, MonitorError::NotFinalized));
-    assert!(w.cursor().is_none());
-}
-
-#[tokio::test]
-async fn tip_below_cursor_is_noop() {
-    let (pub_, _tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(50));
-    let mut w = watcher(pub_, src, Some(100));
-    let n = w.process_once().await.unwrap();
-    assert_eq!(n, 0);
-    assert_eq!(w.cursor(), Some(100));
-}
-
-#[tokio::test]
-async fn backpressure_holds_cursor_so_next_tick_retries() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    tap.set_backpressure(true);
-    let src = MockL1Source::new();
-    src.push_tip(Ok(200));
-    src.push_logs(Ok(vec![dep_log(200, 0, 100)]));
-    let mut w = watcher(pub_, src, Some(150));
-    let n = w.process_once().await.unwrap();
-    assert_eq!(n, 0); // The first publish was backpressured, so the loop returned early.
-    assert_eq!(w.cursor(), Some(150)); // The cursor did not advance.
-}
-
-/// A partially published range must resume at the first block that did
-/// not publish. It must not re-emit the blocks that did publish, and
-/// must not skip past them.
-#[tokio::test]
-async fn partial_range_resumes_at_the_first_unpublished_block() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(104));
-    src.push_logs(Ok(vec![]));
-    let mut w = watcher(pub_, src, Some(100));
-
-    // Let 101 and 102 through, then jam the transport.
-    std::thread::spawn(move || tap.jam_after(2));
-    let n = w.process_once().await.unwrap();
-
-    assert!((1..=4).contains(&n));
-    // Whatever it managed, the cursor names the last block it published.
-    assert_eq!(w.cursor(), Some(100 + n as u64));
-}
-
-/// A log whose block hash disagrees with the hash fetched for that block
-/// number means the two reads saw different L1s. Publishing that epoch
-/// would bake a wrong `source_hash` into the chain.
-#[tokio::test]
-async fn log_disagreeing_with_the_block_hash_is_rejected() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(151));
-    src.push_logs(Ok(vec![LockboxLog::Deposit(DepositLog {
-        block_number: 151,
-        block_hash: B256::repeat_byte(0xFF), // not the filler for 151
-        log_index: 0,
-        from: Address::repeat_byte(0x11),
-        to: Address::repeat_byte(0x22),
-        mint: 1,
-        gas_limit: 100,
-        data: alloy_primitives::Bytes::new(),
-    })]));
-    let mut w = watcher(pub_, src, Some(150));
-
-    let err = w.process_once().await.unwrap_err();
-
-    assert!(matches!(err, MonitorError::Derive(_)));
-    assert_eq!(w.cursor(), Some(150), "cursor must not pass a bad epoch");
-    assert!(tap.epochs().is_empty());
-}
-
-#[tokio::test]
-async fn block_hash_failure_stops_the_range() {
-    let (pub_, _tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    src.push_tip(Ok(151));
-    src.push_logs(Ok(vec![]));
-    *src.block_hash_fails.lock().unwrap() = true;
-    let mut w = watcher(pub_, src, Some(150));
-
-    let err = w.process_once().await.unwrap_err();
-
-    assert!(matches!(err, MonitorError::BlockHash(_)));
-    assert_eq!(w.cursor(), Some(150));
-}
-
-#[tokio::test]
-async fn a_block_that_does_not_descend_from_the_published_one_is_refused() {
-    let (pub_, tap) = InMemoryEpochPublisher::new();
-    let src = MockL1Source::new();
-    // Blocks 10 and 11 publish; 12 then claims a parent that is not 11's
-    // hash, twice: the watcher refuses it each time and keeps its cursor.
-    src.push_tip(Ok(11));
-    src.push_logs(Ok(vec![]));
-    src.push_tip(Ok(12));
-    src.push_logs(Ok(vec![]));
-    src.push_tip(Ok(12));
-    src.push_logs(Ok(vec![]));
-    src.parent_lies.lock().unwrap().insert(12);
-    let mut w = watcher(pub_, src, Some(9));
-    assert_eq!(w.process_once().await.unwrap(), 2);
-    assert_eq!(w.cursor(), Some(11));
+async fn a_record_that_does_not_descend_from_the_head_is_a_chain_break() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.parent_hash = B256::repeat_byte(0xEE);
+    stream.inject(lie);
     let err = w.process_once().await.unwrap_err();
     assert!(
-        matches!(err, MonitorError::ChainBreak { number: 12, .. }),
-        "expected a chain break, got {err}"
+        matches!(err, MonitorError::ChainBreak { number: 101, parent, .. } if parent == B256::repeat_byte(0xEE)),
+        "got {err}"
     );
-    assert_eq!(w.cursor(), Some(11));
-    assert_eq!(tap.epochs().len(), 2);
+    let halt = err.halt().unwrap();
+    assert_eq!(halt.cause, HaltCause::L1ChainBreak);
+    assert_eq!(halt.clears, Clears::Auto);
+    assert!(tap.epochs().is_empty());
+    assert_eq!(w.cursor(), Some(100));
+
+    tokio::time::sleep(TICK * 2).await;
+    stream.archive_up_to(101);
+    assert_eq!(
+        w.process_once().await.unwrap(),
+        1,
+        "the archive's record descends"
+    );
+}
+
+/// Two records of one block with different hashes halt the watcher on
+/// `l1_follower_disagreement`, which an operator clears. The first record
+/// was published; the watcher takes no record after the second.
+#[tokio::test]
+async fn a_second_hash_for_one_block_halts_until_an_operator_clears_it() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 101]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.hash = B256::repeat_byte(0xAB);
+    stream.inject(lie);
     let err = w.process_once().await.unwrap_err();
-    assert!(matches!(err, MonitorError::ChainBreak { number: 12, .. }));
+    assert!(
+        matches!(err, MonitorError::Disagreement { number: 101, second, .. } if second == B256::repeat_byte(0xAB)),
+        "got {err}"
+    );
+    let halt = err.halt().unwrap();
+    assert_eq!(halt.cause, HaltCause::L1FollowerDisagreement);
+    assert_eq!(halt.clears, Clears::Operator);
+    stream.tips(&[103]);
+    assert_eq!(w.process_once().await.unwrap(), 0, "held until the clear");
+    assert_eq!(numbers(&tap), [101]);
+}
+
+/// A second record of a published block with the same hash and another
+/// epoch is the same halt: the follower instances disagree on the content.
+#[tokio::test]
+async fn a_second_epoch_for_one_block_halts_too() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 101]);
+    let (mut w, _tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.epoch.deposits.push(kardamom_types::Deposit::default());
+    stream.inject(lie);
+    let err = w.process_once().await.unwrap_err();
+    assert!(
+        matches!(err, MonitorError::ContentDisagreement { number: 101 }),
+        "got {err}"
+    );
+    assert_eq!(err.halt().unwrap().cause, HaltCause::L1FollowerDisagreement);
+}
+
+/// With no record of the resume block on the stream or in an archive, the
+/// watcher waits: it publishes nothing and stays before the block. It
+/// resumes once an archive holds the record.
+#[tokio::test]
+async fn a_resume_block_no_archive_holds_is_waited_for() {
+    let stream = ScriptedStream::default();
+    stream.archive_down(true);
+    stream.tips(&[105]);
+    let (mut w, tap) = watcher(&stream, Some(100));
+    assert_eq!(w.process_once().await.unwrap(), 0);
+    assert_eq!(w.cursor(), Some(100));
+    assert!(w.confirmed().is_none(), "not anchored without the record");
+
+    stream.archive_down(false);
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 5);
+    assert_eq!(numbers(&tap), (101..=105).collect::<Vec<_>>());
+}
+
+/// A publish the transport refuses holds the record; the next pass after
+/// a tick publishes it, with no gap and no repeat.
+#[tokio::test]
+async fn a_refused_publish_holds_the_record_and_retries_after_a_tick() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 103]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    tap.set_backpressure(true);
+    assert_eq!(w.process_once().await.unwrap(), 0);
+    assert_eq!(w.cursor(), Some(100));
+    tap.set_backpressure(false);
+    assert_eq!(w.process_once().await.unwrap(), 0, "not before the retry");
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 3);
+    assert_eq!(numbers(&tap), [101, 102, 103]);
 }

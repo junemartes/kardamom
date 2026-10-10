@@ -19,5 +19,5 @@ pub mod fault;
 mod http;
 mod server;
 
-pub use fault::{Fault, Faults};
+pub use fault::{Caller, Fault, Faults};
 pub use server::FaultProxy;

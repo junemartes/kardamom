@@ -6,12 +6,17 @@ No L1 source answers: every endpoint errors, rate-limits, or times out.
 
 ## Confirm
 
-1. Read `/halt` on the halted service (the batcher, the da-watcher, or the
-   l1-indexer). The detail carries the last error.
+1. Read `/halt` on the halted service (the batcher or the l1-indexer). The
+   detail carries the last error. A da-watcher paused with the root
+   `l1-indexer/l1_blocks` and this cause is not halted: the follower's stream
+   carries no record (both follower instances are down or halted), or the
+   da-watcher waits for a record no archive holds
+   (`kardamom_da_watcher_waiting_for_l1_block`). Follow the follower's state:
+   `nomad job status l1-indexer` and its `/halt` on port 9009.
 2. Query the endpoint by hand: `eth_blockNumber` on each `--l1-rpc` URL. A 429
    is a rate limit, a connection error is an outage.
 3. Check `kardamom_batcher_last_post_age_seconds` and the `tick_total` counters
-   of the followers. They show how long L1 has been out.
+   of the l1-indexer. They show how long L1 has been out.
 
 ## Steps
 

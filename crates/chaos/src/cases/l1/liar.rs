@@ -1,15 +1,18 @@
 //! `l1-liar`: the proxy serves a wrong block hash, then a broken parent
 //! chain, then swallowed settlement logs, each for the fault window.
+//!
+//! The L1 follower reads two sources: the proxy, which lies, and the
+//! proxy's second source, which serves L1. Each lie is a disagreement of
+//! the two: the follower halts once and publishes nothing of it; the
+//! da-watcher and the batcher pause with the follower as their root; all
+//! resume by themselves when the lie stops. No operator step.
 
 use std::time::{Duration, Instant};
 
 use kardamom_l1_fault_proxy::Fault;
 
 use super::batcher::{assert_posted_through, require_posting};
-use super::deferred;
-use super::followers::{
-    Followers, await_archive_complete, await_resume, heal_single_source_followers,
-};
+use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
@@ -27,26 +30,6 @@ enum Phase {
     WrongHash,
     BrokenChain,
     SwallowedLogs,
-}
-
-/// What one source can see of a lie.
-enum Detection {
-    /// The follower's own chain check catches it.
-    OneSource,
-    /// Only a second source can: nothing in one answer is wrong on its
-    /// own.
-    NeedsSecondSource,
-}
-
-/// How the followers come back once the lie stops.
-enum Recovery {
-    /// The chain check passes again by itself.
-    SelfResume,
-    /// The wrong hash reached the follower's anchor; a single-source
-    /// follower stays halted until an operator acts.
-    PoisonedAnchor,
-    /// Nothing halted.
-    NeverHalted,
 }
 
 impl Phase {
@@ -73,23 +56,9 @@ impl Phase {
         })
     }
 
-    fn detection(self) -> Detection {
-        match self {
-            Self::WrongHash | Self::BrokenChain => Detection::OneSource,
-            Self::SwallowedLogs => Detection::NeedsSecondSource,
-        }
-    }
-
-    fn recovery(self) -> Recovery {
-        match self {
-            Self::WrongHash => Recovery::PoisonedAnchor,
-            Self::BrokenChain => Recovery::SelfResume,
-            Self::SwallowedLogs => Recovery::NeverHalted,
-        }
-    }
-
-    /// One phase: arm the lie, prove the halt and the batcher's posts
-    /// through it, let it run out, clear it, and prove the resume.
+    /// One phase: arm the lie, prove the halt, the pauses and the
+    /// batcher's posts through it, let it run out, clear it, and prove
+    /// the resume.
     async fn run(self, h: &mut Harness, l1: &L1, ctx: &str) -> anyhow::Result<()> {
         let base = Followers::ready(h, ctx).await?;
         let posted0 = require_posting(h, ctx).await?;
@@ -103,27 +72,17 @@ impl Phase {
         ));
         l1.set_faults(&[fault]).await?;
         let armed = Instant::now();
-        match self.detection() {
-            Detection::OneSource => await_followers_halted(h, base, ctx).await?,
-            Detection::NeedsSecondSource => deferred(
-                ctx,
-                "the halt within 3 ticks on swallowed logs: one source cannot see a missing log; the cross-check of two can",
-            ),
-        }
-        deferred(
-            ctx,
-            "kardamom_l1_source_disagreement_total is not exported yet; the halt is proven by the tick-outcome counters",
-        );
+        await_followers_halted(h, base, ctx).await?;
         self.assert_alert(l1, window, ctx).await?;
         tokio::time::sleep(window.saturating_sub(armed.elapsed())).await;
         assert_posted_through(h, posted0, MIN_POSTS_THROUGH_FAULT, ctx).await?;
         let stuck = Followers::at_clear(h, l1, base).await?;
-        self.assert_resume(h, stuck, ctx).await
+        await_resume(h, stuck, ctx).await
     }
 
     /// The stale-post alert fires on the swallowed logs: the batcher's
-    /// own posts vanish from its L1 view. The hash lies change nothing
-    /// the batcher reads, so the alert's state is only logged there.
+    /// own posts vanish from its L1 view. Under the hash lies its state
+    /// is only logged.
     async fn assert_alert(self, l1: &L1, window: Duration, ctx: &str) -> anyhow::Result<()> {
         match self {
             Self::SwallowedLogs => {
@@ -144,30 +103,12 @@ impl Phase {
             }
         }
     }
-
-    async fn assert_resume(
-        self,
-        h: &mut Harness,
-        stuck: Followers,
-        ctx: &str,
-    ) -> anyhow::Result<()> {
-        match self.recovery() {
-            Recovery::SelfResume | Recovery::NeverHalted => await_resume(h, stuck, ctx).await,
-            Recovery::PoisonedAnchor => {
-                deferred(
-                    ctx,
-                    "the resume by itself after a wrong hash: the single-source follower kept the wrong hash as its anchor",
-                );
-                heal_single_source_followers(h, ctx).await?;
-                await_resume(h, stuck, ctx).await
-            }
-        }
-    }
 }
 
-/// The three lies in order. Through each, the followers halt where one
-/// source can see the lie, the batcher keeps posting, and the stale-post
-/// alert fires on the swallowed logs; after each, the followers resume
+/// The three lies in order. Through each, the follower halts on the
+/// disagreement of its two sources, the da-watcher pauses on it, the
+/// batcher keeps posting, and the stale-post alert fires on
+/// the swallowed logs; after each, every one of them resumes by itself
 /// and the archive catches up with L1; at the end, the DA record is
 /// contiguous.
 pub(crate) async fn liar(h: &mut Harness) -> anyhow::Result<()> {

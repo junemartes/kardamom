@@ -178,7 +178,7 @@ workloads_fault_proxy_url: "http://kardamom-l1-fault-proxy.service.{{ datacenter
 # L1_FOLLOWERS_RPC then names the real L1 endpoints, and the light client
 # settles the reads it serves (workloads_followers_light_client).
 workloads_followers_rpc: >-
-  {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
+  {{ workloads_fault_proxy_url ~ ',' ~ workloads_fault_proxy_url ~ '/second' if workloads_l1_fault_proxy | bool
      else lookup('env', 'L1_FOLLOWERS_RPC')
      | default('http://' ~ workloads_light_host ~ ':' ~ workloads_light_port
                if workloads_light_execution_rpc | length > 0 else workloads_l1_rpc, true) }}
@@ -200,7 +200,11 @@ workloads_followers_light_client: >-
 # indexer starts at its first block and the archive holds every batch.
 workloads_indexer_start_block: >-
   {{ lookup('env', 'L1_INDEXER_START_BLOCK') | default('1' if workloads_l1_fault_proxy | bool else '', true) }}
-workloads_indexer_poll_s: "{{ lookup('env', 'L1_INDEXER_POLL_S') }}"
+# The in-cluster anvil has no beacon chain and finalizes fast, so the
+# follower reads every second there, as the da-watcher read before it.
+workloads_indexer_poll_s: >-
+  {{ lookup('env', 'L1_INDEXER_POLL_S')
+     | default('1' if workloads_l1_rpc_given | length == 0 and workloads_light_execution_rpc | length == 0 else '', true) }}
 # The beacon API the follower reads the finality schedule from: the
 # light client's consensus endpoint when one runs. Empty (anvil): the
 # follower reads every poll interval.
@@ -210,11 +214,9 @@ workloads_indexer_max_log_range: "{{ lookup('env', 'L1_MAX_LOG_RANGE') }}"
 # Follower instances, each on its own node with the indexer role. Empty:
 # the job's default, two.
 workloads_indexer_count: "{{ lookup('env', 'L1_INDEXER_COUNT') }}"
-# Whether the indexer job is part of this deployment: with a real L1, a
-# light client, or the fault proxy.
-workloads_indexer_deployed: >-
-  {{ workloads_l1_rpc_given | length > 0 or workloads_light_execution_rpc | length > 0
-     or workloads_l1_fault_proxy | bool }}
+# How long l1_blocks may carry no record before the da-watcher pauses
+# with the follower as its root. Empty: three finality steps (1152 s).
+workloads_da_watcher_silence_s: "{{ lookup('env', 'L1_SILENCE_S') }}"
 workloads_indexer_host: "{{ lookup('env', 'L1_INDEXER_HOST') | default('kardamom-l1-indexer.service.' ~ datacenter ~ '.consul', true) }}"
 workloads_indexer_port: "{{ lookup('env', 'L1_INDEXER_PORT') | default('8549', true) }}"
 workloads_poll_delay: 3

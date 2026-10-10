@@ -300,6 +300,23 @@ impl HaltRef {
         }
     }
 
+    /// The service name of the L1 follower on the stream.
+    pub const L1_FOLLOWER: &'static str = "l1-indexer";
+    /// The instance name of the follower's `l1_blocks` stream as a whole:
+    /// the root of a consumer whose stream carries no record.
+    pub const L1_BLOCKS_INSTANCE: &'static str = "l1_blocks";
+
+    /// The follower's stream carries no record: the root a consumer of
+    /// `l1_blocks` pauses on when no follower instance publishes.
+    #[must_use]
+    pub fn l1_blocks_silent() -> Self {
+        Self {
+            service: Self::L1_FOLLOWER.into(),
+            instance: Self::L1_BLOCKS_INSTANCE.into(),
+            cause: HaltCause::L1Unreachable,
+        }
+    }
+
     /// Whether this root is the sealer.
     #[must_use]
     pub fn is_sealer(&self) -> bool {

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use kardamom_cluster_adapter::{ClusterConfig, LiveCluster};
-use kardamom_da_watcher::{BoundaryFeed, CursorFile, DaWatcherConfig, L1Cursor, L1Endpoints};
+use kardamom_da_watcher::{BoundaryFeed, CursorFile, DaWatcherConfig, L1Cursor};
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::discovery::StreamPlane;
 use serde::Deserialize;
@@ -60,10 +60,8 @@ impl SealerSession {
     }
 }
 
-/// The L1 deposit path, resolved. Present only when both `--l1-rpc` and
-/// `--lockbox` were given.
+/// The L1 deposit path, resolved. Present only with `--l1-blocks`.
 pub(crate) struct L1Path {
-    pub(crate) endpoints: L1Endpoints,
     pub(crate) cfg: DaWatcherConfig,
     /// The durable cursor, with its lock taken. `None` without
     /// `--l1-cursor-file`.

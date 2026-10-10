@@ -1,7 +1,7 @@
 //! The proxy server: one listener for the JSON-RPC pipe and the control
 //! endpoint, one task per connection.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use crate::fault::{Fault, Faults, Refusal};
+use crate::fault::{Caller, Fault, Faults, Refusal};
 use crate::http::{Connection, Request, Response};
 
 /// A running proxy. Dropping it stops the server.
@@ -162,17 +162,18 @@ impl Conn {
     /// Serve requests on `sock` until the peer closes, a reply closes, or
     /// a request is malformed.
     async fn serve(self, sock: TcpStream) {
+        let client = sock.peer_addr().ok().map(|addr| addr.ip());
         let mut conn = Connection::new(sock);
-        while self.step(&mut conn).await.is_continue() {}
+        while self.step(&mut conn, client).await.is_continue() {}
     }
 
     /// One request: read it, answer it, and decide whether the
     /// connection goes on.
-    async fn step(&self, conn: &mut Connection) -> ControlFlow<()> {
+    async fn step(&self, conn: &mut Connection, client: Option<IpAddr>) -> ControlFlow<()> {
         let Ok(Some(request)) = conn.read_request().await else {
             return ControlFlow::Break(());
         };
-        let mut response = self.respond(&request).await;
+        let mut response = self.respond(&request, client).await;
         response.close |= request.close;
         if conn.write(&response).await.is_err() || response.close {
             return ControlFlow::Break(());
@@ -180,12 +181,18 @@ impl Conn {
         ControlFlow::Continue(())
     }
 
-    async fn respond(&self, request: &Request) -> Response {
+    async fn respond(&self, request: &Request, client: Option<IpAddr>) -> Response {
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/health") => Response::json(200, &serde_json::json!({ "ok": true })),
             ("GET", "/fault") => self.active(),
             ("POST", "/fault") => self.set(&request.body),
-            ("POST", _) => self.proxy(&request.body).await,
+            ("POST", path) => {
+                let caller = Caller {
+                    client,
+                    second: path == "/second",
+                };
+                self.proxy(&request.body, caller).await
+            }
             _ => Response::json(404, &serde_json::json!({ "error": "no such path" })),
         }
     }
@@ -211,21 +218,21 @@ impl Conn {
 
     /// Forward one JSON-RPC body, or refuse it, and apply the active
     /// faults to the reply.
-    async fn proxy(&self, body: &[u8]) -> Response {
+    async fn proxy(&self, body: &[u8], caller: Caller) -> Response {
         self.served.fetch_add(1, Ordering::Relaxed);
         let calls: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(e) => return rpc_error_response(400, &Value::Null, &format!("bad request: {e}")),
         };
         let faults = self.faults.borrow().clone();
-        if let Some(refusal) = faults.refusal() {
+        if let Some(refusal) = faults.refusal_for(caller) {
             return refuse(refusal, &calls);
         }
         let mut reply = match self.upstream.forward(body).await {
             Ok(v) => v,
             Err(e) => return rpc_error_response(502, &calls["id"], &format!("upstream: {e:#}")),
         };
-        mutate(&faults, &calls, &mut reply);
+        mutate(&faults, caller, &calls, &mut reply);
         Response::json(200, &reply)
     }
 }
@@ -254,18 +261,18 @@ fn refuse(refusal: Refusal, calls: &Value) -> Response {
 
 /// Apply `faults` to a reply: to each element of a batch, matched to its
 /// call by id, or to the one reply of the one call.
-fn mutate(faults: &Faults, calls: &Value, reply: &mut Value) {
+fn mutate(faults: &Faults, caller: Caller, calls: &Value, reply: &mut Value) {
     match (calls, reply) {
         (Value::Array(calls), Value::Array(replies)) => replies
             .iter_mut()
-            .for_each(|r| mutate_one(faults, method_of(calls, &r["id"]), r)),
-        (call, reply) => mutate_one(faults, call["method"].as_str(), reply),
+            .for_each(|r| mutate_one(faults, caller, method_of(calls, &r["id"]), r)),
+        (call, reply) => mutate_one(faults, caller, call["method"].as_str(), reply),
     }
 }
 
-fn mutate_one(faults: &Faults, method: Option<&str>, reply: &mut Value) {
+fn mutate_one(faults: &Faults, caller: Caller, method: Option<&str>, reply: &mut Value) {
     if let (Some(method), Some(result)) = (method, reply.get_mut("result")) {
-        faults.apply(method, result);
+        faults.apply_from(caller, method, result);
     }
 }
 

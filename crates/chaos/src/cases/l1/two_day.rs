@@ -1,8 +1,9 @@
 //! `two-day-outage`: the order of a real outage. The liar at T0; a
 //! batcher restart at T1; a deploy of the same images at T2; the floor
-//! passes the cursor of T1 at T3; the fault clears at T4. No manual step
-//! for the batcher: it posts through every step, so the floor never
-//! reaches its live cursor.
+//! passes the cursor of T1 at T3; the fault clears at T4. No manual step:
+//! the batcher posts through every step, so the floor never reaches its
+//! live cursor, and the L1 follower, whose two sources disagree on the
+//! lie, publishes none of it and resumes by itself.
 
 use std::time::Duration;
 
@@ -11,10 +12,7 @@ use kardamom_l1_fault_proxy::Fault;
 use super::batcher::{
     BeforeRestart, assert_resumed_from_contract, await_posting, require_posting, restart,
 };
-use super::deferred;
-use super::followers::{
-    Followers, await_archive_complete, await_resume, heal_single_source_followers,
-};
+use super::followers::{Followers, await_archive_complete, await_resume};
 use super::halt::await_followers_halted;
 use super::outage::{MIN_HOLD, hold_until_floor_passes};
 use crate::cases::da_watcher::assert_not_past_sealer;
@@ -60,10 +58,6 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!("{ctx}: T0: {faults:?}"));
     l1.set_faults(&faults).await?;
     await_followers_halted(h, base, ctx).await?;
-    deferred(
-        ctx,
-        "kardamom_l1_source_disagreement_total is not exported yet",
-    );
     // The alert fires before T1.
     l1.await_alert_held(STALE_POST_ALERT, ALERT_HOLD, window, ctx)
         .await?;
@@ -107,11 +101,6 @@ pub(crate) async fn two_day_outage(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!("{ctx}: T4: the fault clears"));
     let stuck = Followers::at_clear(h, &l1, base).await?;
     await_posting(h, at_t3, Duration::from_secs(30), ctx).await?;
-    deferred(
-        ctx,
-        "the followers' resume by themselves after T4: the single-source followers kept the wrong hash as their anchor",
-    );
-    heal_single_source_followers(h, ctx).await?;
     await_resume(h, stuck, ctx).await?;
     await_archive_complete(h, &l1, ctx).await?;
     l1.assert_contiguous(ctx).await

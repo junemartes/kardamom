@@ -1,6 +1,6 @@
 //! The L1 watcher's durable cursor: a restart resumes after the stored
 //! block and checks the parent link against the stored hash; a missing
-//! file falls back to the finalized tip; a file that does not read halts;
+//! file falls back to the first record; a file that does not read halts;
 //! `--l1-resume-after` overrides the file.
 //!
 //! One test here raises the process halt. No other test in this binary
@@ -9,11 +9,11 @@
 mod support;
 
 use alloy_primitives::B256;
+use kardamom_da_watcher::feed::fakes::ScriptedFeed;
 use kardamom_da_watcher::publisher::fakes::InMemoryEpochPublisher;
-use kardamom_da_watcher::source::fakes::MockL1Source;
 use kardamom_da_watcher::{CursorError, L1Cursor, L1CursorError, L1Watcher, MonitorError};
 use kardamom_obs::halt::{self, Clears, HaltCause};
-use support::{Rig, at, source, wait};
+use support::{Rig, at, wait};
 
 #[test]
 fn a_cursor_line_round_trips_and_a_bad_line_is_refused() {
@@ -42,14 +42,14 @@ fn a_cursor_line_round_trips_and_a_bad_line_is_refused() {
 async fn a_restart_resumes_after_the_stored_block() {
     let rig = Rig::new();
     {
-        let mut w = rig.start(source(&[100, 103]), None).unwrap();
+        let mut w = rig.start(&[100, 103], None).unwrap();
         assert_eq!(w.process_once().await.unwrap(), 0, "the first tick seeds");
         assert_eq!(rig.stored(), Some(at(100)), "the seed is stored");
         assert_eq!(w.process_once().await.unwrap(), 3);
         assert_eq!(rig.stored(), Some(at(103)));
     }
 
-    let mut w = rig.start(source(&[106]), None).unwrap();
+    let mut w = rig.start(&[106], None).unwrap();
     assert_eq!(w.cursor(), Some(103));
     assert_eq!(w.process_once().await.unwrap(), 3);
 
@@ -57,12 +57,12 @@ async fn a_restart_resumes_after_the_stored_block() {
     assert_eq!(rig.stored(), Some(at(106)));
 }
 
-/// With no file, the watcher seeds at the finalized tip, as before the
-/// cursor file existed, and stores the seed.
+/// With no file, the watcher anchors at the first record of the stream,
+/// and stores the anchor.
 #[tokio::test]
-async fn a_missing_file_falls_back_to_the_finalized_tip() {
+async fn a_missing_file_falls_back_to_the_first_record() {
     let rig = Rig::new();
-    let mut w = rig.start(source(&[500]), None).unwrap();
+    let mut w = rig.start(&[500], None).unwrap();
     assert_eq!(w.cursor(), None);
     assert_eq!(w.process_once().await.unwrap(), 0);
     assert_eq!(w.cursor(), Some(500));
@@ -79,9 +79,9 @@ async fn a_missing_file_falls_back_to_the_finalized_tip() {
 fn a_corrupt_or_unreadable_file_is_an_operator_halt() {
     let rig = Rig::new();
     rig.write("not a cursor\n");
-    let err = rig.start(source(&[]), None).err().expect("a corrupt file");
+    let err = rig.start(&[], None).err().expect("a corrupt file");
     assert!(matches!(err, CursorError::Corrupt { .. }), "got {err:?}");
-    let halt = L1Watcher::<MockL1Source, InMemoryEpochPublisher>::cursor_halt(&err);
+    let halt = L1Watcher::<ScriptedFeed, InMemoryEpochPublisher>::cursor_halt(&err);
     assert_eq!(halt.cause, HaltCause::L1CursorUnreadable);
     assert_eq!(halt.clears, Clears::Operator);
     assert_eq!(
@@ -92,7 +92,7 @@ fn a_corrupt_or_unreadable_file_is_an_operator_halt() {
     let unreadable = Rig::new();
     std::fs::create_dir(unreadable.path()).unwrap();
     let err = unreadable
-        .start(source(&[]), None)
+        .start(&[], None)
         .err()
         .expect("a directory is not a cursor file");
     assert!(matches!(err, CursorError::Io { .. }), "got {err:?}");
@@ -109,7 +109,7 @@ async fn a_stored_hash_that_the_chain_does_not_hold_halts() {
         hash: B256::repeat_byte(0xEE),
     };
     rig.write(&format!("{stored}\n"));
-    let mut w = rig.start(source(&[52, 52]), None).unwrap();
+    let mut w = rig.start(&[52, 52], None).unwrap();
 
     let err = w.process_once().await.unwrap_err();
     assert!(
@@ -117,6 +117,8 @@ async fn a_stored_hash_that_the_chain_does_not_hold_halts() {
         "got {err}"
     );
     assert_eq!(err.halt().map(|h| h.cause), Some(HaltCause::L1ChainBreak));
+    // The watcher reads the block again from the archives one tick later.
+    tokio::time::sleep(Rig::config(None).tick * 2).await;
     let err = w.process_once().await.unwrap_err();
     assert!(matches!(err, MonitorError::ChainBreak { number: 51, .. }));
 
@@ -133,7 +135,7 @@ async fn a_stored_hash_that_the_chain_does_not_hold_halts() {
 async fn the_resume_flag_overrides_the_file() {
     let rig = Rig::new();
     rig.write(&format!("{}\n", at(100)));
-    let mut w = rig.start(source(&[45]), Some(41)).unwrap();
+    let mut w = rig.start(&[45], Some(41)).unwrap();
     assert_eq!(w.cursor(), Some(41));
     assert_eq!(w.process_once().await.unwrap(), 4);
     assert_eq!(rig.published(), vec![42, 43, 44, 45]);
@@ -141,7 +143,7 @@ async fn the_resume_flag_overrides_the_file() {
 
     let corrupt = Rig::new();
     corrupt.write("garbage");
-    let mut w = corrupt.start(source(&[42]), Some(41)).unwrap();
+    let mut w = corrupt.start(&[42], Some(41)).unwrap();
     assert_eq!(w.process_once().await.unwrap(), 1);
     assert_eq!(corrupt.stored(), Some(at(42)));
 }
@@ -154,13 +156,13 @@ async fn the_resume_flag_overrides_the_file() {
 async fn a_stale_file_publishes_identical_epochs_again() {
     let rig = Rig::new();
     {
-        let mut w = rig.start(source(&[100, 103]), None).unwrap();
+        let mut w = rig.start(&[100, 103], None).unwrap();
         w.process_once().await.unwrap();
         w.process_once().await.unwrap();
     }
     // The process died after the publish of 101..=103, before the write.
     rig.write(&format!("{}\n", at(100)));
-    let mut w = rig.start(source(&[103]), None).unwrap();
+    let mut w = rig.start(&[103], None).unwrap();
     assert_eq!(w.process_once().await.unwrap(), 3);
 
     let epochs = rig.epochs();
@@ -181,9 +183,10 @@ async fn a_stale_file_publishes_identical_epochs_again() {
 async fn a_spawned_watcher_holds_the_halt_until_the_operator_clears_it() {
     let rig = Rig::new();
     rig.write("1631\n");
+    rig.stream.tips(&[52]);
     let handle = L1Watcher::spawn(
         rig.publisher.clone(),
-        source(&[52]),
+        rig.stream.feed(),
         Rig::config(None),
         Some(rig.file()),
     );
