@@ -25,12 +25,15 @@ use super::endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, publication_uri};
 use super::reconcile::{DestinationPort, Reconciler};
 use super::record::{
     ARCHIVE_SERVICE, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, PUBLISHER_SERVICE,
-    PublisherRecord, SUBSCRIBER_SERVICE, Scope, SubscriberRecord, Topic,
+    PublisherRecord, SUBSCRIBER_SERVICE, Scope, ServiceId, SubscriberRecord, Topic,
 };
 use super::registration::Registration;
+use super::start_retry::StartRetry;
 use super::watch::{Membership, MembershipWatch, WatchTiming};
 use super::{Instance, catalog_from_config, scope_from_config};
-use crate::aeron_live::{AeronRuntime, Destinations, PubHandle, RawFrame, TypedSubscription};
+use crate::aeron_live::{
+    AddWait, AeronRuntime, Destinations, PubHandle, RawFrame, TypedSubscription,
+};
 use crate::codec::WireMessage;
 use crate::config::{ChannelsConfig, DiscoveryConfig, LogConfig};
 use crate::error::LogError;
@@ -107,22 +110,45 @@ struct Discovered {
     /// The `publisher_id` label of every record this process registers.
     label: String,
     cancel: CancellationToken,
+    /// Ends the retries of a start-up open. See
+    /// [`StreamPlane::stopping_opens_on`].
+    open_stop: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     registrations: Vec<Registration>,
 }
 
 impl Discovered {
+    /// The retry of the start-up registration of the record `id`, for
+    /// up to `limit`. See [`StartRetry`].
+    fn register_retry(&self, id: &ServiceId, limit: Duration) -> StartRetry {
+        StartRetry::new(
+            format_args!("record {id}"),
+            limit,
+            WatchTiming::from_config(&self.cfg),
+            self.open_stop.clone(),
+        )
+    }
+
+    /// The wait of one start-up add on `rt`: one add that waits the
+    /// start-up limit, with no retry. See [`AddWait`].
+    fn start_add(&self, rt: &AeronRuntime) -> AddWait {
+        AddWait::start_up(rt.start_open_limit(), self.open_stop.clone())
+    }
+
     /// Open a dynamic MDC publication for `key` and register it. The
     /// driver binds the control port, and the record carries the address
     /// the driver bound, so no other socket can take the port between the
-    /// bind and the registration.
+    /// bind and the registration. The add waits the start-up limit once
+    /// ([`AddWait`]). The registration retries a transient error
+    /// ([`StartRetry`]).
     async fn open_publication(
         &mut self,
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<PubHandle, LogError> {
         let uri = publication_uri(IpAddr::V4(self.ip), &self.cfg.flow_control, key.topic);
-        let (publication, control) = rt.open_mdc_publication(&uri, key.stream_id)?;
+        let (publication, control) =
+            rt.open_mdc_publication_within(&uri, key.stream_id, self.start_add(rt))?;
         let record = PublisherRecord {
             id: self.instance.service_id(key.topic, key.stream_id),
             control,
@@ -137,7 +163,10 @@ impl Discovered {
             ttl: self.cfg.check_ttl(),
             deregister_after: self.cfg.deregister_after(),
         };
-        let registration = Registration::register(self.catalog.clone(), spec).await?;
+        let registration = self
+            .register_retry(&spec.entry.id, rt.start_open_limit())
+            .run(|| Registration::register(self.catalog.clone(), spec.clone()))
+            .await?;
         info!(topic = %key.topic, stream_id = key.stream_id, %control, "discovery: publication open");
         self.registrations.push(registration);
         Ok(publication)
@@ -150,11 +179,7 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<TypedSubscription<T>, LogError> {
-        let (sub_id, rx) =
-            rt.open_subscription_with_id::<T>(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
-        self.start_reconcile(rt.destinations(sub_id), key);
-        self.hold_subscriber_record(key);
-        Ok(rx)
+        self.open_manual(rt, key, TypedSubscription::new)
     }
 
     /// Open a multi-destination subscription for `key` delivering raw
@@ -164,18 +189,35 @@ impl Discovered {
         rt: &AeronRuntime,
         key: StreamKey,
     ) -> Result<UnboundedReceiver<RawFrame>, LogError> {
-        let (sub_id, rx) = rt.open_subscription_raw(MANUAL_SUBSCRIPTION_URI, key.stream_id)?;
+        self.open_manual(rt, key, std::convert::identity)
+    }
+
+    /// Open the multi-destination subscription of `key`, wrap its raw
+    /// frames with `wrap`, and start its watch, reconcile and record
+    /// tasks. The add waits the start-up limit once ([`AddWait`]).
+    fn open_manual<R>(
+        &mut self,
+        rt: &AeronRuntime,
+        key: StreamKey,
+        wrap: impl FnOnce(UnboundedReceiver<RawFrame>) -> R,
+    ) -> Result<R, LogError> {
+        let (sub_id, rx) = rt.open_subscription_raw_within(
+            MANUAL_SUBSCRIPTION_URI,
+            key.stream_id,
+            self.start_add(rt),
+        )?;
         self.start_reconcile(rt.destinations(sub_id), key);
-        self.hold_subscriber_record(key);
-        Ok(rx)
+        self.hold_subscriber_record(key, rt.start_open_limit());
+        Ok(wrap(rx))
     }
 
     /// Register the subscriber record of `key` and hold it until the
     /// plane shuts down. The task owns the registration: it deregisters
-    /// on cancel. A failed registration leaves the publishers of the
-    /// stream without the record, and they then treat the stream as one
+    /// on cancel. The registration retries a transient error up to
+    /// `limit` ([`StartRetry`]). A failed registration only logs a WARN
+    /// line: the publishers of the stream then treat the stream as one
     /// without a subscriber.
-    fn hold_subscriber_record(&mut self, key: StreamKey) {
+    fn hold_subscriber_record(&mut self, key: StreamKey, limit: Duration) {
         let record = SubscriberRecord {
             id: self.instance.subscriber_id(key.topic, key.stream_id),
             address: IpAddr::V4(self.ip),
@@ -186,6 +228,7 @@ impl Discovered {
         };
         let held = SubscriberRegistration {
             catalog: self.catalog.clone(),
+            retry: self.register_retry(&record.id, limit),
             spec: RegistrationSpec {
                 entry: record.entry(&self.scope),
                 ttl: self.cfg.check_ttl(),
@@ -271,21 +314,33 @@ impl Discovered {
 /// the plane. See [`Discovered::hold_subscriber_record`].
 struct SubscriberRegistration {
     catalog: Catalog,
+    retry: StartRetry,
     spec: RegistrationSpec,
     cancel: CancellationToken,
 }
 
 impl SubscriberRegistration {
     async fn run(self) {
-        let id = self.spec.entry.id.clone();
-        let registration = match Registration::register(self.catalog, self.spec).await {
+        let Self {
+            catalog,
+            retry,
+            spec,
+            cancel,
+        } = self;
+        let id = spec.entry.id.clone();
+        // A shutdown during the retries ends the task with no record.
+        let registered = tokio::select! {
+            () = cancel.cancelled() => return,
+            r = retry.run(|| Registration::register(catalog.clone(), spec.clone())) => r,
+        };
+        let registration = match registered {
             Ok(registration) => registration,
             Err(e) => {
                 warn!(service = %id, error = %e, "discovery: subscriber registration failed");
                 return;
             }
         };
-        self.cancel.cancelled().await;
+        cancel.cancelled().await;
         if let Err(e) = registration.deregister().await {
             warn!(service = %id, error = %e, "discovery: subscriber deregistration failed at shutdown");
         }
@@ -410,6 +465,7 @@ impl StreamPlane {
         instance: Instance,
         ip: Ipv4Addr,
     ) -> Self {
+        let cancel = CancellationToken::new();
         Self {
             channels: cfg.channels.clone(),
             discovered: Some(Discovered {
@@ -419,11 +475,26 @@ impl StreamPlane {
                 instance,
                 ip,
                 label: label.to_string(),
-                cancel: CancellationToken::new(),
+                open_stop: cancel.clone(),
+                cancel,
                 tasks: Vec::new(),
                 registrations: Vec::new(),
             }),
         }
+    }
+
+    /// The plane, with `stop` as the token that ends a start-up open: the
+    /// wait of an add ([`AddWait`]) and the retries of a registration
+    /// ([`StartRetry`]). A service that handles its stop signal before it
+    /// opens its streams passes the token of that signal, so a stop
+    /// during a stall ends the open at once. Without it, the shutdown of
+    /// the plane ends the retries. A static plane ignores `stop`.
+    #[must_use]
+    pub fn stopping_opens_on(mut self, stop: CancellationToken) -> Self {
+        if let Some(d) = self.discovered.as_mut() {
+            d.open_stop = stop;
+        }
+        self
     }
 
     /// A plane that opens every handle on its static channel.

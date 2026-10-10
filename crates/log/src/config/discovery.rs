@@ -103,8 +103,8 @@ pub struct DiscoveryConfig {
     /// How long one blocking catalog query waits for a change before it
     /// returns unchanged.
     pub blocking_wait_ms: NonZeroU64,
-    /// Retry backoff after a failed catalog query, doubling from the
-    /// minimum to the maximum.
+    /// Retry backoff after a failed catalog query, and between the tries
+    /// of a start-up registration, doubling from the minimum to the maximum.
     pub backoff_min_ms: NonZeroU64,
     pub backoff_max_ms: NonZeroU64,
     /// A publisher missing from a successful query is detached only once
