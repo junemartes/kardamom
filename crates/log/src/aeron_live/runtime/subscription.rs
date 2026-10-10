@@ -137,8 +137,10 @@ impl AeronRuntime {
         )
     }
 
-    /// Detach a previously-attached source endpoint: close its own Aeron
-    /// subscription.
+    /// Detach a previously-attached source endpoint. Its own Aeron
+    /// subscription closes once its image goes, or after one stall
+    /// budget. An attach of the same `uri` before that keeps the open
+    /// subscription and its image.
     ///
     /// # Errors
     ///

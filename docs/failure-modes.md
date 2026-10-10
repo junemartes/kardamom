@@ -1304,6 +1304,14 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
     - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
     - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
+- **Catalog flap of a live publisher**
+  - Trigger: the Consul catalog misses a live publisher for longer than `removal_grace_ms` (5 s by default) and lists it again. For example, a read that returns a malformed body, or a record whose check is late. The publisher does not restart.
+  - Effect: every subscriber and every discovered recorder detaches the publisher, and attaches it again when the catalog lists it.
+  - Rule: a detach lingers until the image goes. The subscription of the destination (and the recording subscription of a recorder) stays open while its image is connected, for up to one stall budget. An attach of the same endpoint during that time keeps the subscription, the image and the recording. A short flap thus loses nothing: the consumers keep the same session and position, and the driver repairs any loss from the term buffer of the publisher.
+  - Without the linger, a detach closes the image at once, and the next attach joins at the live position. The frames between the detach and the attach reach no consumer and no archive, so every executor stops on a join miss that no refetch can serve.
+  - A publisher that stopped loses its image within the image liveness timeout, so its subscription and recording subscription close then.
+  - A flap that outlasts the linger closes the subscription of a live publisher. The next attach then forms a new image at the live position.
+  - Proof: `a_detach_and_attach_keep_one_image_with_no_gap` and `a_detached_destination_closes_once_its_publisher_stops` in `mds_destination_removal` (docker-e2e); the departure tests of the recorder in `discovery/recording/tests.rs`.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.

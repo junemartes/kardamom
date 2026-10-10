@@ -20,9 +20,22 @@ separate Aeron images, so a transaction keeps its
 consumer, and in the recording refetch reads.
 
 A destination is its own Aeron subscription on the destination URI. All
-the destinations of a stream feed one frame stream. A detach closes the
-subscription of the destination. The runtime never uses an Aeron
-multi-destination subscription:
+the destinations of a stream feed one frame stream.
+
+A detach does not close the subscription of the destination at once:
+
+- The subscription lingers. It stays open and polled until it has no
+  image, or until one stall budget of the client ends (at least the image
+  liveness timeout of the driver, 10 s by default).
+- A publisher that stopped loses its image within that time, so its
+  subscription closes as soon as the image goes.
+- An attach of the same URI during the linger keeps the open subscription
+  and its image. A catalog flap that detaches a live publisher for a few
+  seconds thus leaves the image, the session and the position unchanged.
+  The driver repairs any loss from the term buffer of the publisher, and
+  no gap reaches the consumer.
+
+The runtime never uses an Aeron multi-destination subscription:
 
 - The Java media driver sizes the connection table of an image from the
   destination index of that image. It grows the table only for a
@@ -182,7 +195,8 @@ procedure.
 - A read error keeps the last membership and retries with bounded backoff.
   An error is never an empty set.
 - A successful empty read is a distinct state. Every attached publisher is
-  detached after the removal grace.
+  detached after the removal grace. A detached destination lingers until
+  its image goes (see "Transport").
 - An index that moves backwards restarts the blocking query.
 - Attachments are keyed by destination URI. A replacement incarnation on
   the same endpoint keeps its destination; the driver forms a new image
@@ -203,6 +217,13 @@ readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way, and the L1 follower
 its `l1_blocks` publication, through `StreamPlane::record_own`.
+
+A publisher that leaves the catalog for the removal grace keeps its
+recording subscription the same way a destination lingers. The recorder
+stops the subscription once the live recording of the publisher ends (the
+archive ends it when the image goes), or after one stall budget of the
+archive session. A publisher that is listed again before that keeps the
+same recording, with no hole.
 
 Each executor records its own recorded `exec_txs` publication on the
 archive of its node. The recorder adopts only the recording of the

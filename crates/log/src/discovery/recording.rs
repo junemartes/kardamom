@@ -5,9 +5,13 @@
 //! Each publisher becomes its own recording, keyed by its control
 //! endpoint and matched by its session id, so a lookup never adopts
 //! another publisher's recording, nor an earlier incarnation's on the
-//! same port. A publisher that leaves the catalog has its recording
-//! subscription stopped; the recording itself stays in the catalog, so
-//! refetch can still serve it.
+//! same port. A publisher that leaves the catalog keeps its recording
+//! subscription until its live recording ends (the archive ends it when
+//! the image goes), or until a linger of one stall budget ends. A
+//! publisher that returns during the linger keeps the same recording, so
+//! a short catalog flap leaves no hole in the archive. The recording
+//! itself stays in the catalog after the stop, so refetch can still
+//! serve it.
 //!
 //! Readiness is per instance: the thread reports ready once every one of
 //! this process's own publications (the ingress's lanes) has a live
@@ -68,6 +72,9 @@ struct Started {
     /// Whether this process registered the publisher.
     own: bool,
     absence: Absence,
+    /// When the publisher left the catalog for the full removal grace.
+    /// `None` while it is listed.
+    left_at: Option<Instant>,
 }
 
 pub struct DiscoveredRecorder {
@@ -92,6 +99,11 @@ struct Recording<A: RecorderArchive> {
     spec: DiscoveredRecorder,
     archive: A,
     started: BTreeMap<String, Started>,
+    /// How long a departed publisher with a live recording keeps it: the
+    /// stall budget of the archive session, at least the image liveness
+    /// timeout of the driver. A publisher that stops loses its image, and
+    /// its live recording ends, within that time.
+    linger: Duration,
 }
 
 /// What ended one wait.
@@ -117,10 +129,12 @@ impl DiscoveredRecorder {
                 return Err(e);
             }
         };
+        let linger = session.stall_budget();
         let mut state = Recording {
             spec: self,
             archive: session.archive,
             started: BTreeMap::new(),
+            linger,
         };
         let mut ready = Some(ready);
         while state.step(&mut ready) {}
@@ -143,9 +157,11 @@ impl<A: RecorderArchive> Recording<A> {
             return false;
         }
         let snapshot = self.spec.membership.borrow_and_update().clone();
+        let now = Instant::now();
         if snapshot.is_known() {
-            self.reconcile(&snapshot, Instant::now());
+            self.reconcile(&snapshot, now);
         }
+        self.finish_departed(now);
         self.resolve_pending();
         self.report(ready);
         true
@@ -166,8 +182,9 @@ impl<A: RecorderArchive> Recording<A> {
         })
     }
 
-    /// Start missing recordings and stop only publishers whose confirmed
-    /// absence lasts for the removal grace. An outage resets that proof.
+    /// Start missing recordings, and mark as departed only publishers
+    /// whose confirmed absence lasts for the removal grace. An outage
+    /// resets that proof. A departed publisher that is listed again stays.
     fn reconcile(&mut self, membership: &Membership, now: Instant) {
         if !matches!(membership.health, CatalogHealth::Fresh) {
             self.started.values_mut().for_each(|s| s.absence.clear());
@@ -183,19 +200,10 @@ impl<A: RecorderArchive> Recording<A> {
                 )
             })
             .collect();
-        let departed: Vec<String> = self
-            .started
-            .iter_mut()
-            .filter_map(|(uri, started)| {
-                started
-                    .absence
-                    .expired(desired.contains_key(uri), now, self.spec.removal_grace)
-                    .then(|| uri.clone())
-            })
-            .collect();
-        for uri in &departed {
-            self.stop_one(uri);
-        }
+        let grace = self.spec.removal_grace;
+        self.started.iter_mut().for_each(|(uri, started)| {
+            started.follow(uri, desired.contains_key(uri), now, grace);
+        });
         let new: Vec<(String, PublisherRecord)> = desired
             .into_iter()
             .filter(|(uri, _)| !self.started.contains_key(uri))
@@ -219,6 +227,23 @@ impl<A: RecorderArchive> Recording<A> {
             "discovered recorder: recording publisher"
         );
         self.started.insert(uri.to_string(), started);
+    }
+
+    /// Stop every departed publisher whose live recording ended, or whose
+    /// linger ended. A failed catalog listing keeps the recording until
+    /// the linger ends.
+    fn finish_departed(&mut self, now: Instant) {
+        let archive = &self.archive;
+        let linger = self.linger;
+        let done: Vec<String> = self
+            .started
+            .iter()
+            .filter(|(_, s)| s.departure_done(archive, now, linger))
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for uri in &done {
+            self.stop_one(uri);
+        }
     }
 
     fn stop_one(&mut self, uri: &str) {
@@ -277,7 +302,39 @@ impl Started {
             recording_id: None,
             own: record.belongs_to(own_instance),
             absence: Absence::default(),
+            left_at: None,
         }
+    }
+
+    /// Mark the publisher as departed once it is missing for the full
+    /// `grace`, or as listed again when it is `present`.
+    fn follow(&mut self, uri: &str, present: bool, now: Instant, grace: Duration) {
+        let gone = self.absence.expired(present, now, grace);
+        match (gone, self.left_at) {
+            (true, None) => {
+                info!(%uri, "discovered recorder: publisher left; recording until its image goes");
+                self.left_at = Some(now);
+            }
+            (false, Some(_)) => {
+                info!(%uri, "discovered recorder: publisher listed again; keeping its recording");
+                self.left_at = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a departed publisher stops now: it has no live recording,
+    /// or its linger ended.
+    fn departure_done<A: RecorderArchive>(
+        &self,
+        archive: &A,
+        now: Instant,
+        linger: Duration,
+    ) -> bool {
+        let Some(left_at) = self.left_at else {
+            return false;
+        };
+        now.saturating_duration_since(left_at) >= linger || matches!(archive.live(self), Ok(None))
     }
 
     /// A rejected start counts only when the archive proves a matching

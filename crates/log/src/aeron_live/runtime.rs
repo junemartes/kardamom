@@ -125,7 +125,8 @@ pub(super) enum RuntimeCmd {
         uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
-    /// Detach a source endpoint: close the subscription of the endpoint.
+    /// Detach a source endpoint: its subscription closes once its image
+    /// goes, or after one stall budget.
     SubRemoveDestination {
         sub_id: u32,
         uri: String,
@@ -194,10 +195,10 @@ fn aeron_thread_main<F>(
 ) where
     F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
 {
-    let Some(aeron) = report.start(make_ctx) else {
+    let Some((aeron, budget)) = report.start(make_ctx) else {
         return;
     };
-    if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
+    if let Err(e) = run_aeron_thread(aeron, cmd_rx, budget.duration()) {
         error!(error = %e, "aeron runtime thread exited with error");
     }
 }

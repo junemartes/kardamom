@@ -5,6 +5,7 @@ use super::*;
 use crate::discovery::record::{PUBLISHER_SERVICE, ServiceEntry, ServiceId};
 
 const GRACE: Duration = Duration::from_secs(5);
+const LINGER: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct StubArchive {
@@ -30,13 +31,14 @@ impl RecorderArchive for StubArchive {
         Ok(())
     }
 
-    fn latest(&self, started: &Started) -> Option<i64> {
-        self.records
+    fn live(&self, started: &Started) -> Result<Option<i64>, LogError> {
+        Ok(self
+            .records
             .borrow()
             .iter()
             .filter(|(_, session, stop)| started.matches_recording(*session, *stop))
             .map(|(id, _, _)| *id)
-            .max()
+            .max())
     }
 }
 
@@ -79,6 +81,7 @@ fn recording() -> Recording<StubArchive> {
         },
         archive: StubArchive::default(),
         started: BTreeMap::new(),
+        linger: LINGER,
     }
 }
 
@@ -94,16 +97,67 @@ async fn a_publisher_returning_within_grace_keeps_the_same_recording() {
     assert_eq!(state.started.len(), 1);
 }
 
+/// The image of the publisher went, so the archive ended its recording.
+fn end_recordings(state: &Recording<StubArchive>) {
+    state
+        .archive
+        .records
+        .borrow_mut()
+        .iter_mut()
+        .for_each(|r| r.2 = 4096);
+}
+
 #[tokio::test]
-async fn a_confirmed_departure_stops_after_the_full_grace() {
+async fn a_confirmed_departure_stops_once_its_recording_ends() {
     let mut state = recording();
     let now = Instant::now();
     state.reconcile(&membership(true), now);
     state.reconcile(&membership(false), now + Duration::from_secs(1));
-    assert!(state.archive.stops.borrow().is_empty());
-    state.reconcile(&membership(false), now + Duration::from_secs(1) + GRACE);
+    let departed = now + Duration::from_secs(1) + GRACE;
+    state.reconcile(&membership(false), departed);
+    state.finish_departed(departed);
+    assert!(
+        state.archive.stops.borrow().is_empty(),
+        "a live recording outlasts the grace"
+    );
+    end_recordings(&state);
+    state.finish_departed(departed + POLL);
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
     assert!(state.started.is_empty());
+}
+
+#[tokio::test]
+async fn a_publisher_listed_again_during_the_linger_keeps_its_recording() {
+    let mut state = recording();
+    let now = Instant::now();
+    state.reconcile(&membership(true), now);
+    state.reconcile(&membership(false), now + Duration::from_secs(1));
+    let departed = now + Duration::from_secs(1) + GRACE;
+    state.reconcile(&membership(false), departed);
+    state.finish_departed(departed);
+    state.reconcile(&membership(true), departed + POLL);
+    state.finish_departed(departed + LINGER * 2);
+    assert!(state.archive.stops.borrow().is_empty());
+    assert_eq!(
+        state.archive.starts.borrow().len(),
+        1,
+        "no second recording"
+    );
+    assert_eq!(state.started.len(), 1);
+}
+
+#[tokio::test]
+async fn the_linger_ends_a_departed_recording_that_stays_live() {
+    let mut state = recording();
+    let now = Instant::now();
+    state.reconcile(&membership(true), now);
+    state.reconcile(&membership(false), now + Duration::from_secs(1));
+    let departed = now + Duration::from_secs(1) + GRACE;
+    state.reconcile(&membership(false), departed);
+    state.finish_departed(departed + Duration::from_secs(14));
+    assert!(state.archive.stops.borrow().is_empty());
+    state.finish_departed(departed + LINGER);
+    assert_eq!(*state.archive.stops.borrow(), vec![7]);
 }
 
 #[tokio::test]
@@ -120,6 +174,8 @@ async fn a_catalog_outage_preserves_recordings_and_resets_removal_proof() {
     state.reconcile(&membership(false), now + GRACE * 3);
     assert!(state.archive.stops.borrow().is_empty());
     state.reconcile(&membership(false), now + GRACE * 4);
+    end_recordings(&state);
+    state.finish_departed(now + GRACE * 4);
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
 }
 

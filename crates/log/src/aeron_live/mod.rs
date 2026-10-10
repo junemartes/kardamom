@@ -65,6 +65,7 @@
 
 mod add_wait;
 mod bound;
+mod destination;
 mod handles;
 mod image_log;
 mod pending;

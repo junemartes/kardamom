@@ -15,6 +15,7 @@ use tracing::warn;
 
 use super::add_wait::{AddWait, PubAdd, SubAdd};
 use super::bound::BoundControl;
+use super::destination::Destination;
 use super::image_log::ImageHandlers;
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
@@ -73,7 +74,7 @@ struct SubRow {
 
 /// One open Aeron subscription behind a fragment assembler: a row of the
 /// subscription table, or an attached destination.
-struct SubEntry {
+pub(super) struct SubEntry {
     sub: Sub,
     /// Assembler-wrapped handler passed to `poll` (owns per-session
     /// assembly buffers). Delegates complete messages to `inner`.
@@ -113,6 +114,11 @@ impl SubEntry {
         }
     }
 
+    /// The count of images of the subscription.
+    pub(super) fn image_count(&self) -> Result<i32, rusteron_client::AeronCError> {
+        self.sub.image_count()
+    }
+
     /// Log on the transition into the poll-failed state, then latch it. A
     /// run of failing polls on the thread's hot loop then logs once, not
     /// on every pass.
@@ -135,26 +141,9 @@ impl SubEntry {
 pub(super) fn run_aeron_thread(
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
+    linger: Duration,
 ) -> Result<(), LogError> {
-    AeronThread::new(aeron, cmd_rx).run()
-}
-
-/// A destination attached to the subscription `sub_id`, keyed by
-/// `(sub_id, uri)` for removal. The destination is its own Aeron
-/// subscription on `uri`, and it sends its messages to the sink of
-/// `sub_id`. Dropping the row closes that subscription.
-///
-/// The runtime never adds a destination to an Aeron multi-destination
-/// subscription. The Java media driver sizes the connection table of an
-/// image from the destination index of the image, and grows it only for a
-/// destination added after the image forms. The removal of a destination
-/// with a higher index than that table then throws in the driver, and the
-/// other images of the subscription keep a stale connection. A closed
-/// subscription has no destination index, so the removal is always safe.
-struct Destination {
-    sub_id: u32,
-    uri: String,
-    entry: SubEntry,
+    AeronThread::new(aeron, cmd_rx, linger).run()
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -167,8 +156,14 @@ struct AeronThread {
     /// Indexed by `pub_id`. A closed publication leaves a `None` slot,
     /// so the ids of the open ones stay valid.
     pubs: Vec<Option<PubEntry>>,
-    /// The attached destinations of the rows in `subs`.
+    /// The attached destinations of the rows in `subs`, and the detached
+    /// ones that linger.
     dests: Vec<Destination>,
+    /// How long a detached destination with an image stays open: the
+    /// stall budget of the client, which is at least the image liveness
+    /// timeout of the driver (10 s by default). A publisher that stops
+    /// loses its image within that time.
+    linger: Duration,
     /// Indexed by `sub_id`. A closed subscription leaves a `None` slot,
     /// so the ids of the open ones stay valid.
     subs: Vec<Option<SubRow>>,
@@ -184,10 +179,11 @@ struct AeronThread {
 }
 
 impl AeronThread {
-    fn new(aeron: Rc<AeronClient>, cmd_rx: CbReceiver<RuntimeCmd>) -> Self {
+    fn new(aeron: Rc<AeronClient>, cmd_rx: CbReceiver<RuntimeCmd>, linger: Duration) -> Self {
         Self {
             aeron,
             cmd_rx,
+            linger,
             pubs: Vec::new(),
             subs: Vec::new(),
             pending: VecDeque::new(),
@@ -230,6 +226,7 @@ impl AeronThread {
         //    a publish is back-pressured in `pending`, so a slow or
         //    stalled publish can never starve a subscription's image.
         worked |= self.poll_subscriptions();
+        self.close_departed();
 
         // 4. Idle. Block only when there is genuinely nothing to do:
         //    nothing to poll and nothing pending. Otherwise wait at the
@@ -513,18 +510,27 @@ impl AeronThread {
         Ok(())
     }
 
-    /// Detach a destination from a subscription. Dropping the
-    /// [`Destination`] closes its own Aeron subscription.
+    /// Detach a destination from a subscription. The destination
+    /// lingers until its image goes (see [`Destination`]).
     fn cmd_remove_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
-        let before = self.dests.len();
-        self.dests.retain(|d| !(d.sub_id == sub_id && d.uri == uri));
-        if self.dests.len() < before {
-            Ok(())
-        } else {
-            Err(LogError::Aeron(format!(
-                "remove destination: no attached {uri} on sub {sub_id}"
-            )))
-        }
+        let dest = self
+            .dests
+            .iter_mut()
+            .find(|d| d.is(sub_id, uri))
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "remove destination: no attached {uri} on sub {sub_id}"
+                ))
+            })?;
+        dest.leave(Instant::now(), self.linger);
+        Ok(())
+    }
+
+    /// Close every detached destination whose image went or whose linger
+    /// ended.
+    fn close_departed(&mut self) {
+        let now = Instant::now();
+        self.dests.retain(|d| !d.closes(now));
     }
 
     fn handle_cmd(&mut self, cmd: RuntimeCmd) {
@@ -622,27 +628,21 @@ impl AeronThread {
     /// Attach a source endpoint (`uri`, for example
     /// `aeron:udp?endpoint=10.0.0.5:9000`) to the subscription `sub_id`:
     /// open a subscription on `uri` with the stream id and the sink of
-    /// `sub_id`. Idempotent.
+    /// `sub_id`. Idempotent. A detached destination that still lingers
+    /// is attached again with its open subscription and image.
     fn add_sub_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let sub = self
             .subs
             .get(sub_id as usize)
             .and_then(Option::as_ref)
             .ok_or_else(|| LogError::Aeron(format!("add destination: unknown sub_id {sub_id}")))?;
-        if self
-            .dests
-            .iter()
-            .any(|d| d.sub_id == sub_id && d.uri == uri)
-        {
-            return Ok(()); // already attached
+        if let Some(dest) = self.dests.iter_mut().find(|d| d.is(sub_id, uri)) {
+            dest.stay();
+            return Ok(());
         }
         let wait = AddWait::run_time(ADD_SUB_TIMEOUT);
         let entry = self.open_entry(uri, sub.stream_id, sub.sink.clone(), &wait)?;
-        self.dests.push(Destination {
-            sub_id,
-            uri: uri.to_string(),
-            entry,
-        });
+        self.dests.push(Destination::new(sub_id, uri, entry));
         Ok(())
     }
 }
