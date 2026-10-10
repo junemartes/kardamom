@@ -384,6 +384,66 @@ mod tests {
         );
     }
 
+    /// An endpoint that refuses every connection: a port that was bound
+    /// and released, so nothing listens on it.
+    fn dead_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// An endpoint that answers every nonce query with `0x7`.
+    async fn live_endpoint() -> (String, jsonrpsee::server::ServerHandle) {
+        let mut module = jsonrpsee::RpcModule::new(());
+        module
+            .register_method("eth_getTransactionCount", |_, (), _| "0x7")
+            .unwrap();
+        let server = jsonrpsee::server::Server::builder()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module))
+    }
+
+    fn client(endpoints: Vec<String>) -> ExecutorQuery {
+        ExecutorQuery::new(&ExecutorQueryConfig {
+            endpoints,
+            ..ExecutorQueryConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// One dead executor never fails a read: whichever endpoint the
+    /// rotation starts at, the query moves on to the live one.
+    #[tokio::test]
+    async fn a_query_fails_over_past_a_dead_endpoint() {
+        let (live, handle) = live_endpoint().await;
+        let query = client(vec![dead_endpoint(), live]);
+        let a = Address::repeat_byte(0x22);
+
+        let answers = [query.nonce(a).await, query.nonce(a).await];
+
+        assert!(
+            answers
+                .iter()
+                .all(|answer| answer.as_ref().unwrap().value == U256::from(7u64)),
+            "{answers:?}"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// With every endpoint dead the query fails, and the error names the
+    /// last endpoint it tried.
+    #[tokio::test]
+    async fn a_query_fails_when_every_endpoint_is_dead() {
+        let dead = [dead_endpoint(), dead_endpoint()];
+        let query = client(dead.to_vec());
+
+        let err = query.nonce(Address::repeat_byte(0x33)).await.unwrap_err();
+
+        assert!(err.to_string().contains(&dead[1]), "{err}");
+    }
+
     #[test]
     fn off_when_no_endpoint() {
         assert!(ExecutorQuery::new(&ExecutorQueryConfig::default()).is_none());
