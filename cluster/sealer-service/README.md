@@ -412,8 +412,8 @@ A new version needs the coordinated restart of the sealer, not a rolling deploy:
 6. Run `just deploy`. The gate excuses the `sealer_no_quorum` halt, because Nomad does not know the sealer job. The role registers all members in one step. Each member starts from its own snapshot and log.
 
 - The purge removes the job history of the sealer from Nomad.
-- The deploy record then holds no sealer version before the release. A `just rollback` of the release stops the sealer job and does not start the release before.
-- A rollback across a decision version follows "Rollback across a decision version" in [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md).
+- The deploy record then holds no sealer version before the release. A `just rollback` of the release stops the sealer job and does not start the release before. It also restarts the ingress before it stops the sealer, and the restart drops the pause.
+- Do not run `just rollback` across a decision version. Follow "Rollback across a decision version" in [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md): a coordinated restart into the release before.
 
 | Version | Rule change |
 |---|---|

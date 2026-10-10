@@ -109,16 +109,17 @@ deploy succeeded and the release degrades the chain after it.
 
 ### Rollback across a decision version
 
-A release that raises the sealer decision version (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. Its record holds no sealer version before it. Thus `just rollback` stops the sealer job and does not start the release before. The chain then stands on `sealer_no_quorum`.
+A release that raises the sealer decision version (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. Do not run `just rollback` for it:
 
-1. Before the rollback, do steps 1 to 3 of the coordinated restart in the sealer README: pause the submits, wait until no void vote is open, and wait for a snapshot after the last decided void. The members of the release before replay the log after their snapshot with the old rules.
-2. Run `just rollback <env>`. It reverts the other jobs and stops the sealer job.
-3. Purge the sealer job: `nomad job stop -purge cluster`. A stopped job that Nomad still knows holds the new decision version, and the gate refuses its change.
-4. Resume the submits on every ingress.
-5. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, and each member starts from its own snapshot and log.
-   - A gate that excuses the `sealer_no_quorum` halt of a purged sealer passes.
-   - The gate of an older release does not excuse it, and it refuses the deploy with `the chain stands on a halt or a pause`. Then also purge the ingress job: `nomad job stop -purge ingress`. The gate reads no chain status without an ingress job, and the deploy registers the ingress again.
-6. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
+- Its record holds no sealer version before it, so `just rollback` stops the sealer job and does not start the release before.
+- `just rollback` reverts the jobs in reverse deploy order. The ingress restarts before the sealer stops, and a restart drops an operator pause. Submits then reach the sealer of the new rules after the snapshot check.
+
+Do a coordinated restart into the release before instead. The deploy order starts the sealer before the services that wait on it.
+
+1. Do steps 1 to 4 of the coordinated restart in the sealer README: pause the submits, wait until no void vote is open, wait for a snapshot after the last decided void, and purge the sealer job (`nomad job stop -purge cluster`). The members of the release before replay the log after their snapshot with the old rules. After the purge no void can be decided, so a lost pause does no harm.
+2. Purge the ingress job: `nomad job stop -purge ingress`. The gate of a release before the decision version does not excuse the `sealer_no_quorum` halt of a purged sealer. Without an ingress job the gate reads no chain status. The ingress keeps no state.
+3. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, before the ingress. Each member starts from its own snapshot and log.
+4. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
 
 ## Clear
 

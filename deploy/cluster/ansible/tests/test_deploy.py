@@ -892,6 +892,11 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('da_lag', output, 'the purge excuses no other root')
         self.assertEqual(self.api.state['writes'], [])
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN | {
+            'ingress': {'pause': {'reason': 'operator', 'root': None, 'note': 'decision-version'}}}
+        output = self.run_deploy(success=False)
+        self.assertIn("Paused: ['ingress']", output, 'the purge excuses no operator pause')
+        self.assertEqual(self.api.state['writes'], [])
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.run_deploy()
         self.assertEqual(self.api.state['writes'], ['cluster'], 'the sealer registers in one step')
@@ -993,26 +998,24 @@ class RollbackTest(Deploys):
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
 
-    def test_a_rollback_across_a_decision_version_purges_and_renders_the_sealer_again(self):
+    def test_a_return_across_a_decision_version_starts_the_sealer_before_the_ingress(self):
         self.run_deploy()
         # The coordinated restart into release b.
         del self.api.state['jobs']['cluster']
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.repin('b')
         self.run_deploy()
-        self.assertIsNone(self.record()['attempt']['before']['jobs']['cluster']['before'])
-        self.api.state['chain_status'] = HEALTHY_CHAIN
-        self.api.state['writes'] = []
-        self.run_rollback()
-        self.assertIn('stop:cluster', self.api.state['writes'], 'the rollback stops the sealer')
-        self.assertNotIn('cluster', self.api.state['jobs'])
-        # The runbook: the sealer job is purged, and a deploy of the release
-        # before registers it again.
-        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        # The runbook: purge the sealer and the ingress, then deploy the
+        # release before. Without an ingress job the gate reads no chain
+        # status, so an older gate passes too.
+        del self.api.state['jobs']['cluster']
+        del self.api.state['jobs']['ingress']
         self.api.state['writes'] = []
         self.repin('a')
         self.run_deploy()
-        self.assertEqual(self.api.state['writes'], ['cluster'])
+        writes = self.api.state['writes']
+        self.assertEqual(writes.count('cluster'), 1, 'the sealer registers in one step')
+        self.assertLess(writes.index('cluster'), writes.index('ingress'), 'the sealer starts before the ingress')
         self.assertTrue(all(t['Config']['image'].endswith('a' * 64)
                             for g in self.api.state['jobs']['cluster']['TaskGroups'] for t in g['Tasks']))
 
