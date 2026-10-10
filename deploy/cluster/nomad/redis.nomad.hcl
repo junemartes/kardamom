@@ -43,7 +43,12 @@ locals {
   #   `roles` holds redis-primary (roles/consul writes it at agent start).
   # The second rule is the placement rule of the primary group, so on a
   # cold start every sentinel and the replica name the node where the
-  # primary starts. The expression prints no whitespace.
+  # primary starts. The two rules agree only when exactly one node holds
+  # redis-primary; roles/profile refuses an inventory with another count.
+  # The expression prints no whitespace, and prints an empty name when
+  # neither rule finds a node: no node meta yet, or a Consul token that
+  # cannot read the node catalog (Consul then filters the catalog to
+  # empty with no error).
   primary_node = trimspace(<<EOF
 {{ $primary := "" }}{{ with service "redis-primary" }}{{ $primary = (index . 0).Node }}{{ end }}{{ range nodes }}{{ if and (eq $primary "") (.Meta.roles | split "," | contains "redis-primary") }}{{ $primary = .Node }}{{ end }}{{ end }}{{ $primary }}
 EOF
@@ -231,18 +236,28 @@ EOF
         # Sentinel rewrites its own config file (its id, the config
         # epoch, the current primary, the known replicas and sentinels),
         # so the live file is on the writable alloc dir and only Sentinel
-        # writes it. The task copies the rendered seed to the live file
-        # only when the live file does not exist: a new allocation starts
-        # from the seed, and a restart in place keeps the state that
-        # Sentinel wrote. A template re-render changes only the seed.
-        args = [
-          "sh", "-c",
-          "[ -e /local/sentinel.conf ] || cp /local/sentinel.seed.conf /local/sentinel.conf; exec redis-sentinel /local/sentinel.conf",
+        # writes it. A live file with `sentinel myid` is a file that
+        # Sentinel loaded and rewrote: the task keeps it, so a restart in
+        # place keeps the state of Sentinel. Else the task copies the
+        # rendered seed over it at each start, so a later re-render of
+        # the seed reaches the next start. A seed that names no primary
+        # (an empty node name) stops the task with a log line, and the
+        # task never copies it.
+        args = ["sh", "-c", <<EOF
+if ! grep -q '^sentinel myid' /local/sentinel.conf 2>/dev/null; then
+  if grep -q '^sentinel monitor kardamom \.node\.' /local/sentinel.seed.conf; then
+    echo 'redis-sentinel: the seed names no primary: no redis-primary service passes, and no Consul node meta roles holds redis-primary' >&2
+    exit 1
+  fi
+  cp /local/sentinel.seed.conf /local/sentinel.conf
+fi
+exec redis-sentinel /local/sentinel.conf
+EOF
         ]
       }
 
-      # The seed always names a primary (local.primary_node): Sentinel
-      # stops at start on a config without a `sentinel monitor` line.
+      # The seed always has a `sentinel monitor` line (local.primary_node):
+      # Sentinel stops at start on a config without one.
       # From the seed, Sentinel follows each failover by its own state and
       # by the hello messages of the other sentinels, which carry the
       # newest config epoch.

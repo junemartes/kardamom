@@ -651,13 +651,46 @@ class DeployTest(Deploys):
         self.assertTrue(primary.endswith('{{ $primary }}'), primary)
         replica_env = groups['replica']['Tasks'][0]['Templates'][0]['EmbeddedTmpl']
         self.assertEqual(replica_env, f'REDIS_PRIMARY_NODE={primary}\n')
-        # Only Sentinel writes the live config: a restart in place keeps
-        # the state that Sentinel wrote, and a re-render changes only the
-        # seed.
-        self.assertEqual(sentinel['Config']['args'], [
-            'sh', '-c', '[ -e /local/sentinel.conf ] || cp /local/sentinel.seed.conf /local/sentinel.conf; '
-            'exec redis-sentinel /local/sentinel.conf'])
+        self.assertEqual(sentinel['Config']['args'][:2], ['sh', '-c'])
+        self.assert_sentinel_start(sentinel['Config']['args'][2])
         self.assertEqual(self.api.state['writes'], [])
+
+    def assert_sentinel_start(self, script):
+        """Run the start script of a sentinel task on each state of its
+        files, with a stub redis-sentinel. The task keeps a live config
+        that Sentinel rewrote (it has `sentinel myid`), copies a seed that
+        names a primary over any other live config, and refuses a seed
+        that names none without writing the live config."""
+        good = 'sentinel monitor kardamom aux-0.node.dc1.consul 6379 2\n'
+        empty = 'sentinel monitor kardamom .node.dc1.consul 6379 2\n'
+        rewritten = 'sentinel monitor kardamom ingress-1.node.dc1.consul 6379 2\nsentinel myid abc\n'
+        cases = [
+            ('a cold start', good, None, 0, good),
+            ('a seed that names no primary', empty, None, 1, None),
+            ('a restart after Sentinel rewrote its config', empty, rewritten, 0, rewritten),
+            ('a restart after a refused start, with a good seed now', good, empty, 0, good),
+        ]
+        for name, seed, live, code, after in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'local').mkdir()
+                (root / 'bin').mkdir()
+                stub = root / 'bin/redis-sentinel'
+                stub.write_text('#!/bin/sh\necho "started $1"\n')
+                stub.chmod(0o755)
+                (root / 'local/sentinel.seed.conf').write_text(seed)
+                if live is not None:
+                    (root / 'local/sentinel.conf').write_text(live)
+                result = subprocess.run(['sh', '-c', script.replace('/local/', f'{root}/local/')],
+                                        env={'PATH': f'{root}/bin:/usr/bin:/bin'}, text=True,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                config = root / 'local/sentinel.conf'
+                self.assertEqual(config.read_text() if config.exists() else None, after)
+                if code:
+                    self.assertIn('the seed names no primary', result.stderr)
+                else:
+                    self.assertEqual(result.stdout, f'started {root}/local/sentinel.conf\n')
 
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)

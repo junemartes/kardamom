@@ -1049,6 +1049,8 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Effect: the readers degrade to the executor query. The pipeline progresses. The state mirrors retry their writes.
   - Recovery: the job returns empty. The sentinels name a primary. Every state mirror rebuilds the projection from the newest checkpoint of its executor. A mirror never rewrites the checkpoint directory of its executor.
   - The cold start: no primary is registered in Consul yet. The sentinels and the replica name the initial primary by the placement rule of the primary group: the node whose Consul node meta `roles` holds `redis-primary`. So each sentinel starts with a `sentinel monitor` line and does not restart.
+  - The rule names the node where the primary starts only when exactly one node holds `redis-primary`. `roles/profile` refuses an inventory with another count.
+  - When no node meta holds `redis-primary` (a node not yet bootstrapped with it, or a Nomad Consul token without `node_prefix "" read`), the seed names no primary. The sentinel task then stops with the log line `the seed names no primary` and does not write its live config. It starts at the next restart after the seed names a primary.
   - Proof: `redis-total-loss-recover`. The case requires degraded reads, progress, a rising write-retry counter, one `rebuild: done` log line per mirror, and zero sentinel restarts after the restore.
 - **Primary frozen**
   - Trigger: the primary freezes for longer than the sentinel `down-after-milliseconds` (5 s).
@@ -1072,7 +1074,8 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
 - The readers ask every sentinel for the primary and keep the first connection that a primary accepts.
-- A sentinel starts from a seed config only in a new allocation. A restart in place keeps the config that Sentinel rewrote: its id, the config epoch and the current primary. So a restarted sentinel does not count as a new sentinel, and it follows the last failover.
+- A sentinel keeps the config that Sentinel rewrote (it holds `sentinel myid`) across a restart in place: its id, the config epoch and the current primary. So a restarted sentinel does not count as a new sentinel, and it follows the last failover. A sentinel without a rewritten config starts from the seed.
+- Known gap: a sentinel in a new allocation gets a new id. The other sentinels keep the old id as a known sentinel and never drop it. A failover needs the votes of a majority of all known sentinels. With one stale id, a failover needs all three live sentinels. With three stale ids, no failover can win. The remedy is `SENTINEL RESET kardamom` on each sentinel, one at a time, after the reschedule.
 - `redis-total-loss-recover` runs in the `chaos-fleet` shard.
 - `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze` and `mirror-kill-rebuild` run in the `chaos-cache` shard. `mirror-kill-rebuild` runs last, because it flushes the projection.
 - Further reading: [`specs/2026-09-13-redis-account-cache-design.md`](specs/2026-09-13-redis-account-cache-design.md), section 9.3.
