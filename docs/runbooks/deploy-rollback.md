@@ -107,6 +107,19 @@ deploy succeeded and the release degrades the chain after it.
    another controller writes the record of the environment at the same
    time. Let it finish, then read the record again.
 
+### Rollback across a decision version
+
+A release that raises the sealer decision version (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. Its record holds no sealer version before it. Thus `just rollback` stops the sealer job and does not start the release before. The chain then stands on `sealer_no_quorum`.
+
+1. Before the rollback, do steps 1 to 3 of the coordinated restart in the sealer README: pause the submits, wait until no void vote is open, and wait for a snapshot after the last decided void. The members of the release before replay the log after their snapshot with the old rules.
+2. Run `just rollback <env>`. It reverts the other jobs and stops the sealer job.
+3. Purge the sealer job: `nomad job stop -purge cluster`. A stopped job that Nomad still knows holds the new decision version, and the gate refuses its change.
+4. Resume the submits on every ingress.
+5. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, and each member starts from its own snapshot and log.
+   - A gate that excuses the `sealer_no_quorum` halt of a purged sealer passes.
+   - The gate of an older release does not excuse it, and it refuses the deploy with `the chain stands on a halt or a pause`. Then also purge the ingress job: `nomad job stop -purge ingress`. The gate reads no chain status without an ingress job, and the deploy registers the ingress again.
+6. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
+
 ## Clear
 
 The rollback writes the record: the attempt gets `status: rolled_back`, and
@@ -126,12 +139,12 @@ with `Refused:`.
 | Message | Cause | What to do |
 |---|---|---|
 | `the attempt of <time> by <operator> is still started` | The last attempt runs, or died. | Let it finish. If it died: `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1 just deploy` to deploy over it. |
-| `the chain stands on a halt or a pause` | `kardamom_chainStatus` lists a root, or a pause stands on the sealer, the ingress or a service. | Follow the runbook of the root. Resume the paused service. |
+| `the chain stands on a halt or a pause` | `kardamom_chainStatus` lists a root, or a pause stands on the sealer, the ingress or a service. When Nomad does not know the sealer job, the gate excuses `sealer_no_quorum` and the upstream pauses on it. | Follow the runbook of the root. Resume the paused service. |
 | `the ingress job is registered and no allocation of it runs` | The chain status cannot be read: a failed release left the ingress down. | Bring the ingress back, or `just rollback <env>`. |
 | `KARDAMOM_REGISTRY_URL=off skips the image check, and the <profile> profile does not allow that` | Only the local profile skips the image check. | Set `KARDAMOM_REGISTRY_URL` to the registry API. |
 | `the registry ... does not hold the image of <services>` | A digest of the manifest is not in the registry. | `just images`, or fix the manifest. |
 | `a rolling deploy cannot carry a coordinated format change: <ids>` | The accepted release and the target cannot run as a mixed fleet. | Stop the writers, or follow the runbook of the format in `docs/formats.md`. |
 | `the release writes a version that the accepted release cannot read: <ids>` | A one-way format change. A rollback is not safe after the first write. | `KARDAMOM_ALLOW_ONE_WAY=<ids> just deploy`. The record then carries the floor. |
 | `KARDAMOM_ALLOW_ONE_WAY names <ids>, and the release has no one-way change of it` | A stale allowance. | Unset it. |
-| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow`, `decisionVersion` or another setting of the list. A `decisionVersion` change comes with the image. | A coordinated restart of the sealer. For `decisionVersion`, follow "Decision version" in `cluster/sealer-service/README.md`. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
+| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow`, `decisionVersion` or another setting of the list. A `decisionVersion` change comes with the image. | A coordinated restart of the sealer. For `decisionVersion`, follow "Decision version" in `cluster/sealer-service/README.md`, and "Rollback across a decision version" above for a rollback. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
 | `config/shard-map.toml ... differs from the shard map of the registered ingress` | A routing change in the rolling path. | `kardamom-cluster scale-sequencers`. |

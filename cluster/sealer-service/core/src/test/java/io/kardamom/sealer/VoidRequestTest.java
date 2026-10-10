@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -114,7 +115,7 @@ class VoidRequestTest {
 
     /** Order references of sender 1 at {@code nonces}, each with id = nonce, and return their indices. */
     private static long[] orderAll(CanonicalSealerState state, int... nonces) {
-        return java.util.Arrays.stream(nonces).mapToLong(nonce -> order(state, nonce)).toArray();
+        return Arrays.stream(nonces).mapToLong(nonce -> order(state, nonce)).toArray();
     }
 
     private static long expectedOf(CanonicalSealerState state) {
@@ -285,7 +286,7 @@ class VoidRequestTest {
         // per-id deadlines, cut those counts, and set the version field
         // back, which is the exact version-5 byte layout.
         byte[] v6 = SealerStateFixtures.downgradeToVersion(old.takeSnapshot(), 5);
-        byte[] v5 = java.util.Arrays.copyOf(v6, v6.length - 8);
+        byte[] v5 = Arrays.copyOf(v6, v6.length - 8);
 
         CanonicalSealerState restored = CanonicalSealerState.load(v5, 8, Set.of(), THREE_VOTERS);
 

@@ -29,6 +29,12 @@ SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 SENTINEL = 'SECRET-SENTINEL'
 # The chain status of a chain that stands on nothing.
 HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
+# The chain status while no sealer member runs: the ingress halts the
+# sealer on a lost quorum and pauses on it.
+NO_QUORUM_ROOT = {'service': 'sealer', 'instance': 'cluster', 'cause': 'sealer_no_quorum',
+                  'runbook': 'docs/runbooks/sealer_no_quorum.md'}
+NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
+                                   'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 
@@ -872,6 +878,24 @@ class RecordTest(Deploys):
         self.assertIn('the ingress job is registered and no allocation of it runs', output)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_a_purged_sealer_excuses_only_its_own_no_quorum_halt(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        output = self.run_deploy(success=False)
+        self.assertIn('the chain stands on a halt or a pause', output, 'a registered sealer gets no excuse')
+        self.assertEqual(self.api.state['writes'], [])
+        # The coordinated restart: nomad job stop -purge cluster.
+        del self.api.state['jobs']['cluster']
+        da_lag = {'service': 'sealer', 'instance': 'cluster', 'cause': 'da_lag', 'runbook': 'docs/runbooks/da_lag.md'}
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN | {'roots': [NO_QUORUM_ROOT, da_lag]}
+        output = self.run_deploy(success=False)
+        self.assertIn('da_lag', output, 'the purge excuses no other root')
+        self.assertEqual(self.api.state['writes'], [])
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'], ['cluster'], 'the sealer registers in one step')
+
     def test_a_missing_image_refuses_the_release(self):
         self.api.state['missing_images'] = {'kardamom-executor'}
         output = self.run_deploy(success=False)
@@ -968,6 +992,29 @@ class RollbackTest(Deploys):
         self.assertEqual(record['accepted']['target']['formats'], FORMATS)
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
+
+    def test_a_rollback_across_a_decision_version_purges_and_renders_the_sealer_again(self):
+        self.run_deploy()
+        # The coordinated restart into release b.
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.repin('b')
+        self.run_deploy()
+        self.assertIsNone(self.record()['attempt']['before']['jobs']['cluster']['before'])
+        self.api.state['chain_status'] = HEALTHY_CHAIN
+        self.api.state['writes'] = []
+        self.run_rollback()
+        self.assertIn('stop:cluster', self.api.state['writes'], 'the rollback stops the sealer')
+        self.assertNotIn('cluster', self.api.state['jobs'])
+        # The runbook: the sealer job is purged, and a deploy of the release
+        # before registers it again.
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.api.state['writes'] = []
+        self.repin('a')
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'], ['cluster'])
+        self.assertTrue(all(t['Config']['image'].endswith('a' * 64)
+                            for g in self.api.state['jobs']['cluster']['TaskGroups'] for t in g['Tasks']))
 
     def test_a_rollback_after_a_failed_attempt_targets_the_accepted_release(self):
         self.run_deploy()
