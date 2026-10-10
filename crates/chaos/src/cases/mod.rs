@@ -22,6 +22,7 @@ pub(crate) mod deploy;
 pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
+pub(crate) mod l1_canary;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -78,6 +79,7 @@ pub enum Case {
     RedisTotalLossRecover,
     MirrorKillRebuild,
     DaLagHalt,
+    CanaryDaLag,
     PruneFloor,
     L1Liar,
     L1NullReceipts,
@@ -136,6 +138,7 @@ const ALL: [Case; 55] = [
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
     Case::DaLagHalt,
+    Case::CanaryDaLag,
     Case::PruneFloor,
     Case::L1Liar,
     Case::L1NullReceipts,
@@ -210,6 +213,7 @@ impl Case {
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
             Self::DaLagHalt => "da-lag-halt",
+            Self::CanaryDaLag => "canary-da-lag",
             Self::PruneFloor => "prune-floor",
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
@@ -265,6 +269,7 @@ impl Case {
             Self::RetentionOverrun
             | Self::RetentionOverrunValidator
             | Self::DaLagHalt
+            | Self::CanaryDaLag
             | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             // The failed deployment runs to the executor's healthy
@@ -359,7 +364,7 @@ impl Case {
             // attempts cover a halt of about 24 minutes. The sealer fleet
             // wipe stops the ingresses for the whole rebuild, and a refused
             // submit would leave a nonce hole in the load's sender.
-            Self::DaLagHalt | Self::SealerFleetTotalWipeRecover => 120,
+            Self::DaLagHalt | Self::CanaryDaLag | Self::SealerFleetTotalWipeRecover => 120,
             // The submit ingress is dead for the hold and the staggered
             // return, about five minutes, and a dead ingress refuses a
             // connection at once. The retry delay grows by 200 ms per
@@ -444,6 +449,7 @@ impl Case {
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
             Self::DaLagHalt => da_lag::da_lag_halt(h).await,
+            Self::CanaryDaLag => l1_canary::canary_da_lag(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,

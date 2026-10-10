@@ -5,7 +5,7 @@ use alloy_primitives::{Address, B256, Bytes};
 use kardamom_formats::Registry;
 
 use crate::ring::journal::InFlight;
-use crate::store::Contracts;
+use crate::store::{Contracts, Market, SupplyChange};
 
 #[test]
 fn the_journal_layout_matches_the_registry() {
@@ -28,4 +28,18 @@ fn the_store_layout_matches_the_registry() {
     Registry::assert_layout("canary-store", "Contracts", &json);
     let anchor = serde_json::to_string(&B256::repeat_byte(5)).unwrap();
     Registry::assert_layout("canary-store", "anchor", &anchor);
+}
+
+#[test]
+fn the_market_layout_matches_the_registry() {
+    let market = Market {
+        rwa: Some(Address::repeat_byte(6)),
+        pool: Some(Address::repeat_byte(7)),
+        setup: 8,
+        supply: alloy_primitives::U256::from(9),
+        pending: Some(SupplyChange::Burn(alloy_primitives::U256::from(1))),
+        shares: Some(alloy_primitives::U256::from(2)),
+    };
+    let json = serde_json::to_string(&market).unwrap();
+    Registry::assert_layout("canary-market", "Market", &json);
 }

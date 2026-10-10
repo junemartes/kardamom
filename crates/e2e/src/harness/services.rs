@@ -346,6 +346,15 @@ pub struct CanarySpec<'a> {
     /// The first dev-mnemonic account of the ring, and the ring size.
     pub ring_offset: u32,
     pub ring_size: u32,
+    /// The `deposit` probe's L1: the endpoint, the key, and the lockbox.
+    pub l1: Option<CanaryL1>,
+}
+
+/// The L1 side of a spawned canary.
+pub struct CanaryL1 {
+    pub rpc_url: String,
+    pub key: String,
+    pub lockbox: alloy_primitives::Address,
 }
 
 /// Spawn `kardamom-canary` against one ingress and the notifier, on the
@@ -372,10 +381,27 @@ pub fn spawn_canary(spec: &CanarySpec<'_>) -> Result<Spawned> {
             "--contract-ms",
             "2000",
         ])
-        .args(["--balance-ms", "2000"])
+        .args([
+            "--balance-ms",
+            "2000",
+            "--fees-ms",
+            "3000",
+            "--rwa-ms",
+            "3000",
+        ])
+        .args(["--swap-ms", "2000", "--liquidity-ms", "4000"])
+        .args(["--deposit-ms", "600000"])
+        // The local stack runs no batcher, so the safe head stays put.
+        .args(["--safe-sample", "1000000000"])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-canary"])
         .env("KARDAMOM_CANARY_MNEMONIC", super::l2::DEV_MNEMONIC);
+    if let Some(l1) = &spec.l1 {
+        cmd.env("KARDAMOM_L1_RPC", &l1.rpc_url)
+            .env("KARDAMOM_CANARY_L1_KEY", &l1.key)
+            .args(["--lockbox", &l1.lockbox.to_string()])
+            .args(["--l1-timeout-ms", "120000", "--credit-timeout-ms", "120000"]);
+    }
     common_service_env(&mut cmd);
     SpawnPlan {
         name: "canary".to_string(),

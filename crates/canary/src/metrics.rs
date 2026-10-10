@@ -27,6 +27,19 @@ pub const STALLED_NONCE: &str = "kardamom_canary_account_stalled_nonce";
 pub const FEED_GAPS_TOTAL: &str = "kardamom_canary_feed_gaps_total";
 /// 1 while the status feed subscription is open.
 pub const FEED_CONNECTED: &str = "kardamom_canary_feed_connected";
+/// The pool's reserves after the canary's last call, in token units
+/// (wei), by `asset` (`eth`, `kca`).
+pub const POOL_RESERVE: &str = "kardamom_canary_pool_reserve";
+/// The pool's price of one KCA in ETH.
+pub const POOL_PRICE: &str = "kardamom_canary_pool_price_eth";
+/// Pool activity of another account that the canary saw: a reserve
+/// snapshot that moved between two canary calls, or forced ETH. Not a
+/// fault.
+pub const POOL_EXTERNAL_TOTAL: &str = "kardamom_canary_pool_external_total";
+/// The test RWA token's total supply, in tokens.
+pub const RWA_SUPPLY: &str = "kardamom_canary_rwa_supply_tokens";
+/// Top-ups of a ring account from the first one, by `outcome`.
+pub const TOPUPS_TOTAL: &str = "kardamom_canary_topups_total";
 
 /// A wei amount as a gauge value.
 #[allow(
