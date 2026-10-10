@@ -14,6 +14,7 @@
 
 #![cfg(feature = "docker-e2e")]
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use kardamom_log::aeron_live::{PubHandle, RawFrame};
@@ -52,17 +53,31 @@ async fn publish(publisher: &PubHandle, fill: u8) {
     .expect("publisher task");
 }
 
-/// The count of frames with the first byte `fill` among up to `want`
-/// frames received within `budget`.
-async fn received(rx: &mut UnboundedReceiver<RawFrame>, fill: u8, want: usize) -> usize {
+/// Every frame received until the stream stays quiet for 1 s, or for at
+/// most 10 s.
+async fn drain(rx: &mut UnboundedReceiver<RawFrame>) -> Vec<RawFrame> {
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = 0;
-    while seen < want && Instant::now() < deadline {
-        if let Ok(Some(f)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-            seen += usize::from(f.bytes[0] == fill);
+    let mut frames = Vec::new();
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(f)) => frames.push(f),
+            _ => break,
         }
     }
-    seen
+    frames
+}
+
+/// Assert that `frames` hold exactly `FRAMES` copies of `fill`, all from
+/// one session, and nothing else. Return that session.
+fn exactly_once(frames: &[RawFrame], fill: u8, what: &str) -> i32 {
+    assert_eq!(frames.len(), FRAMES, "{what}: every frame arrives once");
+    assert!(
+        frames.iter().all(|f| f.bytes[0] == fill),
+        "{what}: no other frame arrives"
+    );
+    let sessions: BTreeSet<i32> = frames.iter().map(|f| f.session).collect();
+    assert_eq!(sessions.len(), 1, "{what}: one session per publisher");
+    frames[0].session
 }
 
 /// Every distinct error in the error log of the driver at `aeron_dir`.
@@ -96,28 +111,22 @@ async fn removing_a_destination_after_its_images_form_keeps_the_driver_clean() {
         .open_publication(&control_uri(PORT_B), STREAM)
         .expect("publisher b");
     publish(&pub_a, 0xAA).await;
-    assert_eq!(received(&mut rx, 0xAA, FRAMES).await, FRAMES, "a arrives");
+    let session_a = exactly_once(&drain(&mut rx).await, 0xAA, "a");
     publish(&pub_b, 0xBB).await;
-    assert_eq!(received(&mut rx, 0xBB, FRAMES).await, FRAMES, "b arrives");
+    let session_b = exactly_once(&drain(&mut rx).await, 0xBB, "b");
+    assert_ne!(session_a, session_b, "two publishers are two sessions");
 
     rt.remove_destination(sub_id, &destination(PORT_B))
         .expect("remove b");
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     publish(&pub_a, 0xA1).await;
-    assert_eq!(
-        received(&mut rx, 0xA1, FRAMES).await,
-        FRAMES,
-        "a keeps its delivery after the removal of b"
-    );
+    let again_a = exactly_once(&drain(&mut rx).await, 0xA1, "a after the removal of b");
+    assert_eq!(again_a, session_a, "a keeps its session");
     rt.add_destination(sub_id, &destination(PORT_B))
         .expect("destination b again");
     publish(&pub_b, 0xB1).await;
-    assert_eq!(
-        received(&mut rx, 0xB1, FRAMES).await,
-        FRAMES,
-        "b arrives again after a new attach"
-    );
+    exactly_once(&drain(&mut rx).await, 0xB1, "b after a new attach");
 
     let errors = driver_errors(&aeron_dir);
     assert!(

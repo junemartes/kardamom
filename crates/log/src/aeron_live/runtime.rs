@@ -654,7 +654,7 @@ pub struct TxDataSubscription {
 
 impl TxDataSubscription {
     /// Wrap a raw frame stream opened elsewhere, for example a discovered
-    /// multi-destination subscription.
+    /// subscription.
     pub(crate) fn from_raw(rx: UnboundedReceiver<RawFrame>) -> Self {
         Self { rx }
     }

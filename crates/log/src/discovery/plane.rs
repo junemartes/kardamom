@@ -3,7 +3,7 @@
 //! With discovery off, every handle opens on its static `[channels]`
 //! URI, unchanged. With discovery on, a publisher opens a dynamic MDC
 //! publication on the advertised interface and registers it, and a
-//! subscriber opens one multi-destination subscription and runs a
+//! subscriber opens one subscription per stream and runs a
 //! reconcile task that attaches every discovered publisher.
 //!
 //! The reconcile task holds a command-only [`Destinations`] handle, never
@@ -143,7 +143,7 @@ impl Discovered {
         Ok(publication)
     }
 
-    /// Open a multi-destination subscription for `key` and start the
+    /// Open a discovered subscription for `key` and start the
     /// watch and reconcile tasks that attach its publishers.
     fn open_subscription<T: WireMessage>(
         &mut self,
@@ -157,7 +157,7 @@ impl Discovered {
         Ok(rx)
     }
 
-    /// Open a multi-destination subscription for `key` delivering raw
+    /// Open a discovered subscription for `key` delivering raw
     /// frames, and start its watch and reconcile tasks.
     fn open_raw_subscription(
         &mut self,
