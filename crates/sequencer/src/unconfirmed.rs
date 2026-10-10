@@ -104,6 +104,21 @@ impl<T> UnconfirmedLedger<T> {
         self.entries.remove(&(sender, nonce)).map(|(meta, _)| meta)
     }
 
+    /// Drop the ledger entry of `sender` at `nonce` when `named` holds
+    /// for its metadata, and return the metadata.
+    pub(crate) fn take_named<F: Fn(&T) -> bool>(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        named: F,
+    ) -> Option<T> {
+        let held = self
+            .entries
+            .get(&(sender, nonce))
+            .is_some_and(|(meta, _)| named(meta));
+        held.then(|| self.drop_committed(sender, nonce)).flatten()
+    }
+
     /// A sealer contiguity gap: refs for `sender` at `expected..nonce-1`
     /// vanished (voided offers). They are all in the ledger. Take every
     /// retained ref at a nonce at or above `expected`, for immediate

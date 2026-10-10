@@ -383,9 +383,15 @@ impl<T> PartitionState<T> {
             .is_some_and(|buf| buf.contains(nonce))
     }
 
-    /// Remove and return the buffered ref of `sender` at `nonce`.
-    pub(crate) fn take_buffered(&mut self, sender: Address, nonce: u64) -> Option<T> {
-        self.pending.get_mut(&sender)?.remove(nonce)
+    /// Remove and return the parked ref of `sender` at `nonce` when
+    /// `named` holds for it. See [`PendingBuffer::take_parked`].
+    pub(crate) fn take_parked<F: Fn(&T) -> bool>(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        named: F,
+    ) -> Option<T> {
+        self.pending.get_mut(&sender)?.take_parked(nonce, named)
     }
 
     /// Expire the parked entries whose deadline is at or before `now`.

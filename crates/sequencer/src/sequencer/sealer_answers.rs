@@ -5,11 +5,12 @@
 use std::time::Instant;
 
 use alloy_primitives::Address;
-use kardamom_types::TxError;
+use kardamom_types::{TxError, TxErrorReason};
 use tracing::{trace, warn};
 
 use super::{RefMetadata, Sequencer, SequencerPorts};
 use crate::metrics;
+use crate::resync::SealerRefusal;
 use crate::state::FreedNonce;
 
 impl Sequencer {
@@ -98,14 +99,8 @@ impl Sequencer {
     /// carries the transaction's hash, so the `Rejected` status goes out
     /// with the error. An entry a receipt or a rewind already took gets
     /// the error only.
-    fn report_refusal<P: SequencerPorts>(
-        &mut self,
-        ports: &mut P,
-        refusal: crate::resync::SealerRefusal,
-    ) {
-        let tx_hash = self
-            .take_refused(refusal.sender, refusal.nonce)
-            .map(|meta| meta.tx_hash);
+    fn report_refusal<P: SequencerPorts>(&mut self, ports: &mut P, refusal: SealerRefusal) {
+        let tx_hash = self.take_refused(&refusal).map(|meta| meta.tx_hash);
         warn!(
             sender = ?refusal.sender,
             nonce = refusal.nonce,
@@ -124,17 +119,29 @@ impl Sequencer {
         }
     }
 
-    /// Take the refused ref of `sender` at `nonce` out of the ledger, or
-    /// out of the buffer when a freed nonce parked it there, so it never
-    /// publishes. Mark the nonce for the resubmit. The floor stays: the
-    /// sealer also refuses a late copy of a ref it ordered long ago. See
-    /// [`PartitionState::mark_refused`]. Returns the ref's metadata.
-    fn take_refused(&mut self, sender: Address, nonce: u64) -> Option<RefMetadata> {
+    /// Take the refused ref out of the ledger, or out of the buffer when
+    /// a freed nonce parked it there, so it never publishes. Mark the
+    /// nonce for the resubmit. The floor stays: the sealer also refuses a
+    /// late copy of a ref it ordered long ago. See
+    /// [`crate::state::PartitionState::mark_refused`]. Returns the ref's
+    /// metadata.
+    ///
+    /// Only the copy the refusal names leaves, so a resubmit that replaced
+    /// it survives a late refusal. A rebuffered ref stays too: it waits on
+    /// the publisher, the sealer refuses its republish again, and that
+    /// refusal finds it in the ledger.
+    fn take_refused(&mut self, refusal: &SealerRefusal) -> Option<RefMetadata> {
+        let SealerRefusal {
+            sender,
+            nonce,
+            reason,
+        } = refusal;
+        let named = |meta: &RefMetadata| meta.named_by(reason);
         let refused = self
             .unconfirmed
-            .drop_committed(sender, nonce)
-            .or_else(|| self.state.take_buffered(sender, nonce))?;
-        self.state.mark_refused(sender, nonce);
+            .take_named(*sender, *nonce, named)
+            .or_else(|| self.state.take_parked(*sender, *nonce, named))?;
+        self.state.mark_refused(*sender, *nonce);
         Some(refused)
     }
 
@@ -167,5 +174,21 @@ impl Sequencer {
             "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
         );
         self.rewind_for_republish(taken);
+    }
+}
+
+impl RefMetadata {
+    /// Whether a refusal with `reason` names this copy of the ref. A
+    /// past-deadline refusal carries the deadline of the refused copy, and
+    /// a resubmit carries a later one. A DA-lag or a record-lag refusal
+    /// carries no copy identity, so it names every copy at its nonce.
+    fn named_by(&self, reason: &TxErrorReason) -> bool {
+        match reason {
+            TxErrorReason::PastDeadline {
+                max_inclusion_block,
+                ..
+            } => self.max_inclusion_block == *max_inclusion_block,
+            _ => true,
+        }
     }
 }

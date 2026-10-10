@@ -181,6 +181,17 @@ impl<T> PendingBuffer<T> {
         live.then(|| self.remove(nonce)).flatten()
     }
 
+    /// Remove and return the entry at `nonce` when it is parked (it has a
+    /// deadline) and `named` holds for its value. A rebuffered entry has
+    /// no deadline: it waits on the publisher, and it stays.
+    pub(crate) fn take_parked<F: Fn(&T) -> bool>(&mut self, nonce: u64, named: F) -> Option<T> {
+        let parked = self
+            .inner
+            .get(&nonce)
+            .is_some_and(|slot| slot.deadline.is_some() && named(&slot.value));
+        parked.then(|| self.remove(nonce)).flatten()
+    }
+
     /// Drop every buffered entry with a nonce below `floor`. Returns how
     /// many were dropped. The receipt-floor advance
     /// ([`crate::state::PartitionState::advance_floor`]) uses this. Entries

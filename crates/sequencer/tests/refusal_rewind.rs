@@ -21,9 +21,10 @@ use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig, SealerRefusal};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
-/// The reason every refusal in these tests carries.
+/// The reason every refusal in these tests carries. It names the
+/// deadline of the test envelopes, so it names their copies.
 const LATE: TxErrorReason = TxErrorReason::PastDeadline {
-    max_inclusion_block: 64,
+    max_inclusion_block: u64::MAX,
     at_block: 65,
 };
 
@@ -67,17 +68,26 @@ impl Sealed {
 
     /// The client submits `nonce`, and the sequencer takes one step.
     fn submit(&mut self, s: &PrivateKeySigner, nonce: u64) {
+        self.submit_with_deadline(s, nonce, u64::MAX);
+    }
+
+    /// [`Self::submit`] with the deadline `deadline` on the envelope.
+    fn submit_with_deadline(&mut self, s: &PrivateKeySigner, nonce: u64, deadline: u64) {
         let at = pos(self.offset);
         self.offset += 64;
-        self.rig.push(
-            TxDataLoc::new(0, at),
-            signed_envelope(s, nonce, u64::try_from(self.offset).unwrap()),
-        );
+        let mut envelope = signed_envelope(s, nonce, u64::try_from(self.offset).unwrap());
+        envelope.max_inclusion_block = deadline;
+        self.rig.push(TxDataLoc::new(0, at), envelope);
         self.step();
     }
 
     fn step(&mut self) {
         self.rig.step(&mut self.seq).unwrap();
+    }
+
+    /// One step while the publisher pushes back.
+    fn step_blocked(&mut self) {
+        assert!(self.rig.step(&mut self.seq).is_err(), "the publish blocks");
     }
 
     /// Wait past the 20 ms `tx_ttl` of [`Self::short_ttl`], and step.
@@ -300,4 +310,61 @@ fn the_later_refs_expire_without_a_resubmit() {
         "each later ref expires once"
     );
     assert_eq!(sealed.offered_nonces(3), Vec::<u64>::new());
+}
+
+/// Back-pressure keeps the swept refs 0 to 3 in the buffer, with the
+/// floor at 0, when the refusal of an earlier copy of 0 arrives. The
+/// buffered 0 stays: it republishes when the publisher recovers, and the
+/// refs 1 to 3 do not wait for good behind a hole at the floor.
+#[test]
+fn a_refusal_leaves_a_rebuffered_ref_to_republish() {
+    let s = signer(27);
+    let mut sealed = Sealed::short_ttl();
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = true;
+    sealed.seq.set_confirm_timeout_ms(0);
+    sealed.step_blocked();
+    sealed.seq.set_confirm_timeout_ms(60_000);
+
+    sealed.refuse(s.address(), &[0]);
+    sealed.step_blocked();
+    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = false;
+    sealed.step();
+    assert_eq!(sealed.offered_nonces(4), vec![0, 1, 2, 3], "the republish");
+
+    sealed.refuse(s.address(), &[0]);
+    sealed.reject(s.address(), &[1, 2, 3], 0);
+    sealed.step();
+    sealed.step_after_ttl();
+    let expired = [1, 2, 3].map(|n| sealed.errors_of(n));
+    assert_eq!(
+        expired,
+        [1, 2, 3].map(|_| vec![TxErrorReason::Expired { expected_nonce: 0 }]),
+        "without a resubmit of 0, the clients of 1 to 3 hear back"
+    );
+}
+
+/// The refs 1 to 3 park behind the freed nonce 0. The client resubmits 2
+/// with a new deadline, which replaces the parked copy. A late refusal of
+/// the old copy of 2 does not remove the resubmit, and the resubmit of 0
+/// publishes the whole run.
+#[test]
+fn a_late_refusal_spares_the_resubmit_that_replaced_its_copy() {
+    let s = signer(28);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    sealed.refuse(s.address(), &[0]);
+    sealed.reject(s.address(), &[1, 2, 3], 0);
+    sealed.step();
+
+    sealed.submit_with_deadline(&s, 2, 1_000);
+    sealed.refuse(s.address(), &[2]);
+    sealed.step();
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(4), vec![0, 1, 2, 3]);
+    assert_eq!(
+        sealed.rig.offers()[6].guard.max_inclusion_block,
+        1_000,
+        "nonce 2 publishes the resubmit"
+    );
 }
