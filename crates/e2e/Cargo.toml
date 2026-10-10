@@ -27,6 +27,7 @@ full-pipeline-e2e = [
     "dep:clap",
     "dep:jsonrpsee",
     "dep:kardamom-batcher",
+    "dep:kardamom-canary",
     "dep:kardamom-da-watcher",
     "dep:kardamom-exec-core",
     "dep:kardamom-deployer",
@@ -91,6 +92,9 @@ jsonrpsee = { workspace = true, features = ["http-client", "ws-client"], optiona
 # starts for the batcher's posting path and for `kardamom-reconstruct`.
 kardamom-batcher = { path = "../batcher", optional = true, features = ["test-support"] }
 kardamom-state = { path = "../state", optional = true }
+# The transaction canary: its ring and its probes, driven against the
+# local stack.
+kardamom-canary = { path = "../canary", optional = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

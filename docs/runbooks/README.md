@@ -49,6 +49,11 @@ curl -s -X POST 'http://127.0.0.1:<port>/pause?note=disk-swap'
 curl -s -X POST http://127.0.0.1:<port>/resume
 ```
 
+## Deploys
+
+[`deploy-rollback.md`](deploy-rollback.md): when and how to roll a release
+back, what the deploy record shows, and the refusals of the release gate.
+
 ## Alerts without a halt
 
 Two alerts of the L1 follower have a runbook and no halt:

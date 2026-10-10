@@ -232,6 +232,12 @@ async fn chaos_coordinated() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_combined_ordering() {
+    shard_test(Shard::CombinedOrdering).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
 async fn chaos_retention() {
     shard_test(Shard::Retention).await;
 }

@@ -34,7 +34,21 @@ pub fn generate(word_count: u32) -> anyhow::Result<String> {
 /// Returns an error if `phrase` is not a valid BIP-39 mnemonic, or if
 /// BIP-32 derivation fails for a requested index.
 pub fn derive_signers(phrase: &str, count: u32) -> anyhow::Result<Vec<DerivedSigner>> {
-    (0..count)
+    derive_range(phrase, 0..count)
+}
+
+/// Derive the signers of the derivation indices `indices` from `phrase`,
+/// along m/44'/60'/0'/0/N, in index order.
+///
+/// # Errors
+///
+/// Returns an error if `phrase` is not a valid BIP-39 mnemonic, or if
+/// BIP-32 derivation fails for a requested index.
+pub fn derive_range(
+    phrase: &str,
+    indices: std::ops::Range<u32>,
+) -> anyhow::Result<Vec<DerivedSigner>> {
+    indices
         .map(|i| {
             let path = format!("m/44'/60'/0'/0/{i}");
             let signer = MnemonicBuilder::<English>::default()

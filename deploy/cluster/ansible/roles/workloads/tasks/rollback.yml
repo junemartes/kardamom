@@ -1,0 +1,119 @@
+---
+# The rollback: revert every job of the last release to its version before
+# that release, in reverse deploy order, under the waits of the deploy.
+# The record names the release: a failed attempt, or the accepted release
+# when the last attempt succeeded. The rollback goes back one release. It
+# does not cross a rollback floor, and it does not reach a version that
+# Nomad dropped. A rollback that stops resumes: the jobs in `rolled_back`
+# are done. docs/runbooks/deploy-rollback.md is the runbook.
+- name: Read the deploy record
+  ansible.builtin.import_tasks: record_read.yml
+
+- name: Require a release to roll back
+  ansible.builtin.assert:
+    that: workloads_last_attempt | length > 0
+    fail_msg: "No deploy record for {{ workloads_env }} ({{ workloads_record_path }}): nothing to roll back."
+
+- name: Refuse a second rollback
+  ansible.builtin.assert:
+    that: workloads_last_attempt.status != 'rolled_back'
+    fail_msg: >-
+      Refused: the release of {{ workloads_last_attempt.started_at }} is already rolled back; the record holds no
+      older versions. A deeper rollback is a deploy of an older manifest: DIGEST_MANIFEST=<file> just deploy.
+
+- name: Refuse to cross the rollback floor
+  ansible.builtin.assert:
+    that: workloads_rollback_floor | difference(workloads_rollback_below_floor) | length == 0
+    fail_msg: >-
+      Refused: the release of {{ workloads_last_attempt.started_at }} (revision {{ workloads_last_attempt.floor.revision | default('') }})
+      writes {{ workloads_last_attempt.floor.formats | default({}) }}, versions that the release before it cannot read.
+      A rollback below this release is not safe once a writer wrote one. If you confirmed that none did,
+      set KARDAMOM_ROLLBACK_BELOW_FLOOR={{ workloads_rollback_floor | join(',') }}.
+  vars:
+    workloads_rollback_floor: "{{ (workloads_last_attempt.floor.formats | default({})) | list }}"
+
+- name: Name the release and its jobs
+  ansible.builtin.set_fact:
+    workloads_rollback_jobs: >-
+      {{ workloads_last_attempt.changed | reverse | reject('in', workloads_last_attempt.rolled_back | default([])) | list }}
+
+- name: Report the rollback
+  ansible.builtin.debug:
+    msg: >-
+      Rolling {{ workloads_env }} back from the release of {{ workloads_last_attempt.started_at }}
+      ({{ workloads_last_attempt.status }}, revision {{ workloads_last_attempt.target.revision }}):
+      {{ workloads_rollback_jobs | join(', ') }} go to their versions before it.
+      Done already: {{ workloads_last_attempt.rolled_back | default([]) | join(', ') }}.
+
+# The versions to revert to must still be in Nomad, for every job, before
+# the first revert. The reverts read the same answers.
+- name: Read the versions Nomad holds of every changed job
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ item }}/versions?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  loop: "{{ workloads_rollback_jobs }}"
+  register: workloads_rollback_versions
+  when: workloads_last_attempt.before.jobs[item].before is not none
+
+- name: Find the versions that Nomad dropped
+  ansible.builtin.set_fact:
+    workloads_rollback_dropped: >-
+      {{ workloads_rollback_dropped | default([])
+         + ([item.item] if workloads_last_attempt.before.jobs[item.item].before not in item.json.Versions | map(attribute='Version') else []) }}
+  loop: "{{ workloads_rollback_versions.results | selectattr('json', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Write the manifest of the release before, for a re-render
+  ansible.builtin.copy:
+    content: "{{ workloads_last_attempt.before.manifest.items() | map('join', ' ') | join(workloads_newline) }}\n"
+    dest: "{{ workloads_record_dir }}/rollback.digests"
+    mode: "0644"
+  when: workloads_rollback_dropped | default([]) | length > 0
+
+- name: Refuse a revert to a version that Nomad dropped
+  ansible.builtin.assert:
+    that: workloads_rollback_dropped | default([]) | length == 0
+    fail_msg: >-
+      Nomad no longer holds the pre-release version of {{ workloads_rollback_dropped | default([]) | join(', ') }}.
+      Re-render the release before from its manifest: `just rollback-rerender {{ workloads_env }}` deploys
+      deployed/{{ workloads_env }}/rollback.digests with the job files of this checkout.
+
+- name: Initialize the readiness state
+  ansible.builtin.set_fact:
+    workloads_jobs: {}
+
+- name: Revert the changed jobs in reverse deploy order
+  ansible.builtin.include_tasks: revert.yml
+  loop: "{{ workloads_rollback_jobs }}"
+  loop_control:
+    loop_var: workloads_revert_job
+
+# The record after the rollback: the attempt is rolled back, and the
+# accepted release is the one that runs again, restored from the
+# attempt's `before`. A second rollback finds nothing older.
+- name: Mark the release rolled back
+  ansible.builtin.set_fact:
+    workloads_attempt: >-
+      {{ workloads_last_attempt | combine({'status': 'rolled_back', 'rolled_back_at': workloads_rollback_now}) }}
+    workloads_accepted:
+      env: "{{ workloads_env }}"
+      status: accepted
+      started_at: "{{ workloads_rollback_now }}"
+      accepted_at: "{{ workloads_rollback_now }}"
+      operator: "{{ workloads_operator }}"
+      restored_from: "{{ workloads_last_attempt.started_at }}"
+      target:
+        revision: "{{ workloads_last_attempt.before.revision }}"
+        manifest: "{{ workloads_last_attempt.before.manifest }}"
+        formats: "{{ workloads_last_attempt.before.formats }}"
+      before: {manifest: {}, jobs: {}}
+      changed: []
+      rolled_back: []
+      floor: {}
+  vars:
+    workloads_rollback_now: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Write the record of the rollback
+  ansible.builtin.import_tasks: record_write.yml

@@ -8,6 +8,10 @@
 # KardamomServicePaused is muted while the root's alert fires. An
 # operator's pause carries cause="operator", which no halt alert carries,
 # so it is never muted.
+#
+# A canary page is muted while any root halt pages: the halt explains the
+# failed user transactions, and its runbook is the one to follow. A
+# canary page with no halt beside it is the blind spot it exists for.
 inhibit_rules:
   - source_matchers:
       - 'alertname =~ "KardamomHalt.*"'
@@ -15,3 +19,8 @@ inhibit_rules:
       - 'alertname = "KardamomServicePaused"'
     equal:
       - cause
+  - source_matchers:
+      - 'alertname =~ "KardamomHalt.*"'
+    target_matchers:
+      - 'alertname =~ "KardamomCanary.*"'
+      - 'severity = "critical"'

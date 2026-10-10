@@ -522,6 +522,34 @@ The single-replica cases prove that a twin covers a loss. These cases prove the 
   - Recovery: every consumer votes. The sealer voids the entry (see "Removal of an entry that no consumer can execute"). The chain moves again.
   - Proof: `pipeline-blackout-recover`. Every job must return to its count. The sealers must elect a leader within 180 s. Both ingresses must be live. The pipeline must progress. The case prints the number of void decisions as evidence. It does not assert that number.
 
+## Combined outages (`chaos-combined-ordering` shard)
+
+The coordinated cases take one class down, or every node. These cases take two or three classes down at the same time, and bring them back in a set order. The classes depend on each other in this order: the sealers, then the sequencers, then the ingresses. An ingress needs a sealer for its cluster session. A sequencer needs a sealer to order its refs.
+
+- **The ingresses and the sequencers**
+  - Trigger: both ingress tasks and all four sequencer tasks die, and both jobs stop. The sealers run on.
+  - Effect: the sealers seal empty blocks. The executor block gauge advances. The applied-transaction counter stays flat.
+  - Recovery: the sequencers return, then the ingresses. The da-watcher publishes again the epochs that reached no sequencer. The sealer's L1 origin reaches the last published epoch. No lane-0 replica holds a ref below a floor.
+  - Proof: `ingress-sequencer-loss-recover`.
+- **The ingresses and the sealers**
+  - Trigger: both ingress tasks die and the job stops. All three sealer nodes die.
+  - Effect: the pipeline stalls. The executor block gauge stays flat.
+  - Recovery: the ingresses return first. They must wait for the sealers with no restart: an ingress that starts without a sealer serves, and its cluster session connects when a member answers. The sealers return 60 s later. Every member names the same leader for a leadership term.
+  - Proof: `ingress-sealer-loss-recover`.
+- **The sequencers and the sealers**
+  - Trigger: all four sequencer tasks die and the job stops. All three sealer nodes die.
+  - Effect: the pipeline stalls. Both ingresses refuse a submit on `sealer_no_quorum` within 60 s.
+  - Recovery: both classes return at once: the sequencer job is posted and the sealer nodes are started before the first wait. The restarted sequencers hold no epoch, so the da-watcher publishes the unconfirmed epochs again; its re-publish counter must rise. The sealer's L1 origin reaches the last published epoch.
+  - Proof: `sequencer-sealer-loss-recover`.
+- **All three classes**
+  - Trigger: the ingresses, the sequencers and the sealers die.
+  - Effect: the pipeline stalls.
+  - Recovery, in dependency order: the sealers, the sequencers 30 s after the cluster job reaches its count, the ingresses 30 s after the sequencer allocations run. Each class finds what it needs when it starts.
+  - Recovery, against the order: the ingresses, the sequencers 45 s later, the sealers 45 s after that. Each class must wait for the next with no restart.
+  - In both orders: every member names the same leader for a term, and no origin gap remains.
+  - Proof: `ingress-sequencer-sealer-loss-recover` and `ingress-sequencer-sealer-reverse`.
+- Every case ends with the common tail: the load verdict, the converged executors, the recovery probe and the validator verdict. The load verdict proves that no accepted transaction was lost, and the validator verdict proves the L1-origin sequence.
+
 ## Validator (off the hot path, halts on divergence)
 
 The failure philosophy is inverted here: **halting is the feature**. A divergence halts the validator. The process stays up.
@@ -991,6 +1019,27 @@ The notifier is off the hot path by construction. It reads `tx_status`, `tx_rece
 - The two instances shard subscriptions by a rendezvous hash of the id. Both store every registration. The shard of a lost instance moves to the twin when the instance count changes.
 - The `Sealed` stage needs an egress channel on the ingress. See [`tx-status-events.md`](tx-status-events.md) for the API, the settings and the metrics.
 
+## Transaction canary
+
+The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses the chain as a user does and reports each result as a metric. It does not use the halt record and does not publish on the `events` stream. The spec is [`specs/2026-10-07-tx-canary.md`](specs/2026-10-07-tx-canary.md).
+
+- **Probes.**
+  - `transfer`, every 5 s: an EIP-1559 transfer between two ring accounts, through each ingress instance in turn (`kardamom_sendRawTransactionAsync`). The status feed times `offered`, `sealed` and `executed`; the receipt ends the run.
+  - `read`, every 15 s: the head of each ingress instance must move between two runs (`head_stalled`), and the receipt of the first canary transfer must still answer (`receipt_lost`).
+  - `contract`, every 60 s: a write to the canary counter, then a read. The chain serves no `eth_call`, so the read is `eth_getBalance` of the counter, which holds one wei per write. It must equal the count in the write's receipt (`state_mismatch`, or `timeout{stage="read"}` while the read lags).
+- **Nonce ownership.** Each ring account has one owner at a time: a lease. The lease writes the signed transaction to the journal (`<dir>/ring/<address>.json`) before the submit.
+  - A refused first submit frees the nonce: the ingress answered and did not publish.
+  - A submit with no answer, or an accepted one, stays in flight. The next lease asks for its receipt and the committed nonce. If neither shows it, the lease sends the same bytes again, and the account stays blocked. The other accounts serve the probes.
+  - A restart reads the journal, so the rule holds across a restart.
+  - Proof: S19 (`s19_canary_probes_succeed_and_the_ring_resolves_in_flight`) in the chain-semantics suite: a lost submit answer, a restart with an unsent transaction, and six concurrent leases on one account.
+- **Feed gaps.** A stage that a later stage implies is no failure. A missing `executed` with a receipt is a feed gap (`kardamom_canary_feed_gaps_total`), not a transaction failure.
+- **Funds.** An account under the floor is unfunded. The probes skip it, and report `unfunded` when every account is under the floor. `KardamomCanaryLowFunds` is an info alert.
+- **Pages.** `KardamomCanaryFailing`, `KardamomCanaryStalled`, `KardamomCanaryNotSafe`, `KardamomCanaryDepositLate` and `KardamomCanaryFeeMismatch` page. The inhibit file mutes every canary page while a `KardamomHalt*` alert fires: the halt names the cause.
+  - A canary page with no halt beside it means that users fail while every internal signal says the chain is fine.
+- **Known limits.**
+  - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
+  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
+
 ## Redis account cache
 
 Redis is a cache with no persistence. The state of the executors is the truth. The cache layer has five cases.
@@ -1067,7 +1116,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
 - The role waits for each Nomad deployment and requires `successful`. A deployment that Nomad marks `failed` fails the play at that job, before the next job is touched.
 - The ingress and the sequencer can deploy a canary (`KARDAMOM_CANARY=1`, default 0). `auto_revert` is on for those two jobs. The other jobs set `auto_revert = false`.
 - A validator with a standing divergence verdict keeps `/ready` failing, so a deploy cannot pass over it.
-- `just rollback <env>` deploys the previous manifest of the environment. It is a normal rolling deploy of older images under the same checks.
+- The release gate refuses a release before any job changes: a chain that stands on a halt or a pause, an image that the registry does not hold, a coordinated or an unaccepted one-way format change, a sealer setting that every member must match, and a shard map change. See "The release gate" in [../deploy/cluster/README.md](../deploy/cluster/README.md).
+- The deploy record (the Nomad variable `kardamom/deploys/<env>`) holds the pre-deploy version of every job. `just rollback <env>` reverts every job of the last release to that version, in reverse deploy order, under the same waits. It does not cross a rollback floor. Runbook: [runbooks/deploy-rollback.md](runbooks/deploy-rollback.md).
 - Proof: `deploy-broken-image` (`chaos-executor` shard).
   - The case deploys a manifest whose executor image is a real image that is not an executor.
   - The new replica never passes its readiness check. Nomad fails the deployment at its healthy deadline.
@@ -1149,6 +1199,16 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - `sealer-fleet-total-wipe-recover` covers the sealers: it wipes all three and starts them from a seed rebuilt from L1 (see "Sealer fleet rebuild (every sealer wiped)").
   - Open: no chaos rebuild passes `--lockbox`, because the suite never deposits. The e2e scenario `da_parity_batcher_matches_validator` proves a deposit in the rebuild.
   - Open: the chaos cluster deploys no output attester. No case proves the attester after a rollback.
+- **Combined outages**
+  - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
+  - Open: the pairs with the executors (executors with the sealers, with the ingresses, with the sequencers and Redis), the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
+  - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
+- **Executor receipt publication that never connects after a job restart**
+  - Seen once, on the local container cluster, by `ingress-sealer-loss-recover`. The persisted-state audit of the case before it had restarted the executor job. The restarted executor-1 registered its `tx_receipts` control endpoint in Consul (`192.168.56.13:48509`) and logged `tx_receipts publication open`. Its media driver held no socket on that port. Both ingresses attached that endpoint after their own restart, so the publication stayed `NOT_CONNECTED`.
+  - Effect: `tx_receipts` is must-deliver. The commit thread of executor-1 retried `tx_receipts publish failed; retrying (must-deliver) ... NOT_CONNECTED` for ever, so executor-1 stayed at the block of the stall while its peers moved on. The converged-executors gate caught it: `executor fleet NOT fully recovered within 150s (head=756;kardamom-executor-1=lag:120)`.
+  - The driver's error log on that node held ten `java.lang.ArrayIndexOutOfBoundsException: Index 1 out of bounds for length 1` at `io.aeron.driver.PublicationImage.removeDestination`, logged while the ingresses restarted. The other executor nodes held one or none.
+  - A kill of the executor task cleared it: the restarted task opened a new publication, replayed and converged. The case passed on its next run.
+  - Open: the executor does not detect a publication that never connects, and the suite has no check of the registered control endpoints against the sockets of the driver.
 - **Archive *data* loss**
   - Total loss has the rebuild from L1 (`reconstruct_l1_e2e`).
   - The loss of the `tx_data` archive of one node has the re-replication from the peer (`archive-tx-data-wipe` and `kardamom-archive-rereplicate`).

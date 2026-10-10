@@ -12,6 +12,7 @@ pub enum Shard {
     Cluster,
     Fleet,
     Coordinated,
+    CombinedOrdering,
     Retention,
     Cache,
     L1,
@@ -29,6 +30,7 @@ impl Shard {
             Self::Cluster => "chaos-cluster",
             Self::Fleet => "chaos-fleet",
             Self::Coordinated => "chaos-coordinated",
+            Self::CombinedOrdering => "chaos-combined-ordering",
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
             Self::L1 => "chaos-l1",
@@ -109,6 +111,17 @@ impl Shard {
                 "sequencer-lane-loss-recover",
                 "pipeline-blackout-recover",
             ],
+            // Two or three classes down at once, and the order of their
+            // return. The pairs return in dependency order and against
+            // it; the two triple cases take the sealers down with both
+            // the sequencers and the ingresses, in both orders.
+            Self::CombinedOrdering => &[
+                "ingress-sequencer-loss-recover",
+                "ingress-sealer-loss-recover",
+                "sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-loss-recover",
+                "ingress-sequencer-sealer-reverse",
+            ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // A lying L1 in front of the followers. The outage past the
             // retention runs last: it holds the load until the sealers'
@@ -166,6 +179,7 @@ impl Shard {
             | Self::Sequencer
             | Self::Fleet
             | Self::Coordinated
+            | Self::CombinedOrdering
             | Self::Cache
             | Self::Integrity => DeployVars::default(),
         }
@@ -200,6 +214,7 @@ impl Shard {
             | Self::Sequencer
             | Self::Fleet
             | Self::Coordinated
+            | Self::CombinedOrdering
             | Self::Cache
             | Self::Integrity => &[("RUN_LOAD", "0")],
         }
@@ -219,6 +234,7 @@ mod tests {
             Shard::Cluster,
             Shard::Fleet,
             Shard::Coordinated,
+            Shard::CombinedOrdering,
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
@@ -231,7 +247,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 46);
+        assert_eq!(all.len(), 51);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -243,6 +259,7 @@ mod tests {
             Shard::Cluster,
             Shard::Fleet,
             Shard::Coordinated,
+            Shard::CombinedOrdering,
             Shard::Retention,
             Shard::Cache,
             Shard::L1,

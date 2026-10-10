@@ -28,6 +28,15 @@ impl ChainView {
         Ok(Self(Rpc::new(url, chain_id)?.chain_status().await?))
     }
 
+    /// Why the ingress at `url` refuses a submit, or `None` while it takes
+    /// submits. A chain status that does not answer is a refusal.
+    pub(crate) async fn refusal_at(url: &str, chain_id: u64) -> Option<String> {
+        match Self::read_at(url, chain_id).await {
+            Ok(view) => view.refusal(),
+            Err(e) => Some(format!("no chain status ({e:#})")),
+        }
+    }
+
     /// Read the chain status until `holds` accepts it, within `budget`.
     /// A failed read counts as a reading that does not hold.
     pub(crate) async fn await_until(

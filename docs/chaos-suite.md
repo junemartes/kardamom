@@ -49,7 +49,7 @@ Every chaos case follows the same steps.
 
 ## Shards
 
-There are twelve shards. `just container-test` lists their names. Eleven run on every pull request. `chaos-integrity` runs nightly.
+There are thirteen shards. `just container-test` lists their names. Twelve run on every pull request. `chaos-integrity` runs nightly.
 
 | Shard | Cases, in run order | Shard settings |
 |---|---|---|
@@ -61,6 +61,7 @@ There are twelve shards. `just container-test` lists their names. Eleven run on 
 | `chaos-cluster` | `cluster-leader-kill`, `cluster-follower-kill`, `cluster-member-rejoin`, `node-replace-sealer`, `cpu-squeeze` | `RUN_LOAD=0`, sealer snapshot interval 60 s (`KARDAMOM_CLUSTER_SNAPSHOT_S=60`), `SQUEEZE_CYCLES=3`, `SQUEEZE_S=60`, `SQUEEZE_CPUS_PER_NODE=0.4` |
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
+| `chaos-combined-ordering` | `ingress-sequencer-loss-recover`, `ingress-sealer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on |
@@ -141,6 +142,19 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`pipeline-blackout-recover`](failure-modes.md#coordinated-failures-chaos-coordinated-shard): every node except the control node dies at once. The case prints the number of void decisions and does not assert it.
   - The da-watcher dies with the sealers. An epoch that it published and the sealers did not commit is published again, with no operator step.
   - After the recovery, the L1 origin of the sealer must reach the last epoch that the da-watcher published, within 180 s. The budget holds the 90 s grace of the sequencer before `origin_gap` and an election after a full restart.
+
+**Combined ordering shard**
+
+Each case takes two or three classes down at the same time: the ingresses (both tasks, then the job stops), the sequencers (all four tasks, then the job stops), the sealers (all three nodes). The job stops because Nomad restarts a killed task in seconds; a task that runs again before its peers are down is a single-replica case. It holds them down for 60 s, judges the pipeline while they are down, and brings them back in a set order. The classes return in dependency order (sealers, sequencers, ingresses) or against it. A class counts as back when the allocations of its posted job version run, or, for killed nodes, when its job reaches its count; the pause to the next class starts then. With `all at once`, every job is posted and every node started before the first wait. A class that returns before the class it needs must wait: every allocation of its job must run with no restart until the next class returns, and again at the end of the case. See [Combined outages](failure-modes.md#combined-outages-chaos-combined-ordering-shard).
+
+Every case makes these checks after the return: every class is back at its count, the members elected a leader when they were down, both ingresses are live, the executors advance, and the common tail (the load verdict, the converged executors, the recovery probe, the validator verdict).
+
+- [`ingress-sequencer-loss-recover`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): the ingresses and the sequencers die. While they are down, the executor block gauge advances and the applied-transaction counter stays flat. The sequencers return, then the ingresses 30 s later. The sealer's L1 origin must reach the last epoch the da-watcher published. No lane-0 replica may hold a ref below a floor.
+- [`ingress-sealer-loss-recover`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): the ingresses and the sealers die. The executor gauge must stay flat. The ingresses return first and must wait 60 s for the sealers with no restart. At most one member led each leadership term.
+- [`sequencer-sealer-loss-recover`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): the sequencers and the sealers die. The executor gauge must stay flat, and both ingresses must refuse a submit on `sealer_no_quorum`. Both classes return at once. One leader per term, no origin gap, and a lost epoch must be filled again: the da-watcher's re-publish counter rises. The sequencer's origin-gap counter is not a baseline, because it resets with the sequencer.
+- [`ingress-sequencer-sealer-loss-recover`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): all three classes die. The executor gauge must stay flat. They return in dependency order, 30 s apart. One leader per term, no origin gap.
+- [`ingress-sequencer-sealer-reverse`](failure-modes.md#combined-outages-chaos-combined-ordering-shard): all three classes die. They return against the dependency order, 45 s apart: the ingresses, then the sequencers, then the sealers. Each class must wait for the next with no restart. One leader per term, no origin gap.
+- The load of every combined case gets 90 submit retries. The submit ingress is dead for about five minutes, and a dead ingress refuses a connection at once.
 
 **Retention shard**
 

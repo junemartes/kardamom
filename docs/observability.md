@@ -24,6 +24,7 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-validator` | `127.0.0.1:9007` | `0.0.0.0:9006` | `kardamom-validator` |
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
 | `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
+| `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
 Notes on the table:
@@ -161,6 +162,7 @@ It answers 503 with the failed conditions when the rule does not hold.
 | `kardamom-da-watcher` | The last tick (`kardamom_da_watcher_last_tick_unix_seconds`) is fresher than two poll periods plus 10 s. |
 | `kardamom-l1-indexer` | Now is before the planned wake time (`kardamom_l1_follower_next_wake_seconds`) plus one poll interval and 10 s. A follower sleeps between finality steps, so a rule on the last tick would fail between steps. |
 | `kardamom-notifier` | Liveness only. |
+| `kardamom-canary` | Liveness only. A failed probe is a metric, not a readiness failure. |
 
 - `--ready-lag-blocks` (env `KARDAMOM_READY_LAG_BLOCKS`, default 8) is a flag of the executor and the validator.
 - The sealer has its own admin server. It is off by default.
@@ -221,6 +223,7 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-validator` | The validator. |
 | `kardamom-state-mirror` | The account-state mirror. |
 | `kardamom-notifier` | The status feed and the webhooks. |
+| `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
 - The test `crates/obs/tests/dashboards.rs` checks that each dashboard in `EXPECTED_DASHBOARDS` parses, uses schema 38,
@@ -465,6 +468,21 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
   and `state_error` when the query fails.
 - A client that is over its rate limit gets `shed`, and the ingress answers `null` without a query.
 - The receipt cache keeps the newest 131072 receipts and evicts the oldest first.
+
+### Transaction canary
+
+All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-canary`. The canary uses the chain as a user does. See "Transaction canary" in [failure-modes.md](failure-modes.md#transaction-canary).
+
+| Metric | Meaning |
+| --- | --- |
+| `probe_total{probe,endpoint,outcome}` | Probe runs. A failure outcome adds one detail label: `code` (`rpc_error`), `reason` (`rejected`), `stage` (`timeout`) or `field` (`fee_mismatch`). |
+| `stage_seconds{probe,endpoint,stage}` | Stage latencies. `transfer`: `submit` (submit to hash), `offered`, `sealed`, `executed` and `receipt` (hash to each). `contract`: `receipt` (submit to receipt) and `read` (receipt to read). The buckets go from 5 ms to one hour. |
+| `last_success_timestamp_seconds{probe}` | The unix time of the last success. |
+| `balance_wei{layer,account}` | The balance of each canary account. |
+| `balance_floor_wei{layer}` | The balance under which an account is unfunded. |
+| `account_stalled{account}`, `account_stalled_nonce{account}` | 1, and the nonce, while a ring account holds a transaction that the canary cannot resolve. |
+| `feed_gaps_total{kind}` | Status feed gaps: `lagged`, `disconnect`, or `missing_<stage>` for a stage that never came though the receipt did. A gap is not a transaction failure. |
+| `feed_connected` | 1 while the status feed session is open. |
 
 ### Notifier
 

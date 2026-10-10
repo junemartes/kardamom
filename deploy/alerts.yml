@@ -301,6 +301,79 @@ groups:
           description: "The sealer refuses the next L1 epoch because an earlier one is missing, and this sequencer did not get the missing epoch for 90 s, so the da-watcher does not publish it again; or the sequencer holds the most relayed epochs that no boundary confirms. Deposits stop; transactions continue. The detail names the L1 block. Detail: http://{{ $labels.instance }}/halt. Runbook: docs/runbooks/origin_gap.md (recovery id {{ $labels.recovery }})."
           runbook: "docs/runbooks/origin_gap.md"
 
+  # The transaction canary uses the chain as a user does. A canary page
+  # with no internal page beside it is a blind spot of the internal
+  # signals. The inhibit rule in deploy/alertmanager-inhibit.yml mutes
+  # every canary page while a root halt pages: one incident, one page,
+  # with the halt's runbook. An `unfunded` run is no failure: the low
+  # funds alert covers it.
+  - name: kardamom-canary
+    rules:
+      - alert: KardamomCanaryFailing
+        expr: >-
+          sum by (probe) (increase(kardamom_canary_probe_total{probe=~"transfer|contract",outcome="success"}[10m]))
+          / sum by (probe) (increase(kardamom_canary_probe_total{probe=~"transfer|contract",outcome!="unfunded"}[10m]))
+          < 0.95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "canary {{ $labels.probe }} succeeds in {{ $value | humanizePercentage }} of its runs"
+          description: "Under 95% of the canary's {{ $labels.probe }} runs succeeded in the last 10 minutes: users fail. The failures by outcome and endpoint are on the Kardamom Canary dashboard. Check which endpoint and which outcome (rpc_error code, rejected reason, timeout stage) carry them."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
+      - alert: KardamomCanaryStalled
+        expr: >-
+          sum by (host_id) (increase(kardamom_canary_probe_total{probe="transfer",outcome="success"}[5m])) == 0
+          and sum by (host_id) (increase(kardamom_canary_probe_total{probe="transfer",outcome!="unfunded"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "no canary transfer succeeded for 5 minutes ({{ $labels.host_id }})"
+          description: "The canary sends a transfer every 5 seconds through each ingress, and none landed for 5 minutes. Users cannot transact. See the failures by outcome on the Kardamom Canary dashboard."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
+      - alert: KardamomCanaryNotSafe
+        expr: increase(kardamom_canary_probe_total{probe="safe",outcome="timeout"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "a canary transaction did not reach the safe head in time ({{ $labels.host_id }})"
+          description: "A sampled canary transaction was not at or below the safe tag (the batcher's posted head) within twice the batcher's idle flush. The chain's data does not reach L1. Check the batcher and the DA path."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
+      - alert: KardamomCanaryDepositLate
+        expr: increase(kardamom_canary_probe_total{probe="deposit",outcome="timeout",stage="l2_credit"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "a canary deposit has no L2 credit 30 minutes after its L1 finality ({{ $labels.host_id }})"
+          description: "The canary deposited on L1 through the lockbox, the deposit is final on L1, and the L2 credit did not arrive within 30 minutes. Deposits do not reach users. Check the L1 follower and the da-watcher."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
+      - alert: KardamomCanaryFeeMismatch
+        expr: increase(kardamom_canary_probe_total{probe="fees",outcome="fee_mismatch"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "a canary receipt breaks the fee rules ({{ $labels.field }}, {{ $labels.host_id }})"
+          description: "A canary receipt does not match the fee rules: the base fee, the priority fee paid, or the fee methods. The field label names the check. Compare the receipt with docs/priority-fees.md."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
+      - alert: KardamomCanaryLowFunds
+        expr: kardamom_canary_balance_wei < on (layer, host_id) group_left kardamom_canary_balance_floor_wei
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "canary {{ $labels.layer }} account {{ $labels.account }} is under its funding floor"
+          description: "The account cannot pay for its probes. The probes report unfunded for it, and the other ring accounts continue. Fund the account: on L2 through a deposit, on L1 by a transfer."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
   # A pause is not a fault of the paused service: it waits on a root halt
   # upstream, or on an operator. It never pages. The root's halt rule
   # above pages once, with the root's runbook; the inhibit rule in

@@ -90,6 +90,7 @@
     - "{{ paths.checkpoints_dir }}"
     - "{{ paths.mirror_dir }}"
     - "{{ paths.notifier_dir }}"
+    - "{{ paths.canary_dir }}"
     - "{{ paths.batcher_dir }}"
     - "{{ paths.da_watcher_dir }}"
     - "{{ paths.l1_indexer_dir }}"

@@ -117,6 +117,7 @@ jobs:
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             -p kardamom-state-mirror -p kardamom-l1-indexer -p kardamom-notifier \
+            -p kardamom-canary \
             -p kardamom-l1-fault-proxy \
             --bins
           # The settlement-contract deployer. A first deployment to an L1

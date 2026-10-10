@@ -183,6 +183,22 @@ balance = "1000000000000000000000"
 address = "0x86c53Eb85D0B7548fea5C4B4F82b4205C8f6Ac18"
 balance = "1000000000000000000000"
 
+# --- Anvil accounts #34..#37: the transaction canary's ring
+# (nomad/canary.nomad.hcl, --ring-offset 34). The canary owns their nonce
+# chains; no load stage, chaos case or perf soak uses them.
+[[alloc]]
+address = "0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x2f4f06d218E426344CFE1A83D53dAd806994D325"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x1003ff39d25F2Ab16dBCc18EcE05a9B6154f65F4"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x9eAF5590f2c84912A08de97FA28d0529361Deb9E"
+balance = "1000000000000000000000"
+
 # --- ERC-7955 permissionless CREATE2 factory predeploy (from chains/dev.toml).
 # (https://github.com/safe-research/erc-7955). Pre-deployed at the canonical
 # cross-chain address so the deployer can CREATE2 from it without a bootstrap

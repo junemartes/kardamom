@@ -76,9 +76,23 @@ impl SnapshotReceiver {
 
     /// Blocks until a new snapshot is published, then returns it. Returns
     /// `None` if the writer has been dropped.
+    ///
+    /// The slot is latest-wins. One wake covers every publish since the
+    /// previous `recv`, so the count of wakes is not the count of
+    /// commits. A consumer that needs block `n` reads
+    /// [`StateSnapshot::block_number`] and calls `recv` again until it is
+    /// `n` or more.
     #[must_use]
     pub fn recv(&self) -> Option<StateSnapshot> {
         self.notify.recv().ok()?;
+        self.current()
+    }
+
+    /// [`Self::recv`] with a bound. Returns `None` if the writer has been
+    /// dropped, or if no publish arrives before `deadline`.
+    #[must_use]
+    pub fn recv_deadline(&self, deadline: std::time::Instant) -> Option<StateSnapshot> {
+        self.notify.recv_deadline(deadline).ok()?;
         self.current()
     }
 
@@ -109,5 +123,13 @@ mod tests {
     fn current_without_publish_is_none() {
         let (_handle, recv) = channel();
         assert!(recv.current().is_none());
+    }
+
+    #[test]
+    fn recv_deadline_without_publish_returns_none_at_deadline() {
+        let (_handle, recv) = channel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        assert!(recv.recv_deadline(deadline).is_none());
+        assert!(std::time::Instant::now() >= deadline);
     }
 }
