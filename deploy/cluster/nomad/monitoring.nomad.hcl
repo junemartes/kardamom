@@ -4,9 +4,12 @@
 # Prometheus scrapes every service's metrics endpoint by its Consul node
 # name, rendered from the node-class counts: no address in this file. It
 # evaluates the alert rules of deploy/alerts.yml and sends the firing
-# alerts to the Alertmanager of the same allocation. Grafana provisions
-# the Prometheus datasource by the Consul service name and the dashboards
-# from deploy/grafana/provisioning/dashboards-json. This job is the one
+# alerts to the Alertmanager of the same allocation. The L1 follower, the
+# da-watcher and the batcher are targets in every health state: a pause
+# on the follower fails their /ready check, and the alerts read their
+# metrics through that pause. Grafana provisions the Prometheus
+# datasource by the Consul service name and the dashboards from
+# deploy/grafana/provisioning/dashboards-json. This job is the one
 # monitoring stack of every profile. The autoscaler's Prometheus APM
 # reads the same service.
 #
@@ -107,13 +110,13 @@ locals {
           - targets: [{{ range $i, $s := service "kardamom-validator" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-da-watcher
         static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-da-watcher" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+          - targets: [{{ range $i, $s := service "kardamom-da-watcher|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-batcher
         static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-batcher" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+          - targets: [{{ range $i, $s := service "kardamom-batcher|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-l1-indexer
         static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-l1-indexer-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+          - targets: [{{ range $i, $s := service "kardamom-l1-indexer-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-notifier
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-notifier-metrics" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
