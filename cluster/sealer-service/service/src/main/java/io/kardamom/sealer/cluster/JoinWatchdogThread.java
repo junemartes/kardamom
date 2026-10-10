@@ -1,5 +1,6 @@
 package io.kardamom.sealer.cluster;
 
+import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -30,9 +31,9 @@ import org.agrona.concurrent.status.AtomicCounter;
  *       reached a catch-up state, so a leader holds a longer log, and the
  *       leader's log holds every committed entry.</li>
  *   <li>A leader wedge exits with code {@link #LEADER_WEDGE_EXIT_CODE}.
- *       The member won a vote, but no follower joined, or the completion of
- *       the election failed. The relaunch starts from the member's own
- *       state, and the members elect again.</li>
+ *       The completion of a leader's election failed, so the leader has
+ *       no ingress. The relaunch starts from the member's own state, and
+ *       the members elect again.</li>
  *   <li>A closed component exits with code {@link #COMPONENT_CLOSED_EXIT_CODE}.
  *       An agent that throws in its start, for example on an archive
  *       request that times out while it loads its snapshot, records the
@@ -52,7 +53,7 @@ final class JoinWatchdogThread {
     static final int CATCHUP_STALL_EXIT_CODE = 4;
     /** Process exit code when a component closes with no stop request. */
     static final int COMPONENT_CLOSED_EXIT_CODE = 5;
-    /** Process exit code when the election of a member that won a vote does not complete. */
+    /** Process exit code when the completion of a leader's election fails. */
     static final int LEADER_WEDGE_EXIT_CODE = 6;
 
     /**
@@ -83,6 +84,7 @@ final class JoinWatchdogThread {
     private final JoinWatchdog watchdog;
     private final AtomicCounter electionState;
     private final AtomicCounter commitPosition;
+    private final AtomicCounter controlToggle;
     private final StateDir clusterDir;
     /** The election state of the last sample; only this thread reads and writes it. */
     private ElectionState lastState;
@@ -99,6 +101,7 @@ final class JoinWatchdogThread {
         this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L);
         this.electionState = member.consensus().electionStateCounter();
         this.commitPosition = member.consensus().commitPositionCounter();
+        this.controlToggle = member.consensus().controlToggleCounter();
         this.clusterDir = clusterDir;
         this.windowS = windowS;
         this.stallWindowS = stallWindowS;
@@ -143,7 +146,8 @@ final class JoinWatchdogThread {
         final long commit = commitPosition.get();
         final ElectionState state = ElectionState.get(electionState);
         logStateChange(state, commit);
-        switch (watchdog.observe(state, commit, nowMs)) {
+        final boolean toggleActive = controlToggle.get() != ClusterControl.ToggleState.INACTIVE.code();
+        switch (watchdog.observe(state, commit, nowMs, toggleActive)) {
             case INIT_WEDGE -> initWedge(nowMs);
             case CATCHUP_STALL -> catchupStall(commit, nowMs);
             case LEADER_WEDGE -> leaderWedge(nowMs);
@@ -174,8 +178,9 @@ final class JoinWatchdogThread {
 
     private void leaderWedge(final long nowMs) {
         System.out.println("cluster LEADER WEDGE memberId=" + member.memberId()
-            + " election stuck in " + lastState + " for " + watchdog.leaderWaitForMs(nowMs) / 1000L
-            + "s (window " + windowS + "s): no follower joined, or the election did not complete;"
+            + " election stuck in " + lastState + " with an active control toggle for "
+            + watchdog.halfElectedForMs(nowMs) / 1000L
+            + "s: the completion of the election failed and the leader has no ingress;"
             + " exiting for a clean relaunch so the members elect again");
         halt(LEADER_WEDGE_EXIT_CODE);
     }

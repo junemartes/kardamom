@@ -248,14 +248,13 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Effect: each election adds Aeron channels by member name. Without a fallback, a failed add stops the election half way. A failed add of the ingress subscription at the end of an election leaves a leader that no client can reach (see the next entry).
   - Recovery: the media driver of each member keeps the last address of each member name. A failed lookup uses that address and logs `cluster DNS FAILED`. A good lookup replaces it.
   - Proof: the in-JVM test `PeerNameResolverTest`, and the chaos cases `cluster-total-loss-recover`, `sequencer-sealer-loss-recover` and `ingress-sealer-loss-recover` with the Consul agent of one sealer node cut from the server on and off after its restart.
-- **Leader that does not complete its election**
-  - Trigger: one of two faults.
-    - A member wins a vote, but no follower replicates its log or joins its live log. Aeron 1.44 has no timeout for this wait.
-    - The completion of the election throws, for example when the add of the ingress subscription fails on a name lookup. Aeron clears the election before that add, so the member runs as the leader with no ingress subscription.
-  - Effect: the election state of the member stays in `LEADER_LOG_REPLICATION` or `LEADER_READY`. No client can open a session, and the pipeline stalls. The members can show one leader for the term, so the stall is not visible in the roles.
-  - Recovery: the join watchdog acts after 60 s in `LEADER_LOG_REPLICATION` or `LEADER_READY` (`kardamom.cluster.joinWatchdogS`).
+- **Leader election that fails at its completion**
+  - Trigger: the completion of a leader's election throws, for example when the add of the ingress subscription fails on a name lookup. Aeron 1.44 activates the control toggle and clears the election before that add.
+  - Effect: the member runs as the leader with no ingress subscription. Its election state stays in the last election state (usually `LEADER_READY`). No client can open a session, and the pipeline stalls. The members show one leader for the term, so the stall is not visible in the roles.
+  - Recovery: the join watchdog acts when the control toggle is active and the election state is not `CLOSED` for more than 5 s. Only a failed completion leaves that combination: a new election sets the toggle to `INACTIVE` first.
     - It logs `cluster LEADER WEDGE`.
     - It exits with code 6. The relaunch starts from the member's own state, and the members elect again.
+  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, and the watchdog does not act.
   - Proof: the in-JVM test `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.

@@ -246,7 +246,7 @@ public final class ClusterNode {
      * The name resolver of the member's media driver. With a node address,
      * the member's own name resolves to it before any lookup.
      */
-    private static PeerNameResolver nameResolver(final int memberId, final String[] me, final String nodeIp) {
+    static PeerNameResolver nameResolver(final int memberId, final String[] me, final String nodeIp) {
         final PeerNameResolver resolver = new PeerNameResolver(memberId);
         if (nodeIp == null || nodeIp.isBlank()) {
             return resolver;

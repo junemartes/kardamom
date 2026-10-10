@@ -47,20 +47,20 @@ final class JoinWatchdogTest {
     @Test
     void firesWhenInitPersistsPastTheWindow() {
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, WINDOW_MS));
-        assertEquals(Verdict.INIT_WEDGE, w.observe(ElectionState.INIT, 0L, WINDOW_MS + 1L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, WINDOW_MS, false));
+        assertEquals(Verdict.INIT_WEDGE, w.observe(ElectionState.INIT, 0L, WINDOW_MS + 1L, false));
         assertEquals(WINDOW_MS + 1L, w.initForMs(WINDOW_MS + 1L));
     }
 
     @Test
     void aNormalElectionNeverFires() {
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, 0L, 5L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_BALLOT, 0L, 50L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP, 1L, 10 * WINDOW_MS));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, 1L, 20 * WINDOW_MS));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, 0L, 5L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_BALLOT, 0L, 50L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP, 1L, 10 * WINDOW_MS, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, 1L, 20 * WINDOW_MS, false));
         assertEquals(0L, w.initForMs(20 * WINDOW_MS));
     }
 
@@ -70,26 +70,26 @@ final class JoinWatchdogTest {
         // not INIT, and it never reaches a catch-up state without a leader.
         final JoinWatchdog w = watchdog();
         LongStream.range(0, 2 * STALL_MS / 1_000L).forEach(t ->
-                assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, COMMIT, t * 1_000L)));
+                assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, COMMIT, t * 1_000L, false)));
     }
 
     @Test
     void leavingInitResetsTheClock() {
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, 0L, WINDOW_MS / 2));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, 0L, WINDOW_MS / 2, false));
         // A second election (a leader change) starts INIT again. The
         // window restarts from this observation, not from the first.
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, WINDOW_MS));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 2 * WINDOW_MS));
-        assertEquals(Verdict.INIT_WEDGE, w.observe(ElectionState.INIT, 0L, 2 * WINDOW_MS + 1L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, WINDOW_MS, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, 0L, 2 * WINDOW_MS, false));
+        assertEquals(Verdict.INIT_WEDGE, w.observe(ElectionState.INIT, 0L, 2 * WINDOW_MS + 1L, false));
     }
 
     @Test
     void anUnallocatedCounterIsNotInit() {
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(null, 0L, 0L));
-        assertEquals(Verdict.NONE, w.observe(null, 0L, 5 * STALL_MS));
+        assertEquals(Verdict.NONE, w.observe(null, 0L, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(null, 0L, 5 * STALL_MS, false));
         assertEquals(0L, w.initForMs(5 * STALL_MS));
     }
 
@@ -102,7 +102,7 @@ final class JoinWatchdogTest {
     void aStuckCatchupStallsAfterTheWindow() {
         final JoinWatchdog w = watchdog();
         final long fired = LongStream.iterate(0L, t -> t + 1L)
-                .filter(t -> w.observe(stuckAt(t), COMMIT, t * 1_000L) == Verdict.CATCHUP_STALL)
+                .filter(t -> w.observe(stuckAt(t), COMMIT, t * 1_000L, false) == Verdict.CATCHUP_STALL)
                 .findFirst()
                 .orElseThrow();
         assertEquals(STALL_MS / 1_000L, fired, "the first sample at the window fires");
@@ -115,27 +115,27 @@ final class JoinWatchdogTest {
         // commit position up to the same end. Only a new highest position
         // is progress.
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, COMMIT, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 1_000L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, 0L, 2_000L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, COMMIT, 3_000L));
-        assertEquals(Verdict.CATCHUP_STALL, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, COMMIT, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 1_000L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, 0L, 2_000L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_REPLAY, COMMIT, 3_000L, false));
+        assertEquals(Verdict.CATCHUP_STALL, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS, false));
     }
 
     @Test
     void aCatchupThatReceivesLogNeverStalls() {
         final JoinWatchdog w = watchdog();
         LongStream.range(0, 2 * STALL_MS / 1_000L).forEach(t -> assertEquals(Verdict.NONE,
-                w.observe(stuckAt(t), COMMIT + t / 30L, t * 1_000L)));
+                w.observe(stuckAt(t), COMMIT + t / 30L, t * 1_000L, false)));
     }
 
     @Test
     void aClosedElectionResetsTheStall() {
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, STALL_MS / 2));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS));
-        assertEquals(Verdict.CATCHUP_STALL, w.observe(ElectionState.INIT, COMMIT, STALL_MS + STALL_MS / 2));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, STALL_MS / 2, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS, false));
+        assertEquals(Verdict.CATCHUP_STALL, w.observe(ElectionState.INIT, COMMIT, STALL_MS + STALL_MS / 2, false));
     }
 
     @Test
@@ -144,46 +144,49 @@ final class JoinWatchdogTest {
         // date. A seed would drop a full copy of the log, so it must not
         // stall, whatever the wait.
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP, COMMIT, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_LOG_AWAIT, COMMIT, 2 * STALL_MS));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_CATCHUP, COMMIT, 0L, false));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.FOLLOWER_LOG_AWAIT, COMMIT, 2 * STALL_MS, false));
     }
 
     @Test
     void aZeroStallWindowTurnsTheStallRuleOff() {
         final JoinWatchdog w = new JoinWatchdog(WINDOW_MS, 0L);
         LongStream.range(0, 2 * STALL_MS / 1_000L).forEach(t ->
-                assertEquals(Verdict.NONE, w.observe(stuckAt(t), COMMIT, t * 1_000L)));
+                assertEquals(Verdict.NONE, w.observe(stuckAt(t), COMMIT, t * 1_000L, false)));
     }
 
     @Test
-    void aLeaderWithNoFollowerWedgesAfterTheWindow() {
-        // The member won a vote, but no follower replicates its log or joins its live log.
+    void aLeaderThatWaitsLongForAFollowerIsNotAWedge() {
+        // After a total loss on a slow host, a follower loads an old snapshot
+        // and replays minutes of log while the leader waits in LEADER_READY.
+        // The leader's toggle stays INACTIVE until its election completes.
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CANDIDATE_BALLOT, COMMIT, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_000L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_000L + WINDOW_MS));
-        assertEquals(Verdict.LEADER_WEDGE,
-                w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_001L + WINDOW_MS));
-        assertEquals(WINDOW_MS + 1L, w.leaderWaitForMs(1_001L + WINDOW_MS));
+        LongStream.range(0, 2 * STALL_MS / 1_000L).forEach(t -> assertEquals(Verdict.NONE,
+                w.observe(ElectionState.LEADER_READY, COMMIT, t * 1_000L, false)));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, 2 * STALL_MS, true));
     }
 
     @Test
-    void aLeaderThatWaitsForTheLiveLogWedgesAfterTheWindow() {
+    void anOpenElectionWithAnActiveToggleIsAWedge() {
+        // The completion activated the toggle, then the ingress add threw:
+        // the counter keeps LEADER_READY with the toggle at NEUTRAL.
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 0L));
-        assertEquals(Verdict.LEADER_WEDGE, w.observe(ElectionState.LEADER_READY, COMMIT, WINDOW_MS + 1L));
+        final long limit = JoinWatchdog.HALF_ELECTED_LIMIT_MS;
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 0L, true));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, limit, true));
+        assertEquals(Verdict.LEADER_WEDGE, w.observe(ElectionState.LEADER_READY, COMMIT, limit + 1L, true));
+        assertEquals(limit + 1L, w.halfElectedForMs(limit + 1L));
     }
 
     @Test
-    void theOwnReplayOfALeaderIsNotAWait() {
-        // A leader replays its own log after a full restart. The replay can
-        // take longer than the window on a slow host, and it restarts the wait.
+    void theMomentsAroundACompletedElectionAreNotAWedge() {
+        // The toggle turns active one duty cycle before the counter reads
+        // CLOSED, and a new election starts with the toggle still active.
         final JoinWatchdog w = watchdog();
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 0L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_REPLAY, COMMIT, WINDOW_MS / 2));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_REPLAY, COMMIT, 3 * WINDOW_MS));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 3 * WINDOW_MS + 1_000L));
-        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, 3 * WINDOW_MS + 2_000L));
-        assertEquals(0L, w.leaderWaitForMs(3 * WINDOW_MS + 2_000L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 0L, true));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, 1_000L, true));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.INIT, COMMIT, 2_000L, true));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CANVASS, COMMIT, 3_000L, false));
+        assertEquals(0L, w.halfElectedForMs(3_000L));
     }
 }
