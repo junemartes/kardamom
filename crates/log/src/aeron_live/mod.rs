@@ -63,6 +63,7 @@
 //! Everything public is re-exported here. Downstream imports are always
 //! `kardamom_log::aeron_live::<Name>`.
 
+mod add_wait;
 mod bound;
 mod handles;
 mod image_log;
@@ -71,6 +72,7 @@ mod runtime;
 mod table_pub;
 mod thread;
 
+pub use add_wait::AddWait;
 pub use handles::simple::{
     ExecTxsPublisherHandle, ExecTxsSubscriberHandle, FsyncWatermarkPublisherHandle,
     FsyncWatermarkSubscriberHandle, L1BlocksPublisherHandle, L1BlocksSubscriberHandle,
@@ -157,7 +159,9 @@ impl FrameSink {
     }
 }
 
-const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the Aeron thread waits for the driver to add a publication
+/// at run time. A start-up open waits longer ([`AddWait`]).
+pub const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the Aeron thread waits for the control address the driver

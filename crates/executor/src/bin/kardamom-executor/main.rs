@@ -467,10 +467,12 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     let file_cfg = &boot.file_cfg;
     let Transport {
         aeron_cfg,
-        mut plane,
+        plane,
         rt,
         rt_pub,
     } = open_transport(args)?;
+    // A stop signal during a stalled start-up open ends the open at once.
+    let mut plane = plane.stopping_opens_on(boot.stop.clone());
 
     // --- State backend and crash-recovery decision. This runs before the
     // subscriptions, because the tx_ordering subscription branches on

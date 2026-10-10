@@ -10,6 +10,7 @@
 //! - [`catalog`]: the operations, behind the Consul and in-memory
 //!   backends ([`consul`], [`memory`]).
 //! - [`registration`]: bind, register, heartbeat, deregister.
+//! - [`start_retry`]: the bounded retry of a start-up open.
 //! - [`watch`]: the blocking-query loop and its membership snapshots.
 //! - [`reconcile`]: membership snapshots to attach and detach calls.
 //! - [`endpoint`]: the advertised address and the URIs.
@@ -25,6 +26,7 @@ pub mod reconcile;
 pub mod record;
 pub mod recording;
 pub mod registration;
+pub mod start_retry;
 pub mod watch;
 
 pub use catalog::{Catalog, Query, QueryResult, RegistrationSpec};
@@ -41,6 +43,7 @@ pub use record::{
 };
 pub use recording::{DiscoveredRecorder, RecorderProgress};
 pub use registration::{RecordMover, Registration};
+pub use start_retry::StartRetry;
 pub use watch::{CatalogHealth, Membership, MembershipWatch, WatchTiming};
 
 use crate::config::DiscoveryConfig;

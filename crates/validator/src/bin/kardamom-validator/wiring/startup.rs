@@ -135,8 +135,11 @@ impl Startup {
     /// fails.
     pub(crate) fn from_boot(boot: &Boot) -> Result<Self> {
         let args = boot.args.clone();
+        // A stop signal during a stalled start-up open ends the open at
+        // once.
         let plane = StreamPlane::from_config(&boot.log_cfg, "validator")
-            .context("build the stream plane")?;
+            .context("build the stream plane")?
+            .stopping_opens_on(boot.stop.clone());
         let mut aeron_cfg = boot.log_cfg.aeron.clone();
         if let Some(dir) = args.aeron_dir.as_ref() {
             aeron_cfg.aeron_dir.clone_from(dir);

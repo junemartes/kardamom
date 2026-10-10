@@ -307,7 +307,13 @@ The sealer orders a transaction reference before the archives make its data dura
 - A consumer that has the data never votes.
 - The sealer appends the void record only when **every** configured voter has voted for the same `(index, tx_hash)`.
 - One voter that is down blocks the void, and the chain waits for it. This is the safe side, because that voter can be the one that executed the entry.
-- On a void, the sealer removes the hash from its dedup window. It sets the expected nonce of the sender back. The sender can submit the same bytes again.
+- On a void, the sealer removes the hash from its dedup window. The sender can submit the same bytes again.
+- On a void, the sealer sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce.
+  - Two voids of one sender, in either order, leave the lowest voided nonce open. The sender fills the nonces again from there, in order.
+  - A void of nonce `n` below a later ordered nonce of the sender also opens `n`. The consumers drop the voided entry, so the later entries of the sender get a skip receipt.
+  - A later entry that is still in the dedup window absorbs the same bytes as a duplicate. The sender signs that nonce again with other bytes, or waits for the deadline of the entry.
+  - An expected nonce below the nonce of the executors costs the sender one skipped transaction. An expected nonce above it is never filled, and every later transaction of the sender gets a skip receipt. The lower value is the safe side.
+  - The rule is part of the decision version of the sealer. A change to it needs the coordinated restart of the sealer (`cluster/sealer-service/README.md`, "Decision version").
 - A sender gets no notice of a void. The receipt never comes, and the sender submits again.
 
 Three constants bound the rule. Every sealer member must run the same values.
@@ -600,7 +606,7 @@ The ordering shard keeps the executors up. These cases take the executors down w
   - Trigger: the executor tasks, the redis job and the state-mirror tasks die, and all three jobs stop.
   - Effect: the head advances. A cold balance read counts as degraded, and gets no answer: neither Redis nor an executor runs.
   - Recovery: Redis returns empty. The mirrors return 30 s later, find Redis cold, and wait for the first live batch and a checkpoint at or beyond it. The executors return 30 s after that, replay, and checkpoint. Every mirror rebuilds the projection and logs `rebuild: done`. The readers use Redis again.
-  - Proof: `read-path-loss-recover`, by name only (see "Known gaps").
+  - Proof: `read-path-loss-recover`.
 - **The sequencers, the executors and Redis**
   - Trigger: the sequencer tasks, the executor tasks and the redis job die, and all three jobs stop. No source of a sender floor is left.
   - Effect: the head advances. A submit parks at the ingress and times out: no sequencer orders it.
@@ -1270,6 +1276,34 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - Proof: the `client_timeout_exit` test of `kardamom-log` stops a child process past a 1 s liveness timeout. The child must log the handler line on stdout and exit with status 1. One child holds a runtime client and an archive session, so both time out together.
   - The chaos cases that need an eviction read the same value (`StallTolerance` in `crates/chaos/src/knobs.rs`). The `sequencer-lapse` and `validator-lapse` freezes default to the tolerance plus 20 s. The retention-overrun freeze lasts at least that long. The waits after a driver loss grow by the tolerance.
   - The must-deliver escalation of the executor derives from the same value: the reopen of an unconnected publication after the tolerance plus 5 s, the exit after five times that. See "Dead `tx_receipts` publication".
+  - The start-up open of a discovered stream derives from the same value: it waits for two stall budgets. See "Start-up open of a stream".
+- **Start-up open of a stream**
+  - Trigger: a service opens its streams through the discovery plane (`StreamPlane`) at start-up. A loaded host or a stalled media driver delays the answer of the driver to an add (`add_publication`, `add_subscription`). Or the local Consul agent does not answer the registration of a record (no connection, no answer within `request_timeout_ms`, or a 5xx status).
+  - Effect with the run-time add timeout of 5 s: the add fails with `TimedOut`, `main` ends with the open error, and Nomad restarts the service. A chaos case that asserts "no restart while waiting" then fails.
+  - The start-up limit is two Aeron stall budgets: 2 × max(`AERON_DRIVER_TIMEOUT` + 5 s, 10 s) (`AeronRuntime::start_open_limit`). That is 30 s at the default tolerance of 10 s, and 70 s at the CI tolerance of 30 s.
+  - Aeron add of a discovered publication or subscription: one add that waits the whole limit (`AddWait` in `crates/log/src/aeron_live/add_wait.rs`). There is no retry.
+    - The reason: an add that times out leaves its request with the driver. The Aeron client drops its poller with no cleanup, the driver completes the late add, and the publication or subscription stays registered on its own port and session until the process exits. A retry after each short timeout would leak one for each try. One long wait has the same bound and leaks nothing.
+    - A wait that ends with no answer (the limit, or a stop) cancels the add (`aeron_async_add_publication_cancel`, `aeron_async_add_subscription_cancel`), so the driver removes a late publication or subscription.
+    - The Aeron thread of the runtime polls the add, so the wait blocks the other work of that runtime: the subscriptions it already holds are not polled, and its other commands queue. This happens only at start-up, and only while the driver does not answer.
+    - An add at run time keeps the 5 s timeout: a reopen of a publication (`PublisherReopen`), every static open, and the attach of a publisher destination.
+    - A destination is its own Aeron subscription (see [aeron-discovery.md](aeron-discovery.md#transport)). A destination add that gets no answer in 5 s is cancelled, so the driver keeps no subscription that nothing polls. Such a subscription would hold back a publication with `fc=min`.
+  - Consul registration of a record (publisher records and subscriber records): a retry with a bounded backoff (`StartRetry` in `crates/log/src/discovery/start_retry.rs`), for the same limit. A registration is idempotent and leaks nothing.
+    - Only an unavailable agent starts a retry: a connect error, a timeout, a broken transfer, or a 5xx status. A refused permission (a 4xx status, an ACL denial) or a malformed request fails at once.
+    - The pauses follow the catalog backoff of `[discovery]` (`backoff_min_ms` to `backoff_max_ms`, doubling).
+    - Each failed try logs a WARN line `discovery: start-up open failed; trying again`. The line names the record (`open`) and gives the error.
+  - At the end of the limit, the open returns its last error. What happens next depends on the open:
+    - A publication open, a subscription open, or a publisher record registration: the error ends the start-up, and the service exits with the same error as with no wait. Nomad restarts it. A service that cannot open its streams has no state to serve, so the exit does not go through the halt contract.
+    - A subscriber record registration: it runs in a background task, so its last error only logs the WARN line `discovery: subscriber registration failed`, and the service keeps running. The subscription itself is open and attaches its publishers. Without the record, the publishers of the stream treat the stream as one without a subscriber: a must-deliver publisher does not escalate for it.
+  - A stop ends the wait of an add and the retries of a registration at once, with the error `stopped during start-up open`.
+    - The executor and the validator handle SIGTERM before they open their streams, so they pass the token of that signal to the plane (`StreamPlane::stopping_opens_on`). Without the token, a SIGTERM during a stall waits for the end of the limit, and Nomad sends SIGKILL first.
+    - A service that does not handle SIGTERM during its start-up ends at the signal, as before.
+  - The fail-fast handler of a live client does not change. A client error after the start still ends the process at once (see "Aeron stall tolerance").
+  - A static plane (discovery off) keeps the run-time add timeout and does not retry.
+  - Proof:
+    - The `add_wait` unit tests of `kardamom-log`: the start-up wait equals the limit; a wait with no answer times out once and cancels the add; a stop ends the wait at once and cancels the add.
+    - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
+    - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
+    - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.
@@ -1287,8 +1321,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - Open: the chaos cluster deploys no output attester. No case proves the attester after a rollback.
 - **Combined outages**
   - `chaos-combined-ordering` takes two or three classes down at once and brings them back in dependency order and against it: the ingresses with the sequencers, the ingresses with the sealers, the sequencers with the sealers, and all three (see "Combined outages").
-  - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, and with the ingresses (see "Combined outages with the executors").
-  - `read-path-loss-recover` (the executors with Redis and the state mirrors) and `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exist and run by name. They are in no shard: they fail on the defects below (#559, #560, and #545 for `sequencer-executor-redis-loss`).
+  - `chaos-combined-exec` takes the executors down with the sealers, with the sealers and the validator, with the ingresses, and with Redis and the state mirrors (see "Combined outages with the executors").
+  - `sequencer-executor-redis-loss` (the executors with the sequencers and Redis) exists and runs by name. It is in no shard: the Aeron driver error below (#545) can cut a replica off its stream and fail it.
   - Open: the aux node with the sealers, the media drivers on every driver node, and the two ingress nodes. No case takes them down together yet.
   - Open: no combined case checks that the L1 record stays contiguous through the outage, or that a deposit lands once after it. The suite never deposits.
 - **Executor receipt publication that never connects after a job restart**
@@ -1298,21 +1332,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - A kill of the executor task cleared it: the restarted task opened a new publication, replayed and converged. The case passed on its next run.
   - The driver error is #545.
   - `sequencer-executor-redis-loss` hit #545 too. The drivers of ingress-0 and sequencer-1 logged the same error at `PublicationImage.removeDestination` as the case killed the sequencer tasks. After the return, the lane-0 replica on sequencer-1 ingested 257 transactions from `tx_data` and then none, while its twin ingested 23 844. It never parked again, so it never asked for a floor, and the floor check failed. A restart of that one allocation cured it. The twin carried the lane, so the lane lost its redundancy with no alert.
+  - The driver logs the same error in every combined case, also in a run that passes. The error is the cause; the cut-off stream is the effect that only some runs show.
   - Open: the executor does not detect a publication that never connects, and the suite has no check of the registered control endpoints against the sockets of the driver.
-- **A sender sticks for good after an outage of every executor** (#559)
-  - Seen on the local container cluster by `read-path-loss-recover`: the executor tasks, the redis job and the state mirrors were down for about three minutes, and the ingresses, the sequencers and the sealers ran.
-  - The ingress stamps the inclusion deadline from its newest block, and it learns that block only from the `BlockBoundary` markers on `tx_receipts` (`BlockBoundaryWatcher`, `crates/ingress/src/proxy/watchers.rs`). The executors publish those markers. With every executor down, the newest block freezes. About 64 blocks later, every new submit carries a deadline the sealer has passed.
-  - The sealer refuses those refs (`cluster PAST-DEADLINE memberId=0 nonce=623360 maxInclusionBlock=29726 atBlock=29727`). One nonce of the case's sender, 623105, did not get ordered. The lane-0 sequencer does not offer it again. The sealer then rejects every higher nonce of the sender (`cluster CONTIGUITY-REJECT memberId=0 nonce=623312 expected=623105 totalRejected=4194304`), from 02:04 to 02:12 UTC, after the executors had returned.
-  - Effect: the sender is stuck after the outage. `eth_getTransactionCount` stays at 623105. A new transfer at nonce 623105 gets `duplicate (sender, nonce)` from the ingress, and the lane-0 sequencer counts it in `kardamom_sequencer_tx_dropped_past_total`. The recovery probe of the case's sender failed: 257 offered, 0 accepted (`a sender with transactions in flight during the outage cannot get new ones through`). A fresh sender passed the same probe.
-  - The case load still passed the chaos verdict (`missing=0`), because a submit refused during an outage does not count. It offered 1656 transactions in a 570 s window at 200 tx/s, and 59 never landed.
-  - Open: the ingress needs a deadline source that lives while every executor is dark, such as the sealed head of the sealer's status frames (`kardamom_ingress_cluster_sealed_head`). A refused nonce must be offered again, or its resubmit accepted, so that a sender cannot stick. `read-path-loss-recover` and `sequencer-executor-redis-loss` are not in a shard until this is fixed.
-- **Redis sentinels crash-loop on a cold start of the redis job** (#560)
-  - Seen on the local container cluster by `read-path-loss-recover`, on every cold start of the redis job.
-  - The sentinel config template (`deploy/cluster/nomad/redis.nomad.hcl`, task `sentinel`) renders `sentinel monitor kardamom ...` only inside `{{ with service "redis-primary" }}`. On a cold start the primary is not yet in Consul, so that line is missing. The next line, `sentinel down-after-milliseconds kardamom 5000`, then names an unknown master.
-  - Effect: each sentinel exits with `FATAL CONFIG FILE ERROR ... 'sentinel down-after-milliseconds kardamom 5000' No such master with specified name.` Nomad restarts it after 5 s, until the primary registers. One run counted 1, 2 and 1 restarts on the three sentinels, about 20 s in all. The readers find no primary in that time and degrade.
-  - The restart policy allows 3 attempts in 1 minute and then waits, so the job does not fail. A slower primary start can use up the attempts.
-  - `redis-total-loss-recover` checks only the allocation count, so it does not see the restarts. The combined cases require that a returned job runs with no restart, so `read-path-loss-recover` and `sequencer-executor-redis-loss` fail on it.
-  - Open: the sentinel template must not render a config that names an unknown master. `read-path-loss-recover` and `sequencer-executor-redis-loss` are not in a shard until this is fixed.
 - **Archive *data* loss**
   - Total loss has the rebuild from L1 (`reconstruct_l1_e2e`).
   - The loss of the `tx_data` archive of one node has the re-replication from the peer (`archive-tx-data-wipe` and `kardamom-archive-rereplicate`).

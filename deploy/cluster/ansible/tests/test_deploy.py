@@ -29,6 +29,12 @@ SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 SENTINEL = 'SECRET-SENTINEL'
 # The chain status of a chain that stands on nothing.
 HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
+# The chain status while no sealer member runs: the ingress halts the
+# sealer on a lost quorum and pauses on it.
+NO_QUORUM_ROOT = {'service': 'sealer', 'instance': 'cluster', 'cause': 'sealer_no_quorum',
+                  'runbook': 'docs/runbooks/sealer_no_quorum.md'}
+NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
+                                   'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 
@@ -974,6 +980,29 @@ class RecordTest(Deploys):
         self.assertIn('the ingress job is registered and no allocation of it runs', output)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_a_purged_sealer_excuses_only_its_own_no_quorum_halt(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        output = self.run_deploy(success=False)
+        self.assertIn('the chain stands on a halt or a pause', output, 'a registered sealer gets no excuse')
+        self.assertEqual(self.api.state['writes'], [])
+        # The coordinated restart: nomad job stop -purge cluster.
+        del self.api.state['jobs']['cluster']
+        da_lag = {'service': 'sealer', 'instance': 'cluster', 'cause': 'da_lag', 'runbook': 'docs/runbooks/da_lag.md'}
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN | {'roots': [NO_QUORUM_ROOT, da_lag]}
+        output = self.run_deploy(success=False)
+        self.assertIn('da_lag', output, 'the purge excuses no other root')
+        self.assertEqual(self.api.state['writes'], [])
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN | {
+            'ingress': {'pause': {'reason': 'operator', 'root': None, 'note': 'decision-version'}}}
+        output = self.run_deploy(success=False)
+        self.assertIn("Paused: ['ingress']", output, 'the purge excuses no operator pause')
+        self.assertEqual(self.api.state['writes'], [])
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'], ['cluster'], 'the sealer registers in one step')
+
     def test_a_missing_image_refuses_the_release(self):
         self.api.state['missing_images'] = {'kardamom-executor'}
         output = self.run_deploy(success=False)
@@ -1021,6 +1050,16 @@ class RecordTest(Deploys):
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
         self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
 
+    def test_a_new_sealer_decision_version_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=2', '')
+        output = self.run_deploy(success=False)
+        self.assertIn('every member must match: decisionVersion.', output)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()
         self.api.state['writes'] = []
@@ -1060,6 +1099,27 @@ class RollbackTest(Deploys):
         self.assertEqual(record['accepted']['target']['formats'], FORMATS)
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
+
+    def test_a_return_across_a_decision_version_starts_the_sealer_before_the_ingress(self):
+        self.run_deploy()
+        # The coordinated restart into release b.
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.repin('b')
+        self.run_deploy()
+        # The runbook: purge the sealer and the ingress, then deploy the
+        # release before. Without an ingress job the gate reads no chain
+        # status, so an older gate passes too.
+        del self.api.state['jobs']['cluster']
+        del self.api.state['jobs']['ingress']
+        self.api.state['writes'] = []
+        self.repin('a')
+        self.run_deploy()
+        writes = self.api.state['writes']
+        self.assertEqual(writes.count('cluster'), 1, 'the sealer registers in one step')
+        self.assertLess(writes.index('cluster'), writes.index('ingress'), 'the sealer starts before the ingress')
+        self.assertTrue(all(t['Config']['image'].endswith('a' * 64)
+                            for g in self.api.state['jobs']['cluster']['TaskGroups'] for t in g['Tasks']))
 
     def test_a_rollback_after_a_failed_attempt_targets_the_accepted_release(self):
         self.run_deploy()

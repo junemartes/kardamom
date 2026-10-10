@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use tracing::warn;
 
+use super::add_wait::{AddWait, PubAdd, SubAdd};
 use super::bound::BoundControl;
 use super::image_log::ImageHandlers;
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
@@ -61,7 +62,17 @@ enum CmdStep {
     Stop,
 }
 
-/// One row in the Aeron thread's subscription table.
+/// One row in the Aeron thread's subscription table: the subscription,
+/// and the stream id and the sink that each of its destinations opens
+/// its own subscription with.
+struct SubRow {
+    entry: SubEntry,
+    stream_id: i32,
+    sink: FrameSink,
+}
+
+/// One open Aeron subscription behind a fragment assembler: a row of the
+/// subscription table, or an attached destination.
 struct SubEntry {
     sub: Sub,
     /// Assembler-wrapped handler passed to `poll` (owns per-session
@@ -70,10 +81,6 @@ struct SubEntry {
     /// The leaked delegate the assembler forwards to. Retained so it can
     /// be released when the subscription row is dropped.
     inner: rusteron_client::Handler<AssembledDeliver>,
-    /// The stream id and the sink of the subscription. A destination
-    /// attached to this row opens its own subscription with both.
-    stream_id: i32,
-    sink: FrameSink,
     /// Set once `poll` errors, cleared once it succeeds again. Latches
     /// the warning to one line per transition, since `poll` runs on
     /// every pass of the thread's hot loop.
@@ -164,7 +171,7 @@ struct AeronThread {
     dests: Vec<Destination>,
     /// Indexed by `sub_id`. A closed subscription leaves a `None` slot,
     /// so the ids of the open ones stay valid.
-    subs: Vec<Option<SubEntry>>,
+    subs: Vec<Option<SubRow>>,
     pending: VecDeque<PendingPublish>,
     /// The image log handlers of every subscription. They live as long
     /// as the process (see [`ImageHandlers`]).
@@ -305,13 +312,14 @@ impl AeronThread {
 
     /// Poll every subscription and every destination for fragments.
     /// Returns whether any subscription delivered at least one fragment
-    /// this pass. This is
-    /// the per-iteration hot path, so it must poll every subscription and
-    /// cannot short-circuit on the first one that has work.
+    /// this pass. This is the per-iteration hot path, so it must poll
+    /// every subscription and cannot short-circuit on the first one that
+    /// has work.
     fn poll_subscriptions(&mut self) -> bool {
         let mut worked = false;
         let dests = self.dests.iter_mut().map(|d| &mut d.entry);
-        for entry in self.subs.iter_mut().flatten().chain(dests) {
+        let rows = self.subs.iter_mut().flatten().map(|r| &mut r.entry);
+        for entry in rows.chain(dests) {
             worked |= entry.poll_once();
         }
         worked
@@ -390,7 +398,7 @@ impl AeronThread {
     /// Open a publication and append it to `pubs`, replying with its
     /// index and its Aeron session id.
     fn cmd_open_publication(&mut self, uri: &str, stream_id: i32) -> Result<OpenedPub, LogError> {
-        let publication = self.open_pub(uri, stream_id)?;
+        let publication = self.open_pub(uri, stream_id, &AddWait::run_time(ADD_PUB_TIMEOUT))?;
         self.push_pub(TablePub::Shared(publication), stream_id)
     }
 
@@ -412,13 +420,14 @@ impl AeronThread {
     /// Open a dynamic MDC publication whose control endpoint names port
     /// 0, wait for the control address the driver bound, and append the
     /// publication to `pubs`. A publication with no bound address drops
-    /// here and never enters the table.
+    /// here and never enters the table. The add waits as `wait` says.
     fn cmd_open_mdc_publication(
         &mut self,
         uri: &str,
         stream_id: i32,
+        wait: &AddWait,
     ) -> Result<(OpenedPub, SocketAddr), LogError> {
-        let publication = self.open_pub(uri, stream_id)?;
+        let publication = self.open_pub(uri, stream_id, wait)?;
         let control = BoundControl::new(&publication, uri).wait()?;
         Ok((
             self.push_pub(TablePub::Shared(publication), stream_id)?,
@@ -449,33 +458,42 @@ impl AeronThread {
     }
 
     /// Open a subscription behind a fragment assembler, and append it to
-    /// `subs`, replying with its index.
+    /// `subs`, replying with its index. The add waits as `wait` says.
     fn cmd_open_subscription(
         &mut self,
         uri: &str,
         stream_id: i32,
         sink: FrameSink,
+        wait: &AddWait,
     ) -> Result<u32, LogError> {
-        let entry = self.open_entry(uri, stream_id, sink)?;
+        let entry = self.open_entry(uri, stream_id, sink.clone(), wait)?;
         let id = u32::try_from(self.subs.len())
             .map_err(|_| LogError::Aeron("subscription table exceeds u32::MAX entries".into()))?;
-        self.subs.push(Some(entry));
+        self.subs.push(Some(SubRow {
+            entry,
+            stream_id,
+            sink,
+        }));
         Ok(id)
     }
 
     /// Open a subscription on `uri` behind a fragment assembler that sends
-    /// every complete message to `sink`.
-    fn open_entry(&self, uri: &str, stream_id: i32, sink: FrameSink) -> Result<SubEntry, LogError> {
-        let sub = self.open_sub(uri, stream_id)?;
-        let deliver = AssembledDeliver { sink: sink.clone() };
-        let (assembler, inner) = rusteron_client::Handler::leak_with_fragment_assembler(deliver)
-            .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
+    /// every complete message to `sink`. The add waits as `wait` says.
+    fn open_entry(
+        &self,
+        uri: &str,
+        stream_id: i32,
+        sink: FrameSink,
+        wait: &AddWait,
+    ) -> Result<SubEntry, LogError> {
+        let sub = self.open_sub(uri, stream_id, wait)?;
+        let (assembler, inner) =
+            rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { sink })
+                .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
         Ok(SubEntry {
             sub,
             assembler,
             inner,
-            stream_id,
-            sink,
             poll_failed: false,
         })
     }
@@ -537,17 +555,19 @@ impl AeronThread {
             RuntimeCmd::OpenMdcPublication {
                 uri,
                 stream_id,
+                wait,
                 ack,
             } => {
-                let _ = ack.send(self.cmd_open_mdc_publication(&uri, stream_id));
+                let _ = ack.send(self.cmd_open_mdc_publication(&uri, stream_id, &wait));
             }
             RuntimeCmd::OpenSubscription {
                 uri,
                 stream_id,
                 sink,
+                wait,
                 ack,
             } => {
-                let _ = ack.send(self.cmd_open_subscription(&uri, stream_id, sink));
+                let _ = ack.send(self.cmd_open_subscription(&uri, stream_id, sink, &wait));
             }
             RuntimeCmd::SubAddDestination { sub_id, uri, ack } => {
                 let _ = ack.send(self.add_sub_destination(sub_id, &uri));
@@ -565,25 +585,38 @@ impl AeronThread {
         }
     }
 
-    fn open_pub(&self, uri: &str, stream_id: i32) -> Result<super::Pub, LogError> {
+    /// Add a publication, and wait for it as `wait` says.
+    fn open_pub(&self, uri: &str, stream_id: i32, wait: &AddWait) -> Result<super::Pub, LogError> {
         let c = crate::ffi::c_uri(uri, "uri")?;
-        self.aeron
-            .add_publication(c.as_c_str(), stream_id, ADD_PUB_TIMEOUT)
-            .map_err(|e| LogError::Aeron(format!("add_publication {uri}: {e}")))
+        let poller = self
+            .aeron
+            .async_add_publication(c.as_c_str(), stream_id)
+            .map_err(|e| LogError::Aeron(format!("add_publication {uri}: {e}")))?;
+        let add = PubAdd {
+            aeron: &self.aeron,
+            poller,
+        };
+        wait.complete(&add, "add_publication", uri)
     }
 
-    /// Open a subscription with the image log of this thread.
-    fn open_sub(&self, uri: &str, stream_id: i32) -> Result<Sub, LogError> {
+    /// Add a subscription with the image log of this thread, and wait for
+    /// it as `wait` says.
+    fn open_sub(&self, uri: &str, stream_id: i32, wait: &AddWait) -> Result<Sub, LogError> {
         let c = crate::ffi::c_uri(uri, "uri")?;
-        self.aeron
-            .add_subscription(
+        let poller = self
+            .aeron
+            .async_add_subscription(
                 c.as_c_str(),
                 stream_id,
                 Some(self.image_log.available),
                 Some(self.image_log.unavailable),
-                ADD_SUB_TIMEOUT,
             )
-            .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))
+            .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))?;
+        let add = SubAdd {
+            aeron: &self.aeron,
+            poller,
+        };
+        wait.complete(&add, "add_subscription", uri)
     }
 
     /// Attach a source endpoint (`uri`, for example
@@ -603,7 +636,8 @@ impl AeronThread {
         {
             return Ok(()); // already attached
         }
-        let entry = self.open_entry(uri, sub.stream_id, sub.sink.clone())?;
+        let wait = AddWait::run_time(ADD_SUB_TIMEOUT);
+        let entry = self.open_entry(uri, sub.stream_id, sub.sink.clone(), &wait)?;
         self.dests.push(Destination {
             sub_id,
             uri: uri.to_string(),

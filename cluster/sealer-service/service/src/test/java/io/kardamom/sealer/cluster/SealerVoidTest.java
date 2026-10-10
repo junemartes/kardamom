@@ -79,6 +79,42 @@ class SealerVoidTest {
         assertArrayEquals(want.array(), relayed().get(1));
     }
 
+    private void voidEntry(final long index, final int idTag) {
+        deliver(consumer, IngressFrames.voidRequestFrame(0, index, IngressFrames.recordId(idTag)));
+        deliver(consumer, IngressFrames.voidRequestFrame(1, index, IngressFrames.recordId(idTag)));
+    }
+
+    private long contiguityRejects() {
+        return publisher.offered.stream()
+            .filter(f -> f[0] == SealerWire.EGRESS_KIND_CONTIGUITY_REJECT)
+            .count();
+    }
+
+    @Test
+    void after_two_voids_of_one_sender_the_resubmits_order_from_the_lower_nonce() {
+        deliver(publisher, IngressFrames.recordFrame(7, sender(), 0));
+        deliver(publisher, IngressFrames.recordFrame(8, sender(), 1));
+        voidEntry(0, 7);
+        voidEntry(1, 8);
+        assertEquals(4, relayed().size(), "two references and two void records");
+
+        deliver(publisher, IngressFrames.recordFrame(8, sender(), 1));
+        assertEquals(1, contiguityRejects(), "nonce 1 waits for nonce 0");
+
+        deliver(publisher, IngressFrames.recordFrame(7, sender(), 0));
+        deliver(publisher, IngressFrames.recordFrame(8, sender(), 1));
+
+        final List<byte[]> relayed = relayed();
+        assertEquals(6, relayed.size());
+        assertEquals(1, contiguityRejects(), "the resubmits of nonce 0 and then 1 are not refused");
+        assertEquals(7, last(relayed.get(4)), "nonce 0 is ordered first");
+        assertEquals(8, last(relayed.get(5)), "nonce 1 is ordered after it");
+    }
+
+    private static int last(final byte[] frame) {
+        return frame[frame.length - 1];
+    }
+
     @Test
     void a_short_request_is_dropped() {
         deliver(publisher, IngressFrames.recordFrame(7, sender(), 0));

@@ -62,6 +62,16 @@ impl DriverBudget {
     pub(crate) fn duration(self) -> Duration {
         self.0
     }
+
+    /// How long a start-up open waits: two budgets. One budget is the
+    /// wait through a stall that every Aeron party survives. The second
+    /// covers the work that the stall delays. A Consul registration at
+    /// start-up retries for the same time.
+    pub(crate) fn start_open_limit(self) -> Duration {
+        // A limit past `Duration::MAX` has no end, which is the meaning
+        // of so long a budget.
+        self.0.saturating_mul(2)
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +94,18 @@ mod tests {
         assert_eq!(budget_for(0), Duration::from_secs(10));
         assert_eq!(budget_for(1_000), Duration::from_secs(10));
         assert_eq!(budget_for(5_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_start_open_limit_is_two_budgets() {
+        let limit = |ms| {
+            DriverBudget::from_driver_timeout_ms(ms)
+                .unwrap()
+                .start_open_limit()
+        };
+        assert_eq!(limit(10_000), Duration::from_secs(30), "production");
+        assert_eq!(limit(30_000), Duration::from_secs(70), "CI");
+        assert_eq!(limit(1_000), Duration::from_secs(20), "the budget floor");
     }
 
     #[test]
