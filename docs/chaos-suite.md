@@ -130,7 +130,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`executor-fleet-loss-recover`](failure-modes.md#executor): all three executor nodes die. Each executor resumes from its own state.
 - [`executor-fleet-wipe-recover`](failure-modes.md#executor): kills the three executor tasks, stops the job, and wipes every state database while no executor runs. Each executor restores from its local checkpoint.
 - [`executor-fleet-total-wipe-recover`](failure-modes.md#executor): all state and checkpoints are wiped. Every executor resumes from a state rebuilt from L1.
-- [`redis-total-loss-recover`](failure-modes.md#redis-account-cache): the whole Redis job stops. Every state mirror must rebuild.
+- [`redis-total-loss-recover`](failure-modes.md#redis-account-cache): the whole Redis job stops. Every state mirror must rebuild. No sentinel may restart on the cold start.
 - [`cluster-quorum-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): two sealer members die. The pipeline must stall, then recover.
 - [`cluster-total-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): all three sealer members die and return with their logs.
 - [`sealer-fleet-total-wipe-recover`](failure-modes.md#proof-sealer-fleet-total-wipe-recover): all three sealer members lose their directories. The chain restarts after the posted head from a seed and a state rebuilt from L1. The blocks after the posted head are reverted.

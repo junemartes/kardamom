@@ -21,6 +21,14 @@ ports {
 # a Consul service record: Consul must not bootstrap through itself.
 retry_join   = {{ consul_retry_join | to_json }}
 
+# roles: the service classes this node hosts, a comma list (the same
+# value as the Nomad node meta `roles`). A job template reads it from the
+# catalog to find a node by its role before any service on that node is
+# registered: the redis sentinels name the initial primary this way.
+node_meta {
+  roles = "{{ node_role_set | join(',') }}"
+}
+
 {% if control_plane | default(false) | bool %}
 server           = true
 bootstrap_expect = {{ consul_server_expect }}
