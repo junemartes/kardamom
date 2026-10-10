@@ -155,24 +155,30 @@ job "redis" {
         force_pull      = true
         readonly_rootfs = true
         network_mode    = "host"
-        args = [
-          "redis-server", "/usr/local/etc/redis/redis.conf",
-          "--dir", "/local",
-          # The primary, by its node record (REDIS_PRIMARY_NODE, from
-          # its Consul service). A sentinel failover reconfigures this
-          # replica in place.
-          "--replicaof", "${REDIS_PRIMARY_NODE}.node.${var.datacenter}.consul", "6379",
-          # The node record this replica reports to its primary. See the
-          # primary task: the sentinels must know each instance by one
-          # name.
-          "--replica-announce-ip", "${node.unique.name}.node.${var.datacenter}.consul",
+        # The start script reads the primary's node from the rendered
+        # file at each start, so a restart reads the newest render. An
+        # empty node name stops the task with a log line, and Nomad
+        # restarts it. The script starts Redis through the image
+        # entrypoint, which drops root as for the primary.
+        # - --replicaof: the primary, by its node record. A sentinel
+        #   failover reconfigures this replica in place.
+        # - --replica-announce-ip: the node record this replica reports to
+        #   its primary. See the primary task: the sentinels must know
+        #   each instance by one name.
+        args = ["sh", "-c", <<EOF
+. /local/primary.env
+if [ -z "$REDIS_PRIMARY_NODE" ]; then
+  echo 'redis-replica: no primary to follow: no redis-primary service passes, and no Consul node meta roles holds redis-primary' >&2
+  exit 1
+fi
+exec docker-entrypoint.sh redis-server /usr/local/etc/redis/redis.conf --dir /local --replicaof "$REDIS_PRIMARY_NODE.node.${var.datacenter}.consul" 6379 --replica-announce-ip "${node.unique.name}.node.${var.datacenter}.consul"
+EOF
         ]
       }
-      # The node of the primary, read once at start (local.primary_node).
-      # A later failover is the sentinels' work.
+      # The node of the primary (local.primary_node). A later failover is
+      # the sentinels' work.
       template {
         destination = "local/primary.env"
-        env         = true
         change_mode = "noop"
         data        = <<EOF
 REDIS_PRIMARY_NODE=${local.primary_node}

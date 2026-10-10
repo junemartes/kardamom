@@ -649,18 +649,56 @@ class DeployTest(Deploys):
         self.assertTrue(primary.startswith('{{ $primary := "" }}{{ with service "redis-primary" }}'), primary)
         self.assertIn('(.Meta.roles | split "," | contains "redis-primary")', primary)
         self.assertTrue(primary.endswith('{{ $primary }}'), primary)
-        replica_env = groups['replica']['Tasks'][0]['Templates'][0]['EmbeddedTmpl']
-        self.assertEqual(replica_env, f'REDIS_PRIMARY_NODE={primary}\n')
+        replica = groups['replica']['Tasks'][0]
+        self.assertEqual(replica['Templates'][0]['EmbeddedTmpl'], f'REDIS_PRIMARY_NODE={primary}\n')
+        self.assertEqual(replica['Config']['args'][:2], ['sh', '-c'])
+        self.assert_replica_start(replica['Config']['args'][2])
         self.assertEqual(sentinel['Config']['args'][:2], ['sh', '-c'])
         self.assert_sentinel_start(sentinel['Config']['args'][2])
         self.assertEqual(self.api.state['writes'], [])
 
+    @staticmethod
+    def run_task_script(root, script, program, files):
+        """Run the start script of a task in `root`: its /local is
+        `root`/local with `files` in it (a path such as /usr/local stays),
+        and `program` is a stub that prints `started` and its arguments."""
+        (root / 'local').mkdir()
+        (root / 'bin').mkdir()
+        stub = root / 'bin' / program
+        stub.write_text('#!/bin/sh\necho "started $*"\n')
+        stub.chmod(0o755)
+        for name, text in files.items():
+            (root / 'local' / name).write_text(text)
+        return subprocess.run(['sh', '-c', re.sub(r'(?<![\w/])/local/', f'{root}/local/', script)],
+                              env={'PATH': f'{root}/bin:/usr/bin:/bin'}, text=True,
+                              capture_output=True, timeout=10)
+
+    def assert_replica_start(self, script):
+        """The replica start script reads the rendered primary node at
+        each start. An empty node stops the task with the cause, and a
+        set node starts Redis as a replica of that node."""
+        script = script.replace('${node.unique.name}', 'ingress-1')
+        with self.subTest('no primary'), tempfile.TemporaryDirectory() as tmp:
+            result = self.run_task_script(Path(tmp), script, 'docker-entrypoint.sh',
+                                          {'primary.env': 'REDIS_PRIMARY_NODE=\n'})
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('no primary to follow: no redis-primary service passes, '
+                          'and no Consul node meta roles holds redis-primary', result.stderr)
+        with self.subTest('a primary'), tempfile.TemporaryDirectory() as tmp:
+            result = self.run_task_script(Path(tmp), script, 'docker-entrypoint.sh',
+                                          {'primary.env': 'REDIS_PRIMARY_NODE=aux-0\n'})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, 'started redis-server /usr/local/etc/redis/redis.conf --dir /local '
+                             '--replicaof aux-0.node.dc1.consul 6379 '
+                             '--replica-announce-ip ingress-1.node.dc1.consul\n')
+
     def assert_sentinel_start(self, script):
         """Run the start script of a sentinel task on each state of its
-        files, with a stub redis-sentinel. The task keeps a live config
-        that Sentinel rewrote (it has `sentinel myid`), copies a seed that
-        names a primary over any other live config, and refuses a seed
-        that names none without writing the live config."""
+        files. The task keeps a live config that Sentinel rewrote (it has
+        `sentinel myid`), copies a seed that names a primary over any
+        other live config, and refuses a seed that names none without
+        writing the live config."""
         good = 'sentinel monitor kardamom aux-0.node.dc1.consul 6379 2\n'
         empty = 'sentinel monitor kardamom .node.dc1.consul 6379 2\n'
         rewritten = 'sentinel monitor kardamom ingress-1.node.dc1.consul 6379 2\nsentinel myid abc\n'
@@ -673,17 +711,8 @@ class DeployTest(Deploys):
         for name, seed, live, code, after in cases:
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                (root / 'local').mkdir()
-                (root / 'bin').mkdir()
-                stub = root / 'bin/redis-sentinel'
-                stub.write_text('#!/bin/sh\necho "started $1"\n')
-                stub.chmod(0o755)
-                (root / 'local/sentinel.seed.conf').write_text(seed)
-                if live is not None:
-                    (root / 'local/sentinel.conf').write_text(live)
-                result = subprocess.run(['sh', '-c', script.replace('/local/', f'{root}/local/')],
-                                        env={'PATH': f'{root}/bin:/usr/bin:/bin'}, text=True,
-                                        capture_output=True, timeout=10)
+                files = {'sentinel.seed.conf': seed} | ({'sentinel.conf': live} if live is not None else {})
+                result = self.run_task_script(root, script, 'redis-sentinel', files)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 config = root / 'local/sentinel.conf'
                 self.assertEqual(config.read_text() if config.exists() else None, after)
