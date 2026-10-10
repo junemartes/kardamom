@@ -408,6 +408,10 @@ class DeployTest(Deploys):
         variables = self.api.state['variables']
         self.assertEqual(variables['nomad/jobs/l1-indexer'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         self.assertNotIn('nomad/jobs/da-watcher', variables)
+        # Every deployment runs the follower; anvil has no beacon chain,
+        # so it reads every second.
+        follower = self.api.state['jobs']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
         self.assertEqual(variables['nomad/jobs/canary'], {
@@ -583,23 +587,28 @@ class DeployTest(Deploys):
         self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
         self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
-
-    def test_the_follower_runs_twice_and_records_its_stream(self):
-        # Two instances on two nodes, each on the node's Aeron driver and
-        # recording l1_blocks; anvil has no beacon chain, so no schedule.
-        self.run_deploy({'workloads_l1_fault_proxy': True}, check=True)
-        group = self.api.state['plans']['l1-indexer']['TaskGroups'][0]
+        # Two follower instances on two nodes, each on the node's Aeron
+        # driver and recording l1_blocks; anvil has no beacon chain, so no
+        # schedule.
+        group = plans['l1-indexer']['TaskGroups'][0]
         self.assertEqual(group['Count'], 2)
-        job = self.api.state['plans']['l1-indexer']
-        constraints = job.get('Constraints') or []
-        self.assertIn('distinct_hosts', json.dumps(constraints))
+        self.assertIn('distinct_hosts', json.dumps(plans['l1-indexer'].get('Constraints') or []))
         task = group['Tasks'][0]
-        args = task['Config']['args']
-        self.assertIn('--archive-durability', args)
-        self.assertEqual(args[args.index('--log-config') + 1], '/local/channels.toml')
-        self.assertEqual(args[args.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
-        self.assertNotIn('--beacon-api', args)
+        self.assertIn('--archive-durability', indexer)
+        self.assertEqual(indexer[indexer.index('--log-config') + 1], '/local/channels.toml')
+        self.assertEqual(indexer[indexer.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
+        self.assertNotIn('--beacon-api', indexer)
         self.assertIn('/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount', task['Config']['volumes'])
+        # The da-watcher has no L1 endpoint; its history reads replay the
+        # follower archives onto its own ports and fall back to the
+        # follower's API.
+        watcher = plans['da-watcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertIn('--l1-blocks', watcher)
+        self.assertNotIn('--l1-rpc', watcher)
+        self.assertNotIn('kardamom-l1-fault-proxy', json.dumps(plans['da-watcher']))
+        self.assertEqual(watcher[watcher.index('--indexer-url') + 1], 'http://kardamom-l1-indexer.service.consul:8549')
+        self.assertIn('--replay-destination-endpoint', watcher)
+        self.assertIn('--archive-control-response-endpoint', watcher)
 
     def test_the_follower_takes_its_count_and_its_log_range(self):
         self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_count': '1',
@@ -608,27 +617,6 @@ class DeployTest(Deploys):
         self.assertEqual(group['Count'], 1)
         args = group['Tasks'][0]['Config']['args']
         self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
-
-    def test_the_da_watcher_reads_the_follower_stream_with_no_l1_access(self):
-        # The watcher has no L1 endpoint; its history reads replay the
-        # follower archives onto its own ports and fall back to the
-        # follower's API.
-        self.run_deploy({'workloads_l1_fault_proxy': True}, check=True)
-        plans = self.api.state['plans']
-        task = plans['da-watcher']['TaskGroups'][0]['Tasks'][0]
-        args = task['Config']['args']
-        self.assertIn('--l1-blocks', args)
-        self.assertNotIn('--l1-rpc', args)
-        self.assertNotIn('kardamom-l1-fault-proxy', json.dumps(plans['da-watcher']))
-        self.assertEqual(args[args.index('--indexer-url') + 1], 'http://kardamom-l1-indexer.service.consul:8549')
-        self.assertIn('--replay-destination-endpoint', args)
-        self.assertIn('--archive-control-response-endpoint', args)
-        self.assertIn('l1-indexer', plans)
-
-    def test_every_deployment_runs_the_follower_and_anvil_reads_every_second(self):
-        self.run_deploy(check=True)
-        follower = self.api.state['plans']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
-        self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
 
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the
