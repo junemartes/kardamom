@@ -14,6 +14,8 @@ import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.file.Path;
 import java.util.EnumSet;
 import java.util.Optional;
@@ -151,7 +153,11 @@ public final class ClusterNode {
             PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
-        final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me);
+        // The driver keeps the last address of each member name, so a short
+        // outage of the node's DNS agent does not fail an add in an election.
+        // The member's own name starts with the node address.
+        final MemberContexts contexts =
+            new MemberContexts(aeronDir, clusterDir, archiveDir, me, nameResolver(memberId, me, nodeIp));
         prepareState(contexts, clusterMembers, memberId);
 
         // Launch with a retry past the mark-file liveness window. A member
@@ -233,6 +239,22 @@ public final class ClusterNode {
             startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop),
                 contexts.clusterState());
             stop.await();
+        }
+    }
+
+    /**
+     * The name resolver of the member's media driver. With a node address,
+     * the member's own name resolves to it before any lookup.
+     */
+    private static PeerNameResolver nameResolver(final int memberId, final String[] me, final String nodeIp) {
+        final PeerNameResolver resolver = new PeerNameResolver(memberId);
+        if (nodeIp == null || nodeIp.isBlank()) {
+            return resolver;
+        }
+        try {
+            return resolver.knowing(me[0].split(":")[0], InetAddress.getByName(nodeIp.trim()));
+        } catch (final UnknownHostException e) {
+            throw new IllegalArgumentException("kardamom.cluster.nodeIp is not an address: " + nodeIp, e);
         }
     }
 

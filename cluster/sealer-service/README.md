@@ -361,7 +361,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
 | `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
-| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. `0` turns the join watchdog off, and with it the exit on a closed component. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 if it won a vote and its election waits for followers (`LEADER_LOG_REPLICATION` or `LEADER_READY`) for this long. `0` turns the join watchdog off, and with it the exit on a closed component. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
@@ -392,6 +392,14 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes` or `joinWatchdogS`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
 - `decisionVersion`: the sealer job spec (`deploy/cluster/nomad/cluster.nomad.hcl`) names the version as a literal. `ClusterNodeTest` checks that it equals `DECISION_VERSION`. The start-up line `cluster decision version` shows it.
 - The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, and the application version is 0.3.0.
+
+### Member names
+
+The member list names each member by its Consul node name, for example `sealer-0.node.dc1.consul`. Every node resolves these names through its own Consul agent.
+
+- The media driver looks a name up each time a component adds a channel, and again while a destination sends no status. Each election adds channels: the log publication and its destinations, the log subscription, and the archive replication.
+- The driver keeps the last address of each name (`PeerNameResolver`). When a lookup fails, it uses that address and logs `cluster DNS FAILED`. A good lookup replaces the address, so a member that moves to a new address is found at the next good lookup.
+- Without the last address, a short outage of the Consul agent fails an add in an election. A failed add of the ingress subscription at the end of an election leaves a leader that no client can reach, and the pipeline stalls until the member restarts.
 
 ### Decision version
 
@@ -483,6 +491,9 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
+| `cluster LEADER WEDGE` | The member won a vote, but its election stayed in `LEADER_LOG_REPLICATION` or `LEADER_READY` for longer than `joinWatchdogS`: no follower joined, or the completion of the election failed. The process halts with exit code 6, and the members elect again. |
+| `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`). A short state can pass with no line. |
+| `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |

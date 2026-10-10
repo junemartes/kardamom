@@ -154,4 +154,36 @@ final class JoinWatchdogTest {
         LongStream.range(0, 2 * STALL_MS / 1_000L).forEach(t ->
                 assertEquals(Verdict.NONE, w.observe(stuckAt(t), COMMIT, t * 1_000L)));
     }
+
+    @Test
+    void aLeaderWithNoFollowerWedgesAfterTheWindow() {
+        // The member won a vote, but no follower replicates its log or joins its live log.
+        final JoinWatchdog w = watchdog();
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CANDIDATE_BALLOT, COMMIT, 0L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_000L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_000L + WINDOW_MS));
+        assertEquals(Verdict.LEADER_WEDGE,
+                w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 1_001L + WINDOW_MS));
+        assertEquals(WINDOW_MS + 1L, w.leaderWaitForMs(1_001L + WINDOW_MS));
+    }
+
+    @Test
+    void aLeaderThatWaitsForTheLiveLogWedgesAfterTheWindow() {
+        final JoinWatchdog w = watchdog();
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 0L));
+        assertEquals(Verdict.LEADER_WEDGE, w.observe(ElectionState.LEADER_READY, COMMIT, WINDOW_MS + 1L));
+    }
+
+    @Test
+    void theOwnReplayOfALeaderIsNotAWait() {
+        // A leader replays its own log after a full restart. The replay can
+        // take longer than the window on a slow host, and it restarts the wait.
+        final JoinWatchdog w = watchdog();
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_LOG_REPLICATION, COMMIT, 0L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_REPLAY, COMMIT, WINDOW_MS / 2));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_REPLAY, COMMIT, 3 * WINDOW_MS));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.LEADER_READY, COMMIT, 3 * WINDOW_MS + 1_000L));
+        assertEquals(Verdict.NONE, w.observe(ElectionState.CLOSED, COMMIT, 3 * WINDOW_MS + 2_000L));
+        assertEquals(0L, w.leaderWaitForMs(3 * WINDOW_MS + 2_000L));
+    }
 }

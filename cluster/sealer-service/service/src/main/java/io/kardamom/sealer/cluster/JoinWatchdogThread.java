@@ -29,6 +29,10 @@ import org.agrona.concurrent.status.AtomicCounter;
  *       snapshot. The member loses no data that the cluster needs: it
  *       reached a catch-up state, so a leader holds a longer log, and the
  *       leader's log holds every committed entry.</li>
+ *   <li>A leader wedge exits with code {@link #LEADER_WEDGE_EXIT_CODE}.
+ *       The member won a vote, but no follower joined, or the completion of
+ *       the election failed. The relaunch starts from the member's own
+ *       state, and the members elect again.</li>
  *   <li>A closed component exits with code {@link #COMPONENT_CLOSED_EXIT_CODE}.
  *       An agent that throws in its start, for example on an archive
  *       request that times out while it loads its snapshot, records the
@@ -48,6 +52,8 @@ final class JoinWatchdogThread {
     static final int CATCHUP_STALL_EXIT_CODE = 4;
     /** Process exit code when a component closes with no stop request. */
     static final int COMPONENT_CLOSED_EXIT_CODE = 5;
+    /** Process exit code when the election of a member that won a vote does not complete. */
+    static final int LEADER_WEDGE_EXIT_CODE = 6;
 
     /**
      * The member that the thread watches: its id, its two components, and
@@ -78,6 +84,8 @@ final class JoinWatchdogThread {
     private final AtomicCounter electionState;
     private final AtomicCounter commitPosition;
     private final StateDir clusterDir;
+    /** The election state of the last sample; only this thread reads and writes it. */
+    private ElectionState lastState;
     /** The INIT window and the stall window, for the log lines. */
     private final long windowS;
     private final long stallWindowS;
@@ -133,11 +141,28 @@ final class JoinWatchdogThread {
     private void observe() {
         final long nowMs = System.currentTimeMillis();
         final long commit = commitPosition.get();
-        switch (watchdog.observe(ElectionState.get(electionState), commit, nowMs)) {
+        final ElectionState state = ElectionState.get(electionState);
+        logStateChange(state, commit);
+        switch (watchdog.observe(state, commit, nowMs)) {
             case INIT_WEDGE -> initWedge(nowMs);
             case CATCHUP_STALL -> catchupStall(commit, nowMs);
+            case LEADER_WEDGE -> leaderWedge(nowMs);
             case NONE -> { }
         }
+    }
+
+    /**
+     * Log the election state when it differs from the last sample. The
+     * samples are one second apart, so a short state can pass unlogged.
+     * The lines show where an election waits.
+     */
+    private void logStateChange(final ElectionState state, final long commit) {
+        if (state == lastState) {
+            return;
+        }
+        lastState = state;
+        System.out.println("cluster ELECTION memberId=" + member.memberId() + " state=" + state
+            + " commitPosition=" + commit);
     }
 
     private void initWedge(final long nowMs) {
@@ -145,6 +170,14 @@ final class JoinWatchdogThread {
             + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
             + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
         halt(JOIN_WEDGE_EXIT_CODE);
+    }
+
+    private void leaderWedge(final long nowMs) {
+        System.out.println("cluster LEADER WEDGE memberId=" + member.memberId()
+            + " election stuck in " + lastState + " for " + watchdog.leaderWaitForMs(nowMs) / 1000L
+            + "s (window " + windowS + "s): no follower joined, or the election did not complete;"
+            + " exiting for a clean relaunch so the members elect again");
+        halt(LEADER_WEDGE_EXIT_CODE);
     }
 
     private void catchupStall(final long commit, final long nowMs) {

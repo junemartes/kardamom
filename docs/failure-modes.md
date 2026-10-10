@@ -243,6 +243,20 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - It exits with code 5. The relaunch starts from the member's own state.
   - Prevention: the archive waits of a snapshot load scale with the Aeron stall tolerance. The message timeout is the tolerance, and the replay connect timeout is half of it.
   - Proof: the in-JVM test `ComponentCloseTest`.
+- **Member name lookup fails**
+  - Trigger: the Consul agent of a sealer node does not answer for a time, for example while it has no Consul server after a node restart, or while the server is overloaded. A lookup of a member name (`sealer-N.node.<dc>.consul`) then fails.
+  - Effect: each election adds Aeron channels by member name. Without a fallback, a failed add stops the election half way. A failed add of the ingress subscription at the end of an election leaves a leader that no client can reach (see the next entry).
+  - Recovery: the media driver of each member keeps the last address of each member name. A failed lookup uses that address and logs `cluster DNS FAILED`. A good lookup replaces it.
+  - Proof: the in-JVM test `PeerNameResolverTest`, and the chaos cases `cluster-total-loss-recover`, `sequencer-sealer-loss-recover` and `ingress-sealer-loss-recover` with the Consul agent of one sealer node cut from the server on and off after its restart.
+- **Leader that does not complete its election**
+  - Trigger: one of two faults.
+    - A member wins a vote, but no follower replicates its log or joins its live log. Aeron 1.44 has no timeout for this wait.
+    - The completion of the election throws, for example when the add of the ingress subscription fails on a name lookup. Aeron clears the election before that add, so the member runs as the leader with no ingress subscription.
+  - Effect: the election state of the member stays in `LEADER_LOG_REPLICATION` or `LEADER_READY`. No client can open a session, and the pipeline stalls. The members can show one leader for the term, so the stall is not visible in the roles.
+  - Recovery: the join watchdog acts after 60 s in `LEADER_LOG_REPLICATION` or `LEADER_READY` (`kardamom.cluster.joinWatchdogS`).
+    - It logs `cluster LEADER WEDGE`.
+    - It exits with code 6. The relaunch starts from the member's own state, and the members elect again.
+  - Proof: the in-JVM test `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.
   - Effect: the pipeline must stall. Progress without a quorum would be unreplicated ordering, which is unsafe. Client cluster sessions die, because the outage is longer than the session timeout.
