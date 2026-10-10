@@ -1,6 +1,6 @@
 # Transaction bytes in the sealer's Raft log
 
-- Status: design and implementation plan. Not implemented.
+- Status: approved by the user on 2026-10-11. Not implemented.
 - Issue: refs #582.
 - Reviewed by dev-32 (the batcher resume and DA side) and kardamom-3-00 (the executor side). Their points are in this version.
 - Decided by the user:
@@ -9,7 +9,11 @@
   - Variant A (section 15 lists the variant that was not chosen). The sequencers stay and offer
     only references. The ingress offers the transaction data into the cluster through its own
     cluster session.
-- Still open for the user: the target rate and the transaction size (section 10.6).
+- Decided by the user on 2026-10-11 (section 16):
+  - The design target is up to 5,000 tx/s with mixed sizes.
+  - The feed from member `i` to executor `i` is IPC through one shared media driver.
+  - Staging moves by a chain reset. Production uses the drained cut-over.
+  - The starting limits of sections 5 and 7 are accepted. The benchmark tunes them.
 - Scope: the ingress, the sequencer offer, the sealer state machine and its snapshot, the input
   of the executors, the consumers of the canonical stream, and the removal of the void path.
 - Every claim about the current code cites `path:line` on `main` at `0e0c34f25`.
@@ -29,8 +33,8 @@
   sealer refuses it with `PAST_DEADLINE`. The sequencer frees the nonce, as #561 does today.
 - An envelope that no reference names expires at its deadline.
 - Each sealer member publishes the canonical stream, with bytes, to its paired executor: the
-  **member feed**. The feed is an Aeron publication on the member node. It is IPC when the
-  executor runs on the same node.
+  **member feed**. The member and the executor run on one host and share one media driver, so
+  the feed is IPC (section 7.6).
 - The executors execute strictly in canonical order. There is no join, no refetch, no void and
   no vote.
 - The validator, the batcher and any executor without a paired member read the same canonical
@@ -257,9 +261,10 @@ The envelope store is new replicated state in `CanonicalSealerState`.
 - **TTL.** An entry lives until the block after its deadline: at most
   `inclusionHorizonBlocks + 1` blocks. With the deploy values (64 blocks, 2,000 ms) that is
   130 s.
-- **Memory bound.** `kardamom.cluster.envelopeBytes`, a must-match setting. Proposed default:
-  64 MiB, split equally over the lanes. The lane cap is `envelopeBytes / lane count`. A lane with
-  no sequencer then cannot fill the store for the other lanes.
+- **Memory bound.** `kardamom.cluster.laneEnvelopeBytes`, a must-match setting: the cap of the
+  held bytes of one lane. The user accepted 64 MiB as the starting value. The store holds at most
+  `laneEnvelopeBytes x lane count`: 128 MiB with the 2 lanes of today. A lane with no sequencer
+  cannot fill the store for the other lanes.
 - A refused entry changes nothing in the state. The ingress offers it again (section 6.3).
 - **Residency.** An envelope waits for its reference for one sequencer round trip, normally under
   a millisecond. It stays until its TTL only when no reference comes: the sequencer refused it
@@ -303,7 +308,7 @@ becomes:
   The expected nonce stays at the head's nonce.
   - The sequencer already handles both answers. It frees the refused nonce and parks the later
     references above it (#561, `docs/failure-modes.md:520-529`).
-- **Bound.** `kardamom.cluster.waitingRefs`, a must-match setting. Proposed default: 16,384
+- **Bound.** `kardamom.cluster.waitingRefs`, a must-match setting. Starting value (accepted): 16,384
   waiting references, heads and queues together, about 120 bytes each in the heap. A full set
   answers `WINDOW_FULL`, which the sequencer already republishes.
 - Other senders do not wait. A waiting head blocks only its own sender.
@@ -355,7 +360,7 @@ the posted head (`SealerEgress.java:420-449`). The frames now carry bytes.
 - So the DA-lag guard gets a byte budget beside the block budget:
   `kardamom.cluster.daLagBudgetBytes`, a must-match setting. The guard refuses a user record when
   the retained bytes above the posted head pass it. The retained bytes are a function of the
-  log, so every member decides alike. Proposed default: 1 GiB. The benchmark sets the value
+  log, so every member decides alike. Starting value (accepted): 1 GiB. The benchmark sets the value
   (section 10.6).
 - The batcher posts a group at the latest when its last block is half the block budget past the
   posted head (#569). It gets the same rule for the byte budget: the status frame (egress kind 9)
@@ -395,10 +400,10 @@ the posted head (`SealerEgress.java:420-449`). The frames now carry bytes.
 | Waiting references | absent | `[count:u32]` then the 87-byte reference, the session ids, the queue order |
 | Retained frames | `TxRef` frames, 59 B | `RT_TX` frames, `127 + raw_tx` bytes |
 
-- The snapshot size is at most `envelopeBytes` + 2 MB of waiting references + the retained
-  frames, which the byte budget bounds: about 1.1 GiB with the proposed defaults.
+- The snapshot size is at most the store (128 MiB) + 2 MB of waiting references + the retained
+  frames, which the byte budget bounds: about 1.2 GiB with the starting values.
 - The heap holds the same data. The sealer runs with `-Xmx384m` and 1,024 MB of job memory
-  (`deploy/cluster/nomad/cluster.nomad.hcl:362`, `:413`). The proposed defaults need about
+  (`deploy/cluster/nomad/cluster.nomad.hcl:362`, `:413`). The accepted starting values need about
   2 GiB of heap. The benchmark measures the snapshot time and the GC pauses at that size.
 - **Precondition: the host memory.** On staging, each dedicated host (8 cores) runs sealer
   member `i` (cpuset 0-3) and executor `i` (cpuset 4-7) as two node containers. ded-3 took
@@ -520,7 +525,7 @@ With 2 ingresses each sends half. The sequencers add `rate x 182` bytes (section
 |---|---|
 | Topic | `sealer_feed`, a new `Topic` variant (`crates/log/src/discovery/record.rs:24-36`). |
 | Stream id | 1006 for the feed, 1007 for the feed control. Both are free (`crates/log/src/config/mod.rs:503-545`). |
-| Channel | `aeron:ipc` when the executor runs on the member node. Else UDP unicast from member `i` to executor `i`. |
+| Channel | `aeron:ipc` on the media driver that member `i` and executor `i` share (section 7.6). UDP unicast from member `i` to executor `i` only where the deploy cannot share a driver (`feed_transport = udp`). |
 | Publisher | One exclusive publication on each member, owned by a feeder thread in the member JVM. |
 | Subscriber | The paired executor only. |
 | Frames | The egress frames, unchanged: kind 1 (relayed), kind 2 (boundary), kind 9 (status), and the replay answers 3, 4, 11. The feed adds kind 16 (`FEED_GAP`). One codec for the feed and the egress. |
@@ -611,26 +616,64 @@ The executor reads one source at a time, in this order:
 - `kardamom_executor_input_source{source="feed|egress"}` shows the source. An alert fires when an
   executor reads the egress for more than 10 minutes.
 
-### 7.6 Pairing and placement
+### 7.6 Pairing, placement and the shared media driver
 
 - Member `i` feeds executor `i`. Both counts are 3 today
   (`deploy/cluster/ansible/group_vars/all.yml:235-236`).
-- The local profile runs the sealers and the executors on separate node classes. Staging already
-  puts sealer member `i` and executor `i` on one dedicated host, in two node containers with
-  separate cpusets (`kardamom-infra`, `ansible/inventories/staging/hosts.ini:57-66`). Each node
-  container has its own media driver, so the first release pairs them over UDP unicast. On
-  staging that traffic stays inside the host. This already takes the executors off the leader's
-  egress.
-- Co-location (one node runs sealer member `i` and executor `i`, feed over IPC) is the target of
-  the design. It changes the node classes and puts the leader's CPU beside an executor. The
-  cluster shape warns that co-location moves the latency knee
-  (`docs/specs/2026-08-16-10-ggas-cluster-shape.md`, "What breaks first"). Section 16 asks the
-  user.
+- Staging already puts sealer member `i` and executor `i` on one dedicated host, in two node
+  containers with separate cpusets (`kardamom-infra`,
+  `ansible/inventories/staging/hosts.ini:57-66`). The user chose IPC through one media driver
+  for the pair.
+
+**Today.** Each node container has its own `/opt/kardamom`, a host directory of that node
+(`kardamom-infra`, `ansible/roles/node_containers/tasks/main.yml:93-97`). The executor node runs
+the shared `ArchivingMediaDriver` of the aeron system job on `/opt/kardamom/aeron-mount/dir`
+(`deploy/cluster/nomad/aeron.system.nomad.hcl:12-20`, `:201-210`). A sealer node runs no shared
+driver: the member boots its own `ClusteredMediaDriver` on a private
+`/opt/kardamom/aeron-mount/cluster-dir` (`deploy/cluster/nomad/aeron.system.nomad.hcl:124-138`).
+
+**The shared driver.**
+
+| Item | Rule |
+|---|---|
+| Owner | The aeron system job on the executor node. It owns the driver of the pair. The sealer member is only a client of it. |
+| Directory | A host tmpfs `/run/kardamom/pair-<i>/aeron` on the dedicated host. The node_containers role mounts it into both node containers at `/opt/kardamom/pair-aeron`. |
+| Executor node | The aeron system job sets `AERON_DIR=/opt/kardamom/pair-aeron/dir` on a paired node. The executor and every other service on the node use it, as they use `aeron-mount/dir` today. |
+| Sealer node | The cluster job binds `/opt/kardamom/pair-aeron` and passes `-Dkardamom.cluster.feedAeronDir=/opt/kardamom/pair-aeron/dir`. The member's own `ClusteredMediaDriver` stays on its private `cluster-dir`. Raft never uses the shared driver. |
+| Feed client | The feeder thread opens its own Aeron client on `feedAeronDir`. Its error handler closes only that client. It never ends the member JVM. |
+| Liveness | Aeron clients find the driver through the CnC file and its heartbeat, not through a process id. Two containers on one kernel that map the same tmpfs file see one driver. |
+| Unpaired node | A node without a pair keeps `aeron-mount/dir`. `feedAeronDir` empty means the member opens the UDP feed, or no feed. |
+
+**Start order.** None is required.
+
+- The member starts without the driver. The feeder retries the client every 1 s and keeps the
+  feed `idle` meanwhile. The service thread does not wait for it.
+- The executor starts without the member. It reads the leader's egress until the feed answers
+  (section 7.5).
+
+**Restarts.**
+
+| Restart | Effect | Recovery |
+|---|---|---|
+| The executor node container, or its aeron system job | The shared driver goes. The feeder's client sees the driver timeout and closes. The feed is `idle`. Raft does not notice. | The new driver writes a new CnC file. The feeder opens a new client within 1 s of it, then a new publication. The executor starts with a replay request. |
+| The executor process only | The IPC publication loses its subscriber. The feeder drops the ring (`idle`, section 7.2). | The executor restarts and sends a replay request from its state DB cursor. |
+| The sealer node container or the member | The feed publication goes. The executor sees the image close. | The executor switches to the leader's egress at once, not after 6 s. It returns to the feed under the rule of section 7.5. |
+| The dedicated host | The member and the executor go together. The tmpfs goes. | The cluster keeps its quorum on the other two hosts. Both restart; the member rejoins from its log or a peer seed. |
+
+- The local profile (`terraform/containers`) gets the same pair mount, so the chaos shards test the
+  IPC feed. The deploy variable `feed_transport` (`ipc` default, `udp`) keeps the UDP feed for a
+  host that cannot share a directory.
+- The leader's CPU runs beside an executor on one host. The cpusets keep them on separate cores.
+  The cluster shape warns that co-location moves the latency knee
+  (`docs/specs/2026-08-16-10-ggas-cluster-shape.md`, "What breaks first"). The benchmark measures
+  the leader CPU on the paired host.
 
 ### 7.7 Executors without a paired member
 
 - An elastic executor, or an executor whose index has no member, reads the cluster egress. It
   costs the leader one more full stream (section 10).
+- The UDP feed of `feed_transport = udp` and the egress fallback of section 7.5 stay for these
+  executors and for a paired executor whose member is down.
 
 ## 8. The consumers
 
@@ -709,13 +752,14 @@ The executor reads one source at a time, in this order:
 | #481 | `kardamom_getBlockRefs` and the archive rebuild | The archive rebuild retires. The method stays for the fleet-rebuild runbook. |
 | #507 | Archive sync level | Kept. The sealer archive and the `tx_deposits` and `l1_blocks` recordings use it. |
 | #522 | Refetch from an older recording | Kept for `tx_deposits`. The `tx_data` use goes. |
-| #543 (harness part) | ANSI-stripped `Evidence::count_lines` (`crates/chaos/src/evidence.rs:51-59`), one cleanup owner for the iptables rules | Kept. They do not depend on this design. They exist only in #543, which does not merge, so they land in a small separate pull request. kardamom-3-00 offered to do it. |
+| #584 | ANSI-stripped `Evidence::count_lines` (`crates/chaos/src/evidence.rs:51-59`) | Landed on its own. It does not depend on this design. |
+| #543 (harness part) | One cleanup owner for the iptables rules | Retires with the `exec-peer-fetch` case of P5. That case is the only user of it, and it does not exist on `main`. |
 
 Open work that this design supersedes, once the user confirms:
 
 | Item | Title | Action |
 |---|---|---|
-| #543 (PR) | executor: fetch an entry from a peer's `exec_txs` archive before the void vote | Close as superseded, after the harness fixes land on their own. |
+| #543 (PR) | executor: fetch an entry from a peer's `exec_txs` archive before the void vote | Close as superseded. Its `count_lines` fix landed as #584. |
 | #542 (PR) | batcher: read the executor stream behind `--tx-source` | Close as superseded. |
 | #554 (PR) | validator: read the executor stream behind `--tx-source` | Close as superseded. |
 | #570 (issue) | a run of lost entries makes every executor exit on each join timeout | Close as superseded: no entry is lost (R2). |
@@ -726,6 +770,46 @@ the source switching, and the removal of the join, the refetch and the void in t
 and the engine part of PR 11).
 
 ## 10. Throughput and resources
+
+### 10.0 The design target
+
+The user set the target: **up to 5,000 tx/s, with mixed sizes**. The mix below is an example
+for the arithmetic. The benchmark uses the same mix, plus a pure 8 KB row as the worst case.
+
+- Example mix: 80 % transfers (110 B raw), 15 % 2 KB calls, 5 % 8 KB calls. The mean raw size is
+  about 805 B. The log input is about 1.15 KB a transaction, and a canonical frame about 932 B.
+
+| At 5,000 tx/s | Transfers only | Example mix | 2 KB only | 8 KB only |
+|---|---|---|---|---|
+| Log input at the leader | 2.2 MB/s | 5.7 MB/s | 12 MB/s | 44 MB/s |
+| Replication out (2 followers) | 4.3 MB/s | 11.5 MB/s | 24 MB/s | 88 MB/s |
+| Egress out (validator, batcher, 2 ingresses in reference mode) | 2.8 MB/s | 9.7 MB/s | 22 MB/s | 84 MB/s |
+| Leader out, total | 7.1 MB/s | 21 MB/s | 46 MB/s | 171 MB/s (1.4 Gbit/s) |
+| Log written in 15 minutes, each member | 1.9 GB | 5.1 GB | 11 GB | 39 GB |
+| Retained bytes for each 2 s block | 2.4 MB | 9.3 MB | 22 MB | 83 MB |
+| DA-lag time that a 1 GiB byte budget covers | 15 min | 3.8 min | 1.6 min | 26 s |
+| Raw bytes to post to DA | 0.55 MB/s | 4 MB/s | 10 MB/s | 41 MB/s |
+
+Findings from the arithmetic, for the benchmark to confirm:
+
+- **Network.** The mix needs about 21 MB/s out of the leader, inside a 1 Gbit/s link. A stream of
+  only 8 KB calls needs 1.4 Gbit/s, above a 1 Gbit/s link. Only the staging run can measure this
+  (section 10.6).
+- **The byte budget.** At the mix, a 1 GiB budget halts the chain after about 4 minutes without a
+  post. At 8 KB only, after 26 s. The starting value is too small for the target: the benchmark
+  sets it from the longest DA outage that the chain must ride out.
+- **The heap.** A byte budget above about 1 GiB does not fit a 2 GiB heap. At the target, the
+  retained frames above the last snapshot move off the heap into the append-only file of
+  section 5.5. The heap keeps an index of positions.
+- **DA.** 4 MB/s raw at the mix, 41 MB/s at 8 KB only. The second is above the DA estimates of
+  the cluster shape (`docs/specs/2026-08-16-10-ggas-cluster-shape.md`, tier 7). DA, not Raft,
+  is then the first limit.
+
+**If one Raft group does not carry the target.** The follow-up is a second Raft group: the lanes
+are split over two sealer clusters, and a deterministic merge orders their streams, as the
+cluster shape proposes for the sequencer (`docs/specs/2026-08-16-10-ggas-cluster-shape.md`,
+tier 2). This spec does not design it. It is an open follow-up, opened only when the staging run
+shows the limit.
 
 ### 10.1 The leader is the ceiling
 
@@ -778,7 +862,7 @@ executors read the leader's egress.
 
 See section 5.5: the log grows by `rate x log bytes`; the purge keeps 15 minutes and the range
 above the posted head; the snapshot holds the store, the waiting references and the retained
-frames, at most about 1.1 GiB with the proposed defaults.
+frames, at most about 1.2 GiB with the starting values.
 
 ### 10.5 The feed
 
@@ -819,10 +903,15 @@ needs.
 | Feed lag: member head minus executor index | `kardamom_executor_input_lag` (new) |
 | Refusals | `ENVELOPE_FULL`, `WINDOW_FULL`, waiting-reference `PAST_DEADLINE` counts |
 
-- **The decision.** For each size, the highest rate at which p99 commit latency stays under the
-  user's bound and the leader CPU stays under 70 %. The user gives the target rate and size.
-  The result says if one Raft group carries it, and sets `envelopeBytes`, `daLagBudgetBytes`,
-  `feedRingBytes` and the sealer heap.
+- **Matrix rows for the target.** 5,000 tx/s with the example mix of section 10.0, and 5,000 tx/s
+  with 8 KB only, beside the matrix above.
+- **The decision.** One Raft group carries the target when, at 5,000 tx/s with the mix and with
+  8 KB only, the p99 commit latency stays under 100 ms, the leader CPU stays under 70 %, and the
+  snapshot stays under 2 s. The container run answers for CPU, disk, GC and the snapshot. The
+  staging run answers for the network. The result also tunes `laneEnvelopeBytes`,
+  `daLagBudgetBytes`, `feedRingBytes`, `readyLagBytes` and the sealer heap.
+- The 100 ms bound is this spec's proposal. Today's receipt p99 is 47 ms at the edge
+  (`docs/specs/2026-08-16-pipeline-cost-model.md`, "Gas throughput and latency").
 
 ## 11. Failure modes
 
@@ -842,7 +931,7 @@ needs.
 | All members restart | No commit until a quorum returns. | Each member restores its snapshot and replays its log. The executors reconnect to the feeds and replay. The ingress and the sequencers re-offer. |
 | All members lose their state | The retained frames and the log are gone. | The fleet rebuild from L1 at the posted head (`docs/runbooks/sealer-fleet-rebuild.md`). The unposted range is lost, as today. |
 | The DA-lag byte budget is passed | The sealer refuses user records with `DA_LAG_REJECT`. | The batcher posts. The guard clears by itself, as the block guard does. |
-| A member's feed bytes differ from the leader's | A bug: R3 is broken. | An executor whose entry fails its hash check drops that source and replays from the leader's egress, with an alert (section 8). The validator checks every canonical entry it reads. A boundary does not carry a digest of the stream today; section 16 asks if it should. |
+| A member's feed bytes differ from the leader's | A bug: R3 is broken. | An executor whose entry fails its hash check drops that source and replays from the leader's egress, with an alert (section 8). The validator checks every canonical entry it reads. A boundary does not carry a digest of the stream today; section 16.1 asks if it should. |
 | A feed ring fills | The member writes a `FEED_GAP` marker (section 7.2). | The executor asks for a replay at once and stays on the feed. |
 
 ## 12. Migration
@@ -870,10 +959,29 @@ needs.
   mixed fleet never runs. The new release reads v10, the snapshot that the drained old release
   wrote, and writes v12 at once.
 
-### 12.2 Cut-over, not a chain reset
+### 12.2 Staging: a chain reset
 
-The recommendation is a drained cut-over. It keeps the chain, and it reuses the coordinated
-restart of the decision version (`cluster/sealer-service/README.md:405-416`).
+The user chose a chain reset for staging.
+
+1. Merge PR 10. Its images carry the new formats with the flags on.
+2. Tear down the staging chain and launch a new one from genesis: `just teardown`, then
+   `just launch` in `kardamom-infra` (`docs/staging-launch.md:120-123`). The launch deploys the
+   new chain contracts, so the old bridge state, the canary history and the L1 record stay
+   behind with the old contracts.
+3. The node_containers role creates the pair mounts of section 7.6 before the node containers
+   start.
+4. Check: `just smoke`, the canary, and one chaos shard against staging.
+
+- No v10 snapshot is read, and no drain is needed. The waivers of section 12.1 still apply,
+  because the release gate compares the registry of the deployed release with the target.
+- dev-32 recommended the drained cut-over on staging as a rehearsal of production. The user chose
+  the reset. The drained cut-over gets its rehearsal in the container cluster instead: PR 10
+  adds a test that runs section 12.3 there under load.
+
+### 12.3 Production: the drained cut-over
+
+Production keeps its chain. The cut-over reuses the coordinated restart of the decision version
+(`cluster/sealer-service/README.md:405-416`).
 
 1. Deploy every reader first, behind the flags of section 13 (off): the ingress, the sequencers,
    the executors, the validator and the batcher read the new kinds but do not write them.
@@ -897,7 +1005,7 @@ restart of the decision version (`cluster/sealer-service/README.md:405-416`).
    - no void vote is open (`cluster VOID-VOTE` lines all have `result=DECIDED`).
 5. Take a sealer snapshot (v10). Copy it, and take a checkpoint of each executor and of the
    validator, to the backup volume. Keep these copies until the first v12 snapshot is one day
-   old. They are the input of the rollback of section 12.4.
+   old. They are the input of the rollback of section 12.5.
 6. Stop the writers: the ingresses and the sequencers.
 7. Purge the sealer job. Start the new sealer release (decision version 3). It restores the v10
    snapshot:
@@ -911,20 +1019,20 @@ restart of the decision version (`cluster/sealer-service/README.md:405-416`).
 - A consumer that restores a checkpoint older than the cut-over cannot replay the old range: the
   floor is at the cut. It takes a newer checkpoint, or the replay answers `REPLAY_UNAVAILABLE`
   and it fetches a peer checkpoint. The deploy takes a checkpoint of each executor after step 8.
-- **A chain reset** (genesis, empty state) is the simpler alternative for staging. It needs no v10
-  read and no drain. It loses the chain, the bridge state and the canary history. Section 16 asks
-  the user. dev-32 recommends the drained cut-over on staging too, as a rehearsal of production.
-
-### 12.3 Deploy order
+### 12.4 Deploy order
 
 1. PR 1 to PR 8 merge with the flags off. Each deploys as a normal rolling release. They change no
    format that the base cannot read.
 2. PR 9 (benchmark) runs on the flagged build in a container cluster, not on staging.
-3. PR 10 is the cut-over release: the waivers, the flags on by default, the runbook of 12.2.
+3. PR 10 is the cut-over release: the waivers, the flags on by default, the runbook of 12.3.
+   Staging takes it by the reset of 12.2. Production takes it by the cut-over of 12.3.
 4. PR 11 removes the dead code. It is a normal release, because the cut-over already stopped every
    writer of the removed kinds.
 
-### 12.4 Rollback
+### 12.5 Rollback (production)
+
+This section applies to production. Staging has no rollback across the reset: a failed staging
+release is fixed forward, or the reset runs again with the release before.
 
 - Before the first v12 snapshot, a rollback is the coordinated restart into the old release: it
   restores the v10 snapshot of step 5, and the executors and the validator restore their step-5
@@ -935,7 +1043,7 @@ restart of the decision version (`cluster/sealer-service/README.md:405-416`).
   head into the old release (`docs/runbooks/sealer-fleet-rebuild.md`). Nothing is lost, because
   L1 holds every block.
 - The deploy record gets a rollback floor at the cut-over release (`docs/formats.md:155-171`).
-  `just rollback` does not cross it. `docs/runbooks/deploy-rollback.md` gets the path above.
+  `just rollback` does not cross it. The floor applies to staging too. `docs/runbooks/deploy-rollback.md` gets the path above.
 
 ## 13. Implementation plan
 
@@ -972,10 +1080,14 @@ Each item is one pull request. Each passes `just style` and CI alone and follows
 8. **Engine reader.** `RT_TX` entries carry the envelope. The feed transport and the source order
    of section 7.5 for the executor. The validator's hash and signature check. The batcher packs
    from the entry. Behind `--carry-bytes`; the join path stays while the flag is off.
-9. **Benchmark run and gate.** The matrix of section 10.6 on both builds. The results go into this
-   spec as section 17. The user decides on the target and the defaults.
-10. **Cut-over release.** Decision version 3, the flags on by default, the waivers, the pairing in
-    the Nomad jobs, the runbook of 12.2, the rollback floor. The chaos cases of 13.1.
+9. **Benchmark run and gate.** The matrix of section 10.6 on both builds, in the container
+   cluster and on staging. The results go into this spec as section 17, with the answer to
+   section 10.0: does one Raft group carry 5,000 tx/s.
+10. **Cut-over release.** Decision version 3, the flags on by default, the waivers, the pair
+    mount and `feedAeronDir` in the Nomad jobs and in `terraform/containers`, the runbook of 12.3
+    and its rehearsal case, the rollback floor. The chaos cases of 13.1. The pair mount of the
+    staging hosts is a `kardamom-infra` change to the node_containers role, merged before the
+    reset of 12.2.
 11. **Removal.** Everything in section 9.1. `reads_min` of the snapshot to 12 in the release after.
 12. **`tx_heads` (optional).** The ingress publishes `TxHeader`, and the sequencer reads it. The
     sequencers stop reading `tx_data`. `tx_data` goes.
@@ -1000,7 +1112,9 @@ the egress), R16 (the release drain stays a one-step loop body).
 | `feed-slow-executor` (new) | SIGSTOP executor 2 longer than the ring holds, then SIGCONT. | The commit latency of the other members does not rise. Executor 2 catches up through a feed replay. |
 | `envelope-loss` (new) | Drop the envelope session traffic of one ingress to the leader for 20 s, then restore. | References wait. The re-offer fills them. A reference past its deadline is refused and its nonce is free. No sender stays stuck. |
 | `leader-kill-envelopes` (new) | Kill the leader under `on-quorum` load. | Every acknowledged transaction has a receipt. |
-| `envelope-cap` (new, small `envelopeBytes`) | Stop both replicas of lane 0 for 3 minutes. | Lane 0's senders get `Overloaded`. Lane 1 continues. After the start, lane 0 drains. |
+| `envelope-cap` (new, small `laneEnvelopeBytes`) | Stop both replicas of lane 0 for 3 minutes. | Lane 0's senders get `Overloaded`. Lane 1 continues. After the start, lane 0 drains. |
+| `cutover-rehearsal` (new, container cluster only) | Run the drained cut-over of section 12.3 under load, from the release before PR 10. | The posted head reaches `D`; every consumer cursor equals the canonical count; the new members restore the v10 snapshot; the chain continues; root parity holds. |
+| `feed-driver-restart` (new) | Restart the aeron system job on executor node 1 under load. | Member 1's commit latency does not rise. The feeder reconnects. Executor 1 returns to its feed with no gap. |
 | Planned and dropped | `exec-peer-fetch`, `record-lag-halt`, `validator-exec-archive-catchup`, `exec-archive-prune` of the archived-data spec | Not built. |
 
 ## 14. Docs that change with the code
@@ -1038,27 +1152,33 @@ the egress), R16 (the release drain stays a one-step loop body).
 - **`ExecTxRecord` for the remote consumers.** The egress session already carries the canonical
   frames with replay (section 9.2).
 
-## 16. Open questions for the user
+## 16. Decisions of the user (2026-10-11)
 
-1. **Target rate and size.** Which rate and transaction size must one Raft group carry? Section
-   10.6 measures the curve. The defaults of the caps and the heap follow from the answer.
-2. **Placement.** Staging already runs sealer member `i` and executor `i` on one dedicated host,
-   in two node containers (section 7.6). Should they share one media driver, so the feed is IPC,
-   or keep two containers and feed over UDP inside the host?
-3. **Cut-over or chain reset** on staging (section 12.2)? dev-32 recommends the drained cut-over,
-   as a rehearsal of production.
-4. **Defaults.** `envelopeBytes` 64 MiB, `waitingRefs` 16,384, `daLagBudgetBytes` 1 GiB,
-   `feedRingBytes` 64 MiB, the sealer heap 2 GiB. Accept them as the starting values for the
-   benchmark?
-5. **`tx_heads`.** Build PR 12 in this program, or only when the benchmark shows the sequencer
+1. **Target rate and size.** Up to 5,000 tx/s with mixed sizes. Section 10.0 states it as the
+   design target. The benchmark must show whether one Raft group carries it, with the 8 KB rows,
+   and the staging run measures the network. If one group does not carry it, a second Raft group
+   (lane sharding) is the open follow-up. This spec does not design it.
+2. **Placement and the feed.** Sealer member `i` and executor `i` run on one host and share one
+   media driver; the feed is IPC (section 7.6). The UDP feed and the egress fallback stay for
+   executors without a local member.
+3. **Staging migration.** A chain reset (section 12.2). Production uses the drained cut-over
+   (section 12.3), and the backups and the rollback of section 12.5 apply to production.
+4. **Starting limits.** Accepted: 64 MiB of unreferenced envelopes for each lane, 16,384 waiting
+   references, a 2 GiB sealer heap, the byte DA-lag budget, and `readyLagBytes` at 64 MiB. The
+   benchmark tunes them. Section 10.0 already shows that the byte budget must grow for the target.
+
+### 16.1 Still open
+
+1. **`tx_heads`.** Build PR 12 in this program, or only when the benchmark shows that the sequencer
    input matters?
-6. **Remote consumers from a follower.** Each follower could also serve the feed over UDP to the
-   validator, the batcher and the elastic executors, so the leader sends only the replication.
-   Build it now, or only when the benchmark shows the leader's egress as the limit?
-7. **A stream digest.** Should each boundary carry a running hash of the canonical stream, so an
+2. **Remote consumers from a follower.** Each follower could serve the feed over UDP to the
+   validator and the batcher, so the leader sends only the replication. Build it now, or only
+   when the benchmark shows the leader's egress as the limit?
+3. **A stream digest.** Should each boundary carry a running hash of the canonical stream, so an
    executor that switches source detects a divergent member? It changes the boundary frame.
+4. **Superseded work.** Close #543, #542, #554 and #570 as superseded (section 9.2)?
 
-### 16.1 Closed in review
+### 16.2 Closed in review
 
 - **Executor checks.** Each executor checks `keccak256(raw_tx) == canonical_id` and switches
   source on a mismatch (section 8). kardamom-3-00 asked for it.
