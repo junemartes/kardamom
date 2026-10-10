@@ -132,17 +132,16 @@ impl Shard {
                 "ingress-sequencer-sealer-reverse",
             ],
             // The executors down with another class: the sealers, the
-            // sealers and the validator, and the ingresses. The
-            // executor-and-sealer case runs first and audits the persisted
-            // state after it. The read-path and the sequencer-and-Redis
-            // cases run by name only: a cold redis job crash-loops its
-            // sentinels, a sender sticks after an outage of every
-            // executor, and the sequencer-and-Redis case also hits a media
-            // driver error that cuts a replica off its stream.
+            // sealers and the validator, the ingresses, and the read path
+            // (Redis and the state mirrors). The executor-and-sealer case
+            // runs first and audits the persisted state after it. The
+            // sequencer-and-Redis case runs by name only: a media driver
+            // error can cut a replica off its stream.
             Self::CombinedExec => &[
                 "executor-sealer-loss-recover",
                 "executor-sealer-validator-recover",
                 "ingress-executor-loss-recover",
+                "read-path-loss-recover",
             ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // A lying L1 in front of the followers. The outage past the
@@ -275,7 +274,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 56);
+        assert_eq!(all.len(), 57);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
