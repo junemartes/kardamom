@@ -484,7 +484,8 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
   - Proof: `crates/sequencer/tests/replicated_shard_racing.rs`.
 - **Late re-offer past the inclusion deadline**
-  - The ingress stamps every transaction with an inclusion deadline: the newest boundary plus the inclusion horizon (default 64 blocks). With no boundary seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The ingress stamps every transaction with an inclusion deadline: the newest sealed block plus the inclusion horizon (default 64 blocks). With no block seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The newest sealed block is the higher of two values: the newest executor boundary, and the sealed head in the status of the sealer. The sealer sends its status on every boundary tick. So the deadline moves while every executor is down, and an executor outage does not age new transactions past their deadline.
   - The sealer dedup window prunes by deadline, not by count. It drops the ids whose deadline is below the open block. It never evicts an id.
   - The sealer refuses a re-offer whose deadline has passed (`PAST_DEADLINE`). A refused re-offer cannot enter as a fresh transaction.
   - A full window (`kardamom.cluster.dedupCapacity`, default `1 << 17`) is a hard back-pressure cap. The sealer answers `WINDOW_FULL`.
@@ -493,6 +494,16 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - The sealer prints `cluster PAST-DEADLINE ...` and `cluster WINDOW-FULL ...` at power-of-two counts. No Prometheus counter exists for them.
   - The horizon must be equal on the ingress (`--inclusion-horizon-blocks`, env `KARDAMOM_INCLUSION_HORIZON_BLOCKS`) and on every sealer member (`-Dkardamom.cluster.inclusionHorizonBlocks`). The contract check (`just check-contract`, `just validate` and CI) fails if they differ.
   - Details of the sealer window: [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **A refused nonce stays free**
+  - The sealer refuses a ref past its deadline, on a DA lag, or on a record lag before its contiguity guard. Its expected nonce for the sender stays at the refused nonce. Every later nonce of the sender gets `CONTIGUITY-REJECT` until a ref at the refused nonce is ordered.
+  - The sealer also refuses a late copy of a ref that it ordered long ago: the window drops the id when its deadline passes. A confirm sweep with no receipts (all executors down) sends such copies. So a refusal alone does not move the floor of the sequencer.
+  - On a refusal, the sequencer takes the ref out of its publish ledger (or out of its buffer, if it parked there), so it never republishes. The client gets the refusal. If the nonce is below the floor, the sequencer marks it.
+  - Only the copy that the refusal names leaves. A past-deadline refusal names the deadline of the refused copy, so a resubmit that replaced a parked copy survives a late refusal of the old copy. A ref that waits in the buffer for the publisher (back-pressure or a confirm sweep) stays. It republishes, the sealer refuses that copy again, and that refusal finds it in the ledger.
+  - A resubmit at a marked nonce is offered again, and the floor stays. The sealer decides: it orders the resubmit if it did not order the nonce, and it rejects it as a past nonce if it did. A mark ends when a ref at the nonce publishes, or when a receipt floor passes it.
+  - The floor moves back only on a contiguity reject that names an expected nonce `E` at which the sequencer holds no ref. Then the floor goes back to `E`, and the later refs of the sender leave the ledger and park above it. The resubmit of `E` publishes, and the parked refs drain behind it. A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
+  - If the sequencer holds the ref at `E`, the offer vanished, and the sequencer republishes from `E` as before.
+  - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.

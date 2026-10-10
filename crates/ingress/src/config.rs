@@ -91,7 +91,7 @@ pub struct IngressConfig {
     /// are the executor indexes, so this is the executor count. Read
     /// only with `cache` on.
     pub mirror_count: NonZeroU32,
-    /// How far past the newest block boundary this proxy has seen it
+    /// How far past the newest sealed block this proxy has seen it
     /// stamps a transaction's `max_inclusion_block`. The sealer refuses an
     /// offer once its own block number passes that deadline, which is what
     /// makes its dedup window exact: an id leaves the window only when no
@@ -109,7 +109,7 @@ pub const NO_DEADLINE: u64 = i64::MAX as u64;
 
 impl IngressConfig {
     /// The inclusion deadline to stamp on an envelope, given the newest
-    /// block boundary this proxy has seen.
+    /// sealed block this proxy has seen.
     ///
     /// A proxy that lags behind the boundaries stamps an earlier deadline,
     /// which is the safe direction: the transaction expires sooner and the
