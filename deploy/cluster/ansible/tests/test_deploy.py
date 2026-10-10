@@ -1034,8 +1034,9 @@ class RecordTest(Deploys):
         self.assertIn('names remoteOrigins, and the release does not change it', output)
         self.assertEqual(self.api.state['writes'], [])
         # A documented procedure names the settings it changes.
+        # The batcher takes the same budget, so it rolls after the sealer.
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()
