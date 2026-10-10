@@ -412,6 +412,15 @@ class DeployTest(Deploys):
         # so it reads every second.
         follower = self.api.state['jobs']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
+        # A halt or a pause fails /ready, so Consul marks the service
+        # critical. Prometheus takes every kardamom service in every health
+        # state: a healthy-only list drops it exactly when its halt alert
+        # needs it. The Nomad agents' service is not a kardamom job.
+        templates = [t['EmbeddedTmpl'] for g in self.api.state['jobs']['monitoring']['TaskGroups']
+                     for t in g['Tasks'] for t in (t.get('Templates') or [])]
+        services = re.findall(r'service "(kardamom-[^"]*)"', '\n'.join(templates))
+        self.assertIn('kardamom-validator|any', services)
+        self.assertEqual([s for s in services if not s.endswith(('|any', '-nomad'))], [])
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
         self.assertEqual(variables['nomad/jobs/canary'], {
