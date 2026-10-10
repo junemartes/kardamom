@@ -1,0 +1,25 @@
+---
+# The mirror of the deploy record under deployed/<env>/: attempt.json,
+# accepted.json and accepted.formats.toml, as the Nomad variable holds
+# them. The gate refreshes the accepted release from the variable before
+# a deploy, so the mirror follows a deploy from another controller. The
+# gate and the rollback create the directory.
+- name: Mirror the deploy record
+  ansible.builtin.copy:
+    content: "{{ item.value | to_nice_json }}\n"
+    dest: "{{ workloads_record_dir }}/{{ item.key }}.json"
+    mode: "0644"
+  loop: >-
+    {{ ({'attempt': workloads_attempt} if workloads_attempt is defined else {})
+       | combine({'accepted': workloads_accepted} if workloads_accepted | length > 0 else {}) | dict2items }}
+  loop_control:
+    label: "{{ item.key }}"
+  check_mode: false
+
+- name: Mirror the formats of the accepted release
+  ansible.builtin.copy:
+    content: "{{ workloads_accepted.target.formats }}"
+    dest: "{{ workloads_record_dir }}/accepted.formats.toml"
+    mode: "0644"
+  check_mode: false
+  when: workloads_accepted.target.formats | default('') | length > 0

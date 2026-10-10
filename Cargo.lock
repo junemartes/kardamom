@@ -2277,6 +2277,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "kardamom-batcher",
+ "kardamom-canary",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-exec-core",
@@ -3864,6 +3865,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-canary"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "anyhow",
+ "clap",
+ "futures",
+ "jsonrpsee",
+ "kardamom-bench",
+ "kardamom-deployer",
+ "kardamom-formats",
+ "kardamom-obs",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-chaos"
 version = "0.1.0"
 dependencies = [
@@ -3876,6 +3900,7 @@ dependencies = [
  "humantime",
  "jsonrpsee",
  "kardamom-bench",
+ "kardamom-formats",
  "kardamom-l1-fault-proxy",
  "kardamom-reconstruct",
  "kardamom-state",

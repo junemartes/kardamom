@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
-            'batcher', 'state-mirror', 'notifier', 'da-store']
+            'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
 # The images the manifest pins beyond the default deployment: the jobs a
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
@@ -27,6 +27,10 @@ MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 # A secret no rendered job, job variable or play output may hold.
 SENTINEL = 'SECRET-SENTINEL'
+# The chain status of a chain that stands on nothing.
+HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
+# The format registry of the repository: the formats of every target.
+FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -48,6 +52,10 @@ class NomadAPI(BaseHTTPRequestHandler):
             old = state['jobs'].get(job['ID'])
             self.respond({'Diff': {'Type': 'None' if old == job else 'Edited' if old else 'Added'},
                           'JobModifyIndex': 1 if old else 0})
+        elif self.path == '/':
+            # The ingress JSON-RPC: the chain status the release gate reads.
+            assert body['method'] == 'kardamom_chainStatus', body
+            self.respond({'jsonrpc': '2.0', 'id': body['id'], 'result': state.get('chain_status', HEALTHY_CHAIN)})
         elif self.path.startswith('/v1/jobs?'):
             assert body['EnforceIndex'] is True
             # A job that renders its Nomad Variable into the task
@@ -57,31 +65,82 @@ class NomadAPI(BaseHTTPRequestHandler):
                              for t in task['Templates'] or [] if t['Envvars']]
             for path in SECRET_PATH.findall(''.join(env_templates)):
                 assert path in state['variables'], f'{body["Job"]["ID"]} registers before {path}'
-            state['jobs'][body['Job']['ID']] = body['Job']
+            self.register(body['Job'])
             state['writes'].append(body['Job']['ID'])
-            if body['Job']['ID'] in state['deployments']:
-                state['deployments'][body['Job']['ID']].registered(body['Job'])
-            # The sealer groups that carry the roll's new retention, per
+            # The sealer groups that carry the roll's marker (the new
+            # retention, or the digest a rollback restores), per
             # registration: the staged roll adds one group per step.
             if body['Job']['ID'] == 'cluster':
+                marker = state.get('roll_marker', 'retention=4096')
                 state.setdefault('rolled', []).append(sorted(
-                    g['Name'] for g in body['Job']['TaskGroups'] if 'retention=4096' in json.dumps(g)))
+                    g['Name'] for g in body['Job']['TaskGroups'] if marker in json.dumps(g)))
             self.respond({'JobModifyIndex': 1})
         elif self.path.startswith('/v1/deployment/promote/'):
             name = self.path.split('/')[4].split('?')[0]
             assert body['All'] is True
             state['deployments'][name].promote()
             self.respond({'EvalID': 'promoted'})
+        elif self.path.split('?')[0].endswith('/revert'):
+            # The revert registers the old version as a new one, and only
+            # when the job is still at the version the caller names.
+            name = self.path.split('/')[3]
+            versions = state['versions'][name]
+            assert body['JobID'] == name and isinstance(body['JobVersion'], int), body
+            if body['EnforcePriorVersion'] != len(versions) - 1:
+                self.send_response(400)
+                self.end_headers()
+                return
+            self.register(versions[body['JobVersion']])
+            state['writes'].append(f'revert:{name}:{body["JobVersion"]}')
+            self.respond({'EvalID': 'reverted', 'JobModifyIndex': len(versions)})
         else:
             raise AssertionError(self.path)
+
+    def register(self, job):
+        """Store `job` as the current definition and as a new version."""
+        state = self.server.state
+        state['jobs'][job['ID']] = job
+        state.setdefault('versions', {}).setdefault(job['ID'], []).append(job)
+        if job['ID'] in state['deployments']:
+            state['deployments'][job['ID']].registered(job)
+
+    def version(self, name):
+        return len(self.server.state['versions'][name]) - 1
+
+    def auto_revert(self, name):
+        """Whether a group of the job has auto_revert in its update stanza."""
+        return any((g.get('Update') or {}).get('AutoRevert') for g in self.server.state['jobs'][name]['TaskGroups'])
+
+    def do_HEAD(self):
+        # The registry: the manifest of an image, by digest.
+        assert self.path.startswith('/v2/') and '/manifests/sha256:' in self.path, self.path
+        name = self.path.removeprefix('/v2/').split('/manifests/')[0]
+        self.send_response(404 if name in self.server.state.get('missing_images', ()) else 200)
+        self.end_headers()
 
     def do_PUT(self):
         # The bootstrap variable of a new sealer cluster, or the secrets
         # of a job.
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         path = self.path.split('?')[0].removeprefix('/v1/var/')
-        assert self.path.startswith('/v1/var/nomad/jobs/') and body['Path'] == path, (self.path, body)
-        if path == 'nomad/jobs/cluster':
+        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/')) and body['Path'] == path, (self.path, body)
+        if path.startswith('kardamom/deploys/'):
+            # The deploy record: two JSON documents in one variable, written
+            # with a check-and-set on the modify index. A test clobbers the
+            # record once to stand for another controller.
+            assert set(body['Items']) <= {'attempt', 'accepted'}, body
+            state = self.server.state
+            index = state['record_index'].get(path, 0) + int(state.pop('record_clobber', False))
+            if int(self.path.split('cas=')[1]) != index:
+                self.send_response(409)
+                self.end_headers()
+                return
+            state['records'][path] = {k: json.loads(v) for k, v in body['Items'].items()}
+            state['record_index'][path] = index + 1
+            state['record_writes'].append(state['records'][path]['attempt']['status'])
+            self.respond(body | {'ModifyIndex': index + 1})
+            return
+        elif path == 'nomad/jobs/cluster':
             assert body['Items'] == {'bootstrap': 'true'}, body
             self.server.state['writes'].append('bootstrap-open')
         else:
@@ -90,6 +149,13 @@ class NomadAPI(BaseHTTPRequestHandler):
         self.respond(body)
 
     def do_DELETE(self):
+        if self.path.startswith('/v1/job/'):
+            # The stop of a job that a rolled-back release added.
+            name = self.path.split('/')[3].split('?')[0]
+            del self.server.state['jobs'][name]
+            self.server.state['writes'].append(f'stop:{name}')
+            self.respond({'EvalID': 'stopped'})
+            return
         assert self.path.startswith('/v1/var/nomad/jobs/cluster?'), self.path
         self.server.state['writes'].append('bootstrap-close')
         self.send_response(204)
@@ -101,18 +167,36 @@ class NomadAPI(BaseHTTPRequestHandler):
         state = self.server.state
         if parts[2] == 'var':
             path = '/'.join(self.path.split('?')[0].split('/')[3:])
-            if path in state['variables']:
+            if path.startswith('kardamom/deploys/') and path in state['records']:
+                self.respond({'Path': path, 'ModifyIndex': state['record_index'][path],
+                              'Items': {k: json.dumps(v) for k, v in state['records'][path].items()}})
+            elif path in state['variables']:
                 self.respond({'Path': path, 'Items': state['variables'][path]})
             else:
                 self.send_response(404)
                 self.end_headers()
+        elif parts[2] == 'jobs':
+            # The job list stubs of Nomad carry the modify indexes and no
+            # version; only a job's own record has one.
+            self.respond([{'ID': name, 'Name': name, 'Type': job['Type'], 'Status': 'running',
+                           'JobModifyIndex': 1, 'ModifyIndex': 1} for name, job in state['jobs'].items()])
         elif parts[2] == 'deployment' and parts[3] == 'allocations':
             allocs = self.allocations(parts[4])
             allocs[0]['DeploymentStatus']['Canary'] = True
             self.respond(allocs)
         elif parts[2] == 'deployment':
-            # The deployment's verdict, by the job's scripted outcome.
-            self.respond(state['deployments'][parts[3]].state())
+            # The deployment's verdict, by the job's scripted outcome. A
+            # failed deployment of a job with auto_revert makes Nomad
+            # register the previous version again, as a new version; a
+            # job with no previous version stays where it is.
+            deployment = state['deployments'][parts[3]]
+            verdict = deployment.state()
+            if (verdict['Status'] == 'failed' and not deployment.reverted and self.auto_revert(parts[3])
+                    and self.version(parts[3]) > 0):
+                deployment.reverted = True
+                self.register(state['versions'][parts[3]][-2])
+                state['writes'].append(f'auto-revert:{parts[3]}')
+            self.respond(verdict)
         elif parts[2] == 'node':
             # Every node advertises an address of this fake API, so the
             # member status and the smoke target resolve back here. A
@@ -132,9 +216,17 @@ class NomadAPI(BaseHTTPRequestHandler):
             deployment = state['deployments'].get(parts[3])
             self.respond(deployment.state(poll=False) if deployment else None)
         elif parts[2] == 'job' and parts[4] == 'allocations':
-            self.respond(self.allocations(parts[3]))
+            self.respond(self.allocations(parts[3]) if parts[3] in state['jobs'] else [])
+        elif parts[2] == 'job' and parts[4] == 'versions':
+            # Newest first, without the versions the test says Nomad dropped.
+            dropped = state.get('dropped', {}).get(parts[3], [])
+            versions = [job | {'Version': i} for i, job in enumerate(state['versions'][parts[3]]) if i not in dropped]
+            self.respond({'Versions': versions[::-1]})
+        elif parts[2] == 'job' and parts[3] in state['jobs']:
+            self.respond(state['jobs'][parts[3]] | {'Version': self.version(parts[3])})
         elif parts[2] == 'job':
-            self.respond(state['jobs'].get(parts[3], {}) | {'Version': 1})
+            self.send_response(404)
+            self.end_headers()
         else:
             raise AssertionError(self.path)
 
@@ -155,8 +247,10 @@ class NomadAPI(BaseHTTPRequestHandler):
             for i in range(count):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
-                allocs.append({'TaskGroup': group['Name'], 'JobVersion': 0 if stale else 1,
-                               'DesiredStatus': 'run', 'ClientStatus': 'running',
+                # A job the test names has no running allocation: a crash loop.
+                running = name not in state.get('not_running', ())
+                allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
+                               'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
                                'NodeID': f'node-{group["Name"]}',
                                'DeploymentStatus': {'Canary': False}})
         return allocs
@@ -176,6 +270,7 @@ class Deployment:
         self.outcomes = list(outcomes)
         self.canary = canary
         self.promoted = False
+        self.reverted = False
         self.polls = 0
         self.groups = ['group']
 
@@ -202,7 +297,11 @@ class Deployment:
 
 @unittest.skipUnless(shutil.which('nomad') and shutil.which('ansible-playbook'),
                      'nomad and ansible-playbook required')
-class DeployTest(unittest.TestCase):
+class Deploys(unittest.TestCase):
+    """The fixtures of every deploy test: the fake API, the manifest and the
+    operator binary. The test classes below split the suite so CI runs them
+    in parallel processes."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='kardamom-deploy-test-')
         self.addCleanup(self.tmp.cleanup)
@@ -212,10 +311,14 @@ class DeployTest(unittest.TestCase):
         # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
-                          'variables': {}, 'variable_writes': []}
+                          'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
+                          'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
+        # The operator binary: the smoke, and the format findings of the
+        # release gate, which a test scripts in `smoke.sh.findings`.
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
-        self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n')
+        self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
+                              'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
         self.smoke.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
@@ -238,6 +341,10 @@ class DeployTest(unittest.TestCase):
             'workloads_cluster_binary': str(self.smoke),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_cluster_bootstrap': False,
+            'workloads_ingress_rpc_port': self.api.server_port,
+            'workloads_registry_url': f'http://127.0.0.1:{self.api.server_port}',
+            'workloads_revision': 'rev-test',
+            'workloads_operator': 'tester',
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
         env.update(ANSIBLE_NOCOLOR='1', ANSIBLE_STDOUT_CALLBACK='default',
@@ -248,16 +355,47 @@ class DeployTest(unittest.TestCase):
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
         result = subprocess.run(cmd, cwd=ANSIBLE.parent, env=env, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
         self.assertEqual(result.returncode == 0, success, result.stdout)
         return result.stdout
 
-    def test_deploy_order_pinning_and_repeat(self):
+    # The jobs a manifest with new digests changes, in deploy order: every
+    # pinned image, and not anvil or the monitoring.
+    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+                'validator', 'da-watcher', 'da-store', 'batcher']
+
+    def record(self):
+        return self.api.state['records']['kardamom/deploys/local']
+
+    def repin(self, digest):
+        """Point every manifest line at `digest`: a new release."""
+        self.manifest.write_text(self.manifest.read_text().replace(
+            re.search(r'@sha256:([0-9a-f]{64})', self.manifest.read_text()).group(1), digest * 64))
+
+    def run_rollback(self, success=True, environ=None):
+        return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
+
+    def gate_formats(self, findings):
+        """Deploy once, then script the format findings of the next deploy."""
         self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['record_writes'] = []
+        Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
+        self.repin('b')
+
+
+class DeployTest(Deploys):
+    """The deploy: order, pins, secrets, waits, canary, sealer roll."""
+
+    def test_deploy_order_pinning_and_repeat(self):
+        # The local canary runs only on request: the CI shards count
+        # transactions.
+        local_canary = {'CANARY_LOCAL': '1'}
+        self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
-                    'da-store', 'batcher']
+                    'da-store', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
@@ -270,10 +408,19 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(variables['nomad/jobs/da-watcher'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
-        self.assertEqual(sorted(self.api.state['variable_writes']), ['nomad/jobs/batcher', 'nomad/jobs/da-watcher'])
-        self.run_deploy()
+        self.assertEqual(variables['nomad/jobs/canary'], {
+            'KARDAMOM_CANARY_MNEMONIC': 'test test test test test test test test test test test junk'})
+        canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
+        self.assertEqual(sorted(self.api.state['variable_writes']),
+                         ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/da-watcher'])
+        self.run_deploy(environ=local_canary)
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
-        self.assertEqual(len(self.api.state['variable_writes']), 2, 'unchanged redeploy must not write secrets')
+        self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
+
+    def test_the_local_profile_runs_no_canary_by_default(self):
+        self.run_deploy(check=True)
+        self.assertNotIn('canary', self.api.state['plans'])
 
     def test_secrets_reach_tasks_only_through_nomad_variables(self):
         # Every keyed URL and key the deploy gets, by the environment the
@@ -291,6 +438,7 @@ class DeployTest(unittest.TestCase):
         output = self.run_deploy(environ={
             'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
             'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
+            'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
             'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
         self.assertNotIn(SENTINEL, output)
         state = self.api.state
@@ -302,6 +450,7 @@ class DeployTest(unittest.TestCase):
         self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
         self.assertEqual(state['variables'], {
             'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
+            'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC'},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
                                     'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
             'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},
@@ -628,6 +777,282 @@ class DeployTest(unittest.TestCase):
         self.run_deploy()
         self.assertEqual((self.record_dir / 'images.digests').read_text(), self.manifest.read_text())
         self.assertEqual((self.record_dir / 'images.digests.previous').read_text(), first)
+
+
+
+class RecordTest(Deploys):
+    """The deploy record and the release gate."""
+
+    def test_the_record_follows_the_attempt_to_the_accepted_release(self):
+        self.run_deploy()
+        attempt = self.record()['attempt']
+        self.assertEqual(self.record()['accepted'], attempt)
+        self.assertEqual(attempt['status'], 'accepted')
+        self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', 'rev-test'))
+        self.assertEqual(attempt['target']['formats'], FORMATS)
+        self.assertEqual(attempt['target']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
+        self.assertEqual(attempt['changed'], self.api.state['writes'])
+        # Every job was new: no version before, version 0 after.
+        self.assertEqual(attempt['before']['jobs']['ingress'], {'before': None, 'after': 0})
+        self.assertEqual((attempt['before']['manifest'], attempt['floor']), ({}, {}))
+        # The record is written at the start, before and after each
+        # registration, and at the acceptance; the mirror follows it.
+        self.assertEqual(self.api.state['record_writes'], ['started'] * (2 * len(self.api.state['writes']) + 1) + ['accepted'])
+        self.assertEqual(json.loads((self.record_dir / 'attempt.json').read_text()), attempt)
+        self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), attempt)
+        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+        # A new release records the versions before it, and only the jobs it changed.
+        self.repin('b')
+        self.api.state['writes'] = []
+        self.run_deploy()
+        attempt = self.record()['attempt']
+        self.assertEqual(attempt['changed'], self.REPINNED)
+        self.assertEqual(attempt['before']['jobs']['ingress'], {'before': 0, 'after': 1})
+        self.assertEqual(attempt['before']['jobs']['cluster'], {'before': 0, 'after': 3}, 'the sealer roll registers three versions')
+        self.assertEqual(attempt['before']['jobs']['anvil'], {'before': 0})
+        self.assertEqual(attempt['before']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
+
+    def test_a_failed_attempt_stays_distinct_from_the_accepted_release(self):
+        self.run_deploy()
+        accepted = self.record()['accepted']
+        self.repin('b')
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['failed'])
+        self.run_deploy(success=False)
+        attempt = self.record()['attempt']
+        self.assertEqual(attempt['status'], 'started')
+        self.assertEqual(attempt['changed'], ['aeron', 'cluster', 'sequencer', 'redis', 'ingress'])
+        self.assertEqual(self.record()['accepted'], accepted, 'a failed attempt is never the accepted release')
+        self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), accepted)
+        # The attempt is still started: it runs, or it died. Only the
+        # operator can tell, so a deploy over it names that choice.
+        del self.api.state['deployments']['ingress']
+        self.api.state['writes'] = []
+        output = self.run_deploy(success=False)
+        self.assertIn(f"the attempt of {attempt['started_at']} by tester is still started", output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.run_deploy(environ={'KARDAMOM_REPLACE_ATTEMPT': '1'})
+        self.assertEqual(self.record()['attempt']['status'], 'accepted')
+        self.assertEqual(self.record()['attempt']['before']['jobs']['ingress']['before'], 2,
+                         'the record holds the mixed versions that ran: the failed release of the ingress')
+
+    def test_a_record_that_another_controller_changed_stops_the_deploy(self):
+        self.run_deploy()
+        self.repin('b')
+        self.api.state['writes'] = []
+        self.api.state['record_clobber'] = True
+        output = self.run_deploy(success=False)
+        self.assertIn('changed under this run', output)
+        self.assertEqual(self.api.state['writes'], [], 'the first write of the attempt is the check-and-set that fails')
+
+    def test_a_halted_chain_refuses_the_release(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['record_writes'] = []
+        self.api.state['chain_status'] = HEALTHY_CHAIN | {
+            'roots': [{'service': 'sealer', 'instance': 'cluster', 'cause': 'da_lag', 'runbook': 'docs/runbooks/da_lag.md'}],
+            'ingress': {'pause': {'reason': 'upstream'}}}
+        output = self.run_deploy(success=False)
+        self.assertIn('the chain stands on a halt or a pause', output)
+        self.assertIn('da_lag', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.assertEqual(self.api.state['record_writes'], [], 'a refused release starts no attempt')
+        self.api.state['chain_status'] = HEALTHY_CHAIN | {'services': [
+            {'service': 'batcher', 'instance': '0', 'state': 'paused', 'pause': {'note': 'disk-swap'}, 'halt': None}]}
+        output = self.run_deploy(success=False)
+        self.assertIn("Paused: ['batcher']", output)
+        self.assertEqual(self.api.state['writes'], [])
+        # An ingress job without a running allocation is what a failed
+        # release leaves; the chain status cannot be read, so no deploy
+        # goes over it.
+        del self.api.state['chain_status']
+        self.api.state['not_running'] = {'ingress'}
+        output = self.run_deploy(success=False)
+        self.assertIn('the ingress job is registered and no allocation of it runs', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_missing_image_refuses_the_release(self):
+        self.api.state['missing_images'] = {'kardamom-executor'}
+        output = self.run_deploy(success=False)
+        self.assertIn('does not hold the image of executor', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.assertFalse(Path(str(self.smoke) + '.calls').exists(), 'the gate reads the registry before the formats')
+        # Only the local profile skips the check.
+        output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
+        self.assertIn('the production profile does not allow that', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_coordinated_format_change_refuses_the_rolling_path(self):
+        self.gate_formats([{'rule': 'rollback', 'id': 'sealer-snapshot', 'head': 11, 'base': 10},
+                           {'rule': 'mixed_fleet', 'id': 'sealer-snapshot', 'head': 11, 'base': 10}])
+        output = self.run_deploy(success=False)
+        self.assertIn('coordinated format change: sealer-snapshot', output)
+        self.assertEqual(self.api.state['writes'], [])
+        # The comparison ran the library against the accepted registry and this tree.
+        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+
+    def test_a_one_way_format_change_needs_the_allowance(self):
+        self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
+        output = self.run_deploy(success=False)
+        self.assertIn('KARDAMOM_ALLOW_ONE_WAY=state-db', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy(success=False, environ={'KARDAMOM_ALLOW_ONE_WAY': 'state-db,kar1-batch'})
+        self.assertIn('names kar1-batch, and the release has no one-way change of it', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.run_deploy(environ={'KARDAMOM_ALLOW_ONE_WAY': 'state-db'})
+        self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
+        self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': 'rev-test'})
+
+    def test_a_must_match_sealer_setting_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        output = self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, success=False)
+        self.assertIn('every member must match: daLagBudgetBlocks.', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, success=False,
+                                 environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks,remoteOrigins'})
+        self.assertIn('names remoteOrigins, and the release does not change it', output)
+        self.assertEqual(self.api.state['writes'], [])
+        # A documented procedure names the settings it changes.
+        self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+
+    def test_a_shard_map_change_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        task = self.api.state['jobs']['ingress']['TaskGroups'][0]['Tasks'][0]
+        template = next(t for t in task['Templates'] if t['DestPath'] == 'local/shard-map.toml')
+        template['EmbeddedTmpl'] = template['EmbeddedTmpl'].replace('version = 0', 'version = 1')
+        output = self.run_deploy(success=False)
+        self.assertIn('differs from the shard map of the registered ingress (version 1)', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+
+
+class RollbackTest(Deploys):
+    """`just rollback`: the targets, the floor, the re-render, the resume."""
+
+    def test_a_rollback_reverts_the_accepted_release_in_reverse_order(self):
+        self.run_deploy()
+        self.repin('b')
+        self.api.state['roles'] = {'node-cluster-0': 'FOLLOWER', 'node-cluster-1': 'LEADER', 'node-cluster-2': 'FOLLOWER'}
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['roll_marker'] = 'a' * 64
+        self.run_rollback()
+        # Every job goes to its version before the release, last job first;
+        # the sealer rolls back member by member, followers first.
+        expected = [f'revert:{job}:0' for job in reversed(self.REPINNED) if job != 'cluster']
+        expected[expected.index('revert:aeron:0'):expected.index('revert:aeron:0')] = ['cluster'] * 3
+        self.assertEqual(self.api.state['writes'], expected)
+        self.assertEqual(self.api.state['rolled'][-3:],
+                         [['cluster-0'], ['cluster-0', 'cluster-2'], ['cluster-0', 'cluster-1', 'cluster-2']])
+        self.assertTrue(all(t['Config']['image'].endswith('a' * 64) for g in self.api.state['jobs']['ingress']['TaskGroups']
+                            for t in g['Tasks']), 'the ingress runs the release before')
+        record = self.record()
+        self.assertEqual(record['attempt']['status'], 'rolled_back')
+        self.assertEqual(record['accepted']['restored_from'], record['attempt']['started_at'])
+        self.assertEqual(record['accepted']['target']['manifest'], record['attempt']['before']['manifest'])
+        self.assertEqual(record['accepted']['target']['formats'], FORMATS)
+        output = self.run_rollback(success=False)
+        self.assertIn('is already rolled back', output)
+
+    def test_a_rollback_after_a_failed_attempt_targets_the_accepted_release(self):
+        self.run_deploy()
+        self.repin('b')
+        self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
+        self.run_deploy(success=False)
+        self.api.state['writes'] = []
+        del self.api.state['deployments']['executor']
+        self.run_rollback()
+        # The followers register before the role waits for the executor, so
+        # the attempt reached them too.
+        reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
+        self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
+                                    'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
+                                    'revert:aeron:0'])
+        self.assertEqual(self.api.state['writes'].count('cluster'), 3)
+        self.assertNotIn('revert:batcher:0', self.api.state['writes'], 'the failed attempt never reached the batcher')
+        self.assertEqual(self.record()['accepted']['target']['manifest']['executor'],
+                         f'registry.example:5000/kardamom-executor:test@sha256:{"a" * 64}')
+
+    def test_a_rollback_passes_a_job_that_nomad_reverted_itself(self):
+        # The ingress has auto_revert: its failed deployment makes Nomad
+        # register the pre-release definition as a new version. The
+        # rollback finds it there and does not fail the EnforcePriorVersion
+        # check on it.
+        self.run_deploy()
+        self.repin('b')
+        self.api.state['deployments']['ingress'] = Deployment('ingress', ['failed'])
+        self.run_deploy(success=False)
+        self.assertIn('auto-revert:ingress', self.api.state['writes'])
+        self.assertEqual(self.record()['attempt']['before']['jobs']['ingress'], {'before': 0, 'after': 1})
+        self.api.state['writes'] = []
+        del self.api.state['deployments']['ingress']
+        output = self.run_rollback()
+        self.assertIn('ingress is at version 2, the pre-release definition', output)
+        self.assertNotIn('revert:ingress:0', self.api.state['writes'])
+        self.assertIn('revert:redis:0', self.api.state['writes'])
+        self.assertEqual(self.record()['attempt']['rolled_back'], ['ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+        self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
+
+    def test_a_rollback_that_stops_resumes_after_the_jobs_it_reverted(self):
+        self.run_deploy()
+        self.repin('b')
+        self.run_deploy()
+        self.api.state['writes'] = []
+        # The revert of the executor fails: the rollback stops there, with
+        # the jobs before it recorded.
+        self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
+        self.run_rollback(success=False)
+        done = ['batcher', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
+        self.assertEqual(self.record()['attempt']['rolled_back'], done)
+        self.assertEqual(self.record()['attempt']['status'], 'accepted', 'the rollback is not complete')
+        self.assertEqual(self.api.state['writes'], [f'revert:{job}:0' for job in done + ['executor']])
+        # The second run skips the recorded jobs and the executor, which is
+        # at its pre-release definition already, and finishes the rest.
+        del self.api.state['deployments']['executor']
+        self.api.state['writes'] = []
+        output = self.run_rollback()
+        self.assertIn('executor is at version 2, the pre-release definition', output)
+        self.assertEqual(self.api.state['writes'],
+                         ['revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0', 'cluster', 'cluster', 'cluster', 'revert:aeron:0'])
+        self.assertEqual(self.record()['attempt']['status'], 'rolled_back')
+        self.assertEqual(self.record()['attempt']['rolled_back'], done + ['executor', 'ingress', 'redis', 'sequencer', 'cluster', 'aeron'])
+
+    def test_a_rollback_does_not_cross_the_floor(self):
+        self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
+        self.run_deploy(environ={'KARDAMOM_ALLOW_ONE_WAY': 'state-db'})
+        self.api.state['writes'] = []
+        output = self.run_rollback(success=False)
+        self.assertIn("writes {'state-db': 4}", output)
+        self.assertIn('KARDAMOM_ROLLBACK_BELOW_FLOOR=state-db', output)
+        self.assertEqual(self.api.state['writes'], [])
+        self.run_rollback(environ={'KARDAMOM_ROLLBACK_BELOW_FLOOR': 'state-db'})
+        self.assertIn('revert:batcher:0', self.api.state['writes'])
+
+    def test_a_rollback_to_a_dropped_version_asks_for_a_re_render(self):
+        self.run_deploy()
+        self.repin('b')
+        self.run_deploy()
+        self.api.state['writes'] = []
+        self.api.state['dropped'] = {'ingress': [0]}
+        output = self.run_rollback(success=False)
+        self.assertIn('Nomad no longer holds the pre-release version of ingress', output)
+        self.assertIn('just rollback-rerender local', output)
+        self.assertEqual(self.api.state['writes'], [], 'no job changes before every version is confirmed')
+        rerender = (self.record_dir / 'rollback.digests').read_text()
+        self.assertIn(f'ingress registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}\n', rerender)
+        self.assertEqual(len(rerender.splitlines()), len(MANIFEST))
+
+    def test_a_rollback_without_a_record_refuses(self):
+        output = self.run_rollback(success=False)
+        self.assertIn('nothing to roll back', output)
+
+
+
+class SealerTest(Deploys):
+    """The staged roll of the sealer and its bootstrap."""
 
     def sealer_roll(self, leader):
         """Deploy twice: the second deploy edits the sealer, with `leader` leading."""

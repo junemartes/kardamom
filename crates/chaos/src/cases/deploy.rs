@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::harness::Harness;
-use crate::lifecycle::NOMAD_HTTP_PORT;
+use crate::lifecycle::{LastAttempt, NOMAD_HTTP_PORT};
 
 /// The manifest of the running cluster, written by the image push.
 const MANIFEST: &str = "images.digests";
@@ -31,7 +31,10 @@ pub(crate) async fn broken_image(h: &mut Harness) -> anyhow::Result<()> {
     let version = h.nomad.job("executor").await?.version;
 
     crate::log("deploy-broken-image: deploying a manifest whose executor image is the DA stand-in");
-    let broken_deploy = h.lifecycle.deploy(&nomad_addr, BROKEN_MANIFEST).await?;
+    let broken_deploy = h
+        .lifecycle
+        .deploy(&nomad_addr, BROKEN_MANIFEST, LastAttempt::Settled)
+        .await?;
     let _ = std::fs::remove_file(cluster_dir.join(BROKEN_MANIFEST));
     anyhow::ensure!(
         !broken_deploy,
@@ -54,7 +57,10 @@ pub(crate) async fn broken_image(h: &mut Harness) -> anyhow::Result<()> {
     ));
 
     crate::log("deploy-broken-image: deploying the real manifest to heal the executor job");
-    let healed = h.lifecycle.deploy(&nomad_addr, MANIFEST).await?;
+    let healed = h
+        .lifecycle
+        .deploy(&nomad_addr, MANIFEST, LastAttempt::Dead)
+        .await?;
     anyhow::ensure!(
         healed,
         "deploy-broken-image: the deploy of the real manifest failed"

@@ -1,0 +1,41 @@
+[package]
+name = "kardamom-canary"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+# The transaction canary: it uses the chain as a user does and reports
+# each success and each failure as a metric. See
+# docs/specs/2026-10-07-tx-canary.md.
+
+[lib]
+name = "kardamom_canary"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kardamom-canary"
+path = "src/main.rs"
+
+[dependencies]
+kardamom-bench = { path = "../bench" }
+kardamom-obs = { path = "../obs" }
+# The creation bytecode of the canary contracts, from the Foundry build.
+kardamom-deployer = { path = "../deployer" }
+alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+jsonrpsee = { workspace = true, features = ["http-client", "ws-client"] }
+metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kardamom-formats.workspace = true
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

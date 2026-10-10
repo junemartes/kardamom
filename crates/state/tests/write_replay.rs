@@ -4,7 +4,6 @@
 mod common;
 
 use alloy_primitives::{U256, address};
-use kardamom_state::StateSnapshot;
 use kardamom_types::StateDatabase;
 
 #[test]
@@ -12,8 +11,8 @@ fn writer_applies_deltas_and_state_reflects_them() {
     let (_dir, mut writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000aa");
 
-    // Drain the spawn-time snapshot first so the per-block snapshots line up.
-    let _genesis = writer.snapshot_rx.recv().unwrap();
+    let genesis = writer.snapshot_rx.recv().unwrap();
+    assert_eq!(genesis.block_number(), 0);
 
     for block in 1..=5u64 {
         writer
@@ -28,12 +27,9 @@ fn writer_applies_deltas_and_state_reflects_them() {
             .unwrap();
     }
 
-    // Wait for each of the 5 post-commit snapshots.
-    let mut latest: Option<StateSnapshot> = None;
-    for _ in 0..5 {
-        latest = writer.snapshot_rx.recv();
-    }
-    let snap = latest.expect("at least one snapshot");
+    // Five commits can arrive as fewer than five wakes, so wait on the
+    // block number, not on a count of wakes.
+    let snap = common::wait_for_block(&writer, 5);
     assert_eq!(snap.block_number(), 5);
 
     let (nonce, balance, _code_hash) = snap.basic(addr).unwrap().expect("account exists");

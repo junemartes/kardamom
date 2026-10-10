@@ -1,0 +1,13 @@
+---
+- name: Roll the kardamom workloads back one release
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Revert the changed jobs by the deploy record
+      ansible.builtin.include_role:
+        name: workloads
+        tasks_from: rollback

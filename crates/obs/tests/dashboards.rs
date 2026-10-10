@@ -17,6 +17,7 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-validator",
     "kardamom-state-mirror",
     "kardamom-l1-follower",
+    "kardamom-canary",
 ];
 
 fn dashboards_dir() -> PathBuf {

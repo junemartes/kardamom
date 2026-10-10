@@ -6,6 +6,12 @@
   ansible.builtin.set_fact:
     workloads_jobs: {}
 
+# The attempt record: the pre-deploy version of every job, before the
+# first registration. The rollback reverts to these versions.
+- name: Start the deploy record
+  ansible.builtin.import_tasks: record_start.yml
+  when: not ansible_check_mode
+
 - name: Deploy Aeron
   ansible.builtin.include_tasks: job.yml
   vars:
@@ -49,17 +55,6 @@
 # Ingress must subscribe to receipts before executors start publishing them.
 - name: Deploy the sealer
   ansible.builtin.include_tasks: sealer.yml
-  vars:
-    workloads_sealer_job:
-      name: cluster
-      retries: 100
-      vars:
-        cluster_retention: "{{ workloads_cluster_retention }}"
-        cluster_snapshot_interval_s: "{{ workloads_cluster_snapshot_s }}"
-        cluster_log_purge_keep_snapshots: "{{ workloads_cluster_log_purge_keep }}"
-        cluster_da_lag_budget_blocks: "{{ workloads_da_lag_budget_blocks }}"
-        cluster_file_sync_level: "{{ workloads_cluster_file_sync_level }}"
-        cluster_remote_origins: "{{ workloads_remote_origins }}"
 
 - name: Deploy pipeline dependencies
   ansible.builtin.include_tasks: job.yml
@@ -227,6 +222,24 @@
              else workloads_l1_rpc if workloads_l1_rpc_given | length > 0
              else workloads_anvil_service_rpc }}
         KARDAMOM_L1_KEY: "{{ workloads_batcher_key | default(workloads_batcher_dev_key, true) }}"
+
+# The transaction canary uses the chain through the ingresses and the
+# notifier, and nothing waits for it. It comes up last, so its first
+# transactions find every reader of the chain, the batcher included,
+# already subscribed.
+- name: Deploy the transaction canary
+  ansible.builtin.include_tasks: job.yml
+  vars:
+    workloads_job:
+      name: canary
+      wait: false
+      vars:
+        ring_offset: >-
+          {{ workloads_canary_ring_offset if workloads_canary_mnemonic | length > 0
+             else workloads_canary_dev_ring_offset }}
+      secrets:
+        KARDAMOM_CANARY_MNEMONIC: "{{ workloads_canary_mnemonic | default(workloads_canary_dev_mnemonic, true) }}"
+  when: workloads_canary_deployed | bool
 
 - name: Record the deployed manifest
   ansible.builtin.import_tasks: record.yml

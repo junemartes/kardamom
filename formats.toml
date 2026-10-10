@@ -260,3 +260,27 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 [coordinated]
 
 [retired]
+
+# Frozen layout. The canary's nonce journal: one serde JSON file per ring
+# account. A file that does not parse stops the canary at start; the
+# operator removes it after checking the account's nonce.
+[format.canary-journal]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/canary/src/ring/journal.rs#pub struct InFlight"]
+[format.canary-journal.layout]
+InFlight = '{"nonce":1,"hash":"0x0202020202020202020202020202020202020202020202020202020202020202","raw":"0x03","published":true}'
+
+# Frozen layout. The canary's data directory: the contract addresses and
+# the anchor hash, as serde JSON. A new field has a serde default.
+[format.canary-store]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/canary/src/store.rs#pub struct Contracts"]
+[format.canary-store.layout]
+Contracts = '{"counter":"0x0404040404040404040404040404040404040404"}'
+anchor = '"0x0505050505050505050505050505050505050505050505050505050505050505"'

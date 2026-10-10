@@ -3,7 +3,7 @@
 use anyhow::Context;
 use serde_json::Value;
 
-use super::Nomad;
+use super::{Job, Nomad};
 use crate::poll::{self, Budget};
 
 pub(crate) struct SavedJob {
@@ -57,6 +57,20 @@ impl SavedJob {
     /// Register `definition` under the saved job's id, and wait until the
     /// allocations of that version run.
     pub(crate) async fn register(&self, definition: &Value) -> anyhow::Result<()> {
+        let desired = self.post(definition).await?;
+        self.await_running(&desired).await
+    }
+
+    /// Register the saved definition again and return at once, with the
+    /// version Nomad gave it. A caller that brings several jobs back at
+    /// the same time posts each one first and waits for them after.
+    pub(crate) async fn post_restore(&self) -> anyhow::Result<Job> {
+        self.post(&self.definition).await
+    }
+
+    /// Register `definition` under the saved job's id. Returns the job as
+    /// Nomad holds it now, with the version the allocations must reach.
+    async fn post(&self, definition: &Value) -> anyhow::Result<Job> {
         self.nomad
             .http
             .post(self.nomad.url("/v1/jobs"))
@@ -65,7 +79,11 @@ impl SavedJob {
             .await?
             .error_for_status()
             .with_context(|| format!("register job {}", self.id))?;
-        let desired = self.nomad.job(&self.id).await?;
+        self.nomad.job(&self.id).await
+    }
+
+    /// Wait until the allocations of `desired` run.
+    pub(crate) async fn await_running(&self, desired: &Job) -> anyhow::Result<()> {
         let outcome = poll::until(Budget::secs(180, 3), |_| async {
             Ok(desired
                 .running(&self.nomad.allocations(&self.id).await?)

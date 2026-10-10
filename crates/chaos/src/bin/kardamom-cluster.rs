@@ -2,11 +2,13 @@
 //! cluster that ran as shell scripts. Each reads the node contract the
 //! last `tofu apply` wrote.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kardamom_chaos::diagnostics::Diagnostics;
 use kardamom_chaos::harness::INGRESS_RPC_PORT;
+use kardamom_chaos::release::FormatGate;
 use kardamom_chaos::rpc::Rpc;
 use kardamom_chaos::scale::Resize;
 use kardamom_chaos::stages::GATE_ACCOUNT;
@@ -46,6 +48,17 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Compare the format registry of the target tree with the registry
+    /// of the accepted release. Print the findings as JSON; the deploy
+    /// role decides by them.
+    Formats {
+        /// The formats.toml of the accepted release.
+        #[arg(long)]
+        base: PathBuf,
+        /// The root of the target tree; the default is this workspace.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
 }
 
 impl Command {
@@ -65,6 +78,14 @@ impl Command {
                 )?
                 .run()
                 .await
+            }
+            Self::Formats { base, root } => {
+                let gate = FormatGate {
+                    base,
+                    root: root.unwrap_or_else(|| lifecycle.repo_root()),
+                };
+                println!("{}", gate.findings_json()?);
+                Ok(())
             }
         }
     }
