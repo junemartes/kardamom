@@ -12,6 +12,8 @@ use crate::metrics::{self, Scrape, Target};
 
 /// The executor gauge that only goes up: the pipeline-progress signal.
 pub const EXECUTOR_BLOCK_METRIC: &str = "kardamom_executor_block_number";
+/// The executor counter of applied transactions, by outcome.
+pub const EXECUTOR_TX_APPLIED_METRIC: &str = "kardamom_executor_tx_applied_total";
 /// The sealer boundary counter the executors re-export from cluster
 /// egress; the Java cluster node has no exporter of its own.
 pub const SEALER_BOUNDARIES_METRIC: &str = "kardamom_sealer_boundaries_emitted_total";
@@ -280,11 +282,26 @@ impl Probes {
     /// replica that restarted can fairly report a low value while it
     /// replays; the fleet maximum is the pipeline signal.
     async fn executor_max(&self, metric: &str) -> Option<i64> {
+        self.executor_max_by(|body| metrics::first(body, metric))
+            .await
+    }
+
+    /// The maximum, across every responding executor, of what `read`
+    /// takes from its `/metrics` body.
+    async fn executor_max_by(&self, read: impl Fn(&str) -> Option<i64>) -> Option<i64> {
         let mut best = None;
         for i in 0..self.executors.len() {
-            best = best.max(self.exec_metric(i, metric).await);
+            best = best.max(self.exec_metrics(i).await.as_deref().and_then(&read));
         }
         best
+    }
+
+    /// The highest count of applied transactions any executor reports,
+    /// over every outcome: the user-transaction signal. An empty block
+    /// does not move it.
+    pub async fn executor_tx_applied(&self) -> Option<i64> {
+        self.executor_max_by(|body| metrics::sum(body, EXECUTOR_TX_APPLIED_METRIC))
+            .await
     }
 
     /// The last L1 block whose epoch the sealer ordered: the highest

@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::harness::Harness;
+use crate::nomad::SavedJob;
 use crate::poll::{self, Budget};
 
 /// What the last injector killed. `assert_count` reads and clears it.
@@ -108,6 +109,46 @@ impl Harness {
             cid,
         });
         Ok(())
+    }
+
+    /// Hard-kill the `(node, task)` containers of `job`, then stop the
+    /// job. Nomad restarts a killed task in seconds, so the stop is what
+    /// holds the class down. Returns the job as Nomad held it, for the
+    /// restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture, a kill or the stop fails.
+    pub(crate) async fn kill_tasks_and_stop(
+        &mut self,
+        job: &str,
+        tasks: &[(String, &'static str)],
+    ) -> anyhow::Result<SavedJob> {
+        let saved = SavedJob::capture(&self.nomad, job).await?;
+        for (node, task) in tasks {
+            self.inject_hard(&[node], task).await?;
+        }
+        saved.stop().await?;
+        Ok(saved)
+    }
+
+    /// `docker kill` every node of one role, with the progress line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a node is still running 30s after the kill.
+    pub(crate) async fn kill_all_nodes(
+        &self,
+        ctx: &str,
+        role: &str,
+        nodes: &[String],
+    ) -> anyhow::Result<()> {
+        crate::log(format!(
+            "{ctx}: docker kill ALL {role} nodes ({})",
+            nodes.join(" ")
+        ));
+        let names: Vec<&str> = nodes.iter().map(String::as_str).collect();
+        self.kill_nodes(&names).await
     }
 
     /// `docker kill` whole node containers, judging the kill by the
