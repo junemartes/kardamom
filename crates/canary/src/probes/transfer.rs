@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use alloy_primitives::{TxKind, U256};
 
+use super::safe::Safe;
 use super::{Context, Probe, record_stages};
 use crate::metrics;
 use crate::outcome::Outcome;
@@ -21,25 +22,47 @@ const TRANSFER_GAS: u64 = 21_000;
 pub struct Transfer {
     ctx: Arc<Context>,
     turn: usize,
+    /// Landed transfers since the last `safe` sample.
+    since_sample: u32,
 }
 
 impl Transfer {
     #[must_use]
     pub fn new(ctx: Arc<Context>) -> Self {
-        Self { ctx, turn: 0 }
+        Self {
+            ctx,
+            turn: 0,
+            since_sample: 0,
+        }
     }
 
-    async fn attempt(&self, rpc: &Rpc) -> Outcome {
+    /// Hand one landed transfer in `safe_sample` to a `safe` check.
+    fn sample(&mut self, rpc: &Rpc, landed: &super::Landed) {
+        self.since_sample = self.since_sample.saturating_add(1);
+        if self.since_sample < self.ctx.safe_sample.get() {
+            return;
+        }
+        self.since_sample = 0;
+        let check = Safe {
+            ctx: Arc::clone(&self.ctx),
+            rpc: rpc.clone(),
+            block: landed.receipt.block(),
+            landed: landed.at,
+        };
+        tokio::spawn(check.check());
+    }
+
+    async fn attempt(&mut self, rpc: &Rpc) -> Outcome {
         let mut lease = match self.ctx.lease(rpc).await {
             Ok(lease) => lease,
             Err(outcome) => return outcome,
         };
-        let call = Call {
-            to: TxKind::Call(self.ctx.neighbor(lease.address())),
-            value: U256::from(1),
-            input: alloy_primitives::Bytes::new(),
-            gas_limit: TRANSFER_GAS,
-        };
+        let call = Call::new(
+            TxKind::Call(self.ctx.neighbor(lease.address())),
+            U256::from(1),
+            alloy_primitives::Bytes::new(),
+            TRANSFER_GAS,
+        );
         let sent = match lease.send(rpc, call).await {
             Ok(sent) => sent,
             Err(outcome) => return outcome,
@@ -64,6 +87,7 @@ impl Transfer {
             return Outcome::ReceiptStatus0;
         }
         self.keep_anchor(sent.hash).await;
+        self.sample(rpc, &landed);
         if gap {
             Outcome::NonceGap
         } else {

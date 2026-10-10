@@ -22,9 +22,12 @@ kardamom-bench = { path = "../bench" }
 kardamom-obs = { path = "../obs" }
 # The creation bytecode of the canary contracts, from the Foundry build.
 kardamom-deployer = { path = "../deployer" }
+# The source hash of an L1 deposit: the hash of its L2 receipt.
+kardamom-types = { workspace = true }
 alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-signer-local = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
