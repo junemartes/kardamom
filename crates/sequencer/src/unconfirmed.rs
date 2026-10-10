@@ -66,6 +66,11 @@ impl<T> UnconfirmedLedger<T> {
             .collect()
     }
 
+    /// Whether the ledger holds the ref of `sender` at `nonce`.
+    pub(crate) fn contains(&self, sender: Address, nonce: u64) -> bool {
+        self.entries.contains_key(&(sender, nonce))
+    }
+
     /// Retain a just-published ref until a receipt proves canonical
     /// commitment, and queue it for the confirm-timeout sweep.
     pub(crate) fn record_published(&mut self, sender: Address, nonce: u64, meta: T) {

@@ -495,11 +495,12 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Details of the sealer window: [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
 - **A refused nonce stays free**
   - The sealer refuses a ref past its deadline, on a DA lag, or on a record lag before its contiguity guard. Its expected nonce for the sender stays at the refused nonce. Every later nonce of the sender gets `CONTIGUITY-REJECT` until a ref at the refused nonce is ordered.
-  - The sequencer does the same. On a refusal of a ref that its publish ledger holds, it sets the floor of the sender back to the refused nonce. It takes the later refs of the sender out of the ledger and parks them above the floor. They do not republish.
-  - The resubmit of the refused nonce matches the floor and publishes. The parked refs drain behind it. A parked ref that is also past its deadline gets its own refusal, and its client resubmits it.
-  - A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
-  - A refusal of a ref with receipt proof (no ledger entry, or a receipt floor above the nonce) is of a late copy. The floor stays.
-  - The sequencer applies the refusals before the contiguity rejects of the same iteration. A gap rewind first would take the refused ref back for republish, and the sender would never get free.
+  - The sealer also refuses a late copy of a ref that it ordered long ago: the window drops the id when its deadline passes. A confirm sweep with no receipts (all executors down) sends such copies. So a refusal alone does not move the floor of the sequencer.
+  - On a refusal, the sequencer takes the ref out of its publish ledger (or out of its buffer, if it parked there), so it never republishes. The client gets the refusal. If the nonce is below the floor, the sequencer marks it.
+  - A resubmit at a marked nonce is offered again, and the floor stays. The sealer decides: it orders the resubmit if it did not order the nonce, and it rejects it as a past nonce if it did. A mark ends when a ref at the nonce publishes, or when a receipt floor passes it.
+  - The floor moves back only on a contiguity reject that names an expected nonce `E` at which the sequencer holds no ref. Then the floor goes back to `E`, and the later refs of the sender leave the ledger and park above it. The resubmit of `E` publishes, and the parked refs drain behind it. A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
+  - If the sequencer holds the ref at `E`, the offer vanished, and the sequencer republishes from `E` as before.
+  - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
   - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.

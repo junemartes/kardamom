@@ -91,7 +91,6 @@ impl<T> PendingBuffer<T> {
         self.inner.range(..floor).count()
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn contains(&self, nonce: u64) -> bool {
         self.inner.contains_key(&nonce)
@@ -161,8 +160,8 @@ impl<T> PendingBuffer<T> {
     /// future-nonce entry no longer matches, so [`Self::expire`] ignores
     /// it.
     ///
-    /// The refusal rewind
-    /// ([`crate::state::PartitionState::rewind_refused`]) also uses this,
+    /// The freed-nonce park
+    /// ([`crate::state::PartitionState::free_nonce`]) also uses this,
     /// with a deadline. Its entries wait on a nonce gap that only the
     /// client can fill, so they expire like fresh future-nonce entries.
     pub(crate) fn reinsert(&mut self, nonce: u64, value: T, deadline: Option<Instant>) {
