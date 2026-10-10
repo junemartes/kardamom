@@ -5,7 +5,6 @@ use super::*;
 use crate::discovery::record::{PUBLISHER_SERVICE, ServiceEntry, ServiceId};
 
 const GRACE: Duration = Duration::from_secs(5);
-const LINGER: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct StubArchive {
@@ -31,6 +30,15 @@ impl RecorderArchive for StubArchive {
         Ok(())
     }
 
+    fn stop_position(&self, recording_id: i64) -> Result<i64, LogError> {
+        self.records
+            .borrow()
+            .iter()
+            .find(|(id, _, _)| *id == recording_id)
+            .map(|(_, _, stop)| *stop)
+            .ok_or_else(|| LogError::Aeron("unknown recording".into()))
+    }
+
     fn live(&self, started: &Started) -> Result<Option<i64>, LogError> {
         Ok(self
             .records
@@ -42,9 +50,19 @@ impl RecorderArchive for StubArchive {
     }
 }
 
+/// The membership with the own publication of the recorder, or without it.
 fn membership(present: bool) -> Membership {
+    membership_of("alloc-test", present)
+}
+
+/// The membership with the publication of another process, or without it.
+fn peer(present: bool) -> Membership {
+    membership_of("alloc-peer", present)
+}
+
+fn membership_of(instance: &str, present: bool) -> Membership {
     let entry = ServiceEntry {
-        id: ServiceId::new("alloc-test:tx_data:1001".into()),
+        id: ServiceId::new(format!("{instance}:tx_data:1001")),
         name: PUBLISHER_SERVICE.into(),
         address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         port: 41000,
@@ -81,7 +99,6 @@ fn recording() -> Recording<StubArchive> {
         },
         archive: StubArchive::default(),
         started: BTreeMap::new(),
-        linger: LINGER,
     }
 }
 
@@ -107,36 +124,49 @@ fn end_recordings(state: &Recording<StubArchive>) {
         .for_each(|r| r.2 = 4096);
 }
 
-#[tokio::test]
-async fn a_confirmed_departure_stops_once_its_recording_ends() {
-    let mut state = recording();
-    let now = Instant::now();
-    state.reconcile(&membership(true), now);
-    state.reconcile(&membership(false), now + Duration::from_secs(1));
+/// The membership of the peer at `now`, then missing for the full grace.
+/// Returns the time at which the peer departs.
+fn depart_peer(state: &mut Recording<StubArchive>, now: Instant) -> Instant {
+    state.reconcile(&peer(true), now);
+    state.resolve_pending();
+    state.reconcile(&peer(false), now + Duration::from_secs(1));
     let departed = now + Duration::from_secs(1) + GRACE;
-    state.reconcile(&membership(false), departed);
-    state.finish_departed(departed);
+    state.reconcile(&peer(false), departed);
+    state.follow_archive();
+    departed
+}
+
+#[tokio::test]
+async fn a_departed_publisher_stops_once_the_archive_ends_its_recording() {
+    let mut state = recording();
+    depart_peer(&mut state, Instant::now());
     assert!(
         state.archive.stops.borrow().is_empty(),
         "a live recording outlasts the grace"
     );
     end_recordings(&state);
-    state.finish_departed(departed + POLL);
+    state.follow_archive();
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
     assert!(state.started.is_empty());
 }
 
 #[tokio::test]
-async fn a_publisher_listed_again_during_the_linger_keeps_its_recording() {
+async fn a_departed_publisher_keeps_a_live_recording_for_any_time() {
     let mut state = recording();
-    let now = Instant::now();
-    state.reconcile(&membership(true), now);
-    state.reconcile(&membership(false), now + Duration::from_secs(1));
-    let departed = now + Duration::from_secs(1) + GRACE;
-    state.reconcile(&membership(false), departed);
-    state.finish_departed(departed);
-    state.reconcile(&membership(true), departed + POLL);
-    state.finish_departed(departed + LINGER * 2);
+    let departed = depart_peer(&mut state, Instant::now());
+    state.reconcile(&peer(false), departed + GRACE * 100);
+    state.follow_archive();
+    assert!(state.archive.stops.borrow().is_empty());
+    assert_eq!(state.started.len(), 1);
+}
+
+#[tokio::test]
+async fn a_departed_publisher_listed_again_keeps_its_recording() {
+    let mut state = recording();
+    let departed = depart_peer(&mut state, Instant::now());
+    state.reconcile(&peer(true), departed + POLL);
+    end_recordings(&state);
+    state.follow_archive();
     assert!(state.archive.stops.borrow().is_empty());
     assert_eq!(
         state.archive.starts.borrow().len(),
@@ -147,35 +177,54 @@ async fn a_publisher_listed_again_during_the_linger_keeps_its_recording() {
 }
 
 #[tokio::test]
-async fn the_linger_ends_a_departed_recording_that_stays_live() {
+async fn a_catalog_lapse_of_an_own_publication_keeps_its_recording() {
     let mut state = recording();
     let now = Instant::now();
     state.reconcile(&membership(true), now);
+    state.resolve_pending();
     state.reconcile(&membership(false), now + Duration::from_secs(1));
-    let departed = now + Duration::from_secs(1) + GRACE;
-    state.reconcile(&membership(false), departed);
-    state.finish_departed(departed + Duration::from_secs(14));
+    state.reconcile(&membership(false), now + GRACE * 100);
+    state.follow_archive();
     assert!(state.archive.stops.borrow().is_empty());
-    state.finish_departed(departed + LINGER);
-    assert_eq!(*state.archive.stops.borrow(), vec![7]);
+    let own = state.started.values().next().unwrap();
+    assert!(!own.departed, "an own publication never departs");
+    assert_eq!(own.recording_id, Some(11));
+}
+
+#[tokio::test]
+async fn an_ended_recording_of_a_listed_publisher_keeps_its_subscription() {
+    let mut state = recording();
+    state.reconcile(&peer(true), Instant::now());
+    state.resolve_pending();
+    end_recordings(&state);
+    state.follow_archive();
+    assert!(state.archive.stops.borrow().is_empty());
+    assert_eq!(state.started.values().next().unwrap().recording_id, None);
+    state.archive.records.borrow_mut().push((12, 42, -1));
+    state.resolve_pending();
+    assert_eq!(
+        state.started.values().next().unwrap().recording_id,
+        Some(12),
+        "the next recording of the publisher resolves"
+    );
 }
 
 #[tokio::test]
 async fn a_catalog_outage_preserves_recordings_and_resets_removal_proof() {
     let mut state = recording();
     let now = Instant::now();
-    state.reconcile(&membership(true), now);
-    state.reconcile(&membership(false), now + Duration::from_secs(1));
-    let mut degraded = membership(false);
+    state.reconcile(&peer(true), now);
+    state.reconcile(&peer(false), now + Duration::from_secs(1));
+    let mut degraded = peer(false);
     degraded.health = CatalogHealth::Degraded {
         consecutive_errors: 1,
     };
     state.reconcile(&degraded, now + GRACE * 2);
-    state.reconcile(&membership(false), now + GRACE * 3);
-    assert!(state.archive.stops.borrow().is_empty());
-    state.reconcile(&membership(false), now + GRACE * 4);
+    state.reconcile(&peer(false), now + GRACE * 3);
+    assert!(!state.started.values().next().unwrap().departed);
+    state.reconcile(&peer(false), now + GRACE * 4);
     end_recordings(&state);
-    state.finish_departed(now + GRACE * 4);
+    state.follow_archive();
     assert_eq!(*state.archive.stops.borrow(), vec![7]);
 }
 

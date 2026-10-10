@@ -9,6 +9,8 @@ use crate::error::LogError;
 pub(super) trait RecorderArchive {
     fn start(&self, uri: &str, stream: i32) -> Result<i64, LogError>;
     fn stop(&self, subscription: i64) -> Result<(), LogError>;
+    /// The stop position of a recording: negative while it is live.
+    fn stop_position(&self, recording_id: i64) -> Result<i64, LogError>;
     /// The newest live recording that matches `started`, or the error of
     /// the catalog listing.
     fn live(&self, started: &Started) -> Result<Option<i64>, LogError>;
@@ -38,6 +40,11 @@ impl RecorderArchive for rusteron_archive::AeronArchive {
         self.stop_recording_subscription(subscription)
             .map(|_| ())
             .map_err(|e| LogError::Aeron(format!("stop recording: {e}")))
+    }
+
+    fn stop_position(&self, recording_id: i64) -> Result<i64, LogError> {
+        self.get_stop_position(recording_id)
+            .map_err(|e| LogError::Aeron(format!("get_stop_position: {e}")))
     }
 
     fn live(&self, started: &Started) -> Result<Option<i64>, LogError> {

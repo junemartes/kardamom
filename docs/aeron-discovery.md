@@ -218,12 +218,20 @@ once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way, and the L1 follower
 its `l1_blocks` publication, through `StreamPlane::record_own`.
 
-A publisher that leaves the catalog for the removal grace keeps its
-recording subscription the same way a destination lingers. The recorder
-stops the subscription once the live recording of the publisher ends (the
-archive ends it when the image goes), or after one stall budget of the
-archive session. A publisher that is listed again before that keeps the
-same recording, with no hole.
+A catalog change alone never ends a live recording:
+
+- A publisher of another process that leaves the catalog for the removal
+  grace keeps its recording subscription until the archive ends its
+  recording. The archive ends a recording when the image goes. A
+  publisher that is listed again keeps the same recording, with no hole.
+- The recorder never treats an own publication as departed. The process
+  knows its own publications, so a lapse of their records in the catalog
+  (a late TTL check, a flap) changes nothing.
+- When the archive ends the recording of a publisher that is still
+  listed, the recorder logs the WARN line `discovered recorder: the
+  archive ended the recording of a listed publisher` with the stop
+  position. The recording subscription stays, and the next image of the
+  publisher starts a new recording.
 
 Each executor records its own recorded `exec_txs` publication on the
 archive of its node. The recorder adopts only the recording of the

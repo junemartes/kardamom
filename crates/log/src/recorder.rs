@@ -62,12 +62,6 @@ pub struct ArchiveSession {
 }
 
 impl ArchiveSession {
-    /// The stall budget of this session: the wait for a quiet archive or
-    /// media driver.
-    pub(crate) fn stall_budget(&self) -> std::time::Duration {
-        self.driver_budget.duration()
-    }
-
     /// The archive-side Aeron client. A replay-merge subscriber opens its
     /// `control-mode=manual` subscription on this client, so the
     /// subscription and the archive control session share one
