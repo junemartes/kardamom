@@ -1026,6 +1026,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
 - **Nonce ownership.** Each ring account has one owner at a time: a lease. The lease writes the signed transaction to the journal (`<dir>/ring/<address>.json`) before the submit.
   - A refused first submit frees the nonce: the ingress answered and did not publish.
   - A submit with no answer, or an accepted one, stays in flight. The next lease asks for its receipt and the committed nonce. If neither shows it, the lease sends the same bytes again, and the account stays blocked. The other accounts serve the probes.
+  - A sealer refusal on the status feed (`past-deadline`, `da-lag`, `record-lag`) frees the nonce when the committed nonce has not passed it. The sealer is the one orderer, and it drops a hash that it saw again, so a resend of a refused transaction never lands. The status board is in memory: after a restart, such an account stays blocked until an operator clears its journal.
   - A restart reads the journal, so the rule holds across a restart.
   - Proof: S19 (`s19_canary_probes_succeed_and_the_ring_resolves_in_flight`) in the chain-semantics suite: every probe on a local stack with an L1, a lost submit answer, a restart with an unsent transaction, and six concurrent leases on one account.
 - **Feed gaps.** A stage that a later stage implies is no failure. A missing `executed` with a receipt is a feed gap (`kardamom_canary_feed_gaps_total`), not a transaction failure.
@@ -1036,6 +1037,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - Proof: the chaos case `canary-da-lag` freezes the batcher past the DA-lag budget. The canary reports `rpc_error{code="-32010"}`, and Alertmanager holds its page as inhibited. The case runs by name with `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, as `da-lag-halt` does, on a cluster deployed with `CANARY_LOCAL=1`.
 - **Known limits.**
   - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
+  - A receipt carries the number of the block before the block whose base fee it paid. The `fees` probe then reports `fee_mismatch{field="base_fee"}` whenever the base fee moves between two blocks. This is a defect of the chain, open in issue 553. S19 counts that outcome apart.
   - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
 
 ## Redis account cache

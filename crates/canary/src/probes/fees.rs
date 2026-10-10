@@ -69,7 +69,19 @@ impl Fees {
             .until(|| async { rpc.base_fee(block).await.ok() })
             .await
             .ok_or(Outcome::FeeMismatch("fee_history"))?;
-        Rules { base_fee }.check(&receipt)
+        let checked = Rules { base_fee }.check(&receipt);
+        if let Err(outcome) = &checked {
+            tracing::warn!(
+                block,
+                %base_fee,
+                price = ?receipt.effective_gas_price,
+                rate = ?receipt.priority_fee_per_gas,
+                paid = ?receipt.priority_fee_paid,
+                ?outcome,
+                "fees: the receipt breaks a fee rule"
+            );
+        }
+        checked
     }
 }
 

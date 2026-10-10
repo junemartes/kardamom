@@ -134,6 +134,8 @@ impl Outcome {
         metrics::counter!(crate::metrics::PROBE_TOTAL, &labels).increment(1);
         if *self == Self::Success {
             crate::metrics::success_now(probe);
+        } else {
+            tracing::warn!(probe, endpoint, outcome = ?self, "probe failed");
         }
     }
 }

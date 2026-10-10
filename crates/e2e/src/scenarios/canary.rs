@@ -18,6 +18,7 @@ use alloy_consensus::TxEip1559;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use anyhow::{Context, Result};
 use kardamom_canary::config::Endpoint;
+use kardamom_canary::feed::{Board, BoardHandle};
 use kardamom_canary::outcome::Outcome;
 use kardamom_canary::ring::journal::{InFlight, Journal};
 use kardamom_canary::ring::{self, Call, DerivedSigner, Lease, Ring};
@@ -46,6 +47,9 @@ const PROBES: [&str; 6] = [
 /// The probes that must succeed once in the scenario's time: the
 /// liquidity add and the deposit.
 const ONCE: [&str; 2] = ["probe=\"liquidity\"", "probe=\"deposit\""];
+/// The label of the known receipt numbering defect (see
+/// [`probes_succeed`]). Only `fees` runs carry the `field` label.
+const KNOWN_FEE_DEFECT: &str = "field=\"base_fee\"";
 /// The L1 key of the canary in the scenario: anvil account #9, which no
 /// other part of the stack uses.
 pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6";
@@ -54,7 +58,10 @@ pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf70
 /// deposit probes one) on the canary at `canary`, then require that no
 /// probe but `read` failed, and that the feed reported the `executed`
 /// stage. A `read` run can see the head not move between two runs on an
-/// idle local chain.
+/// idle local chain. A `fees` run can find `fee_mismatch{field="base_fee"}`:
+/// the chain gives a receipt the block number before the block whose base
+/// fee it paid, a known defect; the scenario counts that outcome apart and
+/// requires every other `fees` run to succeed.
 ///
 /// # Errors
 /// Returns an error when the successes do not come within the patience,
@@ -91,7 +98,10 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
         .chain(ONCE.iter())
         .filter(|p| !p.contains("read"))
     {
-        let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0);
+        let known = s
+            .value_where_all(PROBE_TOTAL, &[probe, KNOWN_FEE_DEFECT])
+            .unwrap_or(0.0);
+        let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0) - known;
         let ok = s
             .value_where_all(PROBE_TOTAL, &success(probe))
             .unwrap_or(0.0);
@@ -189,7 +199,7 @@ async fn lost_answer(
     if submitted {
         let _ = rpc.send(&journaled.raw).await;
     }
-    let ring = Ring::open(dir, signers, t.chain_id).await?;
+    let ring = Ring::open(dir, signers, t.chain_id, board()).await?;
     let lease = lease_when_free(&ring, rpc).await?;
     anyhow::ensure!(
         rpc.receipt(journaled.hash).await.ok().flatten().is_some(),
@@ -207,7 +217,7 @@ async fn lost_answer(
 /// nonces are distinct and contiguous.
 async fn concurrent(t: &Target, rpc: &Rpc, dir: &Path, signers: Vec<DerivedSigner>) -> Result<()> {
     let start = rpc.nonce(signers[0].address).await?;
-    let ring = std::sync::Arc::new(Ring::open(dir, signers, t.chain_id).await?);
+    let ring = std::sync::Arc::new(Ring::open(dir, signers, t.chain_id, board()).await?);
     let tasks: Vec<_> = (0..6)
         .map(|_| {
             let ring = std::sync::Arc::clone(&ring);
@@ -229,6 +239,14 @@ async fn concurrent(t: &Target, rpc: &Rpc, dir: &Path, signers: Vec<DerivedSigne
         "nonces {nonces:?}, expected {expected:?}"
     );
     Ok(())
+}
+
+/// A status board with no feed: the ring cases resolve by receipt and
+/// nonce alone.
+fn board() -> BoardHandle {
+    let (board, handle) = Board::new();
+    tokio::spawn(board.run());
+    handle
 }
 
 /// Lease the ring's one account once it is free and resolved.

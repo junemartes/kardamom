@@ -25,10 +25,14 @@ pub use kardamom_bench::signers::DerivedSigner;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
+use crate::feed::BoardHandle;
 use crate::outcome::Outcome;
 use crate::rpc::{Rpc, RpcError};
 use crate::wait::Poll;
 use journal::{InFlight, Journal};
+
+/// The rejection reasons of the sealer, which orders every transaction.
+const SEALER_REFUSALS: [&str; 3] = ["past-deadline", "da-lag", "record-lag"];
 
 /// The lowest fee cap the canary signs, in wei per gas: one gwei. A
 /// chain with no fee schedule answers a zero gas price.
@@ -149,12 +153,13 @@ pub struct Ring {
     slots: Vec<Arc<Slot>>,
     chain_id: u64,
     cursor: AtomicUsize,
+    board: BoardHandle,
 }
 
 impl Ring {
     /// The ring of `signers` on chain `chain_id`, with each account's
-    /// journal under `dir`. Every account starts funded; the balance
-    /// task corrects that.
+    /// journal under `dir`. `board` holds the status feed's rejections.
+    /// Every account starts funded; the balance task corrects that.
     ///
     /// # Errors
     ///
@@ -164,6 +169,7 @@ impl Ring {
         dir: &Path,
         signers: Vec<DerivedSigner>,
         chain_id: u64,
+        board: BoardHandle,
     ) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(dir).await?;
         let slots = futures::stream::iter(signers)
@@ -174,6 +180,7 @@ impl Ring {
             slots,
             chain_id,
             cursor: AtomicUsize::new(0),
+            board,
         })
     }
 
@@ -276,6 +283,7 @@ impl Ring {
             chain_id: self.chain_id,
             account,
             gap: false,
+            board: self.board.clone(),
         };
         lease.prepare(rpc).await?;
         Ok(lease)
@@ -289,6 +297,7 @@ pub struct Lease {
     chain_id: u64,
     account: OwnedMutexGuard<Account>,
     gap: bool,
+    board: BoardHandle,
 }
 
 impl Lease {
@@ -337,7 +346,22 @@ impl Lease {
             self.settle_entry(entry.nonce).await;
             return Ok(());
         }
+        if self.sealer_refused(entry.hash).await {
+            self.account.next_nonce = Some(entry.nonce);
+            self.forget().await;
+            crate::metrics::stalled(self.address(), None);
+            return Ok(());
+        }
         self.resend(rpc, entry).await
+    }
+
+    /// Whether the status feed reported that the sealer refused `hash`.
+    /// The sealer is the one orderer and drops a hash it saw again, so a
+    /// refused transaction never lands, and its nonce is free once the
+    /// committed nonce has not passed it.
+    async fn sealer_refused(&self, hash: B256) -> bool {
+        let reason = self.board.stages(hash).await.rejected;
+        reason.is_some_and(|r| SEALER_REFUSALS.contains(&r.as_str()))
     }
 
     /// Send an unresolved transaction again. A refusal of one that never

@@ -70,10 +70,18 @@ impl Canary {
         );
         let chain_id = Self::chain_id(&endpoints).await;
         let store = Store::new(&settings.dir);
-        let ring = Arc::new(Ring::open(&store.ring_dir(), settings.signers, chain_id).await?);
+        let (board, handle) = Board::new();
+        let ring = Arc::new(
+            Ring::open(
+                &store.ring_dir(),
+                settings.signers,
+                chain_id,
+                handle.clone(),
+            )
+            .await?,
+        );
         let contracts = store.contracts().await?;
         let (anchor, _) = watch::channel(store.anchor().await?);
-        let (board, handle) = Board::new();
         let feed = Feed {
             url: settings.notifier_ws,
             senders: ring.addresses(),
