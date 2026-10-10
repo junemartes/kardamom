@@ -22,8 +22,10 @@ use crate::stages::rebuild::{Output, Rebuild, Rebuilt, Target};
 mod sealer_wipe;
 mod seed_evidence;
 mod seeding;
+mod storm;
 
 pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
+pub(crate) use storm::{ROUNDS, executor_restart_storm};
 
 /// How long three restarted members get to elect a leader. Each one
 /// restores its snapshot and replays the log tail before it votes, so

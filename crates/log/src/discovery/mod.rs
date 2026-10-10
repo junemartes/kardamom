@@ -30,14 +30,17 @@ pub mod watch;
 pub use catalog::{Catalog, Query, QueryResult, RegistrationSpec};
 pub use endpoint::{MANUAL_SUBSCRIPTION_URI, advertise_ip, destination_uri, publication_uri};
 pub use own_recording::OwnRecording;
-pub use plane::{DiscoveredPublisher, DiscoveredSubscriber, StreamPlane};
+pub use plane::{
+    DiscoveredPublisher, DiscoveredSubscriber, PublisherReopen, StreamPlane, TxReceiptsReopen,
+};
 pub use reconcile::{DestinationPort, Plan, Reconciler};
 pub use record::{
     ARCHIVE_SERVICE, ArchiveRecord, CLUSTER_MEMBER_SERVICE, ClusterMemberRecord, DISCOVERY_VERSION,
-    PUBLISHER_SERVICE, PublisherRecord, Scope, ServiceEntry, ServiceId, Topic,
+    PUBLISHER_SERVICE, PublisherRecord, SUBSCRIBER_SERVICE, Scope, ServiceEntry, ServiceId,
+    SubscriberRecord, Topic,
 };
 pub use recording::{DiscoveredRecorder, RecorderProgress};
-pub use registration::Registration;
+pub use registration::{RecordMover, Registration};
 pub use watch::{CatalogHealth, Membership, MembershipWatch, WatchTiming};
 
 use crate::config::DiscoveryConfig;
@@ -74,6 +77,14 @@ impl Instance {
     #[must_use]
     pub fn service_id(&self, topic: Topic, stream_id: i32) -> ServiceId {
         ServiceId::new(format!("{}:{topic}:{stream_id}", self.id))
+    }
+
+    /// The service id of this process's subscription of `(topic,
+    /// stream_id)`. The `sub` part keeps it apart from a publication of
+    /// the same stream by the same process.
+    #[must_use]
+    pub fn subscriber_id(&self, topic: Topic, stream_id: i32) -> ServiceId {
+        ServiceId::new(format!("{}:sub:{topic}:{stream_id}", self.id))
     }
 }
 

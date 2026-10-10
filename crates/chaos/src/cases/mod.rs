@@ -85,9 +85,10 @@ pub enum Case {
     BatcherOutagePastRetention,
     FollowerInstanceLoss,
     FollowerTotalLoss,
+    ExecutorRestartStorm,
 }
 
-const ALL: [Case; 54] = [
+const ALL: [Case; 55] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -142,6 +143,7 @@ const ALL: [Case; 54] = [
     Case::BatcherOutagePastRetention,
     Case::FollowerInstanceLoss,
     Case::FollowerTotalLoss,
+    Case::ExecutorRestartStorm,
 ];
 
 impl Case {
@@ -215,6 +217,7 @@ impl Case {
             Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
             Self::FollowerInstanceLoss => "follower-instance-loss",
             Self::FollowerTotalLoss => "follower-total-loss",
+            Self::ExecutorRestartStorm => "executor-restart-storm",
         }
     }
 
@@ -324,6 +327,13 @@ impl Case {
             Self::BatcherOutagePastRetention => {
                 inject + k.retention_freeze_cap + k.restart_slo + Duration::from_mins(8)
             }
+            // Every round: a job stop, a restart within the SLO, and the
+            // convergence of the fleet.
+            Self::ExecutorRestartStorm => inject.saturating_add(
+                k.restart_slo
+                    .saturating_add(Duration::from_mins(1))
+                    .saturating_mul(fleet::ROUNDS),
+            ),
             _ => Duration::ZERO,
         };
         k.case_window.max(floor)
@@ -364,6 +374,7 @@ impl Case {
             | Self::ExecutorFleetLossRecover
             | Self::ExecutorFleetWipeRecover
             | Self::ExecutorFleetTotalWipeRecover
+            | Self::ExecutorRestartStorm
             | Self::IngressPairLossRecover
             | Self::SequencerLaneLossRecover
             | Self::PipelineBlackoutRecover => {
@@ -440,6 +451,7 @@ impl Case {
             Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
             Self::FollowerInstanceLoss => l1::follower_instance_loss(h).await,
             Self::FollowerTotalLoss => l1::follower_total_loss(h).await,
+            Self::ExecutorRestartStorm => fleet::executor_restart_storm(h).await,
         }
     }
 }
@@ -461,6 +473,7 @@ mod tests {
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,
+            crate::Shard::Integrity,
         ] {
             shard
                 .cases()

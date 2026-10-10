@@ -133,6 +133,10 @@ process passes at a third of `check_ttl_ms`. A graceful exit deregisters.
 After a crash the check turns critical, consumers detach after their
 grace, and Consul deletes the record after `deregister_after_ms`.
 
+### `kardamom-mdc-subscriber`, runtime-owned
+
+One record per discovered subscription. The service id is `<instance>:sub:<topic>:<stream_id>`. The address is the advertised interface of the subscriber, and the port is 0: nothing connects to a subscription. The meta carries the scope, `topic`, `stream_id`, `subscriber_id` (the label of the process) and, for a `tx_data` lane, `lane_id`, so the filter of a publisher of the same stream finds both record kinds. The runtime registers the record when the subscription opens, keeps it passing with the same TTL check as a publisher record, and deregisters it when the plane shuts down. A publisher of a must-deliver stream reads these records to tell a stream without a subscriber from a publication that no subscriber can reach. The record kind is new in this release; a runtime of the first release ignores it, because it queries the publisher service only.
+
 ### `kardamom-aeron-archive`, Nomad-owned
 
 One record per archive node, registered by the aeron system job. The
@@ -239,6 +243,7 @@ No job configures a publication control port.
 - The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
 - The publisher record carries the address that the driver bound.
 - The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
+- A publisher can open a publication again (`StreamPlane::tx_receipts_reopen`). The new publication binds a new port. The record of the same service id moves to it through the heartbeat of its registration (`RecordMover`), so every write of the id goes through one task, and a re-registration after a lost check writes the moved record. The subscribers detach the old control endpoint and attach the new one. The executor does this for a `tx_receipts` publication that stays unconnected for one Aeron stall budget while a subscriber record of the stream exists. See "Dead `tx_receipts` publication" in [failure-modes.md](failure-modes.md#executor).
 
 | Job | Publications |
 | --- | --- |
