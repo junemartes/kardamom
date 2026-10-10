@@ -362,7 +362,7 @@ class Deploys(unittest.TestCase):
     # The jobs a manifest with new digests changes, in deploy order: every
     # pinned image, and not anvil or the monitoring.
     REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
-                'validator', 'da-watcher', 'da-store', 'batcher']
+                'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
         return self.api.state['records']['kardamom/deploys/local']
@@ -1018,7 +1018,7 @@ class RollbackTest(Deploys):
         # the jobs before it recorded.
         self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
         self.run_rollback(success=False)
-        done = ['batcher', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
+        done = ['batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
         self.assertEqual(self.record()['attempt']['rolled_back'], done)
         self.assertEqual(self.record()['attempt']['status'], 'accepted', 'the rollback is not complete')
         self.assertEqual(self.api.state['writes'], [f'revert:{job}:0' for job in done + ['executor']])
