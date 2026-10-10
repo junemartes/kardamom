@@ -93,7 +93,10 @@ pub enum Case {
     ExecutorRestartStorm,
 }
 
-const ALL: [Case; 58] = [
+// A slice, not a fixed-size array: two branches that each add a case
+// would otherwise both edit the declared length and break main when they
+// merge close together.
+const ALL: &[Case] = &[
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -163,7 +166,8 @@ impl Case {
     /// Returns an error for an unknown name, before any load or account
     /// is spent.
     pub fn parse(name: &str) -> anyhow::Result<Self> {
-        ALL.into_iter()
+        ALL.iter()
+            .copied()
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
     }
