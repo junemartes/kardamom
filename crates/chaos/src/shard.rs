@@ -136,9 +136,9 @@ impl Shard {
             // executor-and-sealer case runs first and audits the persisted
             // state after it. The read-path and the sequencer-and-Redis
             // cases run by name only: a cold redis job crash-loops its
-            // sentinels (#560), a sender sticks after an outage of every
-            // executor (#559), and the sequencer-and-Redis case also hits
-            // the media driver error (#545).
+            // sentinels, a sender sticks after an outage of every
+            // executor, and the sequencer-and-Redis case also hits a media
+            // driver error that cuts a replica off its stream.
             Self::CombinedExec => &[
                 "executor-sealer-loss-recover",
                 "executor-sealer-validator-recover",
