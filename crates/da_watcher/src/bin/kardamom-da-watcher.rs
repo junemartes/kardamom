@@ -2,15 +2,14 @@
 //!
 //! It runs up to two independent origin watchers in one process:
 //!
-//! * L1 deposits (`--l1-rpc` and `--lockbox`, plus an optional
-//!   `--poll-interval`): an `da_watcher::L1Sources` set over one alloy
-//!   HTTP provider per endpoint. Each finalized L1 block becomes one
-//!   `EpochRecord` on the `tx_deposits` Aeron channel, through
-//!   [`publishers::LiveTxDepositsPublisher`]. With `--config`, a
-//!   boundary-only cluster session follows the sealer's L1 origin: the
-//!   epochs no boundary confirms are published again, and a start
-//!   resumes after the sealer's origin. `--l1-cursor-file` keeps the
-//!   confirmed origin across a restart.
+//! * L1 deposits (`--l1-blocks`): the records of the `l1_blocks` stream,
+//!   which the L1 follower publishes. The watcher has no L1 access. Each
+//!   record's epoch becomes one `EpochRecord` on the `tx_deposits` Aeron
+//!   channel, through [`publishers::LiveTxDepositsPublisher`]. With
+//!   `--config`, a boundary-only cluster session follows the sealer's L1
+//!   origin: the epochs no boundary confirms are published again, and a
+//!   start resumes after the sealer's origin. `--l1-cursor-file` keeps
+//!   the confirmed origin across a restart.
 //! * Interop (`--interop-feed-url`, `--interop-peer-chain-id`, and
 //!   `--self-chain-id`): a WebSocket outbox feed from one peer Kardamom
 //!   chain. Each origin block that carried messages becomes one
@@ -26,17 +25,15 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
-use alloy_primitives::Address;
 use anyhow::Context;
 use clap::Parser;
 
 use kardamom_da_watcher::interop::{
     CursorReconcile, InteropWatcherConfig, ReconcileRetry, RpcDestinationReader,
 };
-use kardamom_da_watcher::{CursorFile, DaWatcherConfig, L1Endpoints, L1ResumeAfter};
+use kardamom_da_watcher::{CursorFile, DaWatcherConfig, L1ResumeAfter};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxDepositsPublisherHandle,
     TxRemoteEpochsPublisherHandle,
@@ -47,6 +44,8 @@ use kardamom_log::recorder::{RecorderKind, RecorderThreads, record_stream_until_
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+#[path = "kardamom-da-watcher/feed.rs"]
+mod feed;
 #[path = "kardamom-da-watcher/publishers.rs"]
 mod publishers;
 #[path = "kardamom-da-watcher/sealer.rs"]
@@ -58,28 +57,37 @@ use sealer::{L1Path, SealerSession};
 use watchers::Watchers;
 
 #[derive(Debug, Parser)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line switch"
+)]
 #[command(
     name = "kardamom-da-watcher",
     version,
     about = "origin monitor — tails finalized L1 blocks onto tx_deposits and/or a peer chain's outbox feed onto tx_remote_epochs"
 )]
 struct Args {
-    /// L1 JSON-RPC HTTP endpoints, for example `http://127.0.0.1:8545`:
-    /// repeat the flag, or separate the endpoints with commas. Enables the
-    /// L1 deposit path. It requires `--lockbox`. With two or more, a
-    /// block is accepted when two agree; a source that fails or lies
-    /// rotates out for a backoff. A deployment passes the list in the
-    /// environment, so a keyed URL stays out of the process arguments.
-    #[arg(long, env = "KARDAMOM_L1_RPC", hide_env_values = true, value_delimiter = ',', num_args = 1..)]
-    l1_rpc: Vec<String>,
-    /// The L1 light client's endpoint. Its answer settles a read when it
-    /// serves the block; a public endpoint that disagrees with it is the
-    /// liar.
-    #[arg(long)]
-    l1_light_client_rpc: Option<String>,
-    /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
-    #[arg(long)]
-    lockbox: Option<String>,
+    /// Enable the L1 deposit path: publish the epoch of each record of the
+    /// `l1_blocks` stream on `tx_deposits`.
+    #[arg(long, default_value_t = false)]
+    l1_blocks: bool,
+    /// The L1 follower's API (`http://host:port`): the backstop of a
+    /// history read, for the records the stream's archives do not hold.
+    #[arg(long, env = "KARDAMOM_INDEXER_URL")]
+    indexer_url: Option<String>,
+    /// How long the `l1_blocks` stream may carry no record before the
+    /// watcher pauses with the follower as its root: three finality steps
+    /// on Ethereum and Sepolia.
+    #[arg(long, default_value = "1152")]
+    l1_silence_secs: NonZeroU64,
+    /// This node's UDP endpoint (`host:port`) for the archive control
+    /// responses of a history read.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_CONTROL_RESPONSE_ENDPOINT")]
+    archive_control_response_endpoint: Option<String>,
+    /// This node's UDP endpoint (`host:port`) that a replayed recording
+    /// lands on.
+    #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION_ENDPOINT")]
+    replay_destination_endpoint: Option<String>,
     /// The last L1 block whose epoch the chain holds: the L1 origin of
     /// the head that a sealer cluster was seeded at. The first tick then
     /// publishes every finalized block after it. The flag overrides
@@ -87,7 +95,7 @@ struct Args {
     /// boundary, and the first tick overwrites the file with this block.
     /// A fallback: with `--config`, a start resumes after the sealer's
     /// origin by itself.
-    #[arg(long, requires = "l1_rpc")]
+    #[arg(long, requires = "l1_blocks")]
     l1_resume_after: Option<L1ResumeAfter>,
     /// Durable L1 cursor file: the sealer's confirmed L1 origin (with
     /// `--config`), or the last published L1 block (without it), by
@@ -97,7 +105,7 @@ struct Args {
     /// at the finalized tip (or `--l1-resume-after`), with a warning. A
     /// file that exists but does not parse halts the watcher
     /// (`l1_cursor_unreadable`) until an operator clears it.
-    #[arg(long, requires = "l1_rpc")]
+    #[arg(long, requires = "l1_blocks")]
     l1_cursor_file: Option<PathBuf>,
     /// The da-watcher config file. Its `[cluster]` section connects a
     /// boundary-only session to the sealer cluster. The watcher then
@@ -105,7 +113,7 @@ struct Args {
     /// the published epochs, the epochs no boundary confirms are
     /// published again, and a start resumes after the sealer's origin.
     /// Without it, a publish confirms its epoch.
-    #[arg(long, requires = "l1_rpc")]
+    #[arg(long, requires = "l1_blocks")]
     config: Option<PathBuf>,
     /// This node's cluster-egress endpoint `ip:port`, for `--config`. It
     /// sets the `[cluster] egress_channel` as
@@ -113,8 +121,9 @@ struct Args {
     /// Without `--config` it is not used.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
-    /// Polling cadence in seconds (default 12). Must be nonzero: 0 reaches
-    /// `tokio::time::interval`, which panics on a zero period.
+    /// The housekeeping tick of the L1 path, in seconds: a history read
+    /// the watcher waits on, a publish to retry, the waiting log, the
+    /// check of the follower, and the readiness mark.
     #[arg(long, default_value = "12")]
     poll_interval_secs: NonZeroU64,
     /// Peer Kardamom chain to source cross-chain messages from. Enables the
@@ -254,7 +263,7 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
     let interop = args.interop_path()?;
     if l1.is_none() && interop.is_none() {
         anyhow::bail!(
-            "nothing to watch: give --l1-rpc + --lockbox, or the interop triple \
+            "nothing to watch: give --l1-blocks, or the interop triple \
              (--interop-peer-chain-id + --interop-feed-url + --self-chain-id), or both"
         );
     }
@@ -262,46 +271,34 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
 }
 
 impl Args {
-    /// Resolve the L1 deposit path: `Some` only when both `--l1-rpc` and
-    /// `--lockbox` were given.
+    /// Resolve the L1 deposit path: `Some` only with `--l1-blocks`.
     fn l1_path(&self) -> anyhow::Result<Option<L1Path>> {
-        match (self.l1_rpc.as_slice(), &self.lockbox) {
-            ([], None) => Ok(None),
-            ([], Some(_)) | ([_, ..], None) => {
-                anyhow::bail!("--l1-rpc and --lockbox must be given together")
-            }
-            (rpcs, Some(lockbox)) => {
-                let lockbox = Address::from_str(lockbox)
-                    .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
-                // `open` takes the cursor's file lock. A second watcher on
-                // the same file stops here with `CursorError::Locked`.
-                let cursor_file = self
-                    .l1_cursor_file
-                    .as_ref()
-                    .map(CursorFile::open)
-                    .transpose()
-                    .context("open --l1-cursor-file")?;
-                let sealer = self
-                    .config
-                    .as_deref()
-                    .map(|path| SealerSession::load(path, self.cluster_egress_endpoint.as_deref()))
-                    .transpose()?;
-                Ok(Some(L1Path {
-                    endpoints: L1Endpoints {
-                        rpcs: rpcs.to_vec(),
-                        light_client: self.l1_light_client_rpc.clone(),
-                    },
-                    cfg: DaWatcherConfig {
-                        lockbox,
-                        poll_interval: Duration::from_secs(self.poll_interval_secs.get()),
-                        resume_after: self.l1_resume_after,
-                    },
-                    cursor_file,
-                    sealer,
-                    origins: None,
-                }))
-            }
+        if !self.l1_blocks {
+            return Ok(None);
         }
+        // `open` takes the cursor's file lock. A second watcher on the
+        // same file stops here with `CursorError::Locked`.
+        let cursor_file = self
+            .l1_cursor_file
+            .as_ref()
+            .map(CursorFile::open)
+            .transpose()
+            .context("open --l1-cursor-file")?;
+        let sealer = self
+            .config
+            .as_deref()
+            .map(|path| SealerSession::load(path, self.cluster_egress_endpoint.as_deref()))
+            .transpose()?;
+        Ok(Some(L1Path {
+            cfg: DaWatcherConfig {
+                tick: Duration::from_secs(self.poll_interval_secs.get()),
+                silence: Duration::from_secs(self.l1_silence_secs.get()),
+                resume_after: self.l1_resume_after,
+            },
+            cursor_file,
+            sealer,
+            origins: None,
+        }))
     }
 
     /// Resolve the interop path: `Some` only when the full peer triple
@@ -473,6 +470,22 @@ async fn serve(
         None => None,
     };
 
+    let l1 = match l1 {
+        Some(l1) => {
+            let (feed, board) = feed::StreamParts {
+                rt: &service.aeron_rt,
+                plane: &mut service.plane,
+                aeron_cfg: &service.aeron_cfg,
+                aeron_dir: args.aeron_dir.clone(),
+                indexer_url: args.indexer_url.as_deref(),
+                response_endpoint: args.archive_control_response_endpoint.as_deref(),
+                replay_endpoint: args.replay_destination_endpoint.as_deref(),
+            }
+            .open()?;
+            Some((l1, feed, board))
+        }
+        None => None,
+    };
     let watchers = Watchers::spawn(
         l1,
         interop,

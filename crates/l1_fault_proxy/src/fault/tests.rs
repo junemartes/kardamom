@@ -140,3 +140,91 @@ fn the_json_form_carries_the_kind_and_the_parameters() {
         serde_json::json!({"kind": "NullReceipts", "from_block": 7})
     );
 }
+
+/// A forked chain stays a chain: the block at the threshold keeps its
+/// true parent, a later block names the forked parent, and a log carries
+/// its block's forked hash. Scoped to one client, the others see L1.
+#[test]
+fn a_forked_chain_is_consistent_and_scoped_to_its_client() {
+    let liar: IpAddr = "10.0.0.7".parse().unwrap();
+    let honest: IpAddr = "10.0.0.8".parse().unwrap();
+    let faults = Faults::one(Fault::ForkedChain {
+        from_block: 0x10,
+        client: Some(liar),
+    });
+    let mut at = block();
+    faults.apply_from(
+        Caller {
+            client: Some(liar),
+            second: true,
+        },
+        "eth_getBlockByNumber",
+        &mut at,
+    );
+    assert_ne!(at["hash"], block()["hash"]);
+    assert_eq!(
+        at["parentHash"],
+        block()["parentHash"],
+        "the fork starts here"
+    );
+
+    let mut after = serde_json::json!({
+        "number": "0x11",
+        "hash": format!("0x{}", "33".repeat(32)),
+        "parentHash": block()["hash"],
+    });
+    faults.apply_from(
+        Caller {
+            client: Some(liar),
+            second: true,
+        },
+        "eth_getBlockByNumber",
+        &mut after,
+    );
+    assert_eq!(after["parentHash"], at["hash"], "the fork is one chain");
+
+    let mut log = serde_json::json!([{ "blockNumber": "0x10", "blockHash": block()["hash"] }]);
+    faults.apply_from(
+        Caller {
+            client: Some(liar),
+            second: true,
+        },
+        "eth_getLogs",
+        &mut log,
+    );
+    assert_eq!(log[0]["blockHash"], at["hash"]);
+
+    let mut seen = block();
+    faults.apply_from(
+        Caller {
+            client: Some(honest),
+            second: false,
+        },
+        "eth_getBlockByNumber",
+        &mut seen,
+    );
+    assert_eq!(seen, block(), "another client sees L1");
+    let json = serde_json::to_value(Fault::ForkedChain {
+        from_block: 3,
+        client: Some(liar),
+    })
+    .unwrap();
+    assert_eq!(json["kind"], "ForkedChain");
+    assert_eq!(json["client"], "10.0.0.7");
+}
+
+/// The second source serves L1 faithfully under every unscoped fault,
+/// and refuses nothing.
+#[test]
+fn the_second_source_serves_l1_faithfully() {
+    let faults = Faults(vec![Fault::WrongBlockHash { from_block: 0 }, Fault::Down]);
+    let second = Caller {
+        client: None,
+        second: true,
+    };
+    let mut seen = block();
+    faults.apply_from(second, "eth_getBlockByNumber", &mut seen);
+    assert_eq!(seen, block());
+    assert_eq!(faults.refusal_for(second), None);
+    assert_eq!(faults.refusal(), Some(Refusal::Down));
+}

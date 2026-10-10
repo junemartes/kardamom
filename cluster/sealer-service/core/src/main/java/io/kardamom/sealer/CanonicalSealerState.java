@@ -189,6 +189,19 @@ public final class CanonicalSealerState {
         return SNAPSHOT_WRITE_VERSION >= 11;
     }
 
+    /** The oldest snapshot version that {@link #load} reads. */
+    public static final int SNAPSHOT_READ_MIN_VERSION = 1;
+
+    /** The snapshot version that {@link #takeSnapshot()} writes. */
+    public static int snapshotWriteVersion() {
+        return SNAPSHOT_WRITE_VERSION;
+    }
+
+    /** The newest snapshot version that {@link #load} reads. */
+    public static int snapshotReadMaxVersion() {
+        return SNAPSHOT_READ_VERSION;
+    }
+
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
     public static final byte REMOTE_REJECT_SEQ_MISMATCH = 1;
     /** Remote-origin reject reason: the anchor does not advance. */
@@ -347,6 +360,13 @@ public final class CanonicalSealerState {
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
+
+    /**
+     * The version of the snapshot this state was restored from, or 0 for
+     * a state that started fresh or from a seed. The admin endpoint
+     * reports it. It is not replicated state and is not snapshotted.
+     */
+    private int restoredSnapshotVersion;
 
     /** Block number the next {@link #onTick(long)} will stamp. */
     private long blockNumber;
@@ -1363,6 +1383,11 @@ public final class CanonicalSealerState {
         return canonicalCount;
     }
 
+    /** The version of the snapshot this state was restored from; 0 when none. */
+    public int restoredSnapshotVersion() {
+        return restoredSnapshotVersion;
+    }
+
     /** Block number the next {@link #onTick(long)} will stamp. */
     public long blockNumber() {
         return blockNumber;
@@ -1616,7 +1641,7 @@ public final class CanonicalSealerState {
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version < 1 || version > SNAPSHOT_READ_VERSION) {
+        if (version < SNAPSHOT_READ_MIN_VERSION || version > SNAPSHOT_READ_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();
@@ -1741,6 +1766,7 @@ public final class CanonicalSealerState {
         // no recorded cursor, so the record-lag guard refuses nothing until
         // the first cursor.
         state.canonicalCount = canonicalCount;
+        state.restoredSnapshotVersion = version;
         return state;
     }
 

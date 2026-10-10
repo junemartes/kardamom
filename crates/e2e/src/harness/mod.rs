@@ -51,6 +51,8 @@ pub struct LocalStack {
     notifier: Option<SpawnedNotifier>,
     ingress: SpawnedIngress,
     da_watcher: Option<Spawned>,
+    /// The L1 follower the da-watcher reads `l1_blocks` from.
+    l1_follower: Option<services::SpawnedFollower>,
     verified_l1: Option<l1_verified::VerifiedL1>,
     executor: Spawned,
     validator: Option<Spawned>,

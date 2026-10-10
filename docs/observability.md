@@ -315,6 +315,9 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
+- `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
+  - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
+  - Growth on a steady fleet means a node runs a release of another schema.
 - `validator_bal_sub_reopen_total` counts the reopens of the `tx_bal` subscription after 60 s of silence.
   - A few reopens on an idle cluster are noise.
   - Growth on a chain that progresses means the BAL delivery to that node is broken. The verification coverage drops.
@@ -348,11 +351,12 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_idle_flush_seconds` | The idle flush wait. The alert compares the post age with twice this value. |
 | `kardamom_batcher_resume_failures_total` | Starts whose L1 read failed. The start retries in the process, so the counter stays scrapeable. |
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |
+| `kardamom_batcher_spool_dropped_total{reason}` | Spools dropped at start. `other-version`: a spool of another release. `unreadable`: a block file does not decode. `discontinuous`: the spool does not continue the confirmed cursor. The sealer serves the range again. One after a deploy is expected. Growth means the spool disk is bad. |
 | `kardamom_batcher_feed_running` | 1 when the feed loop runs over the restored spool. The readiness rule needs it. |
 
 ### L1 sources
 
-The da-watcher and the indexer export these metrics. See "Two L1 sources for the followers" in [l1-data-path.md](l1-data-path.md).
+The indexer (the L1 follower) exports these metrics. See "Two L1 sources for the followers" in [l1-data-path.md](l1-data-path.md).
 
 | Metric | Meaning |
 | --- | --- |
@@ -363,18 +367,20 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_da_watcher_tick_total{outcome}` | Loop ticks. The outcomes are `ok`, `chain_break`, `parse_error`, and `rpc_error`. |
-| `kardamom_da_watcher_l1_finalized_block_number` | Newest finalized L1 block that the watcher saw. |
+| `kardamom_da_watcher_tick_total{outcome}` | Passes over the `l1_blocks` records. The outcomes are `ok` (epochs published), `chain_break`, and `disagreement`. |
+| `kardamom_da_watcher_l1_finalized_block_number` | Newest finalized L1 block that the `l1_blocks` stream carried to the watcher. |
+| `kardamom_da_watcher_waiting_for_l1_block{number}` | 1 while the watcher waits for the record of the block `number` names: no archive holds it, and it is not on the stream. The watcher is paused on the follower meanwhile. |
 | `kardamom_da_watcher_epoch_origin_block_number` | Newest L1 block with a published epoch. The difference to the finalized block is the origin lag. |
 | `kardamom_da_watcher_epochs_published_total` | Epochs published. One for each finalized L1 block. |
 | `kardamom_da_watcher_deposits_detected_total` | Deposit publishes. A range that is retried after back-pressure counts again. |
-| `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last tick. The readiness rule uses it. |
+| `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last housekeeping tick. The readiness rule uses it. |
 | `kardamom_da_watcher_l1_confirmed_origin` | The L1 origin of the sealer, as the boundaries carry it: the last epoch that the sealer committed. The cursor file holds it. |
 | `kardamom_da_watcher_epochs_unconfirmed` | Published epochs that no boundary confirmed yet. It stays near 0 while the sealer commits. At 2048, the watcher publishes no new epoch. |
 | `kardamom_da_watcher_epochs_republished_total` | Epochs published again, because no boundary confirmed them within 30 s. |
 | `kardamom_da_watcher_l1_cursor_persist_failures_total` | Failed writes of the L1 cursor file. A failure is not fatal: a restart publishes epochs again, and the sealer drops them. A growing count moves the restart point further back. |
 
-- A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.
+- A `chain_break` outcome means a record did not descend from the watcher's head. The watcher halts at that block and reads it again from the archives every tick.
+- A `disagreement` outcome means two records of one block had different hashes. The watcher halts until an operator clears it.
 - The interop watcher exports `kardamom_da_watcher_remote_*` counters with the label `origin` (the peer chain id).
 
 ### Publications

@@ -1,87 +1,74 @@
-//! Watcher loop: cursor-tailed L1 polling that builds one
-//! [`kardamom_types::EpochRecord`] per finalized L1 block and publishes it
-//! on the `tx_deposits` Aeron channel.
+//! The L1 watcher: one [`kardamom_types::EpochRecord`] per finalized L1
+//! block on the `tx_deposits` Aeron channel, from the records of the
+//! `l1_blocks` stream.
 //!
 //! The unit is the epoch, not the deposit. Every finalized L1 block yields
 //! exactly one record, including a block with no deposits. The no-skipping
-//! rule only holds if every epoch appears on the stream. See
-//! `docs/agents/l1-origin-deposit-derivation-spec.md`.
+//! rule only holds if every epoch appears on the stream.
 //!
-//! With a sealer feed, the watcher follows the sealer's commit, not its own
-//! publish: see the `follow` module.
+//! The watcher has no L1 access: the L1 follower reads L1, derives each
+//! epoch, and publishes it inside the block's record. The watcher takes
+//! the records in block order, checks each record's parent link against
+//! its head, and publishes the record's epoch. With a sealer feed, it
+//! follows the sealer's commit, not its own publish: see the `follow`
+//! module.
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use kardamom_obs::halt::{self, Halt, HaltCause};
-use kardamom_types::EpochRecord;
-
-use crate::source::LockboxLog;
+use kardamom_types::{L1Block, L1BlockDedup};
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, warn};
+use tokio::time::Instant;
+use tracing::{error, info, warn};
 
 use crate::cursor::{CursorError, CursorFile};
+use crate::feed::BlockFeed;
 use crate::l1_cursor::L1Cursor;
 use crate::metrics;
-use crate::publisher::{EpochPublisher, PublishError};
-use crate::source::{L1Source, L1SourceError};
+use crate::publisher::EpochPublisher;
 use crate::window::Window;
-use kardamom_types::epoch::{EpochError, derive_epoch};
 
 mod follow;
+mod records;
 mod resume;
+mod upstream;
 
 use follow::Confirmation;
 pub use follow::START_WAIT;
 pub use resume::{L1ResumeAfter, ResumeAfterError, WatcherHandle};
+use upstream::Upstream;
 
 /// Watcher configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct DaWatcherConfig {
-    /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
-    pub lockbox: Address,
-    /// Polling cadence for `finalized_block_number()`.
-    pub poll_interval: Duration,
+    /// The cadence of the housekeeping tick: a history read the watcher
+    /// waits on, a publish to retry, the waiting log, the check of the
+    /// follower, and the readiness mark.
+    pub tick: Duration,
+    /// How long the stream may carry no record before the watcher pauses
+    /// with the follower as its root.
+    pub silence: Duration,
     /// The last L1 block whose epoch the chain holds. When set, it
     /// overrides the cursor file and the start's wait for the sealer's
     /// first boundary. A later boundary outside the published range still
     /// moves the watcher to the sealer's origin. `None` resumes after the
     /// sealer's origin, or after the block in the cursor file, or, with
-    /// neither, seeds the cursor at the finalized tip on the first tick.
+    /// neither, anchors at the first record of the stream.
     pub resume_after: Option<L1ResumeAfter>,
 }
 
-/// Errors the watcher's tick loop reports up. A `Tip` or `Logs` error means
-/// the cursor did not advance. The next tick retries the same range. A
-/// chain break and an L1 that does not answer also raise the watcher's
-/// halt (see [`MonitorError::halt`]).
+/// Why a record stops the watcher. A chain break and a disagreement also
+/// raise the watcher's halt (see [`MonitorError::halt`]).
 #[derive(Debug, thiserror::Error)]
 pub enum MonitorError {
-    /// `L1Source::finalized_block_number` failed (transport or decode error).
-    #[error("failed to read L1 finalized tip: {0}")]
-    Tip(L1SourceError),
-    /// `L1Source::lockbox_logs` failed.
-    #[error("failed to read L1 deposit logs: {0}")]
-    Logs(L1SourceError),
-    /// `L1Source::block_hash` failed. An epoch needs its block's hash to
-    /// build the canonical id, so it cannot be built without one.
-    #[error("failed to read L1 block hash: {0}")]
-    BlockHash(L1SourceError),
-    /// The logs fetched for a block disagree with the hash fetched for that
-    /// same block. This can mean an L1 reorg happened between the two
-    /// reads, or the provider served inconsistent views. Never advance the
-    /// cursor past this.
-    #[error("epoch derivation failed: {0}")]
-    Derive(EpochError),
-    /// Block `number` does not descend from the block this watcher
-    /// published before it: its parent hash is not the hash of `number - 1`
-    /// that the watcher holds, from this run or from its cursor file. A
-    /// finalized chain never reorgs, so the provider served an
-    /// inconsistent view, or it lies, or the stored hash came from a lie.
-    /// Never advance the cursor past this: the next tick reads the block
-    /// again, against the same anchor.
+    /// The record of block `number` does not descend from the block this
+    /// watcher published before it. The follower checks the chain before
+    /// it publishes, so the record, or the hash the watcher holds from its
+    /// cursor file, is a lie. The watcher drops the record and reads the
+    /// block again from the archives, against the same anchor.
     #[error(
         "L1 block {number} does not descend from the published block {}: parent {parent}, expected {expected}",
         number - 1
@@ -91,11 +78,23 @@ pub enum MonitorError {
         expected: B256,
         parent: B256,
     },
-    /// The L1 has not yet produced a finalized block. This is a tick-level
-    /// outcome, not an error, so dashboards do not alarm before finality
-    /// starts on a freshly started chain.
-    #[error("L1 has no finalized block yet")]
-    NotFinalized,
+    /// Two records of block `number` with different hashes: one follower
+    /// instance read a lie its cross-check did not catch.
+    #[error(
+        "two records of L1 block {number}: {first} (published) and {second}; the follower instances disagree"
+    )]
+    Disagreement {
+        number: u64,
+        first: B256,
+        second: B256,
+    },
+    /// Two records of block `number` with the same hash and a different
+    /// epoch or batches: one follower instance derived the block's content
+    /// from a lie its cross-check did not catch.
+    #[error(
+        "two records of L1 block {number} with one hash and different contents; the follower instances disagree"
+    )]
+    ContentDisagreement { number: u64 },
     /// The publisher transport is permanently closed. The watcher must exit.
     #[error("deposit publisher closed")]
     PublisherClosed,
@@ -103,62 +102,49 @@ pub enum MonitorError {
 
 impl MonitorError {
     /// The halt this error puts the watcher in: `l1_chain_break` for a
-    /// block that does not descend from the published one, and the halt
-    /// of an L1 read that failed ([`L1SourceError::halt_cause`]). `None`
-    /// for every other error. Every one of these halts clears by itself:
-    /// the watcher retries the same range on every tick.
+    /// record that does not descend from the head, which clears by itself
+    /// once a record that does arrives; `l1_follower_disagreement` for
+    /// two hashes of one block, which an operator clears.
     #[must_use]
     pub fn halt(&self) -> Option<Halt> {
         let cause = match self {
             Self::ChainBreak { .. } => Some(HaltCause::L1ChainBreak),
-            Self::Tip(e) | Self::Logs(e) | Self::BlockHash(e) => e.halt_cause(),
-            _ => None,
+            Self::Disagreement { .. } | Self::ContentDisagreement { .. } => {
+                Some(HaltCause::L1FollowerDisagreement)
+            }
+            Self::PublisherClosed => None,
         };
         cause.map(|cause| Halt::new(cause, self.to_string()))
     }
 }
 
-/// [`Tick::read_range`]'s result: the block the range descends from,
-/// the inclusive `anchor.number + 1..=tip` range this tick should
-/// publish, and its lockbox logs bucketed by block.
-struct TickRange {
-    anchor: L1Cursor,
-    tip: u64,
-    by_block: BTreeMap<u64, Vec<LockboxLog>>,
-}
-
-/// What [`L1Watcher::publish_one_epoch`] did with one block.
-enum PublishStep {
-    /// Published; the caller's count and the cursor both advance to this
-    /// block.
-    Published(EpochRecord),
-    /// Backpressured, transport-failed, or the window is full. The range
-    /// halts here; the next tick retries from this block.
-    Halt,
-}
-
 /// Where the watcher stands on L1.
 #[derive(Debug, Clone)]
 enum Position {
-    /// No block yet: the first tick anchors at the finalized tip.
+    /// No block yet: the first record anchors the watcher.
     Tip,
-    /// Resume after this block. The first tick reads its hash, which then
+    /// Resume after this block. Its record gives its hash, which then
     /// anchors the next block.
     After(L1ResumeAfter),
-    /// The confirmed block, and the epochs published after it. The next
-    /// block must name the last published block's hash as its parent.
-    Anchored(Window),
+    /// The confirmed block, the epochs published after it, and the rule
+    /// of the two follower instances at the window's head. The next record
+    /// must name the head's hash as its parent.
+    Anchored(Window, L1BlockDedup),
 }
 
-/// The L1 watcher's state: the L1 source, the epoch publisher, the
-/// lockbox address, the poll cadence, the position, what confirms a
-/// published epoch, and the file that keeps the confirmed block across a
-/// restart.
+/// The block whose record the watcher needs next and does not have.
+#[derive(Debug, Clone, Copy)]
+struct Wanted {
+    number: u64,
+    since: Instant,
+}
+
+/// The L1 watcher's state: the record feed, the epoch publisher, the
+/// position, what confirms a published epoch, and the file that keeps the
+/// confirmed block across a restart.
 ///
 /// The position chains every block to the one before it by the parent
-/// hash. Verifying each block alone would let an L1 endpoint serve any
-/// hash for any number; the link forces it to fabricate a consistent chain
-/// instead. The cursor file keeps the link across a restart, so the first
+/// hash. The cursor file keeps the link across a restart, so the first
 /// block after a restart is linked too.
 ///
 /// With a sealer feed ([`Self::following`]), the boundaries' L1 origin
@@ -166,48 +152,69 @@ enum Position {
 /// and the epochs that no boundary confirms are published again. Without
 /// one, a publish confirms its epoch, and the file holds the last
 /// published block.
-pub struct L1Watcher<S, P> {
-    source: S,
+pub struct L1Watcher<F, P> {
+    feed: F,
     publisher: P,
-    lockbox: Address,
-    poll_interval: Duration,
+    tick: Duration,
     position: Position,
     confirmation: Confirmation,
     cursor_file: Option<CursorFile<L1Cursor>>,
     /// The cursor the file holds, as this run last read or wrote it.
     persisted: Option<L1Cursor>,
+    /// The records that arrived and wait for their turn, in order.
+    inbox: VecDeque<L1Block>,
+    /// The block whose record the archives must give: the next history
+    /// read starts there.
+    wanted: Option<Wanted>,
+    /// No history read before this instant.
+    history_at: Option<Instant>,
+    /// No publish before this instant: the last one failed.
+    retry_at: Option<Instant>,
+    /// An operator halt stands: the watcher takes no record until the
+    /// clear.
+    held: bool,
+    upstream: Upstream,
 }
 
-impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
-    /// A watcher at the configured resume block, or at the finalized tip.
+impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
+    /// A watcher at the configured resume block, or at the first record.
     /// [`Self::load_cursor`] then applies the cursor file.
     #[must_use]
     pub fn new(
         publisher: P,
-        source: S,
+        feed: F,
         config: DaWatcherConfig,
         cursor_file: Option<CursorFile<L1Cursor>>,
     ) -> Self {
-        Self {
-            source,
+        let mut watcher = Self {
+            feed,
             publisher,
-            lockbox: config.lockbox,
-            poll_interval: config.poll_interval,
-            position: config.resume_after.map_or(Position::Tip, Position::After),
+            tick: config.tick,
+            position: Position::Tip,
             confirmation: Confirmation::Publish,
             cursor_file,
             persisted: None,
+            inbox: VecDeque::new(),
+            wanted: None,
+            history_at: None,
+            retry_at: None,
+            held: false,
+            upstream: Upstream::new(config.silence),
+        };
+        if let Some(after) = config.resume_after {
+            watcher.resume_after(after);
         }
+        watcher
     }
 
     /// The last L1 block whose epoch was published, or `None` before the
-    /// first seed.
+    /// first anchor.
     #[must_use]
     pub fn cursor(&self) -> Option<u64> {
         match &self.position {
             Position::Tip => None,
             Position::After(block) => Some(block.block()),
-            Position::Anchored(window) => Some(window.head().number),
+            Position::Anchored(window, _) => Some(window.head().number),
         }
     }
 
@@ -216,21 +223,38 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     #[must_use]
     pub fn confirmed(&self) -> Option<L1Cursor> {
         match &self.position {
-            Position::Anchored(window) => Some(window.base()),
+            Position::Anchored(window, _) => Some(window.base()),
             Position::Tip | Position::After(_) => None,
         }
+    }
+
+    /// Resume after `after`: the watcher needs its record.
+    fn resume_after(&mut self, after: L1ResumeAfter) {
+        self.position = Position::After(after);
+        self.inbox.clear();
+        self.want(after.block());
+    }
+
+    /// Anchor at `cursor`: the next record must name its hash as its
+    /// parent. The watcher reads the records after it from the archives.
+    fn anchor_at(&mut self, cursor: L1Cursor) {
+        self.position = Position::Anchored(
+            Window::new(cursor),
+            L1BlockDedup::after(cursor.number, cursor.hash),
+        );
     }
 
     /// Apply the cursor file to the start position. The order of
     /// precedence:
     ///
     /// 1. `resume_after` wins. The operator sets it after a seed, and the
-    ///    file then holds a block of the old chain. The first tick
-    ///    anchors at the resume block and overwrites the file.
+    ///    file then holds a block of the old chain. The watcher anchors at
+    ///    the resume block's record and overwrites the file.
     /// 2. A file that parses: resume after its block, linked to its hash.
-    /// 3. No file: the finalized tip, logged as a warning. The epochs
-    ///    between the last publish and the tip are lost, unless this is
-    ///    the chain's first start.
+    ///    The watcher reads the records after it from the archives.
+    /// 3. No file: the first record of the stream, logged as a warning.
+    ///    The epochs between the last publish and that record are lost,
+    ///    unless this is the chain's first start.
     ///
     /// With a sealer feed, the first boundary then overrides 2 and 3: see
     /// [`Self::start_at`].
@@ -243,8 +267,8 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         let Some(file) = &self.cursor_file else {
             warn!(
                 target: "da_watcher",
-                "no L1 cursor file is set; a restart starts at the finalized tip and loses the \
-                 epochs between the last publish and the tip"
+                "no L1 cursor file is set; a restart starts at the newest record and loses the \
+                 epochs between the last publish and that record"
             );
             return Ok(());
         };
@@ -261,9 +285,9 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             warn!(
                 target: "da_watcher",
                 cursor_file = %file.path().display(),
-                "NO L1 CURSOR FILE: starting at the finalized tip. Unless this is the chain's \
-                 first start, the deposits of the L1 blocks between the last publish and the tip \
-                 are lost; give --l1-resume-after to resume after a known block"
+                "NO L1 CURSOR FILE: starting at the newest record of l1_blocks. Unless this is \
+                 the chain's first start, the deposits of the L1 blocks between the last publish \
+                 and that record are lost; give --l1-resume-after to resume after a known block"
             );
             return Ok(());
         };
@@ -273,7 +297,8 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             l1_hash = %cursor.hash,
             "resuming after the block in the L1 cursor file"
         );
-        self.position = Position::Anchored(Window::new(cursor));
+        self.anchor_at(cursor);
+        self.want(cursor.number.saturating_add(1));
         self.persisted = Some(cursor);
         Ok(())
     }
@@ -289,11 +314,11 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// task and a cooperative shutdown channel.
     pub fn spawn(
         publisher: P,
-        source: S,
+        feed: F,
         config: DaWatcherConfig,
         cursor_file: Option<CursorFile<L1Cursor>>,
     ) -> WatcherHandle {
-        Self::new(publisher, source, config, cursor_file).start()
+        Self::new(publisher, feed, config, cursor_file).start()
     }
 
     /// Spawn this watcher's loop. Return a [`WatcherHandle`] that owns the
@@ -307,8 +332,8 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     }
 
     /// Load the cursor, follow the sealer's first boundary, then run the
-    /// tick loop. `shutdown` stays outside the state, so the select in
-    /// [`Self::step`] can wait on it while the pass borrows `self`.
+    /// loop. `shutdown` stays outside the state, so the select in
+    /// [`Self::step`] can wait on it while the step borrows `self`.
     async fn run(mut self, mut shutdown: oneshot::Receiver<()>) {
         if self.await_cursor(&mut shutdown).await.is_break() {
             return;
@@ -316,11 +341,9 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         if self.follow_start(&mut shutdown).await.is_break() {
             return;
         }
-        // `interval` fires immediately on the first `tick().await`. This
-        // is what we want: it seeds the cursor as soon as the task starts.
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        while let ControlFlow::Continue(()) = self.step(&mut shutdown, &mut interval).await {}
+        let mut housekeeping = tokio::time::interval(self.tick);
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while let ControlFlow::Continue(()) = self.step(&mut shutdown, &mut housekeeping).await {}
         self.persist_cursor();
     }
 
@@ -360,127 +383,179 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         }
     }
 
-    /// Wait for the next tick, a new sealer origin, a due re-publish, or
-    /// the shutdown signal, and handle it. A tick runs one pass and
-    /// reports it. `Break` ends the loop: shutdown, or a closed publisher.
-    /// The tick comes before the origin, so a fast boundary stream cannot
-    /// starve the publish; the watch keeps only the newest origin.
+    /// Take the work at hand: a history read that is due, then every
+    /// record that waits. Then wait for the next record, a new sealer
+    /// origin, a due re-publish, the operator's clear, the housekeeping
+    /// tick, or the shutdown signal. `Break` ends the loop: shutdown, a
+    /// closed stream, or a closed publisher. The origin comes before the
+    /// record, so a stream that runs ahead cannot hide a new origin.
     async fn step(
         &mut self,
         shutdown: &mut oneshot::Receiver<()>,
-        interval: &mut tokio::time::Interval,
+        housekeeping: &mut tokio::time::Interval,
     ) -> ControlFlow<()> {
+        if Self::report(&self.process_once().await).is_break() {
+            return ControlFlow::Break(());
+        }
         let due = self.republish_at();
+        let held = self.held;
         tokio::select! {
             biased;
             _ = shutdown => {
                 info!(target: "da_watcher", "shutting down");
-                return ControlFlow::Break(());
+                ControlFlow::Break(())
             }
-            _ = interval.tick() => {}
+            () = halt::cleared(), if held => {
+                self.release();
+                ControlFlow::Continue(())
+            }
             origin = self.confirmation.changed() => {
                 self.on_sealer_origin(origin);
-                return ControlFlow::Continue(());
+                ControlFlow::Continue(())
             }
-            () = Self::sleep_until(due) => return Self::report_republish(&self.republish_due()),
+            () = Self::sleep_until(due) => Self::report_republish(&self.republish_due()),
+            _ = housekeeping.tick() => {
+                self.housekeep();
+                ControlFlow::Continue(())
+            }
+            record = self.feed.next(), if !held => self.receive(record),
         }
-        Self::report(self.process_once().await)
     }
 
-    /// Count and log one pass's outcome. Only a closed publisher stops
-    /// the loop; every other error retries on the next tick. A chain
-    /// break or an unreachable L1 raises the watcher's halt, and a good
-    /// pass clears it.
-    fn report(outcome: Result<usize, MonitorError>) -> ControlFlow<()> {
-        kardamom_obs::ready::mark_now(metrics::LAST_TICK_UNIX_SECONDS);
+    /// Take one live record into the inbox. `Break` when the stream
+    /// closed: the process is shutting down.
+    fn receive(&mut self, record: Option<L1Block>) -> ControlFlow<()> {
+        let Some(record) = record else {
+            warn!(target: "da_watcher", "the l1_blocks stream closed; exiting");
+            return ControlFlow::Break(());
+        };
+        self.arrived(record);
+        ControlFlow::Continue(())
+    }
+
+    /// A live record arrived: it waits in the inbox for its turn.
+    fn arrived(&mut self, record: L1Block) {
+        self.upstream.saw_record();
+        Self::mark_finalized(record.number);
+        self.inbox.push_back(record);
+    }
+
+    /// Export the newest finalized block the stream carried, live or from
+    /// the archives.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric value; never nears 2^52 for an L1 block number"
+    )]
+    fn mark_finalized(number: u64) {
+        ::metrics::gauge!(metrics::L1_FINALIZED).set(number as f64);
+    }
+
+    /// The operator cleared the halt: read the records after the head
+    /// again.
+    fn release(&mut self) {
+        info!(target: "da_watcher", "the operator cleared the halt; reading l1_blocks again");
+        self.held = false;
+        if let Some(head) = self.cursor() {
+            self.want(head.saturating_add(1));
+        }
+    }
+
+    /// Log the outcome of one pass and raise its halt. Only a closed
+    /// publisher stops the loop.
+    fn report(outcome: &Result<usize, MonitorError>) -> ControlFlow<()> {
         match outcome {
-            Ok(0) => {
-                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
-                halt::clear();
-            }
+            Ok(0) => {}
             Ok(n) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
                 info!(target: "da_watcher", published = n, "epochs published");
-                halt::clear();
-            }
-            Err(MonitorError::NotFinalized) => {
-                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
-                debug!(target: "da_watcher", "L1 has no finalized block yet");
-                halt::clear();
             }
             Err(MonitorError::PublisherClosed) => {
                 warn!(target: "da_watcher", "publisher closed; exiting");
                 return ControlFlow::Break(());
             }
-            Err(ref e @ MonitorError::ChainBreak { .. }) => {
+            Err(e @ MonitorError::ChainBreak { .. }) => {
                 ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "chain_break").increment(1);
-                warn!(target: "da_watcher", error = %e, "tick failed (the L1 view is not a chain)");
-                if let Some(halt) = e.halt() {
-                    halt::raise(halt);
-                }
+                warn!(target: "da_watcher", error = %e, "a record does not descend from the head");
+                Self::raise(e);
             }
             Err(
-                ref e @ (MonitorError::Tip(L1SourceError::Decode(_))
-                | MonitorError::Logs(L1SourceError::Decode(_))),
+                e @ (MonitorError::Disagreement { .. } | MonitorError::ContentDisagreement { .. }),
             ) => {
-                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "parse_error").increment(1);
-                warn!(target: "da_watcher", error = %e, "tick failed (parse error)");
-            }
-            Err(e) => {
-                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
-                warn!(target: "da_watcher", error = %e, "tick failed");
-                if let Some(halt) = e.halt() {
-                    halt::raise(halt);
-                }
+                ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "disagreement").increment(1);
+                error!(target: "da_watcher", error = %e, "the follower instances disagree; halted until an operator clears it");
+                Self::raise(e);
             }
         }
         ControlFlow::Continue(())
     }
 
-    /// One processing pass. This is public, so unit tests can call it
-    /// directly, with no timer or thread.
+    fn raise(error: &MonitorError) {
+        if let Some(halt) = error.halt() {
+            halt::raise(halt);
+        }
+    }
+
+    /// One pass, with no wait for a live record: the live records that
+    /// already arrived, the history read when one is due (its records go
+    /// before the live ones), then every record
+    /// that waits, in order, up to the first that does not publish. This
+    /// is public, so unit tests can call it with no timer or thread.
     ///
-    /// On success, return `Ok(n)`, where `n` is the number of epochs
-    /// published this pass. `n` is zero on a seed or idle tick. The cursor
-    /// advances per published block, so a partial pass resumes exactly
-    /// where it stopped.
-    ///
-    /// After the pass, success or not, the cursor file receives the
-    /// confirmed block when it moved. The write follows the confirm it
-    /// records, never precedes it: see [`crate::cursor`].
+    /// On success, return how many epochs the pass published. After the
+    /// pass, success or not, the cursor file receives the confirmed block
+    /// when it moved. The write follows the confirm it records, never
+    /// precedes it: see [`crate::cursor`].
     ///
     /// # Errors
-    /// Returns [`MonitorError`] on any read or publish failure; see
-    /// [`Self::read_range`] and [`Self::publish_one_epoch`] for which
-    /// variant means what. The cursor stays at the last block that
-    /// published.
-    ///
-    /// A publish backpressure event is logged. The cursor stays at the
-    /// last block that did publish, so the next tick retries from the one
-    /// that did not.
+    /// Returns [`MonitorError`] on a record that breaks the chain, two
+    /// records that disagree, or a closed publisher. The head stays at the
+    /// last block that published.
     pub async fn process_once(&mut self) -> Result<usize, MonitorError> {
-        let outcome = self.publish_range().await;
+        self.take_arrived();
+        self.read_history().await;
+        let outcome = self.process();
         self.persist_cursor();
         self.record_window();
         outcome
     }
 
-    /// Read this tick's range and publish its epochs in order, up to the
-    /// first that does not publish.
-    async fn publish_range(&mut self) -> Result<usize, MonitorError> {
-        let Some(mut range) = self.read_range().await? else {
-            return Ok(0);
-        };
-        let mut published_count = 0usize;
-        // PROVEN: `read_range` returns a range only when `anchor.number <
-        // tip <= u64::MAX`, so `anchor.number + 1` cannot overflow.
-        for number in range.anchor.number.saturating_add(1)..=range.tip {
-            match self.publish_block(&mut range, number).await? {
-                PublishStep::Published(_) => published_count += 1,
-                PublishStep::Halt => return Ok(published_count),
-            }
+    /// Move the live records that already arrived into the inbox.
+    fn take_arrived(&mut self) {
+        while let Some(record) = self.feed.try_next() {
+            self.arrived(record);
         }
-        Ok(published_count)
+    }
+
+    /// Ask the archives for the records from `number` on, at the next
+    /// history read. The watcher waits for that record from now.
+    fn want(&mut self, number: u64) {
+        let since = match self.wanted {
+            Some(wanted) if wanted.number == number => wanted.since,
+            _ => Instant::now(),
+        };
+        self.wanted = Some(Wanted { number, since });
+    }
+
+    /// The history read, when the watcher wants a record and the last
+    /// read is one tick back: the records go before the live ones that
+    /// wait. The watcher keeps wanting the block until a record of it is
+    /// taken, so a read that comes back short is repeated every tick.
+    async fn read_history(&mut self) {
+        let now = Instant::now();
+        let Some(wanted) = self.wanted else {
+            return;
+        };
+        if self.history_at.is_some_and(|at| at > now) {
+            return;
+        }
+        self.history_at = now.checked_add(self.tick);
+        let history = self.feed.history(wanted.number).await;
+        if let Some(newest) = history.iter().map(|record| record.number).max() {
+            self.upstream.saw_record();
+            Self::mark_finalized(newest);
+        }
+        let live = std::mem::take(&mut self.inbox);
+        self.inbox = history.into_iter().chain(live).collect();
     }
 
     /// Write the confirmed block to the file when it moved since the last
@@ -510,212 +585,5 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
             "L1 cursor persist failed; a restart before the next good persist publishes \
              again from an older block (harmless: the sealer drops the repeats)"
         );
-    }
-
-    /// Read the finalized tip and, when the cursor already has new blocks
-    /// behind it, fetch this tick's lockbox logs. `Ok(None)` means the
-    /// tick only seeded the cursor or found nothing new; the caller
-    /// reports `Ok(0)` for both.
-    ///
-    /// # Errors
-    /// - [`MonitorError::Tip`] if reading the L1 finalized tip fails.
-    /// - [`MonitorError::BlockHash`] if reading the anchor block fails.
-    /// - [`MonitorError::Logs`] if reading the deposit logs in `(cursor, tip]` fails.
-    async fn read_range(&mut self) -> Result<Option<TickRange>, MonitorError> {
-        let tip = match self.source.finalized_block_number().await {
-            Ok(n) => n,
-            Err(L1SourceError::NotFinalized) => return Err(MonitorError::NotFinalized),
-            Err(e) => return Err(MonitorError::Tip(e)),
-        };
-
-        // Emit the finalized tip gauge on every successful tip fetch.
-        // Metric value; f64 precision loss only above 2^52, never reached
-        // by an L1 block number.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "metric value; never nears 2^52 for an L1 block number"
-        )]
-        ::metrics::gauge!(metrics::L1_FINALIZED).set(tip as f64);
-
-        let Some(anchor) = self.anchor(tip).await? else {
-            return Ok(None);
-        };
-        if tip <= anchor.number {
-            return Ok(None);
-        }
-        // PROVEN: `anchor.number < tip <= u64::MAX`, so `+ 1` cannot
-        // overflow. `saturating_add` documents that at the call site
-        // instead of an unchecked `+`.
-        let from_block = anchor.number.saturating_add(1);
-
-        // Fetch the logs with one range query, then split by block. A query per
-        // block would multiply RPC round-trips during catch-up, for no gain.
-        let logs = self
-            .source
-            .lockbox_logs(self.lockbox, from_block, tip)
-            .await
-            .map_err(MonitorError::Logs)?;
-        let mut by_block: BTreeMap<u64, Vec<LockboxLog>> = BTreeMap::new();
-        for log in logs {
-            by_block.entry(log.block_number()).or_default().push(log);
-        }
-        Ok(Some(TickRange {
-            anchor,
-            tip,
-            by_block,
-        }))
-    }
-
-    /// The block the next epoch descends from. A position without a hash
-    /// reads it from L1 here, once, and the watcher anchors there: at the
-    /// finalized tip on a first start (historical deposits are skipped,
-    /// per the spec's Non-Goals section), or at the resume block. `None`
-    /// while the resume block is not finalized yet.
-    ///
-    /// # Errors
-    /// [`MonitorError::BlockHash`] if reading the anchor block fails.
-    async fn anchor(&mut self, tip: u64) -> Result<Option<L1Cursor>, MonitorError> {
-        let number = match &self.position {
-            Position::Anchored(window) => return Ok(Some(window.head())),
-            Position::After(block) if tip < block.block() => return Ok(None),
-            Position::After(block) => block.block(),
-            Position::Tip => tip,
-        };
-        let (hash, _) = self
-            .source
-            .block_ids(number)
-            .await
-            .map_err(MonitorError::BlockHash)?;
-        let anchor = L1Cursor { number, hash };
-        info!(
-            target: "da_watcher",
-            l1_number = number,
-            l1_hash = %hash,
-            "anchored the L1 cursor"
-        );
-        self.position = Position::Anchored(Window::new(anchor));
-        Ok(Some(anchor))
-    }
-
-    /// Take block `number`'s logs out of the range (empty when the block
-    /// had none) and publish its epoch. On a publish, the range and the
-    /// window both advance to the block. A full window publishes nothing:
-    /// the range halts until a boundary confirms an epoch. For
-    /// [`Self::publish_range`]'s loop.
-    ///
-    /// # Errors
-    /// Same as [`Self::publish_one_epoch`].
-    async fn publish_block(
-        &mut self,
-        range: &mut TickRange,
-        number: u64,
-    ) -> Result<PublishStep, MonitorError> {
-        if let Position::Anchored(window) = &self.position
-            && window.is_full()
-        {
-            debug!(
-                target: "da_watcher",
-                l1_number = number,
-                unconfirmed = window.len(),
-                "the publish window is full; waiting for a boundary"
-            );
-            return Ok(PublishStep::Halt);
-        }
-        let logs = range.by_block.remove(&number).unwrap_or_default();
-        let step = self.publish_one_epoch(range.anchor, number, logs).await?;
-        if let PublishStep::Published(epoch) = &step {
-            range.anchor = L1Cursor {
-                number,
-                hash: epoch.l1_hash,
-            };
-            self.keep_published(epoch.clone());
-        }
-        Ok(step)
-    }
-
-    /// Derive block `number`'s epoch from `logs` and its L1 hash, and
-    /// publish it. The block must descend from `anchor`, the block
-    /// published before it.
-    ///
-    /// # Errors
-    /// - [`MonitorError::BlockHash`] if reading the L1 block hash fails.
-    /// - [`MonitorError::ChainBreak`] if the block's parent is not `anchor`.
-    /// - [`MonitorError::Derive`] if the logs disagree with the hash.
-    /// - [`MonitorError::PublisherClosed`] if the publisher transport is shut.
-    async fn publish_one_epoch(
-        &mut self,
-        anchor: L1Cursor,
-        number: u64,
-        logs: Vec<LockboxLog>,
-    ) -> Result<PublishStep, MonitorError> {
-        // A block with no deposits has no log to carry its hash, so the hash is
-        // fetched per block. `derive_epoch` then checks every log's
-        // block_hash against it. This is what catches a reorg between the log
-        // query and this read.
-        let (hash, parent) = self
-            .source
-            .block_ids(number)
-            .await
-            .map_err(MonitorError::BlockHash)?;
-        if parent != anchor.hash {
-            return Err(MonitorError::ChainBreak {
-                number,
-                expected: anchor.hash,
-                parent,
-            });
-        }
-        let epoch = derive_epoch(number, hash, &logs).map_err(MonitorError::Derive)?;
-        let deposits = epoch.deposits.len();
-
-        match self.publisher.publish(&epoch) {
-            Ok(pos) => {
-                // The caller advances the cursor per block, not once for the
-                // whole range. A failure halfway through must not re-publish
-                // already-accepted epochs. Dedup would absorb a repeat, but
-                // the cursor also drives the origin-lag signal, and it should
-                // not go backwards.
-                ::metrics::counter!(metrics::EPOCHS_PUBLISHED_TOTAL).increment(1);
-                ::metrics::counter!(metrics::DEPOSITS_DETECTED_TOTAL).increment(deposits as u64);
-                // Metric value; f64 precision loss only above 2^52,
-                // never reached by an L1 block number.
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "metric value; never nears 2^52 for an L1 block number"
-                )]
-                ::metrics::gauge!(metrics::EPOCH_ORIGIN).set(number as f64);
-                debug!(
-                    target: "da_watcher",
-                    l1_number = number,
-                    deposits,
-                    ?pos,
-                    "published epoch"
-                );
-                Ok(PublishStep::Published(epoch))
-            }
-            Err(PublishError::Backpressure) => {
-                // Hold the cursor at the last successful block. The next tick
-                // resumes at exactly this one.
-                warn!(
-                    target: "da_watcher",
-                    l1_number = number,
-                    "epoch publish backpressured; will retry next tick"
-                );
-                Ok(PublishStep::Halt)
-            }
-            Err(PublishError::Closed) => Err(MonitorError::PublisherClosed),
-            Err(PublishError::Transport(detail)) => {
-                // An epoch must never be skipped: skipping one puts a permanent
-                // hole in the origin sequence, and a verifier would later
-                // reject the chain for it. Stop the range here and retry from
-                // this block.
-                warn!(
-                    target: "da_watcher",
-                    l1_number = number,
-                    %detail,
-                    "epoch publish failed; halting range (an epoch must never be skipped)"
-                );
-                Ok(PublishStep::Halt)
-            }
-        }
     }
 }

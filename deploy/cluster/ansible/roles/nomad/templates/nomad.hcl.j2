@@ -60,9 +60,7 @@ client {
   # node_ip and node_index feed the jobs that still form an endpoint or
   # a host id from the node. Their removal belongs to the dynamic MDC
   # cutover; until then every profile stamps them.
-{# The role set (node_roles): an inventory gives it as a comma list, the
-   container contract as a list; a node without one hosts its class only. #}
-{% set roles_set = ((node_roles.split(',') if node_roles is string else node_roles) if node_roles is defined else [role]) | map('trim') | list %}
+{% set roles_set = node_role_set %}
   meta {
     kardamom_node = "{{ kardamom_node }}"
     cluster_id    = "{{ cluster_id }}"

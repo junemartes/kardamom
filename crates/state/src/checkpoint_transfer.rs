@@ -22,6 +22,9 @@
 //!
 //! HTTP/1.0 200 OK
 //! x-checkpoint-block: <u64>
+//! x-checkpoint-keccak: <0x hash>
+//! x-checkpoint-genesis: <0x hash>
+//! x-checkpoint-schema: <u32>
 //! content-length: <bytes>
 //!
 //! <mdbx image>
@@ -44,7 +47,9 @@ use tracing::{info, warn};
 
 use alloy_primitives::B256;
 
-use crate::checkpoint::{CheckpointInfo, checkpoint_data_file, checkpoint_name, latest_checkpoint};
+use crate::checkpoint::{
+    CheckpointInfo, ImageSchema, checkpoint_data_file, checkpoint_name, latest_checkpoint,
+};
 use crate::error::StateError;
 
 /// The read/write timeout for each socket. Transfers stream in bounded
@@ -64,6 +69,9 @@ mod framing {
     pub(super) const HDR_BLOCK: &str = "x-checkpoint-block";
     pub(super) const HDR_KECCAK: &str = "x-checkpoint-keccak";
     pub(super) const HDR_GENESIS: &str = "x-checkpoint-genesis";
+    /// The state schema of the image. A peer of an older release sends
+    /// no such header.
+    pub(super) const HDR_SCHEMA: &str = "x-checkpoint-schema";
 }
 
 /// Removes the wrapped temp directory on drop. Set the field to `None`
@@ -188,8 +196,13 @@ fn prepare_response(
             return Err(SERVER_ERROR);
         }
     };
+    let schema = manifest
+        .schema_version
+        .stated()
+        .map(|schema| format!("{}: {schema}\r\n", framing::HDR_SCHEMA))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.0 200 OK\r\n{}: {}\r\n{}: {:#x}\r\n{}: {:#x}\r\ncontent-length: {len}\r\n\r\n",
+        "HTTP/1.0 200 OK\r\n{}: {}\r\n{}: {:#x}\r\n{}: {:#x}\r\n{schema}content-length: {len}\r\n\r\n",
         framing::HDR_BLOCK,
         ckpt.block,
         framing::HDR_KECCAK,
@@ -262,6 +275,8 @@ pub(crate) fn fetch_latest_checkpoint(
         // floor. Do not download the body.
         return Ok(None);
     }
+    // An image this release cannot open is refused before the download.
+    head.schema.check(&format!("from peer {peer}"))?;
 
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(head.block));
@@ -485,6 +500,7 @@ impl<'a> CheckpointFetch<'a> {
             block: head.block,
             image_keccak: got,
             genesis_digest: head.genesis,
+            schema_version: head.schema,
         })
     }
 }
@@ -505,6 +521,9 @@ struct CheckpointHead {
     len: u64,
     keccak: B256,
     genesis: B256,
+    /// The image's state schema; none stated from a peer of an older
+    /// release.
+    schema: ImageSchema,
 }
 
 impl PeerResponse {
@@ -551,6 +570,7 @@ impl PeerResponse {
             len,
             keccak,
             genesis,
+            schema: headers.schema,
         }))
     }
 
@@ -586,6 +606,7 @@ struct ParsedHeaders {
     content_length: Option<u64>,
     keccak: Option<B256>,
     genesis: Option<B256>,
+    schema: ImageSchema,
 }
 
 impl ParsedHeaders {
@@ -599,6 +620,7 @@ impl ParsedHeaders {
             "content-length" => self.content_length = v.parse().ok(),
             framing::HDR_KECCAK => self.keccak = v.parse().ok(),
             framing::HDR_GENESIS => self.genesis = v.parse().ok(),
+            framing::HDR_SCHEMA => self.schema = ImageSchema::parse(v),
             _ => {}
         }
         self

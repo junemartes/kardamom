@@ -431,7 +431,10 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 | any other path | 404 |
 
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition` and `ready`.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest` and `ready`.
+  - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
+  - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
+  - A deploy reads `snapshotLatest` on every member before it rolls. It refuses a release whose `reads_max` is below that version, because that member could not restore its own snapshot after the roll.
 - A member is ready when all of these are true:
   - the role is `LEADER` or `FOLLOWER`
   - the election state is `CLOSED`

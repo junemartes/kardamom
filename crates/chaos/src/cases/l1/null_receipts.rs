@@ -10,8 +10,8 @@ use kardamom_l1_fault_proxy::Fault;
 use super::batcher::{
     BeforeRestart, assert_resumed_from_contract, await_posting, require_posting, restart,
 };
-use super::deferred;
 use super::followers::{Followers, await_archive_complete, await_resume};
+use super::halt::await_followers_halted;
 use crate::harness::Harness;
 use crate::l1::{L1, STALE_POST_ALERT};
 
@@ -35,10 +35,9 @@ pub(crate) async fn null_receipts(h: &mut Harness) -> anyhow::Result<()> {
     crate::log(format!("{ctx}: {faults:?} for {}s", window.as_secs()));
     l1.set_faults(&faults).await?;
     let armed = Instant::now();
-    deferred(
-        ctx,
-        "the followers' halt within 3 ticks: one source cannot see a null receipt or a missing log; the cross-check of two can",
-    );
+    // The follower's two sources disagree on the swallowed logs: it halts,
+    // and the da-watcher pauses on it.
+    await_followers_halted(h, base, ctx).await?;
     // The batcher waits on a receipt that never comes, so its last post
     // ages on L1: the one signal of this fault that pages.
     l1.await_alert_held(STALE_POST_ALERT, ALERT_HOLD, window, ctx)

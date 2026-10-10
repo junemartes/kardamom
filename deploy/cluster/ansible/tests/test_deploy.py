@@ -368,7 +368,7 @@ class Deploys(unittest.TestCase):
     # The jobs a manifest with new digests changes, in deploy order: every
     # pinned image, and not anvil or the monitoring.
     REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
-                'validator', 'da-watcher', 'da-store', 'batcher']
+                'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
         return self.api.state['records']['kardamom/deploys/local']
@@ -401,17 +401,23 @@ class DeployTest(Deploys):
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
                     'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
-                    'da-store', 'batcher', 'canary']
+                    'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertIn('--collector.disable-defaults', exporter, 'the local profile skips the host hardware collectors')
         for name in SERVICES:
             tasks = [t for g in self.api.state['jobs'][name]['TaskGroups'] for t in g['Tasks']]
             self.assertTrue(all(t['Config']['image'].endswith('@sha256:' + 'a' * 64) for t in tasks))
-        # Without a real L1, the batcher and the da-watcher get the
-        # in-cluster anvil, and the batcher the anvil dev key.
+        # Without a real L1, the batcher and the L1 follower get the
+        # in-cluster anvil, and the batcher the anvil dev key. The
+        # da-watcher reads no L1, so it has no secret.
         variables = self.api.state['variables']
-        self.assertEqual(variables['nomad/jobs/da-watcher'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
+        self.assertEqual(variables['nomad/jobs/l1-indexer'], {'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
+        self.assertNotIn('nomad/jobs/da-watcher', variables)
+        # Every deployment runs the follower; anvil has no beacon chain,
+        # so it reads every second.
+        follower = self.api.state['jobs']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
         self.assertEqual(variables['nomad/jobs/canary'], {
@@ -420,7 +426,7 @@ class DeployTest(Deploys):
         canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
         self.assertEqual(sorted(self.api.state['variable_writes']),
-                         ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/da-watcher'])
+                         ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/l1-indexer'])
         self.run_deploy(environ=local_canary)
         self.assertEqual(self.api.state['writes'], expected, 'unchanged redeploy must not register jobs')
         self.assertEqual(len(self.api.state['variable_writes']), 3, 'unchanged redeploy must not write secrets')
@@ -461,7 +467,6 @@ class DeployTest(Deploys):
                                   'KARDAMOM_CANARY_L1_KEY': f'0x{SENTINEL}-CANARY', 'KARDAMOM_L1_RPC': l1},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
                                     'EIGENDA_PROXY_EIGENDA_V2_SIGNER_PRIVATE_KEY_HEX': key},
-            'nomad/jobs/da-watcher': {'KARDAMOM_L1_RPC': followers},
             'nomad/jobs/l1-indexer': {'KARDAMOM_L1_RPC': followers},
         })
         # Each job renders its own variable into the task environment.
@@ -580,30 +585,38 @@ class DeployTest(Deploys):
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(anvil[anvil.index('--slots-in-an-epoch') + 1], '1')
-        for job in ('batcher', 'da-watcher', 'l1-indexer'):
-            self.assertEqual(self.api.state['variables'][f'nomad/jobs/{job}']['KARDAMOM_L1_RPC'], proxy, job)
+        variables = self.api.state['variables']
+        self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], proxy)
+        # The follower reads the proxy and its second source, so a lie of
+        # the first is a disagreement.
+        self.assertEqual(variables['nomad/jobs/l1-indexer']['KARDAMOM_L1_RPC'], f'{proxy},{proxy}/second')
         indexer = plans['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(indexer[indexer.index('--poll-interval-secs') + 1], '2')
         self.assertEqual(indexer[indexer.index('--start-block') + 1], '1')
         self.assertEqual(indexer[indexer.index('--lockbox') + 1], '0x' + '0' * 40)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
-
-    def test_the_follower_runs_twice_and_records_its_stream(self):
-        # Two instances on two nodes, each on the node's Aeron driver and
-        # recording l1_blocks; anvil has no beacon chain, so no schedule.
-        self.run_deploy({'workloads_l1_fault_proxy': True}, check=True)
-        group = self.api.state['plans']['l1-indexer']['TaskGroups'][0]
+        # Two follower instances on two nodes, each on the node's Aeron
+        # driver and recording l1_blocks; anvil has no beacon chain, so no
+        # schedule.
+        group = plans['l1-indexer']['TaskGroups'][0]
         self.assertEqual(group['Count'], 2)
-        job = self.api.state['plans']['l1-indexer']
-        constraints = job.get('Constraints') or []
-        self.assertIn('distinct_hosts', json.dumps(constraints))
+        self.assertIn('distinct_hosts', json.dumps(plans['l1-indexer'].get('Constraints') or []))
         task = group['Tasks'][0]
-        args = task['Config']['args']
-        self.assertIn('--archive-durability', args)
-        self.assertEqual(args[args.index('--log-config') + 1], '/local/channels.toml')
-        self.assertEqual(args[args.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
-        self.assertNotIn('--beacon-api', args)
+        self.assertIn('--archive-durability', indexer)
+        self.assertEqual(indexer[indexer.index('--log-config') + 1], '/local/channels.toml')
+        self.assertEqual(indexer[indexer.index('--aeron-dir') + 1], '/opt/kardamom/aeron-mount/dir')
+        self.assertNotIn('--beacon-api', indexer)
         self.assertIn('/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount', task['Config']['volumes'])
+        # The da-watcher has no L1 endpoint; its history reads replay the
+        # follower archives onto its own ports and fall back to the
+        # follower's API.
+        watcher = plans['da-watcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertIn('--l1-blocks', watcher)
+        self.assertNotIn('--l1-rpc', watcher)
+        self.assertNotIn('kardamom-l1-fault-proxy', json.dumps(plans['da-watcher']))
+        self.assertEqual(watcher[watcher.index('--indexer-url') + 1], 'http://kardamom-l1-indexer.service.consul:8549')
+        self.assertIn('--replay-destination-endpoint', watcher)
+        self.assertIn('--archive-control-response-endpoint', watcher)
 
     def test_the_follower_takes_its_count_and_its_log_range(self):
         self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_count': '1',
@@ -640,6 +653,95 @@ class DeployTest(Deploys):
         self.assertIn('egress', ports)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_every_redis_instance_names_a_primary_on_a_cold_start(self):
+        # A sentinel stops at start on a config without a `sentinel
+        # monitor` line. So the seed always names a primary: the
+        # registered one, else the node that the placement rule of the
+        # primary group picks. The replica follows the same node.
+        self.run_deploy(check=True)
+        groups = {g['Name']: g for g in self.api.state['plans']['redis']['TaskGroups']}
+        self.assertEqual(groups['primary']['Constraints'],
+                         [{'LTarget': '${meta.roles}', 'RTarget': 'redis-primary', 'Operand': 'set_contains'}])
+        sentinel = groups['sentinel']['Tasks'][0]
+        seed = {t['DestPath']: t['EmbeddedTmpl'] for t in sentinel['Templates']}['local/sentinel.seed.conf']
+        monitor = re.search(r'^sentinel monitor kardamom (.*)\.node\.dc1\.consul 6379 2$', seed, re.MULTILINE)
+        self.assertIsNotNone(monitor, seed)
+        primary = monitor.group(1)
+        self.assertTrue(primary.startswith('{{ $primary := "" }}{{ with service "redis-primary" }}'), primary)
+        self.assertIn('(.Meta.roles | split "," | contains "redis-primary")', primary)
+        self.assertTrue(primary.endswith('{{ $primary }}'), primary)
+        replica = groups['replica']['Tasks'][0]
+        self.assertEqual(replica['Templates'][0]['EmbeddedTmpl'], f'REDIS_PRIMARY_NODE={primary}\n')
+        self.assertEqual(replica['Config']['args'][:2], ['sh', '-c'])
+        self.assert_replica_start(replica['Config']['args'][2])
+        self.assertEqual(sentinel['Config']['args'][:2], ['sh', '-c'])
+        self.assert_sentinel_start(sentinel['Config']['args'][2])
+        self.assertEqual(self.api.state['writes'], [])
+
+    @staticmethod
+    def run_task_script(root, script, program, files):
+        """Run the start script of a task in `root`: its /local is
+        `root`/local with `files` in it (a path such as /usr/local stays),
+        and `program` is a stub that prints `started` and its arguments."""
+        (root / 'local').mkdir()
+        (root / 'bin').mkdir()
+        stub = root / 'bin' / program
+        stub.write_text('#!/bin/sh\necho "started $*"\n')
+        stub.chmod(0o755)
+        for name, text in files.items():
+            (root / 'local' / name).write_text(text)
+        return subprocess.run(['sh', '-c', re.sub(r'(?<![\w/])/local/', f'{root}/local/', script)],
+                              env={'PATH': f'{root}/bin:/usr/bin:/bin'}, text=True,
+                              capture_output=True, timeout=10)
+
+    def assert_replica_start(self, script):
+        """The replica start script reads the rendered primary node at
+        each start. An empty node stops the task with the cause, and a
+        set node starts Redis as a replica of that node."""
+        script = script.replace('${node.unique.name}', 'ingress-1')
+        with self.subTest('no primary'), tempfile.TemporaryDirectory() as tmp:
+            result = self.run_task_script(Path(tmp), script, 'docker-entrypoint.sh',
+                                          {'primary.env': 'REDIS_PRIMARY_NODE=\n'})
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('no primary to follow: no redis-primary service passes, '
+                          'and no Consul node meta roles holds redis-primary', result.stderr)
+        with self.subTest('a primary'), tempfile.TemporaryDirectory() as tmp:
+            result = self.run_task_script(Path(tmp), script, 'docker-entrypoint.sh',
+                                          {'primary.env': 'REDIS_PRIMARY_NODE=aux-0\n'})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, 'started redis-server /usr/local/etc/redis/redis.conf --dir /local '
+                             '--replicaof aux-0.node.dc1.consul 6379 '
+                             '--replica-announce-ip ingress-1.node.dc1.consul\n')
+
+    def assert_sentinel_start(self, script):
+        """Run the start script of a sentinel task on each state of its
+        files. The task keeps a live config that Sentinel rewrote (it has
+        `sentinel myid`), copies a seed that names a primary over any
+        other live config, and refuses a seed that names none without
+        writing the live config."""
+        good = 'sentinel monitor kardamom aux-0.node.dc1.consul 6379 2\n'
+        empty = 'sentinel monitor kardamom .node.dc1.consul 6379 2\n'
+        rewritten = 'sentinel monitor kardamom ingress-1.node.dc1.consul 6379 2\nsentinel myid abc\n'
+        cases = [
+            ('a cold start', good, None, 0, good),
+            ('a seed that names no primary', empty, None, 1, None),
+            ('a restart after Sentinel rewrote its config', empty, rewritten, 0, rewritten),
+            ('a restart after a refused start, with a good seed now', good, empty, 0, good),
+        ]
+        for name, seed, live, code, after in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                files = {'sentinel.seed.conf': seed} | ({'sentinel.conf': live} if live is not None else {})
+                result = self.run_task_script(root, script, 'redis-sentinel', files)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                config = root / 'local/sentinel.conf'
+                self.assertEqual(config.read_text() if config.exists() else None, after)
+                if code:
+                    self.assertIn('the seed names no primary', result.stderr)
+                else:
+                    self.assertEqual(result.stdout, f'started {root}/local/sentinel.conf\n')
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
@@ -672,7 +774,7 @@ class DeployTest(Deploys):
                    for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
         self.assertEqual({name for name, _ in parties}, {
             'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
-            'state-mirror', 'notifier'})
+            'state-mirror', 'notifier', 'l1-indexer'})
         liveness_ns = tolerance * 1_000_000
         for name, task in parties:
             if name not in jvm_options:
@@ -1067,7 +1169,7 @@ class RollbackTest(Deploys):
         # the jobs before it recorded.
         self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
         self.run_rollback(success=False)
-        done = ['batcher', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
+        done = ['batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
         self.assertEqual(self.record()['attempt']['rolled_back'], done)
         self.assertEqual(self.record()['attempt']['status'], 'accepted', 'the rollback is not complete')
         self.assertEqual(self.api.state['writes'], [f'revert:{job}:0' for job in done + ['executor']])

@@ -12,7 +12,7 @@ use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
 use kardamom_cluster_adapter::wire::{EGRESS_KIND_ORIGIN_GAP, encode_egress_boundary};
 use kardamom_da_watcher::{BoundaryFeed, START_WAIT};
 use kardamom_types::epoch_delivery::{PUBLISH_WINDOW, REPUBLISH_AFTER};
-use support::{Rig, at, source, wait};
+use support::{Rig, at, wait};
 use tokio::sync::watch;
 
 /// The sealer's origin feed, before its first boundary.
@@ -35,7 +35,7 @@ fn ids(rig: &Rig) -> Vec<alloy_primitives::B256> {
 async fn the_file_holds_the_confirmed_origin_not_the_last_publish() {
     let rig = Rig::new();
     let origins = sealer();
-    let mut w = rig.follow(source(&[100, 103]), &origins);
+    let mut w = rig.follow(&[100, 103], &origins);
     w.start_at(Some(0));
     assert_eq!(w.process_once().await.unwrap(), 0, "the first tick seeds");
     assert_eq!(w.process_once().await.unwrap(), 3);
@@ -44,7 +44,7 @@ async fn the_file_holds_the_confirmed_origin_not_the_last_publish() {
 
     w.on_sealer_origin(102);
     assert_eq!(w.confirmed(), Some(at(102)));
-    assert!(w.process_once().await.is_err(), "no new tip");
+    assert_eq!(w.process_once().await.unwrap(), 0, "no new record");
     assert_eq!(rig.stored(), Some(at(102)));
 }
 
@@ -56,16 +56,16 @@ async fn a_restart_in_the_publish_to_commit_window_loses_no_epoch() {
     let rig = Rig::new();
     let origins = sealer();
     {
-        let mut w = rig.follow(source(&[100, 103]), &origins);
+        let mut w = rig.follow(&[100, 103], &origins);
         w.start_at(Some(0));
         w.process_once().await.unwrap();
         w.process_once().await.unwrap();
         w.on_sealer_origin(101);
-        assert!(w.process_once().await.is_err());
+        assert_eq!(w.process_once().await.unwrap(), 0);
         assert_eq!(rig.stored(), Some(at(101)));
     }
 
-    let mut w = rig.follow(source(&[104]), &origins);
+    let mut w = rig.follow(&[104], &origins);
     assert_eq!(w.confirmed(), Some(at(101)), "the file's block");
     w.start_at(Some(101));
     assert_eq!(w.process_once().await.unwrap(), 3);
@@ -81,7 +81,7 @@ async fn a_restart_in_the_publish_to_commit_window_loses_no_epoch() {
 async fn epochs_no_boundary_confirms_are_published_again_after_the_timeout() {
     let rig = Rig::new();
     let origins = sealer();
-    let mut w = rig.follow(source(&[100, 103]), &origins);
+    let mut w = rig.follow(&[100, 103], &origins);
     w.start_at(Some(0));
     w.process_once().await.unwrap();
     w.process_once().await.unwrap();
@@ -102,32 +102,34 @@ async fn epochs_no_boundary_confirms_are_published_again_after_the_timeout() {
 }
 
 /// A sealer fleet rebuilt from a seed at 100 sends boundaries below the
-/// watcher's confirmed 108. The watcher follows 100: it reads 100's hash,
-/// and publishes every block after it.
+/// watcher's confirmed 108. The watcher follows 100: it takes 100's hash
+/// from its record, and replays the stream from 101 out of the archives.
 #[tokio::test]
 async fn an_origin_that_moves_back_is_followed() {
     let rig = Rig::new();
     rig.write(&format!("{}\n", at(108)));
     let origins = sealer();
-    let mut w = rig.follow(source(&[110, 103]), &origins);
+    let mut w = rig.follow(&[110], &origins);
     w.start_at(None);
     assert_eq!(w.process_once().await.unwrap(), 2);
 
     w.on_sealer_origin(100);
     assert_eq!(w.cursor(), Some(100), "anchored at the sealer's origin");
-    assert_eq!(w.process_once().await.unwrap(), 3);
-    assert_eq!(rig.published(), [109, 110, 101, 102, 103]);
-    assert_eq!(rig.stored(), Some(at(100)), "the hash read from L1");
+    assert_eq!(w.process_once().await.unwrap(), 10);
+    let replayed: Vec<u64> = [109, 110].into_iter().chain(101..=110).collect();
+    assert_eq!(rig.published(), replayed);
+    assert_eq!(rig.stored(), Some(at(100)), "the hash of the record of 100");
 }
 
 /// A stored cursor ahead of the sealer's origin at start (a seed at an
-/// older origin): the start resumes after the sealer's origin.
+/// older origin): the start resumes after the sealer's origin, with its
+/// hash from the record of the origin.
 #[tokio::test]
 async fn a_start_resumes_after_the_sealer_origin_below_the_file() {
     let rig = Rig::new();
     rig.write(&format!("{}\n", at(120)));
     let origins = sealer();
-    let mut w = rig.follow(source(&[102]), &origins);
+    let mut w = rig.follow(&[102], &origins);
     w.start_at(Some(100));
     assert_eq!(w.process_once().await.unwrap(), 2);
     assert_eq!(rig.published(), [101, 102]);
@@ -142,7 +144,7 @@ async fn a_start_resumes_after_the_sealer_origin_below_the_file() {
 async fn an_origin_ahead_of_the_head_is_followed_without_a_republish() {
     let rig = Rig::new();
     let origins = sealer();
-    let mut w = rig.follow(source(&[100, 103, 112]), &origins);
+    let mut w = rig.follow(&[100, 103, 112], &origins);
     w.start_at(Some(0));
     w.process_once().await.unwrap();
     w.process_once().await.unwrap();
@@ -159,7 +161,7 @@ async fn an_origin_ahead_of_the_head_is_followed_without_a_republish() {
 
     let behind = Rig::new();
     behind.write(&format!("{}\n", at(90)));
-    let mut w = behind.follow(source(&[101]), &origins);
+    let mut w = behind.follow(&[101], &origins);
     w.start_at(Some(100));
     assert_eq!(w.process_once().await.unwrap(), 1);
     assert_eq!(behind.published(), [101]);
@@ -172,8 +174,8 @@ async fn an_origin_ahead_of_the_head_is_followed_without_a_republish() {
 async fn two_watchers_publish_identical_copies_and_follow_one_origin() {
     let origins = sealer();
     let (a, b) = (Rig::new(), Rig::new());
-    let mut wa = a.follow(source(&[102]), &origins);
-    let mut wb = b.follow(source(&[101, 102]), &origins);
+    let mut wa = a.follow(&[102], &origins);
+    let mut wb = b.follow(&[101, 102], &origins);
     wa.start_at(Some(100));
     wb.start_at(Some(100));
     assert_eq!(wa.process_once().await.unwrap(), 2);
@@ -197,7 +199,7 @@ async fn a_full_window_stops_new_publishes_and_drops_nothing() {
     let origins = sealer();
     let bound = u64::try_from(PUBLISH_WINDOW.get()).unwrap();
     let tip = 1_000 + bound + 10;
-    let mut w = rig.follow(source(&[1_000, tip, tip, tip]), &origins);
+    let mut w = rig.follow(&[1_000, tip, tip, tip], &origins);
     w.start_at(Some(0));
     w.process_once().await.unwrap();
     assert_eq!(w.process_once().await.unwrap(), PUBLISH_WINDOW.get());
@@ -217,7 +219,7 @@ async fn a_spawned_watcher_resumes_after_the_first_boundary() {
     let rig = Rig::new();
     rig.write(&format!("{}\n", at(120)));
     let origins = sealer();
-    let w = rig.follow(source(&[102]), &origins);
+    let w = rig.follow(&[102], &origins);
     let handle = w.start();
     origins.send_replace(Some(100));
     wait("the resume", || rig.published().len() == 2).await;
@@ -234,7 +236,7 @@ async fn a_silent_sealer_at_start_falls_back_to_the_file() {
     let rig = Rig::new();
     rig.write(&format!("{}\n", at(100)));
     let origins = sealer();
-    let w = rig.follow(source(&[102]), &origins);
+    let w = rig.follow(&[102], &origins);
     let handle = w.start();
     tokio::time::sleep(START_WAIT).await;
     wait("the fallback", || rig.published().len() == 2).await;

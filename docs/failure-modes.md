@@ -60,9 +60,9 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 
 | Cause | Service | Clears | Runbook |
 |---|---|---|---|
-| `l1_source_disagreement` | da-watcher, l1-indexer | auto | [`l1_source_disagreement`](runbooks/l1_source_disagreement.md) |
+| `l1_source_disagreement` | l1-indexer | auto | [`l1_source_disagreement`](runbooks/l1_source_disagreement.md) |
 | `l1_chain_break` | da-watcher, l1-indexer | auto | [`l1_chain_break`](runbooks/l1_chain_break.md) |
-| `l1_unreachable` | batcher, da-watcher, l1-indexer | auto | [`l1_unreachable`](runbooks/l1_unreachable.md) |
+| `l1_unreachable` | batcher, l1-indexer | auto | [`l1_unreachable`](runbooks/l1_unreachable.md) |
 | `replay_unavailable` | batcher | operator | [`replay_unavailable`](runbooks/replay_unavailable.md) |
 | `da_lag` | sealer (raised by the ingress) | auto | [`da_lag`](runbooks/da_lag.md) |
 | `sealer_no_quorum` | sealer (raised by the ingress) | auto | [`sealer_no_quorum`](runbooks/sealer_no_quorum.md) |
@@ -106,7 +106,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
   - A cluster session that sees no boundary for 10 s calls the sealer halted on a lost quorum.
 - **Publishers.** The ingress, the sequencer, the executor, the validator, the batcher, the da-watcher, the l1-indexer and the state-mirror.
   - The validator also publishes the attester as `service="attester"`.
-- **Subscribers.** The ingress and the validator. Other services do not subscribe.
+- **Subscribers.** The ingress, the validator and the da-watcher. Other services do not subscribe.
 - **The sealer is not on the stream.** The ingress observes it from the status frame (see "DA-lag guard") and from silence. It publishes the sealer as `sealer/cluster`.
 - **The l1-indexer is on the stream** as `l1-indexer/l1-indexer-<n>`. Its halt is also on its own `/halt` route and on the `indexer_halt` JSON-RPC method.
 
@@ -119,6 +119,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 | Validator `validator_divergence` | The attester pauses while any live validator is halted on this cause. |
 | Batcher halted | The chain status shows `batcher_halted`. |
 | da-watcher halted | The chain status shows `deposits_delayed`. |
+| Every l1-indexer instance halted, or `l1_blocks` silent | The da-watcher pauses with the follower as its root. |
 | l1-indexer halted | `kardamom-reconstruct` refuses to rebuild from that indexer. |
 
 - No executor raises a halt yet. The executor publishes only its lifecycle. The row "every executor halted" has a reaction in the ingress and a unit test, and it has no producer.
@@ -259,6 +260,16 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - A lost epoch delays deposits by one round trip, or by one re-publish period. The sealer never seals over it.
   - The first epoch at genesis, or after a seed with origin 0, can start at any L1 block. After a seed with origin `M`, the next epoch is `M + 1`.
   - Proof: the in-process test `OriginGapClusterTest`, with `a_republish_from_the_boundary_origin_refills_a_lost_epoch_in_either_order`.
+- **Ingress frame of an unknown kind**
+  - Trigger: a client of a newer release sends an ingress kind that this release does not define.
+  - Effect: every member drops the frame, counts it, and orders nothing. The drop is a decision of the replicated state machine, so the members stay equal. It logs `cluster DROPPED unknown-kind kind=.. memberId=.. totalDropped=..` at powers of two.
+  - Rule: a new kind that changes the replicated state is sent only after every member runs a release that reads it. Until then a mixed fleet drops it alike.
+  - Proof: the in-JVM test `SealerUnknownKindClusterTest`. Every member counts one drop, the record after the frame takes index 0, and the snapshot bytes of the members are equal.
+- **Snapshot of a newer release on disk**
+  - Trigger: a release writes a snapshot version that the previous release does not read, and the deploy rolls back.
+  - Effect: the rolled-back member cannot restore its newest snapshot and stops at start.
+  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. A deploy preflight reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it.
+  - Proof: the in-JVM tests `SealerSnapshotVersionTest`, `MemberStatusTest` and `FormatRegistryTest`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
@@ -397,7 +408,8 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - All of this runs in the same process. The cost is one fetch and one restore. It burns no restart attempt of the orchestrator.
     - `kardamom_executor_resync_total` counts these repairs by outcome.
   - If no peer offers a checkpoint at or above the floor, the node stays down and says so. The remaining paths are an operator-restored checkpoint or the rebuild from L1 (`kardamom-reconstruct`).
-  - Proof: `replay-window-resync`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
+  - A checkpoint of another state schema is skipped. The manifest states `schema_version`, and the peer sends it as `x-checkpoint-schema`. The adopter refuses the image before the copy, logs `checkpoint holds a state schema this release does not read; skipping it`, counts `kardamom_checkpoint_unreadable_schema_skips_total`, and takes the next checkpoint or the next peer. So an executor or a validator of the previous release does not adopt a checkpoint of a release with a newer schema. A manifest without the key passes, and the image says its schema when it opens.
+  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
 - **Dead `tx_receipts` publication**
   - Trigger: the must-deliver `tx_receipts` publication of an executor has no connected subscriber. Every publish fails with `NOT_CONNECTED`. The causes seen: a restored executor job whose new control port every ingress attached, and a media driver that crashed and restarted under the executor.
   - Effect: the commit thread holds the receipt and retries, so the exec thread blocks and the executor stops at one block. Without a bound, one dead publication held an executor for minutes. `kardamom_publication_connected{topic="tx_receipts"}` reads 0, and `kardamom_publication_not_connected_seconds` grows.
@@ -489,7 +501,8 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
   - Proof: `crates/sequencer/tests/replicated_shard_racing.rs`.
 - **Late re-offer past the inclusion deadline**
-  - The ingress stamps every transaction with an inclusion deadline: the newest boundary plus the inclusion horizon (default 64 blocks). With no boundary seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The ingress stamps every transaction with an inclusion deadline: the newest sealed block plus the inclusion horizon (default 64 blocks). With no block seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The newest sealed block is the higher of two values: the newest executor boundary, and the sealed head in the status of the sealer. The sealer sends its status on every boundary tick. So the deadline moves while every executor is down, and an executor outage does not age new transactions past their deadline.
   - The sealer dedup window prunes by deadline, not by count. It drops the ids whose deadline is below the open block. It never evicts an id.
   - The sealer refuses a re-offer whose deadline has passed (`PAST_DEADLINE`). A refused re-offer cannot enter as a fresh transaction.
   - A full window (`kardamom.cluster.dedupCapacity`, default `1 << 17`) is a hard back-pressure cap. The sealer answers `WINDOW_FULL`.
@@ -498,6 +511,16 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - The sealer prints `cluster PAST-DEADLINE ...` and `cluster WINDOW-FULL ...` at power-of-two counts. No Prometheus counter exists for them.
   - The horizon must be equal on the ingress (`--inclusion-horizon-blocks`, env `KARDAMOM_INCLUSION_HORIZON_BLOCKS`) and on every sealer member (`-Dkardamom.cluster.inclusionHorizonBlocks`). The contract check (`just check-contract`, `just validate` and CI) fails if they differ.
   - Details of the sealer window: [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **A refused nonce stays free**
+  - The sealer refuses a ref past its deadline, on a DA lag, or on a record lag before its contiguity guard. Its expected nonce for the sender stays at the refused nonce. Every later nonce of the sender gets `CONTIGUITY-REJECT` until a ref at the refused nonce is ordered.
+  - The sealer also refuses a late copy of a ref that it ordered long ago: the window drops the id when its deadline passes. A confirm sweep with no receipts (all executors down) sends such copies. So a refusal alone does not move the floor of the sequencer.
+  - On a refusal, the sequencer takes the ref out of its publish ledger (or out of its buffer, if it parked there), so it never republishes. The client gets the refusal. If the nonce is below the floor, the sequencer marks it.
+  - Only the copy that the refusal names leaves. A past-deadline refusal names the deadline of the refused copy, so a resubmit that replaced a parked copy survives a late refusal of the old copy. A ref that waits in the buffer for the publisher (back-pressure or a confirm sweep) stays. It republishes, the sealer refuses that copy again, and that refusal finds it in the ledger.
+  - A resubmit at a marked nonce is offered again, and the floor stays. The sealer decides: it orders the resubmit if it did not order the nonce, and it rejects it as a past nonce if it did. A mark ends when a ref at the nonce publishes, or when a receipt floor passes it.
+  - The floor moves back only on a contiguity reject that names an expected nonce `E` at which the sequencer holds no ref. Then the floor goes back to `E`, and the later refs of the sender leave the ledger and park above it. The resubmit of `E` publishes, and the parked refs drain behind it. A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
+  - If the sequencer holds the ref at `E`, the offer vanished, and the sequencer republishes from `E` as before.
+  - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
@@ -682,6 +705,7 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 1. **The spool.**
    - It holds every block that the batcher consumed and did not post yet. It is on the disk of the batcher.
    - A restart continues the pending group from it.
+   - The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. It drops every other entry of the spool root, a spool whose block file does not decode, and a spool that does not continue the confirmed cursor. Each drop logs a warning and counts `kardamom_batcher_spool_dropped_total{reason}` (`other-version`, `unreadable`, `discontinuous`). The next source serves the dropped range. A spool never stops the batcher, so a rollback and a roll forward both start.
 2. **The sealer replay** from the cursor. The sealer keeps every frame above the posted head, and the batcher publishes its cursor as that head.
 3. **A rebuild from what the nodes already keep.**
    - The state DB of every executor and of the validator holds the ordering. The `headers` table maps a block to its canonical end and its L1 origin. The `receipts` table holds one row per canonical position with the hash of the transaction.
@@ -947,13 +971,19 @@ The l1-indexer is the L1 follower: the one service that reads L1 data. It publis
 
 ## DA-watcher
 
-The da-watcher is tick-based, and it follows the commit of the sealer.
+The da-watcher takes the records of the L1 follower's `l1_blocks` stream, and it follows the commit of the sealer. It has no L1 access.
+
+- Each record carries the block's epoch, which the follower derived. The watcher publishes it on `tx_deposits`.
+- The watcher checks only the record's parent link against its head. Two follower instances publish every block: the watcher drops a copy with the same hash, and halts on a second hash for one number (`l1_follower_disagreement`, cleared by an operator).
+- A record that does not descend from the head is the halt `l1_chain_break`. The watcher reads the block again from the archives every tick, and resumes by itself on a record that descends.
+- A record past the next block is a gap on the subscription. The watcher reads the missing records from the archives of the follower nodes, and the follower's archive (`indexer_l1_block`) serves what they do not hold.
+- The loop selects on the next record, the sealer's origin, the re-publish deadline, and a housekeeping tick (`--poll-interval-secs`, 1 s in the deploy).
 
 - With `--config` (the deploy), a boundary-only cluster session reads the L1 origin `C` of every boundary. `C` is the last epoch that the sealer committed.
 - The watcher keeps the epochs that it published after `C`. This is its window. The window holds up to 2048 epochs (6.8 hours of L1). The gauge is `kardamom_da_watcher_epochs_unconfirmed`.
 - A boundary that carries an origin in the window confirms the epochs up to it. The gauge is `kardamom_da_watcher_l1_confirmed_origin`.
 - A dead watcher stalls deposits only.
-- It reads *finalized* L1 blocks, so reorgs are out of scope by construction.
+- The stream carries *finalized* L1 blocks only, so reorgs are out of scope by construction.
 
 **Re-publish.**
 
@@ -974,13 +1004,13 @@ The da-watcher is tick-based, and it follows the commit of the sealer.
 - The origin is below the base of the window: a sealer fleet seeded at an older origin.
 - The origin is past the head of the window: another da-watcher published the epochs.
 
-The watcher then reads the hash of the origin through its L1 source set. The next block must descend from it. The watcher never publishes the confirmed epochs again.
+The watcher then takes the hash of the origin from its `l1_blocks` record, and replays the stream from the block after it. The next block must descend from it. The watcher never publishes the confirmed epochs again.
 
 **The durable cursor.**
 
 - The cursor holds `C`, by number and hash. It is in the file that `--l1-cursor-file` names (`/opt/kardamom/da-watcher/l1-cursor` in the deploy).
 - After a pass in which `C` moved, the watcher writes `C` to the file atomically (temp file, fsync, rename).
-- Any RPC or publish error leaves the position unadvanced. The next tick retries the same range.
+- A publish error holds the record. The watcher publishes it again after a tick, and never skips it.
 
 **The start.** The watcher picks its start in this order of precedence:
 
@@ -988,14 +1018,15 @@ The watcher then reads the hash of the origin through its L1 source set. The nex
    - The first tick reads the hash of `M` and writes it to the file.
    - It is the fallback for a da-watcher that cannot reach the sealer.
    - A later boundary outside the published range moves the watcher to the origin of the sealer. So a wrong flag cannot leave a gap.
-2. The first boundary of the sealer, within 20 s: the watcher resumes after its origin `S`. It reads the hash of `S` through the L1 source set.
+2. The first boundary of the sealer, within 20 s: the watcher resumes after its origin `S`. It takes the hash of `S` from the `l1_blocks` record of `S`, and replays the stream from `S + 1`.
+   - With no record of `S` (the follower is down, or no archive holds `S` yet), the watcher waits. It logs once a minute, sets `kardamom_da_watcher_waiting_for_l1_block{number}`, and is paused with the follower as its root. It never publishes without the parent check.
    - The watcher does not use a file ahead of `S` (a seed) or behind `S` (another da-watcher published).
    - The watcher replaces a wrong hash in the file.
    - Origin 0 means that the sealer holds no epoch. The watcher then goes on to 3 or 4.
 3. A file that parses: the watcher resumes after its block, linked to its hash.
    - This also applies when no boundary arrives within 20 s (the sealer cluster is down).
    - The file holds an origin that the sealer confirmed, so it is at or behind the origin of the sealer. The first boundary that arrives later corrects it in both directions.
-4. No file: the watcher starts at the finalized tip and logs a warning.
+4. No file: the watcher anchors at the first record of the stream and logs a warning.
    - With a sealer feed, the first boundary moves the watcher back to the origin of the sealer.
    - Without a sealer feed, and unless this is the first start of the chain, the start skips the epochs between the last publish and the tip.
 
@@ -1016,8 +1047,15 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - The watcher stays up and publishes nothing.
 - It reads the file again after an operator clears the halt.
 - It never guesses a start.
+- The reader takes the block number and the hash, and ignores any field after the hash. A later release can add a field at the tail, and a rollback still reads the file. A line with fewer than two fields, or a field that does not parse, is the halt.
 
-**Two L1 sources.** The followers (the da-watcher and the indexer) read L1 through a set of endpoints. The flags are `--l1-rpc` (a list) and `--l1-light-client-rpc` (the light client).
+**The pause on the follower.** The da-watcher subscribes to the `events` stream. It is paused with the follower as its root (`kardamom_paused{root_service="l1-indexer"}`) in three cases, and resumes by itself:
+
+- every live follower instance is halted: the root is that halt;
+- `l1_blocks` carried no record for `--l1-silence-secs` (three finality steps, 1152 s, by default): the root is `l1-indexer/l1_blocks` with the cause `l1_unreachable`;
+- the watcher waits for a record no archive holds, for more than one tick: the same root.
+
+**Two L1 sources.** The L1 follower (the indexer) reads L1 through a set of endpoints, and so does the validator's check. The flags are `--l1-rpc` (a list) and `--l1-light-client-rpc` (the light client).
 
 - A block id or a log query is accepted when two sources agree, or when the light client serves it.
 - The finalized tip is the lowest tip that the agreeing sources report.
@@ -1030,19 +1068,17 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
   - With a light client, the source that disagrees with it is the liar. That source rotates out.
 - The error type `SourceHalt` has two values: `l1_source_disagreement` and `l1_sources_out`. The error, the log line and the counter carry that label.
 - The halt record and the `kardamom_halt` gauge use the halt causes of "Halts and service events". `l1_sources_out` is the cause `l1_unreachable` there.
-- The da-watcher and the indexer raise the halts `l1_source_disagreement`, `l1_chain_break` and `l1_unreachable`. All three clear by themselves, because the follower retries the same range on every tick.
+- The indexer raises the halts `l1_source_disagreement`, `l1_chain_break` and `l1_unreachable`. All three clear by themselves, because the follower retries the same range every slot.
 - Rotations count in `kardamom_l1_source_rotations_total{source,reason}`. The reasons are `error`, `rate_limited` and `disagreement`.
 - The alert is `KardamomL1SourceDisagreement`.
 - The details of the sources are in [`l1-data-path.md`](l1-data-path.md).
 
 **A lying L1 endpoint.**
 
-- The watcher chains consecutive blocks by their parent hashes.
-- A broken parent chain halts it at the first lying block. This is the `l1_chain_break` halt. `kardamom_da_watcher_tick_total{outcome="chain_break"}` moves on every tick. The watcher resumes by itself when the endpoint serves the chain again.
-- A wrong block hash is caught one block late. The lying hash is already the anchor. It is already in the epoch that the watcher published, and in its cursor file. The halt lasts until an operator resets the cursor (see [`l1_chain_break`](runbooks/l1_chain_break.md)).
+- The follower is the one reader of L1. With two sources, a lie of one is a disagreement: the follower halts (`l1_source_disagreement`), publishes none of it, and resumes by itself when the sources agree again. The da-watcher pauses on it.
+- With one source, the follower chains every header of a range, to its cursor, and halts on a break (`l1_chain_break`). A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores and publishes its hash. A light client anchor closes this case at the finalized tip; two sources close it everywhere.
 - A swallowed log is invisible to one source. Two sources see it.
-- `KardamomDaWatcherTickErrors` pages on a sustained error rate.
-- Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie. They check the halt and the resume. The inbox indexer chains blocks the same way through a persisted cursor. The cases check it beside the watcher.
+- Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 
 ## Notifier
 
@@ -1095,7 +1131,10 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Trigger: the whole redis job stops for 30 s. The job holds the primary, the replica and three sentinels.
   - Effect: the readers degrade to the executor query. The pipeline progresses. The state mirrors retry their writes.
   - Recovery: the job returns empty. The sentinels name a primary. Every state mirror rebuilds the projection from the newest checkpoint of its executor. A mirror never rewrites the checkpoint directory of its executor.
-  - Proof: `redis-total-loss-recover`. The case requires degraded reads, progress, a rising write-retry counter, and one `rebuild: done` log line per mirror.
+  - The cold start: no primary is registered in Consul yet. The sentinels and the replica name the initial primary by the placement rule of the primary group: the node whose Consul node meta `roles` holds `redis-primary`. So each sentinel starts with a `sentinel monitor` line and does not restart.
+  - The rule names the node where the primary starts only when exactly one node holds `redis-primary`. `roles/profile` refuses an inventory with another count.
+  - When no node meta holds `redis-primary` (a node not yet bootstrapped with it, or a Nomad Consul token without `node_prefix "" read`), the seed names no primary. The sentinel task then stops with the log line `the seed names no primary` and does not write its live config. The replica task stops with the log line `no primary to follow`. Each one starts at the next restart after its template names a primary.
+  - Proof: `redis-total-loss-recover`. The case requires degraded reads, progress, a rising write-retry counter, one `rebuild: done` log line per mirror, and zero sentinel restarts after the restore.
 - **Primary frozen**
   - Trigger: the primary freezes for longer than the sentinel `down-after-milliseconds` (5 s).
   - Effect: the readers degrade. The pipeline progresses.
@@ -1118,6 +1157,8 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
 - The readers ask every sentinel for the primary and keep the first connection that a primary accepts.
+- A sentinel keeps the config that Sentinel rewrote (it holds `sentinel myid`) across a restart in place: its id, the config epoch and the current primary. So a restarted sentinel does not count as a new sentinel, and it follows the last failover. A sentinel without a rewritten config starts from the seed.
+- Known gap: a sentinel in a new allocation gets a new id. The other sentinels keep the old id as a known sentinel and never drop it. A failover needs the votes of a majority of all known sentinels. With one stale id, a failover needs all three live sentinels. With three stale ids, no failover can win. The remedy is `SENTINEL RESET kardamom` on each sentinel, one at a time, after the reschedule.
 - `redis-total-loss-recover` runs in the `chaos-fleet` shard.
 - `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze` and `mirror-kill-rebuild` run in the `chaos-cache` shard. `mirror-kill-rebuild` runs last, because it flushes the projection.
 - Further reading: [`specs/2026-09-13-redis-account-cache-design.md`](specs/2026-09-13-redis-account-cache-design.md), section 9.3.

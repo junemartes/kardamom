@@ -85,6 +85,11 @@ pub(crate) mod live_metric_names {
     /// `tx_data` archives after the sealer refused the replay: the gap
     /// between the cursor and the sealer's retention floor.
     pub(crate) const REBUILT_BLOCKS: &str = "kardamom_batcher_rebuilt_blocks_total";
+    /// Spools dropped at start, by reason: `other-version` (a spool of
+    /// another release), `unreadable` (a block file does not decode), or
+    /// `discontinuous` (the spool does not continue the confirmed
+    /// cursor). The range is read again from the sealer.
+    pub(crate) const SPOOL_DROPPED: &str = "kardamom_batcher_spool_dropped_total";
     /// 1 once the feed loop runs over the spool it restored. The
     /// readiness rule of the live batcher requires it.
     pub const FEED_RUNNING: &str = "kardamom_batcher_feed_running";

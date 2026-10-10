@@ -301,6 +301,18 @@ where
         Ok(Some(receipt))
     }
 
+    /// The newest sealed block this proxy knows of, the base of the
+    /// inclusion deadline: the newest executor boundary, or the sealed
+    /// head of the sealer's status, whichever is higher. Both count the
+    /// sealer's own blocks. The sealer sends its status on every boundary
+    /// tick, so the value moves while every executor is down. A deadline
+    /// from the executor boundaries alone stops at the outage, and the
+    /// sealer then refuses every new transaction as past its deadline.
+    fn deadline_clock(&self) -> u64 {
+        self.latest_block_number()
+            .max(self.cluster_status().sealed_head)
+    }
+
     /// Publishes a validated envelope onto `tx_data[shard]`. The shard comes
     /// from the sender-address hash, `partition_for(sender, K)`, so every
     /// tx from a given sender lands on the same shard's A stream. This
@@ -322,10 +334,7 @@ where
                     raw_tx: raw_tx.0.clone(),
                     sender: v.sender,
                     tx_hash: v.tx_hash,
-                    // The deadline is read from the newest boundary this
-                    // proxy has seen, so the whole pipeline compares block
-                    // numbers from one clock: the sealer's own.
-                    max_inclusion_block: self.cfg.inclusion_deadline(self.latest_block_number()),
+                    max_inclusion_block: self.cfg.inclusion_deadline(self.deadline_clock()),
                 },
             )
             .await

@@ -1,16 +1,12 @@
-# kardamom-da-watcher polls L1 for deposits, and publishes Deposit
-# envelopes onto tx_deposits. It runs on the aux node.
+# kardamom-da-watcher takes the records of the l1_blocks stream, which
+# the L1 follower (nomad/l1-indexer.nomad.hcl) publishes, and publishes
+# the epoch of each, with its deposits, onto tx_deposits. It has no L1
+# access. It runs on the aux node.
 #
-# Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-da-watcher --l1-rpc http://anvil.service.consul:8546 --lockbox <addr> \
-#       --aeron-dir <dir> --poll-interval-secs 1
-#
-# --l1-rpc points at the in-cluster anvil by its Consul service record
-# (var.l1_rpc). --lockbox is the chain-specific Lockbox
-# contract address. It is not known until the deployer deploys it, so
-# it is exposed as the HCL variable `lockbox_address` below, with a
-# clearly marked placeholder default. Override it at submit time:
-#   nomad run -var 'lockbox_address=0x<real-addr>' da-watcher.nomad.hcl
+# A history read (a start, a gap) replays the l1_blocks recordings from
+# the archives of the follower nodes onto this node's replay port, and
+# reads what they do not hold from the follower's API
+# (var.indexer_url).
 #
 # This shares the node's Aeron media driver, through the bind-mounted
 # tmpfs aeron.dir.
@@ -24,12 +20,21 @@
 # hash) lives under /opt/kardamom/da-watcher, a host directory that the
 # common role creates. A start with no boundary resumes after that block.
 
-variable "lockbox_address" {
+# The L1 follower's API, by its Consul service record: the backstop of
+# a history read.
+variable "indexer_url" {
   type        = string
-  description = "L1 Lockbox contract address (chain-specific; supplied by the deployer after the Lockbox is deployed). The default below is a PLACEHOLDER and will not work against a real chain."
-  # This is a placeholder. Replace it with `-var
-  # lockbox_address=0x...` at submit time.
-  default = "0x0000000000000000000000000000000000000000"
+  description = "The L1 follower's API (nomad/l1-indexer.nomad.hcl)."
+  default     = "http://kardamom-l1-indexer.service.consul:8549"
+}
+
+# How long l1_blocks may carry no record before the watcher pauses with
+# the follower as its root: three finality steps on Ethereum and
+# Sepolia. Empty: the binary's default, 1152 s.
+variable "l1_silence_secs" {
+  type        = string
+  description = "Seconds with no l1_blocks record before the watcher pauses on the follower. Empty: 1152."
+  default     = ""
 }
 
 # Digest-pinned image. ansible/deploy.yml
@@ -63,14 +68,6 @@ variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
-}
-
-# The light client's endpoint, when one runs: its answer settles a read
-# it serves, and a public endpoint that disagrees with it is the liar.
-variable "l1_light_client_rpc" {
-  type        = string
-  description = "The L1 light client's endpoint (nomad/l1-light-client.nomad.hcl). Empty: none."
-  default     = ""
 }
 
 job "da-watcher" {
@@ -123,6 +120,10 @@ job "da-watcher" {
       }
       # The cluster-egress (response) endpoint of the boundary session.
       port "egress" {}
+      # The history read of l1_blocks: replayed fragments and archive
+      # control responses. Nomad picks them per allocation.
+      port "replay" {}
+      port "archive_response" {}
     }
 
     task "da-watcher" {
@@ -148,7 +149,10 @@ job "da-watcher" {
         ]
         args = concat(
           [
-            "--lockbox", "${var.lockbox_address}",
+            "--l1-blocks",
+            "--indexer-url", var.indexer_url,
+            "--replay-destination-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_replay}",
+            "--archive-control-response-endpoint", "${meta.node_ip}:${NOMAD_HOST_PORT_archive_response}",
             "--log-config", "/local/channels.toml",
             "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
             "--poll-interval-secs", "1",
@@ -163,7 +167,7 @@ job "da-watcher" {
             # recovery).
             "--archive-durability",
           ],
-          var.l1_light_client_rpc != "" ? ["--l1-light-client-rpc", var.l1_light_client_rpc] : [],
+          var.l1_silence_secs != "" ? ["--l1-silence-secs", var.l1_silence_secs] : [],
         )
       }
 
@@ -178,24 +182,6 @@ job "da-watcher" {
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node.
         KARDAMOM_METRICS_ADDR = "0.0.0.0:9005"
-      }
-
-      # The L1 endpoints the watcher derives epochs from
-      # (KARDAMOM_L1_RPC, comma-separated; with two or more, a block is
-      # accepted when two agree). The watcher is the epoch source, so a
-      # lying endpoint makes bad epochs at the source; two agreeing
-      # endpoints, or a light client that settles the reads, close that.
-      # They come from the job's Nomad
-      # Variable, which the workloads role writes. They reach the task as
-      # environment, never as a job variable or an argument, so a job
-      # read does not show them.
-      template {
-        destination = "secrets/l1.env"
-        env         = true
-        data        = <<-EOT
-        {{- with nomadVar "nomad/jobs/da-watcher" }}{{ range $k, $v := . }}
-        {{ $k }}={{ $v.Value | toJSON }}{{ end }}{{ end }}
-        EOT
       }
 
       # Cluster LogConfig (Aeron streams and discovery), read through
