@@ -33,10 +33,7 @@ impl SavedJob {
             .with_context(|| format!("stop job {}", self.id))?;
         let outcome = poll::until(Budget::secs(120, 2), |_| async {
             let allocs = self.nomad.allocations(&self.id).await?;
-            Ok(allocs
-                .iter()
-                .all(|a| matches!(a.client_status.as_str(), "complete" | "failed" | "lost"))
-                .then_some(()))
+            Ok(allocs.iter().all(super::Alloc::is_terminal).then_some(()))
         })
         .await?;
         outcome.or_fail(|_| anyhow::anyhow!("job {} still has writers after stop", self.id))?;

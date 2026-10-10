@@ -286,3 +286,15 @@ code = ["crates/canary/src/store.rs#pub struct Contracts"]
 [format.canary-store.layout]
 Contracts = '{"counter":"0x0404040404040404040404040404040404040404"}'
 anchor = '"0x0505050505050505050505050505050505050505050505050505050505050505"'
+
+# Frozen layout. The canary's market state: the token and pool
+# addresses, the setup progress, the supply ledger, and the liquidity
+# shares, as serde JSON. A new field has a serde default.
+[format.canary-market]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/canary/src/store.rs#pub struct Market"]
+[format.canary-market.layout]
+Market = '{"rwa":"0x0606060606060606060606060606060606060606","pool":"0x0707070707070707070707070707070707070707","setup":8,"supply":"0x9","pending":{"Burn":"0x1"},"shares":"0x2"}'

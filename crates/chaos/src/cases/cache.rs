@@ -108,7 +108,9 @@ async fn probe_cold_read(h: &Harness, step: u32) -> anyhow::Result<()> {
 }
 
 /// Wait until a probe read moves the counter `pick` selects: proof
-/// that the reader took the path under test.
+/// that the reader took the path under test. The counter is the
+/// evidence, not the answer: the read itself fails while no executor
+/// runs behind the degraded path.
 async fn wait_reader_moves(
     h: &Harness,
     ctx: &str,
@@ -118,7 +120,7 @@ async fn wait_reader_moves(
 ) -> anyhow::Result<()> {
     let outcome = poll::until(budget, |_| async move {
         let before = pick(readers(h).await?);
-        probe_cold_read(h, 0).await?;
+        let _ = probe_cold_read(h, 0).await;
         let after = pick(readers(h).await?);
         Ok::<_, anyhow::Error>((after > before).then_some(after))
     })
@@ -134,7 +136,7 @@ async fn wait_reader_moves(
 
 /// The readers use Redis again: a probe read raises the Redis lookups
 /// and leaves the degraded count where it was.
-async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     let outcome = poll::until(Budget::secs(120, 3), |_| async move {
         let before = readers(h).await?;
         probe_cold_read(h, 1).await?;
@@ -160,7 +162,7 @@ async fn wait_readers_recovered(h: &Harness, ctx: &str) -> anyhow::Result<()> {
 
 /// The readers degrade instead of stalling: a probe read raises the
 /// degraded count.
-async fn wait_readers_degraded(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+pub(crate) async fn wait_readers_degraded(h: &Harness, ctx: &str) -> anyhow::Result<()> {
     wait_reader_moves(h, ctx, "degraded reads", Budget::secs(60, 2), |r| {
         r.degraded
     })
@@ -184,7 +186,7 @@ async fn mirror_head(h: &Harness) -> Option<i64> {
 
 /// The finished rebuilds in the mirror job's logs. A task log survives
 /// an in-place restart, so the count only grows.
-async fn mirror_rebuilds(h: &Harness) -> anyhow::Result<usize> {
+pub(crate) async fn mirror_rebuilds(h: &Harness) -> anyhow::Result<usize> {
     h.evidence
         .count_lines("state-mirror", REBUILD_DONE, Streams::Both)
         .await
@@ -473,7 +475,11 @@ async fn wait_primary_named(h: &Harness, ctx: &str) -> anyhow::Result<String> {
 
 /// Every mirror finished a rebuild since `rebuilds0`: each one wrote
 /// into the empty Redis from its own executor's checkpoint.
-async fn wait_every_mirror_rebuilt(h: &Harness, ctx: &str, rebuilds0: usize) -> anyhow::Result<()> {
+pub(crate) async fn wait_every_mirror_rebuilt(
+    h: &Harness,
+    ctx: &str,
+    rebuilds0: usize,
+) -> anyhow::Result<()> {
     let target = rebuilds0 + MIRROR_ALLOCS;
     let outcome = poll::until(Budget::secs(300, 5), |_| async move {
         Ok::<_, anyhow::Error>(Some(mirror_rebuilds(h).await?).filter(|n| *n >= target))

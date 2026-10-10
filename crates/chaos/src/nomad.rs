@@ -74,6 +74,13 @@ impl Alloc {
         self.client_status == "running"
     }
 
+    /// Whether the allocation ended: complete, failed or lost. Its task
+    /// runs no more.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.client_status.as_str(), "complete" | "failed" | "lost")
+    }
+
     /// Running, and meant to keep running: a stopping allocation still
     /// reports `running` for a moment after the job asks it to stop.
     #[must_use]

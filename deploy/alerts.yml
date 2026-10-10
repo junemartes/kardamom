@@ -364,6 +364,16 @@ groups:
           description: "A canary receipt does not match the fee rules: the base fee, the priority fee paid, or the fee methods. The field label names the check. Compare the receipt with docs/priority-fees.md."
           runbook: "docs/failure-modes.md#transaction-canary"
 
+      - alert: KardamomCanaryStateFault
+        expr: increase(kardamom_canary_probe_total{outcome=~"supply_mismatch|allowlist_breach|swap_mismatch|invariant_broken|reserve_mismatch|liquidity_mismatch"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the EVM computed a wrong result for the canary: {{ $labels.outcome }} ({{ $labels.host_id }})"
+          description: "The canary's {{ $labels.probe }} probe found {{ $labels.outcome }}: a token supply that is not the mints less the burns, a transfer off the allowlist that succeeded, a swap or a liquidity change off the pool's formula, a product of the reserves that fell, or an ETH reserve above the pool's balance. Compare the executor and the validator state for the block of the probe's receipt."
+          runbook: "docs/failure-modes.md#transaction-canary"
+
       - alert: KardamomCanaryLowFunds
         expr: kardamom_canary_balance_wei < on (layer, host_id) group_left kardamom_canary_balance_floor_wei
         for: 5m
