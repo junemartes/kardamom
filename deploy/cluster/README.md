@@ -319,7 +319,6 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Settlement | `L1_OWNER`, `L1_OWNER_KEY` | the Anvil dev account 0 | The owner address and key that the deployer uses. |
 | Settlement | `BATCHER_EOA` | the Anvil dev account 2 | The batcher address that the deployer registers. |
 | Settlement | `L2_CHAIN_ID` | `chain_id` of `all.yml` (412346) | The L2 chain id. |
-| Settlement | `SETTLEMENT_DEPLOY_BLOCK` | empty (0) | The L1 block of the settlement deployment. A `BatchPosted` scan starts here. |
 | Real L1 | `L1_RPC` | empty | The L1 endpoint. Empty: the in-cluster anvil, found through the Nomad API. Set: the batcher uses it. |
 | Real L1 | `BATCHER_KEY` | the Anvil dev key | The L1 key of the batcher. The DA proxy signs with it. |
 | Real L1 | `LOCKBOX_ADDRESS` | empty | The lockbox contract. Empty: a placeholder address, and the deposit path is idle. The light client needs it. |
@@ -337,7 +336,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Monitoring | `ALERTMANAGER_CONFIG_FILE` | empty | A file with the Alertmanager routes and receivers of the environment. Set: the role writes it, with the inhibit rules of `deploy/alertmanager-inhibit.yml` added, to the item `alertmanager` of `nomad/jobs/monitoring`. The file must not hold `inhibit_rules`. Empty: the role leaves the variable as it is. |
 | Monitoring | `PROMETHEUS_RULES_FILE` | empty (`groups: []`) | The extra Prometheus rule file of the environment, the item `rules`. The role writes it only with `ALERTMANAGER_CONFIG_FILE`. Prometheus loads `deploy/alerts.yml` in all cases. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the indexer (the L1 follower) reads. A comma-separated list. With two or more entries, a block counts only when two agree. The da-watcher reads the follower's stream, not L1. |
-| da-watcher | `L1_SILENCE_S` | empty (`1152` in the binary) | Seconds with no `l1_blocks` record before the da-watcher pauses with the follower as its root. |
+| da-watcher, batcher | `L1_SILENCE_S` | empty (`1152` in the binaries) | Seconds with no `l1_blocks` record before the da-watcher and the batcher pause with the follower as their root. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
 | Indexer | `L1_INDEXER_POLL_S` | empty (`12` in the binary) | One slot, in seconds: the read cadence while the finalized tip does not move, and the whole cadence without a beacon API. |
 | Indexer | `L1_BEACON_API` | `L1_LIGHT_CLIENT_CONSENSUS_RPC` | The beacon API of the finality schedule. Empty: the follower reads every slot. |
@@ -346,7 +345,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Indexer | `L1_INDEXER_HOST`, `L1_INDEXER_PORT` | `kardamom-l1-indexer.service.<datacenter>.consul`, `8549` | Where the batcher reaches the indexer. |
 | Fault proxy | `KARDAMOM_L1_FAULT_PROXY` | `0` | `1` deploys the lying L1 of the `chaos-l1` shard in front of the in-cluster anvil. All followers read L1 through it. |
 | Sealer | `KARDAMOM_CLUSTER_RETENTION` | empty (`65536` frames in the job) | The egress replay retention, in frames. It is a minimum. The sealer keeps a frame above the posted head even past this window. See the [sealer README](../../cluster/sealer-service/README.md). |
-| Sealer | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` (job variable `cluster_da_lag_budget_blocks`) | empty (`10000` in the job) | The DA-lag budget, in blocks. The sealer refuses user transactions when the sealed head is more than this far past the posted head. `0` turns the guard off. Every member must use the same value. |
+| Sealer, batcher | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` (job variables `cluster_da_lag_budget_blocks`, `da_lag_budget_blocks`) | empty (`10000` in the jobs) | The DA-lag budget, in blocks. The sealer refuses user transactions when the sealed head is more than this far past the posted head. `0` turns the guard off. Every member must use the same value. The batcher posts at half of it. The deploy refuses `BATCHER_IDLE_FLUSH_MS / 1000` at or above it. |
 | Sealer | `KARDAMOM_CLUSTER_BOOTSTRAP` | `0` (`1` in `just container-up`) | `1` opens the sealer bootstrap while the role registers a cluster job that Nomad does not know. See [Sealer bootstrap](#sealer-bootstrap). |
 | Sealer | `KARDAMOM_CLUSTER_SNAPSHOT_S` | empty (`300` in the job) | The interval of the Raft snapshot, in seconds. `0` disables it. |
 | Sealer | `KARDAMOM_CLUSTER_LOG_PURGE_KEEP` | empty (`3` in the job) | How many of the newest Raft snapshots keep their log. `0` turns the log purge off. See [Sealer log purge](#sealer-log-purge). |

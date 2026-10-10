@@ -35,7 +35,7 @@ The streams and their publishers:
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
-| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher |
+| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher, batcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 

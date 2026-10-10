@@ -418,6 +418,15 @@ class DeployTest(Deploys):
         # so it reads every second.
         follower = self.api.state['jobs']['l1-indexer']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(follower[follower.index('--poll-interval-secs') + 1], '1')
+        # A halt or a pause fails /ready, so Consul marks the service
+        # critical. Prometheus takes every kardamom service in every health
+        # state: a healthy-only list drops it exactly when its halt alert
+        # needs it. The Nomad agents' service is not a kardamom job.
+        templates = [t['EmbeddedTmpl'] for g in self.api.state['jobs']['monitoring']['TaskGroups']
+                     for t in g['Tasks'] for t in (t.get('Templates') or [])]
+        services = re.findall(r'service "(kardamom-[^"]*)"', '\n'.join(templates))
+        self.assertIn('kardamom-validator|any', services)
+        self.assertEqual([s for s in services if not s.endswith(('|any', '-nomad'))], [])
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_RPC'], 'http://anvil.service.consul:8546')
         self.assertEqual(variables['nomad/jobs/batcher']['KARDAMOM_L1_KEY'][:10], '0x5de4111a')
         self.assertEqual(variables['nomad/jobs/canary'], {
@@ -579,8 +588,16 @@ class DeployTest(Deploys):
             self.assertIn('base_fee_initial', self.genesis_template(plans[name]), name)
 
     def test_fault_proxy_routes_the_followers_through_it(self):
-        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2'})
+        # Staging-like batcher values ride on this run: a 12 h idle flush
+        # needs a budget above 43200 blocks.
+        self.run_deploy({'workloads_l1_fault_proxy': True, 'workloads_indexer_poll_s': '2',
+                         'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000),
+                         'workloads_da_lag_budget_blocks': '100000'})
         plans = self.api.state['plans']
+        # The batcher gets the cluster's budget and posts at half of it.
+        batcher = plans['batcher']['TaskGroups'][0]['Tasks'][0]['Config']['args']
+        self.assertEqual(batcher[batcher.index('--da-lag-budget-blocks') + 1], '100000')
+        self.assertIn('-Dkardamom.cluster.daLagBudgetBlocks=100000', json.dumps(plans['cluster']))
         proxy = 'http://kardamom-l1-fault-proxy.service.dc1.consul:8547'
         self.assertIn('http://anvil.service.consul:8546', json.dumps(plans['l1-fault-proxy']))
         anvil = plans['anvil']['TaskGroups'][0]['Tasks'][0]['Config']['args']
@@ -625,6 +642,14 @@ class DeployTest(Deploys):
         self.assertEqual(group['Count'], 1)
         args = group['Tasks'][0]['Config']['args']
         self.assertEqual(args[args.index('--max-log-range') + 1], '2000')
+
+    def test_the_batcher_posts_before_the_da_lag_guard_halts_an_idle_chain(self):
+        # The budget below the idle interval in blocks halts an idle chain:
+        # the role refuses it before any job. The accepted case rides on
+        # the fault proxy test's deploy run.
+        output = self.run_deploy({'workloads_batcher_idle_flush_ms': str(12 * 3600 * 1000)},
+                                 check=True, success=False)
+        self.assertIn('must be below the DA-lag budget', output)
 
     def test_the_da_watcher_keeps_its_l1_cursor_on_the_node(self):
         # A restart resumes after the last published L1 block only when the
@@ -1047,8 +1072,9 @@ class RecordTest(Deploys):
         self.assertIn('names remoteOrigins, and the release does not change it', output)
         self.assertEqual(self.api.state['writes'], [])
         # A documented procedure names the settings it changes.
+        # The batcher takes the same budget, so it rolls after the sealer.
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
-        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster'])
+        self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
 
     def test_a_new_sealer_decision_version_refuses_the_rolling_path(self):
         self.run_deploy()

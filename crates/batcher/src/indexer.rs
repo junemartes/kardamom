@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use crate::da::PayloadSource;
 use crate::error::BatcherError;
 use crate::l1::BatchDescriptor;
+use kardamom_types::L1Block;
 
 /// A client of one indexer's API (`http://host:port`).
 #[derive(Clone, Debug)]
@@ -91,6 +92,37 @@ impl IndexerClient {
     /// Returns an error when the request fails.
     pub async fn batch(&self, index: u64) -> Result<Option<BatchDescriptor>, BatcherError> {
         self.call("indexer_batch", serde_json::json!([index])).await
+    }
+
+    /// The L1 timestamp of the newest batch the follower's archive holds:
+    /// the block that carried it, from its `l1_blocks` record. `None`
+    /// while the archive holds no batch.
+    ///
+    /// # Errors
+    /// Returns an error when a request fails or a record does not decode.
+    pub async fn last_post_time(&self) -> Result<Option<u64>, BatcherError> {
+        let cursor: serde_json::Value = self.call("indexer_status", serde_json::json!([])).await?;
+        let Some(index) = cursor["last_batch"].as_u64() else {
+            return Ok(None);
+        };
+        let Some(entry) = self
+            .call::<Option<serde_json::Value>>("indexer_batch", serde_json::json!([index]))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(block) = entry["l1_block"].as_u64() else {
+            return Ok(None);
+        };
+        let Some(bytes) = self
+            .call::<Option<Bytes>>("indexer_l1_block", serde_json::json!([block]))
+            .await?
+        else {
+            return Ok(None);
+        };
+        rkyv::from_bytes::<L1Block, rkyv::rancor::Error>(&bytes)
+            .map(|record| Some(record.timestamp))
+            .map_err(|e| BatcherError::L1(format!("decode the l1_blocks record of {block}: {e}")))
     }
 
     /// Refuse an indexer that is not running: a halted follower may hold

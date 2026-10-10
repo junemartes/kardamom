@@ -156,7 +156,7 @@ groups:
           severity: critical
         annotations:
           summary: "validator scrape target down"
-          description: "Prometheus cannot scrape the validator. A halted validator (epoch fault or divergence) looks like this too."
+          description: "Prometheus cannot scrape the validator: the process is down or its port does not answer. A halted validator stays a target and raises its halt alert instead."
 
   # One rule per halt cause. A halted service exports kardamom_halt = 1
   # with the cause and the runbook id as labels, and serves the whole

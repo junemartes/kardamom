@@ -106,7 +106,7 @@
     - name: da-watcher
       wait: false
       vars:
-        l1_silence_secs: "{{ workloads_da_watcher_silence_s }}"
+        l1_silence_secs: "{{ workloads_l1_silence_s }}"
   loop_control:
     loop_var: workloads_job
     label: "{{ workloads_job.name }}"
@@ -209,7 +209,8 @@
            | combine({'blocks_per_batch': workloads_batcher_blocks_per_batch} if workloads_batcher_blocks_per_batch | length > 0 else {})
            | combine({'flush_ms': workloads_batcher_flush_ms} if workloads_batcher_flush_ms | length > 0 else {})
            | combine({'idle_flush_ms': workloads_batcher_idle_flush_ms} if workloads_batcher_idle_flush_ms | length > 0 else {})
-           | combine({'settlement_deploy_block': workloads_settlement_deploy_block} if workloads_settlement_deploy_block | length > 0 else {})
+           | combine({'l1_silence_secs': workloads_l1_silence_s} if workloads_l1_silence_s | length > 0 else {})
+           | combine({'da_lag_budget_blocks': workloads_da_lag_budget_blocks} if workloads_da_lag_budget_blocks | length > 0 else {})
            | combine({'indexer_url': 'http://' ~ workloads_indexer_host ~ ':' ~ workloads_indexer_port}) }}
       # The fault proxy when it is deployed, else the real L1 when one is
       # given, else the in-cluster anvil. The batcher's own key when one

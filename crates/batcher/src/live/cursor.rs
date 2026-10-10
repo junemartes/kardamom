@@ -9,10 +9,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::da::DaProxy;
 use crate::frame::BlockFrame;
 use crate::indexer::IndexerClient;
-use crate::l1::{read_posted_batches, recover_blocks};
+use crate::l1::recover_blocks;
 use crate::settlement::IKardamomL2Settlement;
 
 /// The durable cursor: the ordering-stream position matching the last
@@ -144,67 +143,40 @@ impl L1Truth {
 }
 
 /// Where the last posted batch's payload comes from when no cursor file
-/// exists: the indexer's archive when it holds the batch, else the
-/// `BatchPosted` log and the DA proxy, the inputs of a rebuild. Neither
-/// waits: an indexer behind the head answers at once, and the read falls
-/// through to L1.
-pub(crate) struct PayloadSources<'a, P> {
+/// exists: the L1 follower's archive. The follower is the one reader of
+/// L1 data, so the batcher reads no `BatchPosted` log itself. The archive
+/// holds a batch once its block is finalized: until then the resume
+/// fails, and the start retries it.
+pub(crate) struct PayloadSources<'a> {
     pub(crate) indexer: Option<&'a IndexerClient>,
-    pub(crate) provider: &'a P,
-    pub(crate) da: &'a DaProxy,
-    pub(crate) settlement: Address,
-    /// Where the `BatchPosted` scan starts.
-    pub(crate) deploy_block: u64,
 }
 
-impl<P: Provider> PayloadSources<'_, P> {
+impl PayloadSources<'_> {
     /// The cursor a fresh batcher resumes from when L1 already holds
     /// batches: the position just past the last posted batch, read from
-    /// that batch's own blobs. The blobs carry each block's cursor
+    /// that batch's own payload. The payload carries each block's cursor
     /// (`BlockCursor`), so the replay request names a point of the stream
     /// the sealer can check, instead of genesis, which the cluster's
     /// retention cannot serve.
     ///
     /// # Errors
-    /// Returns an error when no source serves the batch, a blob fails
-    /// verification, or the batch's last block is not L1's covered block.
+    /// Returns an error without a follower, while its archive does not
+    /// hold the batch, when its payload fails verification, or when the
+    /// batch's last block is not L1's covered block.
     pub(crate) async fn resume(&self, l1: L1Truth) -> Result<(BatchCursor, u64)> {
-        let blocks = match self.blocks_from_indexer(l1.last_batch_index).await? {
-            Some(blocks) => blocks,
-            None => self.blocks_from_l1(l1.last_batch_index).await?,
-        };
-        resume_from_blocks(&blocks, l1)
-    }
-
-    /// The batch's blocks from the indexer, or `None` without an indexer
-    /// or while it has not reached the batch.
-    async fn blocks_from_indexer(&self, index: u64) -> Result<Option<Vec<BlockFrame>>> {
-        let Some(indexer) = self.indexer else {
-            return Ok(None);
-        };
-        let Some(descriptor) = indexer.batch(index).await? else {
-            warn!(
-                last_batch_index = index,
-                "indexer has not reached the last batch; reading it from L1 and the DA proxy"
-            );
-            return Ok(None);
-        };
+        let index = l1.last_batch_index;
+        let indexer = self.indexer.with_context(|| {
+            format!("no cursor file and no --indexer-url: batch {index} cannot be read")
+        })?;
+        let descriptor = indexer.batch(index).await?.with_context(|| {
+            format!(
+                "the L1 follower's archive does not hold batch {index} yet (its block is not \
+                 finalized); the start retries"
+            )
+        })?;
         let blocks = recover_blocks(std::slice::from_ref(&descriptor), indexer)
-            .with_context(|| format!("recover batch {index} from the indexer"))?;
-        Ok(Some(blocks))
-    }
-
-    /// The batch's blocks from its `BatchPosted` log and the DA proxy.
-    async fn blocks_from_l1(&self, index: u64) -> Result<Vec<BlockFrame>> {
-        let posted = read_posted_batches(self.provider, self.settlement, self.deploy_block)
-            .await
-            .context("read BatchPosted events")?;
-        let descriptor = posted
-            .into_iter()
-            .find(|d| d.index == index)
-            .with_context(|| format!("lastBatchIndex={index} but no BatchPosted event with it"))?;
-        recover_blocks(std::slice::from_ref(&descriptor), self.da)
-            .with_context(|| format!("recover batch {index} from the DA proxy"))
+            .with_context(|| format!("recover batch {index} from the L1 follower"))?;
+        resume_from_blocks(&blocks, l1)
     }
 }
 

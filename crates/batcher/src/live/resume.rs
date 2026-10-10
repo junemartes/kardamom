@@ -10,7 +10,6 @@ use kardamom_obs::halt::{self, Halt, HaltCause};
 use metrics::counter;
 use tracing::warn;
 
-use crate::da::DaProxy;
 use crate::indexer::IndexerClient;
 
 use super::cursor::{BatchCursor, L1Truth, PayloadSources};
@@ -30,7 +29,6 @@ impl LiveArgs {
     async fn resume_once<P: Provider>(
         &self,
         provider: &P,
-        da: &DaProxy,
         loaded: Option<BatchCursor>,
     ) -> Result<Resumed> {
         let l1_truth = L1Truth::read(provider, self.settlement).await?;
@@ -39,10 +37,6 @@ impl LiveArgs {
             None if l1_truth.last_batch_index > 0 => Some(
                 PayloadSources {
                     indexer: indexer.as_ref(),
-                    provider,
-                    da,
-                    settlement: self.settlement,
-                    deploy_block: self.settlement_deploy_block,
                 }
                 .resume(l1_truth)
                 .await?,
@@ -60,12 +54,11 @@ impl LiveArgs {
     pub(super) async fn resume_until_l1_answers<P: Provider>(
         &self,
         provider: &P,
-        da: &DaProxy,
         loaded: Option<BatchCursor>,
     ) -> Resumed {
         let mut attempt: u32 = 0;
         loop {
-            if let Some(resumed) = self.resume_step(provider, da, loaded, &mut attempt).await {
+            if let Some(resumed) = self.resume_step(provider, loaded, &mut attempt).await {
                 return resumed;
             }
         }
@@ -75,11 +68,10 @@ impl LiveArgs {
     async fn resume_step<P: Provider>(
         &self,
         provider: &P,
-        da: &DaProxy,
         loaded: Option<BatchCursor>,
         attempt: &mut u32,
     ) -> Option<Resumed> {
-        let error = match self.resume_once(provider, da, loaded).await {
+        let error = match self.resume_once(provider, loaded).await {
             Ok(resumed) => return Some(resumed),
             Err(error) => error,
         };

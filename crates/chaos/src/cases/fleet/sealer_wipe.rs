@@ -6,6 +6,7 @@
 //! the seed's L1 origin. Blocks after H are reverted. The case lets them
 //! hold only epochs, so the revert takes no receipt from the load.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -52,6 +53,11 @@ const EPOCHS_PUBLISHED: &str = "kardamom_da_watcher_epochs_published_total";
 /// and makes the seed directory. It keeps `archive/dir`: that is the
 /// node's shared Aeron archive, not the member's.
 const SEALER_WIPE: &str = "find /opt/kardamom/cluster -mindepth 1 -delete && find /opt/kardamom/archive -mindepth 1 -maxdepth 1 ! -name dir -exec rm -rf {} + && mkdir -p /opt/kardamom/seed";
+
+/// The L1 blocks the wait for the batcher's first new post mines at each
+/// poll: two finality windows of anvil's default (2 x 32 slots) pass in
+/// less than half the wait.
+const MINE_PER_POLL: NonZeroU64 = NonZeroU64::new(4).unwrap();
 
 /// The batcher's spool and cursor file. A spool that holds blocks after
 /// H continues the confirmed cursor, so the batcher would post reverted
@@ -189,7 +195,7 @@ impl<'a> FleetWipe<'a> {
     async fn quiesce(&self) -> anyhow::Result<u64> {
         self.jobs.ingress.stop().await?;
         let drained = self.advance(5).await?;
-        self.await_posted_through(drained).await?;
+        self.await_posted_through(drained, None).await?;
         self.jobs.batcher.stop().await?;
         crate::log(format!(
             "{CTX}: ingress and batcher stopped; L1 covers block {drained} or more"
@@ -234,10 +240,18 @@ impl<'a> FleetWipe<'a> {
         Ok(u64::try_from(head)?)
     }
 
-    /// Wait until L1 covers `block`.
-    async fn await_posted_through(&self, block: u64) -> anyhow::Result<u64> {
+    /// Wait until L1 covers `block`. With `mine`, each poll mines that
+    /// many L1 blocks first.
+    async fn await_posted_through(
+        &self,
+        block: u64,
+        mine: Option<NonZeroU64>,
+    ) -> anyhow::Result<u64> {
         let l1 = &self.l1;
         let outcome = poll::until(Budget::secs(300, 3), |_| async move {
+            if let Some(blocks) = mine {
+                l1.mine(blocks.get()).await?;
+            }
             Ok(Some(l1.covered_through().await?).filter(|end| *end >= block))
         })
         .await?;
@@ -506,11 +520,17 @@ impl<'a> FleetWipe<'a> {
 
     /// The batcher posts after H again, and L1's record has no gap and no
     /// overlap: the first new batch starts at H + 1.
+    ///
+    /// The batcher starts with no cursor file, so it reads its last batch
+    /// from the L1 follower's archive. The archive holds that batch once
+    /// its block is final. Anvil mines only for a transaction, and the
+    /// waiting batcher sends none, so the wait mines L1 blocks as a live
+    /// chain makes them.
     async fn assert_the_record_continues(&self, head: u64) -> anyhow::Result<()> {
         let next = head
             .checked_add(1)
             .ok_or_else(|| crate::chaos_fail!("{CTX}: block {head} overflows"))?;
-        self.await_posted_through(next).await?;
+        self.await_posted_through(next, Some(MINE_PER_POLL)).await?;
         self.l1.assert_contiguous(CTX).await
     }
 
