@@ -7,12 +7,15 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use crossbeam_channel::{Sender, bounded};
+use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_engine::ExecStreamItem;
+use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
 use kardamom_log::error::LogError;
 use kardamom_types::{BPosition, ExecTxRecord, TxEnvelope, TxRef};
 use rkyv::util::AlignedVec;
 use tokio_util::sync::CancellationToken;
 
+use super::cadence::CursorHandoff;
 use super::cursor::RecordedCursor;
 use super::locators::{LOCATOR_EVERY, Locator, LocatorLog};
 use super::publisher::{ExecStreamPublisher, PublisherInputs, StreamPublications};
@@ -78,6 +81,8 @@ impl FakePublications {
 }
 
 impl StreamPublications for FakePublications {
+    type CursorIngress = FakeIngress;
+
     fn session_id(&self) -> i32 {
         SESSION
     }
@@ -108,6 +113,8 @@ struct Rig {
     items: Sender<ExecStreamItem>,
     positions: Sender<i64>,
     handle: thread::JoinHandle<anyhow::Result<()>>,
+    /// The hand-off of the recorded cursor, until a test starts it.
+    cursor: Option<CursorHandoff<FakeIngress>>,
     _dir: tempfile::TempDir,
     path: std::path::PathBuf,
 }
@@ -119,18 +126,22 @@ impl Rig {
         let (items, items_rx) = bounded(depth);
         let (positions, positions_rx) = bounded(16);
         positions.send(0).expect("the start position");
+        let (cursor, cursor_sender) = CursorHandoff::new();
         let handle = ExecStreamPublisher::spawn(PublisherInputs {
             items: items_rx,
             positions: positions_rx,
             publications: pubs.clone(),
             locators: LocatorLog::open(&path).expect("open the locator log"),
+            answers: None,
             stop: CancellationToken::new(),
+            cursor: cursor_sender,
         })
         .expect("spawn");
         Self {
             items,
             positions,
             handle,
+            cursor: Some(cursor),
             _dir: dir,
             path,
         }
@@ -145,6 +156,17 @@ impl Rig {
         });
     }
 
+    /// Start the recorded cursor of executor 2 on `ingress`, or end the
+    /// hand-off with none.
+    fn start_cursor(&mut self, ingress: Option<&FakeIngress>) {
+        let publisher = ingress.map(|ingress| {
+            ClusterTxOrderingSubscription::new(FakeEgress::new())
+                .with_ingress(ingress.clone())
+                .recorded_cursor_publisher(2)
+        });
+        self.cursor.take().expect("one start").start(publisher);
+    }
+
     /// Close the reader side, join the publisher, and reopen the locator
     /// log it wrote. The recorder stays up until the publisher ended.
     fn finish(self) -> LocatorLog {
@@ -154,6 +176,7 @@ impl Rig {
             handle,
             _dir,
             path,
+            ..
         } = self;
         Self::hang_up(items);
         handle.join().expect("no panic").expect("a clean end");
@@ -374,4 +397,77 @@ fn a_recorder_end_ends_a_wait_for_a_refused_record() {
         .expect_err("a lost recording ends the wait");
     assert!(err.to_string().contains("recording ended"), "got {err}");
     assert_eq!(pubs.recorded_indices(), [] as [u64; 0]);
+}
+
+/// The cursors that reached `ingress`, from the kind-9 frames.
+fn sent_cursors(ingress: &FakeIngress) -> Vec<u64> {
+    ingress
+        .accepted()
+        .iter()
+        .map(|frame| u64::from_le_bytes(frame[2..10].try_into().expect("8 bytes")))
+        .collect()
+}
+
+/// Whether `check` holds within two seconds.
+fn eventually(mut check: impl FnMut() -> bool) -> bool {
+    std::iter::repeat_with(|| {
+        thread::sleep(Duration::from_millis(5));
+        check()
+    })
+    .take(400)
+    .any(|held| held)
+}
+
+/// The end position of the record with `index` on the recorded
+/// publication.
+fn end_of(pubs: &FakePublications, index: u64) -> i64 {
+    pubs.recorded
+        .lock()
+        .expect("lock")
+        .iter()
+        .find(|(i, _)| *i == index)
+        .expect("the record is offered")
+        .1
+}
+
+#[test]
+fn the_publisher_sends_only_recorded_cursors_on_the_cadence() {
+    let pubs = FakePublications::new(true);
+    let ingress = FakeIngress::new();
+    let mut rig = Rig::spawn(&pubs, 64);
+    rig.start_cursor(Some(&ingress));
+    rig.send_records(0..10);
+    assert!(eventually(|| pubs.recorded_indices().len() == 10));
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        sent_cursors(&ingress),
+        [] as [u64; 0],
+        "the archive has written no record yet"
+    );
+    rig.positions.send(end_of(&pubs, 4)).expect("position");
+    assert!(
+        eventually(|| sent_cursors(&ingress) == [4]),
+        "the first cursor goes out at once"
+    );
+    rig.positions.send(end_of(&pubs, 9)).expect("position");
+    assert!(
+        eventually(|| sent_cursors(&ingress) == [4, 9]),
+        "the next cursor goes out on the time cadence: {:?}",
+        sent_cursors(&ingress)
+    );
+    rig.finish();
+}
+
+#[test]
+fn the_publisher_sends_no_cursor_while_the_cursor_is_off() {
+    let pubs = FakePublications::new(true);
+    let ingress = FakeIngress::new();
+    let mut rig = Rig::spawn(&pubs, 64);
+    rig.start_cursor(None);
+    rig.send_records(0..10);
+    assert!(eventually(|| pubs.recorded_indices().len() == 10));
+    rig.positions.send(end_of(&pubs, 9)).expect("position");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(sent_cursors(&ingress), [] as [u64; 0]);
+    rig.finish();
 }

@@ -203,7 +203,20 @@ impl Probes {
     /// zero when the exporter answers without the label, `None` on a
     /// failed scrape.
     pub async fn aux_metric_where(&self, port: u16, metric: &str, label: &str) -> Option<i64> {
-        let body = self.scrape.fetch(&self.aux_target(port)).await?;
+        self.metric_where(&self.aux_target(port), metric, label)
+            .await
+    }
+
+    /// The label-filtered sum of `metric` on the validator: zero when the
+    /// exporter answers without the label, `None` on a failed scrape.
+    pub async fn val_metric_where(&self, metric: &str, label: &str) -> Option<i64> {
+        self.metric_where(&self.validator_target(), metric, label)
+            .await
+    }
+
+    /// The label-filtered sum of `metric` on `target`.
+    async fn metric_where(&self, target: &Target, metric: &str, label: &str) -> Option<i64> {
+        let body = self.scrape.fetch(target).await?;
         metrics::sum_where(&body, metric, label)
     }
 

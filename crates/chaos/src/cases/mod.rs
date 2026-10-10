@@ -21,10 +21,13 @@ pub(crate) mod deploy;
 pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
+pub(crate) mod peer_fetch;
+pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
 pub(crate) mod squeeze;
 pub(crate) mod validator;
+pub(crate) mod validator_catchup;
 
 /// Every case, by its CI name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,7 @@ pub enum Case {
     SequencerLaneLossRecover,
     PipelineBlackoutRecover,
     ArchiveDriverLoss,
+    ExecPeerFetch,
     ArchiveTxDataWipe,
     ArchiveCorruption,
     SequencerLapse,
@@ -62,6 +66,7 @@ pub enum Case {
     RetentionOverrunValidator,
     ValidatorLapse,
     ValidatorJoin,
+    ValidatorExecArchiveCatchup,
     CpuSqueeze,
     ResizeScaleOutIn,
     LookupBlackout,
@@ -78,7 +83,7 @@ pub enum Case {
     BatcherOutagePastRetention,
 }
 
-const ALL: [Case; 47] = [
+const ALL: [Case; 49] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -105,6 +110,7 @@ const ALL: [Case; 47] = [
     Case::SequencerLaneLossRecover,
     Case::PipelineBlackoutRecover,
     Case::ArchiveDriverLoss,
+    Case::ExecPeerFetch,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
     Case::SequencerLapse,
@@ -112,6 +118,7 @@ const ALL: [Case; 47] = [
     Case::RetentionOverrunValidator,
     Case::ValidatorLapse,
     Case::ValidatorJoin,
+    Case::ValidatorExecArchiveCatchup,
     Case::CpuSqueeze,
     Case::ResizeScaleOutIn,
     Case::LookupBlackout,
@@ -171,6 +178,7 @@ impl Case {
             Self::SequencerLaneLossRecover => "sequencer-lane-loss-recover",
             Self::PipelineBlackoutRecover => "pipeline-blackout-recover",
             Self::ArchiveDriverLoss => "archive-driver-loss",
+            Self::ExecPeerFetch => "exec-peer-fetch",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
             Self::SequencerLapse => "sequencer-lapse",
@@ -178,6 +186,7 @@ impl Case {
             Self::RetentionOverrunValidator => "retention-overrun-validator",
             Self::ValidatorLapse => "validator-lapse",
             Self::ValidatorJoin => "validator-join",
+            Self::ValidatorExecArchiveCatchup => "validator-exec-archive-catchup",
             Self::CpuSqueeze => "cpu-squeeze",
             Self::ResizeScaleOutIn => "resize-scale-out-in",
             Self::LookupBlackout => "lookup-blackout",
@@ -234,6 +243,10 @@ impl Case {
             Self::SequencerReplicaKill => inject + k.restart_slo + Duration::from_mins(1),
             Self::SequencerLapse => inject + k.seq_lapse + Duration::from_mins(1),
             Self::ValidatorLapse => inject + k.validator_lapse + Duration::from_mins(1),
+            // The stop, the restart of the job, and the catch-up polls.
+            Self::ValidatorExecArchiveCatchup => {
+                inject + k.validator_catchup_stop + Duration::from_mins(6)
+            }
             Self::RetentionOverrun
             | Self::RetentionOverrunValidator
             | Self::DaLagHalt
@@ -361,6 +374,7 @@ impl Case {
             Self::SequencerLaneLossRecover => coordinated::sequencer_lane_loss_recover(h).await,
             Self::PipelineBlackoutRecover => coordinated::pipeline_blackout_recover(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
+            Self::ExecPeerFetch => peer_fetch::exec_peer_fetch(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
             Self::SequencerLapse => seq_retention::sequencer_lapse(h).await,
@@ -372,6 +386,7 @@ impl Case {
             }
             Self::ValidatorLapse => validator::lapse(h).await,
             Self::ValidatorJoin => validator::join(h).await,
+            Self::ValidatorExecArchiveCatchup => validator_catchup::exec_archive_catchup(h).await,
             Self::CpuSqueeze => squeeze::cpu_squeeze(h).await,
             Self::ResizeScaleOutIn => resize::scale_out_in(h).await,
             Self::LookupBlackout => resize::lookup_blackout(h).await,

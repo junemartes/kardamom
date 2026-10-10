@@ -46,18 +46,20 @@
 pub mod cluster;
 mod exec_stream;
 mod join;
+mod peer_fetch;
 mod ports;
 mod source;
 mod threads;
 mod tx_data;
 mod void;
 
+pub(crate) use exec_stream::LocatorClient;
 pub use exec_stream::{
     ArchiveLocator, ExecArchive, ExecArchiveSeed, ExecFetchError, ExecRecordSubscription,
     ExecStreamJoin, ExecStreamSeed, ExecStreamSource, LiveExecArchive, LiveExecArchiveSeed,
-    LocatorAnswer, LocatorClient, LocatorError, QueryEndpoint, RecordBuffer,
+    LocatorAnswer,
 };
-pub use join::{JoinBuffer, ReaderConfig};
+pub use join::{JoinBuffer, OwnTail, ReaderConfig};
 pub use ports::{
     EpochObserver, ExecSink, ExecStreamItem, ExecStreamSink, JoinRecovery, JoinRecoveryError,
     JoinRecoveryFactory, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, RemoteEpochObserver,
@@ -71,6 +73,8 @@ pub use tx_data::{TxDataJoin, TxDataSeed, TxDataSource};
 mod tests;
 #[cfg(test)]
 mod tests_exec_stream;
+#[cfg(test)]
+mod tests_peer;
 #[cfg(test)]
 mod tests_remote;
 #[cfg(test)]

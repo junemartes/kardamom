@@ -76,6 +76,7 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "cluster node up",
     "cluster JOIN WEDGE",
     "cluster CATCHUP STALL",
+    "cluster COMPONENT CLOSED",
     "cluster LOG PURGE",
     "cluster SEED",
 ];

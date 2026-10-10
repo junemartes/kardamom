@@ -63,16 +63,21 @@ impl Shard {
                 "graceful-ingress",
                 "hard-ingress",
                 "archive-driver-loss",
+                "exec-peer-fetch",
                 "archive-tx-data-wipe",
                 "archive-corruption",
             ],
+            // The shard-0 cases and the other cases alternate so each one
+            // takes the next funded account and none burns: the accounts
+            // from #7 on sit on shards 0 0 0 1 0 1 1 0 1.
             Self::Sequencer => &[
                 "graceful-sequencer",
                 "hard-sequencer",
                 "sequencer-replica-kill",
-                "sequencer-lapse",
                 "validator-lapse",
+                "sequencer-lapse",
                 "validator-join",
+                "validator-exec-archive-catchup",
                 "lookup-blackout",
                 "resize-scale-out-in",
             ],
@@ -134,10 +139,17 @@ impl Shard {
     /// small egress retention so a freeze can overrun it; the L1 shard
     /// takes both, plus the fault proxy in front of the followers, and
     /// runs the batcher on the executor stream, so CI exercises the
-    /// switch before it flips.
+    /// switch before it flips. The
+    /// executor shard turns the recorded cursor on, so `hard-executor`
+    /// checks the sealer's best cursor while one executor is down. The
+    /// sequencer shard deploys the validator on the executor stream.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
+            Self::Executor => DeployVars {
+                exec_cursor: true,
+                ..DeployVars::default()
+            },
             Self::Cluster => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
                 ..DeployVars::default()
@@ -154,12 +166,13 @@ impl Shard {
                 batcher_tx_source: Some("exec-stream"),
                 ..DeployVars::default()
             },
-            Self::Executor
-            | Self::Ingress
-            | Self::Sequencer
-            | Self::Fleet
-            | Self::Coordinated
-            | Self::Cache => DeployVars::default(),
+            // The validator cases of this shard run on the executor
+            // stream, so CI exercises the switch before it flips.
+            Self::Sequencer => DeployVars {
+                validator_tx_source: Some("exec-stream"),
+                ..DeployVars::default()
+            },
+            Self::Ingress | Self::Fleet | Self::Coordinated | Self::Cache => DeployVars::default(),
         }
     }
 
@@ -188,12 +201,10 @@ impl Shard {
                 ("L1_FAULT_S", "60"),
                 ("KARDAMOM_BATCHER_TX_SOURCE", "exec-stream"),
             ],
-            Self::Executor
-            | Self::Ingress
-            | Self::Sequencer
-            | Self::Fleet
-            | Self::Coordinated
-            | Self::Cache => &[("RUN_LOAD", "0")],
+            Self::Executor => &[("RUN_LOAD", "0"), ("KARDAMOM_EXEC_CURSOR", "on")],
+            Self::Ingress | Self::Sequencer | Self::Fleet | Self::Coordinated | Self::Cache => {
+                &[("RUN_LOAD", "0")]
+            }
         }
     }
 }
@@ -222,7 +233,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 45);
+        assert_eq!(all.len(), 47);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -253,6 +264,18 @@ mod tests {
             Shard::L1
                 .env()
                 .contains(&(crate::lifecycle::BATCHER_TX_SOURCE_ENV, "exec-stream"))
+        );
+        assert_eq!(
+            Shard::Sequencer.deploy_vars().validator_tx_source,
+            Some("exec-stream")
+        );
+        // The executor shard deploys the recorded cursor and tells its
+        // cases so through the knob of the same name.
+        assert!(Shard::Executor.deploy_vars().exec_cursor);
+        assert!(
+            Shard::Executor
+                .env()
+                .contains(&("KARDAMOM_EXEC_CURSOR", "on"))
         );
         assert!(Shard::L1.audits_each_case() && !Shard::Retention.audits_each_case());
         assert_eq!(

@@ -1,31 +1,44 @@
 //! The stream publisher thread: it takes the reader's items in order,
 //! writes each record to the recorded and the live publication, keeps the
-//! locator log, and computes the recorded cursor.
+//! locator log, computes the recorded cursor, and sends the cursor to the
+//! sealer on its cadence.
 
 use std::ops::ControlFlow;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use crossbeam_channel::{Receiver, TryRecvError, select};
+use kardamom_cluster_adapter::gateway::ClusterIngress;
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::error::LogError;
+use kardamom_state::ExecAnswersFeed;
 use kardamom_types::ExecTxRecord;
 use rkyv::util::AlignedVec;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::cadence::CursorSender;
 use super::cursor::RecordedCursor;
 use super::locators::{LOCATOR_EVERY, Locator, LocatorLog};
 use super::metrics::ExecStreamMetrics;
 
-/// The two publications of the executor stream.
+/// The longest wait of the publisher thread for an item or a recording
+/// position. The cursor cadence runs at least this often.
+const IDLE_TICK: Duration = Duration::from_millis(20);
+
+/// The two publications of the executor stream, and the cluster session
+/// that the recorded cursor goes out on.
 ///
 /// The recorded publication is the one the local archive records. It
 /// cannot run ahead of the archive, so an offer can be refused while the
 /// archive is slow or gone. The live publication is lossy: a consumer
 /// repairs a gap from an archive.
 pub(crate) trait StreamPublications: Send + 'static {
+    /// The ingress of the cluster session that carries the recorded
+    /// cursor.
+    type CursorIngress: ClusterIngress + 'static;
+
     /// The Aeron session id of the recorded publication.
     fn session_id(&self) -> i32;
 
@@ -44,7 +57,7 @@ pub(crate) trait StreamPublications: Send + 'static {
 }
 
 /// Everything the publisher thread takes.
-pub(crate) struct PublisherInputs<P> {
+pub(crate) struct PublisherInputs<P: StreamPublications> {
     /// The reader's records and progress marks, in canonical order.
     pub(crate) items: Receiver<ExecStreamItem>,
     /// The recording positions that the recorder thread reads from the
@@ -52,8 +65,14 @@ pub(crate) struct PublisherInputs<P> {
     pub(crate) positions: Receiver<i64>,
     pub(crate) publications: P,
     pub(crate) locators: LocatorLog,
+    /// The answers state of the query endpoint. It gets a copy of each
+    /// locator that the log takes.
+    pub(crate) answers: Option<ExecAnswersFeed>,
     /// Cancelled at shutdown. It ends a wait for a refused record.
     pub(crate) stop: CancellationToken,
+    /// Sends the recorded cursor to the sealer, once the cluster session
+    /// is up.
+    pub(crate) cursor: CursorSender<P::CursorIngress>,
 }
 
 /// Whether the publisher loop goes on.
@@ -64,7 +83,7 @@ enum Flow {
 
 /// The state of the publisher thread. One thread owns it, so the locator
 /// log and the cursor need no lock.
-pub(crate) struct ExecStreamPublisher<P> {
+pub(crate) struct ExecStreamPublisher<P: StreamPublications> {
     inputs: PublisherInputs<P>,
     cursor: RecordedCursor,
     /// The records that this session published.
@@ -127,9 +146,10 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
         Ok(())
     }
 
-    /// Take the next reader item or recording position.
+    /// Take the next reader item or recording position, then send the
+    /// recorded cursor when it is due.
     fn step(&mut self) -> anyhow::Result<Flow> {
-        select! {
+        let flow = select! {
             recv(self.inputs.items) -> item => match item {
                 Ok(item) => self.on_item(item).map(|()| Flow::Continue),
                 Err(_) => Ok(Flow::Stop),
@@ -139,7 +159,17 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
                 ExecStreamMetrics::recorded(self.cursor.recorded(position));
                 Ok(Flow::Continue)
             },
-        }
+            default(IDLE_TICK) => Ok(Flow::Continue),
+        }?;
+        self.send_cursor();
+        Ok(flow)
+    }
+
+    /// Send the recorded cursor to the sealer when the cadence says so.
+    fn send_cursor(&mut self) {
+        self.inputs
+            .cursor
+            .tick(self.cursor.through(), Instant::now());
     }
 
     /// The recorder thread ended: the local recording is lost, or the
@@ -151,7 +181,8 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
         anyhow!("the local exec_txs recording ended")
     }
 
-    /// Take the recording positions that arrived while an offer waits.
+    /// Take the recording positions that arrived while an offer waits, and
+    /// send the recorded cursor when it is due.
     ///
     /// # Errors
     ///
@@ -162,6 +193,7 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
             Err(TryRecvError::Empty) => (),
             Err(TryRecvError::Disconnected) => return Err(Self::recording_ended()),
         }
+        self.send_cursor();
         Ok(())
     }
 
@@ -230,16 +262,23 @@ impl<P: StreamPublications> ExecStreamPublisher<P> {
                 session_id: self.inputs.publications.session_id(),
                 position: start,
             };
-            let _ =
-                self.inputs.locators.append(locator).inspect_err(
-                    |e| warn!(index, error = %e, "exec stream: locator append failed"),
-                );
+            match self.inputs.locators.append(locator) {
+                Ok(()) => self.share_locator(locator),
+                Err(e) => warn!(index, error = %e, "exec stream: locator append failed"),
+            }
         }
         self.records = self
             .records
             .checked_add(1)
             .context("the exec stream record count overflows u64")?;
         Ok(())
+    }
+
+    /// Send a locator that the log took to the answers state.
+    fn share_locator(&self, locator: Locator) {
+        if let Some(answers) = &self.inputs.answers {
+            answers.located(locator);
+        }
     }
 }
 

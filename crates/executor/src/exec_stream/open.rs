@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Sender, bounded};
+use kardamom_cluster_adapter::LiveIngress;
 use kardamom_engine::ExecStreamItem;
 use kardamom_log::aeron_live::{AeronRuntime, ExecTxsPublisherHandle, PubHandle};
 use kardamom_log::config::AeronConfig;
@@ -15,11 +16,13 @@ use kardamom_log::error::LogError;
 use kardamom_log::recorder::{
     PositionReport, RecordedStream, RecorderKind, RecorderThreads, record_stream_reporting,
 };
+use kardamom_state::ExecAnswersFeed;
 use rkyv::util::AlignedVec;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::locators::LocatorLog;
+use super::cadence::CursorHandoff;
+use super::locators::{Locator, LocatorLog};
 use super::publisher::{ExecStreamPublisher, PublisherInputs, StreamPublications};
 
 /// The recorded publication. An IPC publication cannot run ahead of its
@@ -46,6 +49,8 @@ struct AeronPublications {
 }
 
 impl StreamPublications for AeronPublications {
+    type CursorIngress = LiveIngress;
+
     fn session_id(&self) -> i32 {
         self.recorded.session_id()
     }
@@ -72,15 +77,26 @@ pub struct ExecStreamConfig<'a> {
     /// The state directory. The locator log is
     /// `<state_dir>/exec_stream/locators.log`.
     pub state_dir: &'a Path,
+    /// The answers state of the query endpoint, when it runs. It gets
+    /// every locator of the log.
+    pub answers: Option<ExecAnswersFeed>,
+    /// The first canonical index that this run reads on a resume.
+    pub resume_index: Option<u64>,
     /// Cancelled at shutdown.
     pub stop: CancellationToken,
 }
 
-/// The open executor stream: the reader's sink, and the threads behind it.
+/// The open executor stream: the reader's sink, the hand-off of the
+/// recorded cursor, and the threads behind them.
 pub struct ExecStream {
     /// The sink of the `tx_ordering` reader.
     pub sink: Sender<ExecStreamItem>,
+    /// Starts the recorded cursor once the cluster session is up.
+    pub cursor: CursorHandoff<LiveIngress>,
     pub threads: ExecStreamThreads,
+    /// The newest locator at or below the resume index: where the records
+    /// of an earlier run above the resume index start.
+    pub tail: Option<Locator>,
 }
 
 /// The publisher thread and the recorder thread of the executor stream.
@@ -133,7 +149,15 @@ impl ExecStream {
         Self::wait_ready(ready_rx, session_id).await?;
         let locators = LocatorLog::open(&cfg.state_dir.join("exec_stream").join("locators.log"))
             .context("open the exec stream locator log")?;
+        if let Some(answers) = &cfg.answers {
+            locators
+                .entries()
+                .iter()
+                .for_each(|&locator| answers.located(locator));
+        }
+        let tail = cfg.resume_index.and_then(|index| locators.lookup(index));
         let (sink, items) = bounded(ITEMS_DEPTH);
+        let (cursor, cursor_sender) = CursorHandoff::new();
         let publisher = ExecStreamPublisher::spawn(PublisherInputs {
             items,
             positions,
@@ -142,15 +166,19 @@ impl ExecStream {
                 live,
             },
             locators,
+            answers: cfg.answers,
             stop: cfg.stop,
+            cursor: cursor_sender,
         })
         .context("spawn the exec stream publisher")?;
         Ok(Self {
             sink,
+            cursor,
             threads: ExecStreamThreads {
                 publisher,
                 recorder,
             },
+            tail,
         })
     }
 

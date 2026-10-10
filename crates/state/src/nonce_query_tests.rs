@@ -49,7 +49,7 @@ async fn serves_the_committed_nonce_and_balance() {
         &[],
     )
     .unwrap();
-    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env, None).unwrap();
     let addr = server.addr;
 
     let nonce_reply =
@@ -84,7 +84,7 @@ async fn serves_the_committed_nonce_and_balance() {
 }
 
 /// A state DB with one committed block that holds one receipt.
-fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
+pub(crate) fn env_with_receipt(dir: &std::path::Path, receipt: &Receipt) -> StateEnv {
     use crate::writer::{StateWriter, TrieMode, WriteBatch};
     use kardamom_types::{BPosition, BlockBoundary, BlockDelta};
 
@@ -131,7 +131,7 @@ async fn serves_the_committed_receipt_by_hash_and_null_for_an_unknown_hash() {
     };
     let dir = tempfile::tempdir().unwrap();
     let env = env_with_receipt(dir.path(), &receipt);
-    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env, None).unwrap();
     let addr = server.addr;
     let ask = move |hash: B256| {
         post(
@@ -174,7 +174,7 @@ async fn serves_the_committed_receipt_by_hash_and_null_for_an_unknown_hash() {
 async fn rejects_other_methods_and_bad_input() {
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path()).open().unwrap();
-    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env, None).unwrap();
     let addr = server.addr;
 
     let wrong_method = tokio::task::spawn_blocking(move || {
@@ -317,7 +317,7 @@ fn env_with_two_blocks_and(dir: &std::path::Path, first_block: FirstBlock) -> St
 async fn serves_the_block_references_and_null_for_an_unknown_block() {
     let dir = tempfile::tempdir().unwrap();
     let env = env_with_two_blocks(dir.path());
-    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env, None).unwrap();
     let addr = server.addr;
     let ask = move |params: &'static str| {
         post(
@@ -424,7 +424,7 @@ async fn a_block_rebuilt_from_l1_is_refused_with_the_cause() {
     let env = env_with_two_blocks_and(dir.path(), |boundary, delta, _| {
         crate::writer::WriteBatch::rebuilt_from_l1(boundary, delta)
     });
-    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env).unwrap();
+    let server = serve_nonce_queries("127.0.0.1:0".parse().unwrap(), env, None).unwrap();
     let addr = server.addr;
     let ask = move |number: u64| {
         post(

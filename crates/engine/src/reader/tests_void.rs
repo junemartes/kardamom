@@ -2,8 +2,8 @@
 //! slots, and the three cases of a void record.
 //!
 //! No unit test can make an archive refuse a range, so these tests enter at
-//! [`TxOrderingReader::on_unjoinable`], the point the join reaches when every
-//! archive refused.
+//! [`TxOrderingReader::on_unjoined`], the point the join reaches when every
+//! archive failed.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -17,8 +17,9 @@ use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage, TxRef, Vo
 
 use super::join::TxDataKey;
 use super::tests::pos;
+use super::tests_peer::ParkRig;
 use super::threads::Flow;
-use super::void::{MAX_READ_AHEAD, ParkOutcome, ReadAhead, VoidPark};
+use super::void::{MAX_READ_AHEAD, ParkOutcome, ReadAhead};
 use super::*;
 use crate::error::ExecutorError;
 
@@ -26,7 +27,7 @@ pub(super) type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
 
 /// An ordering subscription over a fixed queue. It records every vote.
 pub(super) struct VotingSub {
-    queue: VecDeque<(BPosition, TxOrderingMessage)>,
+    pub(super) queue: VecDeque<(BPosition, TxOrderingMessage)>,
     pub(super) votes: Votes,
     outcome: OfferOutcome,
 }
@@ -66,14 +67,14 @@ impl TxOrderingSubscription for VotingSub {
     }
 }
 
-const LOST: B256 = B256::repeat_byte(0xA1);
+pub(super) const LOST: B256 = B256::repeat_byte(0xA1);
 const NEXT: B256 = B256::repeat_byte(0xA2);
 
-fn tx_ref(hash: B256, data_offset: i32) -> TxRef {
+pub(super) fn tx_ref(hash: B256, data_offset: i32) -> TxRef {
     TxRef::new(hash, 0, pos(data_offset), 0)
 }
 
-fn boundary(block_number: u64) -> TxOrderingMessage {
+pub(super) fn boundary(block_number: u64) -> TxOrderingMessage {
     TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
         block_number,
         end_tx_idx: pos(0),
@@ -82,22 +83,22 @@ fn boundary(block_number: u64) -> TxOrderingMessage {
     })
 }
 
-fn void(index: u64, tx_hash: B256) -> TxOrderingMessage {
+pub(super) fn void(index: u64, tx_hash: B256) -> TxOrderingMessage {
     TxOrderingMessage::Void(VoidRecord { index, tx_hash })
 }
 
-fn voter_cfg() -> ReaderConfig {
+pub(super) fn voter_cfg() -> ReaderConfig {
     ReaderConfig {
         voter_id: Some(3),
         ..ReaderConfig::default()
     }
 }
 
-type TestReader =
+pub(super) type TestReader =
     TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream, TxDataJoin>;
 
 /// A reader over `sub`, with its exec sink's far end.
-fn reader(
+pub(super) fn reader(
     sub: VotingSub,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
@@ -119,7 +120,7 @@ fn reader(
 /// The slot kinds the executor received, in order: `V` for a vacant slot,
 /// `T` for a transaction, each with its canonical index, and `B` for a
 /// boundary with its block number.
-fn slots(rx: &Receiver<ReaderToExec>) -> Vec<(char, u64)> {
+pub(super) fn slots(rx: &Receiver<ReaderToExec>) -> Vec<(char, u64)> {
     rx.try_iter()
         .map(|msg| match msg {
             ReaderToExec::Vacant { position } => ('V', position.as_index()),
@@ -153,7 +154,7 @@ fn a_voter_drops_the_entry_when_the_void_record_arrives() {
     let (mut reader, rx) = reader(sub, buffer, voter_cfg());
 
     let flow = reader
-        .on_unjoinable(&tx_ref(LOST, 10), pos(0))
+        .on_unjoined(&tx_ref(LOST, 10), pos(0), true)
         .expect("voided");
     assert!(matches!(flow, Flow::Continue));
     // Nothing behind the entry reached the executor during the wait.
@@ -179,7 +180,7 @@ fn a_consumer_that_is_no_voter_stops_as_before() {
     let sub = VotingSub::new(1, vec![void(0, LOST)]);
     let votes = sub.votes.clone();
     let (mut reader, _rx) = reader(sub, JoinBuffer::new(), ReaderConfig::default());
-    let err = reader.on_unjoinable(&tx_ref(LOST, 10), pos(0)).err();
+    let err = reader.on_unjoined(&tx_ref(LOST, 10), pos(0), true).err();
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
     assert!(votes.lock().unwrap().is_empty());
 }
@@ -193,7 +194,7 @@ fn a_wait_that_ends_with_no_void_record_stops_the_reader() {
     let sub = VotingSub::new(1, vec![void(0, LOST)]);
     let votes = sub.votes.clone();
     let (mut reader, rx) = reader(sub, JoinBuffer::new(), cfg);
-    let err = reader.on_unjoinable(&tx_ref(LOST, 10), pos(0)).err();
+    let err = reader.on_unjoined(&tx_ref(LOST, 10), pos(0), true).err();
     assert!(matches!(err, Some(ExecutorError::JoinTimeout { .. })));
     // The vote went out before the wait ended: the sealer keeps it.
     assert_eq!(votes.lock().unwrap().len(), 1);
@@ -206,7 +207,7 @@ fn a_void_record_for_another_entry_does_not_end_the_wait() {
     let (mut reader, rx) = reader(sub, JoinBuffer::new(), voter_cfg());
     // The order closes before the right record comes: a clean stop.
     let flow = reader
-        .on_unjoinable(&tx_ref(LOST, 10), pos(0))
+        .on_unjoined(&tx_ref(LOST, 10), pos(0), true)
         .expect("closed");
     assert!(matches!(flow, Flow::Stop));
     assert!(slots(&rx).is_empty());
@@ -232,23 +233,12 @@ fn a_void_record_below_the_first_index_counts_its_own_slot_only() {
     assert_eq!(slots(&rx), vec![('V', 6), ('B', 9)]);
 }
 
-fn park<'a>(
-    sub: &'a mut VotingSub,
-    backlog: &'a mut ReadAhead,
-    index: u64,
-) -> VoidPark<'a, VotingSub> {
-    let record = VoidRecord {
-        index,
-        tx_hash: LOST,
-    };
-    VoidPark::new(sub, backlog, 3, record, Duration::from_mins(1))
-}
-
 #[test]
 fn the_voter_sends_its_vote_again_after_the_interval() {
     let mut sub = VotingSub::new(0, vec![boundary(1), boundary(2), void(0, LOST)]);
     let mut backlog = ReadAhead::new();
-    let mut wait = park(&mut sub, &mut backlog, 0);
+    let mut rig = ParkRig::default();
+    let mut wait = rig.park(&mut sub, &mut backlog, 0);
     // An interval of zero has elapsed at every message.
     wait.revote_after = Duration::ZERO;
     let outcome = wait.run().expect("voided");
@@ -262,7 +252,10 @@ fn the_voter_sends_its_vote_again_after_the_interval() {
 fn the_voter_sends_one_vote_inside_the_interval() {
     let mut sub = VotingSub::new(0, vec![boundary(1), boundary(2), void(0, LOST)]);
     let mut backlog = ReadAhead::new();
-    let outcome = park(&mut sub, &mut backlog, 0).run().expect("voided");
+    let outcome = ParkRig::default()
+        .park(&mut sub, &mut backlog, 0)
+        .run()
+        .expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
     assert_eq!(sub.votes.lock().unwrap().len(), 1);
 }
@@ -272,7 +265,10 @@ fn a_session_that_refuses_the_vote_does_not_stop_the_wait() {
     let mut sub = VotingSub::new(0, vec![void(0, LOST)]);
     sub.outcome = OfferOutcome::NotConnected;
     let mut backlog = ReadAhead::new();
-    let outcome = park(&mut sub, &mut backlog, 0).run().expect("voided");
+    let outcome = ParkRig::default()
+        .park(&mut sub, &mut backlog, 0)
+        .run()
+        .expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
 }
 
@@ -285,7 +281,10 @@ fn the_wait_reads_the_backlog_first_and_keeps_the_canonical_order() {
         .map(|msg| (pos(0), msg))
         .collect();
     let mut sub = VotingSub::new(0, vec![boundary(3)]);
-    let outcome = park(&mut sub, &mut backlog, 5).run().expect("voided");
+    let outcome = ParkRig::default()
+        .park(&mut sub, &mut backlog, 5)
+        .run()
+        .expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
     let blocks: Vec<Option<u64>> = backlog
         .iter()
@@ -300,7 +299,10 @@ fn the_read_ahead_has_a_bound() {
     let queue: Vec<TxOrderingMessage> = (0..=MAX_READ_AHEAD as u64).map(boundary).collect();
     let mut sub = VotingSub::new(0, queue);
     let mut backlog = ReadAhead::new();
-    let outcome = park(&mut sub, &mut backlog, 0).run().expect("bound");
+    let outcome = ParkRig::default()
+        .park(&mut sub, &mut backlog, 0)
+        .run()
+        .expect("bound");
     assert!(matches!(outcome, ParkOutcome::GaveUp));
     assert_eq!(backlog.len(), MAX_READ_AHEAD);
 }

@@ -96,7 +96,11 @@ impl ArchiveAccess<'_> {
         &mut self,
         executor_query_endpoints: &[String],
     ) -> Result<Option<LiveExecArchiveSeed>> {
-        let locator = LocatorClient::new(executor_query_endpoints).map_err(anyhow::Error::msg)?;
+        let locator = LocatorClient::new(
+            executor_query_endpoints,
+            kardamom_state::exec_peers::DEFAULT_PEER_TIMEOUT,
+        )
+        .map_err(anyhow::Error::msg)?;
         let stream_id = self.plane.channels().exec_txs_stream_id;
         let sources = ArchiveSources::of(self.plane, self.aeron_cfg);
         let local = LocalRefetch::new(

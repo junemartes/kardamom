@@ -39,12 +39,13 @@ code = [
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
-# to 7. The sealer itself writes kind 8 into its log. The sealer reads
-# kind 9 (the recorded cursor), but no service sends it in this release:
-# the executor does not start its publisher. The sealer orders an unknown
-# kind of 85 bytes or more as a user record, and drops a shorter one. Thus
-# a new kind that changes the replicated state can fork members that run
-# different versions.
+# to 7. The sealer itself writes kind 8 into its log. The executor sends
+# kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
+# (--exec-cursor); the default is off. The sealer orders an unknown kind
+# of 85 bytes or more as a user record, and drops a shorter one. Thus a
+# new kind that changes the replicated state can fork members that run
+# different versions. The 10-byte kind 9 drops on an older member, but
+# switch the flag on only after every member reads kind 9.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
@@ -53,7 +54,9 @@ shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_RECORDED_CURSOR",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
+    "crates/executor/src/bin/kardamom-executor/args.rs#KARDAMOM_EXEC_CURSOR",
 ]
+activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
@@ -187,6 +190,15 @@ L1Cursor = "7 0x0707070707070707070707070707070707070707070707070707070707070707
 # archives: receipts, block deltas, boundaries, service events, transaction
 # status, transaction errors, and transaction envelopes. An enum adds a
 # variant only at the end.
+#
+# `HaltCause` (inside `ServiceEvent`) adds `RecordLag` and then
+# `ExecRecordMismatch`, each one last, with `RecoveryId` the same way. A
+# reader of the release before a variant fails the validation of an event
+# that names it, and drops that event as a malformed frame; the next event
+# decodes (crates/types/tests/service_event_compat.rs). The events stream is
+# best effort and changes no canonical state. An older board then shows the
+# publisher as gone after 15 s, and a gone record pauses nothing. So the
+# version stays 1.
 [format.aeron-stream-records]
 writes = 1
 reads_min = 1

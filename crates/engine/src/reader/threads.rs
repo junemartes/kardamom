@@ -154,7 +154,7 @@ pub struct TxOrderingReader<O, S, E, J> {
     cfg: ReaderConfig,
     exec_out: S,
     exec_stream: E,
-    join: J,
+    pub(super) join: J,
     /// The canonical index of the first record this reader read. A void
     /// record for an entry below it names an entry that an earlier run of
     /// this consumer already passed.
@@ -222,12 +222,13 @@ where
             exec_stream,
             join,
         } = inputs;
+        let join = join.build(&cfg);
         Self {
             sub,
             cfg,
             exec_out,
             exec_stream,
-            join: join.build(),
+            join,
             first_index: None,
             backlog: ReadAhead::new(),
             dropped: BTreeSet::new(),
@@ -395,7 +396,7 @@ where
             Err(ExecutorError::TxOrderingClosed) => return Ok(Flow::Stop),
             Err(e) => return Err(e),
         };
-        self.first_index.get_or_insert(position.as_index());
+        self.note_first(position.as_index());
         let through = Self::last_slot(position, &msg);
         match self.dispatch(position, msg)? {
             Flow::Continue => self.mark(through),
@@ -415,12 +416,24 @@ where
             .checked_add(slot_width(msg).checked_sub(1)?)
     }
 
+    /// Keep the index of the first message, and tell the answers state.
+    fn note_first(&mut self, index: u64) {
+        if self.first_index.is_some() {
+            return;
+        }
+        self.first_index = Some(index);
+        self.cfg.tell_answers(|answers| answers.first(index));
+    }
+
     /// Send the progress mark of a dispatched message, when it takes a
-    /// slot.
+    /// slot, to the executor stream and to the answers state.
     fn mark(&self, through: Option<u64>) -> Result<Flow, ExecutorError> {
         through
             .map_or(Ok(()), |t| self.exec_stream.passed(t))
             .map_err(|_| Self::stream_closed())?;
+        if let Some(t) = through {
+            self.cfg.tell_answers(|answers| answers.passed(t));
+        }
         Ok(Flow::Continue)
     }
 
@@ -473,12 +486,14 @@ where
     E: ExecStreamSink,
 {
     /// The reader at the point a `tx_data` join reaches when every archive
-    /// refused the entry. No unit test can make an archive refuse a
-    /// range, so the void tests enter here.
-    pub(super) fn on_unjoinable(
+    /// failed the entry: refused it (`every_archive_refused`) or gave no
+    /// definite answer. No unit test can make an archive fail a range, so
+    /// the void and peer tests enter here.
+    pub(super) fn on_unjoined(
         &mut self,
         tx_ref: &kardamom_types::TxRef,
         position: BPosition,
+        every_archive_refused: bool,
     ) -> Result<Flow, ExecutorError> {
         let at = JoinAt {
             tx_ref,
@@ -487,7 +502,7 @@ where
             order: &mut self.sub,
             backlog: &mut self.backlog,
         };
-        let joined = super::tx_data::TxDataJoin::on_unjoinable(at)?;
+        let joined = self.join.on_unjoined(at, every_archive_refused)?;
         self.on_joined(joined, *tx_ref, position)
     }
 }

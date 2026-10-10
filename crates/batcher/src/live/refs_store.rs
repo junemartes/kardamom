@@ -40,7 +40,27 @@ pub(crate) struct BlockRefs {
     /// answers without it. The rebuild from the executor archives replays
     /// from it first, and asks the executors for a record it still lacks.
     #[serde(default)]
-    pub(crate) exec_locator: Option<ArchiveLocator>,
+    pub(crate) exec_locator: Option<BlockLocator>,
+}
+
+/// The `exec_locator` of a block, as an executor serves it with the
+/// references: the archive, the session of the recording, and a raw
+/// position at or before the block's first record.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub(crate) struct BlockLocator {
+    pub(crate) archive_id: String,
+    pub(crate) session_id: i32,
+    pub(crate) position: i64,
+}
+
+impl From<&BlockLocator> for ArchiveLocator {
+    fn from(at: &BlockLocator) -> Self {
+        Self {
+            archive_id: at.archive_id.clone(),
+            session_id: at.session_id,
+            position: at.position,
+        }
+    }
 }
 
 /// One transaction of a block: its hash, its canonical position, and

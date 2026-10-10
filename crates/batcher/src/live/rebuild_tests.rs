@@ -10,6 +10,7 @@ use kardamom_types::{ExecTxRecord, TxRef};
 
 use super::*;
 use crate::batcher::{BatcherConfig, pack_blocks};
+use crate::live::refs_store::BlockLocator;
 
 /// A signed-looking envelope: the hash is the keccak of the bytes, as the
 /// proxy computes it.
@@ -321,7 +322,11 @@ fn the_locator_of_the_block_refs_needs_no_query() {
     let live = live_range();
     let mut refs = live.iter().map(refs_of).collect::<Vec<_>>();
     for b in &mut refs {
-        b.exec_locator = Some(locator("executor-2"));
+        b.exec_locator = Some(BlockLocator {
+            archive_id: "executor-2".to_owned(),
+            session_id: 3,
+            position: 0,
+        });
     }
     let archives = FakeExecArchives::default()
         .answering(LocatorAnswer::NotReached)

@@ -130,12 +130,21 @@ pub struct Knobs {
     /// The validator-lapse freeze window. The default is the evicting
     /// freeze of the stall tolerance.
     pub validator_lapse: Duration,
+    /// How long validator-exec-archive-catchup keeps the validator job
+    /// stopped. The live executor stream holds nothing for a validator
+    /// that was away, so every record of the window comes from an
+    /// executor archive.
+    pub validator_catchup_stop: Duration,
     /// The cluster egress retention the cluster was deployed with, in
     /// frames. The retention cases need it; other cases ignore it.
     pub cluster_retention: Option<NonZeroU64>,
     /// The sealer's DA-lag budget in blocks, when the shard deploys one
     /// (`KARDAMOM_DA_LAG_BUDGET_BLOCKS`). The DA cases need it small.
     pub da_lag_budget_blocks: Option<NonZeroU64>,
+    /// Whether the deployed executors send their recorded cursor to the
+    /// sealer (`KARDAMOM_EXEC_CURSOR=on`). `hard-executor` checks the
+    /// sealer's best cursor only then.
+    pub exec_cursor: bool,
     /// The hard cap of the adaptive retention freeze.
     pub retention_freeze_cap: Duration,
     /// How long one L1 fault of the chaos-l1 cases stays active.
@@ -287,8 +296,10 @@ impl Knobs {
             aeron_stall,
             seq_lapse: env.secs("SEQ_LAPSE_S", lapse_s)?,
             validator_lapse: env.secs("LAPSE_S", lapse_s)?,
+            validator_catchup_stop: env.secs("VALIDATOR_CATCHUP_STOP_S", 90)?,
             cluster_retention: retention,
             da_lag_budget_blocks: da_lag_budget,
+            exec_cursor: env.or("KARDAMOM_EXEC_CURSOR", "off") == "on",
             retention_freeze_cap: env.secs("RETENTION_FREEZE_CAP_S", 600)?,
             l1_fault: env.secs("L1_FAULT_S", 60)?,
             l1_tps: env.nonzero_u32("L1_CASE_TPS", 50)?,

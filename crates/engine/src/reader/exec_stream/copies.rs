@@ -66,7 +66,7 @@ const BOUNDS: Bounds = Bounds {
 /// The buffer of executor stream records, keyed by canonical index. The
 /// feed thread and the replays of the wait insert. The `tx_ordering`
 /// reader takes.
-pub struct RecordBuffer(KeyedBuffer<u64, Copies>);
+pub(super) struct RecordBuffer(KeyedBuffer<u64, Copies>);
 
 impl Default for RecordBuffer {
     fn default() -> Self {
@@ -77,7 +77,7 @@ impl Default for RecordBuffer {
 impl RecordBuffer {
     /// Insert one record under its index. A refused copy counts by its
     /// reason: `repeat` is the dedup of the copies of the other executors.
-    pub fn insert(&self, record: ExecTxRecord) {
+    pub(super) fn insert(&self, record: ExecTxRecord) {
         let inserted = self.0.insert(record.index, record);
         if let Some(skip) = inserted.refused {
             ::metrics::counter!(EXEC_STREAM_DROPPED_TOTAL, "reason" => skip.id()).increment(1);
@@ -91,19 +91,7 @@ impl RecordBuffer {
     /// The copies of `index`, after a wait of up to `timeout`. `None`
     /// when no copy arrived, or when the live head is far ahead.
     #[must_use]
-    pub fn take(&self, index: u64, timeout: Duration) -> Option<Vec<ExecTxRecord>> {
+    pub(super) fn take(&self, index: u64, timeout: Duration) -> Option<Vec<ExecTxRecord>> {
         self.0.take(index, timeout).current.map(|copies| copies.0)
-    }
-
-    /// The count of buffered indices.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether no index is buffered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }

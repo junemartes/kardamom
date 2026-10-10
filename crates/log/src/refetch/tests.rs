@@ -1,6 +1,6 @@
 use kardamom_types::BPosition;
 
-use super::{FakeArchiveCatalog, FoundRecording, Origin, RecordedLimit, ReplayPlan, Wanted};
+use super::{FakeArchiveCatalog, FoundRecording, RecordedLimit, ReplayFrom, ReplayPlan, Wanted};
 use crate::error::LogError;
 
 /// The raw position `term_id * 65536 + term_offset` of the fake layout.
@@ -21,31 +21,9 @@ fn pick(recordings: &[(i64, i64, Option<i64>)], raw: i64) -> Option<i64> {
     let wanted = Wanted {
         stream_id: 0,
         session_id: 0,
-        from: Origin::Term(at(raw)),
+        from: ReplayFrom::Fragment(at(raw)),
     };
     wanted.resolve(recs).ok().map(|l| l.rec.recording_id)
-}
-
-/// [`pick`], with the range named by its raw position, as a locator of the
-/// executor stream names it.
-fn pick_raw(recordings: &[(i64, i64, Option<i64>)], raw: i64) -> Option<i64> {
-    let recs = recordings
-        .iter()
-        .map(|&(id, start, stop)| FoundRecording::fake(id, start, stop))
-        .collect();
-    let wanted = Wanted {
-        stream_id: 0,
-        session_id: 0,
-        from: Origin::Raw(raw),
-    };
-    wanted.resolve(recs).ok().map(|l| l.rec.recording_id)
-}
-
-#[test]
-fn a_raw_origin_picks_the_recording_a_term_origin_picks() {
-    for raw in [50_000, 100_000, 250_000, 350_000, 400_000, 900_000] {
-        assert_eq!(pick_raw(&TWO, raw), pick(&TWO, raw), "raw {raw}");
-    }
 }
 
 /// Two recordings of one session: recording 15 ended at 300000, and the
@@ -131,7 +109,7 @@ fn only_the_recordings_of_the_session_count() {
     let wanted = Wanted {
         stream_id: 0,
         session_id: 0,
-        from: Origin::Term(at(250_000)),
+        from: ReplayFrom::Fragment(at(250_000)),
     };
     assert!(wanted.resolve(recs).is_err());
 }

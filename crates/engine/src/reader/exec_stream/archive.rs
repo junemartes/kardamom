@@ -3,16 +3,17 @@
 
 use alloy_primitives::B256;
 use kardamom_log::error::LogError;
-use kardamom_log::refetch::{ArchiveRefetcher, ExecReplay, RefetchConfig};
+use kardamom_log::refetch::{ArchiveRefetcher, ExecRecordsAt, RefetchConfig};
+use kardamom_state::PeerError;
 use kardamom_types::ExecTxRecord;
 
-use super::locator::{ArchiveLocator, LocatorAnswer, LocatorClient, LocatorError};
+use super::locator::{ArchiveLocator, LocatorAnswer, LocatorClient};
 
 /// A refetch step of the executor stream failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecFetchError {
     #[error(transparent)]
-    Locator(#[from] LocatorError),
+    Locator(#[from] PeerError),
     #[error(transparent)]
     Archive(#[from] LogError),
 }
@@ -142,9 +143,9 @@ impl ExecArchive for LiveExecArchive {
         at: &ArchiveLocator,
         sink: impl FnMut(ExecTxRecord),
     ) -> Result<u64, ExecFetchError> {
-        let replay = ExecReplay {
-            stream_id: self.stream_id,
+        let replay = ExecRecordsAt {
             archive_id: &at.archive_id,
+            stream_id: self.stream_id,
             session_id: at.session_id,
             position: at.position,
         };

@@ -48,8 +48,8 @@ pub use kardamom_exec_core::{
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
     EpochObserver, ExecStreamItem, ExecStreamSink, JoinBuffer, NoEpochCheck, NoExecStream,
-    NoRemoteEpochCheck, ReaderConfig, ReaderToExec, RemoteEpochObserver, TxDataSubscription,
-    TxOrderingSubscription,
+    NoRemoteEpochCheck, OwnTail, ReaderConfig, ReaderToExec, RemoteEpochObserver,
+    TxDataSubscription, TxOrderingSubscription,
 };
 pub use replay::{
     CanonicalEnd, ReplayBlock, ReplayError, ReplayGenesis, ReplayOutcome, replay_blocks,

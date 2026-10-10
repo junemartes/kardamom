@@ -186,7 +186,7 @@ async fn the_exec_locator_of_a_block_is_read_when_present() {
     assert_eq!(blocks[0].exec_locator, None);
     assert_eq!(
         blocks[1].exec_locator,
-        Some(ArchiveLocator {
+        Some(BlockLocator {
             archive_id: "executor-1".to_owned(),
             session_id: 5,
             position: 4096,

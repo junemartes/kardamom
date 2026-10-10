@@ -147,12 +147,13 @@ impl<X: ExecArchive> EnvelopeSource for ExecArchiveEnvelopes<X> {
             executors = self.archive.executors(),
             "rebuild: reading the executor archives"
         );
-        let mut hints: Vec<&ArchiveLocator> = blocks
+        let mut hints: Vec<ArchiveLocator> = blocks
             .iter()
             .filter_map(|b| b.exec_locator.as_ref())
+            .map(ArchiveLocator::from)
             .collect();
         hints.dedup();
-        for at in hints {
+        for at in &hints {
             self.replay(&mut fetch, at);
         }
         while let Some((index, tx_hash)) = fetch.lowest_missing() {

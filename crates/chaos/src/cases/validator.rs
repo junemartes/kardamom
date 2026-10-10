@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::harness::Harness;
 use crate::poll::{self, Budget};
 
-const VERIFIED: &str = "validator_blocks_verified_total";
-const COMMITTED: &str = "validator_committed_block";
+pub(crate) const VERIFIED: &str = "validator_blocks_verified_total";
+pub(crate) const COMMITTED: &str = "validator_committed_block";
 pub(crate) const DIVERGENCE: &str = "validator_divergence_total";
 const BAL_MISSING: &str = "validator_bal_missing_total";
 
@@ -87,7 +87,7 @@ async fn validator_inner(h: &Harness, ctx: &str) -> anyhow::Result<String> {
 
 /// Forensics for a validator failure: the Nomad view, the node's
 /// containers, and the validator's log tail.
-async fn val_debug(h: &Harness) {
+pub(crate) async fn val_debug(h: &Harness) {
     let node = &h.probes.validator.container;
     crate::log("validator DEBUG: containers on the validator node:");
     println!(
@@ -134,9 +134,10 @@ pub(crate) async fn lapse(h: &mut Harness) -> anyhow::Result<()> {
             )
         })?;
     crate::log(format!(
-        "validator-lapse: warmed up ({}) after {}s",
+        "validator-lapse: warmed up ({}) after {}s, tx source {}",
         warm_line(warm),
-        warm.elapsed.as_secs()
+        warm.elapsed.as_secs(),
+        super::validator_catchup::deployed_tx_source(h).await
     ));
     let m0 = h.probes.val_metric(BAL_MISSING).await.unwrap_or(0);
     let vf0 = h.probes.val_metric(VERIFIED).await.unwrap_or(0);
@@ -341,8 +342,9 @@ pub(crate) async fn join(h: &mut Harness) -> anyhow::Result<()> {
             )
         })?;
     crate::log(format!(
-        "validator-join: warmed up ({}); wiping the validator for a fresh join",
-        warm_line(warm)
+        "validator-join: warmed up ({}), tx source {}; wiping the validator for a fresh join",
+        warm_line(warm),
+        super::validator_catchup::deployed_tx_source(h).await
     ));
     let started0 = h.nodes.started_at(&node, &inner).await;
     h.nodes

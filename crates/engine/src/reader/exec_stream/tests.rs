@@ -143,17 +143,13 @@ impl Chain {
         record
     }
 
-    /// The canonical order: a `TxRef` at each of `indices`.
-    fn order(&self, indices: impl IntoIterator<Item = u64>) -> Vec<(BPosition, TxOrderingMessage)> {
-        indices
-            .into_iter()
-            .map(|i| {
-                (
-                    BPosition::from_index(i),
-                    TxOrderingMessage::TxRef(self.tx_ref(i)),
-                )
-            })
-            .collect()
+    /// The canonical order from `start`: a `TxRef` at each of the `count`
+    /// indices.
+    fn order(&self, start: u64, count: u64) -> VotingSub {
+        let refs = (start..start + count)
+            .map(|i| TxOrderingMessage::TxRef(self.tx_ref(i)))
+            .collect();
+        VotingSub::new(start, refs)
     }
 }
 
@@ -218,15 +214,6 @@ impl Run {
 /// Close the feed, so its thread ends.
 fn drop_sender(_feed: Sender<ExecTxRecord>) {}
 
-/// A fixed order that closes when empty.
-struct Order(std::collections::VecDeque<(BPosition, TxOrderingMessage)>);
-
-impl TxOrderingSubscription for Order {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.pop_front().ok_or(ExecutorError::TxOrderingClosed)
-    }
-}
-
 /// The transactions the exec thread got, as `(index, tx_hash)`.
 fn txs(out: &[ReaderToExec]) -> Vec<(u64, B256)> {
     out.iter()
@@ -257,7 +244,7 @@ fn three_copies_of_each_record_reach_the_exec_thread_once() {
         .flat_map(|i| [chain.record(i), chain.record(i), chain.record(i)])
         .collect();
     let run = Run::start(
-        Order(chain.order(0..3).into()),
+        chain.order(0, 3),
         live,
         FakeArchive::default(),
         cfg(Duration::from_secs(5)),
@@ -282,7 +269,7 @@ fn a_copy_that_fails_the_check_drops_and_the_good_copy_wins() {
     assert_eq!(canonical.reject(&chain.record(2)), None);
 
     let run = Run::start(
-        Order(chain.order([2]).into()),
+        chain.order(2, 1),
         vec![chain.forged(2), chain.record(2)],
         FakeArchive::default(),
         cfg(Duration::from_secs(5)),
@@ -305,7 +292,7 @@ fn a_gap_in_the_live_stream_fills_from_an_executor_archive() {
     let replays = archive.replays.clone();
     // The live stream lost 5 and 6, and delivered 7.
     let run = Run::start(
-        Order(chain.order(5..8).into()),
+        chain.order(5, 3),
         vec![chain.record(7)],
         archive,
         cfg(Duration::from_millis(50)),
@@ -388,7 +375,7 @@ fn a_restart_refetches_its_cursor_range_without_the_live_wait() {
     let replays = archive.replays.clone();
     let began = Instant::now();
     let run = Run::start(
-        Order(chain.order(start..start + 4).into()),
+        chain.order(start, 4),
         live,
         archive,
         cfg(Duration::from_secs(30)),
@@ -416,7 +403,7 @@ fn every_archive_with_a_mismatched_record_stops_the_reader() {
         ..FakeArchive::default()
     };
     let run = Run::start(
-        Order(chain.order([9]).into()),
+        chain.order(9, 1),
         vec![chain.forged(9)],
         archive,
         cfg(Duration::from_millis(50)),
@@ -468,60 +455,29 @@ fn a_mismatch_with_one_executor_unanswered_waits() {
 }
 
 #[test]
-fn a_locator_answer_parses_once() {
-    let located: LocatorAnswer = serde_json::from_str(
-        r#"{"status":"located","archive_id":"executor-1","session_id":-5,"position":4096}"#,
-    )
-    .unwrap();
+fn a_peer_answer_maps_to_the_consumer_answer() {
+    use kardamom_state::ExecLocatorAnswer;
+    let located = ExecLocatorAnswer::Located {
+        archive_id: "executor-1".into(),
+        session_id: -5,
+        position: 4096,
+    };
     assert_eq!(
-        located,
+        LocatorAnswer::from(located),
         LocatorAnswer::Located(ArchiveLocator {
             archive_id: "executor-1".into(),
             session_id: -5,
             position: 4096,
         })
     );
-    for (raw, want) in [
-        (r#"{"status":"not_held"}"#, LocatorAnswer::NotHeld),
-        (r#"{"status":"not_reached"}"#, LocatorAnswer::NotReached),
-        (r#"{"status":"lost"}"#, LocatorAnswer::Lost),
+    for (peer, want) in [
+        (ExecLocatorAnswer::NotHeld, LocatorAnswer::NotHeld),
+        (ExecLocatorAnswer::NotReached, LocatorAnswer::NotReached),
+        (ExecLocatorAnswer::Lost, LocatorAnswer::Lost),
     ] {
-        assert_eq!(serde_json::from_str::<LocatorAnswer>(raw).unwrap(), want);
+        assert_eq!(LocatorAnswer::from(peer), want);
     }
-    assert!(serde_json::from_str::<LocatorAnswer>(r#"{"status":"maybe"}"#).is_err());
-    assert_eq!(
-        QueryEndpoint::parse("http://executor-0.node.dc1.consul:9010/"),
-        QueryEndpoint::parse("executor-0.node.dc1.consul:9010")
-    );
-    assert!(QueryEndpoint::parse("http://executor-0").is_err());
-}
-
-/// One HTTP answer from a one-shot server on loopback.
-fn serve_once(response: &'static str) -> String {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 1024];
-        let _ = stream.read(&mut buf).unwrap();
-        stream.write_all(response.as_bytes()).unwrap();
-    });
-    format!("http://{addr}")
-}
-
-#[test]
-fn the_locator_client_reads_an_answer_over_http() {
-    let endpoint = serve_once(
-        "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\n\r\n\
-         {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"status\":\"not_reached\"}}",
-    );
-    let client = LocatorClient::new(&[endpoint]).unwrap();
-    assert_eq!(
-        client.ask(0, 5, B256::ZERO).unwrap(),
-        LocatorAnswer::NotReached
-    );
-    let refusing = serve_once("HTTP/1.0 500 Internal Server Error\r\n\r\n");
-    let client = LocatorClient::new(&[refusing]).unwrap();
-    assert!(client.ask(0, 5, B256::ZERO).is_err());
+    assert!(LocatorClient::new(&["executor-0:9024".into()], Duration::from_secs(1)).is_err());
+    let client = LocatorClient::new(&[], Duration::from_secs(1)).unwrap();
+    assert!(client.ask(0, 5, B256::ZERO).is_err(), "no such executor");
 }

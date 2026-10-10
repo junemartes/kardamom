@@ -245,6 +245,7 @@ class DeployTest(unittest.TestCase):
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
         env.pop('AERON_STALL_TOLERANCE_MS', None)
         env.pop('KARDAMOM_BATCHER_TX_SOURCE', None)
+        env.pop('KARDAMOM_VALIDATOR_TX_SOURCE', None)
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
@@ -507,6 +508,27 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(endpoints[0], 'http://executor-0.node.dc1.consul:9024')
         self.assertEqual(len(endpoints), 3)
 
+    def test_the_validator_reads_the_source_the_switch_names(self):
+        def validator_args():
+            task = self.api.state['plans']['validator']['TaskGroups'][0]['Tasks'][0]
+            return task['Config']['args']
+        self.run_deploy(check=True)
+        args = validator_args()
+        self.assertEqual(args[args.index('--tx-source') + 1], 'tx-data')
+        self.run_deploy(check=True, environ={'KARDAMOM_VALIDATOR_TX_SOURCE': 'exec-stream'})
+        args = validator_args()
+        self.assertEqual(args[args.index('--tx-source') + 1], 'exec-stream')
+        endpoints = args[args.index('--executor-query-endpoints') + 1].split(',')
+        self.assertEqual(endpoints[0], 'http://executor-0.node.dc1.consul:9024')
+        self.assertEqual(len(endpoints), 3)
+
+    def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
+        for switch, expected in (('', 'false'), ('on', 'true')):
+            with self.subTest(switch=switch):
+                self.run_deploy({'workloads_exec_cursor': switch}, check=True)
+                env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
+                self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
+
     def test_every_aeron_party_takes_the_stall_tolerance(self):
         for tolerance in (10000, 30000):
             with self.subTest(tolerance=tolerance):
@@ -536,6 +558,11 @@ class DeployTest(unittest.TestCase):
             unblock = [o for o in options if o.startswith('-Daeron.publication.unblock.timeout=')]
             self.assertEqual(len(unblock), 1, name)
             self.assertGreater(int(unblock[0].split('=')[1]), liveness_ns, name)
+        # A sealer member loads its snapshots at a start through the
+        # archive waits, so they scale with the tolerance too.
+        cluster_options = dict(parties)['cluster']['Env']['JAVA_TOOL_OPTIONS'].split()
+        self.assertIn(f'-Daeron.archive.message.timeout={tolerance}ms', cluster_options)
+        self.assertIn(f'-Daeron.archive.connect.timeout={tolerance // 2}ms', cluster_options)
         # A restarted driver waits out the active-driver window of its
         # dead predecessor: Nomad's 15 s default at the 10 s tolerance.
         delay_ns = plans['aeron']['TaskGroups'][0]['RestartPolicy']['Delay']

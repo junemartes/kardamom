@@ -72,7 +72,10 @@
     # the state mirror writes it.
     - {name: redis}
     - {name: ingress}
-    - {name: executor, wait: false}
+    - name: executor
+      wait: false
+      vars:
+        exec_cursor: "{{ workloads_exec_cursor }}"
     - {name: state-mirror, wait: false}
     # The notifier taps the sequencers' and the ingress's status stream
     # and the executors' receipts; it needs none of them up to start.
@@ -102,6 +105,7 @@
       vars:
         l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
         lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
+        tx_source: "{{ workloads_validator_tx_source }}"
     # The watcher derives the epochs the validator checks. It walks the
     # followers' L1 (workloads_followers_rpc): the fault proxy when it is
     # deployed, else the light client when one runs and can serve every

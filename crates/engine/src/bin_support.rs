@@ -247,6 +247,7 @@ pub fn archive_join_recovery(
     Some(JoinRecoveryFactory {
         cfg: local.config(sources),
         tx_data_stream_base: channels.tx_data_stream_id_base,
+        exec_txs_stream_id: channels.exec_txs_stream_id,
     })
 }
 
@@ -554,11 +555,16 @@ impl ResyncFallback<'_> {
 /// a revolution races the retention window, and a lost race must cost
 /// one fetch, not one restart attempt (issue #298).
 ///
+/// The same repair serves a [`ExecutorError::PeerRecordLost`]: a peer
+/// executed an entry that this node cannot fetch, so a peer checkpoint at
+/// or above the entry's block aligns this node with that peer.
+///
 /// `adopted_unverified` selects the validator's log wording, for its
 /// catch-up trust class (its adopted state is unverified through the
 /// checkpoint block). This returns the resync outcome label
 /// (`"peer-checkpoint"` or `"unrecoverable"`) for the caller's per-service
-/// metric, or `None` when `err` is not a `ClusterReplayUnavailable`.
+/// metric, or `None` when `err` is neither a `ClusterReplayUnavailable`
+/// nor a `PeerRecordLost`.
 ///
 /// # Errors
 ///
@@ -571,21 +577,35 @@ pub fn replay_unavailable_fallback(
     expected_genesis: Option<alloy_primitives::B256>,
     adopted_unverified: bool,
 ) -> Result<Option<&'static str>> {
-    let Some(ExecutorError::ClusterReplayUnavailable {
-        from_index,
-        oldest_index,
-        oldest_block,
-    }) = err
-    else {
-        return Ok(None);
+    let oldest_block = match err {
+        Some(ExecutorError::ClusterReplayUnavailable {
+            from_index,
+            oldest_index,
+            oldest_block,
+        }) => {
+            tracing::warn!(
+                from_index,
+                oldest_index,
+                oldest_block,
+                "cluster replay unavailable — attempting peer-checkpoint fallback"
+            );
+            *oldest_block
+        }
+        Some(ExecutorError::PeerRecordLost {
+            index,
+            tx_hash,
+            block,
+        }) => {
+            tracing::warn!(
+                index,
+                ?tx_hash,
+                block,
+                "a peer executed the entry and lost its record — attempting peer-checkpoint fallback"
+            );
+            *block
+        }
+        _ => return Ok(None),
     };
-    let oldest_block = *oldest_block;
-    tracing::warn!(
-        from_index,
-        oldest_index,
-        oldest_block,
-        "cluster replay unavailable — attempting peer-checkpoint fallback"
-    );
     if let (Some(ckpt_dir), false) = (checkpoint_dir, checkpoint_peers.is_empty()) {
         let fallback = ResyncFallback {
             checkpoint_peers,
@@ -696,46 +716,5 @@ impl EngineShutdown<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The factory gates on config. No archive endpoints means no recovery,
-    // just a plain bounded join. Endpoints without local transport means it
-    // is disabled, with a loud warning. It never builds a half-configured
-    // client.
-    #[test]
-    fn recovery_factory_gates_on_config() {
-        let mut plane = kardamom_log::discovery::StreamPlane::static_only(
-            kardamom_log::config::ChannelsConfig::default(),
-        );
-        let mut aeron = AeronConfig::default();
-        assert!(
-            archive_join_recovery(
-                &mut plane,
-                &aeron,
-                None,
-                Some("10.0.0.1:40140"),
-                Some("10.0.0.1:40130")
-            )
-            .is_none(),
-            "no endpoints configured ⇒ None"
-        );
-        aeron.tx_data_archive_endpoints = vec!["192.168.56.31:8010".into()];
-        assert!(
-            archive_join_recovery(&mut plane, &aeron, None, None, None).is_none(),
-            "endpoints but no local transport ⇒ None"
-        );
-        let f = archive_join_recovery(
-            &mut plane,
-            &aeron,
-            None,
-            Some("10.0.0.1:40140"),
-            Some("10.0.0.1:40130"),
-        )
-        .expect("endpoints plus local transport ⇒ Some");
-        assert_eq!(
-            f.cfg.tx_data_endpoints.current(),
-            vec!["192.168.56.31:8010".to_string()]
-        );
-    }
-}
+#[path = "bin_support_tests.rs"]
+mod tests;

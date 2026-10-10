@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use crate::evidence::without_ansi;
 use crate::harness::Harness;
 use crate::l1::L1;
 use crate::nomad::Streams;
@@ -251,24 +252,6 @@ pub(super) fn field_in_last(logs: &str, needle: &str, field: &str) -> Option<u64
         .split_whitespace()
         .find_map(|word| word.strip_prefix(prefix.as_str()).map(str::to_string))
         .and_then(|v| v.parse().ok())
-}
-
-/// `line` without its ANSI escape sequences (`ESC [` up to the final
-/// letter).
-fn without_ansi(line: &str) -> String {
-    line.split('\x1b')
-        .enumerate()
-        .map(|(i, part)| match i {
-            0 => part,
-            _ => part
-                .strip_prefix('[')
-                .and_then(|rest| {
-                    rest.find(|c: char| c.is_ascii_alphabetic())
-                        .map(|end| &rest[end + 1..])
-                })
-                .unwrap_or(part),
-        })
-        .collect()
 }
 
 #[cfg(test)]

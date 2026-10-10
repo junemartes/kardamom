@@ -57,6 +57,12 @@ pub struct DeployVars {
     /// The batcher's transaction source, `tx-data` or `exec-stream`.
     /// `None` keeps the job default.
     pub batcher_tx_source: Option<&'static str>,
+    /// The validator's transaction source, `tx-data` or `exec-stream`.
+    /// `None` keeps the job default.
+    pub validator_tx_source: Option<&'static str>,
+    /// `--exec-cursor` of the executors: each one sends its recorded
+    /// cursor to the sealer.
+    pub exec_cursor: bool,
 }
 
 impl DeployVars {
@@ -79,6 +85,12 @@ impl DeployVars {
         let batcher_source = self
             .batcher_tx_source
             .map(|v| (BATCHER_TX_SOURCE_ENV, v.to_string()));
+        let tx_source = self
+            .validator_tx_source
+            .map(|v| ("KARDAMOM_VALIDATOR_TX_SOURCE", v.to_string()));
+        let cursor = self
+            .exec_cursor
+            .then(|| ("KARDAMOM_EXEC_CURSOR", "on".to_string()));
         snapshot
             .into_iter()
             .chain(retention)
@@ -86,6 +98,8 @@ impl DeployVars {
             .chain(proxy)
             .chain(poll)
             .chain(batcher_source)
+            .chain(tx_source)
+            .chain(cursor)
             .collect()
     }
 }

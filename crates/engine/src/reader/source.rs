@@ -56,8 +56,8 @@ pub struct SourceStart<D> {
 pub trait JoinSeed: Send + 'static {
     type Join: TxJoin;
 
-    /// Build the join on the reader thread.
-    fn build(self) -> Self::Join;
+    /// Build the join on the reader thread, with the reader's config.
+    fn build(self, cfg: &ReaderConfig) -> Self::Join;
 }
 
 /// The join of one `TxRef`, on the `tx_ordering` reader thread.
@@ -120,10 +120,10 @@ impl<D> SourceStart<D> {
 impl<A: JoinSeed, B: JoinSeed> JoinSeed for Either<A, B> {
     type Join = Either<A::Join, B::Join>;
 
-    fn build(self) -> Self::Join {
+    fn build(self, cfg: &ReaderConfig) -> Self::Join {
         match self {
-            Self::Left(a) => Either::Left(a.build()),
-            Self::Right(b) => Either::Right(b.build()),
+            Self::Left(a) => Either::Left(a.build(cfg)),
+            Self::Right(b) => Either::Right(b.build(cfg)),
         }
     }
 }

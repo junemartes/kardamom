@@ -51,9 +51,11 @@ use crate::metrics::{
 pub use archive::{
     ExecArchive, ExecArchiveSeed, ExecFetchError, LiveExecArchive, LiveExecArchiveSeed,
 };
-pub use copies::RecordBuffer;
-pub use locator::{ArchiveLocator, LocatorAnswer, LocatorClient, LocatorError, QueryEndpoint};
+use copies::RecordBuffer;
+pub(crate) use locator::LocatorClient;
+pub use locator::{ArchiveLocator, LocatorAnswer};
 
+use super::join::ReaderConfig;
 use super::ports::TxOrderingSubscription;
 use super::source::{FeedHandle, JoinAt, JoinSeed, Joined, SourceStart, TxJoin, TxSource};
 use super::void::{MAX_READ_AHEAD, ReadAhead};
@@ -139,7 +141,7 @@ pub struct ExecStreamSeed<A> {
 impl<A: ExecArchiveSeed> JoinSeed for ExecStreamSeed<A> {
     type Join = ExecStreamJoin<A::Archive>;
 
-    fn build(self) -> Self::Join {
+    fn build(self, _cfg: &ReaderConfig) -> Self::Join {
         ExecStreamJoin {
             buffer: self.buffer,
             archive: self.archive.build(),
@@ -190,7 +192,7 @@ struct Canonical<'a> {
 
 impl Canonical<'_> {
     fn reject(self, record: &ExecTxRecord) -> Option<Reject> {
-        if record.index != self.index || record.tx_ref != *self.tx_ref {
+        if record.tx_ref != *self.tx_ref {
             return Some(Reject::TxRef);
         }
         (keccak256(&record.envelope.raw_tx) != self.tx_ref.tx_hash).then_some(Reject::Hash)
@@ -409,8 +411,11 @@ impl<'a, O: TxOrderingSubscription, X: ExecArchive> StreamWait<'a, O, X> {
     /// the void record of the index. At the read-ahead bound the wait only
     /// takes and asks: the sealer refuses a vote for an entry more than
     /// one void window behind its head, so no void record comes later.
+    /// The step then sleeps one poll, because a take can end at once when
+    /// the live head is far ahead.
     fn read_ahead(&mut self) -> Result<Option<Joined>, ExecutorError> {
         if self.ahead.len() >= MAX_READ_AHEAD {
+            thread::sleep(WAIT_POLL);
             return Ok(None);
         }
         let read = match self.backlog.pop_front() {

@@ -55,7 +55,16 @@ impl Evidence {
         streams: Streams,
     ) -> anyhow::Result<usize> {
         let logs = self.nomad.job_logs(job, streams).await?;
-        Ok(logs.lines().filter(|l| l.contains(needle)).count())
+        Ok(Self::count_in(&logs, needle))
+    }
+
+    /// The number of lines of `logs` that contain `needle`. The services
+    /// color each field name and its `=` with ANSI escapes, so a needle
+    /// such as `field=value` matches the line without them.
+    fn count_in(logs: &str, needle: &str) -> usize {
+        logs.lines()
+            .filter(|l| without_ansi(l).contains(needle))
+            .count()
     }
 
     /// Poll until the count of `needle` in the job's logs exceeds the
@@ -201,6 +210,24 @@ pub fn member_id_of(line: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// `line` without its ANSI escape sequences (`ESC [` up to the final
+/// letter).
+pub(crate) fn without_ansi(line: &str) -> String {
+    line.split('\x1b')
+        .enumerate()
+        .map(|(i, part)| match i {
+            0 => part,
+            _ => part
+                .strip_prefix('[')
+                .and_then(|rest| {
+                    rest.find(|c: char| c.is_ascii_alphabetic())
+                        .map(|end| &rest[end + 1..])
+                })
+                .unwrap_or(part),
+        })
+        .collect()
+}
+
 /// Print the divergence context to stderr: the lines around the hit.
 pub fn dump_divergence(hit: &Divergence) {
     eprintln!("----- divergence context (alloc {}) -----", hit.alloc);
@@ -240,5 +267,16 @@ mod tests {
             member_id_of("sealer snapshot TAKEN memberId=12 block=30"),
             Some(12)
         );
+    }
+
+    #[test]
+    fn a_field_needle_matches_a_colored_line() {
+        let logs = "\x1b[32m INFO\x1b[0m parking to ask the peers \x1b[3mindex\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mevery_archive_refused\x1b[0m\x1b[2m=\x1b[0mtrue\n\
+            \x1b[32m INFO\x1b[0m parking to ask the peers \x1b[3mevery_archive_refused\x1b[0m\x1b[2m=\x1b[0mfalse\n\
+            plain parking to ask the peers every_archive_refused=true\n";
+        assert_eq!(Evidence::count_in(logs, "every_archive_refused=true"), 2);
+        assert_eq!(Evidence::count_in(logs, "every_archive_refused=false"), 1);
+        assert_eq!(Evidence::count_in(logs, "parking to ask the peers"), 3);
+        assert_eq!(Evidence::count_in(logs, "index=7"), 1);
     }
 }
