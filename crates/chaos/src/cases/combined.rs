@@ -18,7 +18,7 @@ use crate::cases::validator::COMMITTED;
 use crate::harness::Harness;
 use crate::nomad::{Job, SavedJob};
 use crate::poll::{self, Budget};
-use crate::probes::{CLUSTER_TASK, Probed};
+use crate::probes::CLUSTER_TASK;
 
 mod checks;
 #[cfg(test)]
@@ -167,7 +167,7 @@ impl Class {
                     .flat_map(|n| LANES.iter().map(move |lane| (n.container.clone(), *lane)))
                     .collect(),
             ),
-            Self::Ingress => one_task(&names_of(&h.probes.ingresses), "ingress"),
+            Self::Ingress => one_task(&h.probes.ingress_containers(), "ingress"),
         })
     }
 
@@ -225,11 +225,6 @@ impl Class {
         ));
         Ok(())
     }
-}
-
-/// The host container names of probed nodes.
-fn names_of(nodes: &[Probed]) -> Vec<String> {
-    nodes.iter().map(|n| n.container.clone()).collect()
 }
 
 impl Held {
@@ -418,8 +413,9 @@ pub(crate) enum Expect {
     /// ingress refuses a submit with `sealer_no_quorum`.
     Stall,
     /// Blocks are still sealed, but no user transaction is applied: the
-    /// head advances and the applied-transaction counter of a live
-    /// executor stays flat.
+    /// head rises and the applied-transaction counter of a live executor
+    /// stays flat. A head that reads lower is not a rise: a source of the
+    /// head stopped answering.
     SealOnly,
 }
 
@@ -432,7 +428,7 @@ impl Expect {
                 "the pipeline UNEXPECTEDLY progressed while the sealers were down (head {} -> {})",
                 before.block, after.block
             )),
-            Self::SealOnly if after.block == before.block => Err(format!(
+            Self::SealOnly if after.block <= before.block => Err(format!(
                 "no block was sealed while the sealers were up (head {} -> {})",
                 before.block, after.block
             )),

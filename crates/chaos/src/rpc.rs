@@ -200,27 +200,11 @@ impl Rpc {
     /// status is not `0x1`.
     pub async fn transfer_smoke(&self, account: u32, budget: Duration) -> anyhow::Result<()> {
         let nonce = self.nonce_of(account).await?;
-        self.transfer_at(account, nonce, budget).await
-    }
-
-    /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
-    /// itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the signer cannot derive, the submit fails,
-    /// no receipt arrives in time, or the receipt status is not `0x1`.
-    pub async fn transfer_at(
-        &self,
-        account: u32,
-        nonce: u64,
-        budget: Duration,
-    ) -> anyhow::Result<()> {
         self.transfer_hash(account, nonce, budget).await.map(|_| ())
     }
 
-    /// [`Self::transfer_at`], with the hash of the receipted transfer, for
-    /// a case that asks for its receipt again later.
+    /// [`Self::transfer_smoke`] at `nonce`, for a case that sets the nonce
+    /// itself. Returns the hash of the receipted transfer.
     ///
     /// # Errors
     ///

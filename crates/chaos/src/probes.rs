@@ -149,6 +149,12 @@ impl Probes {
             .collect()
     }
 
+    /// The host container names of the ingress nodes.
+    #[must_use]
+    pub fn ingress_containers(&self) -> Vec<String> {
+        self.ingresses.iter().map(|n| n.container.clone()).collect()
+    }
+
     /// The scraper, for probes a case builds itself.
     #[must_use]
     pub fn scrape(&self) -> &Scrape {

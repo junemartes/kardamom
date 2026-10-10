@@ -22,10 +22,10 @@ pub(super) const LOG_READ_BUDGET: Budget = Budget {
     interval: Duration::from_secs(5),
 };
 
-/// The cause a client agent names in a 5xx when the directory of an
+/// The cause a client agent names in a 5xx when the log directory of an
 /// allocation is gone: the client collected the allocation, and the
-/// server still lists it. The log is gone for good, as with a 404.
-const ALLOC_DIR_GONE: &str = "no such file or directory";
+/// server still lists it.
+const ALLOC_LOGS_GONE: &str = "/alloc/logs: no such file or directory";
 
 /// One answer of the fs/logs endpoint of one agent.
 enum LogRead {
@@ -34,6 +34,22 @@ enum LogRead {
     /// A 5xx answer or a transport failure, with the text that names the
     /// cause.
     Failed(String),
+    /// A 5xx answer that says the log directory is gone, with its text.
+    Gone(String),
+}
+
+impl LogRead {
+    /// The answer for `alloc`. A gone log is an empty log only for a
+    /// terminal allocation: the client collected it, and its log is gone
+    /// for good. For a live allocation it is a failed read, so a check
+    /// never reads a missing log as a clean one.
+    fn for_alloc(self, alloc: &Alloc) -> Self {
+        match self {
+            Self::Gone(_) if alloc.is_terminal() => Self::Text(String::new()),
+            Self::Gone(cause) => Self::Failed(cause),
+            other => other,
+        }
+    }
 }
 
 /// The HTTP address that a node record advertises for its agent.
@@ -111,17 +127,17 @@ impl Nomad {
         last: &RefCell<String>,
     ) -> anyhow::Result<Option<String>> {
         let url = self.url(&read.path());
-        let control = match self.read_log_once(&url).await? {
+        let control = match self.read_log_once(&url).await?.for_alloc(read.alloc) {
             LogRead::Text(text) => return Ok(Some(text)),
-            LogRead::Failed(cause) => cause,
+            LogRead::Failed(cause) | LogRead::Gone(cause) => cause,
         };
         let node = &read.alloc.node_name;
         crate::log(format!(
             "log read {url} answered {control}; reading it from the agent on {node}"
         ));
-        match self.node_log(read).await {
+        match self.node_log(read).await.for_alloc(read.alloc) {
             LogRead::Text(text) => Ok(Some(text)),
-            LogRead::Failed(cause) => {
+            LogRead::Failed(cause) | LogRead::Gone(cause) => {
                 crate::log(format!(
                     "log read on the agent on {node} answered {cause}; retrying"
                 ));
@@ -152,10 +168,10 @@ impl Nomad {
         Ok(format!("{scheme}://{}", node.http_addr))
     }
 
-    /// One read of a task log from one agent. A 404 reads as empty text,
-    /// and so does a 5xx that says the allocation directory is gone. Any
-    /// other 5xx is a failed read, with its body: the body names the
-    /// cause, and the status alone does not.
+    /// One read of a task log from one agent. A 404 reads as empty text.
+    /// A 5xx that says the log directory is gone is `Gone`; any other 5xx
+    /// is a failed read. Both carry the body: the body names the cause,
+    /// and the status alone does not.
     async fn read_log_once(&self, url: &str) -> anyhow::Result<LogRead> {
         let response = self
             .http
@@ -169,10 +185,12 @@ impl Nomad {
         }
         if status.is_server_error() {
             let body = response.text().await.unwrap_or_default();
-            if body.contains(ALLOC_DIR_GONE) {
-                return Ok(LogRead::Text(String::new()));
-            }
-            return Ok(LogRead::Failed(format!("{status}: {}", body.trim())));
+            let cause = format!("{status}: {}", body.trim());
+            return Ok(if body.contains(ALLOC_LOGS_GONE) {
+                LogRead::Gone(cause)
+            } else {
+                LogRead::Failed(cause)
+            });
         }
         let text = response
             .error_for_status()

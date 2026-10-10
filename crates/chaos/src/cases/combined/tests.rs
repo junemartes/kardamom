@@ -32,17 +32,11 @@ fn pauses(plan: &[Wave]) -> Vec<u64> {
 
 /// The classes of a case's return, one wave after the other.
 fn order(c: Combined) -> Vec<Class> {
-    c.recovery.plan(c.down).into_iter().flatten_classes()
-}
-
-trait FlattenClasses {
-    fn flatten_classes(self) -> Vec<Class>;
-}
-
-impl<I: Iterator<Item = Wave>> FlattenClasses for I {
-    fn flatten_classes(self) -> Vec<Class> {
-        self.flat_map(|w| w.classes).collect()
-    }
+    c.recovery
+        .plan(c.down)
+        .into_iter()
+        .flat_map(|w| w.classes)
+        .collect()
 }
 
 #[test]
@@ -184,6 +178,17 @@ fn the_expectations_judge_two_readings() {
     assert!(Expect::SealOnly.judge(flat, dark).is_ok());
     assert!(Expect::Stall.judge(dark, dark).is_ok());
     assert!(Expect::Stall.judge(flat, dark).is_err());
+    // A head that reads lower is not a seal: a source of it went dark.
+    let lower = Progress {
+        block: 99,
+        applied: None,
+    };
+    assert!(
+        Expect::SealOnly
+            .judge(flat, lower)
+            .unwrap_err()
+            .contains("no block was sealed")
+    );
     assert_eq!(dark.describe(), "head 103, applied ?");
     assert!(
         Expect::Stall
@@ -214,20 +219,38 @@ fn one_leader_per_term() {
         2026-09-20T14:30:00Z cluster TERMINATION memberId=2 reason=shutdown\n\
         2026-09-20T14:31:00Z cluster TERM memberId=0 leadershipTermId=8 leaderMemberId=2 logPosition=9 role=FOLLOWER block=40\n";
     let terms = Terms::parse(logs);
-    assert_eq!(terms.len(), 2);
     assert_eq!(
-        terms,
-        Terms(BTreeMap::from([
-            (7, BTreeSet::from([1])),
-            (8, BTreeSet::from([2]))
-        ]))
+        terms.leaders,
+        BTreeMap::from([(7, BTreeSet::from([1])), (8, BTreeSet::from([2]))])
     );
+    assert_eq!(terms.reporters, BTreeSet::from([0, 1, 2]));
     assert_eq!(terms.split(), Vec::<String>::new());
+    assert_eq!(terms.silent(3), Vec::<u64>::new());
+    assert!(terms.assert_one_leader("case", 3).is_ok());
     let split = format!(
         "{logs}2026-09-20T14:31:00Z cluster TERM memberId=1 leadershipTermId=8 leaderMemberId=1 logPosition=9 role=LEADER block=40\n"
     );
     assert_eq!(Terms::parse(&split).split(), ["term 8: members {1, 2}"]);
-    assert_eq!(Terms::parse("cluster role=LEADER memberId=1").len(), 0);
+    assert!(
+        Terms::parse("cluster role=LEADER memberId=1")
+            .leaders
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_member_whose_log_reads_empty_fails_the_term_check() {
+    // Member 2's log is empty: no split shows, but its leaders are not
+    // known, so the check must not pass.
+    let logs = "cluster TERM memberId=0 leadershipTermId=7 leaderMemberId=0 role=LEADER\n\
+        cluster TERM memberId=1 leadershipTermId=7 leaderMemberId=0 role=FOLLOWER\n";
+    let terms = Terms::parse(logs);
+    assert_eq!(terms.silent(3), [2]);
+    let err = terms.assert_one_leader("case", 3).unwrap_err().to_string();
+    assert!(
+        err.contains("members [2] logged no leadership term"),
+        "{err}"
+    );
 }
 
 #[test]
