@@ -211,7 +211,8 @@ aeron_tmpfs_size: "2g"
 # Placement by a role set. A node's class is its `role` (one value: the
 # node name and the index derive from it). A node also carries a role
 # set (node_roles in an inventory): its class plus the service classes it
-# hosts. roles/nomad stamps it as meta.roles.
+# hosts. roles/nomad stamps it as the Nomad node meta `roles`, and
+# roles/consul as the Consul node meta `roles`.
 # The service jobs (redis, batcher, monitoring, validator, da-watcher,
 # l1-indexer) constrain on `roles` with set_contains; the pipeline jobs
 # (sealer, executor, ingress, sequencer, anvil) constrain on `role`. No
@@ -221,6 +222,10 @@ aeron_tmpfs_size: "2g"
 # Production gives each service class its own nodes (see
 # inventories/production/hosts.example.ini). The local profile packs them
 # onto aux-0 and the ingress nodes, so the container count stays.
+# The role set of this node as a list. An inventory gives node_roles as
+# a comma list, the container contract as a list. A node without
+# node_roles hosts its class only.
+node_role_set: "{{ ((node_roles.split(',') if node_roles is string else node_roles) if node_roles is defined else [role]) | map('trim') | list }}"
 node_classes:
   control: { count: 1, tier: control }
   sequencer: { count: 2, tier: sequencer }

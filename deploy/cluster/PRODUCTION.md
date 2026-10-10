@@ -15,6 +15,7 @@ A node has one class and a set of roles. A job selects its nodes by class or by 
 | `node_roles` | The inventory, as a comma list | The class plus the service classes that the node hosts. A node without it hosts its class only. |
 | `roles`, `instance_roles` | `node_classes` in `ansible/group_vars/all.yml` (the local profile and the container root) | The service classes that every node of a class hosts, and the service classes that one node hosts by index. |
 | `meta.role`, `meta.roles` | Stamped by `roles/nomad` | The Nomad node meta of the class, and of the role set (a comma list). |
+| Consul node meta `roles` | Stamped by `roles/consul` | The same role set. A job template reads it from the Consul catalog. The redis job names its initial primary by it. |
 | `node_pool` | The inventory or the node user data | The Nomad node pool. Default: `default`. |
 
 How jobs place themselves:
@@ -108,6 +109,7 @@ node_prefix "" { policy = "read" }
 ```
 
 - Every production agent needs the DNS token. The local profile has no ACLs and needs none.
+- The Nomad Consul token (`nomad_consul_token`) needs `node_prefix "" { policy = "read" }`. The templates of the redis job read the node catalog.
 - The agents need the TLS material in `consul_tls_dir` and `nomad_tls_dir` (`ca.pem`, `cert.pem`, `key.pem`). The example profile uses `/etc/consul.d/tls` and `/etc/nomad.d/tls`.
 - A dedicated host on the vSwitch VLAN gets its address from `vswitch_address` (`roles/vswitch`, `roles/netinfo`). Another host uses `private_interface`. The role fails when the interface has no IPv4 address or more than one.
 - `roles/firewall` installs an nftables rule set. It accepts the private ranges (`private_cidrs`), SSH from `ssh_allowed_cidrs`, and the `public_tcp_ports` list. It drops the rest.

@@ -1048,7 +1048,8 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Trigger: the whole redis job stops for 30 s. The job holds the primary, the replica and three sentinels.
   - Effect: the readers degrade to the executor query. The pipeline progresses. The state mirrors retry their writes.
   - Recovery: the job returns empty. The sentinels name a primary. Every state mirror rebuilds the projection from the newest checkpoint of its executor. A mirror never rewrites the checkpoint directory of its executor.
-  - Proof: `redis-total-loss-recover`. The case requires degraded reads, progress, a rising write-retry counter, and one `rebuild: done` log line per mirror.
+  - The cold start: no primary is registered in Consul yet. The sentinels and the replica name the initial primary by the placement rule of the primary group: the node whose Consul node meta `roles` holds `redis-primary`. So each sentinel starts with a `sentinel monitor` line and does not restart.
+  - Proof: `redis-total-loss-recover`. The case requires degraded reads, progress, a rising write-retry counter, one `rebuild: done` log line per mirror, and zero sentinel restarts after the restore.
 - **Primary frozen**
   - Trigger: the primary freezes for longer than the sentinel `down-after-milliseconds` (5 s).
   - Effect: the readers degrade. The pipeline progresses.
@@ -1071,6 +1072,7 @@ Redis is a cache with no persistence. The state of the executors is the truth. T
   - Proof: `mirror-kill-rebuild`. The case counts `rebuild: done` lines in the `state-mirror` job log. It does not use the rebuild counter, because a new process starts that counter at zero.
 - A state mirror waits for Redis at start. It retries the connection every 2 s. A missing address or an unset password variable still ends the start at once.
 - The readers ask every sentinel for the primary and keep the first connection that a primary accepts.
+- A sentinel starts from a seed config only in a new allocation. A restart in place keeps the config that Sentinel rewrote: its id, the config epoch and the current primary. So a restarted sentinel does not count as a new sentinel, and it follows the last failover.
 - `redis-total-loss-recover` runs in the `chaos-fleet` shard.
 - `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze` and `mirror-kill-rebuild` run in the `chaos-cache` shard. `mirror-kill-rebuild` runs last, because it flushes the projection.
 - Further reading: [`specs/2026-09-13-redis-account-cache-design.md`](specs/2026-09-13-redis-account-cache-design.md), section 9.3.

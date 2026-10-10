@@ -632,6 +632,33 @@ class DeployTest(Deploys):
         self.assertIn('egress', ports)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_every_redis_instance_names_a_primary_on_a_cold_start(self):
+        # A sentinel stops at start on a config without a `sentinel
+        # monitor` line. So the seed always names a primary: the
+        # registered one, else the node that the placement rule of the
+        # primary group picks. The replica follows the same node.
+        self.run_deploy(check=True)
+        groups = {g['Name']: g for g in self.api.state['plans']['redis']['TaskGroups']}
+        self.assertEqual(groups['primary']['Constraints'],
+                         [{'LTarget': '${meta.roles}', 'RTarget': 'redis-primary', 'Operand': 'set_contains'}])
+        sentinel = groups['sentinel']['Tasks'][0]
+        seed = {t['DestPath']: t['EmbeddedTmpl'] for t in sentinel['Templates']}['local/sentinel.seed.conf']
+        monitor = re.search(r'^sentinel monitor kardamom (.*)\.node\.dc1\.consul 6379 2$', seed, re.MULTILINE)
+        self.assertIsNotNone(monitor, seed)
+        primary = monitor.group(1)
+        self.assertTrue(primary.startswith('{{ $primary := "" }}{{ with service "redis-primary" }}'), primary)
+        self.assertIn('(.Meta.roles | split "," | contains "redis-primary")', primary)
+        self.assertTrue(primary.endswith('{{ $primary }}'), primary)
+        replica_env = groups['replica']['Tasks'][0]['Templates'][0]['EmbeddedTmpl']
+        self.assertEqual(replica_env, f'REDIS_PRIMARY_NODE={primary}\n')
+        # Only Sentinel writes the live config: a restart in place keeps
+        # the state that Sentinel wrote, and a re-render changes only the
+        # seed.
+        self.assertEqual(sentinel['Config']['args'], [
+            'sh', '-c', '[ -e /local/sentinel.conf ] || cp /local/sentinel.seed.conf /local/sentinel.conf; '
+            'exec redis-sentinel /local/sentinel.conf'])
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_priority_fees_default_off_on_every_role(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']

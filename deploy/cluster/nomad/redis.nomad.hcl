@@ -11,6 +11,11 @@
 # the node it runs on, and the replica and the sentinels read the
 # primary's node from its Consul service.
 #
+# The initial primary is the node with redis-primary: the placement rule
+# of the primary group. The replica and the sentinels name it by the
+# expression in local.primary_node, so every instance names the same node
+# on a cold start, before the primary has registered its service.
+#
 # The readers (ingress, sequencer, mirror) discover the primary through
 # the sentinels, not through Consul. Consul carries the three services for
 # the health view and the chaos suite.
@@ -28,6 +33,21 @@ variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
   default     = "dc1"
+}
+
+locals {
+  # A consul-template expression that prints the node of the primary:
+  # - the node of the registered redis-primary service, when one passes
+  #   its check;
+  # - else the first catalog node, by name, whose Consul node meta
+  #   `roles` holds redis-primary (roles/consul writes it at agent start).
+  # The second rule is the placement rule of the primary group, so on a
+  # cold start every sentinel and the replica name the node where the
+  # primary starts. The expression prints no whitespace.
+  primary_node = trimspace(<<EOF
+{{ $primary := "" }}{{ with service "redis-primary" }}{{ $primary = (index . 0).Node }}{{ end }}{{ range nodes }}{{ if and (eq $primary "") (.Meta.roles | split "," | contains "redis-primary") }}{{ $primary = .Node }}{{ end }}{{ end }}{{ $primary }}
+EOF
+  )
 }
 
 job "redis" {
@@ -143,14 +163,14 @@ job "redis" {
           "--replica-announce-ip", "${node.unique.name}.node.${var.datacenter}.consul",
         ]
       }
-      # The node of the primary, read once at start: the task waits for
-      # the primary's service. A later failover is the sentinels' work.
+      # The node of the primary, read once at start (local.primary_node).
+      # A later failover is the sentinels' work.
       template {
         destination = "local/primary.env"
         env         = true
         change_mode = "noop"
         data        = <<EOF
-{{ with service "redis-primary" }}REDIS_PRIMARY_NODE={{ (index . 0).Node }}{{ end }}
+REDIS_PRIMARY_NODE=${local.primary_node}
 EOF
       }
 
@@ -208,23 +228,37 @@ EOF
         force_pull      = true
         readonly_rootfs = true
         network_mode    = "host"
-        # Sentinel rewrites its own config file, so it runs on the
-        # writable alloc dir.
-        args = ["redis-sentinel", "/local/sentinel.conf"]
+        # Sentinel rewrites its own config file (its id, the config
+        # epoch, the current primary, the known replicas and sentinels),
+        # so the live file is on the writable alloc dir and only Sentinel
+        # writes it. The task copies the rendered seed to the live file
+        # only when the live file does not exist: a new allocation starts
+        # from the seed, and a restart in place keeps the state that
+        # Sentinel wrote. A template re-render changes only the seed.
+        args = [
+          "sh", "-c",
+          "[ -e /local/sentinel.conf ] || cp /local/sentinel.seed.conf /local/sentinel.conf; exec redis-sentinel /local/sentinel.conf",
+        ]
       }
 
+      # The seed always names a primary (local.primary_node): Sentinel
+      # stops at start on a config without a `sentinel monitor` line.
+      # From the seed, Sentinel follows each failover by its own state and
+      # by the hello messages of the other sentinels, which carry the
+      # newest config epoch.
+      #
       # A quorum of 2 of 3 sentinels declares the primary down after 5 s
       # and elects the replica. Readers degrade during the election; the
       # spec's fallback rule covers the gap.
       template {
-        destination = "local/sentinel.conf"
+        destination = "local/sentinel.seed.conf"
         change_mode = "noop"
         data        = <<EOF
 port 26379
 dir /local
 sentinel resolve-hostnames yes
 sentinel announce-hostnames yes
-{{ with service "redis-primary" }}sentinel monitor kardamom {{ (index . 0).Node }}.node.${var.datacenter}.consul 6379 2{{ end }}
+sentinel monitor kardamom ${local.primary_node}.node.${var.datacenter}.consul 6379 2
 sentinel down-after-milliseconds kardamom 5000
 sentinel failover-timeout kardamom 30000
 sentinel parallel-syncs kardamom 1

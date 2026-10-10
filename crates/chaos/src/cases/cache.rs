@@ -394,7 +394,9 @@ async fn mirror_write_retries(h: &Harness) -> i64 {
 /// writes. The job then starts again with both instances empty, since
 /// Redis keeps nothing on disk. The sentinels name a primary, every
 /// mirror rebuilds the projection from its executor's newest
-/// checkpoint, and the readers use Redis again.
+/// checkpoint, and the readers use Redis again. No sentinel restarts on
+/// the cold start: each one starts with a config that names the
+/// initial primary, also before the primary registers in Consul.
 pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "redis-total-loss-recover";
     wait_readers_connected(h, ctx).await?;
@@ -418,6 +420,8 @@ pub(crate) async fn redis_total_loss_recover(h: &mut Harness) -> anyhow::Result<
     wait_mirror_advances(h, ctx).await?;
     assert_chaos_account_projected(h, ctx, &master).await?;
     wait_readers_recovered(h, ctx).await?;
+    h.assert_group_never_restarted("redis", "sentinel", ctx)
+        .await?;
     h.assert_progress().await
 }
 
