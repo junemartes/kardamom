@@ -157,8 +157,10 @@ async fn s18_tx_status_feed_shows_every_stage() {
 /// swaps and liquidity, and a deposit. The ring's nonce owner resolves a
 /// lost submit answer and a restart with an unsent transaction from its
 /// journal, and serves concurrent leases on one account with contiguous
-/// nonces. The canary ring is dev accounts #34 to #37, which the cluster
-/// genesis funds for the canary; the ring cases use #10 to #12.
+/// nonces. Each transfer's receipt agrees with its block: the block that
+/// lists it, the header's base fee, and `eth_feeHistory`. The canary ring
+/// is dev accounts #34 to #37, which the cluster genesis funds for the
+/// canary; the ring cases use #10 to #12, and the block cases #13.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s19_canary_probes_succeed_and_the_ring_resolves_in_flight() {
@@ -200,5 +202,12 @@ async fn s19_canary_probes_succeed_and_the_ring_resolves_in_flight() {
     if let Err(e) = canary::ring_resolves_in_flight(&t, &root.join("ring-cases"), 10).await {
         stack.dump_tails();
         panic!("S19 ring: {e:#}");
+    }
+    let state_dir = stack.executor_state_dir().expect("the executor's state dir");
+    if let Err(e) =
+        canary::receipts_match_their_blocks(&t, &state_dir, &root.join("block-cases"), 13).await
+    {
+        stack.dump_tails();
+        panic!("S19 blocks: {e:#}");
     }
 }

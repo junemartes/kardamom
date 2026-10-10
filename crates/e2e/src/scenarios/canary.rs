@@ -21,7 +21,7 @@ use kardamom_canary::config::Endpoint;
 use kardamom_canary::feed::{Board, BoardHandle};
 use kardamom_canary::outcome::Outcome;
 use kardamom_canary::ring::journal::{InFlight, Journal};
-use kardamom_canary::ring::{self, Call, DerivedSigner, Lease, Ring};
+use kardamom_canary::ring::{self, Call, DerivedSigner, Lease, Ring, Sent};
 use kardamom_canary::rpc::Rpc;
 use kardamom_canary::wait::Poll;
 
@@ -47,9 +47,8 @@ const PROBES: [&str; 6] = [
 /// The probes that must succeed once in the scenario's time: the
 /// liquidity add and the deposit.
 const ONCE: [&str; 2] = ["probe=\"liquidity\"", "probe=\"deposit\""];
-/// The label of the known receipt numbering defect (see
-/// [`probes_succeed`]). Only `fees` runs carry the `field` label.
-const KNOWN_FEE_DEFECT: &str = "field=\"base_fee\"";
+/// How many transfers [`receipts_match_their_blocks`] checks.
+const BLOCK_CHECKS: usize = 5;
 /// The L1 key of the canary in the scenario: anvil account #9, which no
 /// other part of the stack uses.
 pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6";
@@ -58,10 +57,7 @@ pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf70
 /// deposit probes one) on the canary at `canary`, then require that no
 /// probe but `read` failed, and that the feed reported the `executed`
 /// stage. A `read` run can see the head not move between two runs on an
-/// idle local chain. A `fees` run can find `fee_mismatch{field="base_fee"}`:
-/// the chain gives a receipt the block number before the block whose base
-/// fee it paid, a known defect; the scenario counts that outcome apart and
-/// requires every other `fees` run to succeed.
+/// idle local chain.
 ///
 /// # Errors
 /// Returns an error when the successes do not come within the patience,
@@ -98,10 +94,7 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
         .chain(ONCE.iter())
         .filter(|p| !p.contains("read"))
     {
-        let known = s
-            .value_where_all(PROBE_TOTAL, &[probe, KNOWN_FEE_DEFECT])
-            .unwrap_or(0.0);
-        let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0) - known;
+        let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0);
         let ok = s
             .value_where_all(PROBE_TOTAL, &success(probe))
             .unwrap_or(0.0);
@@ -205,7 +198,7 @@ async fn lost_answer(
         rpc.receipt(journaled.hash).await.ok().flatten().is_some(),
         "the journal's transaction did not land before the lease"
     );
-    let next = transfer(rpc, lease).await?;
+    let next = transfer(rpc, lease).await?.nonce;
     anyhow::ensure!(
         Some(next) == nonce.checked_add(1),
         "after nonce {nonce} the ring signed {next}"
@@ -224,7 +217,7 @@ async fn concurrent(t: &Target, rpc: &Rpc, dir: &Path, signers: Vec<DerivedSigne
             let rpc = rpc.clone();
             tokio::spawn(async move {
                 let lease = lease_when_free(&ring, &rpc).await?;
-                transfer(&rpc, lease).await
+                transfer(&rpc, lease).await.map(|sent| sent.nonce)
             })
         })
         .collect();
@@ -239,6 +232,113 @@ async fn concurrent(t: &Target, rpc: &Rpc, dir: &Path, signers: Vec<DerivedSigne
         "nonces {nonces:?}, expected {expected:?}"
     );
     Ok(())
+}
+
+/// The ground truth of a receipt's block. The ring account `index` lands
+/// [`BLOCK_CHECKS`] transfers, one at a time, so they fall in different
+/// blocks while the base fee moves. For each one, these must agree:
+///
+/// - the receipt's `blockNumber` on the ingress, and in the executor's
+///   committed receipt;
+/// - the committed block of that number, which lists the transaction;
+/// - the base fee of that block's header row;
+/// - the receipt's `effectiveGasPrice`, the base fee it paid;
+/// - the base fee that `eth_feeHistory` gives for that block.
+///
+/// # Errors
+/// Returns an error when a transfer does not land, or when two of these
+/// values disagree.
+pub async fn receipts_match_their_blocks(
+    t: &Target,
+    state_dir: &Path,
+    dir: &Path,
+    index: u32,
+) -> Result<()> {
+    let rpc = Rpc::new(
+        t.rpc.url.parse::<Endpoint>().map_err(anyhow::Error::msg)?,
+        LAND,
+    )?;
+    let signers = ring::signers(DEV_MNEMONIC, index, NonZeroU32::MIN)?;
+    let ring = Ring::open(dir, signers, t.chain_id, board()).await?;
+    let mut hashes = Vec::with_capacity(BLOCK_CHECKS);
+    for _ in 0..BLOCK_CHECKS {
+        hashes.push(
+            transfer(&rpc, lease_when_free(&ring, &rpc).await?)
+                .await?
+                .hash,
+        );
+    }
+    let env = super::open_state_ro(state_dir)?;
+    for hash in hashes {
+        BlockCheck {
+            rpc: &rpc,
+            env: &env,
+            hash,
+        }
+        .run()
+        .await?;
+    }
+    Ok(())
+}
+
+/// One transaction of [`receipts_match_their_blocks`], with the ingress
+/// and the executor's state.
+struct BlockCheck<'a> {
+    rpc: &'a Rpc,
+    env: &'a kardamom_state::StateEnv,
+    hash: B256,
+}
+
+impl BlockCheck<'_> {
+    async fn run(&self) -> Result<()> {
+        let receipt = self
+            .rpc
+            .receipt(self.hash)
+            .await?
+            .with_context(|| format!("no receipt for {:#x}", self.hash))?;
+        let number = receipt.block();
+        let price = receipt
+            .effective_gas_price
+            .context("the receipt has no effectiveGasPrice")?;
+        let listed = self.committed_block(number).await?;
+        anyhow::ensure!(
+            listed.refs.iter().any(|r| r.tx_hash == self.hash),
+            "block {number} does not list {:#x}",
+            self.hash
+        );
+        let committed = kardamom_state::committed_receipt(self.env, self.hash)?
+            .receipt
+            .context("no committed receipt")?;
+        let header = kardamom_state::read_all_headers(self.env)?
+            .into_iter()
+            .find_map(|(n, h)| (n == number).then_some(h))
+            .with_context(|| format!("no header row for block {number}"))?;
+        let history = self.rpc.base_fee(number).await.context("eth_feeHistory")?;
+        anyhow::ensure!(
+            committed.block_number == number,
+            "the ingress gives block {number}, the state gives {}",
+            committed.block_number
+        );
+        anyhow::ensure!(
+            U256::from(header.base_fee) == price && history == price,
+            "block {number}: header base fee {}, fee history {history}, \
+             effectiveGasPrice {price}",
+            header.base_fee
+        );
+        Ok(())
+    }
+
+    /// The references of block `number`, once the executor commits it.
+    async fn committed_block(&self, number: u64) -> Result<kardamom_state::BlockRefs> {
+        Poll::within(LAND, POLL)
+            .until(|| async {
+                kardamom_state::committed_block_refs(self.env, number)
+                    .ok()
+                    .and_then(|c| c.refs)
+            })
+            .await
+            .with_context(|| format!("block {number} is not committed"))
+    }
 }
 
 /// A status board with no feed: the ring cases resolve by receipt and
@@ -264,8 +364,8 @@ async fn lease_when_free(ring: &Ring, rpc: &Rpc) -> Result<Lease> {
 }
 
 /// Send one transfer on `lease`, wait for its receipt, settle, and
-/// return its nonce.
-async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<u64> {
+/// return what was sent.
+async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<Sent> {
     let sent = lease
         .send(
             rpc,
@@ -280,7 +380,7 @@ async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<u64> {
         .map_err(|o| anyhow::anyhow!("send: {o:?}"))?;
     landed(rpc, sent.hash).await?;
     lease.settle().await;
-    Ok(sent.nonce)
+    Ok(sent)
 }
 
 async fn landed(rpc: &Rpc, hash: B256) -> Result<()> {
