@@ -49,15 +49,19 @@ impl From<ClientError> for RpcError {
 }
 
 /// One log of a receipt.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Log {
     pub address: Address,
     pub topics: Vec<B256>,
     pub data: Bytes,
+    /// The log's index in its block: an L1 deposit's position.
+    #[serde(default)]
+    pub log_index: Option<U64>,
 }
 
 /// The fields of a receipt the probes read.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub status: U64,
@@ -66,6 +70,14 @@ pub struct Receipt {
     pub contract_address: Option<Address>,
     #[serde(default)]
     pub logs: Vec<Log>,
+    #[serde(default)]
+    pub block_hash: Option<B256>,
+    #[serde(default)]
+    pub effective_gas_price: Option<U256>,
+    #[serde(default)]
+    pub priority_fee_per_gas: Option<U256>,
+    #[serde(default)]
+    pub priority_fee_paid: Option<U256>,
 }
 
 impl Receipt {
@@ -80,6 +92,13 @@ impl Receipt {
     pub fn block(&self) -> u64 {
         self.block_number.map_or(0, |b| b.to::<u64>())
     }
+}
+
+/// The part of an `eth_feeHistory` answer the probes read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeeHistory {
+    base_fee_per_gas: Vec<U256>,
 }
 
 /// One ingress endpoint.
@@ -176,6 +195,70 @@ impl Rpc {
     pub async fn send(&self, raw: &Bytes) -> Result<B256, RpcError> {
         self.call("kardamom_sendRawTransactionAsync", rpc_params![raw])
             .await
+    }
+
+    /// `kardamom_blockNumberByTag("safe")`: the posted head.
+    ///
+    /// # Errors
+    ///
+    /// The call's error.
+    pub async fn safe_head(&self) -> Result<u64, RpcError> {
+        self.call::<U64>("kardamom_blockNumberByTag", rpc_params!["safe"])
+            .await
+            .map(|n| n.to::<u64>())
+    }
+
+    /// The base fee of block `number`, from `eth_feeHistory`.
+    ///
+    /// # Errors
+    ///
+    /// The call's error, or an answer without the block's base fee.
+    pub async fn base_fee(&self, number: u64) -> Result<U256, RpcError> {
+        let history: FeeHistory = self
+            .call(
+                "eth_feeHistory",
+                rpc_params![U64::from(1), U64::from(number), [50.0]],
+            )
+            .await?;
+        history
+            .base_fee_per_gas
+            .first()
+            .copied()
+            .ok_or_else(|| RpcError::Unknown(format!("no base fee for block {number}")))
+    }
+
+    /// `eth_maxPriorityFeePerGas`.
+    ///
+    /// # Errors
+    ///
+    /// The call's error.
+    pub async fn max_priority_fee(&self) -> Result<U256, RpcError> {
+        self.call("eth_maxPriorityFeePerGas", rpc_params![]).await
+    }
+
+    /// `eth_sendRawTransaction`: the submit of an L1 endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The call's error.
+    pub async fn send_raw(&self, raw: &Bytes) -> Result<B256, RpcError> {
+        self.call("eth_sendRawTransaction", rpc_params![raw]).await
+    }
+
+    /// The number of the block the `finalized` tag names on an L1
+    /// endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The call's error, or a block without a number.
+    pub async fn finalized(&self) -> Result<u64, RpcError> {
+        let block: serde_json::Value = self
+            .call("eth_getBlockByNumber", rpc_params!["finalized", false])
+            .await?;
+        block["number"]
+            .as_str()
+            .and_then(|n| u64::from_str_radix(n.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| RpcError::Unknown("no finalized block number".to_string()))
     }
 
     /// `eth_getTransactionReceipt`.

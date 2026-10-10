@@ -3,7 +3,10 @@
 //! outcomes itself.
 
 pub mod contract;
+pub mod deposit;
+pub mod fees;
 pub mod read;
+pub mod safe;
 pub mod transfer;
 
 use std::future::Future;
@@ -18,7 +21,7 @@ use crate::config::Timing;
 use crate::feed::{BoardHandle, Stages};
 use crate::metrics;
 use crate::outcome::{Outcome, Stage};
-use crate::ring::{Lease, Ring};
+use crate::ring::{Call, Lease, Ring};
 use crate::rpc::{Receipt, Rpc};
 use crate::store::Store;
 use crate::wait::Poll;
@@ -34,6 +37,15 @@ pub struct Context {
     /// The hash of an old canary transaction: the `transfer` probe sets
     /// it once, the `read` probe asks for its receipt.
     pub anchor: watch::Sender<Option<B256>>,
+    /// One `transfer` in this many gets a `safe` check.
+    pub safe_sample: std::num::NonZeroU32,
+}
+
+/// A transaction that landed, and whether its lease found a nonce gap.
+#[derive(Debug, Clone)]
+pub struct Done {
+    pub landed: Landed,
+    pub gap: bool,
 }
 
 /// A transaction's receipt and the time it arrived.
@@ -60,6 +72,44 @@ impl Context {
     pub async fn lease(&self, rpc: &Rpc) -> Result<Lease, Outcome> {
         let wait = Poll::within(self.timing.receipt_timeout, self.timing.poll);
         self.ring.lease(rpc, wait).await
+    }
+
+    /// Lease ring account `index`. A probe waits while another probe
+    /// holds it, up to the receipt timeout.
+    ///
+    /// # Errors
+    ///
+    /// The outcome a user would see when the account cannot send.
+    pub async fn lease_index(&self, index: usize, rpc: &Rpc) -> Result<Lease, Outcome> {
+        let wait = Poll::within(self.timing.receipt_timeout, self.timing.poll);
+        self.ring.lease_index(index, rpc, wait).await
+    }
+
+    /// Send `call` on `lease`, wait for the receipt, and settle the lease.
+    /// Records the submit-to-receipt stage of `probe`. The receipt's
+    /// status is the caller's to judge.
+    ///
+    /// # Errors
+    ///
+    /// The send's or the wait's outcome.
+    pub async fn transact(
+        &self,
+        probe: &'static str,
+        rpc: &Rpc,
+        mut lease: Lease,
+        call: Call,
+    ) -> Result<Done, Outcome> {
+        let sent = lease.send(rpc, call).await?;
+        let landed = self.landed(rpc, sent.hash).await?;
+        let gap = lease.found_gap();
+        lease.settle().await;
+        metrics::stage(
+            probe,
+            &rpc.endpoint.name,
+            "receipt",
+            landed.at.saturating_duration_since(sent.at),
+        );
+        Ok(Done { landed, gap })
     }
 
     /// Another ring account than `from`.

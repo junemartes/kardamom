@@ -13,6 +13,7 @@ pub enum Shard {
     Fleet,
     Coordinated,
     CombinedOrdering,
+    CombinedExec,
     Retention,
     Cache,
     L1,
@@ -31,6 +32,7 @@ impl Shard {
             Self::Fleet => "chaos-fleet",
             Self::Coordinated => "chaos-coordinated",
             Self::CombinedOrdering => "chaos-combined-ordering",
+            Self::CombinedExec => "chaos-combined-exec",
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
             Self::L1 => "chaos-l1",
@@ -38,13 +40,20 @@ impl Shard {
         }
     }
 
-    /// Whether every case of the shard ends with the persisted-state
-    /// stage. The L1 cases each leave a DA record a silent gap could
-    /// hide in, so each one proves the rebuild from L1 before the next.
-    /// The last case's stage is the one in the shard's tail.
+    /// Whether `case` ends with the persisted-state stage. The L1 cases
+    /// each leave a DA record a silent gap could hide in, so each one
+    /// proves the rebuild from L1 before the next. The executor and
+    /// sealer nodes die together in the first exec case, so the state
+    /// every executor kept is compared with the validator's before the
+    /// next case builds on it. The last case's stage is the one in the
+    /// shard's tail.
     #[must_use]
-    pub fn audits_each_case(self) -> bool {
-        matches!(self, Self::L1)
+    pub fn audits_after(self, case: &str) -> bool {
+        match self {
+            Self::L1 => true,
+            Self::CombinedExec => case == "executor-sealer-loss-recover",
+            _ => false,
+        }
     }
 
     /// The cases of the shard, in run order. The sequencer shard runs
@@ -122,6 +131,19 @@ impl Shard {
                 "ingress-sequencer-sealer-loss-recover",
                 "ingress-sequencer-sealer-reverse",
             ],
+            // The executors down with another class: the sealers, the
+            // sealers and the validator, and the ingresses. The
+            // executor-and-sealer case runs first and audits the persisted
+            // state after it. The read-path and the sequencer-and-Redis
+            // cases run by name only: a cold redis job crash-loops its
+            // sentinels, a sender sticks after an outage of every
+            // executor, and the sequencer-and-Redis case also hits a media
+            // driver error that cuts a replica off its stream.
+            Self::CombinedExec => &[
+                "executor-sealer-loss-recover",
+                "executor-sealer-validator-recover",
+                "ingress-executor-loss-recover",
+            ],
             Self::Retention => &["retention-overrun", "retention-overrun-validator"],
             // A lying L1 in front of the followers. The outage past the
             // retention runs last: it holds the load until the sealers'
@@ -181,6 +203,7 @@ impl Shard {
             | Self::Coordinated
             | Self::CombinedOrdering
             | Self::Cache
+            | Self::CombinedExec
             | Self::Integrity => DeployVars::default(),
         }
     }
@@ -216,6 +239,7 @@ impl Shard {
             | Self::Coordinated
             | Self::CombinedOrdering
             | Self::Cache
+            | Self::CombinedExec
             | Self::Integrity => &[("RUN_LOAD", "0")],
         }
     }
@@ -235,6 +259,7 @@ mod tests {
             Shard::Fleet,
             Shard::Coordinated,
             Shard::CombinedOrdering,
+            Shard::CombinedExec,
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
@@ -247,7 +272,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 51);
+        assert_eq!(all.len(), 54);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -260,6 +285,7 @@ mod tests {
             Shard::Fleet,
             Shard::Coordinated,
             Shard::CombinedOrdering,
+            Shard::CombinedExec,
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
@@ -280,7 +306,16 @@ mod tests {
                 .env()
                 .contains(&("KARDAMOM_EXEC_CURSOR", "on"))
         );
-        assert!(Shard::L1.audits_each_case() && !Shard::Retention.audits_each_case());
+        assert!(
+            Shard::L1.audits_after("l1-liar")
+                && !Shard::Retention.audits_after("retention-overrun")
+        );
+        assert!(Shard::CombinedExec.audits_after("executor-sealer-loss-recover"));
+        assert!(!Shard::CombinedExec.audits_after("ingress-executor-loss-recover"));
+        assert_eq!(
+            Shard::CombinedExec.cases().first(),
+            Some(&"executor-sealer-loss-recover")
+        );
         assert_eq!(
             Shard::L1.cases().last(),
             Some(&"batcher-outage-past-retention")

@@ -22,6 +22,7 @@ pub(crate) mod deploy;
 pub(crate) mod exec_stream;
 pub(crate) mod fleet;
 pub(crate) mod l1;
+pub(crate) mod l1_canary;
 pub(crate) mod recorded_cursor;
 pub(crate) mod resize;
 pub(crate) mod seq_retention;
@@ -61,6 +62,11 @@ pub enum Case {
     SequencerSealerLossRecover,
     IngressSequencerSealerLossRecover,
     IngressSequencerSealerReverse,
+    ExecutorSealerLossRecover,
+    ExecutorSealerValidatorRecover,
+    IngressExecutorLossRecover,
+    ReadPathLossRecover,
+    SequencerExecutorRedisLoss,
     ArchiveDriverLoss,
     ArchiveTxDataWipe,
     ArchiveCorruption,
@@ -78,6 +84,7 @@ pub enum Case {
     RedisTotalLossRecover,
     MirrorKillRebuild,
     DaLagHalt,
+    CanaryDaLag,
     PruneFloor,
     L1Liar,
     L1NullReceipts,
@@ -86,7 +93,10 @@ pub enum Case {
     ExecutorRestartStorm,
 }
 
-const ALL: [Case; 53] = [
+// A slice, not a fixed-size array: two branches that each add a case
+// would otherwise both edit the declared length and break main when they
+// merge close together.
+const ALL: &[Case] = &[
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
@@ -117,6 +127,11 @@ const ALL: [Case; 53] = [
     Case::SequencerSealerLossRecover,
     Case::IngressSequencerSealerLossRecover,
     Case::IngressSequencerSealerReverse,
+    Case::ExecutorSealerLossRecover,
+    Case::ExecutorSealerValidatorRecover,
+    Case::IngressExecutorLossRecover,
+    Case::ReadPathLossRecover,
+    Case::SequencerExecutorRedisLoss,
     Case::ArchiveDriverLoss,
     Case::ArchiveTxDataWipe,
     Case::ArchiveCorruption,
@@ -134,6 +149,7 @@ const ALL: [Case; 53] = [
     Case::RedisTotalLossRecover,
     Case::MirrorKillRebuild,
     Case::DaLagHalt,
+    Case::CanaryDaLag,
     Case::PruneFloor,
     Case::L1Liar,
     Case::L1NullReceipts,
@@ -150,7 +166,8 @@ impl Case {
     /// Returns an error for an unknown name, before any load or account
     /// is spent.
     pub fn parse(name: &str) -> anyhow::Result<Self> {
-        ALL.into_iter()
+        ALL.iter()
+            .copied()
             .find(|c| c.name() == name)
             .ok_or_else(|| crate::chaos_fail!("unknown chaos case: {name}"))
     }
@@ -189,6 +206,11 @@ impl Case {
             Self::SequencerSealerLossRecover => "sequencer-sealer-loss-recover",
             Self::IngressSequencerSealerLossRecover => "ingress-sequencer-sealer-loss-recover",
             Self::IngressSequencerSealerReverse => "ingress-sequencer-sealer-reverse",
+            Self::ExecutorSealerLossRecover => "executor-sealer-loss-recover",
+            Self::ExecutorSealerValidatorRecover => "executor-sealer-validator-recover",
+            Self::IngressExecutorLossRecover => "ingress-executor-loss-recover",
+            Self::ReadPathLossRecover => "read-path-loss-recover",
+            Self::SequencerExecutorRedisLoss => "sequencer-executor-redis-loss",
             Self::ArchiveDriverLoss => "archive-driver-loss",
             Self::ArchiveTxDataWipe => "archive-tx-data-wipe",
             Self::ArchiveCorruption => "archive-corruption",
@@ -206,6 +228,7 @@ impl Case {
             Self::RedisTotalLossRecover => "redis-total-loss-recover",
             Self::MirrorKillRebuild => "mirror-kill-rebuild",
             Self::DaLagHalt => "da-lag-halt",
+            Self::CanaryDaLag => "canary-da-lag",
             Self::PruneFloor => "prune-floor",
             Self::L1Liar => "l1-liar",
             Self::L1NullReceipts => "l1-null-receipts",
@@ -238,7 +261,8 @@ impl Case {
             | Self::GracefulSequencer
             | Self::HardSequencer
             | Self::SequencerLaneLossRecover
-            | Self::LookupBlackout => Pin::Shard0,
+            | Self::LookupBlackout
+            | Self::SequencerExecutorRedisLoss => Pin::Shard0,
             Self::ResizeScaleOutIn => Pin::MovesOnScaleOut,
             _ => Pin::Any,
         }
@@ -257,6 +281,7 @@ impl Case {
             Self::RetentionOverrun
             | Self::RetentionOverrunValidator
             | Self::DaLagHalt
+            | Self::CanaryDaLag
             | Self::PruneFloor => inject + k.retention_freeze_cap + Duration::from_mins(2),
             Self::ResizeScaleOutIn => inject + Duration::from_mins(13),
             // The failed deployment runs to the executor's healthy
@@ -293,6 +318,15 @@ impl Case {
             | Self::IngressSequencerSealerLossRecover
             | Self::IngressSequencerSealerReverse => {
                 inject + k.reschedule_slo + Duration::from_mins(5)
+            }
+            // The same, plus the replay of the executors after their
+            // return.
+            Self::ExecutorSealerLossRecover
+            | Self::ExecutorSealerValidatorRecover
+            | Self::IngressExecutorLossRecover
+            | Self::ReadPathLossRecover
+            | Self::SequencerExecutorRedisLoss => {
+                inject + k.reschedule_slo + Duration::from_mins(6)
             }
             Self::CpuSqueeze => {
                 let cycle = k.squeeze.window + k.squeeze.release;
@@ -347,16 +381,23 @@ impl Case {
             // attempts cover a halt of about 24 minutes. The sealer fleet
             // wipe stops the ingresses for the whole rebuild, and a refused
             // submit would leave a nonce hole in the load's sender.
-            Self::DaLagHalt | Self::SealerFleetTotalWipeRecover => 120,
+            Self::DaLagHalt | Self::CanaryDaLag | Self::SealerFleetTotalWipeRecover => 120,
             // The submit ingress is dead for the hold and the staggered
             // return, about five minutes, and a dead ingress refuses a
             // connection at once. The retry delay grows by 200 ms per
             // attempt, so ninety attempts span about fourteen minutes.
+            // With the executors down and the ingress up, each attempt
+            // parks 30 s at the ingress instead, for about the same time.
             Self::IngressSequencerLossRecover
             | Self::IngressSealerLossRecover
             | Self::SequencerSealerLossRecover
             | Self::IngressSequencerSealerLossRecover
-            | Self::IngressSequencerSealerReverse => 90,
+            | Self::IngressSequencerSealerReverse
+            | Self::ExecutorSealerLossRecover
+            | Self::ExecutorSealerValidatorRecover
+            | Self::IngressExecutorLossRecover
+            | Self::ReadPathLossRecover
+            | Self::SequencerExecutorRedisLoss => 90,
             Self::ClusterQuorumLossRecover => 6,
             Self::ClusterTotalLossRecover
             | Self::ExecutorFleetLossRecover
@@ -411,6 +452,13 @@ impl Case {
             Self::SequencerSealerLossRecover => combined::SEQUENCER_SEALER.run(h).await,
             Self::IngressSequencerSealerLossRecover => combined::ALL_THREE.run(h).await,
             Self::IngressSequencerSealerReverse => combined::ALL_THREE_REVERSE.run(h).await,
+            Self::ExecutorSealerLossRecover => combined::EXECUTOR_SEALER.run(h).await,
+            Self::ExecutorSealerValidatorRecover => {
+                combined::EXECUTOR_SEALER_VALIDATOR.run(h).await
+            }
+            Self::IngressExecutorLossRecover => combined::INGRESS_EXECUTOR.run(h).await,
+            Self::ReadPathLossRecover => combined::READ_PATH.run(h).await,
+            Self::SequencerExecutorRedisLoss => combined::SEQUENCER_EXECUTOR_REDIS.run(h).await,
             Self::ArchiveDriverLoss => archive::driver_loss(h).await,
             Self::ArchiveTxDataWipe => archive::tx_data_wipe(h).await,
             Self::ArchiveCorruption => archive::corruption(h).await,
@@ -432,6 +480,7 @@ impl Case {
             Self::RedisTotalLossRecover => cache::redis_total_loss_recover(h).await,
             Self::MirrorKillRebuild => cache::mirror_kill_rebuild(h).await,
             Self::DaLagHalt => da_lag::da_lag_halt(h).await,
+            Self::CanaryDaLag => l1_canary::canary_da_lag(h).await,
             Self::PruneFloor => da_lag::prune_floor(h).await,
             Self::L1Liar => l1::liar(h).await,
             Self::L1NullReceipts => l1::null_receipts(h).await,
@@ -456,6 +505,7 @@ mod tests {
             crate::Shard::Fleet,
             crate::Shard::Coordinated,
             crate::Shard::CombinedOrdering,
+            crate::Shard::CombinedExec,
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,

@@ -55,6 +55,20 @@ pub fn canary_counter_creation() -> Bytes {
     Bytes::from_static(CANARY_COUNTER_CREATION)
 }
 
+/// Creation bytecode of `CanaryRwa`, the canary's test RWA token. The
+/// constructor arguments follow it.
+#[must_use]
+pub fn canary_rwa_creation() -> Bytes {
+    Bytes::from_static(CANARY_RWA_CREATION)
+}
+
+/// Creation bytecode of `CanaryPool`, the canary's constant-product pool.
+/// The constructor arguments follow it.
+#[must_use]
+pub fn canary_pool_creation() -> Bytes {
+    Bytes::from_static(CANARY_POOL_CREATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
