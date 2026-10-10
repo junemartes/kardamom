@@ -90,7 +90,7 @@ pub enum Case {
     ExecutorRestartStorm,
 }
 
-const ALL: [Case; 55] = [
+const ALL: [Case; 56] = [
     Case::GracefulExecutor,
     Case::HardExecutor,
     Case::GracefulIngress,
