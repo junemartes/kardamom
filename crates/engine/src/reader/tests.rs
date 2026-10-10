@@ -122,11 +122,13 @@ pub(super) fn run_ordering(
     let (tx, rx) = bounded::<ReaderToExec>(8);
     let h = TxOrderingReader::spawn(TxOrderingInputs {
         sub: b,
-        buffer: buf,
         cfg,
         exec_out: tx,
         exec_stream: NoExecStream,
-        recovery_factory: None,
+        join: TxDataSeed {
+            buffer: buf,
+            recovery: None,
+        },
     });
     h.join().expect("no panic")?;
     Ok(drain(&rx))
@@ -293,11 +295,13 @@ fn channel_b_reader_tolerates_a_publisher_lag() {
     let (tx, rx) = bounded::<ReaderToExec>(2);
     let h = TxOrderingReader::spawn(TxOrderingInputs {
         sub: b,
-        buffer: buf,
         cfg,
         exec_out: tx,
         exec_stream: NoExecStream,
-        recovery_factory: None,
+        join: TxDataSeed {
+            buffer: buf,
+            recovery: None,
+        },
     });
     h.join().expect("no panic").expect("ok");
     a_inserter.join().unwrap();

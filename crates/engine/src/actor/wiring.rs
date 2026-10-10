@@ -34,9 +34,7 @@ use crossbeam_channel::Sender;
 
 use kardamom_types::SnapshotSource;
 
-use crate::reader::{
-    EpochObserver, ExecStreamSink, JoinRecoveryFactory, TxDataSubscription, TxOrderingSubscription,
-};
+use crate::reader::{EpochObserver, ExecStreamSink, TxOrderingSubscription, TxSource};
 
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
 use super::tx_hook::TxHook;
@@ -45,7 +43,7 @@ use super::types::{BalHandoff, BlockExecStrategy};
 /// The port types the exec thread itself needs, independent of the reader
 /// and commit threads. A supertrait, not folded into [`EngineWiring`]
 /// directly, so a test fixture that only drives the exec thread (see
-/// `test_support::ExecRig`) can implement this alone, with no `TxData`,
+/// `test_support::ExecRig`) can implement this alone, with no `TxSource`,
 /// `TxOrdering`, or `TxReceipts` type to name.
 pub trait ExecPorts {
     /// Post-block state snapshot source: the state writer's read side.
@@ -95,7 +93,7 @@ pub trait ExecPorts {
 ///     type TxHook = VerifyRecordIdentity;
 /// }
 /// impl EngineWiring for ValidatorWiring {
-///     type TxData = ClusterTxDataSubscription;
+///     type TxSource = Either<TxDataSource<LiveTxDataSub>, ExecStreamSource<LiveExecTxsSub, LiveExecArchive>>;
 ///     type TxOrdering = ClusterTxOrderingSubscription;
 ///     type TxReceipts = Either<AttestingReceiptSink<PlainSink>, PlainSink>; // attester tee
 ///     type ExecStream = NoExecStream;
@@ -104,9 +102,12 @@ pub trait ExecPorts {
 ///
 /// [`Executor::run`]: super::Executor::run
 pub trait EngineWiring: ExecPorts {
-    /// Per-partition `tx_data` subscription. There are M of them (see
-    /// [`Inbound`]).
-    type TxData: TxDataSubscription + 'static;
+    /// Where the `tx_ordering` reader gets the bytes of each `TxRef`. The
+    /// executor names [`TxDataSource`](crate::reader::TxDataSource). A
+    /// consumer outside the executors names
+    /// [`ExecStreamSource`](crate::reader::ExecStreamSource), or
+    /// [`Either`](super::ports::Either) of the two when a flag picks it.
+    type TxSource: TxSource;
     /// The canonical `tx_ordering` subscription.
     type TxOrdering: TxOrderingSubscription + 'static;
     /// The `tx_receipts` publication the commit thread drains into.
@@ -122,21 +123,14 @@ pub trait EngineWiring: ExecPorts {
 /// the double projection through [`SnapshotSource::Db`].
 pub type SnapshotDb<W> = <<W as ExecPorts>::Snapshots as SnapshotSource>::Db;
 
-/// What the reader threads consume: the M `tx_data` subscriptions, the
-/// canonical `tx_ordering` subscription, and the optional archive-backed
-/// join-miss recovery. It also names where the reader sends what it
-/// joins: the executor stream.
+/// What the reader threads consume: the transaction source and the
+/// canonical `tx_ordering` subscription. It also names where the reader
+/// sends what it joins: the executor stream.
 pub struct Inbound<W: EngineWiring> {
-    /// One subscription per sequencer partition (M total). Callers may
-    /// supply them in any order, since each subscription declares its own
-    /// `sequencer_id`.
-    pub tx_data: Vec<W::TxData>,
+    /// The source of the transaction bytes.
+    pub tx_source: W::TxSource,
     /// The canonical orderer. Its clean close ends the run.
     pub tx_ordering: W::TxOrdering,
-    /// Archive-backed join-miss refetch factory (see
-    /// [`crate::reader::JoinRecovery`]). `None` keeps the plain bounded
-    /// join.
-    pub join_recovery: Option<JoinRecoveryFactory>,
     /// The executor-stream sink of the `tx_ordering` reader.
     pub exec_stream: W::ExecStream,
 }

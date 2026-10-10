@@ -27,6 +27,10 @@ bytes.workspace = true
 metrics = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
+# The locator query of the executor stream (`reader::exec_stream`): one
+# JSON-RPC request per miss, parsed once at the boundary.
+serde = { workspace = true }
+serde_json = { workspace = true }
 crossbeam-channel = "0.5"
 dashmap = { workspace = true }
 # bin_support: shared wiring for the two engine-driven binaries (executor +

@@ -594,6 +594,14 @@ impl<T: crate::codec::WireMessage> TypedSubscription<T> {
         try_recv_decoded(&mut self.rx, decode_typed_frame)
     }
 
+    /// The next frame, for a caller on a plain std thread. It parks the
+    /// thread until a frame arrives. `None` when the channel closes. Do not
+    /// call it inside a tokio runtime: `UnboundedReceiver::blocking_recv`
+    /// panics there.
+    pub fn blocking_recv(&mut self) -> Option<(BPosition, T)> {
+        blocking_recv_decoded(&mut self.rx, decode_typed_frame)
+    }
+
     /// The next frame, with the Aeron session id of its publication. Each
     /// publisher process opens its own publication, so the session tells
     /// apart the publishers of one stream.

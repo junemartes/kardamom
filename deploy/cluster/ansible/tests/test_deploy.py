@@ -244,6 +244,7 @@ class DeployTest(unittest.TestCase):
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
         env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.pop('KARDAMOM_VALIDATOR_TX_SOURCE', None)
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
@@ -490,6 +491,20 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+
+    def test_the_validator_reads_the_source_the_switch_names(self):
+        def validator_args():
+            task = self.api.state['plans']['validator']['TaskGroups'][0]['Tasks'][0]
+            return task['Config']['args']
+        self.run_deploy(check=True)
+        args = validator_args()
+        self.assertEqual(args[args.index('--tx-source') + 1], 'tx-data')
+        self.run_deploy(check=True, environ={'KARDAMOM_VALIDATOR_TX_SOURCE': 'exec-stream'})
+        args = validator_args()
+        self.assertEqual(args[args.index('--tx-source') + 1], 'exec-stream')
+        endpoints = args[args.index('--executor-query-endpoints') + 1].split(',')
+        self.assertEqual(endpoints[0], 'http://executor-0.node.dc1.consul:9024')
+        self.assertEqual(len(endpoints), 3)
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):

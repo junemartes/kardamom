@@ -5,10 +5,12 @@
 //!
 //! The inbound path splits into two parts:
 //!
-//! - Each of the M `tx_data` reader threads (one per sequencer partition)
-//!   subscribes to its own `tx_data` stream. It reads full `TxEnvelope`
-//!   records and inserts them into a shared join buffer, keyed by
-//!   `(sequencer_id, tx_data_position)`.
+//! - The feed threads of the transaction source fill a shared buffer. The
+//!   executor's source is M `tx_data` reader threads (one per lane). Each
+//!   one reads full `TxEnvelope` records and inserts them into the join
+//!   buffer, keyed by `(sequencer_id, tx_data_position)`. A consumer
+//!   outside the executors reads the executor stream instead, keyed by
+//!   canonical index (see `reader::ExecStreamSource`).
 //! - The one `tx_ordering` reader thread reads small `TxOrderingMessage`
 //!   records (`TxRef | BoundaryStart`) in canonical order. For each
 //!   `TxRef`, it looks up the buffer and sends `(b_position, TxEnvelope)`
@@ -67,7 +69,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, bounded};
 
 use crate::error::ExecutorError;
-use crate::reader::{JoinBuffer, ReaderToExec, TxDataReader, TxOrderingInputs, TxOrderingReader};
+use crate::reader::{
+    FeedHandle, ReaderToExec, SourceStart, TxOrderingInputs, TxOrderingReader, TxSource,
+};
 
 mod commit_thread;
 mod exec_block;
@@ -199,7 +203,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
             tx_hook,
         } = hooks;
 
-        let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
+        let (feed_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth.get());
 
         let exec = ExecState::<W>::spawn(ExecInputs {
@@ -222,7 +226,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
         let commit = CommitLoop::new(tx_receipts, rx_e2c).spawn();
 
         Threads {
-            tx_data: tx_data_handles,
+            feeds: feed_handles,
             tx_ordering: tx_ordering_handle,
             exec,
             commit,
@@ -234,61 +238,55 @@ impl<W: EngineWiring + 'static> Executor<W> {
 /// subscription close, or the first error.
 type ThreadResult = Result<(), ExecutorError>;
 
-/// The readers [`Inbound::spawn_readers`] returns: the M `tx_data`
-/// handles, the one `tx_ordering` handle, and the exec thread's inbound
-/// channel.
+/// The readers [`Inbound::spawn_readers`] returns: the feed handles of the
+/// transaction source, the one `tx_ordering` handle, and the exec thread's
+/// inbound channel.
 type SpawnedReaders = (
-    Vec<JoinHandle<ThreadResult>>,
+    Vec<FeedHandle>,
     JoinHandle<ThreadResult>,
     Receiver<ReaderToExec>,
 );
 
 impl<W: EngineWiring + 'static> Inbound<W> {
-    /// Spawn the M `tx_data` readers and the one `tx_ordering` reader.
-    /// Each `tx_data` thread owns its subscription for its full life;
-    /// `next` already reports the `sequencer_id`, so the returned join
-    /// handles are enough to surface an error. Returns the `tx_data`
-    /// handles, the `tx_ordering` handle, and the exec thread's inbound
-    /// channel.
+    /// Start the transaction source's feed threads and spawn the one
+    /// `tx_ordering` reader. Each feed thread owns its subscription for
+    /// its full life, so the returned join handles are enough to surface
+    /// an error. Returns the feed handles, the `tx_ordering` handle, and
+    /// the exec thread's inbound channel.
     fn spawn_readers(self, cfg: &ExecutorConfig) -> SpawnedReaders {
         let Inbound {
-            tx_data,
+            tx_source,
             tx_ordering,
-            join_recovery,
             exec_stream,
         } = self;
-        let buffer = JoinBuffer::new();
+        let SourceStart { feeds, seed } = tx_source.start();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth.get());
-        let tx_data_handles: Vec<JoinHandle<ThreadResult>> = tx_data
-            .into_iter()
-            .map(|sub| TxDataReader::new(sub, buffer.clone()).spawn())
-            .collect();
         let tx_ordering_handle = TxOrderingReader::spawn(TxOrderingInputs {
             sub: tx_ordering,
-            buffer,
             cfg: cfg.reader.clone(),
             exec_out: tx_r2e,
             exec_stream,
-            recovery_factory: join_recovery,
+            join: seed,
         });
-        (tx_data_handles, tx_ordering_handle, rx_r2e)
+        (feeds, tx_ordering_handle, rx_r2e)
     }
 }
 
-/// The M+3 spawned threads: M `tx_data` readers, one `tx_ordering` reader,
-/// one exec thread, one commit thread. [`Self::join`] enforces the one join
-/// order that is safe: the pipeline first, then the `tx_data` readers. A
-/// caller that joins the handles itself must keep that order, because a
-/// `tx_data` reader blocks in `next()` until its subscription closes.
+/// The spawned threads: the feed threads of the transaction source, one
+/// `tx_ordering` reader, one exec thread, one commit thread.
+/// [`Self::join`] enforces the one join order that is safe: the pipeline
+/// first, then the feeds. A caller that joins the handles itself must keep
+/// that order, because a feed blocks in `next()` until its subscription
+/// closes.
 pub struct Threads {
-    pub(crate) tx_data: Vec<JoinHandle<ThreadResult>>,
+    pub(crate) feeds: Vec<FeedHandle>,
     pub(crate) tx_ordering: JoinHandle<ThreadResult>,
     pub(crate) exec: JoinHandle<ThreadResult>,
     pub(crate) commit: JoinHandle<ThreadResult>,
 }
 
 impl Threads {
-    /// Join the critical pipeline, then the `tx_data` readers.
+    /// Join the critical pipeline, then the feeds.
     ///
     /// # Errors
     ///
@@ -296,13 +294,13 @@ impl Threads {
     /// `BoundaryMisaligned` in exec).
     pub fn join(self) -> Result<(), ExecutorError> {
         let Threads {
-            tx_data,
+            feeds,
             tx_ordering,
             exec,
             commit,
         } = self;
         Self::join_pipeline(tx_ordering, exec, commit)?;
-        Self::join_tx_data(tx_data)
+        Self::join_feeds(feeds)
     }
 
     /// Join the critical pipeline: the `tx_ordering` reader, then exec,
@@ -325,10 +323,9 @@ impl Threads {
         r_ordering.and(r_exec).and(r_commit)
     }
 
-    /// Join the M `tx_data` reader threads, after [`Self::join_pipeline`]
-    /// confirms Ok.
+    /// Join the feed threads, after [`Self::join_pipeline`] confirms Ok.
     ///
-    /// Do not join these before the pipeline: each `tx_data` thread blocks
+    /// Do not join these before the pipeline: each feed thread blocks
     /// in its Aeron `next()` call until its subscription closes, and that
     /// only happens on process teardown. Joining them while the process is
     /// still running would hang forever and hide a pipeline error: the
@@ -338,12 +335,12 @@ impl Threads {
     ///
     /// `fold` reads the whole iterator, so every reader is joined with no
     /// short-circuit. `and` keeps the first error.
-    fn join_tx_data(handles: Vec<JoinHandle<ThreadResult>>) -> Result<(), ExecutorError> {
+    fn join_feeds(handles: Vec<FeedHandle>) -> Result<(), ExecutorError> {
         handles
             .into_iter()
             // A panicked reader thread means a logic bug; propagate it as
             // a panic here too, the same as `join_pipeline` above.
-            .map(|h| h.join().expect("tx_data reader panic"))
+            .map(|h| h.join().expect("feed reader panic"))
             .fold(Ok(()), Result::and)
     }
 }

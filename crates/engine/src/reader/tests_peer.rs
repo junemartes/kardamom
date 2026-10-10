@@ -521,7 +521,7 @@ fn a_kept_record_joins_its_entry_at_its_turn_after_the_check() {
         TxOrderingMessage::TxRef(ref_of(&live, 30)),
     ];
     let (mut reader, rx) = reader(VotingSub::new(1, queue), buffer, voter_cfg());
-    reader.fetched.keep(
+    reader.join.fetched.keep(
         1,
         vec![
             record(1, ref_of(&kept, 20), &kept),

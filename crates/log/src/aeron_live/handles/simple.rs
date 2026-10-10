@@ -142,6 +142,12 @@ macro_rules! declare_channel_handles {
             pub fn try_recv(&mut self) -> Option<(BPosition, $msg)> {
                 self.rx.try_recv()
             }
+
+            /// The next record, for a caller on a plain std thread. See
+            /// `TypedSubscription::blocking_recv`.
+            pub fn blocking_recv(&mut self) -> Option<(BPosition, $msg)> {
+                self.rx.blocking_recv()
+            }
         }
     };
 

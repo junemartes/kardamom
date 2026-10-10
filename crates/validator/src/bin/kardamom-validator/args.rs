@@ -7,7 +7,7 @@ use std::str::FromStr;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
-use kardamom_engine::bin_support::StateDurabilityArg;
+use kardamom_engine::bin_support::{StateDurabilityArg, TxSourceArg};
 use kardamom_engine::reader::cluster::ClusterConfig;
 use kardamom_validator::interop::{
     DEFAULT_FEED_MAX_SUBSCRIPTIONS, DEFAULT_FEED_MAX_SUBSCRIPTIONS_PER_DEST, RetentionBlocks,
@@ -135,6 +135,18 @@ pub(crate) struct Args {
     /// `kardamom.cluster.voidVoters` list, and each consumer has its own id.
     #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
     pub(crate) void_voter_id: Option<u8>,
+    /// Where the validator reads the transaction bytes. `tx-data` joins the
+    /// `tx_data` lanes, as an executor does. `exec-stream` reads the
+    /// executor stream (`exec_txs`), checks each record against the
+    /// canonical hash, refetches a miss from an executor archive by
+    /// locator, and never votes: it drops an entry only on its void record.
+    #[arg(long, value_enum, env = "KARDAMOM_TX_SOURCE", default_value_t = TxSourceArg::TxData)]
+    pub(crate) tx_source: TxSourceArg,
+    /// The executor query endpoints (`http://host:port`, comma-separated)
+    /// that the `exec-stream` source asks for a locator on a miss
+    /// (`kardamom_getExecLocator`). Empty turns the archive refetch off.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
+    pub(crate) executor_query_endpoints: Vec<String>,
     /// Address for the Prometheus /metrics HTTP listener. Port 9007, since
     /// 9006 is the ingress default; running both locally with defaults
     /// must not compete for one socket. See docs/observability.md.

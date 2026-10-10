@@ -89,6 +89,23 @@ impl Halted {
         }
     }
 
+    /// Raise the `exec_record_mismatch` halt for `reason` and wait for the
+    /// operator's clear (`POST /halt/clear`) or the shutdown signal. No
+    /// file keeps this halt: the executor archives keep the evidence, and
+    /// a restart meets the same index and halts again. `Continue` means
+    /// the operator cleared it after the runbook's steps.
+    pub(crate) async fn hold_mismatch(boot: &Boot, reason: String) -> ControlFlow<()> {
+        tracing::error!(
+            reason = %reason,
+            "validator halted: no executor archive holds a record that passes the check"
+        );
+        halt::raise(Halt::new(HaltCause::ExecRecordMismatch, reason));
+        tokio::select! {
+            () = boot.stop.cancelled() => ControlFlow::Break(()),
+            () = halt::cleared() => ControlFlow::Continue(()),
+        }
+    }
+
     /// End both records of a cleared divergence: the verdict file and the
     /// halt. A file that cannot be removed is logged: the next start then
     /// holds again, which is the safe side.

@@ -67,13 +67,17 @@ impl Shard {
                 "archive-tx-data-wipe",
                 "archive-corruption",
             ],
+            // The shard-0 cases and the other cases alternate so each one
+            // takes the next funded account and none burns: the accounts
+            // from #7 on sit on shards 0 0 0 1 0 1 1 0 1.
             Self::Sequencer => &[
                 "graceful-sequencer",
                 "hard-sequencer",
                 "sequencer-replica-kill",
-                "sequencer-lapse",
                 "validator-lapse",
+                "sequencer-lapse",
                 "validator-join",
+                "validator-exec-archive-catchup",
                 "lookup-blackout",
                 "resize-scale-out-in",
             ],
@@ -135,7 +139,8 @@ impl Shard {
     /// small egress retention so a freeze can overrun it; the L1 shard
     /// takes both, plus the fault proxy in front of the followers. The
     /// executor shard turns the recorded cursor on, so `hard-executor`
-    /// checks the sealer's best cursor while one executor is down.
+    /// checks the sealer's best cursor while one executor is down. The
+    /// sequencer shard deploys the validator on the executor stream.
     #[must_use]
     pub fn deploy_vars(self) -> DeployVars {
         match self {
@@ -158,9 +163,13 @@ impl Shard {
                 indexer_poll_s: Some(2),
                 ..DeployVars::default()
             },
-            Self::Ingress | Self::Sequencer | Self::Fleet | Self::Coordinated | Self::Cache => {
-                DeployVars::default()
-            }
+            // The validator cases of this shard run on the executor
+            // stream, so CI exercises the switch before it flips.
+            Self::Sequencer => DeployVars {
+                validator_tx_source: Some("exec-stream"),
+                ..DeployVars::default()
+            },
+            Self::Ingress | Self::Fleet | Self::Coordinated | Self::Cache => DeployVars::default(),
         }
     }
 
@@ -220,7 +229,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 46);
+        assert_eq!(all.len(), 47);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -243,6 +252,10 @@ mod tests {
             );
         }
         assert!(Shard::L1.deploy_vars().l1_fault_proxy);
+        assert_eq!(
+            Shard::Sequencer.deploy_vars().validator_tx_source,
+            Some("exec-stream")
+        );
         // The executor shard deploys the recorded cursor and tells its
         // cases so through the knob of the same name.
         assert!(Shard::Executor.deploy_vars().exec_cursor);

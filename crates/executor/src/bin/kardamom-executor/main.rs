@@ -584,10 +584,9 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         Executor::<ExecutorWiring>::new(
             cfg,
             Inbound {
-                tx_data: tx_data_subs,
-                tx_ordering: tx_ordering_sub,
                 // Join-miss archive refetch (None on single-host/IPC runs).
-                join_recovery,
+                tx_source: kardamom_engine::reader::TxDataSource::new(tx_data_subs, join_recovery),
+                tx_ordering: tx_ordering_sub,
                 exec_stream: outputs.exec_stream.sink,
             },
             Outbound {

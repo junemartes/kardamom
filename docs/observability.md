@@ -282,11 +282,12 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomHaltRecordLag` | critical | `kardamom_halt{cause="record_lag"} == 1`. The record-lag guard is off by default, so this alert cannot fire until a later release turns the guard on. |
 | `KardamomHaltL1LightClientMismatch` | critical | `kardamom_halt{cause="l1_light_client_mismatch"} == 1`. |
 | `KardamomHaltL1FollowerDisagreement` | critical | `kardamom_halt{cause="l1_follower_disagreement"} == 1`. |
+| `KardamomHaltExecRecordMismatch` | critical | `kardamom_halt{cause="exec_record_mismatch"} == 1`. Only a validator or a batcher on `--tx-source exec-stream` raises it. |
 | `KardamomServicePaused` | info | `kardamom_paused == 1` for 1 minute. |
 
 - A validator that diverges stays up and keeps `up == 1`.
   The pages for a divergence are `KardamomValidatorDivergence` and `KardamomHaltValidatorDivergence`.
-- The twelve `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
+- The thirteen `KardamomHalt*` rules have one rule for each halt cause. Each one fires at once (`for: 0m`), except `KardamomHaltOriginGap`.
   - `KardamomHaltOriginGap` waits 1 minute. A restarted sequencer can miss the epoch that the sealer expects, and its twin offers that epoch again within milliseconds. Only a gap that no replica fills pages.
   - Each rule has the labels `severity` and `cause`.
   - Each rule has the annotation `runbook`, a path to the file in [runbooks/](runbooks/README.md).
@@ -395,6 +396,15 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
 - With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the recorded cursor to the sealer. It sends a cursor that moved when 100 ms passed, or at once when it moved by 1024 records. A sent cursor never moves down. The ingress shows the best cursor of the executors in `kardamom_ingress_cluster_recorded_head`.
+
+A validator on `--tx-source exec-stream` reads the executor stream and exports these metrics. See "The executor stream source" in [failure-modes.md](failure-modes.md#validator-off-the-hot-path-halts-on-divergence).
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_exec_stream_dropped_total{reason}` | Copies that the record buffer refused. `repeat` is the dedup: with three executors it grows about twice as fast as the records. `late` is an index the reader passed. `bound`, `evicted` and `ahead` are the limits of the buffer. |
+| `kardamom_exec_stream_record_rejected_total{reason}` | Copies that failed the check against the canonical `TxRef`: `tx_ref` (the reference differs) or `hash` (the keccak of the bytes is not the canonical hash). Any growth is a fault of an executor or of the stream. |
+| `kardamom_exec_stream_refetch_total{outcome}` | Asks of one executor on a miss: `located` (a good copy from its archive), `mismatch`, `absent` (the replay held no record at the index), `not_reached`, `not_held`, `lost`, `no_answer`, `replay_failed`. |
+| `kardamom_exec_stream_wait_seconds` | How long the reader has waited for the record at one index. Zero when no wait runs. A value that grows means that no executor serves the record: the validator waits for the record or a void record. |
 
 ### L1 follower (inbox indexer)
 

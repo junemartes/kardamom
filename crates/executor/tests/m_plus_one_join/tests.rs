@@ -168,9 +168,8 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         Executor::<Wiring>::new(
             cfg,
             Inbound {
-                tx_data: tx_data_subs,
+                tx_source: kardamom_engine::reader::TxDataSource::new(tx_data_subs, None),
                 tx_ordering: tx_ordering_sub,
-                join_recovery: None,
                 exec_stream: kardamom_engine::NoExecStream,
             },
             Outbound {

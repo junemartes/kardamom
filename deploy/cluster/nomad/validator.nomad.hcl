@@ -103,6 +103,26 @@ variable "executor_count" {
   default     = 3
 }
 
+# The executor query port (group_vars/all.yml, ports.executor_nonce_query).
+# The exec-stream source asks it for the locator of a lost record.
+variable "executor_query_port" {
+  type    = number
+  default = 9024
+}
+
+# Where the validator reads the transaction bytes: "tx-data" (the tx_data
+# lanes, as an executor does) or "exec-stream" (the executor stream, with
+# the executor archives for a miss). Ansible deployment passes -var from
+# KARDAMOM_VALIDATOR_TX_SOURCE. Rollback: set it back to "tx-data".
+variable "tx_source" {
+  type    = string
+  default = "tx-data"
+  validation {
+    condition     = contains(["tx-data", "exec-stream"], var.tx_source)
+    error_message = "The tx_source value must be tx-data or exec-stream."
+  }
+}
+
 job "validator" {
   datacenters = [var.datacenter]
   type        = "service"
@@ -246,6 +266,11 @@ job "validator" {
           # The void voter id: the first id after the executors'
           # (cluster.nomad.hcl builds the sealer's voter list the same way).
           "--void-voter-id", format("%d", var.executor_count),
+          # The transaction source. On exec-stream the validator never
+          # votes: it drops an entry only on the void record, and it asks
+          # the executors where their archives hold a lost record.
+          "--tx-source", var.tx_source,
+          "--executor-query-endpoints", join(",", [for i in range(var.executor_count) : "http://executor-${i}.node.${var.datacenter}.consul:${var.executor_query_port}"]),
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
           # Use the validator's own state directory under the shared

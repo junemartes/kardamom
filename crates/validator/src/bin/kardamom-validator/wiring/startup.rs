@@ -235,8 +235,9 @@ pub(crate) struct Opened {
 }
 
 impl Opened {
-    /// Open every subscription the validator reads: the M `tx_data`
-    /// streams plus `tx_deposits` (identical to the executor), the one
+    /// Open every subscription the validator reads: the transaction
+    /// source that `--tx-source` names (the M `tx_data` streams, or the
+    /// executor stream), the one
     /// cluster (Raft) `tx_ordering` egress, and the verification and
     /// interop side buffers those streams feed.
     ///
@@ -279,6 +280,8 @@ impl Opened {
                 cursor: bin_support::cluster_replay_cursor(&self.state.start),
                 bin_name: "kardamom-validator",
                 suppress_sealer_metrics: true,
+                tx_source: args.tx_source,
+                executor_query_endpoints: &args.executor_query_endpoints,
             })?;
 
         // --- Verification streams: tx_bal (BAL) and tx_receipts. ---

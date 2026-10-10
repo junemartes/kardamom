@@ -190,6 +190,15 @@ L1Cursor = "7 0x0707070707070707070707070707070707070707070707070707070707070707
 # archives: receipts, block deltas, boundaries, service events, transaction
 # status, transaction errors, and transaction envelopes. An enum adds a
 # variant only at the end.
+#
+# `HaltCause` (inside `ServiceEvent`) adds `RecordLag` and then
+# `ExecRecordMismatch`, each one last, with `RecoveryId` the same way. A
+# reader of the release before a variant fails the validation of an event
+# that names it, and drops that event as a malformed frame; the next event
+# decodes (crates/types/tests/service_event_compat.rs). The events stream is
+# best effort and changes no canonical state. An older board then shows the
+# publisher as gone after 15 s, and a gone record pauses nothing. So the
+# version stays 1.
 [format.aeron-stream-records]
 writes = 1
 reads_min = 1

@@ -72,6 +72,7 @@ A **halt** is a service that stops its work, stays up, and names its cause. A **
 | `record_lag` | sealer (raised by the ingress) | auto | [`record_lag`](runbooks/record_lag.md) |
 | `l1_light_client_mismatch` | l1-indexer | operator | [`l1_light_client_mismatch`](runbooks/l1_light_client_mismatch.md) |
 | `l1_follower_disagreement` | consumers of `l1_blocks` | operator | [`l1_follower_disagreement`](runbooks/l1_follower_disagreement.md) |
+| `exec_record_mismatch` | validator, batcher (`--tx-source exec-stream`) | operator | [`exec_record_mismatch`](runbooks/exec_record_mismatch.md) |
 
 - The sealer is a Java service with no Rust exporter. The ingress observes the sealer and raises its halts under `service="sealer"`.
 - The ingress raises `record_lag` while the status frame says the record-lag guard refuses. It clears the halt when the flag clears.
@@ -593,6 +594,18 @@ A divergence is a state, not a dead process.
 
 - A divergence never gives an exit code. It gives a halt.
 - The deploy restarts and reschedules the validator job like any other job.
+
+**The executor stream source (`--tx-source exec-stream`).** The validator reads the transaction bytes from the executor stream, not from `tx_data`. The default is `tx-data` in this release. The deploy flips it with the job variable `tx_source`.
+
+- **Live read and dedup**: one `exec_txs` subscription with one destination for each executor. A feed thread keys each record by its canonical index. The buffer keeps the distinct copies of an index and drops the repeats, so three identical copies become one. `kardamom_exec_stream_dropped_total{reason="repeat"}` counts the dedup.
+- **The check**: the validator accepts the copy at index `i` only when its `tx_ref` equals the canonical `TxRef(i)` and `keccak256(raw_tx)` equals `TxRef(i).tx_hash`. A copy that fails counts in `kardamom_exec_stream_record_rejected_total{reason}` (`tx_ref` or `hash`) and drops. The identity check of the exec thread (`RecordIdentity`) still runs on each record.
+- **A gap**: no copy arrives within the live wait (10 s), or every copy fails the check. The validator asks each executor `kardamom_getExecLocator(i, tx_hash)` (`--executor-query-endpoints`) and replays the archive of the first executor that answers `located`. One replay delivers a run of records into the buffer, so the next indices need no ask. The validator asks again every 1 s. `kardamom_exec_stream_refetch_total{outcome}` counts the answers.
+- **A restart**: the live stream holds only the head. When the head is more than 4096 indices past the cursor, the live wait ends at once and the first miss refetches the cursor range from an archive. Past the sealer retention, the validator still adopts a peer checkpoint.
+- **No executor serves the record**: the validator waits with no deadline and exports `kardamom_exec_stream_wait_seconds`. It never votes. It reads ahead in the canonical order and drops `i` only on `Void(i)`. A wait is a pause, not a halt. Until the voter set changes, the sealer still counts the validator's voter id, so a void cannot complete while the validator runs on this source: a lost entry waits.
+- **Every copy fails**: when every executor archive holds a record at `i` and no record passes the check, the reader stops with `ExecRecordMismatch`. The validator raises the `exec_record_mismatch` halt and waits for `POST /halt/clear`. No file keeps this halt: a restart meets the same index and halts again. It is not a divergence: the validator did not execute the entry, and the attester pauses on nothing. Follow the runbook [`exec_record_mismatch`](runbooks/exec_record_mismatch.md).
+- **No miss path**: without `--executor-query-endpoints` or the local refetch endpoints, the validator logs `executor stream refetch DISABLED` and a lost live record waits for a void record.
+- **Executors that do not serve the locator query**: an executor of a release without `kardamom_getExecLocator` answers the method with an error. Each ask counts `no_answer`, and a gap, a restart past the live window, or a fresh validator waits. Run `exec-stream` only on executors that serve the query.
+- Proof: the unit tests of `crates/engine/src/reader/exec_stream/tests.rs` (dedup of three copies, a rejected copy, a gap filled by one replay, a void with no vote, a restart that refetches its cursor range, the stop when every archive mismatches). The chaos case `validator-exec-archive-catchup` stops the validator past the live window and asserts that it verifies again with no checkpoint adoption.
 
 **Replay-window overrun.** The cursor of the validator aged out of the bounded retention of the cluster. The validator repairs itself like the executor does.
 

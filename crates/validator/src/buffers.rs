@@ -1,6 +1,8 @@
-//! Verification buffers: a shared, bounded, cursor-pruned core, plus the
-//! replica buffers for the BAL (by block number), receipts and account rows
-//! (by canonical `tx_idx`), and the per-block claim index buffer.
+//! Verification buffers: the replica buffers for the BAL (by block
+//! number), receipts and account rows (by canonical `tx_idx`), and the
+//! per-block claim index buffer. Each one is a
+//! [`KeyedBuffer`](kardamom_engine::keyed_buffer::KeyedBuffer) with its
+//! own slot type and bounds.
 //!
 //! A replica buffer keeps every distinct result of each key, with the
 //! sessions that published it. A second result for a key never replaces
@@ -11,68 +13,17 @@
 //! The binary's Aeron subscriber tasks fill the buffers. The sync exec and
 //! commit threads drain them, and wait briefly for the matching data to
 //! arrive.
-//!
-//! # Why a `Condvar`, not a tokio channel
-//!
-//! The async/sync seam elsewhere in the validator uses tokio primitives
-//! (`tokio::sync::mpsc`, `CancellationToken`). This buffer keeps a
-//! `Mutex` + `Condvar` on purpose:
-//!
-//! - The consumer waits on a KEY with a DEADLINE, not on the next item.
-//!   A channel is FIFO; the keyed map would still have to exist beside it,
-//!   and `tokio::sync::mpsc` has no `recv_timeout` for the sync side.
-//! - The wait lives entirely on the std thread. The async producer only
-//!   takes the mutex for a short, await-free critical section and calls
-//!   `notify_all`, which never blocks. So no tokio task ever parks on a
-//!   std primitive, and the exec thread needs no runtime handle.
-//! - `Condvar::wait_timeout` gives the deadline semantics `take` depends on
-//!   (see the comment in [`KeyedBuffer::take`]) with one primitive.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+pub use kardamom_engine::keyed_buffer::BufKey;
+use kardamom_engine::keyed_buffer::{Bounds, KeyedBuffer, Skip, Slot};
 use kardamom_types::{AccountRow, BPosition, BlockDelta, Receipt};
 
 use crate::metrics;
-use crate::replica::{Check, Distinct, ReplicaId, Skip, Taken};
-
-/// Key of a verification buffer. It maps to the increasing index (block
-/// number or canonical record index) that the catch-up and pruning logic
-/// uses.
-pub trait BufKey: Ord + Copy {
-    fn index(self) -> u64;
-    fn from_index(index: u64) -> Self;
-}
-impl BufKey for u64 {
-    fn index(self) -> u64 {
-        self
-    }
-    fn from_index(index: u64) -> Self {
-        index
-    }
-}
-impl BufKey for BPosition {
-    fn index(self) -> u64 {
-        self.as_index()
-    }
-    fn from_index(index: u64) -> Self {
-        BPosition::from_index(index)
-    }
-}
-
-/// What one key of a [`KeyedBuffer`] holds, and how a later insert for
-/// the same key joins it.
-trait Slot: Sized {
-    type Item;
-    fn first(item: Self::Item) -> Self;
-    /// Join a later insert for the key, or say why the slot refuses it.
-    fn join(&mut self, item: Self::Item) -> Result<(), Skip>;
-    /// The replica results the slot holds.
-    fn results(&self) -> usize;
-}
+use crate::replica::{Check, Distinct, ReplicaId, Taken};
 
 /// The latest insert for a key replaces the earlier one. The claim
 /// index is a scheduling hint, not a checked result, so one copy is
@@ -133,223 +84,6 @@ impl<V: PartialEq> Slot for Results<V> {
     }
     fn results(&self) -> usize {
         Distinct::results(&self.0)
-    }
-}
-
-/// The limits of one buffer. The distances are in key index units.
-#[derive(Clone, Copy)]
-struct Bounds {
-    /// Max retained keys. On overflow, the highest key is evicted, so a
-    /// key far ahead never pushes out a key near the consumer. The
-    /// consumer treats missing data as "could not verify", never as a
-    /// divergence, so eviction can only leave a key unverified.
-    cap: NonZeroUsize,
-    /// Catch-up skip horizon. See [`KeyedBuffer::take_step`].
-    lookbehind: u64,
-    /// How far below the consumer's cursor an insert is still taken. The
-    /// next take hands it over as a late entry. Zero keeps only the
-    /// cursor key itself.
-    late_window: u64,
-    /// How far above the consumer's cursor an insert is still taken. A
-    /// key beyond it is a wrong or wrapped key, not a live one.
-    reach: u64,
-}
-
-/// How many buffered keys must lie beyond the catch-up horizon before
-/// the consumer skips a key. A real live head is a run of keys. One
-/// wrong key far ahead does not turn the skip on.
-const SKIP_EVIDENCE: usize = 4;
-
-/// Shared core of the replica buffers and [`ClaimBuffer`]. The producer
-/// task inserts values. The sync consumer thread calls `take` in
-/// increasing key order, and waits briefly for matching data. The buffer
-/// is bounded and cursor-pruned, so late or stale data can never leak:
-/// each take hands over every entry below its key, and an insert outside
-/// the window around the cursor is refused.
-struct KeyedBuffer<K, S> {
-    inner: Mutex<KeyedInner<K, S>>,
-    cv: Condvar,
-    bounds: Bounds,
-}
-
-struct KeyedInner<K, S> {
-    map: BTreeMap<K, S>,
-    /// Index of the latest key requested by `take`. Requests only
-    /// increase. An insert more than the late window below this index is
-    /// for a key that the consumer can no longer use, so the buffer
-    /// refuses it. This stops the buffer from holding dead entries.
-    cursor: Option<u64>,
-}
-
-/// What an insert did: the reason the buffer refused the item, and how
-/// many replica results the cap evicted.
-struct Inserted {
-    refused: Option<Skip>,
-    evicted: usize,
-}
-
-/// What a take hands over: the slot of the key, the slots below it, and
-/// how many replica results it dropped beyond the reach.
-struct Took<K, S> {
-    current: Option<S>,
-    below: BTreeMap<K, S>,
-    beyond: usize,
-}
-
-/// One cycle of [`KeyedBuffer::take`]'s wait loop.
-enum TakeStep<'a, K, S> {
-    /// The final result: found, or given up on.
-    Done(Option<S>),
-    /// Not ready yet; wait another cycle with this guard.
-    Retry(std::sync::MutexGuard<'a, KeyedInner<K, S>>),
-}
-
-impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
-    fn new(bounds: Bounds) -> Self {
-        Self {
-            inner: Mutex::new(KeyedInner {
-                map: BTreeMap::new(),
-                cursor: None,
-            }),
-            cv: Condvar::new(),
-            bounds,
-        }
-    }
-
-    /// Insert `item` under `key`, and wake the waiters when the buffer
-    /// took it.
-    fn insert(&self, key: K, item: S::Item) -> Inserted {
-        let inserted = self.insert_locked(key, item);
-        if inserted.refused.is_none() {
-            self.cv.notify_all();
-        }
-        inserted
-    }
-
-    /// Insert `item` under the lock, and release the lock when this
-    /// returns. One insert adds at most one key, so at most one key is
-    /// evicted.
-    fn insert_locked(&self, key: K, item: S::Item) -> Inserted {
-        let mut g = self
-            .inner
-            .lock()
-            .expect("verification buffer lock poisoned");
-        let refused =
-            g.cursor
-                .and_then(|c| self.outside(key, c))
-                .or_else(|| match g.map.entry(key) {
-                    Entry::Vacant(e) => {
-                        e.insert(S::first(item));
-                        None
-                    }
-                    Entry::Occupied(mut e) => e.get_mut().join(item).err(),
-                });
-        let evicted = (g.map.len() > self.bounds.cap.get())
-            .then(|| g.map.pop_last())
-            .flatten()
-            .map_or(0, |(_, slot)| slot.results());
-        Inserted { refused, evicted }
-    }
-
-    /// Why `key` is outside the window around `cursor`, if it is.
-    fn outside(&self, key: K, cursor: u64) -> Option<Skip> {
-        let index = key.index();
-        if index < cursor.saturating_sub(self.bounds.late_window) {
-            return Some(Skip::Late);
-        }
-        (index > cursor.saturating_add(self.bounds.reach)).then_some(Skip::Ahead)
-    }
-
-    /// Take the slot for `key`, and wait up to `timeout` for it to
-    /// arrive. Also hands over every slot below `key`: the entries that
-    /// arrived after their own take, or that no take requested. The
-    /// current slot is `None` if it never arrives. The caller treats that
-    /// as "could not verify", never as a divergence.
-    fn take(&self, key: K, timeout: Duration) -> Took<K, S> {
-        // Use a deadline, not a fresh timeout per wakeup. Inserts for other
-        // keys call notify_all on every block (about 250ms to 2s on a live
-        // chain). A fresh timeout per wakeup would mean a wait for a key
-        // that never arrives never times out, and the consumer hangs
-        // forever on one lost item while the buffer keeps filling.
-        let deadline = std::time::Instant::now() + timeout;
-        let mut g = self
-            .inner
-            .lock()
-            .expect("verification buffer lock poisoned");
-        // Requests only increase: everything below `key` goes to the
-        // caller now. Remember the cursor, so inserts outside the window
-        // are refused. Entries that arrived before the first take can
-        // lie beyond the reach; they go now.
-        let cursor = g.cursor.map_or(key.index(), |c| c.max(key.index()));
-        g.cursor = Some(cursor);
-        let beyond = g.map.split_off(&K::from_index(
-            cursor.saturating_add(self.bounds.reach).saturating_add(1),
-        ));
-        let upper = g.map.split_off(&key);
-        let below = std::mem::replace(&mut g.map, upper);
-        let beyond = beyond.values().map(Slot::results).sum();
-        loop {
-            match self.take_step(g, &key, deadline) {
-                TakeStep::Done(current) => {
-                    return Took {
-                        current,
-                        below,
-                        beyond,
-                    };
-                }
-                TakeStep::Retry(next_g) => g = next_g,
-            }
-        }
-    }
-
-    /// One wait cycle of [`Self::take`]: try the value, then the
-    /// catch-up check, then wait out the remaining deadline (or take the
-    /// final value at the deadline). `Done` carries the result to
-    /// return; `Retry` carries the guard for another cycle.
-    fn take_step<'a>(
-        &'a self,
-        mut g: std::sync::MutexGuard<'a, KeyedInner<K, S>>,
-        key: &K,
-        deadline: std::time::Instant,
-    ) -> TakeStep<'a, K, S> {
-        if let Some(v) = g.map.remove(key) {
-            return TakeStep::Done(Some(v));
-        }
-        // Catch-up check: if the live head (a run of buffered keys) is
-        // far ahead of `key`, this item has aged out of the live stream's
-        // buffer and will never arrive. Return None now instead of
-        // waiting out the timeout, so the validator catches up fast after
-        // a cold start or a lapse longer than the live buffer. A
-        // caught-up validator asks for keys near the head, so this check
-        // never triggers and verification runs as normal.
-        let horizon = K::from_index(
-            key.index()
-                .saturating_add(self.bounds.lookbehind)
-                .saturating_add(1),
-        );
-        if g.map.range(horizon..).nth(SKIP_EVIDENCE - 1).is_some() {
-            return TakeStep::Done(None);
-        }
-        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            return TakeStep::Done(g.map.remove(key));
-        };
-        let (mut g2, wait) = self
-            .cv
-            .wait_timeout(g, remaining)
-            .expect("verification buffer lock poisoned");
-        if wait.timed_out() {
-            return TakeStep::Done(g2.map.remove(key));
-        }
-        TakeStep::Retry(g2)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("verification buffer lock poisoned")
-            .map
-            .len()
     }
 }
 

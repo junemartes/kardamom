@@ -98,7 +98,7 @@ impl ExecPorts for ExecutorWiring {
 }
 
 impl EngineWiring for ExecutorWiring {
-    type TxData = bin_support::LiveTxDataSub;
+    type TxSource = kardamom_engine::reader::TxDataSource<bin_support::LiveTxDataSub>;
     type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = LiveTxReceiptsPub;
     type ExecStream = crossbeam_channel::Sender<kardamom_engine::ExecStreamItem>;

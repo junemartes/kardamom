@@ -23,7 +23,7 @@ use super::void::{MAX_READ_AHEAD, ParkOutcome, ReadAhead};
 use super::*;
 use crate::error::ExecutorError;
 
-type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
+pub(super) type Votes = Arc<Mutex<Vec<(u8, VoidRecord)>>>;
 
 /// An ordering subscription over a fixed queue. It records every vote.
 pub(super) struct VotingSub {
@@ -95,7 +95,7 @@ pub(super) fn voter_cfg() -> ReaderConfig {
 }
 
 pub(super) type TestReader =
-    TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream>;
+    TxOrderingReader<VotingSub, crossbeam_channel::Sender<ReaderToExec>, NoExecStream, TxDataJoin>;
 
 /// A reader over `sub`, with its exec sink's far end.
 pub(super) fn reader(
@@ -106,11 +106,13 @@ pub(super) fn reader(
     let (exec_out, rx) = unbounded();
     let reader = TxOrderingReader::new(TxOrderingInputs {
         sub,
-        buffer,
         cfg,
         exec_out,
         exec_stream: NoExecStream,
-        recovery_factory: None,
+        join: TxDataSeed {
+            buffer,
+            recovery: None,
+        },
     });
     (reader, rx)
 }
