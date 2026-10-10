@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use kardamom_types::TxEnvelope;
 
+use crate::live::rebuild::rebuild;
 use crate::live::rebuild::tests::{archive_of, live_block, refs_of};
-use crate::live::rebuild::{ArchiveLoc, rebuild};
 use crate::live::refs_store::BlockRefs;
 use crate::live::refs_store::tests::FakeStore;
 
@@ -104,7 +104,7 @@ fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
 }
 
 /// A rebuilder over a map of envelopes: the test's archive.
-struct MapRebuilder(HashMap<ArchiveLoc, TxEnvelope>);
+struct MapRebuilder(HashMap<u64, TxEnvelope>);
 
 impl Rebuilder for MapRebuilder {
     fn rebuild(mut self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {

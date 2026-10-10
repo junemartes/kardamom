@@ -24,15 +24,13 @@ use kardamom_log::refetch::{EndpointSource, RefetchConfig};
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, CodeEntry, TxDataLoc, TxEnvelope};
 
-use crate::actor::Either;
 use crate::error::ExecutorError;
-use crate::reader::{JoinRecoveryFactory, TxDataSource, TxDataSubscription};
+use crate::reader::{JoinRecoveryFactory, TxDataSubscription};
 
-mod exec_stream;
+mod tx_source;
 
-pub use exec_stream::{
-    ExecStreamConfig, LiveExecStreamSource, LiveExecTxsSub, LiveTxSource, TxSourceArg,
-    open_exec_stream,
+pub use tx_source::{
+    ArchiveAccess, LiveExecStreamSource, LiveExecTxsSub, LiveTxSource, TxSourceArg, TxSourceConfig,
 };
 
 /// CLI mirror of [`kardamom_state::Durability`]. Clap renders the variants
@@ -431,68 +429,20 @@ pub fn connect_cluster_ordering(
 /// Everything [`open_inbound`] needs, gathered so the function reads no
 /// eight-argument list.
 pub struct InboundConfig<'a> {
-    pub rt: &'a AeronRuntime,
-    /// The plane the `tx_data` lanes open through. Its channels also feed
-    /// the refetch wiring.
-    pub plane: &'a mut kardamom_log::discovery::StreamPlane,
-    pub aeron_cfg: &'a AeronConfig,
-    pub aeron_dir: Option<&'a Path>,
-    pub archive_control_response_endpoint: Option<&'a str>,
-    pub replay_destination_endpoint: Option<&'a str>,
+    /// The transaction source, and the archives of its miss path. Its
+    /// `bin_name` also names this binary in the
+    /// `tx_ordering via Aeron Cluster` log line.
+    pub source: TxSourceConfig<'a>,
     pub cluster_cfg: kardamom_cluster_adapter::LiveClusterConfig,
     pub cursor: crate::reader::cluster::ReplayCursor,
-    /// Names this binary in the `tx_ordering via Aeron Cluster` log line.
-    pub bin_name: &'a str,
     /// The executor is the chosen emitter of the `kardamom_sealer_*`
     /// re-export; the validator suppresses its own copy to avoid a
     /// second, lagging series.
     pub suppress_sealer_metrics: bool,
-    /// The transaction source: the `tx_data` lanes, or the executor
-    /// stream.
-    pub tx_source: TxSourceArg,
-    /// The executor query endpoints of the executor stream's miss path.
-    /// Unused on the `tx_data` source.
-    pub executor_query_endpoints: &'a [String],
-}
-
-impl InboundConfig<'_> {
-    /// Open the transaction source that [`Self::tx_source`] names: the M
-    /// `tx_data` streams (always live multicast, join-miss gaps recovered
-    /// in-band by archive refetch), or the executor stream.
-    fn open_tx_source(&mut self) -> Result<LiveTxSource> {
-        tracing::info!(
-            tx_source = self.tx_source.id(),
-            "{}: transaction source",
-            self.bin_name
-        );
-        match self.tx_source {
-            TxSourceArg::TxData => {
-                let tx_data = open_tx_data_subs(self.rt, self.plane)?;
-                let join_recovery = archive_join_recovery(
-                    self.plane,
-                    self.aeron_cfg,
-                    self.aeron_dir,
-                    self.archive_control_response_endpoint,
-                    self.replay_destination_endpoint,
-                );
-                Ok(Either::Left(TxDataSource::new(tx_data, join_recovery)))
-            }
-            TxSourceArg::ExecStream => open_exec_stream(ExecStreamConfig {
-                rt: self.rt,
-                plane: self.plane,
-                aeron_cfg: self.aeron_cfg,
-                aeron_dir: self.aeron_dir,
-                archive_control_response_endpoint: self.archive_control_response_endpoint,
-                replay_destination_endpoint: self.replay_destination_endpoint,
-                executor_query_endpoints: self.executor_query_endpoints,
-            })
-            .map(Either::Right),
-        }
-    }
 }
 
 /// Open the shared inbound side of the engine for a consumer that reads
-/// the transaction source a flag picks (see [`InboundConfig::tx_source`]),
+/// the transaction source a flag picks (see [`TxSourceConfig::open`]),
 /// and the one `tx_ordering` subscription (always the Aeron Cluster
 /// egress). Returns the ready-to-run [`Inbound`] plus the
 /// [`kardamom_cluster_adapter::LiveCluster`] guard, which the caller
@@ -503,7 +453,7 @@ impl InboundConfig<'_> {
 /// Returns `Err` when opening the transaction source or the cluster
 /// ordering connection fails.
 pub fn open_inbound<W>(
-    mut cfg: InboundConfig<'_>,
+    cfg: InboundConfig<'_>,
 ) -> Result<(crate::Inbound<W>, kardamom_cluster_adapter::LiveCluster)>
 where
     W: crate::EngineWiring<
@@ -512,10 +462,12 @@ where
             ExecStream = crate::reader::NoExecStream,
         >,
 {
-    let tx_source = cfg.open_tx_source()?;
+    let aeron_dir = cfg.source.archives.aeron_dir;
+    let bin_name = cfg.source.bin_name;
+    let tx_source = cfg.source.open()?;
     let (cluster_guard, cluster_sub) =
-        connect_cluster_ordering(cfg.aeron_dir, cfg.cluster_cfg, cfg.cursor)?;
-    tracing::info!("{}: tx_ordering via Aeron Cluster", cfg.bin_name);
+        connect_cluster_ordering(aeron_dir, cfg.cluster_cfg, cfg.cursor)?;
+    tracing::info!("{bin_name}: tx_ordering via Aeron Cluster");
     let tx_ordering = if cfg.suppress_sealer_metrics {
         cluster_sub.suppress_sealer_metrics()
     } else {

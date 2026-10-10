@@ -4,7 +4,7 @@ This halt occurs only on a validator or a batcher that reads the executor
 stream (`--tx-source exec-stream`, deploy switches
 `KARDAMOM_VALIDATOR_TX_SOURCE` and `KARDAMOM_BATCHER_TX_SOURCE`). The steps below
 name the validator. On the batcher, read its `/halt` on port 9002: it posts
-nothing past the entry.
+nothing past the entry. See "The batcher" below.
 
 ## Cause
 
@@ -62,3 +62,13 @@ This halt waits for an operator (`operator`).
   again.
 - No file keeps this halt. A restart of the validator meets the same index
   and halts again.
+
+## The batcher
+
+- The batcher posts only checked bytes. It posts the blocks that it closed
+  before the index, then stays up and posts nothing past it.
+- The cause and the steps are the same. The executors and the batcher must run
+  one release.
+- Clear it with `POST /halt/clear` on the batcher node. The batcher then starts
+  again from its cursor. If every archive still holds a mismatched record, it
+  halts again.

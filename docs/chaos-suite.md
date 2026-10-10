@@ -63,7 +63,7 @@ There are eleven shards. `just container-test` lists their names.
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on, the batcher on the executor stream (`KARDAMOM_BATCHER_TX_SOURCE=exec-stream`) |
 
 Case order matters in four places.
 
@@ -175,6 +175,7 @@ The shard deploys the validator with `--tx-source exec-stream`, so `validator-la
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.
   - In both cases the L1 record must be contiguous.
+  - When the deploy runs the batcher on the executor stream (`KARDAMOM_BATCHER_TX_SOURCE=exec-stream`, the `chaos-l1` shard), the batcher must log `kardamom-batcher: transaction source exec-stream`. A rebuild must then log a `rebuild: executor archive replay` line past the baseline, unless its `rebuild: reading the executor archives` line says `wanted=0`.
 
 **DA cases**
 
@@ -421,6 +422,7 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` cases stays active. |
 | `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
 | `RUN_LOAD` | `1` | `1` when the load stage ran on this cluster. The chaos shards set `0`. The resize case then takes a load-reserve account. |
+| `KARDAMOM_BATCHER_TX_SOURCE` | unset (`exec-stream` in `chaos-l1`) | The transaction source of the deployed batcher. The deploy reads it, and with `exec-stream` the batcher cases assert the executor stream and the executor archives. |
 
 ### CPU squeeze knobs
 

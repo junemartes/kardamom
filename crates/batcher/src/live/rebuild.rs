@@ -1,18 +1,24 @@
-//! The rebuild of a block range from its references: the bytes of every
-//! transaction come from the `tx_data` archives, through the refetch the
-//! engine uses for a join miss, and the blocks close as the live feed
-//! closes them, so they pack to the bytes the live path posts.
+//! The rebuild of a block range from its references. The bytes of every
+//! transaction come from the archives of the transaction source: the
+//! `tx_data` archives through the refetch the engine uses for a join
+//! miss, or the executor archives through a locator and the replay of the
+//! executor stream source. The blocks close as the live feed closes them,
+//! so they pack to the bytes the live path posts.
+
+mod exec;
 
 use std::collections::{BTreeSet, HashMap};
 
 use alloy_primitives::keccak256;
 use anyhow::{Context, Result, bail};
-use kardamom_engine::reader::{JoinRecovery, JoinRecoveryFactory};
+use kardamom_engine::reader::{ExecArchiveSeed, JoinRecovery, JoinRecoveryFactory};
 use kardamom_types::{BPosition, TxEnvelope};
 use tracing::info;
 
 use super::refs_store::{BlockRefs, BlockTxRef};
 use crate::batch::{ClosedBlock, RecordedTx};
+
+pub(crate) use exec::ExecArchiveEnvelopes;
 
 /// Where a transaction's bytes are: the join key of the `tx_data`
 /// archives.
@@ -33,29 +39,31 @@ impl BlockTxRef {
     }
 }
 
-/// A source of transaction bytes by archive location: the durability
-/// archives, or a map in a test.
+/// A source of the transaction bytes of a block range: the `tx_data`
+/// archives, the executor archives, or a map in a test.
 pub(crate) trait EnvelopeSource {
-    /// The envelopes at `wanted`, keyed by location. A location the source
-    /// cannot serve is absent; the caller names it.
+    /// The envelopes of the references of `blocks`, keyed by canonical
+    /// index. An index the source cannot serve is absent; the caller
+    /// names it.
     ///
     /// # Errors
     ///
     /// Returns an error when the source fails before it can say which
-    /// locations it holds.
-    fn fetch(&mut self, wanted: &BTreeSet<ArchiveLoc>) -> Result<HashMap<ArchiveLoc, TxEnvelope>>;
+    /// envelopes it holds.
+    fn fetch(&mut self, blocks: &[BlockRefs]) -> Result<HashMap<u64, TxEnvelope>>;
 }
 
-impl EnvelopeSource for HashMap<ArchiveLoc, TxEnvelope> {
-    fn fetch(&mut self, wanted: &BTreeSet<ArchiveLoc>) -> Result<HashMap<ArchiveLoc, TxEnvelope>> {
-        Ok(wanted
+impl EnvelopeSource for HashMap<u64, TxEnvelope> {
+    fn fetch(&mut self, blocks: &[BlockRefs]) -> Result<HashMap<u64, TxEnvelope>> {
+        Ok(blocks
             .iter()
-            .filter_map(|loc| self.get(loc).map(|env| (*loc, env.clone())))
+            .flat_map(|b| &b.refs)
+            .filter_map(|r| self.get(&r.tx_idx).map(|env| (r.tx_idx, env.clone())))
             .collect())
     }
 }
 
-/// The durability archives as an [`EnvelopeSource`]. One bounded replay
+/// The `tx_data` archives as an [`EnvelopeSource`]. One bounded replay
 /// per publisher session, from the lowest wanted position, delivers the
 /// recording's tail; the sink keeps the wanted locations and drops the
 /// rest. A replay the drain budget cuts short leaves locations missing,
@@ -148,9 +156,24 @@ impl ArchiveEnvelopes {
 }
 
 impl EnvelopeSource for ArchiveEnvelopes {
-    fn fetch(&mut self, wanted: &BTreeSet<ArchiveLoc>) -> Result<HashMap<ArchiveLoc, TxEnvelope>> {
-        // Group by publisher session, in location order, so each replay
-        // starts at the lowest wanted position of its recording.
+    fn fetch(&mut self, blocks: &[BlockRefs]) -> Result<HashMap<u64, TxEnvelope>> {
+        let refs = || blocks.iter().flat_map(|b| &b.refs);
+        let wanted: BTreeSet<ArchiveLoc> = refs().map(BlockTxRef::loc).collect();
+        let mut by_loc = self.fetch_locs(&wanted)?;
+        Ok(refs()
+            .filter_map(|r| by_loc.remove(&r.loc()).map(|env| (r.tx_idx, env)))
+            .collect())
+    }
+}
+
+impl ArchiveEnvelopes {
+    /// The envelopes at `wanted`, keyed by location. Group by publisher
+    /// session, in location order, so each replay starts at the lowest
+    /// wanted position of its recording.
+    fn fetch_locs(
+        &mut self,
+        wanted: &BTreeSet<ArchiveLoc>,
+    ) -> Result<HashMap<ArchiveLoc, TxEnvelope>> {
         let mut sessions: Vec<SessionFetch<'_>> = Vec::new();
         for loc in wanted {
             Self::group(&mut sessions, loc);
@@ -161,9 +184,7 @@ impl EnvelopeSource for ArchiveEnvelopes {
         }
         Ok(all)
     }
-}
 
-impl ArchiveEnvelopes {
     /// Add `loc` to its session's group, or open the group. The locations
     /// arrive in order, so a group is the last one or a new one.
     fn group<'a>(sessions: &mut Vec<SessionFetch<'a>>, loc: &'a ArchiveLoc) {
@@ -195,8 +216,9 @@ pub(crate) trait Rebuilder {
     fn rebuild(self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>>;
 }
 
-/// The live rebuilder: the archives, reached through the join-miss
-/// refetch the reader stack is configured with.
+/// The live rebuilder of the `tx_data` source: the `tx_data` archives,
+/// reached through the join-miss refetch the reader stack is configured
+/// with.
 pub(crate) struct ArchiveRebuilder {
     pub(crate) factory: JoinRecoveryFactory,
 }
@@ -204,6 +226,35 @@ pub(crate) struct ArchiveRebuilder {
 impl Rebuilder for ArchiveRebuilder {
     fn rebuild(self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
         rebuild(&blocks, &mut ArchiveEnvelopes::new(self.factory))
+    }
+}
+
+/// The live rebuilder of the executor stream source: the executor
+/// archives, reached through the locator query and the replay of the
+/// executor stream source. The archive is built on the rebuild's thread,
+/// because it holds thread-bound Aeron resources.
+pub(crate) struct ExecArchiveRebuilder<S> {
+    pub(crate) seed: S,
+}
+
+impl<S: ExecArchiveSeed> Rebuilder for ExecArchiveRebuilder<S> {
+    fn rebuild(self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
+        rebuild(&blocks, &mut ExecArchiveEnvelopes::new(self.seed.build()))
+    }
+}
+
+/// The rebuilder of the source that `--tx-source` names.
+pub(crate) enum SourceRebuilder {
+    TxData(ArchiveRebuilder),
+    ExecStream(ExecArchiveRebuilder<kardamom_engine::reader::LiveExecArchiveSeed>),
+}
+
+impl Rebuilder for SourceRebuilder {
+    fn rebuild(self, blocks: Vec<BlockRefs>) -> Result<Vec<ClosedBlock>> {
+        match self {
+            Self::TxData(r) => r.rebuild(blocks),
+            Self::ExecStream(r) => r.rebuild(blocks),
+        }
     }
 }
 
@@ -220,18 +271,14 @@ pub(crate) fn rebuild<E: EnvelopeSource>(
     blocks: &[BlockRefs],
     source: &mut E,
 ) -> Result<Vec<ClosedBlock>> {
-    let wanted: BTreeSet<ArchiveLoc> = blocks
-        .iter()
-        .flat_map(|b| b.refs.iter().map(BlockTxRef::loc))
-        .collect();
-    let found = source.fetch(&wanted)?;
+    let found = source.fetch(blocks)?;
     let closed = blocks
         .iter()
         .map(|block| close(block, &found))
         .collect::<Result<Vec<_>>>()?;
     info!(
         blocks = closed.len(),
-        transactions = wanted.len(),
+        transactions = closed.iter().map(|b| b.txs.len()).sum::<usize>(),
         "rebuild: blocks closed from the archives"
     );
     Ok(closed)
@@ -240,7 +287,7 @@ pub(crate) fn rebuild<E: EnvelopeSource>(
 /// Close one block: its boundary from the references, its transactions
 /// from the envelopes. A block rebuilt this way carries no remote-epoch
 /// record; the query endpoint refuses a block that had one.
-fn close(block: &BlockRefs, found: &HashMap<ArchiveLoc, TxEnvelope>) -> Result<ClosedBlock> {
+fn close(block: &BlockRefs, found: &HashMap<u64, TxEnvelope>) -> Result<ClosedBlock> {
     let txs = block
         .refs
         .iter()
@@ -257,17 +304,17 @@ fn close(block: &BlockRefs, found: &HashMap<ArchiveLoc, TxEnvelope>) -> Result<C
 }
 
 /// The recorded transaction of one reference: the envelope at its
-/// location, whose hash and bytes must agree with the reference.
+/// canonical index, whose hash and bytes must agree with the reference.
 fn recorded(
     r: &BlockTxRef,
-    found: &HashMap<ArchiveLoc, TxEnvelope>,
+    found: &HashMap<u64, TxEnvelope>,
     block_number: u64,
 ) -> Result<RecordedTx> {
-    let envelope = found.get(&r.loc()).with_context(|| {
+    let envelope = found.get(&r.tx_idx).with_context(|| {
         format!(
-            "the archives do not serve transaction {} of block {block_number} (shard {} \
-             session {} position {})",
-            r.tx_hash, r.shard_id, r.session_id, r.position
+            "the archives do not serve transaction {} of block {block_number} (canonical \
+             index {}; tx_data shard {} session {} position {})",
+            r.tx_hash, r.tx_idx, r.shard_id, r.session_id, r.position
         )
     })?;
     let digest = keccak256(&envelope.raw_tx);
@@ -283,17 +330,6 @@ fn recorded(
         position: BPosition::from_index(r.tx_idx),
         envelope: envelope.clone(),
     })
-}
-
-/// A `tx_data` location as the refetch sink reports it, for the tests of
-/// this module's callers.
-#[cfg(test)]
-pub(crate) fn loc_of(shard_id: u8, loc: kardamom_types::TxDataLoc) -> ArchiveLoc {
-    ArchiveLoc {
-        shard_id,
-        session_id: loc.session_id,
-        position: loc.position,
-    }
 }
 
 #[cfg(test)]

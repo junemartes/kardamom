@@ -33,6 +33,7 @@ use kardamom_batcher::live;
 use kardamom_batcher::multi_archive_reader::{
     MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
 };
+use kardamom_engine::bin_support::TxSourceArg;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -129,10 +130,29 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_VOID_VOTER_ID")]
     void_voter_id: Option<u8>,
 
-    /// The UDP endpoint on this node where refetched `tx_data` and
-    /// `tx_deposits` fragments land (join-miss recovery from the remote
-    /// durability archives). If unset, refetch is disabled, and a lost
-    /// envelope is then fatal after the join timeout.
+    /// Where the batcher reads the transaction bytes. `tx-data` joins the
+    /// `tx_data` lanes, as an executor does. `exec-stream` reads the
+    /// executor stream (`exec_txs`), checks each record against the
+    /// canonical hash, refetches a miss from an executor archive by
+    /// locator, and never votes: it drops an entry only on its void record.
+    /// The rebuild of a refused replay reads the archives of the same
+    /// source.
+    #[arg(long, value_enum, env = "KARDAMOM_TX_SOURCE", default_value_t = TxSourceArg::TxData)]
+    tx_source: TxSourceArg,
+
+    /// The executor query endpoints (`http://host:port`, comma-separated)
+    /// that the `exec-stream` source asks for a locator on a miss and in a
+    /// rebuild (`kardamom_getExecLocator`). Empty turns the archive
+    /// refetch off.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_QUERY_ENDPOINTS", value_delimiter = ',')]
+    executor_query_endpoints: Vec<String>,
+
+    /// The UDP endpoint on this node where refetched fragments land: the
+    /// `tx_data` and `tx_deposits` join-miss recovery from the remote
+    /// durability archives, or the `exec_txs` replay from an executor
+    /// archive. If unset, refetch is disabled. A lost `tx_data` envelope is
+    /// then fatal after the join timeout, and a lost `exec_txs` record
+    /// waits for its void record.
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     replay_destination_endpoint: Option<String>,
 
@@ -163,12 +183,12 @@ struct Cli {
     settlement_deploy_block: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`): repeat the flag, or separate them with
-    /// commas. They keep, with every receipt, where the transaction's
-    /// bytes are on the `tx_data` archives. When the sealer no longer
-    /// retains the cursor, the batcher reads each missing block's
-    /// references from the first endpoint that serves it, fetches the
-    /// bytes from the archives, and resumes at the sealer's floor.
-    /// Without them, a refused replay is a fail-stop.
+    /// commas. They keep, with every receipt, the canonical index of the
+    /// transaction and where its bytes are on the `tx_data` archives. When
+    /// the sealer no longer retains the cursor, the batcher reads each
+    /// missing block's references from the first endpoint that serves it,
+    /// fetches the bytes from the archives of `--tx-source`, and resumes at
+    /// the sealer's floor. Without them, a refused replay is a fail-stop.
     #[arg(long, env = "KARDAMOM_BLOCK_REFS_SOURCES", value_delimiter = ',', num_args = 1..)]
     block_refs_source: Vec<String>,
 
@@ -384,6 +404,8 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         aeron_dir: cli.aeron_dir.clone(),
         cluster_egress_endpoint: cli.cluster_egress_endpoint.clone(),
         void_voter_id: cli.void_voter_id,
+        tx_source: cli.tx_source,
+        executor_query_endpoints: cli.executor_query_endpoints.clone(),
         replay_destination_endpoint: cli.replay_destination_endpoint.clone(),
         archive_control_response_endpoint: cli.archive_control_response_endpoint.clone(),
         blocks_per_batch: cli.blocks_per_batch,

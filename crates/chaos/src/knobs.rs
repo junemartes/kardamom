@@ -157,6 +157,10 @@ pub struct Knobs {
     /// Whether the load stage ran on this cluster, which decides whether
     /// the resize case may take a load-reserve account.
     pub run_load: bool,
+    /// Whether the deploy runs the batcher on the executor stream
+    /// (`KARDAMOM_BATCHER_TX_SOURCE=exec-stream`). The batcher cases then
+    /// assert that it reads the executor stream and its archives.
+    pub batcher_exec_stream: bool,
     /// The values of the non-chaos stages.
     pub stages: Stages,
 }
@@ -307,6 +311,8 @@ impl Knobs {
                 release: env.secs("SQUEEZE_RELEASE_S", 30)?,
             },
             run_load: env.or("RUN_LOAD", "1") == "1",
+            batcher_exec_stream: env.get(crate::lifecycle::BATCHER_TX_SOURCE_ENV).as_deref()
+                == Some("exec-stream"),
             stages: env.stages()?,
         })
     }
@@ -348,6 +354,8 @@ mod tests {
         assert_eq!(knobs.l1_fault, Duration::from_secs(60));
         assert_eq!(knobs.l1_tps.get(), 50);
         assert!(Knobs::read(&[("CHAOS_TPS", "0")]).is_err());
+        let exec = Knobs::read(&[("KARDAMOM_BATCHER_TX_SOURCE", "exec-stream")]).unwrap();
+        assert!(exec.batcher_exec_stream);
     }
 
     #[test]
