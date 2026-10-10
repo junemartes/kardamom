@@ -16,6 +16,7 @@ pub enum Shard {
     Retention,
     Cache,
     L1,
+    Integrity,
 }
 
 impl Shard {
@@ -33,6 +34,7 @@ impl Shard {
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
             Self::L1 => "chaos-l1",
+            Self::Integrity => "chaos-integrity",
         }
     }
 
@@ -138,6 +140,9 @@ impl Shard {
                 "redis-primary-freeze",
                 "mirror-kill-rebuild",
             ],
+            // The nightly shard: the long repetition cases, too slow for
+            // every pull request.
+            Self::Integrity => &["executor-restart-storm"],
         }
     }
 
@@ -175,7 +180,8 @@ impl Shard {
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::Cache => DeployVars::default(),
+            | Self::Cache
+            | Self::Integrity => DeployVars::default(),
         }
     }
 
@@ -209,7 +215,8 @@ impl Shard {
             | Self::Fleet
             | Self::Coordinated
             | Self::CombinedOrdering
-            | Self::Cache => &[("RUN_LOAD", "0")],
+            | Self::Cache
+            | Self::Integrity => &[("RUN_LOAD", "0")],
         }
     }
 }
@@ -231,6 +238,7 @@ mod tests {
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
+            Shard::Integrity,
         ]
         .iter()
         .flat_map(|s| s.cases().iter().copied())
@@ -239,7 +247,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 50);
+        assert_eq!(all.len(), 51);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -255,6 +263,7 @@ mod tests {
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
+            Shard::Integrity,
         ] {
             assert!(
                 shard.env().contains(&("RUN_LOAD", "0")),
@@ -280,5 +289,7 @@ mod tests {
             Shard::Fleet.cases().last(),
             Some(&"sealer-fleet-total-wipe-recover")
         );
+        assert_eq!(Shard::Integrity.cases(), ["executor-restart-storm"]);
+        assert_eq!(Shard::Integrity.name(), "chaos-integrity");
     }
 }

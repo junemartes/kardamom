@@ -65,6 +65,7 @@
 
 mod bound;
 mod handles;
+mod image_log;
 mod pending;
 mod runtime;
 mod table_pub;

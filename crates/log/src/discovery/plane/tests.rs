@@ -173,3 +173,98 @@ fn stream_key_filter_carries_topic_stream_and_lane() {
     .collect();
     assert_eq!(filter, expect);
 }
+
+/// A discovered subscription registers a subscriber record of its stream,
+/// and the reopen of the publication of that stream sees it. Before the
+/// record, the reopen sees no subscriber. After the shutdown of the
+/// subscribing plane, the record is gone. The test drives the discovery
+/// side alone: no Aeron runtime, so no media driver.
+#[tokio::test]
+async fn a_discovered_subscription_registers_a_subscriber_record() {
+    let catalog = MemoryCatalog::new();
+    let mut publisher = test_plane(&catalog);
+    let key = publisher.receipts_key();
+    let registered = {
+        let d = publisher.discovered.as_mut().expect("discovered plane");
+        let record = crate::discovery::record::PublisherRecord {
+            id: d.instance.service_id(key.topic, key.stream_id),
+            control: SocketAddr::new(IpAddr::V4(d.ip), 40_001),
+            topic: key.topic,
+            stream_id: key.stream_id,
+            lane: None,
+            publisher_id: d.label.clone(),
+            session_id: Some(7),
+        };
+        let spec = RegistrationSpec {
+            entry: record.entry(&d.scope),
+            ttl: d.cfg.check_ttl(),
+            deregister_after: d.cfg.deregister_after(),
+        };
+        Registration::register(d.catalog.clone(), spec)
+            .await
+            .unwrap()
+    };
+    publisher
+        .discovered
+        .as_mut()
+        .unwrap()
+        .registrations
+        .push(registered);
+    let reopen = publisher.tx_receipts_reopen(0).expect("reopen");
+    assert!(!reopen.subscribers_listed(), "no subscriber yet");
+
+    let mut subscriber = StreamPlane::with_catalog(
+        &test_config(),
+        "ingress-0",
+        Catalog::Memory(catalog.clone()),
+        Instance {
+            id: "alloc-2".into(),
+        },
+        Ipv4Addr::new(10, 0, 0, 6),
+    );
+    subscriber
+        .discovered
+        .as_mut()
+        .unwrap()
+        .hold_subscriber_record(key);
+    wait_until(|| reopen.subscribers_listed()).await;
+    let listed = catalog
+        .query(&Query {
+            service: crate::discovery::record::SUBSCRIBER_SERVICE.into(),
+            meta_equals: BTreeMap::new(),
+            index: 0,
+            wait: Duration::ZERO,
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.entries.len(), 1);
+    let entry = &listed.entries[0];
+    assert_eq!(entry.id.as_str(), "alloc-2:sub:tx_receipts:1002");
+    assert_eq!(entry.meta["topic"], "tx_receipts");
+    assert_eq!(entry.meta["subscriber_id"], "ingress-0");
+    assert_eq!(entry.port, 0);
+
+    subscriber.shutdown().await;
+    wait_until(|| !reopen.subscribers_listed()).await;
+    publisher.shutdown().await;
+}
+
+/// A reopen of a stream whose publication is not open is an error.
+#[tokio::test]
+async fn a_reopen_needs_an_open_publication() {
+    let catalog = MemoryCatalog::new();
+    let mut publisher = test_plane(&catalog);
+    assert!(publisher.tx_receipts_reopen(0).is_err());
+}
+
+/// Poll `holds` until it is true, within 5 s.
+async fn wait_until(holds: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !holds() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the condition never held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

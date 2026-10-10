@@ -49,7 +49,7 @@ Every chaos case follows the same steps.
 
 ## Shards
 
-There are twelve shards. `just container-test` lists their names.
+There are thirteen shards. `just container-test` lists their names. Twelve run on every pull request. `chaos-integrity` runs nightly.
 
 | Shard | Cases, in run order | Shard settings |
 |---|---|---|
@@ -65,6 +65,7 @@ There are twelve shards. `just container-test` lists their names.
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
 | `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on |
+| `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
 Case order matters in four places.
 
@@ -78,6 +79,8 @@ Case order matters in four places.
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
 `KARDAMOM_CHAOS_CASES` narrows a run to a space-separated list of case names. An unknown name fails before any load starts.
+
+The nightly shard holds the long repetition cases. The `cluster-e2e` workflow runs it on its schedule (03:17 UTC), alone. Adding the `chaos-nightly` label to a pull request runs it alone too, in a run of its own: the `labeled` event starts the run, and no other label starts one. The build job of the workflow picks the shard list. A nightly run has its own concurrency group, so it never cancels the regular run of the ref. A failed shard of the scheduled run opens an issue `nightly: the <shard> shard failed` with the `chaos-nightly` label, or adds the run to the open issue of that shard.
 
 ### Cases
 
@@ -185,6 +188,14 @@ Every case makes these checks after the return: every class is back at its count
   - The sealer keeps every frame above the posted head. The batcher normally gets its replay served.
   - A sealer that prunes by the window alone refuses the replay. The batcher then rebuilds the gap.
   - In both cases the L1 record must be contiguous.
+
+**Integrity shard (nightly)**
+
+- [`executor-restart-storm`](failure-modes.md#executor): stops and restores the executor job ten times under load.
+  - Every round, all replicas must run again within the restart SLO, and every executor must advance within the convergence SLO (`assert_executors_converged`).
+  - Every round gives each executor a new `tx_receipts` publication on a new control port, which every subscriber attaches again. This is the shape of the fault behind the must-deliver escalation: a publication that stayed unconnected while its subscribers were attached. See "Dead `tx_receipts` publication" in [`failure-modes.md`](failure-modes.md#executor).
+  - At the end, the case counts the escalation lines of the executors (`tx_receipts publication reopened on a new session`, `the process exits so the supervisor restarts it`) and prints them as evidence. The counts do not fail the case.
+  - The load gets the same submit retry as the fleet cases. The case window is ten times the restart SLO plus one minute.
 
 **DA cases**
 

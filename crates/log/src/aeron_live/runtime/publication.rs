@@ -126,6 +126,23 @@ impl PubHandle {
         self.session_id
     }
 
+    /// Close the publication on the Aeron thread. The driver releases the
+    /// session and the control socket. Every clone of this handle is dead
+    /// after the close: a publish on one fails as an unknown publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publication is already closed, or if the
+    /// command round trip to the Aeron thread times out.
+    pub fn close(&self) -> Result<(), LogError> {
+        let pub_id = self.pub_id;
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::ClosePublication { pub_id, ack },
+            "close_publication",
+        )
+    }
+
     /// Blocking publish with `BPosition` ack. Waits
     /// [`ACK_TIMEOUT`](super::super::ACK_TIMEOUT) for the Aeron thread's
     /// reply. See that constant for why the ack always resolves first.

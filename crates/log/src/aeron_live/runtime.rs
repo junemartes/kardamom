@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, Sender as CbSender};
 use rkyv::util::AlignedVec;
@@ -39,6 +40,9 @@ use start::{StartReport, StartWait};
 #[derive(Clone)]
 pub struct AeronRuntime {
     cmd_tx: CbSender<RuntimeCmd>,
+    /// The wait after which a silent Aeron party counts as gone. See
+    /// [`Self::stall_budget`].
+    stall_budget: Duration,
     /// Shared owner of the Aeron thread: the last clone to drop tears it
     /// down (see [`AeronThread`]). Held only for its `Drop`.
     _thread: Arc<AeronThread>,
@@ -125,6 +129,13 @@ pub(super) enum RuntimeCmd {
     /// Aeron subscription itself. Its `sub_id` is never reused.
     CloseSubscription {
         sub_id: u32,
+        ack: CbSender<Result<(), LogError>>,
+    },
+    /// Close a publication: drop the Aeron publication, so the driver
+    /// releases its session and its control socket. Its `pub_id` is never
+    /// reused, and a frame queued for it fails as unknown.
+    ClosePublication {
+        pub_id: u32,
         ack: CbSender<Result<(), LogError>>,
     },
     /// Stop the loop, drop everything.
@@ -255,7 +266,7 @@ impl AeronRuntime {
             .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &report))
             .map_err(|e| LogError::Aeron(format!("spawn aeron thread: {e}")))?;
 
-        wait.wait()?;
+        let budget = wait.wait()?;
 
         let thread = Arc::new(AeronThread {
             cmd_tx: cmd_tx.clone(),
@@ -263,8 +274,20 @@ impl AeronRuntime {
         });
         Ok(Self {
             cmd_tx,
+            stall_budget: budget.duration(),
             _thread: thread,
         })
+    }
+
+    /// The wait after which a silent Aeron party counts as gone: the
+    /// driver timeout of this client (`AERON_DRIVER_TIMEOUT`, the stall
+    /// tolerance of the deploy) plus a margin, and at least 10 s. A party
+    /// that is silent for less than this can be a stalled party that
+    /// every Aeron party survives. A user of the runtime derives its own
+    /// patience from this value, so one deploy value sets every wait.
+    #[must_use]
+    pub fn stall_budget(&self) -> Duration {
+        self.stall_budget
     }
 
     /// Open a subscription, returning its raw undecoded fragment stream

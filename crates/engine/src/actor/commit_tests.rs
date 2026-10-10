@@ -10,7 +10,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
 
 use super::test_support::{feed_commits, pos};
-use super::{CommitLoop, ExecToCommit, TxReceiptsPublication};
+use super::{CommitLoop, Escalation, ExecToCommit, TxReceiptsPublication};
 
 struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
 impl TxReceiptsPublication for RecordPub {
@@ -274,4 +274,133 @@ fn commit_thread_fail_stops_on_divergence() {
         matches!(res, Err(ExecutorError::Divergence(_))),
         "divergence must propagate, not be retried: {res:?}"
     );
+}
+
+/// A publication with no connected subscriber: every publish fails with
+/// `NotConnected` until `reopen` runs `connects_after_reopen` times,
+/// then every publish lands. A subscriber is listed from attempt
+/// `listed_from_attempt` on. Counts the attempts and the reopens.
+struct UnconnectedPub {
+    reopens: Arc<Mutex<u32>>,
+    connects_after_reopen: u32,
+    listed_from_attempt: u32,
+    attempts: Arc<Mutex<u32>>,
+    log: Arc<Mutex<Vec<CMessage>>>,
+}
+
+impl UnconnectedPub {
+    fn new(connects_after_reopen: u32, listed_from_attempt: u32) -> Self {
+        Self {
+            reopens: Arc::new(Mutex::new(0)),
+            connects_after_reopen,
+            listed_from_attempt,
+            attempts: Arc::new(Mutex::new(0)),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn connected(&self) -> bool {
+        *self.reopens.lock().unwrap() >= self.connects_after_reopen
+    }
+}
+
+impl TxReceiptsPublication for UnconnectedPub {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        *self.attempts.lock().unwrap() += 1;
+        if !self.connected() {
+            return Err(ExecutorError::NotConnected {
+                topic: "tx_receipts".into(),
+                detail: "aeron offer failed: NOT_CONNECTED (-1)".into(),
+            });
+        }
+        self.log.lock().unwrap().push(msg);
+        Ok(())
+    }
+
+    fn reopen(&mut self) -> Result<(), ExecutorError> {
+        *self.reopens.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    fn subscribers_listed(&mut self) -> bool {
+        *self.attempts.lock().unwrap() >= self.listed_from_attempt
+    }
+}
+
+/// A tiny budget, so a test runs its whole escalation in under a second:
+/// the reopen after 100 ms, the exit after 500 ms.
+const TEST_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn one_receipt() -> crossbeam_channel::Receiver<ExecToCommit> {
+    feed_commits(vec![ExecToCommit::Receipt(receipt(0xAC, 0))])
+}
+
+// A publication that connects after its reopen delivers the receipt: the
+// escalation reopens once, and the retry carries the receipt across.
+#[test]
+fn commit_thread_reopens_an_unconnected_publication_once_and_delivers() {
+    let publication = UnconnectedPub::new(1, 0);
+    let (reopens, log) = (publication.reopens.clone(), publication.log.clone());
+    let h = CommitLoop::new(publication, one_receipt())
+        .escalating(Escalation::from_stall_budget(TEST_BUDGET))
+        .spawn();
+    h.join()
+        .expect("no panic")
+        .expect("delivered after the reopen");
+    assert_eq!(
+        *reopens.lock().unwrap(),
+        1,
+        "one reopen per unconnected period"
+    );
+    assert_eq!(log.lock().unwrap().len(), 1, "the receipt was not dropped");
+}
+
+// While no subscriber is listed, the clock does not run: no reopen, no
+// exit, however long the publication stays unconnected. Once a subscriber
+// is listed, the clock starts, and the reopen follows after one budget.
+#[test]
+fn commit_thread_escalates_only_while_a_subscriber_is_listed() {
+    // About 10 attempts of 50 ms pass unlisted: five budgets, which
+    // would have exited with a listed subscriber.
+    let publication = UnconnectedPub::new(1, 10);
+    let (reopens, attempts) = (publication.reopens.clone(), publication.attempts.clone());
+    let started = std::time::Instant::now();
+    let h = CommitLoop::new(publication, one_receipt())
+        .escalating(Escalation::from_stall_budget(TEST_BUDGET))
+        .spawn();
+    h.join()
+        .expect("no panic")
+        .expect("delivered after the reopen, with no exit");
+    assert_eq!(*reopens.lock().unwrap(), 1);
+    assert!(
+        *attempts.lock().unwrap() >= 12,
+        "the reopen waits one budget after the listing: {} attempts",
+        *attempts.lock().unwrap()
+    );
+    assert!(started.elapsed() >= TEST_BUDGET * 5);
+}
+
+// A publication that stays unconnected after its reopen ends the thread
+// with `PublicationDead` after the total budget, with one reopen only.
+#[test]
+fn commit_thread_exits_after_the_total_budget_without_a_subscriber() {
+    let publication = UnconnectedPub::new(u32::MAX, 0);
+    let reopens = publication.reopens.clone();
+    let started = std::time::Instant::now();
+    let h = CommitLoop::new(publication, one_receipt())
+        .escalating(Escalation::from_stall_budget(TEST_BUDGET))
+        .spawn();
+    let res = h.join().expect("no panic");
+    assert!(
+        matches!(
+            &res,
+            Err(ExecutorError::PublicationDead { topic, reopen_after_s: 0, .. }) if topic == "tx_receipts"
+        ),
+        "the thread must end with PublicationDead: {res:?}"
+    );
+    assert!(
+        started.elapsed() >= TEST_BUDGET * 5,
+        "the exit waits the whole budget"
+    );
+    assert_eq!(*reopens.lock().unwrap(), 1, "one reopen, then the exit");
 }

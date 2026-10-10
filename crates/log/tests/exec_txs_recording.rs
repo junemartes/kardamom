@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use kardamom_log::recorder::{
-    PositionReport, RecordedStream, RecorderKind, record_stream_reporting,
+    ARCHIVE_CONNECT_TIMEOUT, PositionReport, RecordedStream, RecorderKind, record_stream_reporting,
 };
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
 use rkyv::util::AlignedVec;
@@ -64,6 +64,7 @@ async fn the_recording_position_reaches_the_end_of_every_offered_frame() {
                     channel: CHANNEL,
                     stream_id: STREAM,
                     kind: RecorderKind::ExecTxs { session_id },
+                    connect_timeout: ARCHIVE_CONNECT_TIMEOUT,
                 },
                 &stop,
                 |outcome| ready_tx.send(outcome).expect("ready"),

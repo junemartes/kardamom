@@ -28,12 +28,14 @@ mod args;
 mod state;
 mod wiring;
 
+use std::process::ExitCode;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource, MdbxWriterQueue,
-    MdbxWriterSignal, NoTxHook, Outbound, RoleHooks,
+    MdbxWriterSignal, NoTxHook, Outbound, PUBLICATION_DEAD_EXIT_CODE, RoleHooks,
 };
 use kardamom_executor::ExecutorFileConfig;
 use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
@@ -398,7 +400,28 @@ enum Verdict {
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            exit_code(&e)
+        }
+    }
+}
+
+/// The exit code of a failed process. A publication that stayed
+/// unconnected past its budget exits with
+/// [`PUBLICATION_DEAD_EXIT_CODE`]; every other failure exits with 1. The
+/// supervisor restarts the process on both, and the code names the cause.
+fn exit_code(e: &anyhow::Error) -> ExitCode {
+    match e.downcast_ref::<ExecutorError>() {
+        Some(ExecutorError::PublicationDead { .. }) => ExitCode::from(PUBLICATION_DEAD_EXIT_CODE),
+        _ => ExitCode::FAILURE,
+    }
+}
+
+async fn run() -> Result<()> {
     let boot = Boot::init(Args::parse()).await?;
     // Each turn runs the whole pipeline once. A refused replay stages a
     // peer checkpoint and comes back here for the next turn, which
@@ -418,7 +441,9 @@ async fn main() -> Result<()> {
 async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<std::ops::ControlFlow<()>> {
     match Box::pin(run_once(boot)).await? {
         Verdict::Done => return Ok(std::ops::ControlFlow::Break(())),
-        Verdict::Failed(e) => anyhow::bail!("executor pipeline failed: {e}"),
+        Verdict::Failed(e) => {
+            return Err(anyhow::Error::new(e).context("executor pipeline failed"));
+        }
         Verdict::Revolve => (),
     }
     if boot.stop.is_cancelled() {
@@ -500,7 +525,10 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         _nonce_query: nonce_query,
     } = spawn_writer_and_bal(args, env, genesis.as_ref(), &rt_pub, &mut plane).await?;
 
-    let cfg = boot.engine_config(chain_id, genesis.as_ref(), start.is_resume());
+    let mut cfg = boot.engine_config(chain_id, genesis.as_ref(), start.is_resume());
+    // The must-deliver escalation of the commit thread follows the stall
+    // budget of the publication runtime.
+    cfg.stall_budget = rt_pub.stall_budget();
 
     let block_exec = wiring::build_block_exec(args);
 
@@ -669,5 +697,24 @@ mod tests {
         ));
         assert!(matches!(verdict(Some(refused()), None), Verdict::Failed(_)));
         assert!(matches!(verdict(None, None), Verdict::Done));
+    }
+
+    /// A dead publication exits with its own code, also behind a context;
+    /// every other failure exits with 1.
+    #[test]
+    fn a_dead_publication_has_its_own_exit_code() {
+        let dead = anyhow::Error::new(ExecutorError::PublicationDead {
+            topic: "tx_receipts".into(),
+            unconnected_s: 140,
+            reopen_after_s: 35,
+        })
+        .context("executor pipeline failed");
+        assert_eq!(exit_code(&dead), ExitCode::from(3));
+        let other = anyhow::Error::new(ExecutorError::TxOrderingClosed);
+        assert_eq!(exit_code(&other), ExitCode::FAILURE);
+        assert_eq!(
+            exit_code(&anyhow::anyhow!("bind failed")),
+            ExitCode::FAILURE
+        );
     }
 }

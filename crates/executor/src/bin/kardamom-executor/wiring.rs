@@ -10,8 +10,8 @@ use kardamom_engine::{
     MdbxWriterSignal, NoEpochCheck, NoRemoteEpochCheck, NoTxHook, TxReceiptsPublication,
 };
 use kardamom_executor::parallel::StmBlockExec;
-use kardamom_log::aeron_live::AeronRuntime;
-use kardamom_log::discovery::StreamPlane;
+use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
+use kardamom_log::discovery::{StreamPlane, TxReceiptsReopen};
 use kardamom_state::StateSnapshot;
 
 use crate::args::Args;
@@ -22,7 +22,7 @@ use crate::args::Args;
 /// plane picks the per-replica MDS endpoint (chosen by `--recorder-id`)
 /// or the shared channel from the static config. Either way, the commit
 /// thread's must-deliver retry drives the same `publish_receipt` and
-/// `publish_boundary` surface.
+/// `publish_boundary` surface, and the same reopen.
 pub(crate) async fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
     plane: &mut StreamPlane,
@@ -37,7 +37,14 @@ pub(crate) async fn open_tx_receipts_pub(
         session = handle.session_id(),
         "tx_receipts publication open"
     );
-    Ok(LiveTxReceiptsPub { handle })
+    Ok(LiveTxReceiptsPub {
+        handle,
+        reopen: plane
+            .tx_receipts_reopen(args.recorder_id)
+            .context("the tx_receipts reopen")?,
+        rt_pub: rt_pub.clone(),
+        tokio: tokio::runtime::Handle::current(),
+    })
 }
 
 /// Block-STM execution strategy (opt-in). The pool server starts at
@@ -104,11 +111,61 @@ impl EngineWiring for ExecutorWiring {
     type ExecStream = crossbeam_channel::Sender<kardamom_engine::ExecStreamItem>;
 }
 
+/// The live `tx_receipts` publication of this replica, with what a reopen
+/// needs: the plane's reopen recipe, the publication runtime, and the
+/// Tokio handle the catalog call runs on. The commit thread, a plain OS
+/// thread, blocks on that handle for the one call of a reopen.
 pub(crate) struct LiveTxReceiptsPub {
-    handle: kardamom_log::aeron_live::TxReceiptsPublisherHandle,
+    handle: TxReceiptsPublisherHandle,
+    reopen: TxReceiptsReopen,
+    rt_pub: AeronRuntime,
+    tokio: tokio::runtime::Handle,
+}
+
+impl LiveTxReceiptsPub {
+    /// The topic of the receipt stream, for the typed error.
+    const TOPIC: &'static str = "tx_receipts";
+
+    /// The engine error of one failed publish. A `NOT_CONNECTED` offer
+    /// gets the typed error the escalation clock runs on; every other
+    /// transport error stays a transient state error.
+    fn publish_error(op: &str, e: &kardamom_log::error::LogError) -> ExecutorError {
+        let detail = format!("{op}: {e}");
+        if detail.contains("NOT_CONNECTED") {
+            return ExecutorError::NotConnected {
+                topic: Self::TOPIC.into(),
+                detail,
+            };
+        }
+        ExecutorError::State(detail)
+    }
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {
+    fn subscribers_listed(&mut self) -> bool {
+        self.reopen.subscribers_listed()
+    }
+
+    /// Open the receipt stream again on a new session, move the discovery
+    /// record to it, and close the old publication. A failed close only
+    /// leaves the old session to the driver's own timeout.
+    fn reopen(&mut self) -> Result<(), ExecutorError> {
+        let opened = self
+            .tokio
+            .block_on(self.reopen.reopen(&self.rt_pub))
+            .map_err(|e| ExecutorError::State(format!("reopen tx_receipts: {e}")))?;
+        let old = self.handle.replace_receipts(opened);
+        tracing::warn!(
+            old_session = old.session_id(),
+            session = self.handle.session_id(),
+            "tx_receipts publication reopened on a new session"
+        );
+        if let Err(e) = old.close() {
+            tracing::warn!(error = %e, session = old.session_id(), "the old tx_receipts publication did not close");
+        }
+        Ok(())
+    }
+
     /// One `ReceiptBatch` wire frame per batch: one encode and one blocking
     /// ack round trip through the Aeron thread, instead of one per receipt.
     /// The per-tx account rows merge into the frame here, at the wire
@@ -127,10 +184,7 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
             .publish_receipts(&kardamom_types::ReceiptBatch::merge(items))
         {
             Ok(_) => (items.len(), None),
-            Err(e) => (
-                0,
-                Some(ExecutorError::State(format!("publish_receipts: {e}"))),
-            ),
+            Err(e) => (0, Some(Self::publish_error("publish_receipts", &e))),
         }
     }
 
@@ -140,7 +194,7 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
                 .handle
                 .publish_receipt(&r)
                 .map(|_| ())
-                .map_err(|e| ExecutorError::State(format!("publish_receipt: {e}"))),
+                .map_err(|e| Self::publish_error("publish_receipt", &e)),
             // Best-effort: a block-boundary marker. Ingress acks on the receipt
             // or durable watermark, not on this marker. Blocking the commit
             // thread here (for example, at startup before ingress's MDS

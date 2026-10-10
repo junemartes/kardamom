@@ -2,8 +2,9 @@
 //! whole-block strategies, and a metrics recorder that counts applied
 //! records.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 use kardamom_types::StateDatabase;
@@ -100,6 +101,53 @@ impl<D: StateDatabase> BlockExecStrategy<D> for SequentialBlockExec {
         _block_number: u64,
     ) -> Result<BlockExecOutput, ExecutorError> {
         crate::stateless::execute_block(snapshot, parent, records, env)
+    }
+}
+
+/// A metrics recorder that keeps every gauge, keyed by its name and its
+/// labels as `name{key=value,...}`, and drops every other metric.
+#[derive(Default)]
+pub(crate) struct GaugeRecorder {
+    gauges: Mutex<BTreeMap<String, Arc<AtomicU64>>>,
+}
+
+impl GaugeRecorder {
+    /// The value of the gauge `name` with `labels`, or `None` while no
+    /// write has reached it.
+    pub(crate) fn gauge(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        let rendered: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let key = format!("{name}{{{}}}", rendered.join(","));
+        self.gauges
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|g| f64::from_bits(g.load(Ordering::Relaxed)))
+    }
+}
+
+impl Recorder for GaugeRecorder {
+    fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+    fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+        Counter::noop()
+    }
+
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        let rendered: Vec<String> = key
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        let name = format!("{}{{{}}}", key.name(), rendered.join(","));
+        let cell = Arc::clone(self.gauges.lock().unwrap().entry(name).or_default());
+        Gauge::from_arc(cell)
+    }
+
+    fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+        Histogram::noop()
     }
 }
 

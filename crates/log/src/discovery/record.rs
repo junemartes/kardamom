@@ -13,6 +13,7 @@ pub const DISCOVERY_VERSION: &str = "1";
 
 /// Consul service names, frozen for the infrastructure integration.
 pub const PUBLISHER_SERVICE: &str = "kardamom-mdc-publisher";
+pub const SUBSCRIBER_SERVICE: &str = "kardamom-mdc-subscriber";
 pub const ARCHIVE_SERVICE: &str = "kardamom-aeron-archive";
 pub const CLUSTER_MEMBER_SERVICE: &str = "kardamom-cluster-member";
 
@@ -188,6 +189,48 @@ impl ServiceEntry {
             self.meta_parsed(key).map(Some)
         } else {
             Ok(None)
+        }
+    }
+}
+
+/// A discovered multi-destination subscription: the stream it takes, and
+/// the process that takes it. A publisher of the stream reads these
+/// records to tell a stream without a subscriber from a publication that
+/// no subscriber can reach. The record has no port: nothing connects to
+/// a subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberRecord {
+    pub id: ServiceId,
+    /// The advertised interface of the subscriber.
+    pub address: IpAddr,
+    pub topic: Topic,
+    pub stream_id: i32,
+    /// The physical transport lane of a `tx_data` subscription. `None`
+    /// on every other topic.
+    pub lane: Option<u8>,
+    /// A human label of the subscribing process, for logs.
+    pub subscriber_id: String,
+}
+
+impl SubscriberRecord {
+    /// The catalog entry this record registers as, under `scope`. The
+    /// filter keys are those of a publisher record of the same stream, so
+    /// one [`super::plane::StreamKey`] filter finds both.
+    #[must_use]
+    pub fn entry(&self, scope: &Scope) -> ServiceEntry {
+        let mut meta = scope.meta();
+        meta.insert("topic".into(), self.topic.as_str().into());
+        meta.insert("stream_id".into(), self.stream_id.to_string());
+        meta.insert("subscriber_id".into(), self.subscriber_id.clone());
+        if let Some(lane) = self.lane {
+            meta.insert("lane_id".into(), lane.to_string());
+        }
+        ServiceEntry {
+            id: self.id.clone(),
+            name: SUBSCRIBER_SERVICE.into(),
+            address: self.address,
+            port: 0,
+            meta,
         }
     }
 }

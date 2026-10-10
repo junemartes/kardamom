@@ -4,6 +4,7 @@
 
 use kardamom_types::{BlockFees, FeeSchedule};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use kardamom_types::BlockBoundary;
 
@@ -120,7 +121,17 @@ pub struct ExecutorConfig {
     /// The chain's fee schedule, from the genesis `[fees]` section. `None`
     /// runs no schedule: a zero base fee, and every tip burns.
     pub fees: Option<FeeSchedule>,
+    /// The wait after which a silent Aeron party counts as gone: the
+    /// driver timeout of the client plus a margin
+    /// (`AeronRuntime::stall_budget`). The must-deliver escalation of the
+    /// commit thread derives its thresholds from it. The default is the
+    /// floor of that budget.
+    pub stall_budget: Duration,
 }
+
+/// Default [`ExecutorConfig::stall_budget`]: the floor of the Aeron
+/// stall budget.
+const DEFAULT_STALL_BUDGET: Duration = Duration::from_secs(10);
 
 /// Default [`ExecutorConfig::chain_id`]: chain id 1.
 const DEFAULT_CHAIN_ID: NonZeroU64 = NonZeroU64::new(1).expect("1 is nonzero");
@@ -135,6 +146,7 @@ impl Default for ExecutorConfig {
             receipt_queue_depth: DEFAULT_RECEIPT_QUEUE_DEPTH,
             reader: ReaderConfig::default(),
             fees: None,
+            stall_budget: DEFAULT_STALL_BUDGET,
         }
     }
 }

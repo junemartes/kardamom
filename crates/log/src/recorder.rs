@@ -87,8 +87,11 @@ pub fn connect_archive(
     aeron_dir: Option<&Path>,
     cfg: &AeronConfig,
 ) -> Result<ArchiveSession, LogError> {
-    connect_archive_with_timeout(aeron_dir, cfg, Duration::from_secs(30))
+    connect_archive_with_timeout(aeron_dir, cfg, ARCHIVE_CONNECT_TIMEOUT)
 }
+
+/// The connect timeout of a boot-time archive session.
+pub const ARCHIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`connect_archive`] with a caller-chosen connect timeout. The recorder's
 /// boot-time connect keeps the generous 30 second default. Inline callers
@@ -214,6 +217,8 @@ pub struct RecordedStream<'a> {
     pub channel: &'a str,
     pub stream_id: i32,
     pub kind: RecorderKind,
+    /// How long the archive control session may take to connect.
+    pub connect_timeout: Duration,
 }
 
 /// Body of a dedicated stream-recorder thread. This is the recorder-thread
@@ -266,6 +271,7 @@ pub fn record_stream_until_stopped(
         channel,
         stream_id,
         kind,
+        connect_timeout: ARCHIVE_CONNECT_TIMEOUT,
     };
     if Recorder::start_reporting(aeron_dir, aeron_cfg, stream, stop, ready)?.is_some() {
         // Hold the recording (and its archive session) alive until shutdown.
@@ -459,17 +465,19 @@ impl Recorder {
         stop: &CancellationToken,
         ready: impl FnOnce(Result<i64, String>),
     ) -> Result<Option<(Self, DriverBudget)>, LogError> {
-        let session = match connect_archive(aeron_dir, aeron_cfg) {
-            Ok(s) => s,
-            Err(e) => {
-                ready(Err(format!("connect archive: {e}")));
-                return Err(e);
-            }
-        };
+        let session =
+            match connect_archive_with_timeout(aeron_dir, aeron_cfg, stream.connect_timeout) {
+                Ok(s) => s,
+                Err(e) => {
+                    ready(Err(format!("connect archive: {e}")));
+                    return Err(e);
+                }
+            };
         let RecordedStream {
             channel,
             stream_id,
             kind,
+            connect_timeout: _,
         } = stream;
         let budget = session.driver_budget;
         match Recorder::start_stream(session.archive, channel, stream_id, kind, stop) {
