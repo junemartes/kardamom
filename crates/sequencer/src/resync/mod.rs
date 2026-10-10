@@ -753,7 +753,8 @@ impl ResyncController {
 /// One terminal refusal from the sealer: the ref of `sender` at `nonce`
 /// is not ordered, and `reason` is what the client is told. The past
 /// deadline, the DA lag and the record lag share this path, because the
-/// remedy is the same: drop the ledger entry and tell the client, who resubmits.
+/// remedy is the same: drop the ledger entry, free the nonce, and tell the
+/// client, who resubmits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealerRefusal {
     pub sender: Address,

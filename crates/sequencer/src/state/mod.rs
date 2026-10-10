@@ -6,7 +6,8 @@
 //! surface. Every nontrivial test in this crate exercises it directly.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
@@ -40,6 +41,10 @@ pub(crate) enum NonceOutcome<T> {
     BufferedReplaced,
     BufferedDisabled,
     Past,
+    /// A nonce below the floor that the sealer refused for good: it is
+    /// offered again, and the floor stays. See
+    /// [`PartitionState::mark_refused`].
+    Reoffered,
 }
 
 #[derive(Debug)]
@@ -58,6 +63,16 @@ struct ParkedDeadline {
     nonce: u64,
 }
 
+/// The nonce the sealer expects of a sender, which this replica holds no
+/// ref for, and the later refs of the sender that the publish ledger gave
+/// back, as `(nonce, payload)`. The input of [`PartitionState::free_nonce`].
+#[derive(Debug)]
+pub(crate) struct FreedNonce<T> {
+    pub(crate) sender: Address,
+    pub(crate) nonce: u64,
+    pub(crate) later: Vec<(u64, T)>,
+}
+
 #[derive(Debug)]
 pub(crate) struct PartitionState<T> {
     max_pending_per_sender: usize,
@@ -70,6 +85,10 @@ pub(crate) struct PartitionState<T> {
     /// slot before it expires anything. So a replace, a rebuffer, a
     /// drain, or a floor drop needs no heap surgery.
     deadlines: BinaryHeap<Reverse<ParkedDeadline>>,
+    /// The nonces below the floor that the sealer refused for good. A
+    /// submit at such a nonce is offered again instead of reported as a
+    /// past nonce. See [`Self::mark_refused`].
+    refused: HashMap<Address, BTreeSet<u64>>,
 }
 
 impl<T> PartitionState<T> {
@@ -81,6 +100,7 @@ impl<T> PartitionState<T> {
             next: HashMap::new(),
             pending: HashMap::new(),
             deadlines: BinaryHeap::new(),
+            refused: HashMap::new(),
         }
     }
 
@@ -136,6 +156,12 @@ impl<T> PartitionState<T> {
         payload: T,
     ) -> ProcessResult<T> {
         let expected = self.next_nonce(sender);
+        if nonce < expected && self.is_refused(sender, nonce) {
+            return ProcessResult {
+                actions: vec![ProcessAction::Publish { nonce, payload }],
+                outcome: NonceOutcome::Reoffered,
+            };
+        }
         if nonce < expected {
             return ProcessResult {
                 actions: vec![ProcessAction::ReportDuplicate {
@@ -252,16 +278,7 @@ impl<T> PartitionState<T> {
     /// every ref of the first batch below it: never drained, never
     /// expired, and every fresh submit at those nonces dropped as past.
     pub(crate) fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
-        // Rewind expected nonce so the retry treats it as a Match. A
-        // cold sender seeds at `nonce`, not at 0.
-        let floor = self
-            .next_nonce_known(sender)
-            .map_or(nonce, |next| next.min(nonce));
-        self.next.insert(sender, floor);
-        let buf = self
-            .pending
-            .entry(sender)
-            .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
+        let buf = self.rewind_floor(sender, nonce);
         // This insert is unbounded. A capacity-enforcing insert here could
         // evict the lowest rebuffered nonce when the buffer is still full.
         // For example: a full future run, drained by `process`, plus the
@@ -270,7 +287,111 @@ impl<T> PartitionState<T> {
         // floor already rewound below it: a permanent per-sender gap. This
         // buffer accounted for the rebuffered items moments ago. Capacity
         // applies only to fresh ingress.
-        buf.reinsert(nonce, payload);
+        buf.reinsert(nonce, payload, None);
+    }
+
+    /// Lower the floor of `sender` to `nonce`, so the retry or the
+    /// resubmit at `nonce` matches, and return the sender's buffer. The
+    /// rewind only lowers the floor. A cold sender seeds at `nonce`, not
+    /// at 0.
+    fn rewind_floor(&mut self, sender: Address, nonce: u64) -> &mut PendingBuffer<T> {
+        let floor = self
+            .next_nonce_known(sender)
+            .map_or(nonce, |next| next.min(nonce));
+        self.next.insert(sender, floor);
+        self.pending
+            .entry(sender)
+            .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender))
+    }
+
+    /// The sealer expects `freed.nonce` of the sender, and this replica
+    /// holds no ref at that nonce. The floor goes back to it, so a
+    /// resubmit matches. The later refs park above the floor and drain
+    /// behind the resubmit. They wait on a gap that only the client can
+    /// fill, so each one gets a deadline of `now + tx_ttl`. The insert is
+    /// unbounded for the reason in [`Self::reinsert_for_retry`].
+    pub(crate) fn free_nonce(&mut self, now: Instant, freed: FreedNonce<T>) {
+        let FreedNonce {
+            sender,
+            nonce,
+            later,
+        } = freed;
+        self.trim_refused(sender, |n| n < nonce);
+        let at = now + self.tx_ttl;
+        let buf = self.rewind_floor(sender, nonce);
+        let parked: Vec<_> = later
+            .into_iter()
+            .map(|(n, payload)| {
+                buf.reinsert(n, payload, Some(at));
+                Reverse(ParkedDeadline {
+                    at,
+                    sender,
+                    nonce: n,
+                })
+            })
+            .collect();
+        self.deadlines.extend(parked);
+    }
+
+    /// The sealer refused the ref of `sender` at `nonce` for good. A
+    /// refusal alone does not move the floor: the sealer also refuses a
+    /// late copy of a ref it ordered long ago. A nonce below the floor is
+    /// marked instead. A resubmit at a marked nonce is offered again, and
+    /// the sealer decides: it orders the resubmit if it did not order the
+    /// nonce, and rejects it as a past nonce if it did.
+    pub(crate) fn mark_refused(&mut self, sender: Address, nonce: u64) {
+        if nonce < self.next_nonce(sender) {
+            self.refused.entry(sender).or_default().insert(nonce);
+        }
+    }
+
+    /// Whether the sealer refused `nonce` of `sender`, and no ref at that
+    /// nonce has published since.
+    #[must_use]
+    pub(crate) fn is_refused(&self, sender: Address, nonce: u64) -> bool {
+        self.refused
+            .get(&sender)
+            .is_some_and(|marks| marks.contains(&nonce))
+    }
+
+    /// A ref of `sender` at `nonce` published: its mark ends.
+    pub(crate) fn clear_refused(&mut self, sender: Address, nonce: u64) {
+        self.trim_refused(sender, |n| n != nonce);
+    }
+
+    /// Keep the refused marks of `sender` for which `keep` holds. The
+    /// empty map is the steady state, and the publish path calls this for
+    /// every ref, so an empty map returns before the sender lookup.
+    fn trim_refused<F: Fn(u64) -> bool>(&mut self, sender: Address, keep: F) {
+        if self.refused.is_empty() {
+            return;
+        }
+        let Entry::Occupied(mut marks) = self.refused.entry(sender) else {
+            return;
+        };
+        marks.get_mut().retain(|n| keep(*n));
+        if marks.get().is_empty() {
+            marks.remove();
+        }
+    }
+
+    /// Whether the buffer of `sender` holds a ref at `nonce`.
+    #[must_use]
+    pub(crate) fn holds(&self, sender: Address, nonce: u64) -> bool {
+        self.pending
+            .get(&sender)
+            .is_some_and(|buf| buf.contains(nonce))
+    }
+
+    /// Remove and return the parked ref of `sender` at `nonce` when
+    /// `named` holds for it. See [`PendingBuffer::take_parked`].
+    pub(crate) fn take_parked<F: Fn(&T) -> bool>(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        named: F,
+    ) -> Option<T> {
+        self.pending.get_mut(&sender)?.take_parked(nonce, named)
     }
 
     /// Expire the parked entries whose deadline is at or before `now`.
@@ -409,6 +530,7 @@ impl<T> PartitionState<T> {
             .get_mut(&sender)
             .map_or(0, |b| b.drop_below(floor));
         self.next.insert(sender, floor);
+        self.trim_refused(sender, |n| n >= floor);
         Some((cur, dropped))
     }
 

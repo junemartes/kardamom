@@ -18,6 +18,11 @@ use crate::settlement::IKardamomL2Settlement;
 /// confirmed L1 post. `next_index` and `next_block` seed the cluster replay
 /// request. `last_batch_index` ties the position to the contract's CAS
 /// counter.
+///
+/// The file is serde JSON. The reader ignores a field it does not know,
+/// so an older release reads the cursor of a newer one. A new field gets
+/// `#[serde(default)]`, so a newer release reads the cursor of an older
+/// one. The three fields here are required.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchCursor {
     pub next_index: u64,

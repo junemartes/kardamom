@@ -262,6 +262,16 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - A lost epoch delays deposits by one round trip, or by one re-publish period. The sealer never seals over it.
   - The first epoch at genesis, or after a seed with origin 0, can start at any L1 block. After a seed with origin `M`, the next epoch is `M + 1`.
   - Proof: the in-process test `OriginGapClusterTest`, with `a_republish_from_the_boundary_origin_refills_a_lost_epoch_in_either_order`.
+- **Ingress frame of an unknown kind**
+  - Trigger: a client of a newer release sends an ingress kind that this release does not define.
+  - Effect: every member drops the frame, counts it, and orders nothing. The drop is a decision of the replicated state machine, so the members stay equal. It logs `cluster DROPPED unknown-kind kind=.. memberId=.. totalDropped=..` at powers of two.
+  - Rule: a new kind that changes the replicated state is sent only after every member runs a release that reads it. Until then a mixed fleet drops it alike.
+  - Proof: the in-JVM test `SealerUnknownKindClusterTest`. Every member counts one drop, the record after the frame takes index 0, and the snapshot bytes of the members are equal.
+- **Snapshot of a newer release on disk**
+  - Trigger: a release writes a snapshot version that the previous release does not read, and the deploy rolls back.
+  - Effect: the rolled-back member cannot restore its newest snapshot and stops at start.
+  - Prevention: the writer stays one version behind the reader (`SNAPSHOT_WRITE_VERSION`, `SNAPSHOT_READ_VERSION`). `GET /status` reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax` and `snapshotLatest`, the version of the newest snapshot the member restored or took. A deploy preflight reads `snapshotLatest` on every member and refuses a target whose `reads_max` is below it.
+  - Proof: the in-JVM tests `SealerSnapshotVersionTest`, `MemberStatusTest` and `FormatRegistryTest`.
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
@@ -394,7 +404,8 @@ The executors are deterministic state machines. One dead or lagging replica neve
     - All of this runs in the same process. The cost is one fetch and one restore. It burns no restart attempt of the orchestrator.
     - `kardamom_executor_resync_total` counts these repairs by outcome.
   - If no peer offers a checkpoint at or above the floor, the node stays down and says so. The remaining paths are an operator-restored checkpoint or the rebuild from L1 (`kardamom-reconstruct`).
-  - Proof: `replay-window-resync`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
+  - A checkpoint of another state schema is skipped. The manifest states `schema_version`, and the peer sends it as `x-checkpoint-schema`. The adopter refuses the image before the copy, logs `checkpoint holds a state schema this release does not read; skipping it`, counts `kardamom_checkpoint_unreadable_schema_skips_total`, and takes the next checkpoint or the next peer. So an executor or a validator of the previous release does not adopt a checkpoint of a release with a newer schema. A manifest without the key passes, and the image says its schema when it opens.
+  - Proof: `replay-window-resync`; the unit tests `restore_skips_a_checkpoint_of_another_schema` and `a_peer_image_of_another_schema_is_skipped`. The `retention-overrun` case (`chaos-retention` shard) freezes one executor past a small retention. The shard deploys that retention. The executor must adopt a peer checkpoint.
 - **Dead `tx_receipts` publication**
   - Trigger: the must-deliver `tx_receipts` publication of an executor has no connected subscriber. Every publish fails with `NOT_CONNECTED`. The causes seen: a restored executor job whose new control port every ingress attached, and a media driver that crashed and restarted under the executor.
   - Effect: the commit thread holds the receipt and retries, so the exec thread blocks and the executor stops at one block. Without a bound, one dead publication held an executor for minutes. `kardamom_publication_connected{topic="tx_receipts"}` reads 0, and `kardamom_publication_not_connected_seconds` grows.
@@ -486,7 +497,8 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - Per-sender nonce order stays (per-session order and identical per-replica streams).
   - Proof: `crates/sequencer/tests/replicated_shard_racing.rs`.
 - **Late re-offer past the inclusion deadline**
-  - The ingress stamps every transaction with an inclusion deadline: the newest boundary plus the inclusion horizon (default 64 blocks). With no boundary seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The ingress stamps every transaction with an inclusion deadline: the newest sealed block plus the inclusion horizon (default 64 blocks). With no block seen, it stamps `NO_DEADLINE` (`i64::MAX`).
+  - The newest sealed block is the higher of two values: the newest executor boundary, and the sealed head in the status of the sealer. The sealer sends its status on every boundary tick. So the deadline moves while every executor is down, and an executor outage does not age new transactions past their deadline.
   - The sealer dedup window prunes by deadline, not by count. It drops the ids whose deadline is below the open block. It never evicts an id.
   - The sealer refuses a re-offer whose deadline has passed (`PAST_DEADLINE`). A refused re-offer cannot enter as a fresh transaction.
   - A full window (`kardamom.cluster.dedupCapacity`, default `1 << 17`) is a hard back-pressure cap. The sealer answers `WINDOW_FULL`.
@@ -495,6 +507,16 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - The sealer prints `cluster PAST-DEADLINE ...` and `cluster WINDOW-FULL ...` at power-of-two counts. No Prometheus counter exists for them.
   - The horizon must be equal on the ingress (`--inclusion-horizon-blocks`, env `KARDAMOM_INCLUSION_HORIZON_BLOCKS`) and on every sealer member (`-Dkardamom.cluster.inclusionHorizonBlocks`). The contract check (`just check-contract`, `just validate` and CI) fails if they differ.
   - Details of the sealer window: [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+- **A refused nonce stays free**
+  - The sealer refuses a ref past its deadline, on a DA lag, or on a record lag before its contiguity guard. Its expected nonce for the sender stays at the refused nonce. Every later nonce of the sender gets `CONTIGUITY-REJECT` until a ref at the refused nonce is ordered.
+  - The sealer also refuses a late copy of a ref that it ordered long ago: the window drops the id when its deadline passes. A confirm sweep with no receipts (all executors down) sends such copies. So a refusal alone does not move the floor of the sequencer.
+  - On a refusal, the sequencer takes the ref out of its publish ledger (or out of its buffer, if it parked there), so it never republishes. The client gets the refusal. If the nonce is below the floor, the sequencer marks it.
+  - Only the copy that the refusal names leaves. A past-deadline refusal names the deadline of the refused copy, so a resubmit that replaced a parked copy survives a late refusal of the old copy. A ref that waits in the buffer for the publisher (back-pressure or a confirm sweep) stays. It republishes, the sealer refuses that copy again, and that refusal finds it in the ledger.
+  - A resubmit at a marked nonce is offered again, and the floor stays. The sealer decides: it orders the resubmit if it did not order the nonce, and it rejects it as a past nonce if it did. A mark ends when a ref at the nonce publishes, or when a receipt floor passes it.
+  - The floor moves back only on a contiguity reject that names an expected nonce `E` at which the sequencer holds no ref. Then the floor goes back to `E`, and the later refs of the sender leave the ledger and park above it. The resubmit of `E` publishes, and the parked refs drain behind it. A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
+  - If the sequencer holds the ref at `E`, the offer vanished, and the sequencer republishes from `E` as before.
+  - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
@@ -679,6 +701,7 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 1. **The spool.**
    - It holds every block that the batcher consumed and did not post yet. It is on the disk of the batcher.
    - A restart continues the pending group from it.
+   - The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. It drops every other entry of the spool root, a spool whose block file does not decode, and a spool that does not continue the confirmed cursor. Each drop logs a warning and counts `kardamom_batcher_spool_dropped_total{reason}` (`other-version`, `unreadable`, `discontinuous`). The next source serves the dropped range. A spool never stops the batcher, so a rollback and a roll forward both start.
 2. **The sealer replay** from the cursor. The sealer keeps every frame above the posted head, and the batcher publishes its cursor as that head.
 3. **A rebuild from what the nodes already keep.**
    - The state DB of every executor and of the validator holds the ordering. The `headers` table maps a block to its canonical end and its L1 origin. The `receipts` table holds one row per canonical position with the hash of the transaction.
@@ -1021,6 +1044,7 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - The watcher stays up and publishes nothing.
 - It reads the file again after an operator clears the halt.
 - It never guesses a start.
+- The reader takes the block number and the hash, and ignores any field after the hash. A later release can add a field at the tail, and a rollback still reads the file. A line with fewer than two fields, or a field that does not parse, is the halt.
 
 **The pause on the follower.** The da-watcher subscribes to the `events` stream. It is paused with the follower as its root (`kardamom_paused{root_service="l1-indexer"}`) in three cases, and resumes by itself:
 

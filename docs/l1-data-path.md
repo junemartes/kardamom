@@ -59,7 +59,7 @@ The live batcher is a cluster-egress consumer. It starts with `--live`. It needs
 | `--da-proxy` | `KARDAMOM_DA_PROXY` | none | URL of the EigenDA proxy. |
 | `--l1-retries` | — | `5` | Retries for each L1 post. When all fail, the batcher halts with `l1_unreachable`. |
 | `--cursor-file` | `KARDAMOM_BATCHER_CURSOR` | none | Durable cursor: the ordering position of the last confirmed post. Live mode needs it. |
-| `--spool-dir` | `KARDAMOM_BATCHER_SPOOL` | `spool` beside the cursor file | Directory of consumed blocks that are not yet posted. |
+| `--spool-dir` | `KARDAMOM_BATCHER_SPOOL` | `spool` beside the cursor file | Root of the spool: the consumed blocks that are not yet posted. The block files of layout version N live in `v<N>` under it. |
 | `--indexer-url` | `KARDAMOM_INDEXER_URL` | none | API of the L1 follower (the inbox indexer). |
 | `--da-lag-budget-blocks` | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | `10000` | The sealer's DA-lag budget. A group is due at half of it. `0` matches a sealer with the guard off. |
 | `--l1-silence-secs` | — | `1152` | Seconds with no `l1_blocks` record before the batcher pauses with the follower as its root. |
