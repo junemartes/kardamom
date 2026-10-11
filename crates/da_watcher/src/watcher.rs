@@ -32,6 +32,7 @@ use crate::publisher::EpochPublisher;
 use crate::window::Window;
 
 mod follow;
+mod history;
 mod records;
 mod resume;
 mod upstream;
@@ -406,7 +407,7 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
                 ControlFlow::Break(())
             }
             () = halt::cleared(), if held => {
-                self.release();
+                self.on_halt_cleared();
                 ControlFlow::Continue(())
             }
             origin = self.confirmation.changed() => {
@@ -450,11 +451,12 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
         ::metrics::gauge!(metrics::L1_FINALIZED).set(number as f64);
     }
 
-    /// The operator cleared the halt: read the records after the head
-    /// again.
-    fn release(&mut self) {
+    /// The operator cleared the halt: forget the records seen before the
+    /// head, and read the records after it again.
+    pub fn on_halt_cleared(&mut self) {
         info!(target: "da_watcher", "the operator cleared the halt; reading l1_blocks again");
         self.held = false;
+        self.forget_seen();
         if let Some(head) = self.cursor() {
             self.want(head.saturating_add(1));
         }
@@ -554,6 +556,7 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
             self.upstream.saw_record();
             Self::mark_finalized(newest);
         }
+        let history = self.linked(history);
         let live = std::mem::take(&mut self.inbox);
         self.inbox = history.into_iter().chain(live).collect();
     }

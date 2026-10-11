@@ -182,16 +182,29 @@ pub fn counter_rows_unverified(n: usize) {
     metrics::counter!(ROWS_UNVERIFIED_TOTAL).increment(n as u64);
 }
 
-pub fn counter_epoch_verified() {
-    metrics::counter!(EPOCHS_VERIFIED_TOTAL).increment(1);
+pub fn counter_epoch_verified(n: u64) {
+    metrics::counter!(EPOCHS_VERIFIED_TOTAL).increment(n);
 }
 
 pub fn counter_epoch_fault() {
     metrics::counter!(EPOCH_FAULTS_TOTAL).increment(1);
 }
 
-pub fn counter_epoch_unverified() {
-    metrics::counter!(EPOCHS_UNVERIFIED_TOTAL).increment(1);
+pub fn counter_epoch_unverified(n: u64) {
+    metrics::counter!(EPOCHS_UNVERIFIED_TOTAL).increment(n);
+}
+
+/// The newest finalized L1 block as the validator's own L1 view reports
+/// it: the reference of the follower-lag alert.
+pub const L1_FINALIZED: &str = "validator_l1_finalized_block_number";
+
+/// Export the validator's own finalized L1 tip.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric value; never nears 2^52 for an L1 block number"
+)]
+pub fn gauge_l1_finalized(number: u64) {
+    metrics::gauge!(L1_FINALIZED).set(number as f64);
 }
 
 pub fn counter_remote_epoch_verified() {

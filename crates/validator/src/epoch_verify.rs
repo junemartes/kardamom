@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
+use kardamom_da_watcher::L1Header;
 use kardamom_engine::{EpochObserver, ExecutorError};
 use kardamom_types::EpochRecord;
 use kardamom_types::epoch::derive_epoch;
@@ -39,8 +40,12 @@ use crate::metrics;
 /// fake.
 #[async_trait::async_trait]
 pub trait L1EpochSource: Send + Sync + 'static {
+    /// The newest finalized L1 block number.
+    async fn finalized_block_number(&self) -> anyhow::Result<u64>;
     /// `(hash, parent_hash)` of L1 block `number`, from one round trip.
     async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)>;
+    /// The headers of the blocks `from..=to`, in order, from one batch.
+    async fn headers(&self, from: u64, to: u64) -> anyhow::Result<Vec<L1Header>>;
     /// Both lockbox event kinds, from one query, the same call the producer
     /// makes. Reading fewer kinds than the watcher writes would report every
     /// upgrade as a fabricated deposit.
@@ -59,8 +64,20 @@ impl<T> L1EpochSource for T
 where
     T: kardamom_da_watcher::L1Source,
 {
+    async fn finalized_block_number(&self) -> anyhow::Result<u64> {
+        kardamom_da_watcher::L1Source::finalized_block_number(self)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
         kardamom_da_watcher::L1Source::block_ids(self, number)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn headers(&self, from: u64, to: u64) -> anyhow::Result<Vec<L1Header>> {
+        kardamom_da_watcher::L1Source::headers(self, from, to)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -265,16 +282,18 @@ impl EpochVerifier {
     }
 
     /// Add the L1 content check. Its task runs on `rt`, owns the L1 reads,
-    /// and reads L1 through `source`. The exec thread only queues epochs.
+    /// and reads L1 through `sources`. The exec thread only queues epochs.
+    /// A second task reads the anchor's finalized tip every
+    /// [`TIP_EVERY`], the validator's own view of L1 finality.
     #[must_use]
     pub fn with_content_check<S: L1EpochSource>(
         self,
-        source: Arc<S>,
-        lockbox: Address,
+        sources: ContentSources<S>,
         rt: &tokio::runtime::Handle,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel::<EpochRecord>(EPOCH_QUEUE_CAP);
-        rt.spawn(Verifier::new(source, lockbox, self.divergence.clone(), rx).run());
+        rt.spawn(step::watch_tip(sources.anchor.clone()));
+        rt.spawn(Verifier::new(sources, self.divergence.clone(), rx).run());
         Self {
             content: Some(ContentQueue(tx)),
             ..self
@@ -293,7 +312,7 @@ impl ContentQueue {
         match self.0.try_send(epoch.clone()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                metrics::counter_epoch_unverified();
+                metrics::counter_epoch_unverified(1);
                 tracing::warn!(
                     l1_number = epoch.l1_number,
                     "epoch verifier queue full; epoch not content-checked"
@@ -304,205 +323,6 @@ impl ContentQueue {
             }
         }
     }
-}
-
-/// Outcome of a full retry sequence for one epoch's content check.
-enum VerifyVerdict {
-    /// The epoch verified; carries the new anchor.
-    Verified(Anchor),
-    /// A chain fault: the epoch is provably wrong.
-    Fault(EpochFault),
-    /// L1 stayed unreachable through every retry. Not a chain fault: an
-    /// RPC outage must not read as a divergence.
-    Unverified,
-}
-
-/// The content-check task's state: the epoch queue from the exec thread,
-/// the L1 source, the lockbox, the divergence sink, and the anchor carried
-/// forward across epochs.
-struct Verifier<S: L1EpochSource> {
-    rx: tokio::sync::mpsc::Receiver<EpochRecord>,
-    source: Arc<S>,
-    lockbox: Address,
-    divergence: Arc<Divergence>,
-    anchor: Option<Anchor>,
-}
-
-impl<S: L1EpochSource> Verifier<S> {
-    fn new(
-        source: Arc<S>,
-        lockbox: Address,
-        divergence: Arc<Divergence>,
-        rx: tokio::sync::mpsc::Receiver<EpochRecord>,
-    ) -> Self {
-        Self {
-            rx,
-            source,
-            lockbox,
-            divergence,
-            anchor: None,
-        }
-    }
-
-    /// Verify each queued epoch until the exec side drops its sender.
-    async fn run(mut self) {
-        while let Some(epoch) = self.rx.recv().await {
-            let verdict = self.verify_with_retry(&epoch).await;
-            self.record_verdict(verdict);
-        }
-    }
-
-    /// Verify `epoch`'s content against L1, retrying a transient L1
-    /// failure up to [`VERIFY_ATTEMPTS`] times. Retrying, rather than
-    /// giving up after one try, absorbs the normal case where this
-    /// validator's L1 view lags the producer's by a block or two, and
-    /// avoids silently dropping verification coverage for the epoch,
-    /// which is exactly where a forgery would hide.
-    async fn verify_with_retry(&self, epoch: &EpochRecord) -> VerifyVerdict {
-        let mut attempt = 0u32;
-        loop {
-            // Bounded: the loop breaks once `attempt >= VERIFY_ATTEMPTS`
-            // (a small constant), so this never approaches `u32::MAX`.
-            attempt += 1;
-            match self.verify_attempt(epoch, attempt).await {
-                std::ops::ControlFlow::Break(verdict) => return verdict,
-                std::ops::ControlFlow::Continue(()) => (),
-            }
-        }
-    }
-
-    /// One retry attempt: `Break` carries the final verdict, `Continue`
-    /// means the caller's loop should try again (after this attempt's
-    /// own retry-delay sleep, when a retry is warranted).
-    async fn verify_attempt(
-        &self,
-        epoch: &EpochRecord,
-        attempt: u32,
-    ) -> std::ops::ControlFlow<VerifyVerdict> {
-        match self.verify_one(epoch).await {
-            Ok(()) => std::ops::ControlFlow::Break(VerifyVerdict::Verified(Anchor {
-                number: epoch.l1_number,
-                hash: epoch.l1_hash,
-            })),
-            Err(VerifyOutcome::Fault(fault)) => {
-                std::ops::ControlFlow::Break(VerifyVerdict::Fault(fault))
-            }
-            Err(VerifyOutcome::Unavailable(e)) if attempt < VERIFY_ATTEMPTS => {
-                tracing::debug!(
-                    l1_number = epoch.l1_number,
-                    attempt,
-                    error = %e,
-                    "epoch verification retrying"
-                );
-                tokio::time::sleep(VERIFY_RETRY_DELAY).await;
-                std::ops::ControlFlow::Continue(())
-            }
-            Err(VerifyOutcome::Unavailable(e)) => {
-                std::ops::ControlFlow::Break(Self::give_up(epoch, attempt, &e))
-            }
-        }
-    }
-
-    /// Out of retries. If L1 simply does not have this block, the epoch
-    /// is anchored to something that never happened: rule 4, a fault.
-    /// Any other transport failure stays a coverage gap. A "not found"
-    /// error is a statement about the chain; any other error is about the
-    /// network.
-    fn give_up(epoch: &EpochRecord, attempt: u32, e: &anyhow::Error) -> VerifyVerdict {
-        if e.to_string().contains("not found") {
-            return VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
-                l1_number: epoch.l1_number,
-                attempts: attempt,
-            });
-        }
-        tracing::warn!(
-            l1_number = epoch.l1_number,
-            attempts = attempt,
-            error = %e,
-            "epoch verification gave up: L1 unavailable"
-        );
-        VerifyVerdict::Unverified
-    }
-
-    /// Apply one epoch's verdict: bump the metric, record a divergence on
-    /// a fault, and advance the anchor on success.
-    fn record_verdict(&mut self, verdict: VerifyVerdict) {
-        match verdict {
-            VerifyVerdict::Verified(new_anchor) => {
-                metrics::counter_epoch_verified();
-                self.anchor = Some(new_anchor);
-            }
-            VerifyVerdict::Fault(fault) => {
-                metrics::counter_epoch_fault();
-                self.divergence
-                    .record(format!("epoch verification failed: {fault}"));
-            }
-            VerifyVerdict::Unverified => {
-                metrics::counter_epoch_unverified();
-            }
-        }
-    }
-
-    /// One content check against L1: the block ids, the parent chain link
-    /// to the anchor, then the lockbox logs.
-    async fn verify_one(&self, epoch: &EpochRecord) -> Result<(), VerifyOutcome> {
-        let (hash, parent) = self
-            .source
-            .block_ids(epoch.l1_number)
-            .await
-            .map_err(VerifyOutcome::Unavailable)?;
-        // Chain the origins together. Verifying each block alone would let
-        // an L1 endpoint serve any hash it likes for any number. Requiring
-        // block N to descend from block N-1 forces it to fabricate a
-        // consistent chain instead. This check costs nothing, since the
-        // parent hash came back in the same header. It only checks the
-        // immediate predecessor, which the sequence rules already require.
-        if let Some(Anchor {
-            number: prev_number,
-            hash: prev_hash,
-        }) = self.anchor
-            // `prev_number` came from a verified epoch, but it is still an
-            // L1 wire value, not this process's own counter: check it
-            // rather than assume it is not already `u64::MAX`. `None` here
-            // (an impossible predecessor number) just skips the
-            // immediate-parent check; the sequence rules already reject
-            // any actual gap.
-            && prev_number.checked_add(1) == Some(epoch.l1_number)
-            && parent != prev_hash
-        {
-            return Err(VerifyOutcome::Fault(EpochFault::ParentMismatch {
-                l1_number: epoch.l1_number,
-                expected_parent: prev_hash,
-                got_parent: parent,
-            }));
-        }
-        let logs = self
-            .source
-            .lockbox_logs(self.lockbox, epoch.l1_number, epoch.l1_number)
-            .await
-            .map_err(VerifyOutcome::Unavailable)?;
-        compare_against_l1(epoch, hash, &logs).map_err(VerifyOutcome::Fault)
-    }
-}
-
-/// Depth of the queue from the exec thread to the verifier task. Epochs
-/// arrive at L1 block cadence, about 1 per 12 s. One content check takes
-/// at most `VERIFY_ATTEMPTS * VERIFY_RETRY_DELAY` (16 s). The queue drains
-/// faster than it fills, unless L1 is down for a long time. 64 entries hold
-/// about 13 minutes of epochs. After that, the exec thread drops the epoch
-/// (see [`ContentQueue::offer`]) and does not block on the outage.
-const EPOCH_QUEUE_CAP: usize = 64;
-
-/// How many times a content check is retried before a verdict. This spans a
-/// few L1 block times, so a normal lag between this validator's L1 view and
-/// the producer's resolves well inside it.
-const VERIFY_ATTEMPTS: u32 = 8;
-const VERIFY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Outcome of one content check, separating a chain fault from an L1 outage.
-enum VerifyOutcome {
-    Fault(EpochFault),
-    Unavailable(anyhow::Error),
 }
 
 impl EpochObserver for EpochVerifier {
@@ -527,6 +347,11 @@ impl EpochObserver for EpochVerifier {
         Ok(())
     }
 }
+
+mod step;
+
+pub use step::{ContentSources, TIP_EVERY};
+use step::{EPOCH_QUEUE_CAP, Verifier};
 
 #[cfg(test)]
 #[path = "epoch_verify_tests.rs"]

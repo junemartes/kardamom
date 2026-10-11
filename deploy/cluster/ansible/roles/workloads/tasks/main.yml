@@ -98,8 +98,16 @@
     - name: validator
       wait: false
       vars:
-        l1_rpc_url: "{{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0 else '' }}"
-        lockbox_address: "{{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0 else '' }}"
+        # The validator's own L1 view: the light client when one runs;
+        # behind the fault proxy, the in-cluster anvil itself, so the
+        # proxy's lies to the follower never reach the check.
+        l1_rpc_url: >-
+          {{ 'http://' ~ workloads_light_host ~ ':' ~ workloads_light_port if workloads_light_execution_rpc | length > 0
+             else workloads_anvil_service_rpc if workloads_l1_fault_proxy | bool else '' }}
+        lockbox_address: >-
+          {{ workloads_lockbox_address if workloads_light_execution_rpc | length > 0
+             else (workloads_lockbox_address | default(workloads_zero_address, true)) if workloads_l1_fault_proxy | bool
+             else '' }}
     # The watcher publishes the epochs the validator checks. It reads
     # them from the L1 follower's l1_blocks stream and has no L1 access;
     # it waits for the follower, deployed below, at its start.
