@@ -129,7 +129,7 @@ macro_rules! declare_channel_handles {
             }
 
             /// Wrap a subscription opened elsewhere, for example a
-            /// discovered multi-destination subscription.
+            /// discovered subscription.
             #[must_use]
             pub fn from_subscription(rx: TypedSubscription<$msg>) -> Self {
                 Self { rx }
@@ -211,7 +211,7 @@ macro_rules! declare_channel_handles {
             }
 
             /// Wrap a subscription opened elsewhere, for example a
-            /// discovered multi-destination subscription.
+            /// discovered subscription.
             #[must_use]
             pub fn from_subscription(rx: $rxty) -> Self {
                 Self { rx }

@@ -108,7 +108,7 @@ pub(super) enum RuntimeCmd {
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and sends
     /// each assembled fragment to `sink` as a [`RawFrame`]. Replies with
-    /// the assigned `sub_id` (needed to attach MDS destinations).
+    /// the assigned `sub_id` (needed to attach source endpoints).
     OpenSubscription {
         uri: String,
         stream_id: i32,
@@ -116,16 +116,17 @@ pub(super) enum RuntimeCmd {
         wait: AddWait,
         ack: CbSender<Result<u32, LogError>>,
     },
-    /// Attach a source endpoint to a multi-destination
-    /// (`control-mode=manual`) subscription. Used to aggregate
-    /// per-publisher streams, for example one ingress MDS subscription
-    /// pulling receipts from every executor replica.
+    /// Attach a source endpoint to a subscription: the Aeron thread opens
+    /// a subscription on the endpoint that feeds the sink of `sub_id`.
+    /// Used to aggregate per-publisher streams, for example one ingress
+    /// receipt stream from every executor replica.
     SubAddDestination {
         sub_id: u32,
         uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
-    /// Detach a previously-attached source endpoint from an MDS subscription.
+    /// Detach a source endpoint: its subscription closes once its image
+    /// goes, or after one stall budget.
     SubRemoveDestination {
         sub_id: u32,
         uri: String,
@@ -194,10 +195,10 @@ fn aeron_thread_main<F>(
 ) where
     F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
 {
-    let Some(aeron) = report.start(make_ctx) else {
+    let Some((aeron, budget)) = report.start(make_ctx) else {
         return;
     };
-    if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
+    if let Err(e) = run_aeron_thread(aeron, cmd_rx, budget.duration()) {
         error!(error = %e, "aeron runtime thread exited with error");
     }
 }
@@ -434,7 +435,7 @@ pub struct TxDataSubscription {
 
 impl TxDataSubscription {
     /// Wrap a raw frame stream opened elsewhere, for example a discovered
-    /// multi-destination subscription.
+    /// subscription.
     pub(crate) fn from_raw(rx: UnboundedReceiver<RawFrame>) -> Self {
         Self { rx }
     }
@@ -552,7 +553,7 @@ fn build_aeron(ctx: &rusteron_client::AeronContext) -> Result<Rc<AeronClient>, L
     Ok(Rc::new(aeron))
 }
 
-/// The attach and detach commands of one multi-destination subscription,
+/// The attach and detach commands of the source endpoints of one subscription,
 /// without ownership of the Aeron thread. See
 /// [`AeronRuntime::destinations`].
 #[derive(Clone)]

@@ -1,4 +1,4 @@
-//! The subscription side of [`AeronRuntime`]: the opens, the MDS
+//! The subscription side of [`AeronRuntime`]: the opens, the attached
 //! destinations, and the close.
 
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -13,8 +13,8 @@ use crate::error::LogError;
 
 impl AeronRuntime {
     /// Open a subscription, returning its raw undecoded fragment stream
-    /// (as [`RawFrame`]s) plus the assigned `sub_id` (used to attach MDS
-    /// destinations; most callers ignore it). Used by adapters that
+    /// (as [`RawFrame`]s) plus the assigned `sub_id` (used to attach source
+    /// endpoints; most callers ignore it). Used by adapters that
     /// decode or demultiplex fragments themselves, on the consumer side
     /// rather than on the Aeron thread — see [`FrameSink`].
     ///
@@ -115,9 +115,13 @@ impl AeronRuntime {
         Ok((sub_id, rx))
     }
 
-    /// Attach a source endpoint to a multi-destination subscription (one
-    /// opened `control-mode=manual`). Blocks until the driver confirms the
-    /// attach. Idempotent: re-adding an already-attached `uri` is a no-op.
+    /// Attach a source endpoint to the subscription `sub_id`. The endpoint
+    /// gets its own Aeron subscription, which feeds the frame stream of
+    /// `sub_id`. No Aeron multi-destination subscription is used: the
+    /// Java media driver fails the removal of some of its destinations.
+    /// The add waits the run-time add timeout, and a wait with no answer
+    /// cancels it. Idempotent: re-adding an already-attached `uri` is a
+    /// no-op.
     ///
     /// # Errors
     ///
@@ -133,7 +137,10 @@ impl AeronRuntime {
         )
     }
 
-    /// Detach a previously-attached source endpoint from an MDS subscription.
+    /// Detach a previously-attached source endpoint. Its own Aeron
+    /// subscription closes once its image goes, or after one stall
+    /// budget. An attach of the same `uri` before that keeps the open
+    /// subscription and its image.
     ///
     /// # Errors
     ///
@@ -222,10 +229,10 @@ impl AeronRuntime {
     }
 
     /// Like [`open_subscription`](Self::open_subscription), but also
-    /// returns the `sub_id`, so the caller can attach MDS source endpoints
-    /// with [`add_destination`](Self::add_destination). Open the
-    /// subscription on a `control-mode=manual` channel to make it
-    /// multi-destination.
+    /// returns the `sub_id`, so the caller can attach source endpoints
+    /// with [`add_destination`](Self::add_destination). A
+    /// `control-mode=manual` channel opens a subscription that receives
+    /// only through its attached endpoints.
     ///
     /// # Errors
     ///

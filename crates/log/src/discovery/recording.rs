@@ -5,9 +5,16 @@
 //! Each publisher becomes its own recording, keyed by its control
 //! endpoint and matched by its session id, so a lookup never adopts
 //! another publisher's recording, nor an earlier incarnation's on the
-//! same port. A publisher that leaves the catalog has its recording
-//! subscription stopped; the recording itself stays in the catalog, so
-//! refetch can still serve it.
+//! same port.
+//!
+//! A catalog change alone never ends a live recording. The archive ends a
+//! recording when the image of the publisher goes. A publisher that left
+//! the catalog for the removal grace has its recording subscription
+//! stopped only after that. A publisher that is listed again keeps the
+//! same recording. The publications of this process never leave: the
+//! process knows them, so a lapse of their own records in the catalog
+//! changes nothing. An ended recording stays in the catalog, so refetch
+//! can still serve it.
 //!
 //! Readiness is per instance: the thread reports ready once every one of
 //! this process's own publications (the ingress's lanes) has a live
@@ -68,6 +75,9 @@ struct Started {
     /// Whether this process registered the publisher.
     own: bool,
     absence: Absence,
+    /// Whether the publisher left the catalog for the full removal grace.
+    /// Never set for an own publication.
+    departed: bool,
 }
 
 pub struct DiscoveredRecorder {
@@ -92,6 +102,18 @@ struct Recording<A: RecorderArchive> {
     spec: DiscoveredRecorder,
     archive: A,
     started: BTreeMap<String, Started>,
+}
+
+/// How the recording of a publisher ended.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// The archive ended the recording at `stop_position`.
+    Ended {
+        recording_id: i64,
+        stop_position: i64,
+    },
+    /// A departed publisher has no live recording.
+    NoRecording,
 }
 
 /// What ended one wait.
@@ -143,9 +165,11 @@ impl<A: RecorderArchive> Recording<A> {
             return false;
         }
         let snapshot = self.spec.membership.borrow_and_update().clone();
+        let now = Instant::now();
         if snapshot.is_known() {
-            self.reconcile(&snapshot, Instant::now());
+            self.reconcile(&snapshot, now);
         }
+        self.follow_archive();
         self.resolve_pending();
         self.report(ready);
         true
@@ -166,8 +190,9 @@ impl<A: RecorderArchive> Recording<A> {
         })
     }
 
-    /// Start missing recordings and stop only publishers whose confirmed
-    /// absence lasts for the removal grace. An outage resets that proof.
+    /// Start missing recordings, and mark as departed only publishers
+    /// whose confirmed absence lasts for the removal grace. An outage
+    /// resets that proof. A departed publisher that is listed again stays.
     fn reconcile(&mut self, membership: &Membership, now: Instant) {
         if !matches!(membership.health, CatalogHealth::Fresh) {
             self.started.values_mut().for_each(|s| s.absence.clear());
@@ -183,19 +208,10 @@ impl<A: RecorderArchive> Recording<A> {
                 )
             })
             .collect();
-        let departed: Vec<String> = self
-            .started
-            .iter_mut()
-            .filter_map(|(uri, started)| {
-                started
-                    .absence
-                    .expired(desired.contains_key(uri), now, self.spec.removal_grace)
-                    .then(|| uri.clone())
-            })
-            .collect();
-        for uri in &departed {
-            self.stop_one(uri);
-        }
+        let grace = self.spec.removal_grace;
+        self.started.iter_mut().for_each(|(uri, started)| {
+            started.follow(uri, desired.contains_key(uri), now, grace);
+        });
         let new: Vec<(String, PublisherRecord)> = desired
             .into_iter()
             .filter(|(uri, _)| !self.started.contains_key(uri))
@@ -219,6 +235,42 @@ impl<A: RecorderArchive> Recording<A> {
             "discovered recorder: recording publisher"
         );
         self.started.insert(uri.to_string(), started);
+    }
+
+    /// Follow the recordings that the archive ended. A departed
+    /// publisher whose recording ended, or that has no live recording,
+    /// has its recording subscription stopped. A listed publisher whose
+    /// recording ended keeps its subscription: the archive starts a new
+    /// recording when a new image forms.
+    fn follow_archive(&mut self) {
+        let archive = &self.archive;
+        let ended: Vec<(String, Ending)> = self
+            .started
+            .iter()
+            .filter_map(|(uri, s)| s.ending(archive).map(|e| (uri.clone(), e)))
+            .collect();
+        for (uri, ending) in ended {
+            self.on_ending(&uri, ending);
+        }
+    }
+
+    /// Act on one [`Ending`] of the recording of `uri`.
+    fn on_ending(&mut self, uri: &str, ending: Ending) {
+        let Some(started) = self.started.get_mut(uri) else {
+            return;
+        };
+        if started.departed {
+            self.stop_one(uri);
+            return;
+        }
+        if let Ending::Ended {
+            recording_id,
+            stop_position,
+        } = ending
+        {
+            warn!(%uri, recording_id, stop_position, "discovered recorder: the archive ended the recording of a listed publisher");
+            started.recording_id = None;
+        }
     }
 
     fn stop_one(&mut self, uri: &str) {
@@ -277,6 +329,45 @@ impl Started {
             recording_id: None,
             own: record.belongs_to(own_instance),
             absence: Absence::default(),
+            departed: false,
+        }
+    }
+
+    /// Mark the publisher as departed once it is missing for the full
+    /// `grace`, or as listed again when it is `present`. An own
+    /// publication never departs.
+    fn follow(&mut self, uri: &str, present: bool, now: Instant, grace: Duration) {
+        if self.own {
+            return;
+        }
+        let gone = self.absence.expired(present, now, grace);
+        match (gone, self.departed) {
+            (true, false) => {
+                info!(%uri, "discovered recorder: publisher left; recording until the archive ends it");
+                self.departed = true;
+            }
+            (false, true) => {
+                info!(%uri, "discovered recorder: publisher listed again; keeping its recording");
+                self.departed = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// How the recording of this publisher ended, if it did. A failed
+    /// archive query reads as a live recording.
+    fn ending<A: RecorderArchive>(&self, archive: &A) -> Option<Ending> {
+        match self.recording_id {
+            Some(recording_id) => archive
+                .stop_position(recording_id)
+                .ok()
+                .filter(|p| *p >= 0)
+                .map(|stop_position| Ending::Ended {
+                    recording_id,
+                    stop_position,
+                }),
+            None => (self.departed && matches!(archive.live(self), Ok(None)))
+                .then_some(Ending::NoRecording),
         }
     }
 

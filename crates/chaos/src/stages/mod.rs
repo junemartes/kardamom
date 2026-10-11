@@ -45,8 +45,10 @@ impl Harness {
     /// the archive refetch: it keeps pace on a healthy cluster, and
     /// stops for good when a case removes an ingress archive. The Aeron
     /// client logs one `auto closing` line per subscription it closes,
-    /// and no case has run yet, so one such line after the last start
-    /// line means the runtime ended by itself.
+    /// with the channel of the subscription. A detached publisher closes
+    /// the subscription of its destination, so only the close of a lane
+    /// subscription counts. No case has run yet, so one such line after
+    /// the last start line means the runtime ended by itself.
     async fn assert_batcher_lanes_open(&self) -> anyhow::Result<()> {
         let logs = self.nomad.job_logs("batcher", Streams::Both).await?;
         let closed = lanes_closed_since_start(&logs);
@@ -65,14 +67,21 @@ const BATCHER_START: &str = "live batcher starting";
 /// The Aeron client's line for a subscription it closes.
 const SUBSCRIPTION_CLOSED: &str = "auto closing AeronSubscription";
 
-/// How many subscriptions the batcher closed after its last start. The
-/// log of a task holds every start of it, and a process that ends
+/// The channel of a publisher destination. Its close is a detach, not
+/// the end of a lane.
+const DESTINATION_CHANNEL: &str = "control-mode=dynamic";
+
+/// How many lane subscriptions the batcher closed after its last start.
+/// The log of a task holds every start of it, and a process that ends
 /// closes its subscriptions in order; only the last start counts.
 fn lanes_closed_since_start(logs: &str) -> usize {
     let running = logs
         .rsplit_once(BATCHER_START)
         .map_or(logs, |(_, tail)| tail);
-    running.matches(SUBSCRIPTION_CLOSED).count()
+    running
+        .lines()
+        .filter(|l| l.contains(SUBSCRIPTION_CLOSED) && !l.contains(DESTINATION_CHANNEL))
+        .count()
 }
 
 /// The last `n` lines of `text`.
@@ -150,8 +159,12 @@ mod tests {
     fn only_the_running_batcher_counts_for_closed_lanes() {
         let ended = "live batcher starting\nauto closing AeronSubscription a\n";
         let healthy = format!("{ended}live batcher starting\nsubscription open\n");
-        let broken = format!("{healthy}auto closing AeronSubscription b\n");
+        let detached = format!(
+            "{healthy}auto closing AeronSubscription channel: \"aeron:udp?endpoint=a:0|control=b:1|control-mode=dynamic\"\n"
+        );
+        let broken = format!("{detached}auto closing AeronSubscription b\n");
         assert_eq!(lanes_closed_since_start(&healthy), 0);
+        assert_eq!(lanes_closed_since_start(&detached), 0);
         assert_eq!(lanes_closed_since_start(&broken), 1);
     }
 

@@ -65,6 +65,7 @@
 
 mod add_wait;
 mod bound;
+mod destination;
 mod handles;
 mod image_log;
 mod pending;
@@ -137,6 +138,7 @@ pub struct RawFrame {
 /// Both variants forward to the same fragment callback
 /// ([`thread::AssembledDeliver`]); the enum, not a boxed closure, is what
 /// lets one non-generic `RuntimeCmd::OpenSubscription` field carry either.
+#[derive(Clone)]
 pub(super) enum FrameSink {
     Tokio(tokio::sync::mpsc::UnboundedSender<RawFrame>),
     Crossbeam(crossbeam_channel::Sender<RawFrame>),

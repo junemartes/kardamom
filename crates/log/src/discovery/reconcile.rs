@@ -1,10 +1,11 @@
 //! The reconciler: turns membership snapshots into idempotent attach and
-//! detach calls on one multi-destination subscription.
+//! detach calls on the destinations of one discovered subscription. Each
+//! destination is its own Aeron subscription on the destination URI.
 //!
-//! Attachments are keyed by destination URI, the key the Aeron driver
-//! uses. A replacement incarnation that reuses an endpoint keeps the
-//! destination attached; the driver forms a new image with a new session
-//! id, which is how the consumer tells the incarnations apart. The
+//! Attachments are keyed by destination URI. A replacement incarnation
+//! that reuses an endpoint keeps the destination attached; the driver
+//! forms a new image with a new session id, which is how the consumer
+//! tells the incarnations apart. The
 //! service ids behind each URI are tracked for the log lines.
 //!
 //! A member that vanishes from a successful read is detached only after

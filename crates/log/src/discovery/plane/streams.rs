@@ -88,7 +88,7 @@ impl StreamPlane {
 
     /// The `tx_receipts` subscriber. Static: `open_auto` over the
     /// channels, attaching `executor_count` replica endpoints under MDS.
-    /// Discovered: one multi-destination subscription the reconcile task
+    /// Discovered: one subscription the reconcile task
     /// fills from the catalog, so `executor_count` is unused.
     ///
     /// # Errors
@@ -168,7 +168,7 @@ impl StreamPlane {
     }
 
     /// The raw `tx_data` subscription of `lane`, as the engine's reader
-    /// threads consume it. Discovered: one multi-destination subscription
+    /// threads consume it. Discovered: one subscription
     /// the reconcile task fills with every publisher of that lane.
     ///
     /// # Errors

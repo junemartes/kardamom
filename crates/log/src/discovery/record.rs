@@ -193,7 +193,7 @@ impl ServiceEntry {
     }
 }
 
-/// A discovered multi-destination subscription: the stream it takes, and
+/// A discovered subscription: the stream it takes, and
 /// the process that takes it. A publisher of the stream reads these
 /// records to tell a stream without a subscriber from a publication that
 /// no subscriber can reach. The record has no port: nothing connects to
