@@ -26,7 +26,7 @@ async fn json_rpc_accepts_the_cap_and_refuses_one_byte_more() {
     } = start_test_server(IngressConfig::default()).await;
     let executor = spawn_fake_executor(&mock, shard_rx);
     let client = http_client(addr);
-    let signer = PrivateKeySigner::random();
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).unwrap();
 
     let at_cap = sign_legacy_sized(&signer, 0, CAP.get());
     let hash: B256 = client

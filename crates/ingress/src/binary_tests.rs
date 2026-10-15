@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 
+use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 
 use super::*;
@@ -110,7 +111,7 @@ async fn oversized_frame_gets_a_reply_and_the_connection_stays_open() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_size_cap_accepts_the_cap_and_refuses_one_byte_more() {
     let mut served = Served::start(true).await;
-    let signer = PrivateKeySigner::random();
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).unwrap();
 
     served
         .send(&sign_legacy_sized(&signer, 0, DEFAULT_MAX_TX_BYTES.get()))

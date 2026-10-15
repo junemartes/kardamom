@@ -106,8 +106,8 @@ pub struct IngressConfig {
     pub max_tx_bytes: NonZeroUsize,
 }
 
-/// The default of [`IngressConfig::max_tx_bytes`]: 128 KiB, the order of
-/// the geth default of 128 KB.
+/// The default of [`IngressConfig::max_tx_bytes`]: 128 KiB, equal to the
+/// geth default (`txMaxSize` = 131072).
 pub const DEFAULT_MAX_TX_BYTES: NonZeroUsize = NonZeroUsize::new(128 * 1024).unwrap();
 
 /// The deadline that never passes. The sealer reads the guard header's
@@ -164,7 +164,7 @@ impl IngressConfig {
         if raw_tx.len() <= self.max_tx_bytes.get() {
             return Ok(());
         }
-        crate::metrics::count_reject("too_large");
+        crate::metrics::count_reject("too-large");
         Err(IngressError::TxTooLarge {
             size: raw_tx.len(),
             cap: self.max_tx_bytes,

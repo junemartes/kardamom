@@ -243,6 +243,7 @@ An error has a JSON-RPC `code` and a `message`. Most errors have no `data` field
 | `-32603` | `internal server error` | An internal fault. | Yes. |
 
 - The fee and funds messages use the shape of the geth messages, so a wallet handles them as on Ethereum.
+- `oversized data`: geth sends this error with the code `-32000`. Kardamom uses `-32602`, as for the gas cap, because the request can never succeed as sent. The message has the geth prefix.
 - The sequencer errors reach `eth_sendRawTransaction` as an error response. Every such error also appears as a `txError` frame and as a `rejected` status event.
 - `past deadline`: the sealer did not order the transaction. A new submission of the same signed bytes gets a new deadline.
 - A resubmission of a transaction that already has a receipt is not an error. The call returns its hash.
@@ -278,7 +279,7 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
   - Connections: 8192 at the same time. The `--rpc-max-connections` flag (env `KARDAMOM_RPC_MAX_CONNECTIONS`) sets it. A held `eth_sendRawTransaction` uses a connection, so keep the limit above the submit rate times the receipt latency.
   - Waiting submissions: 16384. More than this gives `-32005`.
   - Transaction size: 131072 bytes (128 KiB) for the signed transaction. A larger one gives `-32602` with the message `oversized data`. The `--max-tx-bytes` flag (env `KARDAMOM_MAX_TX_BYTES`) sets it. The binary protocol answers a larger one with the decode status `2` and the same message.
-- Metrics: `kardamom_ingress_tx_rejected_total` has a `reason` label for each refusal. The size cap uses `reason="too_large"`. See [Observability](observability.md).
+- Metrics: `kardamom_ingress_tx_rejected_total` has a `reason` label for each refusal. The size cap uses `reason="too-large"`. See [Observability](observability.md).
 
 ## Further reading
 
