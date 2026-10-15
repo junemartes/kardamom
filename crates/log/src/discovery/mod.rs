@@ -2,7 +2,7 @@
 //!
 //! Consul is the discovery control plane: a publication registers its
 //! control endpoint, and a consumer watches the catalog and attaches one
-//! destination per publisher to its multi-destination subscription.
+//! destination per publisher to its subscription.
 //! Messages travel directly between Aeron media drivers. Consul never
 //! relays a message, answers a per-message lookup, or orders anything.
 //!

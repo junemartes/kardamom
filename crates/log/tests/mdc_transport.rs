@@ -3,7 +3,8 @@
 //! 1. one `control-mode=manual` subscription joins several dynamic MDC
 //!    publishers through `add_destination`, each on an ephemeral receive
 //!    port, and each publisher stays a distinct image;
-//! 2. `remove_destination` stops delivery from that publisher;
+//! 2. `remove_destination` stops delivery from that publisher after the
+//!    linger of the detach;
 //! 3. an archive records a dynamic MDC publisher through its control
 //!    endpoint, and the recording carries the publisher's session id;
 //! 4. one control endpoint carries two stream ids to two manual
@@ -169,9 +170,11 @@ async fn manual_subscription_joins_and_leaves_dynamic_mdc_publishers() {
         "the recording is publisher a's image"
     );
 
+    // The detached destination of a live publisher lingers for one stall
+    // budget, then closes.
     rt.remove_destination(sub_id, &destination(41001))
         .expect("remove b");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(rt.stall_budget() + Duration::from_secs(1)).await;
     let _ = tokio::task::spawn_blocking(move || pub_b.publish_bytes(frame(0xBB)))
         .await
         .expect("publisher b task");

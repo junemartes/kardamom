@@ -45,7 +45,7 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 With discovery on, Consul is the control plane of the dynamic MDC transport.
 
 - A publisher binds a dynamic MDC publication and registers its control endpoint.
-- A subscriber watches the catalog. It attaches one destination for each publisher to its multi-destination subscription.
+- A subscriber watches the catalog. It attaches one destination for each publisher. Each destination is its own Aeron subscription, and all of them feed one frame stream. The runtime does not use an Aeron multi-destination subscription: the Java media driver fails the removal of some of its destinations.
 - Messages travel directly between the Aeron media drivers. Consul never relays or orders a message.
 - The `[discovery]` section of `LogConfig` sets the Consul agent, the scope and the timing.
 - The instance identity comes from `NOMAD_ALLOC_ID`. The media driver binds the control port of each publication, and the publisher record carries the bound address.

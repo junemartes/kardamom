@@ -17,6 +17,7 @@ pub enum Shard {
     Retention,
     Cache,
     L1,
+    Follower,
     Integrity,
 }
 
@@ -36,6 +37,7 @@ impl Shard {
             Self::Retention => "chaos-retention",
             Self::Cache => "chaos-cache",
             Self::L1 => "chaos-l1",
+            Self::Follower => "chaos-follower",
             Self::Integrity => "chaos-integrity",
         }
     }
@@ -50,7 +52,7 @@ impl Shard {
     #[must_use]
     pub fn audits_after(self, case: &str) -> bool {
         match self {
-            Self::L1 => true,
+            Self::L1 | Self::Follower => true,
             Self::CombinedExec => case == "executor-sealer-loss-recover",
             _ => false,
         }
@@ -151,10 +153,17 @@ impl Shard {
             Self::L1 => &[
                 "l1-liar",
                 "l1-null-receipts",
-                "follower-instance-loss",
-                "follower-total-loss",
                 "two-day-outage",
                 "batcher-outage-past-retention",
+            ],
+            // The loss and the disagreement of the L1 follower's
+            // instances, behind the same lying L1. They are a shard of
+            // their own: with the liar cases, one shard passed the job's
+            // limit.
+            Self::Follower => &[
+                "follower-instance-loss",
+                "follower-total-loss",
+                "follower-disagreement",
             ],
             // The mirror rebuild runs last: it flushes the projection.
             Self::Cache => &[
@@ -191,7 +200,7 @@ impl Shard {
                 cluster_retention: Some(6144),
                 ..DeployVars::default()
             },
-            Self::L1 => DeployVars {
+            Self::L1 | Self::Follower => DeployVars {
                 cluster_snapshot_interval_s: Some(60),
                 cluster_retention: Some(6144),
                 l1_fault_proxy: true,
@@ -228,7 +237,7 @@ impl Shard {
             // One minute per fault: every assertion holds at one minute,
             // and four cases with their state audits must fit the job's
             // budget.
-            Self::L1 => &[
+            Self::L1 | Self::Follower => &[
                 ("RUN_LOAD", "0"),
                 ("KARDAMOM_CLUSTER_RETENTION", "6144"),
                 ("KARDAMOM_CLUSTER_SNAPSHOT_S", "60"),
@@ -265,6 +274,7 @@ mod tests {
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
+            Shard::Follower,
             Shard::Integrity,
         ]
         .iter()
@@ -274,7 +284,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(all.len(), unique.len(), "a case rides two shards");
-        assert_eq!(all.len(), 57);
+        assert_eq!(all.len(), 58);
         assert_eq!(
             Shard::Sequencer.cases().last(),
             Some(&"resize-scale-out-in")
@@ -291,6 +301,7 @@ mod tests {
             Shard::Retention,
             Shard::Cache,
             Shard::L1,
+            Shard::Follower,
             Shard::Integrity,
         ] {
             assert!(
@@ -300,6 +311,9 @@ mod tests {
             );
         }
         assert!(Shard::L1.deploy_vars().l1_fault_proxy);
+        assert!(Shard::Follower.deploy_vars().l1_fault_proxy);
+        assert_eq!(Shard::Follower.env(), Shard::L1.env());
+        assert!(Shard::Follower.audits_after("follower-total-loss"));
         // The executor shard deploys the recorded cursor and tells its
         // cases so through the knob of the same name.
         assert!(Shard::Executor.deploy_vars().exec_cursor);

@@ -269,7 +269,7 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomBatcherResumeFailures` | critical | A batcher start failed to read L1 in the last 10 minutes. |
 | `KardamomL1IndexerTickErrors` | critical | More than half of the indexer ticks fail for 15 minutes. |
 | `KardamomDaWatcherTickErrors` | critical | More than half of the da-watcher ticks have an outcome other than `ok` for 15 minutes. |
-| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
+| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip that the validator's own L1 read sees (`validator_l1_finalized_block_number`; the follower's own tip without a validator L1 check) for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
 | `KardamomL1FollowerWakeOverdue` | critical | A follower instance is more than 2 minutes past its planned wake time for 2 minutes. Runbook: [`l1_follower_wake_overdue`](runbooks/l1_follower_wake_overdue.md). |
 | `KardamomL1SourceDisagreement` | critical | Two L1 sources gave different answers in the last 10 minutes. The follower halts. |
 | `KardamomValidatorEpochsUnverified` | warning | The validator committed an epoch without an L1 check in the last 10 minutes. |

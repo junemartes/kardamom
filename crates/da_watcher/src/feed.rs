@@ -57,6 +57,8 @@ pub mod fakes {
         injected: VecDeque<L1Block>,
         /// Whether the archives answer `history`.
         archive_down: bool,
+        /// Records the archives hold beside the chain: another instance's.
+        archived: Vec<L1Block>,
     }
 
     /// The test's handle on the scripted stream.
@@ -157,6 +159,15 @@ pub mod fakes {
             self.chain.lock().unwrap().injected.push_back(record);
         }
 
+        /// Put a record into the archives beside the chain's own record of
+        /// its block, as another follower instance's recording holds it.
+        ///
+        /// # Panics
+        /// Panics when a test thread panicked while it held the lock.
+        pub fn add_archived(&self, record: L1Block) {
+            self.chain.lock().unwrap().archived.push(record);
+        }
+
         /// Turn the archives off or on.
         ///
         /// # Panics
@@ -227,7 +238,10 @@ pub mod fakes {
             if chain.archive_down {
                 return Vec::new();
             }
-            chain.blocks.range(from..).map(|(_, r)| r.clone()).collect()
+            let extra = chain.archived.iter().filter(|r| r.number >= from).cloned();
+            extra
+                .chain(chain.blocks.range(from..).map(|(_, r)| r.clone()))
+                .collect()
         }
 
         async fn next(&mut self) -> Option<L1Block> {

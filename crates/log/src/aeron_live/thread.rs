@@ -1,8 +1,8 @@
 //! The dedicated Aeron thread: the poll/command loop that owns every
-//! `!Send` rusteron object (client, publications, subscriptions, MDS
-//! destinations). Everything here runs on the one `kardamom-aeron` OS
-//! thread; the rest of the module talks to it exclusively through
-//! [`RuntimeCmd`]s.
+//! `!Send` rusteron object (client, publications, subscriptions, and the
+//! subscriptions of attached destinations). Everything here runs on the
+//! one `kardamom-aeron` OS thread; the rest of the module talks to it
+//! exclusively through [`RuntimeCmd`]s.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -15,6 +15,7 @@ use tracing::warn;
 
 use super::add_wait::{AddWait, PubAdd, SubAdd};
 use super::bound::BoundControl;
+use super::destination::Destination;
 use super::image_log::ImageHandlers;
 use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
@@ -62,8 +63,18 @@ enum CmdStep {
     Stop,
 }
 
-/// One row in the Aeron thread's subscription table.
-struct SubEntry {
+/// One row in the Aeron thread's subscription table: the subscription,
+/// and the stream id and the sink that each of its destinations opens
+/// its own subscription with.
+struct SubRow {
+    entry: SubEntry,
+    stream_id: i32,
+    sink: FrameSink,
+}
+
+/// One open Aeron subscription behind a fragment assembler: a row of the
+/// subscription table, or an attached destination.
+pub(super) struct SubEntry {
     sub: Sub,
     /// Assembler-wrapped handler passed to `poll` (owns per-session
     /// assembly buffers). Delegates complete messages to `inner`.
@@ -103,6 +114,11 @@ impl SubEntry {
         }
     }
 
+    /// The count of images of the subscription.
+    pub(super) fn image_count(&self) -> Result<i32, rusteron_client::AeronCError> {
+        self.sub.image_count()
+    }
+
     /// Log on the transition into the poll-failed state, then latch it. A
     /// run of failing polls on the thread's hot loop then logs once, not
     /// on every pass.
@@ -125,25 +141,9 @@ impl SubEntry {
 pub(super) fn run_aeron_thread(
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
+    linger: Duration,
 ) -> Result<(), LogError> {
-    AeronThread::new(aeron, cmd_rx).run()
-}
-
-/// Live MDS destination attachment, keyed by `(sub_id, uri)` for removal.
-/// `handle`, the rusteron `AeronAsyncDestination`, removes its
-/// destination when dropped, so this must be retained for as long as the
-/// attachment should stay active. That drop passes the driver the raw
-/// pointer of `uri_c`, the C string the attach was made with, so `uri_c`
-/// must outlive `handle`: fields drop in declaration order.
-struct Destination {
-    sub_id: u32,
-    uri: String,
-    // RAII: dropping this field issues the async remove-destination
-    // command to the driver. The field is never read; its only purpose
-    // is the drop.
-    _handle: rusteron_client::AeronAsyncDestination,
-    // Read by the driver through `_handle`'s drop. Never read here.
-    _uri_c: std::ffi::CString,
+    AeronThread::new(aeron, cmd_rx, linger).run()
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -156,13 +156,17 @@ struct AeronThread {
     /// Indexed by `pub_id`. A closed publication leaves a `None` slot,
     /// so the ids of the open ones stay valid.
     pubs: Vec<Option<PubEntry>>,
-    /// Declared before `subs`: a destination detaches through its
-    /// subscription, so every destination must drop while its
-    /// subscription is still open.
+    /// The attached destinations of the rows in `subs`, and the detached
+    /// ones that linger.
     dests: Vec<Destination>,
+    /// How long a detached destination with an image stays open: the
+    /// stall budget of the client, which is at least the image liveness
+    /// timeout of the driver (10 s by default). A publisher that stops
+    /// loses its image within that time.
+    linger: Duration,
     /// Indexed by `sub_id`. A closed subscription leaves a `None` slot,
     /// so the ids of the open ones stay valid.
-    subs: Vec<Option<SubEntry>>,
+    subs: Vec<Option<SubRow>>,
     pending: VecDeque<PendingPublish>,
     /// The image log handlers of every subscription. They live as long
     /// as the process (see [`ImageHandlers`]).
@@ -175,10 +179,11 @@ struct AeronThread {
 }
 
 impl AeronThread {
-    fn new(aeron: Rc<AeronClient>, cmd_rx: CbReceiver<RuntimeCmd>) -> Self {
+    fn new(aeron: Rc<AeronClient>, cmd_rx: CbReceiver<RuntimeCmd>, linger: Duration) -> Self {
         Self {
             aeron,
             cmd_rx,
+            linger,
             pubs: Vec::new(),
             subs: Vec::new(),
             pending: VecDeque::new(),
@@ -221,6 +226,7 @@ impl AeronThread {
         //    a publish is back-pressured in `pending`, so a slow or
         //    stalled publish can never starve a subscription's image.
         worked |= self.poll_subscriptions();
+        self.close_departed();
 
         // 4. Idle. Block only when there is genuinely nothing to do:
         //    nothing to poll and nothing pending. Otherwise wait at the
@@ -301,13 +307,16 @@ impl AeronThread {
         }
     }
 
-    /// Poll every subscription for fragments. Returns whether any
-    /// subscription delivered at least one fragment this pass. This is
-    /// the per-iteration hot path, so it must poll every subscription and
-    /// cannot short-circuit on the first one that has work.
+    /// Poll every subscription and every destination for fragments.
+    /// Returns whether any subscription delivered at least one fragment
+    /// this pass. This is the per-iteration hot path, so it must poll
+    /// every subscription and cannot short-circuit on the first one that
+    /// has work.
     fn poll_subscriptions(&mut self) -> bool {
         let mut worked = false;
-        for entry in self.subs.iter_mut().flatten() {
+        let dests = self.dests.iter_mut().map(|d| &mut d.entry);
+        let rows = self.subs.iter_mut().flatten().map(|r| &mut r.entry);
+        for entry in rows.chain(dests) {
             worked |= entry.poll_once();
         }
         worked
@@ -454,24 +463,41 @@ impl AeronThread {
         sink: FrameSink,
         wait: &AddWait,
     ) -> Result<u32, LogError> {
-        let sub = self.open_sub(uri, stream_id, wait)?;
-        let (assembler, inner) =
-            rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { sink })
-                .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
+        let entry = self.open_entry(uri, stream_id, sink.clone(), wait)?;
         let id = u32::try_from(self.subs.len())
             .map_err(|_| LogError::Aeron("subscription table exceeds u32::MAX entries".into()))?;
-        self.subs.push(Some(SubEntry {
-            sub,
-            assembler,
-            inner,
-            poll_failed: false,
+        self.subs.push(Some(SubRow {
+            entry,
+            stream_id,
+            sink,
         }));
         Ok(id)
     }
 
-    /// Close a subscription: its destinations drop first (they detach
-    /// through it), then the row itself, which releases the handlers and
-    /// closes the Aeron subscription. The slot stays `None`.
+    /// Open a subscription on `uri` behind a fragment assembler that sends
+    /// every complete message to `sink`. The add waits as `wait` says.
+    fn open_entry(
+        &self,
+        uri: &str,
+        stream_id: i32,
+        sink: FrameSink,
+        wait: &AddWait,
+    ) -> Result<SubEntry, LogError> {
+        let sub = self.open_sub(uri, stream_id, wait)?;
+        let (assembler, inner) =
+            rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver { sink })
+                .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
+        Ok(SubEntry {
+            sub,
+            assembler,
+            inner,
+            poll_failed: false,
+        })
+    }
+
+    /// Close a subscription: its destinations drop first, then the row
+    /// itself. Each drop releases the handlers and closes the Aeron
+    /// subscription of the row. The slot stays `None`.
     fn cmd_close_subscription(&mut self, sub_id: u32) -> Result<(), LogError> {
         let slot = self.subs.get_mut(sub_id as usize).ok_or_else(|| {
             LogError::Aeron(format!("close subscription: unknown sub_id {sub_id}"))
@@ -484,20 +510,27 @@ impl AeronThread {
         Ok(())
     }
 
-    /// Detach a source endpoint from an MDS subscription. Dropping the
-    /// retained [`Destination`] issues the async remove command to the
-    /// driver. Best effort: a removed source's image also times out on
-    /// its own.
+    /// Detach a destination from a subscription. The destination
+    /// lingers until its image goes (see [`Destination`]).
     fn cmd_remove_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
-        let before = self.dests.len();
-        self.dests.retain(|d| !(d.sub_id == sub_id && d.uri == uri));
-        if self.dests.len() < before {
-            Ok(())
-        } else {
-            Err(LogError::Aeron(format!(
-                "remove destination: no attached {uri} on sub {sub_id}"
-            )))
-        }
+        let dest = self
+            .dests
+            .iter_mut()
+            .find(|d| d.is(sub_id, uri))
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "remove destination: no attached {uri} on sub {sub_id}"
+                ))
+            })?;
+        dest.leave(Instant::now(), self.linger);
+        Ok(())
+    }
+
+    /// Close every detached destination whose image went or whose linger
+    /// ended.
+    fn close_departed(&mut self) {
+        let now = Instant::now();
+        self.dests.retain(|d| !d.closes(now));
     }
 
     fn handle_cmd(&mut self, cmd: RuntimeCmd) {
@@ -593,83 +626,25 @@ impl AeronThread {
     }
 
     /// Attach a source endpoint (`uri`, for example
-    /// `aeron:udp?endpoint=10.0.0.5:9000`) to a `control-mode=manual` MDS
-    /// subscription, and retain the returned `AeronAsyncDestination` so
-    /// the attachment stays live (dropping it issues the async remove).
-    /// Idempotent. Blocks the Aeron thread only briefly to poll the
-    /// driver's async completion, since destination changes are rare
-    /// (membership churn), unlike steady-state publishing.
+    /// `aeron:udp?endpoint=10.0.0.5:9000`) to the subscription `sub_id`:
+    /// open a subscription on `uri` with the stream id and the sink of
+    /// `sub_id`. Idempotent. A detached destination that still lingers
+    /// is attached again with its open subscription and image.
     fn add_sub_destination(&mut self, sub_id: u32, uri: &str) -> Result<(), LogError> {
         let sub = self
             .subs
             .get(sub_id as usize)
             .and_then(Option::as_ref)
             .ok_or_else(|| LogError::Aeron(format!("add destination: unknown sub_id {sub_id}")))?;
-        if self
-            .dests
-            .iter()
-            .any(|d| d.sub_id == sub_id && d.uri == uri)
-        {
-            return Ok(()); // already attached
+        if let Some(dest) = self.dests.iter_mut().find(|d| d.is(sub_id, uri)) {
+            dest.stay();
+            return Ok(());
         }
-        let c = crate::ffi::c_uri(uri, "destination uri")?;
-        let dest =
-            rusteron_client::AeronAsyncDestination::aeron_subscription_async_add_destination(
-                &self.aeron,
-                &sub.sub,
-                c.as_c_str(),
-            )
-            .map_err(|e| LogError::Aeron(format!("add destination {uri}: {e}")))?;
-        poll_until_attached(&dest, Instant::now(), uri)?;
-        self.dests.push(Destination {
-            sub_id,
-            uri: uri.to_string(),
-            _handle: dest,
-            _uri_c: c,
-        });
+        let wait = AddWait::run_time(ADD_SUB_TIMEOUT);
+        let entry = self.open_entry(uri, sub.stream_id, sub.sink.clone(), &wait)?;
+        self.dests.push(Destination::new(sub_id, uri, entry));
         Ok(())
     }
-}
-
-/// Block until `dest`'s attach completes or `uri`'s add-destination call
-/// times out (measured from `start`). Polls at a fixed 2 ms cadence.
-fn poll_until_attached(
-    dest: &rusteron_client::AeronAsyncDestination,
-    start: Instant,
-    uri: &str,
-) -> Result<(), LogError> {
-    loop {
-        if let ControlFlow::Break(result) = poll_attach_step(dest, start, uri) {
-            return result;
-        }
-    }
-}
-
-/// One attach-poll for [`poll_until_attached`]'s loop. `Break` carries the
-/// answer: ready, a poll error, or a timeout past `ADD_SUB_TIMEOUT`.
-/// `Continue` means the caller polls again, after this waits at the
-/// fixed 2 ms cadence.
-fn poll_attach_step(
-    dest: &rusteron_client::AeronAsyncDestination,
-    start: Instant,
-    uri: &str,
-) -> ControlFlow<Result<(), LogError>> {
-    match dest.aeron_subscription_async_destination_poll() {
-        Ok(1) => return ControlFlow::Break(Ok(())),
-        Ok(_) => {}
-        Err(e) => {
-            return ControlFlow::Break(Err(LogError::Aeron(format!(
-                "destination poll {uri}: {e}"
-            ))));
-        }
-    }
-    if start.elapsed() > ADD_SUB_TIMEOUT {
-        return ControlFlow::Break(Err(LogError::Aeron(format!(
-            "add destination {uri} timed out"
-        ))));
-    }
-    std::thread::sleep(Duration::from_millis(2));
-    ControlFlow::Continue(())
 }
 
 /// Read the fragment-start [`BPosition`] and the Aeron publisher
