@@ -8,6 +8,8 @@ use std::time::Duration;
 use kardamom_cache::{CacheConfig, ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_types::AckPolicy;
 
+use crate::error::IngressError;
+
 /// Static configuration for an `IngressProxy` instance.
 ///
 /// All fields are required. Use `IngressConfig::default()` for tests.
@@ -98,7 +100,15 @@ pub struct IngressConfig {
     /// copy of it can be accepted again. See
     /// `docs/agents/offer-inclusion-deadline-spec.md`.
     pub inclusion_horizon_blocks: NonZeroU64,
+    /// The largest `raw_tx` the submit path accepts, in bytes. The proxy
+    /// refuses a larger transaction before it decodes it. The cap bounds
+    /// the bytes of each transaction on every path after the ingress.
+    pub max_tx_bytes: NonZeroUsize,
 }
+
+/// The default of [`IngressConfig::max_tx_bytes`]: 128 KiB, the order of
+/// the geth default of 128 KB.
+pub const DEFAULT_MAX_TX_BYTES: NonZeroUsize = NonZeroUsize::new(128 * 1024).unwrap();
 
 /// The deadline that never passes. The sealer reads the guard header's
 /// deadline as a signed 64-bit integer and refuses a record once its block
@@ -143,6 +153,23 @@ impl IngressConfig {
             None => crate::routing::partition_for(sender, self.partition_count_m),
         }
     }
+
+    /// Refuses a `raw_tx` above [`Self::max_tx_bytes`], and counts the
+    /// refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngressError::TxTooLarge`] with the size and the cap.
+    pub(crate) fn check_tx_size(&self, raw_tx: &[u8]) -> Result<(), IngressError> {
+        if raw_tx.len() <= self.max_tx_bytes.get() {
+            return Ok(());
+        }
+        crate::metrics::count_reject("too_large");
+        Err(IngressError::TxTooLarge {
+            size: raw_tx.len(),
+            cap: self.max_tx_bytes,
+        })
+    }
 }
 
 impl Default for IngressConfig {
@@ -179,6 +206,7 @@ impl Default for IngressConfig {
             // sequencer to drain its reorder buffer, and both are far
             // below the stall that makes a re-offer a hazard.
             inclusion_horizon_blocks: nonzero!(64u64),
+            max_tx_bytes: DEFAULT_MAX_TX_BYTES,
         }
     }
 }
@@ -223,5 +251,18 @@ mod tests {
         assert_eq!(cfg.partition_count_m.get(), 8);
         assert_eq!(cfg.sig_verify_batch_depth.get(), 64);
         assert_eq!(cfg.sig_verify_flush_window, Duration::from_micros(50));
+        assert_eq!(cfg.max_tx_bytes.get(), 131_072);
+    }
+
+    #[test]
+    fn the_size_cap_accepts_the_cap_and_refuses_one_byte_more() {
+        let cfg = IngressConfig::default();
+        let cap = cfg.max_tx_bytes.get();
+        assert!(cfg.check_tx_size(&vec![0; cap]).is_ok());
+        let err = cfg.check_tx_size(&vec![0; cap + 1]).unwrap_err();
+        assert!(
+            matches!(err, IngressError::TxTooLarge { size: 131_073, cap } if cap.get() == 131_072),
+            "{err:?}"
+        );
     }
 }

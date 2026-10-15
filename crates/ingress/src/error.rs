@@ -52,6 +52,13 @@ pub enum IngressError {
         cap = kardamom_types::limits::TX_GAS_LIMIT_CAP
     )]
     GasLimitExceedsCap(u64),
+    /// The `raw_tx` is above the size cap of the ingress. The prefix is
+    /// the geth error text, so a wallet handles it as on L1.
+    #[error("oversized data: transaction size {size} bytes, limit {cap} bytes")]
+    TxTooLarge {
+        size: usize,
+        cap: std::num::NonZeroUsize,
+    },
     #[error(
         "unsupported transaction type {0:#04x}: blob (EIP-4844) transactions are not supported"
     )]
@@ -174,6 +181,7 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::SignatureInvalid
             | IngressError::Duplicate(_)
             | IngressError::GasLimitExceedsCap(_)
+            | IngressError::TxTooLarge { .. }
             | IngressError::UnsupportedTxType(_) => -32602,
             // Generic server error. Evicted is retryable once the sender's
             // nonce is back within the reorder window. Expired is
@@ -304,5 +312,15 @@ mod tests {
         let rpc: ErrorObjectOwned = IngressError::UnsupportedTxType(0x03).into();
         assert_eq!(rpc.code(), -32602);
         assert!(rpc.message().contains("0x03"), "{}", rpc.message());
+        let rpc: ErrorObjectOwned = IngressError::TxTooLarge {
+            size: 131_073,
+            cap: crate::config::DEFAULT_MAX_TX_BYTES,
+        }
+        .into();
+        assert_eq!(rpc.code(), -32602);
+        assert_eq!(
+            rpc.message(),
+            "oversized data: transaction size 131073 bytes, limit 131072 bytes"
+        );
     }
 }
