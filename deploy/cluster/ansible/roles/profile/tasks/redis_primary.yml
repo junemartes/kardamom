@@ -1,0 +1,18 @@
+---
+# The redis job places its primary on the node whose role set holds
+# redis-primary, and its sentinels name the first such node in the Consul
+# catalog. The two agree only when one node holds the role. The check
+# reads the whole inventory, so bootstrap.yml runs it once per play.
+- name: Check that exactly one node holds redis-primary
+  run_once: true
+  vars:
+    profile_redis_primaries: >-
+      {{ groups['all'] | map('extract', hostvars) | selectattr('role', 'defined')
+         | selectattr('node_role_set', 'contains', 'redis-primary')
+         | map(attribute='inventory_hostname') | list }}
+  ansible.builtin.assert:
+    that:
+      - profile_redis_primaries | length == 1
+    fail_msg: >-
+      exactly one node must hold the role redis-primary, got
+      {{ profile_redis_primaries | length }}: {{ profile_redis_primaries | join(', ') }}

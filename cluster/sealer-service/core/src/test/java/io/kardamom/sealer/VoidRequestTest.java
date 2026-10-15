@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -112,6 +113,82 @@ class VoidRequestTest {
         assertFalse(again.kind == CanonicalSealerState.RecordOutcome.Kind.CONTIGUITY_REJECT);
     }
 
+    /** Order references of sender 1 at {@code nonces}, each with id = nonce, and return their indices. */
+    private static long[] orderAll(CanonicalSealerState state, int... nonces) {
+        return Arrays.stream(nonces).mapToLong(nonce -> order(state, nonce)).toArray();
+    }
+
+    private static long expectedOf(CanonicalSealerState state) {
+        return state.expectedNonceOf(sender(1)).orElseThrow();
+    }
+
+    @Test
+    void a_single_void_sets_the_expected_nonce_back_to_the_entry() {
+        CanonicalSealerState state = stateWith(new VoidLedger.Config(8, 0b1L));
+        long[] index = orderAll(state, 5, 6, 7);
+
+        state.onVoidRequest(0, index[1], id(6));
+
+        assertEquals(6L, expectedOf(state), "a void below a later ordered nonce opens the voided nonce");
+    }
+
+    @Test
+    void two_voids_in_nonce_order_keep_the_lower_nonce_open() {
+        CanonicalSealerState state = stateWith(new VoidLedger.Config(8, 0b1L));
+        long[] index = orderAll(state, 5, 6);
+
+        state.onVoidRequest(0, index[0], id(5));
+        state.onVoidRequest(0, index[1], id(6));
+
+        assertEquals(5L, expectedOf(state), "the second void must not skip the first voided nonce");
+    }
+
+    @Test
+    void two_voids_in_reverse_nonce_order_keep_the_lower_nonce_open() {
+        CanonicalSealerState state = stateWith(new VoidLedger.Config(8, 0b1L));
+        long[] index = orderAll(state, 5, 6);
+
+        state.onVoidRequest(0, index[1], id(6));
+        state.onVoidRequest(0, index[0], id(5));
+
+        assertEquals(5L, expectedOf(state));
+    }
+
+    @Test
+    void after_two_voids_the_sender_fills_both_nonces_in_order() {
+        CanonicalSealerState state = stateWith(new VoidLedger.Config(8, 0b1L));
+        long[] index = orderAll(state, 5, 6);
+        state.onVoidRequest(0, index[0], id(5));
+        state.onVoidRequest(0, index[1], id(6));
+
+        CanonicalSealerState.RecordOutcome early = state.onRecord(id(6), sender(1), 6, NO_DEADLINE, payload("ref"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.CONTIGUITY_REJECT, early.kind);
+        assertEquals(5L, early.expectedNonce, "the guard asks for the lowest voided nonce");
+
+        long five = order(state, 5);
+        long six = order(state, 6);
+        assertTrue(six > five, "the resubmit of 6 is ordered after the resubmit of 5");
+        assertEquals(7L, expectedOf(state));
+    }
+
+    @Test
+    void a_void_of_an_unknown_sender_adds_no_expected_nonce() {
+        CanonicalSealerState state = new CanonicalSealerState(
+            1, CanonicalSealerState.GENESIS_BLOCK_NUMBER, Set.of(), new VoidLedger.Config(8, 0b1L));
+        long index = state.onRecord(
+                id(5), sender(1), 5, CanonicalSealerState.GENESIS_BLOCK_NUMBER, payload("ref"))
+            .relayed
+            .orElseThrow()
+            .index;
+        state.onTick(0L);
+        state.onRecord(id(9), sender(2), 0, NO_DEADLINE, payload("ref"));
+        assertFalse(state.expectedNonceOf(sender(1)).isPresent(), "the second sender evicts the first");
+
+        state.onVoidRequest(0, index, id(5));
+
+        assertFalse(state.expectedNonceOf(sender(1)).isPresent(), "the void does not add the evicted sender");
+    }
+
     @Test
     void an_entry_that_left_the_window_cannot_be_removed() {
         CanonicalSealerState state = stateWith(new VoidLedger.Config(2, 0b11L));
@@ -209,7 +286,7 @@ class VoidRequestTest {
         // per-id deadlines, cut those counts, and set the version field
         // back, which is the exact version-5 byte layout.
         byte[] v6 = SealerStateFixtures.downgradeToVersion(old.takeSnapshot(), 5);
-        byte[] v5 = java.util.Arrays.copyOf(v6, v6.length - 8);
+        byte[] v5 = Arrays.copyOf(v6, v6.length - 8);
 
         CanonicalSealerState restored = CanonicalSealerState.load(v5, 8, Set.of(), THREE_VOTERS);
 

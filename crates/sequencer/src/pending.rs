@@ -91,7 +91,6 @@ impl<T> PendingBuffer<T> {
         self.inner.range(..floor).count()
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn contains(&self, nonce: u64) -> bool {
         self.inner.contains_key(&nonce)
@@ -155,18 +154,18 @@ impl<T> PendingBuffer<T> {
     /// transient and bounded to one drained batch; the next successful
     /// flush drains it back out.
     ///
-    /// A rebuffered entry has no deadline. It does not wait on a nonce
-    /// gap. It waits on the publisher, and it lives until the publisher
-    /// recovers. A stale deadline from its earlier life as a future-nonce
-    /// entry no longer matches, so [`Self::expire`] ignores it.
-    pub(crate) fn reinsert(&mut self, nonce: u64, value: T) {
-        self.inner.insert(
-            nonce,
-            Slot {
-                deadline: None,
-                value,
-            },
-        );
+    /// A rebuffered entry has no deadline (`None`). It does not wait on a
+    /// nonce gap. It waits on the publisher, and it lives until the
+    /// publisher recovers. A stale deadline from its earlier life as a
+    /// future-nonce entry no longer matches, so [`Self::expire`] ignores
+    /// it.
+    ///
+    /// The freed-nonce park
+    /// ([`crate::state::PartitionState::free_nonce`]) also uses this,
+    /// with a deadline. Its entries wait on a nonce gap that only the
+    /// client can fill, so they expire like fresh future-nonce entries.
+    pub(crate) fn reinsert(&mut self, nonce: u64, value: T, deadline: Option<Instant>) {
+        self.inner.insert(nonce, Slot { deadline, value });
     }
 
     /// Remove and return the entry at `nonce`, but only if it still
@@ -180,6 +179,17 @@ impl<T> PendingBuffer<T> {
             .get(&nonce)
             .is_some_and(|slot| slot.deadline == Some(deadline));
         live.then(|| self.remove(nonce)).flatten()
+    }
+
+    /// Remove and return the entry at `nonce` when it is parked (it has a
+    /// deadline) and `named` holds for its value. A rebuffered entry has
+    /// no deadline: it waits on the publisher, and it stays.
+    pub(crate) fn take_parked<F: Fn(&T) -> bool>(&mut self, nonce: u64, named: F) -> Option<T> {
+        let parked = self
+            .inner
+            .get(&nonce)
+            .is_some_and(|slot| slot.deadline.is_some() && named(&slot.value));
+        parked.then(|| self.remove(nonce)).flatten()
     }
 
     /// Drop every buffered entry with a nonce below `floor`. Returns how
@@ -349,7 +359,7 @@ mod tests {
         b.insert(10, 1, d);
         assert_eq!(b.expire(10, far()), None, "a stale deadline is ignored");
         assert_eq!(b.expire(10, d), Some(1));
-        b.reinsert(11, 2);
+        b.reinsert(11, 2, None);
         assert_eq!(b.expire(11, d), None, "a rebuffered entry never expires");
         assert!(b.contains(11));
     }

@@ -12,7 +12,7 @@
 
 The design landed in two pull requests: #432 (the envelope field, the wire, the
 proxy stamp) and #433 (the sealer rule, the window, the client notice, the
-deploy wiring). Five things differ from the design above.
+deploy wiring). Six things differ from the design above.
 
 1. **The reason is `TxErrorReason::PastDeadline`, not `Expired`.** That name was
    already taken by the sequencer's nonce-gap `tx_ttl`, a different event with a
@@ -31,6 +31,11 @@ deploy wiring). Five things differ from the design above.
    the executor re-exports only its boundary stream. `PAST-DEADLINE` and
    `WINDOW-FULL` print at power-of-two counts, like `CONTIGUITY-REJECT` and
    `VOID-VOTE`, which is what the chaos suite greps.
+6. **The stamp's base is the newest sealed block, not only the newest
+   executor boundary.** The proxy takes the higher of the executor boundary
+   and the sealed head of the sealer's status, which rides every boundary
+   tick. With every executor down, the executor boundary stops, and every
+   new transaction would reach the sealer past its deadline.
 
 One addition is not in the design: the sealer **clamps** the stored deadline to
 `blockNumber + inclusionHorizonBlocks`. Without it, a proxy stamping a deadline

@@ -33,13 +33,18 @@ const FREEZE_ATTEMPTS: u32 = 10;
 /// back: the spool restore after a restart, and one post.
 const SPOOL_POST_BUDGET: Duration = Duration::from_secs(90);
 
-/// The spool of the batcher on the aux node.
-const SPOOL_DIR: &str = "/opt/kardamom/batcher/spool";
+/// The spool root of the batcher on the aux node: its `--spool-dir`.
+const SPOOL_ROOT: &str = "/opt/kardamom/batcher/spool";
+
+/// The format registry of this build. The batcher checks its
+/// `SPOOL_VERSION` against the `batcher-spool` entry, so the directory of
+/// its spool follows from this entry.
+const FORMATS: &str = include_str!("../../../../../formats.toml");
 
 /// One freeze attempt on the aux node: find the running batcher
 /// container, then in one exec SIGSTOP it, read its process state from
-/// `/proc`, count the spool's block files, and SIGCONT it again unless it
-/// is stopped with a non-empty spool. The attempt takes about one second.
+/// `/proc`, count the block files of its spool, and SIGCONT it again
+/// unless it is stopped with a non-empty spool. The attempt takes about one second.
 /// So a retried attempt stays far under the Aeron client's service
 /// interval (10 s), and the thaw does not restart the batcher. A scrape
 /// of the frozen exporter waits for its timeout, and does not fit. Each
@@ -47,13 +52,42 @@ const SPOOL_DIR: &str = "/opt/kardamom/batcher/spool";
 /// replace it.
 struct FreezeAttempt<'a> {
     aux: &'a str,
+    /// The directory of the spool that the batcher of this build writes.
+    spool: String,
 }
 
-impl FreezeAttempt<'_> {
+impl<'a> FreezeAttempt<'a> {
+    /// The attempt on the aux node `aux`, against the spool directory of
+    /// this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry does not load or lists no
+    /// `batcher-spool`.
+    fn new(aux: &'a str) -> anyhow::Result<Self> {
+        let versions = kardamom_formats::Registry::parse(FORMATS)?
+            .versions("batcher-spool")
+            .ok_or_else(|| anyhow::anyhow!("the format registry lists no batcher-spool"))?;
+        Ok(Self {
+            aux,
+            spool: format!("{SPOOL_ROOT}/v{}", versions.writes),
+        })
+    }
+
+    /// The shell command that prints the count of block files in the
+    /// spool directory, and 0 when the directory does not exist.
+    fn count_command(&self) -> String {
+        format!(
+            "ls {} 2>/dev/null | grep -c '\\.block$' || true",
+            self.spool
+        )
+    }
+
     /// The shell script of the attempt on the container `inner`. It
     /// prints the process state and the count of spooled blocks, or
     /// `gone 0` when the container is gone before the signal.
-    fn script(inner: &str) -> String {
+    fn script(&self, inner: &str) -> String {
+        let count = self.count_command();
         format!(
             "docker kill -s STOP {inner} >/dev/null 2>&1 || {{ echo 'gone 0'; exit 0; }}
 pid=$(docker inspect -f '{{{{.State.Pid}}}}' {inner})
@@ -63,7 +97,7 @@ for _ in $(seq 1 40); do
   [ \"$state\" = T ] && break
   sleep 0.05
 done
-blocks=$(ls {SPOOL_DIR} 2>/dev/null | grep -c '\\.block$' || true)
+blocks=$({count})
 if [ \"$state\" != T ] || [ \"$blocks\" = 0 ]; then docker kill -s CONT {inner} >/dev/null; fi
 echo \"$state $blocks\""
         )
@@ -85,7 +119,7 @@ echo \"$state $blocks\""
             ));
             return Ok(None);
         };
-        let out = h.nodes.exec(self.aux, &Self::script(&inner)).await?;
+        let out = h.nodes.exec(self.aux, &self.script(&inner)).await?;
         Frozen::parse(&out, inner, ctx)
     }
 }
@@ -121,7 +155,7 @@ impl Frozen {
 /// to recover. The spool empties for an instant after every post, so an
 /// attempt that lands in that instant thaws the batcher and tries again.
 async fn freeze_with_spool(h: &Harness, aux: &str, ctx: &str) -> anyhow::Result<Frozen> {
-    let attempt = FreezeAttempt { aux };
+    let attempt = FreezeAttempt::new(aux)?;
     let attempt = &attempt;
     let target = h.probes.aux_target(BATCHER_PORT);
     let target = &target;

@@ -5,13 +5,14 @@
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use anyhow::Context;
-
 use kardamom_da_watcher::interop::{CursorReconcile, InteropWatcher, WsRemoteChainSource};
-use kardamom_da_watcher::{L1Endpoints, L1ResumeAfter, L1Watcher, WatcherHandle};
+use kardamom_da_watcher::{L1ResumeAfter, L1Watcher, WatcherHandle};
 use kardamom_log::aeron_live::{TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle};
 use kardamom_obs::bin::wait_for_shutdown;
+use kardamom_obs::events::BoardView;
+use tokio::sync::watch;
 
+use super::feed::StreamFeed;
 use super::publishers::{LiveRemoteEpochsPublisher, LiveTxDepositsPublisher};
 use super::{InteropPath, L1Path};
 
@@ -47,7 +48,7 @@ pub(crate) struct Watchers {
 impl Watchers {
     /// Spawn one watcher per fully-configured path.
     pub(crate) async fn spawn(
-        l1: Option<L1Path>,
+        l1: Option<(L1Path, StreamFeed, watch::Receiver<BoardView>)>,
         interop: Option<InteropPath>,
         tx_deposits_pub: Option<TxDepositsPublisherHandle>,
         tx_remote_epochs_pub: Option<TxRemoteEpochsPublisherHandle>,
@@ -55,28 +56,22 @@ impl Watchers {
     ) -> anyhow::Result<Self> {
         let mut handles: Vec<(WatcherKind, WatcherHandle)> = Vec::new();
 
-        if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
+        if let (Some((l1, feed, board)), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
             tracing::info!(
-                l1_rpc = ?l1.endpoints.origins(),
-                l1_light_client = ?l1.endpoints.light_client.as_deref().map(L1Endpoints::origin),
-                lockbox = ?l1.cfg.lockbox,
-                poll_interval = ?l1.cfg.poll_interval,
+                tick = ?l1.cfg.tick,
+                silence = ?l1.cfg.silence,
                 resume_after = ?l1.cfg.resume_after.map(L1ResumeAfter::block),
                 cursor_file = ?l1.cursor_file.as_ref().map(|f| f.path().display().to_string()),
                 follows_sealer = l1.origins.is_some(),
-                "kardamom-da-watcher: publishing L1 epochs onto tx_deposits"
+                "kardamom-da-watcher: publishing the epochs of l1_blocks onto tx_deposits"
             );
-            let sources = l1
-                .endpoints
-                .connect()
-                .await
-                .context("connect the L1 sources")?;
             let watcher = L1Watcher::new(
                 LiveTxDepositsPublisher::new(tx_deposits_pub),
-                sources,
+                feed,
                 l1.cfg,
                 l1.cursor_file,
-            );
+            )
+            .with_board(board);
             let watcher = match l1.origins {
                 Some(origins) => watcher.following(origins),
                 None => watcher,

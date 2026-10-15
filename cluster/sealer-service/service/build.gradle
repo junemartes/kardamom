@@ -40,6 +40,10 @@ tasks.named('test') {
     def formats = rootProject.file('../../formats.toml')
     inputs.file(formats)
     systemProperty 'kardamom.formats', formats.canonicalPath
+    // ClusterNodeTest reads the decision version that the sealer job passes.
+    def sealerJob = rootProject.file('../../deploy/cluster/nomad/cluster.nomad.hcl')
+    inputs.file(sealerJob)
+    systemProperty 'kardamom.sealerJob', sealerJob.canonicalPath
     // TestCluster spins up many threads; give the forked worker a single test fork.
     maxParallelForks = 1
 }

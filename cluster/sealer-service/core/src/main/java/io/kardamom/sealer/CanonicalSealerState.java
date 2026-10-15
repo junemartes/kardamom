@@ -101,6 +101,16 @@ public final class CanonicalSealerState {
     public static final long DEFAULT_INCLUSION_HORIZON_BLOCKS = 64L;
 
     /**
+     * The version of the rules that decide the replicated state. Two members
+     * on two versions can decide one log entry differently, and the state
+     * forks. A change that decides an ordered entry differently raises the
+     * version. The deploy passes it in {@code kardamom.cluster.decisionVersion},
+     * a setting that every member must match, so a new version needs a
+     * coordinated restart of the sealer.
+     */
+    public static final int DECISION_VERSION = 2;
+
+    /**
      * Default ordering window: off. The deploy sets {@code 20} together with
      * the sequencer's priority-fee setting, and every member must run the
      * same value: the window decides the relay order inside the replicated
@@ -177,6 +187,19 @@ public final class CanonicalSealerState {
      */
     public static boolean snapshotKeepsRecordedCursors() {
         return SNAPSHOT_WRITE_VERSION >= 11;
+    }
+
+    /** The oldest snapshot version that {@link #load} reads. */
+    public static final int SNAPSHOT_READ_MIN_VERSION = 1;
+
+    /** The snapshot version that {@link #takeSnapshot()} writes. */
+    public static int snapshotWriteVersion() {
+        return SNAPSHOT_WRITE_VERSION;
+    }
+
+    /** The newest snapshot version that {@link #load} reads. */
+    public static int snapshotReadMaxVersion() {
+        return SNAPSHOT_READ_VERSION;
     }
 
     /** Remote-origin reject reason: {@code firstSeq} is not the lane cursor. */
@@ -337,6 +360,13 @@ public final class CanonicalSealerState {
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
+
+    /**
+     * The version of the snapshot this state was restored from, or 0 for
+     * a state that started fresh or from a seed. The admin endpoint
+     * reports it. It is not replicated state and is not snapshotted.
+     */
+    private int restoredSnapshotVersion;
 
     /** Block number the next {@link #onTick(long)} will stamp. */
     private long blockNumber;
@@ -872,10 +902,14 @@ public final class CanonicalSealerState {
      *   <li>It removes the hash from the dedup window. The sender submits
      *       the same signed bytes again, and the window must not absorb them
      *       as a duplicate.</li>
-     *   <li>It sets the sender's expected nonce back to the nonce of the
-     *       entry. If it did not, the contiguity guard would refuse the new
-     *       submit. An evicted sender re-seeds on its next record, so it
-     *       needs no change.</li>
+     *   <li>It sets the sender's expected nonce to the lower of the
+     *       expected nonce and the nonce of the entry. If it did not, the
+     *       contiguity guard would refuse the new submit. The lower value
+     *       keeps the lowest voided nonce open when two entries of one
+     *       sender are voided in either order. An expected nonce below the
+     *       executor's nonce costs the sender one skipped transaction. An
+     *       expected nonce above it is never filled. An evicted sender
+     *       re-seeds on its next record, so it needs no change.</li>
      * </ul>
      *
      * <p>A void never waits on a clock. The decision is a function of the
@@ -891,7 +925,8 @@ public final class CanonicalSealerState {
     private Relayed appendVoid(VoidLedger.Entry entry) {
         forget(ByteBuffer.wrap(entry.id).asReadOnlyBuffer());
         expectedNonce.computeIfPresent(
-            ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(), (sender, expected) -> entry.nonce);
+            ByteBuffer.wrap(entry.sender).asReadOnlyBuffer(),
+            (sender, expected) -> Math.min(expected, entry.nonce));
         long voidIndex = canonicalCount;
         canonicalCount++;
         return new Relayed(voidIndex, VoidLedger.payload(entry));
@@ -1348,6 +1383,11 @@ public final class CanonicalSealerState {
         return canonicalCount;
     }
 
+    /** The version of the snapshot this state was restored from; 0 when none. */
+    public int restoredSnapshotVersion() {
+        return restoredSnapshotVersion;
+    }
+
     /** Block number the next {@link #onTick(long)} will stamp. */
     public long blockNumber() {
         return blockNumber;
@@ -1601,7 +1641,7 @@ public final class CanonicalSealerState {
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version < 1 || version > SNAPSHOT_READ_VERSION) {
+        if (version < SNAPSHOT_READ_MIN_VERSION || version > SNAPSHOT_READ_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();
@@ -1726,6 +1766,7 @@ public final class CanonicalSealerState {
         // no recorded cursor, so the record-lag guard refuses nothing until
         // the first cursor.
         state.canonicalCount = canonicalCount;
+        state.restoredSnapshotVersion = version;
         return state;
     }
 

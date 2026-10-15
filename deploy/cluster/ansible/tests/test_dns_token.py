@@ -12,7 +12,7 @@ ANSIBLE = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible required')
 class DnsTokenTest(unittest.TestCase):
-    def render(self, production=True, token='dns-read-only'):
+    def render(self, production=True, token='dns-read-only', **extra):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             output = root / 'consul.hcl'
@@ -34,7 +34,7 @@ class DnsTokenTest(unittest.TestCase):
                             consul_acl_enabled=production, nomad_acl_enabled=production,
                             consul_tls_dir='/test/tls', nomad_tls_dir='/test/tls',
                             consul_server_expect=3, nomad_server_expect=3,
-                            consul_retry_join=['a', 'b', 'c'], private_cidrs=['10.0.0.0/8'])
+                            consul_retry_join=['a', 'b', 'c'], private_cidrs=['10.0.0.0/8']) | extra
             env = {k: v for k, v in os.environ.items() if not k.startswith('ANSIBLE_')}
             env['ANSIBLE_ROLES_PATH'] = str(ANSIBLE / 'roles')
             result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(play),
@@ -48,6 +48,16 @@ class DnsTokenTest(unittest.TestCase):
         self.assertIn('agent   = "agent-token"', config)
         self.assertIn('default = "dns-read-only"', config)
         self.assertNotIn('dns-read-only', result.stdout + result.stderr)
+
+    def test_the_node_meta_carries_the_role_set(self):
+        # A job template finds the node of a role in the catalog, before
+        # any service on that node registers.
+        result, config = self.render(production=False, token='')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('node_meta {\n  roles = "sealer"\n}', config)
+        result, config = self.render(production=False, token='', node_roles='aux, redis,redis-primary')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('roles = "aux,redis,redis-primary"', config)
 
     def test_missing_dns_token_fails_before_render(self):
         result, config = self.render(token='')

@@ -13,11 +13,39 @@ cluster.
 
 Every application stream is a dynamic Aeron MDC publication. A publisher
 binds one control endpoint per publication on the advertised interface and
-registers it. A consumer opens one multi-destination subscription per
-stream and attaches one destination per publisher the catalog lists. The
-publishers stay separate Aeron images, so a transaction keeps its
+registers it. A consumer opens one subscription per stream and attaches
+one destination per publisher the catalog lists. The publishers stay
+separate Aeron images, so a transaction keeps its
 `(shard, session, position)` identity at the publisher, at every live
 consumer, and in the recording refetch reads.
+
+A destination is its own Aeron subscription on the destination URI. All
+the destinations of a stream feed one frame stream.
+
+A detach does not close the subscription of the destination at once:
+
+- The subscription lingers. It stays open and polled until it has no
+  image, or until one stall budget of the client ends (at least the image
+  liveness timeout of the driver, 10 s by default).
+- A publisher that stopped loses its image within that time, so its
+  subscription closes as soon as the image goes.
+- An attach of the same URI during the linger keeps the open subscription
+  and its image. A catalog flap that detaches a live publisher for a few
+  seconds thus leaves the image, the session and the position unchanged.
+  The driver repairs any loss from the term buffer of the publisher, and
+  no gap reaches the consumer.
+
+The runtime never uses an Aeron multi-destination subscription:
+
+- The Java media driver sizes the connection table of an image from the
+  destination index of that image. It grows the table only for a
+  destination that is added after the image forms.
+- The removal of a destination with a higher index than that table throws
+  `ArrayIndexOutOfBoundsException` in `PublicationImage.removeDestination`.
+  The other images of the subscription then keep a stale connection.
+- An image usually forms after the destinations of a stream attach, so each
+  detach after a publisher leaves hits this fault. Aeron 1.45 to 1.53 have
+  the fault.
 
 Consul is the discovery control plane only. Messages travel between Aeron
 media drivers. Consul never relays a message, answers a per-message
@@ -35,7 +63,7 @@ The streams and their publishers:
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
-| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, state mirror | ingress, validator |
+| `events` | ingress, sequencer, executor, validator, batcher, DA watcher, L1 follower, state mirror | ingress, validator, DA watcher, batcher |
 | `exec_txs` | executor | validator, batcher (none subscribes yet), the archive on the node of each executor |
 | `l1_blocks` | L1 follower (two instances) | da-watcher, batcher, follower archives |
 
@@ -81,7 +109,7 @@ voting set.
 | `advertise_interface` | none | Interface name or IPv4 network in CIDR form. Required when enabled. Exactly one address must match. |
 | `request_timeout_ms` | `5000` | One HTTP request's connect plus response budget. |
 | `blocking_wait_ms` | `30000` | How long one blocking catalog query waits for a change. |
-| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read. |
+| `backoff_min_ms`, `backoff_max_ms` | `500`, `10000` | Retry backoff after a failed catalog read, and between the tries of a start-up registration. |
 | `removal_grace_ms` | `5000` | A missing publisher is detached only after this long. |
 | `check_ttl_ms` | `10000` | The TTL of a publication's health check. |
 | `deregister_after_ms` | `60000` | Consul deletes a registration critical for this long. |
@@ -167,7 +195,8 @@ procedure.
 - A read error keeps the last membership and retries with bounded backoff.
   An error is never an empty set.
 - A successful empty read is a distinct state. Every attached publisher is
-  detached after the removal grace.
+  detached after the removal grace. A detached destination lingers until
+  its image goes (see "Transport").
 - An index that moves backwards restarts the blocking query.
 - Attachments are keyed by destination URI. A replacement incarnation on
   the same endpoint keeps its destination; the driver forms a new image
@@ -188,6 +217,21 @@ readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way, and the L1 follower
 its `l1_blocks` publication, through `StreamPlane::record_own`.
+
+A catalog change alone never ends a live recording:
+
+- A publisher of another process that leaves the catalog for the removal
+  grace keeps its recording subscription until the archive ends its
+  recording. The archive ends a recording when the image goes. A
+  publisher that is listed again keeps the same recording, with no hole.
+- The recorder never treats an own publication as departed. The process
+  knows its own publications, so a lapse of their records in the catalog
+  (a late TTL check, a flap) changes nothing.
+- When the archive ends the recording of a publisher that is still
+  listed, the recorder logs the WARN line `discovered recorder: the
+  archive ended the recording of a listed publisher` with the stop
+  position. The recording subscription stays, and the next image of the
+  publisher starts a new recording.
 
 Each executor records its own recorded `exec_txs` publication on the
 archive of its node. The recorder adopts only the recording of the
@@ -243,13 +287,19 @@ No job configures a publication control port.
 - The runtime reads the bound address from the driver (`aeron_publication_local_sockaddrs`). It waits up to 2 seconds for the bind.
 - The publisher record carries the address that the driver bound.
 - The driver holds the socket from the bind on. No other socket can take the port before the record is registered.
+- A start-up open waits for the start-up limit: two Aeron stall budgets (30 s at the default tolerance, 70 s in CI).
+  - The Aeron add of a publication or a subscription is one add that waits the whole limit, with no retry. An add that times out stays registered in the driver, so a retry would leak one publication or subscription for each try. A wait that ends with no answer cancels the add.
+  - The Consul registration of a record retries an unavailable agent (no answer, or a 5xx status) with the pauses of `backoff_min_ms` to `backoff_max_ms`. Each try logs a WARN line that names the record.
+  - After the limit, a failed publication open, subscription open or publisher record registration ends the start-up, and the service exits with the open error. A failed subscriber record registration only logs a WARN line, and the service runs without that record.
+  - A stop token (`StreamPlane::stopping_opens_on`) ends the wait and the retries at once.
+  - See "Start-up open of a stream" in [failure-modes.md](failure-modes.md#substrate-the-shared-failure-domain).
 - A publisher can open a publication again (`StreamPlane::tx_receipts_reopen`). The new publication binds a new port. The record of the same service id moves to it through the heartbeat of its registration (`RecordMover`), so every write of the id goes through one task, and a re-registration after a lost check writes the moved record. The subscribers detach the old control endpoint and attach the new one. The executor does this for a `tx_receipts` publication that stays unconnected for one Aeron stall budget while a subscriber record of the stream exists. See "Dead `tx_receipts` publication" in [failure-modes.md](failure-modes.md#executor).
 
 | Job | Publications |
 | --- | --- |
 | ingress | 8 `tx_data` lanes, `tx_status` |
 | executor | receipts, boundaries, BAL, the live `exec_txs` publication |
-| da-watcher | deposits, remote epochs |
+| da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
 | sequencer lane `n` | `tx_errors`, `tx_status` |
 

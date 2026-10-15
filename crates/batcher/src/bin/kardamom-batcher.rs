@@ -150,17 +150,24 @@ struct Cli {
     /// Defaults to `spool` beside the cursor file.
     #[arg(long, env = "KARDAMOM_BATCHER_SPOOL")]
     spool_dir: Option<PathBuf>,
-    /// The inbox indexer's API (`http://host:port`). A batcher without a
-    /// cursor file then resumes just past the last posted batch, from the
-    /// batch's own blobs, instead of replaying from genesis. Without an
-    /// indexer, or while it is behind the head, the batcher scans
-    /// `BatchPosted` events on L1.
+    /// The L1 follower's API (`http://host:port`). A batcher without a
+    /// cursor file resumes just past the last posted batch, from the
+    /// batch's payload in the follower's archive, and waits while the
+    /// archive does not hold it. The post age starts from the last post
+    /// the archive holds.
     #[arg(long, env = "KARDAMOM_INDEXER_URL")]
     indexer_url: Option<String>,
-    /// The settlement contract's deployment block: where a `BatchPosted`
-    /// scan starts when no indexer serves it. 0 is fine on anvil.
-    #[arg(long, env = "KARDAMOM_SETTLEMENT_DEPLOY_BLOCK", default_value_t = 0)]
-    settlement_deploy_block: u64,
+    /// How long the `l1_blocks` stream may carry no record before the
+    /// batcher pauses with the follower as its root: three finality steps
+    /// on Ethereum and Sepolia.
+    #[arg(long, default_value = "1152")]
+    l1_silence_secs: std::num::NonZeroU64,
+    /// The sealer's DA-lag budget, in blocks: the value the cluster job
+    /// passes to the sealer. The batcher posts once the sealed head is
+    /// half of it past the posted head, so the guard never halts an idle
+    /// chain between posts. 0 matches a sealer with the guard off.
+    #[arg(long, env = "KARDAMOM_DA_LAG_BUDGET_BLOCKS", default_value_t = 10_000)]
+    da_lag_budget_blocks: u64,
     /// The query endpoints of the executors and the validator
     /// (`http://host:port`): repeat the flag, or separate them with
     /// commas. They keep, with every receipt, where the transaction's
@@ -394,7 +401,8 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         l1_retries: cli.l1_retries,
         chain_id: cli.chain_id,
         indexer_url: cli.indexer_url.clone(),
-        settlement_deploy_block: cli.settlement_deploy_block,
+        l1_silence: std::time::Duration::from_secs(cli.l1_silence_secs.get()),
+        da_lag_budget_blocks: cli.da_lag_budget_blocks,
         block_refs_sources: cli.block_refs_source.clone(),
     })
     .await

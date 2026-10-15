@@ -1,4 +1,4 @@
-use super::{AtFreeze, Frozen, Lines};
+use super::{AtFreeze, FreezeAttempt, Frozen, Lines, SPOOL_ROOT};
 use crate::l1::Posted;
 
 const CTX: &str = "batcher-outage-past-retention";
@@ -104,4 +104,50 @@ fn a_freeze_attempt_holds_only_a_stopped_batcher_with_a_spool() {
     );
     assert!(Frozen::parse("S 4", "batcher-1".into(), CTX).is_err());
     assert!(Frozen::parse("garbage", "batcher-1".into(), CTX).is_err());
+}
+
+/// The freeze counts the block files of the spool that the batcher of
+/// this build writes: `v<N>` under the spool root, with N from the
+/// `batcher-spool` entry of the registry.
+#[test]
+fn the_freeze_reads_the_versioned_spool_directory() {
+    let attempt = FreezeAttempt::new("aux").unwrap();
+    let version = attempt
+        .spool
+        .strip_prefix(&format!("{SPOOL_ROOT}/v"))
+        .expect("the spool directory is v<N> under the spool root");
+    assert!(version.parse::<u32>().is_ok(), "{}", attempt.spool);
+    assert!(attempt.script("batcher-1").contains(&attempt.spool));
+}
+
+/// The count command counts the block files of the versioned directory
+/// only: not the spool root, and not a temporary file. A missing
+/// directory counts 0.
+#[test]
+fn the_count_command_counts_the_block_files_of_the_spool() {
+    let root = tempfile::tempdir().unwrap();
+    let spool = root.path().join("v1");
+    std::fs::create_dir_all(&spool).unwrap();
+    for name in [
+        "00000000000000000007.block",
+        "00000000000000000008.block",
+        "00000000000000000009.tmp",
+    ] {
+        std::fs::write(spool.join(name), b"x").unwrap();
+    }
+    std::fs::write(root.path().join("00000000000000000001.block"), b"x").unwrap();
+    let count = |dir: &std::path::Path| {
+        let attempt = FreezeAttempt {
+            aux: "aux",
+            spool: dir.display().to_string(),
+        };
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(attempt.count_command())
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    assert_eq!(count(&spool), "2");
+    assert_eq!(count(&root.path().join("v9")), "0");
 }

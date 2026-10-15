@@ -11,6 +11,16 @@
 - name: Configure every host and join it to the substrate
   hosts: "{{ provision_hosts | default('all') }}"
   become: true
+  pre_tasks:
+    # A check of the whole inventory. An elastic node and an image build
+    # use an inventory of one host alone, so they skip the check.
+    - name: Check the redis-primary placement
+      when: >-
+        not (image_build | default(false) | bool)
+        and enrollment_argv is not defined and bootstrap_revision is not defined
+      ansible.builtin.include_role:
+        name: profile
+        tasks_from: redis_primary
   roles:
     - role: enroll
       when: enrollment_argv is defined

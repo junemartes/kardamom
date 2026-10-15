@@ -28,6 +28,7 @@ alloy-rpc-client.workspace = true
 async-trait = "0.1"
 futures.workspace = true
 jsonrpsee = { workspace = true }
+rkyv.workspace = true
 metrics = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true

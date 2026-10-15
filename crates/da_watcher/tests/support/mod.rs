@@ -1,6 +1,6 @@
-//! The fixture of the L1 cursor and follow tests: one test's cursor file
-//! in its own directory, the publisher that sees every epoch across the
-//! test's restarts, and a mock L1 source.
+//! The fixture of the L1 watcher tests: one test's cursor file in its own
+//! directory, the publisher that sees every epoch across the test's
+//! restarts, and the scripted `l1_blocks` stream.
 
 #![allow(dead_code, reason = "each test binary uses a part of the fixture")]
 
@@ -9,22 +9,22 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use kardamom_da_watcher::feed::fakes::{ScriptedFeed, ScriptedStream};
 use kardamom_da_watcher::publisher::fakes::{InMemoryEpochPublisher, PublisherTap};
-use kardamom_da_watcher::source::fakes::MockL1Source;
 use kardamom_da_watcher::{
     CursorError, CursorFile, DaWatcherConfig, L1Cursor, L1ResumeAfter, L1Watcher,
 };
 use kardamom_types::EpochRecord;
 use tokio::sync::watch;
 
-pub(crate) type Watcher = L1Watcher<MockL1Source, InMemoryEpochPublisher>;
+pub(crate) type Watcher = L1Watcher<ScriptedFeed, InMemoryEpochPublisher>;
 
-/// One test's cursor file in its own directory, and the publisher that
-/// sees every epoch across the test's restarts.
+/// One test's cursor file in its own directory, the publisher that sees
+/// every epoch across the test's restarts, and the stream.
 pub(crate) struct Rig {
     pub(crate) dir: tempfile::TempDir,
     pub(crate) publisher: InMemoryEpochPublisher,
+    pub(crate) stream: ScriptedStream,
     tap: PublisherTap,
     /// Every epoch the tap gave so far: the tap hands each epoch out once.
     seen: RefCell<Vec<EpochRecord>>,
@@ -36,6 +36,7 @@ impl Rig {
         Self {
             dir: tempfile::tempdir().unwrap(),
             publisher,
+            stream: ScriptedStream::default(),
             tap,
             seen: RefCell::new(Vec::new()),
         }
@@ -51,45 +52,41 @@ impl Rig {
 
     pub(crate) fn config(resume_after: Option<u64>) -> DaWatcherConfig {
         DaWatcherConfig {
-            lockbox: Address::repeat_byte(0xC0),
-            poll_interval: Duration::from_millis(5),
+            tick: Duration::from_millis(5),
+            silence: Duration::from_secs(3600),
             resume_after: resume_after
                 .map(|b| L1ResumeAfter::from(NonZeroU64::new(b).expect("a test block is not 0"))),
         }
     }
 
-    /// A watcher over `src` with this rig's cursor file, before its
-    /// `load_cursor`.
-    pub(crate) fn watcher(&self, src: MockL1Source, resume_after: Option<u64>) -> Watcher {
+    /// A watcher that sees the next `tips` of the stream, one per pass,
+    /// with this rig's cursor file, before its `load_cursor`.
+    pub(crate) fn watcher(&self, tips: &[u64], resume_after: Option<u64>) -> Watcher {
+        self.stream.tips(tips);
         L1Watcher::new(
             self.publisher.clone(),
-            src,
+            self.stream.feed(),
             Self::config(resume_after),
             Some(self.file()),
         )
     }
 
-    /// A watcher over `src` with this rig's cursor file, after its
-    /// `load_cursor`. Dropping the watcher releases the file's lock: that
-    /// is a restart.
+    /// The same, after its `load_cursor`. Dropping the watcher releases
+    /// the file's lock: that is a restart.
     pub(crate) fn start(
         &self,
-        src: MockL1Source,
+        tips: &[u64],
         resume_after: Option<u64>,
     ) -> Result<Watcher, CursorError> {
-        let mut w = self.watcher(src, resume_after);
+        let mut w = self.watcher(tips, resume_after);
         w.load_cursor()?;
         Ok(w)
     }
 
     /// A watcher that follows the sealer through `origins`, after its
     /// `load_cursor`.
-    pub(crate) fn follow(
-        &self,
-        src: MockL1Source,
-        origins: &watch::Sender<Option<u64>>,
-    ) -> Watcher {
-        let mut w = self.watcher(src, None).following(origins.subscribe());
+    pub(crate) fn follow(&self, tips: &[u64], origins: &watch::Sender<Option<u64>>) -> Watcher {
+        let mut w = self.watcher(tips, None).following(origins.subscribe());
         w.load_cursor().unwrap();
         w
     }
@@ -117,20 +114,11 @@ impl Rig {
     }
 }
 
-/// A source whose finalized tip reads `tips`, in order, one per tick.
-pub(crate) fn source(tips: &[u64]) -> MockL1Source {
-    let src = MockL1Source::new();
-    for tip in tips {
-        src.push_tip(Ok(*tip));
-    }
-    src
-}
-
-/// The cursor at block `number` of the mock's chain.
+/// The cursor at block `number` of the scripted chain.
 pub(crate) fn at(number: u64) -> L1Cursor {
     L1Cursor {
         number,
-        hash: MockL1Source::filler_hash(number),
+        hash: ScriptedStream::hash(number),
     }
 }
 

@@ -15,8 +15,10 @@ import org.junit.jupiter.api.Test;
 final class AdminServerTest {
     private static final long LAG = 1024;
 
-    private static final MemberStatus READY = new MemberStatus(0, "LEADER", "CLOSED", 10, 10);
-    private static final MemberStatus BEHIND = new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10);
+    private static final MemberStatus.SnapshotVersions SNAPSHOT = MemberStatus.SnapshotVersions.of(0);
+    private static final MemberStatus READY = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT);
+    private static final MemberStatus BEHIND =
+        new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT);
 
     private static HttpResponse<String> get(final AdminServer admin, final String path)
             throws IOException, InterruptedException {

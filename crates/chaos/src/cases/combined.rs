@@ -16,7 +16,7 @@ use crate::cases::component::executor_containers;
 use crate::cases::fleet::{FULL_RESTART_ELECTION, await_exporter_back, sealers};
 use crate::cases::validator::COMMITTED;
 use crate::harness::Harness;
-use crate::nomad::{Job, SavedJob};
+use crate::nomad::{Alloc, Job, SavedJob};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 
@@ -204,12 +204,7 @@ impl Class {
     /// after the pause and again at the end.
     async fn assert_no_restart(self, h: &Harness, ctx: &str) -> anyhow::Result<()> {
         let allocs = h.nomad.running(self.job()).await?;
-        let restarted: Vec<String> = allocs
-            .iter()
-            .map(|a| (a.short_id(), a.task_restarts()))
-            .filter(|(_, n)| *n > 0)
-            .map(|(id, n)| format!("{id} restarted {n} times"))
-            .collect();
+        let restarted: Vec<String> = allocs.iter().filter_map(Alloc::restart_note).collect();
         anyhow::ensure!(
             allocs.len() == self.count() && restarted.is_empty(),
             "{}: {ctx}: the {} job did not wait for the classes it needs: {} of {} running, {}",

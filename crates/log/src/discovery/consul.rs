@@ -143,19 +143,30 @@ impl ConsulClient {
         }
     }
 
-    /// Send a request whose only interesting outcome is success.
-    async fn send_ok(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(), LogError> {
+    /// Send `req` within `timeout`, and return the answer when its status
+    /// is a success.
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<reqwest::Response, LogError> {
         let resp = req
-            .timeout(self.request_timeout)
+            .timeout(timeout)
             .send()
             .await
-            .map_err(|e| LogError::Discovery(format!("{what}: {e}")))?;
+            .map_err(|e| LogError::catalog_send(what, &e))?;
         let status = resp.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(resp);
         }
         let body = resp.text().await.unwrap_or_default();
-        Err(LogError::Discovery(format!("{what}: {status}: {body}")))
+        Err(LogError::catalog_status(what, status, &body))
+    }
+
+    /// Send a request whose only interesting outcome is success.
+    async fn send_ok(&self, req: reqwest::RequestBuilder, what: &str) -> Result<(), LogError> {
+        self.send(req, self.request_timeout, what).await.map(|_| ())
     }
 
     /// # Errors
@@ -223,18 +234,8 @@ impl ConsulClient {
         let timeout = query.wait + query.wait / 16 + self.request_timeout;
         let what = format!("query {}", query.service);
         let path = format!("/v1/health/service/{}", query.service);
-        let resp = self
-            .request(reqwest::Method::GET, &path)
-            .query(&params)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| LogError::Discovery(format!("{what}: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LogError::Discovery(format!("{what}: {status}: {body}")));
-        }
+        let req = self.request(reqwest::Method::GET, &path).query(&params);
+        let resp = self.send(req, timeout, &what).await?;
         let index = resp
             .headers()
             .get(INDEX_HEADER)

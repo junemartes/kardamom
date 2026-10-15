@@ -296,9 +296,8 @@ fn a_floor_is_looked_up_when_a_park_asked_and_a_source_answered() {
 fn the_tables_are_the_shards() {
     let names = |table: &[Combined]| -> Vec<&str> { table.iter().map(|c| c.case.name()).collect() };
     assert_eq!(names(&ALL), Shard::CombinedOrdering.cases());
-    // The read-path and the sequencer-and-Redis rows run by name only,
-    // until the defects they found are fixed.
-    assert_eq!(names(&ALL_EXEC[..3]), Shard::CombinedExec.cases());
+    // The sequencer-and-Redis row runs by name only.
+    assert_eq!(names(&ALL_EXEC[..4]), Shard::CombinedExec.cases());
     for c in ALL.iter().chain(&ALL_EXEC) {
         // A stall needs the sealers down; a seal-only case keeps them.
         assert_eq!(

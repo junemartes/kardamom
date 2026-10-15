@@ -90,7 +90,10 @@ pub enum Case {
     L1NullReceipts,
     TwoDayOutage,
     BatcherOutagePastRetention,
+    FollowerInstanceLoss,
+    FollowerTotalLoss,
     ExecutorRestartStorm,
+    FollowerDisagreement,
 }
 
 // A slice, not a fixed-size array: two branches that each add a case
@@ -155,7 +158,10 @@ const ALL: &[Case] = &[
     Case::L1NullReceipts,
     Case::TwoDayOutage,
     Case::BatcherOutagePastRetention,
+    Case::FollowerInstanceLoss,
+    Case::FollowerTotalLoss,
     Case::ExecutorRestartStorm,
+    Case::FollowerDisagreement,
 ];
 
 impl Case {
@@ -234,7 +240,10 @@ impl Case {
             Self::L1NullReceipts => "l1-null-receipts",
             Self::TwoDayOutage => "two-day-outage",
             Self::BatcherOutagePastRetention => "batcher-outage-past-retention",
+            Self::FollowerInstanceLoss => "follower-instance-loss",
+            Self::FollowerTotalLoss => "follower-total-loss",
             Self::ExecutorRestartStorm => "executor-restart-storm",
+            Self::FollowerDisagreement => "follower-disagreement",
         }
     }
 
@@ -247,7 +256,10 @@ impl Case {
             Self::L1Liar
             | Self::L1NullReceipts
             | Self::TwoDayOutage
-            | Self::BatcherOutagePastRetention => k.l1_tps,
+            | Self::BatcherOutagePastRetention
+            | Self::FollowerInstanceLoss
+            | Self::FollowerTotalLoss
+            | Self::FollowerDisagreement => k.l1_tps,
             _ => k.tps,
         }
     }
@@ -344,6 +356,12 @@ impl Case {
                     + k.retention_freeze_cap
                     + Duration::from_mins(5)
             }
+            // The freeze, the resume, and the commit of the last epoch.
+            Self::FollowerInstanceLoss => inject + k.l1_fault + Duration::from_mins(5),
+            // The stop, the resume, and the commit of the last epoch.
+            Self::FollowerTotalLoss => inject + Duration::from_mins(9),
+            // The lead, the halt, the heal, and the commit after it.
+            Self::FollowerDisagreement => inject + Duration::from_mins(14),
             // The freeze until the floor passes, the restart, and the
             // rebuild of the gap after it.
             Self::BatcherOutagePastRetention => {
@@ -486,7 +504,10 @@ impl Case {
             Self::L1NullReceipts => l1::null_receipts(h).await,
             Self::TwoDayOutage => l1::two_day_outage(h).await,
             Self::BatcherOutagePastRetention => l1::batcher_outage_past_retention(h).await,
+            Self::FollowerInstanceLoss => l1::follower_instance_loss(h).await,
+            Self::FollowerTotalLoss => l1::follower_total_loss(h).await,
             Self::ExecutorRestartStorm => fleet::executor_restart_storm(h).await,
+            Self::FollowerDisagreement => l1::follower_disagreement(h).await,
         }
     }
 }
@@ -509,6 +530,7 @@ mod tests {
             crate::Shard::Retention,
             crate::Shard::Cache,
             crate::Shard::L1,
+            crate::Shard::Follower,
             crate::Shard::Integrity,
         ] {
             shard

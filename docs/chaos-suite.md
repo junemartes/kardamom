@@ -62,10 +62,11 @@ There are fourteen shards. `just container-test` lists their names. Thirteen run
 | `chaos-fleet` | `executor-fleet-loss-recover`, `executor-fleet-wipe-recover`, `executor-fleet-total-wipe-recover`, `redis-total-loss-recover`, `cluster-quorum-loss-recover`, `cluster-total-loss-recover`, `sealer-fleet-total-wipe-recover` | `RUN_LOAD=0` |
 | `chaos-coordinated` | `ingress-pair-loss-recover`, `sequencer-lane-loss-recover`, `pipeline-blackout-recover` | `RUN_LOAD=0` |
 | `chaos-combined-ordering` | `ingress-sequencer-loss-recover`, `ingress-sealer-loss-recover`, `sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-loss-recover`, `ingress-sequencer-sealer-reverse` | `RUN_LOAD=0` |
-| `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover` | `RUN_LOAD=0` |
+| `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
 Case order matters in five places.
@@ -76,7 +77,7 @@ Case order matters in five places.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 
-`chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
+`chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
 
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
@@ -130,7 +131,7 @@ Each case name links to the section of [`failure-modes.md`](failure-modes.md) th
 - [`executor-fleet-loss-recover`](failure-modes.md#executor): all three executor nodes die. Each executor resumes from its own state.
 - [`executor-fleet-wipe-recover`](failure-modes.md#executor): kills the three executor tasks, stops the job, and wipes every state database while no executor runs. Each executor restores from its local checkpoint.
 - [`executor-fleet-total-wipe-recover`](failure-modes.md#executor): all state and checkpoints are wiped. Every executor resumes from a state rebuilt from L1.
-- [`redis-total-loss-recover`](failure-modes.md#redis-account-cache): the whole Redis job stops. Every state mirror must rebuild.
+- [`redis-total-loss-recover`](failure-modes.md#redis-account-cache): the whole Redis job stops. Every state mirror must rebuild. No sentinel may restart on the cold start.
 - [`cluster-quorum-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): two sealer members die. The pipeline must stall, then recover.
 - [`cluster-total-loss-recover`](failure-modes.md#sealer-the-aeron-cluster-raft): all three sealer members die and return with their logs.
 - [`sealer-fleet-total-wipe-recover`](failure-modes.md#proof-sealer-fleet-total-wipe-recover): all three sealer members lose their directories. The chain restarts after the posted head from a seed and a state rebuilt from L1. The blocks after the posted head are reverted.
@@ -169,7 +170,8 @@ The executors are dark in every case, so the head the judgement reads is the hig
 - [`ingress-executor-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor nodes and the ingress tasks die. The sealers order the transactions in flight, so the head advances. The executors return first and publish the receipts of their replay while no ingress listens; the ingresses return 60 s later. Before the fault, the case sends one transfer from the gate account through ingress-0 and waits for its receipt. After the return, every ingress must serve that receipt and must count a receipt served from an executor's state since its restart (`kardamom_cache_lookups_total{layer="receipt",outcome="state_hit"}` above zero; the counter starts at zero with the process): the restarted memory caches hold nothing, so the state query served it. The load's drain asks every ingress for the receipts it still misses, which drives the same path at scale.
 - [`read-path-loss-recover`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the executor tasks, the redis job and the state-mirror tasks die. The head advances, and a cold read degrades. Redis returns empty, the mirrors return 30 s later and wait for a checkpoint, the executors return 30 s after that. Every mirror must log `rebuild: done`, and the readers must use Redis again with no degraded read.
 - [`sequencer-executor-redis-loss`](failure-modes.md#combined-outages-with-the-executors-chaos-combined-exec-shard): the sequencer tasks, the executor tasks and the redis job die: no source of a sender floor is left. The head advances, and a cold read degrades. The sequencers return first and must park every established sender, Redis returns empty 30 s later, the executors 30 s after that. Every lane-0 replica must have asked for a floor (`kardamom_sequencer_nonce_lookup_requests_total`) and got one from an executor or from Redis (`kardamom_sequencer_nonce_lookups_total{outcome="ok"|"redis"}`), and no ref may sit below a floor. The load is pinned to shard 0. The load verdict proves that no nonce gap remains.
-- `read-path-loss-recover` and `sequencer-executor-redis-loss` are in no shard yet. Run them by name with `KARDAMOM_CHAOS_CASES`. They fail on open defects: a cold start of the redis job crash-loops the sentinels (#560), a sender sticks after an outage of every executor (#559), and `sequencer-executor-redis-loss` also hits the Aeron driver error (#545). See [Known gaps](failure-modes.md#known-gaps-untested-failure-surface).
+- `sequencer-executor-redis-loss` is in no shard yet. Run it by name with `KARDAMOM_CHAOS_CASES`. The Aeron driver error (#545) can fail it. See [Known gaps](failure-modes.md#known-gaps-untested-failure-surface).
+- On a local host, the shard takes about 45 minutes after a bring-up of about 21 minutes. `read-path-loss-recover` alone takes about 12 minutes with the smoke gate and the tail. The job timeout is 120 minutes.
 - The load of every exec case gets 90 submit retries. With the executors down and the ingress up, each attempt parks 30 s at the ingress and times out with no receipt.
 
 **Retention shard**
@@ -186,15 +188,16 @@ The executors are dark in every case, so the head the judgement reads is the hig
 
 **L1 shard**
 
-- [`l1-liar`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
-  - The wrong hash halts the single-source followers. The case then does the operator step.
-  - It restarts the da-watcher from its registered job, with no flag. The start resumes after the L1 origin of the sealer and reads the hash of that block again. It never removes the cursor file.
-  - The cursor file of the da-watcher must then stand at or before the L1 origin of the sealer, within 60 s.
-  - It re-indexes the archive of each follower instance (the aux node and `ingress-0`) from the first block of the chain.
+- [`l1-liar`](failure-modes.md#l1-follower): serves a wrong block hash, a broken parent chain and swallowed settlement logs, one after the other.
+  - The L1 follower reads two sources: the proxy and its second source (`/second`). Each lie is a disagreement of the two: the follower halts and publishes none of it, and the da-watcher pauses with the follower as its root (`kardamom_paused{root_service="l1-indexer"}`).
+  - Each one resumes by itself when the lie stops. No operator step.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
+- [`follower-instance-loss`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0` for the fault window, during load. The da-watcher must not pause or wait, must publish past its start, and must publish one epoch for each block. The batcher must post, and no origin gap may remain.
+- [`follower-disagreement`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0`, then serves it a fork that is consistent in itself (`Fault::ForkedChain`, scoped to that node's address). The honest instance leads past the fork's first block; the thawed liar's records must halt the da-watcher on `l1_follower_disagreement`. The validator's own L1 read must verify epochs with no epoch fault. The case then runs the runbook: the fault ends, the liar's archive is wiped, the follower restarts, the da-watcher's halt is cleared. The da-watcher must publish again, and no origin gap may remain.
+- [`follower-total-loss`](failure-modes.md#l1-follower): stops the `l1-indexer` job for 75 s, past the da-watcher's silence window. The da-watcher must pause with the follower as its root. After the restart, it must resume with one epoch for each block since the start, and no origin gap may remain.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.
-  - The heal of the followers is the `l1-liar` operator step.
+  - The follower and the da-watcher resume by themselves when the fault clears.
 - [`batcher-outage-past-retention`](failure-modes.md#batcher-live-service-cluster-egress-driven): freezes the batcher while twice the retention flows past its cursor and a sealer snapshot lands. It then thaws the batcher.
   - Each freeze attempt finds the batcher container again. A restart between two attempts can replace the container.
   - The frozen group must land on L1 right after the covered block. The case finds the first batch that ends past the covered block, and that batch must start at the next block. More batches can land before the poll reads L1, so the case does not read the last batch.
@@ -379,7 +382,7 @@ The steps share one budget of 300 s. A failure names the first step that did not
 
 ## The L1 fault proxy
 
-`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` shard uses it. The code is in `crates/l1_fault_proxy`.
+`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` and `chaos-follower` shards use it. The code is in `crates/l1_fault_proxy`.
 
 - The proxy forwards every call to the upstream L1 (`--upstream`, env `KARDAMOM_L1_UPSTREAM`).
 - It changes the reply as the active faults say.
@@ -388,6 +391,8 @@ The steps share one budget of 300 s. A failure names the first step that did not
 
 **Fault kinds.** A fault is a JSON object with a `kind` field.
 
+The proxy serves two sources. The root path lies as the active faults say. The path `/second` serves L1 faithfully, refuses nothing, and serves only a fault scoped to the caller's address (`ForkedChain` with `client`).
+
 | Kind | Parameter | Effect |
 |---|---|---|
 | `None` | none | Serves L1 faithfully. |
@@ -395,6 +400,7 @@ The steps share one budget of 300 s. A failure names the first step that did not
 | `BrokenParentChain` | `from_block` | Corrupts only `parentHash`. Each block looks right alone. |
 | `SwallowLogs` | `address` | Drops every log of the address from an `eth_getLogs` reply. |
 | `NullReceipts` | `from_block` | Answers `null` for the receipts of blocks at or above `from_block`. |
+| `ForkedChain` | `from_block`, `client` (optional) | Serves a fork that is consistent in itself from `from_block` on: every block hash, every later parent hash and every log's block hash map through one function. With `client`, only the calls from that peer address see it. |
 | `RateLimit` | none | Answers HTTP 429 to every call. |
 | `Down` | none | Answers HTTP 503 to every call and closes the connection. `Down` wins over `RateLimit`. |
 
@@ -412,11 +418,11 @@ Several faults can be active at once. They model one bad endpoint.
 **`KARDAMOM_L1_FAULT_PROXY=1`.** This switch of the deploy changes the cluster in these ways.
 
 - It deploys the `l1-fault-proxy` job (`deploy/cluster/nomad/l1-fault-proxy.nomad.hcl`) before its consumers.
-- The da-watcher, the indexer and the batcher read L1 through the proxy.
-- The followers therefore read one source, the proxy.
+- The indexer (the L1 follower) reads two sources: the proxy, and the proxy's second source `/second`, which serves L1 except a fault scoped to the caller's address. The batcher reads the proxy. The da-watcher reads the follower's stream.
+- A lie of the proxy is therefore a disagreement for the follower: it halts and publishes none of it.
 - The in-cluster anvil finalizes two blocks behind its head (one slot in each epoch). The followers walk finalized blocks.
 - The inbox indexer starts at block 1, so its archive holds every batch.
-- The `chaos-l1` shard sets the switch itself. The default is `0`.
+- The `chaos-l1` and `chaos-follower` shards set the switch themselves. The default is `0`.
 
 [`failure-modes.md`](failure-modes.md#batcher-live-service-cluster-egress-driven) lists what the cases prove, and which two-source checks stay open.
 
@@ -458,8 +464,8 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `KARDAMOM_EXEC_CURSOR` | `off` (`on` in `chaos-executor`) | `on` when the deployed executors send their recorded cursor to the sealer. The bring-up of `chaos-executor` deploys it on. `hard-executor` checks the sealer's best cursor only when it is `on`. |
 | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | unset | The DA-lag budget of the deployed sealer, in blocks. `da-lag-halt` needs it. It must be a positive number, so the knob cannot pass 0. |
 | `RETENTION_FREEZE_CAP_S` | `600` | The hard cap of the adaptive retention freeze. |
-| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` cases stays active. |
-| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
+| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` and `chaos-follower` cases stays active. |
+| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` and `chaos-follower` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
 | `RUN_LOAD` | `1` | `1` when the load stage ran on this cluster. The chaos shards set `0`. The resize case then takes a load-reserve account. |
 
 ### CPU squeeze knobs

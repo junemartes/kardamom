@@ -43,6 +43,9 @@ Notes on the table:
 - The monitoring job scrapes each exporter by its Consul node name: `<class>-<i>.node.<datacenter>.consul:<port>`.
   The job renders the targets from the node-class counts (`executor_count`, `sequencer_count`, `ingress_count`).
   A larger class gets its targets at the next deploy.
+- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier and the canary) are targets in every health state.
+  A halt or a pause fails `/ready` by design, so Consul marks the service critical. A healthy-only list would drop the target exactly when the halt and pause alerts need its metrics.
+  A dead process stays a registered target and reads as `up == 0`.
 
 ### Labels and the sealer series
 
@@ -266,7 +269,7 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomBatcherResumeFailures` | critical | A batcher start failed to read L1 in the last 10 minutes. |
 | `KardamomL1IndexerTickErrors` | critical | More than half of the indexer ticks fail for 15 minutes. |
 | `KardamomDaWatcherTickErrors` | critical | More than half of the da-watcher ticks have an outcome other than `ok` for 15 minutes. |
-| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
+| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip that the validator's own L1 read sees (`validator_l1_finalized_block_number`; the follower's own tip without a validator L1 check) for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
 | `KardamomL1FollowerWakeOverdue` | critical | A follower instance is more than 2 minutes past its planned wake time for 2 minutes. Runbook: [`l1_follower_wake_overdue`](runbooks/l1_follower_wake_overdue.md). |
 | `KardamomL1SourceDisagreement` | critical | Two L1 sources gave different answers in the last 10 minutes. The follower halts. |
 | `KardamomValidatorEpochsUnverified` | warning | The validator committed an epoch without an L1 check in the last 10 minutes. |
@@ -315,6 +318,9 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
+- `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
+  - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
+  - Growth on a steady fleet means a node runs a release of another schema.
 - `validator_bal_sub_reopen_total` counts the reopens of the `tx_bal` subscription after 60 s of silence.
   - A few reopens on an idle cluster are noise.
   - Growth on a chain that progresses means the BAL delivery to that node is broken. The verification coverage drops.
@@ -344,15 +350,16 @@ The live batcher exports a settlement-health group on port 9002. See [l1-data-pa
 | `kardamom_batcher_pending_blocks` | Closed blocks that wait for the group to fill or flush. |
 | `kardamom_batcher_l1_post_retries_total` | Retries of L1 posts. It flags a flaky L1. |
 | `kardamom_batcher_skipped_posted_blocks_total` | Blocks that were seen again and dropped because L1 covers them. A restart causes a few. Growth means the cursor file is not persisted. |
-| `kardamom_batcher_last_post_age_seconds` | Age of the last `BatchPosted` block as L1 serves it. The batcher reads it from L1 every 10 seconds, not from its memory. It grows when the batcher stops posting and when the L1 endpoint hides its posts. |
+| `kardamom_batcher_last_post_age_seconds` | Age of the newest L1 block that carried a `BatchPosted` event, as the L1 follower's `l1_blocks` stream shows it. At start, the follower's archive gives the last post. The value never comes from the batcher's memory. It grows when the batcher stops posting, when the follower's sources hide its posts, and while the follower is down. |
 | `kardamom_batcher_idle_flush_seconds` | The idle flush wait. The alert compares the post age with twice this value. |
 | `kardamom_batcher_resume_failures_total` | Starts whose L1 read failed. The start retries in the process, so the counter stays scrapeable. |
 | `kardamom_batcher_rebuilt_blocks_total` | Blocks rebuilt from references after the sealer refused a replay. |
+| `kardamom_batcher_spool_dropped_total{reason}` | Spools dropped at start. `other-version`: a spool of another release. `unreadable`: a block file does not decode. `discontinuous`: the spool does not continue the confirmed cursor. The sealer serves the range again. One after a deploy is expected. Growth means the spool disk is bad. |
 | `kardamom_batcher_feed_running` | 1 when the feed loop runs over the restored spool. The readiness rule needs it. |
 
 ### L1 sources
 
-The da-watcher and the indexer export these metrics. See "Two L1 sources for the followers" in [l1-data-path.md](l1-data-path.md).
+The indexer (the L1 follower) exports these metrics. See "Two L1 sources for the followers" in [l1-data-path.md](l1-data-path.md).
 
 | Metric | Meaning |
 | --- | --- |
@@ -363,18 +370,20 @@ The da-watcher and the indexer export these metrics. See "Two L1 sources for the
 
 | Metric | Meaning |
 | --- | --- |
-| `kardamom_da_watcher_tick_total{outcome}` | Loop ticks. The outcomes are `ok`, `chain_break`, `parse_error`, and `rpc_error`. |
-| `kardamom_da_watcher_l1_finalized_block_number` | Newest finalized L1 block that the watcher saw. |
+| `kardamom_da_watcher_tick_total{outcome}` | Passes over the `l1_blocks` records. The outcomes are `ok` (epochs published), `chain_break`, and `disagreement`. |
+| `kardamom_da_watcher_l1_finalized_block_number` | Newest finalized L1 block that the `l1_blocks` stream carried to the watcher. |
+| `kardamom_da_watcher_waiting_for_l1_block{number}` | 1 while the watcher waits for the record of the block `number` names: no archive holds it, and it is not on the stream. The watcher is paused on the follower meanwhile. |
 | `kardamom_da_watcher_epoch_origin_block_number` | Newest L1 block with a published epoch. The difference to the finalized block is the origin lag. |
 | `kardamom_da_watcher_epochs_published_total` | Epochs published. One for each finalized L1 block. |
 | `kardamom_da_watcher_deposits_detected_total` | Deposit publishes. A range that is retried after back-pressure counts again. |
-| `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last tick. The readiness rule uses it. |
+| `kardamom_da_watcher_last_tick_unix_seconds` | Unix time of the last housekeeping tick. The readiness rule uses it. |
 | `kardamom_da_watcher_l1_confirmed_origin` | The L1 origin of the sealer, as the boundaries carry it: the last epoch that the sealer committed. The cursor file holds it. |
 | `kardamom_da_watcher_epochs_unconfirmed` | Published epochs that no boundary confirmed yet. It stays near 0 while the sealer commits. At 2048, the watcher publishes no new epoch. |
 | `kardamom_da_watcher_epochs_republished_total` | Epochs published again, because no boundary confirmed them within 30 s. |
 | `kardamom_da_watcher_l1_cursor_persist_failures_total` | Failed writes of the L1 cursor file. A failure is not fatal: a restart publishes epochs again, and the sealer drops them. A growing count moves the restart point further back. |
 
-- A `chain_break` outcome means a block did not descend from the block before it. The watcher halts at that block.
+- A `chain_break` outcome means a record did not descend from the watcher's head. The watcher halts at that block and reads it again from the archives every tick.
+- A `disagreement` outcome means two records of one block had different hashes. The watcher halts until an operator clears it.
 - The interop watcher exports `kardamom_da_watcher_remote_*` counters with the label `origin` (the peer chain id).
 
 ### Publications

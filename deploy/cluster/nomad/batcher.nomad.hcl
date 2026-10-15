@@ -82,20 +82,32 @@ variable "executor_count" {
   default     = 3
 }
 
-# The inbox indexer's API. With it, a batcher whose node is fresh resumes
-# just past the last posted batch (public #455). Empty: no indexer, the
-# job's replay-from-genesis behavior.
-# The settlement's deployment block: where a BatchPosted scan starts. A
-# public endpoint caps a log query's range; 0 suits anvil.
-variable "settlement_deploy_block" {
+# The L1 follower's API. A batcher whose node is fresh resumes just past
+# the last posted batch from its archive, and the post age starts from
+# the last post it holds. The batcher reads no BatchPosted log itself: it
+# learns its posts from the follower's l1_blocks stream.
+variable "indexer_url" {
   type        = string
-  description = "The settlement's deployment block on L1. Empty: 0."
+  description = "The L1 follower's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
   default     = ""
 }
 
-variable "indexer_url" {
+# The sealer's DA-lag budget, in blocks: the same deploy value as the
+# cluster job's (KARDAMOM_DA_LAG_BUDGET_BLOCKS). The batcher posts once
+# the sealed head is half of it past the posted head, so the sealer's
+# guard stays a backstop. Empty: the binary's default, 10000, the
+# cluster job's default.
+variable "da_lag_budget_blocks" {
   type        = string
-  description = "The inbox indexer's JSON-RPC endpoint (nomad/l1-indexer.nomad.hcl). Empty: none."
+  description = "The sealer's DA-lag budget in blocks; the batcher posts at half of it. Empty: 10000."
+  default     = ""
+}
+
+# Seconds with no l1_blocks record before the batcher pauses with the
+# follower as its root. Empty: the binary's default, 1152.
+variable "l1_silence_secs" {
+  type        = string
+  description = "Seconds with no l1_blocks record before the batcher pauses on the follower. Empty: 1152."
   default     = ""
 }
 
@@ -271,7 +283,8 @@ job "batcher" {
           ],
           var.indexer_url != "" ? ["--indexer-url", var.indexer_url] : [],
           var.idle_flush_ms != "" ? ["--idle-flush-ms", var.idle_flush_ms] : [],
-          var.settlement_deploy_block != "" ? ["--settlement-deploy-block", var.settlement_deploy_block] : [],
+          var.l1_silence_secs != "" ? ["--l1-silence-secs", var.l1_silence_secs] : [],
+          var.da_lag_budget_blocks != "" ? ["--da-lag-budget-blocks", var.da_lag_budget_blocks] : [],
         )
       }
 

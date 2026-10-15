@@ -28,6 +28,21 @@ import org.junit.jupiter.api.Test;
 class CanonicalSealerStateTest {
 
     @Test
+    void a_restored_state_knows_its_snapshot_version() {
+        CanonicalSealerState fresh = new CanonicalSealerState(8);
+        assertEquals(0, fresh.restoredSnapshotVersion(), "a fresh state came from no snapshot");
+        fresh.onRecord(id(1), payload("a"));
+
+        CanonicalSealerState current = CanonicalSealerState.load(fresh.takeSnapshot(), 8);
+        assertEquals(CanonicalSealerState.snapshotWriteVersion(), current.restoredSnapshotVersion());
+
+        int newest = CanonicalSealerState.snapshotReadMaxVersion();
+        CanonicalSealerState ahead = CanonicalSealerState.load(fresh.takeSnapshot(newest), 8);
+        assertEquals(newest, ahead.restoredSnapshotVersion());
+        assertEquals(1L, ahead.canonicalCount());
+    }
+
+    @Test
     void dedup_first_seen_only_relays_once() {
         CanonicalSealerState state = new CanonicalSealerState(8);
 
