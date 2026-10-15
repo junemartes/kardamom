@@ -779,3 +779,19 @@ fn archived_remote_epoch_needs_sixteen_byte_alignment() {
         "an 8 mod 16 address must be rejected"
     );
 }
+
+/// A relayed record that fills one session message encodes. One byte more
+/// is refused with a typed error.
+#[test]
+fn a_relayed_record_is_bounded_by_one_session_message() {
+    let max = kardamom_cluster_client::message::MAX_APP_PAYLOAD_LEN - (1 + 8 + 4);
+    let frame = encode_egress_record(3, &vec![0x5A; max]).unwrap();
+    assert_eq!(
+        frame.len(),
+        kardamom_cluster_client::message::MAX_APP_PAYLOAD_LEN
+    );
+    assert!(matches!(
+        encode_egress_record(3, &vec![0x5A; max + 1]),
+        Err(WireError::EntryTooLarge { len }) if len == max + 1
+    ));
+}

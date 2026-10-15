@@ -157,6 +157,7 @@ An offer to a session never waits. The service thread also runs the boundary tic
 | No frame leaves the backlog | 1 second. The clock restarts each time a frame leaves. | `offer deadline exhausted (back-pressure)` |
 | The backlog holds more bytes | 64 MiB. A replay of the default retention fits well below it. | `egress backlog over <n> bytes` |
 | A terminal offer result (not `CLOSED`) | at once | `terminal offer result <n>` |
+| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication` |
 
 - A session that is closing gets no more frames. The client reconnects, replays and recovers.
 - A role change drops all backlogs. The clients of a leader that steps down reconnect to the new leader and replay.
@@ -391,7 +392,11 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - Every member mounts `/opt/kardamom/seed` read-only. The procedure is the runbook [`sealer-fleet-rebuild`](../../docs/runbooks/sealer-fleet-rebuild.md).
 - The deploy does not pass `dedupCapacity`, `voidWindow`, `readyLagBytes` or `joinWatchdogS`. They keep the code defaults. The deploy sets the bootstrap through the task file, not through the property.
 - `decisionVersion`: the sealer job spec (`deploy/cluster/nomad/cluster.nomad.hcl`) names the version as a literal. `ClusterNodeTest` checks that it equals `DECISION_VERSION`. The start-up line `cluster decision version` shows it.
-- The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, and the application version is 0.3.0.
+- The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, sparse ingress images, and the application version is 0.3.0.
+- One session message, its 32-byte session header included, holds at most 1 MiB: the 8 MB log term divided by 8.
+  - A message above one MTU travels as many Aeron fragments. The consensus module and the service reassemble them.
+  - The Rust client opens its ingress publication and its egress channel with 8 MB sparse terms, so both directions carry 1 MiB. It refuses a larger payload before the offer.
+  - An egress frame above the maximum message length of a session's egress publication closes that session. See [Egress back-pressure](#egress-back-pressure).
 
 ### Decision version
 

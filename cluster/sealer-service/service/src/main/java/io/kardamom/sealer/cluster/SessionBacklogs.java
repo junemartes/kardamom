@@ -62,6 +62,13 @@ final class SessionBacklogs {
      */
     static final long BYTE_LIMIT = 64L * 1024 * 1024;
 
+    /**
+     * The offer result for a frame above the maximum message length of the
+     * session's egress publication. That length is the term length of the
+     * client's response channel divided by 8. No retry can succeed.
+     */
+    static final long FRAME_TOO_LONG = Long.MIN_VALUE;
+
     /** What happened to one offered frame. */
     enum Outcome {
         /** The session's egress publication took the frame. */
@@ -210,11 +217,23 @@ final class SessionBacklogs {
     /**
      * One offer of {@code frame}. ADMIN_ACTION means the publication rotated
      * its term, and Aeron asks for a retry at once, so this retries once.
+     *
+     * <p>Aeron throws for a frame above the maximum message length of the
+     * publication. It checks the length before it writes, so the
+     * publication stays intact. The throw must not leave the log callback:
+     * the leader then handles the log entry differently from the
+     * followers, whose offers always succeed. So the throw becomes
+     * {@link #FRAME_TOO_LONG}, a terminal result, and the session
+     * closes.</p>
      */
     private long attempt(final ClientSession session, final byte[] frame) {
         view.wrap(frame);
-        final long result = session.offer(view, 0, frame.length);
-        return result == Publication.ADMIN_ACTION ? session.offer(view, 0, frame.length) : result;
+        try {
+            final long result = session.offer(view, 0, frame.length);
+            return result == Publication.ADMIN_ACTION ? session.offer(view, 0, frame.length) : result;
+        } catch (final IllegalArgumentException aboveMaxMessageLength) {
+            return FRAME_TOO_LONG;
+        }
     }
 
     /**
@@ -243,7 +262,9 @@ final class SessionBacklogs {
      * while it gets no frames.
      */
     private void closeOnTerminal(final ClientSession session, final long result) {
-        if (result != Publication.CLOSED) {
+        if (result == FRAME_TOO_LONG) {
+            closeLoudly(session, "frame above the max message length of the egress publication");
+        } else if (result != Publication.CLOSED) {
             closeLoudly(session, "terminal offer result " + result);
         }
     }

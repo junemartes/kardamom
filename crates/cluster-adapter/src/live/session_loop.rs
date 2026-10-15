@@ -609,7 +609,7 @@ impl SessionLoop {
     /// publish the payload, then reply with the outcome.
     fn handle_one_offer(&mut self, req: OfferReq, now: u64) {
         let OfferReq { payload, reply } = req;
-        let outcome = match self.driver.wrap_app(&payload, now_ms_i64(now)) {
+        let outcome = match self.driver.wrap_app(payload.as_bytes(), now_ms_i64(now)) {
             Some(framed) => match self.ingress.publish_bytes(to_aligned(&framed)) {
                 Ok(_) => OfferOutcome::Accepted,
                 Err(_) => OfferOutcome::BackPressured,

@@ -457,13 +457,12 @@ impl Sequencer {
     ) -> ControlFlow<Result<(), SequencerError>> {
         // Each chunk rides one cluster app message (KIND_BATCH), which
         // amortizes the per-offer session round trip that dominated the
-        // sequencer's per-transaction cost. The chunk must stay under one
-        // Aeron MTU (about 1408 bytes): the hand-rolled cluster ingress
-        // path does not survive fragmented session messages. With the
-        // guard header (sender 20 bytes, nonce 8 bytes, deadline 8 bytes,
-        // tip 16 bytes), each entry is 99 bytes plus a 4 byte length
-        // prefix. 13 x 103 + 3 is about 1.31 KB, which stays under the
-        // MTU with margin (14 x 103 + 3 is over it). A 13:1 ratio still
+        // sequencer's per-transaction cost. With the guard header (sender
+        // 20 bytes, nonce 8 bytes, deadline 8 bytes, tip 16 bytes), each
+        // entry is 99 bytes plus a 4 byte length prefix, so a full chunk
+        // is 13 x 103 + 3 = 1,342 bytes. Aeron splits a message above one
+        // MTU into fragments, and the cluster reassembles them, up to one
+        // session message (`MAX_APP_PAYLOAD_LEN`). A 13:1 ratio already
         // amortizes away the dominant per-offer cost.
         const BATCH_MAX: usize = 13;
         let chunk = BATCH_MAX.min(rest.len());

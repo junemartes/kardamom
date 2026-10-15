@@ -38,6 +38,9 @@ pub(crate) const TEMPLATE_SESSION_KEEP_ALIVE: u16 = 5;
 pub(crate) const TEMPLATE_NEW_LEADER_EVENT: u16 = 6;
 
 const BLOCK_SESSION_MESSAGE_HEADER: u16 = 24;
+/// The length of a `SessionMessageHeader` in front of its payload: the
+/// SBE header and the root block.
+pub(crate) const SESSION_HEADER_LEN: usize = HEADER_LEN + BLOCK_SESSION_MESSAGE_HEADER as usize;
 #[cfg(test)]
 const BLOCK_SESSION_EVENT_MIN: u16 = 32;
 const BLOCK_SESSION_CONNECT_REQUEST: u16 = 16;

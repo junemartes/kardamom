@@ -15,6 +15,8 @@ edition.workspace = true
 default = []
 # Expose the in-memory gateway fakes for downstream-crate tests.
 testing = []
+# The real-Aeron tests in `tests/` (a Docker media driver).
+docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dependencies]
 kardamom-types.workspace = true
@@ -39,3 +41,4 @@ kardamom-cluster-adapter = { path = ".", features = ["testing"] }
 toml.workspace = true
 kardamom-sequencer = { path = "../sequencer" }
 kardamom-engine = { path = "../engine" }
+tokio.workspace = true

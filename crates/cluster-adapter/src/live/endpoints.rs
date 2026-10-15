@@ -8,11 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle};
 use rkyv::util::AlignedVec;
 
-use super::with_control_term_length;
+use super::control_channel;
 
 /// Parse a `memberId=host:port,…` list and open an ingress publication to
-/// the given member. Use small terms through [`with_control_term_length`]
-/// (see its doc for the reason).
+/// the given member, with the control term length of [`control_channel`].
 pub(super) fn open_leader_pub(
     rt: &AeronRuntime,
     endpoints: &str,
@@ -20,7 +19,7 @@ pub(super) fn open_leader_pub(
     stream_id: i32,
 ) -> Option<PubHandle> {
     let endpoint = endpoint_for_member(endpoints, member_id)?;
-    let uri = with_control_term_length(&format!("aeron:udp?endpoint={endpoint}"));
+    let uri = control_channel(&format!("aeron:udp?endpoint={endpoint}"));
     rt.open_publication(&uri, stream_id).ok()
 }
 

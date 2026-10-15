@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use kardamom_cluster_client::message::{AppPayload, PayloadTooLarge};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use thiserror::Error;
 
@@ -62,7 +63,7 @@ pub struct LiveClusterConfig {
 }
 
 struct OfferReq {
-    payload: Vec<u8>,
+    payload: AppPayload,
     reply: Sender<OfferOutcome>,
 }
 
@@ -94,12 +95,19 @@ pub struct LiveIngress {
 }
 
 impl ClusterIngress for LiveIngress {
+    /// Refuse a payload above the session message bound here, before it
+    /// reaches the session thread: Aeron refuses an offer above its
+    /// maximum message length, and a retry cannot succeed.
     fn offer(&mut self, payload: &[u8]) -> OfferOutcome {
+        let payload = match AppPayload::try_from(payload) {
+            Ok(payload) => payload,
+            Err(PayloadTooLarge { len }) => return OfferOutcome::TooLarge { len },
+        };
         let (reply_tx, reply_rx) = bounded(1);
         if self
             .req_tx
             .send(OfferReq {
-                payload: payload.to_vec(),
+                payload,
                 reply: reply_tx,
             })
             .is_err()
@@ -211,24 +219,32 @@ pub fn connect_with(
         .spawn_thread()
 }
 
-/// Append a small term length to a cluster control channel, unless the
-/// URI already pins one. Used for both the egress channel
-/// ([`SessionConnect::open_egress`]) and every ingress publication
-/// ([`endpoints::open_leader_pub`]). Small terms matter on both sides: a
-/// publication's log allocates at its term length on the client, and as
-/// the matching image on every cluster member's tmpfs. Cluster ingress
-/// and egress carry only a few KB/s of control and canonical frames, but
-/// Aeron's default 16 MB term allocates a log of about 50 MB per
-/// publication image. Session churn (chaos failovers, zombie-close
-/// reconnects) at 50 MB each exhausts the 1 GB tmpfs. The clustered
-/// service then dies with "insufficient usable storage", while Raft
-/// itself stays healthy: this shows up as a pipeline freeze right after
-/// failover. A 1 MB term cuts every such log by 16x.
-fn with_control_term_length(uri: &str) -> String {
+/// The term length of the cluster control channels. Aeron takes one
+/// message of at most a term length divided by 8, so an 8 MiB term
+/// carries a session message of [`MAX_SESSION_MESSAGE_LEN`], the same
+/// bound as the cluster log.
+///
+/// [`MAX_SESSION_MESSAGE_LEN`]: kardamom_cluster_client::message::MAX_SESSION_MESSAGE_LEN
+const CONTROL_TERM_LENGTH: &str = "8m";
+
+/// Append the control term length and sparse log buffers to a cluster
+/// control channel, unless the URI already pins a term length. The
+/// egress channel ([`SessionConnect::open_egress`]) and every ingress
+/// publication ([`endpoints::open_leader_pub`]) use it.
+///
+/// A log buffer is three terms. It lives on the tmpfs of the client and,
+/// as the matching image or egress publication, on the tmpfs of each
+/// cluster member. Session churn (chaos failovers, zombie-close
+/// reconnects) keeps old logs alive for a while. A full tmpfs kills the
+/// clustered service with "insufficient usable storage", while Raft stays
+/// healthy. Sparse log buffers take tmpfs pages only as the stream writes
+/// them, so a log of a quiet or short-lived session stays small.
+#[must_use]
+pub fn control_channel(uri: &str) -> String {
     if uri.contains("term-length") {
         uri.to_string()
     } else {
-        format!("{uri}|term-length=1m")
+        format!("{uri}|term-length={CONTROL_TERM_LENGTH}|sparse=true")
     }
 }
 
@@ -272,7 +288,7 @@ impl SessionConnect {
         opts: ConnectOptions,
     ) -> Result<Self, LiveError> {
         validate_config(&cfg)?;
-        cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
+        cfg.egress_channel = control_channel(&cfg.egress_channel);
         Ok(Self { rt, cfg, opts })
     }
 
@@ -408,6 +424,30 @@ mod tests {
             egress_stream_id: 102,
             keep_alive_interval_ms: 1000,
         }
+    }
+
+    #[test]
+    fn a_control_channel_has_an_8_mib_sparse_term() {
+        let uri = control_channel("aeron:udp?endpoint=127.0.0.1:9050");
+        assert_eq!(
+            uri,
+            "aeron:udp?endpoint=127.0.0.1:9050|term-length=8m|sparse=true"
+        );
+    }
+
+    #[test]
+    fn a_control_channel_keeps_a_pinned_term_length() {
+        let pinned = "aeron:udp?endpoint=127.0.0.1:9050|term-length=64k";
+        assert_eq!(control_channel(pinned), pinned);
+    }
+
+    #[test]
+    fn an_offer_above_the_bound_is_refused_before_the_session_thread() {
+        let (req_tx, req_rx) = unbounded();
+        let mut ingress = LiveIngress { req_tx };
+        let len = kardamom_cluster_client::message::MAX_APP_PAYLOAD_LEN + 1;
+        assert_eq!(ingress.offer(&vec![0; len]), OfferOutcome::TooLarge { len });
+        assert!(req_rx.is_empty(), "no request reaches the session thread");
     }
 
     #[test]

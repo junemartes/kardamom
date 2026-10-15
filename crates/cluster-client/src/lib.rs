@@ -19,6 +19,8 @@
 //! - [`protocol`]: a pure SBE codec for the client-facing cluster messages
 //!   (schema id 111, `io.aeron.cluster.codecs`). It has no native
 //!   dependencies.
+//! - [`message`]: the size bound of one session message, and the
+//!   payload type that carries it.
 //! - [`session`]: the sans-IO [`session::SessionDriver`] state machine. It
 //!   handles the connect handshake, keep-alive, `NewLeaderEvent` redirects,
 //!   and app framing.
@@ -30,5 +32,6 @@
 //! without a media driver.
 
 pub mod bytes;
+pub mod message;
 pub(crate) mod protocol;
 pub mod session;

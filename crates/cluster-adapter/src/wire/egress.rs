@@ -5,6 +5,7 @@
 //! parent module.
 
 use alloy_primitives::{Address, B256};
+use kardamom_cluster_client::message::MAX_APP_PAYLOAD_LEN;
 use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::RemoteEpochRecord;
@@ -405,18 +406,24 @@ where
 
 // ── encode (egress: mirrors Java framing, for tests and a Rust service mock) ─
 
+/// The framing in front of a relayed payload: kind, index and length.
+const RELAYED_HEADER_LEN: usize = 1 + 8 + 4;
+
 /// Frame a relayed record exactly as the Java service does. `payload` is the
 /// relayed payload (`[canonical_id:32][record_type][fields…]`).
 ///
 /// # Errors
 ///
-/// Returns [`WireError::EntryTooLarge`] if `payload.len()` does not fit
-/// in a `u32`. Every relayed payload rides one Aeron frame (MTU about
-/// 1408 bytes), far under that bound.
+/// Returns [`WireError::EntryTooLarge`] if the framed record does not fit
+/// one session message ([`MAX_APP_PAYLOAD_LEN`]).
 pub fn encode_egress_record(index: u64, payload: &[u8]) -> Result<Vec<u8>, WireError> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| WireError::EntryTooLarge { len: payload.len() })?;
-    let mut b = Vec::with_capacity(1 + 8 + 4 + payload.len());
+    let too_large = || WireError::EntryTooLarge { len: payload.len() };
+    let frame_len = RELAYED_HEADER_LEN
+        .checked_add(payload.len())
+        .filter(|&n| n <= MAX_APP_PAYLOAD_LEN)
+        .ok_or_else(too_large)?;
+    let len = u32::try_from(payload.len()).map_err(|_| too_large())?;
+    let mut b = Vec::with_capacity(frame_len);
     b.push(EGRESS_KIND_RELAYED);
     b.extend_from_slice(&index.to_le_bytes());
     b.extend_from_slice(&len.to_le_bytes());
