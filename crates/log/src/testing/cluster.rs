@@ -205,6 +205,65 @@ impl AeronTestCluster {
         Ok(())
     }
 
+    /// Freeze node `i` with `docker pause`, or thaw it with `docker
+    /// unpause`. A frozen media driver answers no client command until it
+    /// thaws. In external mode this is a no-op, since the operator
+    /// manages the MD.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails.
+    pub async fn set_frozen(&self, i: usize, frozen: bool) -> anyhow::Result<()> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(());
+        };
+        let verb = if frozen { "pause" } else { "unpause" };
+        let out = tokio::process::Command::new("docker")
+            .args([verb, c.container.id()])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "docker {verb} failed with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+
+    /// The labels of the counters of the media driver of node `i`, read
+    /// with Aeron's `AeronStat` in the container: one label per counter,
+    /// for example `pub-lmt: <registration id> <session id> <stream id>
+    /// <channel>` for each publication. In external mode this returns no
+    /// label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the docker command fails to run.
+    pub async fn driver_counter_labels(
+        &self,
+        i: usize,
+    ) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let Node::Container(c) = &self.nodes[i] else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+        // `AeronStat` prints the counters every second until it ends, so
+        // `timeout` ends it after a few prints.
+        let script = "timeout 6 java -cp /opt/aeron/aeron-all.jar \
+            -Daeron.dir=\"$AERON_DIR\" io.aeron.samples.AeronStat";
+        let out = tokio::process::Command::new("docker")
+            .args(["exec", c.container.id(), "sh", "-c", script])
+            .output()
+            .await?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" - ")
+                    .map(|(_, label)| label.trim().to_string())
+            })
+            .collect())
+    }
+
     /// Bring up a single-node cluster, spawn an [`AeronRuntime`] against
     /// its bind-mounted `aeron.dir`, and build a [`LogConfig`] whose
     /// `tx_data` channel is a plain IPC template rooted at

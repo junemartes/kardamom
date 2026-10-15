@@ -48,6 +48,32 @@ class ContiguityGuardTest {
         assertEquals(3L, state.canonicalCount());
     }
 
+    /**
+     * A refusal past the deadline moves nothing: the expected nonce stays
+     * at the refused nonce, and the refused id stays out of the window. A
+     * later nonce gets a contiguity reject until the client resubmits the
+     * refused nonce. The resubmit, with the same id and a new deadline, is
+     * fresh, and the later nonce follows it.
+     */
+    @Test
+    void guard_keeps_the_nonce_of_a_refusal_past_the_deadline() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        long open = state.blockNumber();
+        state.onRecord(id(1), sender(1), 0, NO_DEADLINE, payload("a"));
+        state.onTick(1_000L);
+
+        CanonicalSealerState.RecordOutcome late = state.onRecord(id(2), sender(1), 1, open, payload("late"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.PAST_DEADLINE, late.kind);
+        assertEquals(Optional.of(1L), state.expectedNonceOf(sender(1)), "a refusal must not advance");
+        CanonicalSealerState.RecordOutcome next = state.onRecord(id(3), sender(1), 2, NO_DEADLINE, payload("next"));
+        assertEquals(CanonicalSealerState.RecordOutcome.Kind.CONTIGUITY_REJECT, next.kind);
+        assertEquals(1L, next.expectedNonce);
+
+        assertTrue(state.onRecord(id(2), sender(1), 1, NO_DEADLINE, payload("resubmit")).relayed.isPresent());
+        assertTrue(state.onRecord(id(3), sender(1), 2, NO_DEADLINE, payload("next")).relayed.isPresent());
+        assertEquals(Optional.of(3L), state.expectedNonceOf(sender(1)));
+    }
+
     @Test
     void guard_dedup_absorbs_republished_copies_before_the_nonce_check() {
         // The sequencer republishes unconfirmed refs.

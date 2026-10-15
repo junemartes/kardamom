@@ -2,7 +2,8 @@
 # The release gate: the checks that refuse a release before any job
 # changes. Each refusal is distinct and names its cause:
 # 1. The last attempt is not still running.
-# 2. The chain stands on no halt and no pause.
+# 2. The chain stands on no halt and no pause. A purged sealer excuses
+#    its own sealer_no_quorum halt.
 # 3. The registry holds every image of the manifest.
 # 4. The formats of the target are safe against the accepted release.
 # 5. No sealer setting that every member must match changes in the
@@ -114,15 +115,37 @@
   check_mode: false
   when: workloads_gate_ingress_node | length > 0
 
+# A sealer that Nomad does not know is stopped on purpose: the coordinated
+# restart of the sealer purges the job, and this deploy brings it back.
+# The ingress then halts on sealer_no_quorum, and the gate excuses that
+# root and the upstream pauses on it. A registered sealer gets no excuse.
+- name: Read the registered sealer for the chain status
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
+
+- name: Keep the registered sealer
+  ansible.builtin.set_fact:
+    workloads_gate_cluster_job: "{{ workloads_registered_job }}"
+
+- name: Keep the halt causes that a stopped sealer excuses
+  ansible.builtin.set_fact:
+    workloads_gate_excused: "{{ ['sealer_no_quorum'] if workloads_gate_cluster_job.status == 404 else [] }}"
+    workloads_gate_pauses: >-
+      {{ ([workloads_gate_status.json.result.sealer.pause, workloads_gate_status.json.result.ingress.pause]
+          + (workloads_gate_status.json.result.services | map(attribute='pause') | list)) | reject('none') | list
+         if workloads_gate_ingress_node | length > 0 else [] }}
+
 # A deploy cannot tell a failed release from a halted environment, so it
 # starts only on a chain that stands on nothing.
 - name: Refuse a release while the chain stands on a halt or a pause
   ansible.builtin.assert:
     that:
-      - workloads_gate_status.json.result.roots | length == 0
-      - workloads_gate_status.json.result.sealer.pause is none
-      - workloads_gate_status.json.result.ingress.pause is none
-      - workloads_gate_status.json.result.services | rejectattr('pause', 'none') | list | length == 0
+      - workloads_gate_status.json.result.roots | rejectattr('cause', 'in', workloads_gate_excused) | list | length == 0
+      - >-
+        workloads_gate_pauses | length == workloads_gate_pauses | selectattr('reason', 'defined')
+        | selectattr('reason', 'equalto', 'upstream') | selectattr('root', 'defined') | rejectattr('root', 'none')
+        | selectattr('root.cause', 'in', workloads_gate_excused) | list | length
     fail_msg: >-
       Refused: the chain stands on a halt or a pause.
       Roots: {{ workloads_gate_status.json.result.roots | map(attribute='cause') | list }}.
@@ -238,16 +261,11 @@
   vars:
     workloads_job: "{{ workloads_sealer_job }}"
 
-- name: Read the registered sealer
-  ansible.builtin.include_tasks: read_job.yml
-  vars:
-    workloads_read_job: cluster
-
 - name: Keep the sealer settings that change
   ansible.builtin.set_fact:
     workloads_gate_sealer_changed: >-
-      {{ ([] if workloads_registered_job.status != 200 else
-          workloads_registered_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+      {{ ([] if workloads_gate_cluster_job.status != 200 else
+          workloads_gate_cluster_job.json.TaskGroups | map(attribute='Tasks') | map('first')
           | map(attribute='Env.JAVA_TOOL_OPTIONS') | map('regex_findall', workloads_gate_pattern)
           | map('map', 'join', '=') | map('symmetric_difference', workloads_gate_new) | flatten)
          | map('regex_replace', '=.*$', '') | unique }}

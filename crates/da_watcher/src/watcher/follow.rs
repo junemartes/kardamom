@@ -13,8 +13,8 @@
 //!   lost its queue, a leader kill, and a dropped session;
 //! - when C leaves the published range, the watcher anchors at C: below
 //!   the base (a sealer fleet seeded at an older origin), or past the head
-//!   (another watcher published the epochs). It reads C's hash through
-//!   its L1 source set, and the next block must descend from it.
+//!   (another watcher published the epochs). It takes C's hash from the
+//!   `l1_blocks` record of C, and the next block must descend from it.
 
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
@@ -27,9 +27,9 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::{L1Watcher, MonitorError, Position};
+use crate::feed::BlockFeed;
 use crate::metrics;
 use crate::publisher::{EpochPublisher, PublishError};
-use crate::source::L1Source;
 use crate::window::Confirm;
 
 /// How long a start waits for the first boundary before it resumes from
@@ -71,7 +71,7 @@ impl Confirmation {
     }
 }
 
-impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
+impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
     /// Follow the sealer's boundaries. `origins` holds the L1 origin of the
     /// last boundary, `None` before the first.
     #[must_use]
@@ -108,11 +108,13 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// - S > 0: resume after S, whatever the cursor file holds. A file
     ///   ahead of S (a sealer fleet seeded at an older origin) would skip
     ///   the epochs after S; a file behind S publishes copies the sealer
-    ///   drops. The first tick reads S's hash through the L1 source set,
-    ///   and the next block must descend from it. This also replaces a
-    ///   wrong hash in the file.
+    ///   drops. The watcher takes S's hash from the `l1_blocks` record of
+    ///   S, and replays the stream from S + 1; the next block must
+    ///   descend from S. This also replaces a wrong hash in the file.
+    ///   With no record of S, the watcher waits for it: it never
+    ///   publishes without the parent check.
     /// - S = 0: the sealer holds no epoch, and accepts any first one. The
-    ///   watcher resumes from the file, or at the finalized tip.
+    ///   watcher resumes from the file, or at the first record.
     /// - No boundary within [`START_WAIT`]: resume from the file. The
     ///   file holds an origin the sealer confirmed, so it is at or behind
     ///   the sealer's origin, except after a seed at an older origin. The
@@ -129,13 +131,13 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
                     ?stored,
                     "resuming after the sealer's L1 origin"
                 );
-                self.position = Position::After(origin.into());
+                self.resume_after(origin.into());
             }
             Some(None) => info!(
                 target: "da_watcher",
                 ?stored,
                 "the sealer holds no epoch yet; resuming from the cursor file, or at the \
-                 finalized tip"
+                 first record"
             ),
             None => warn!(
                 target: "da_watcher",
@@ -149,14 +151,14 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
 
     /// Apply the L1 origin a boundary carries. An origin in the published
     /// range confirms the epochs up to it. An origin outside it anchors
-    /// the watcher at the origin: the next tick reads its hash. Origin 0
+    /// the watcher at the origin: its record gives its hash. Origin 0
     /// confirms nothing: the sealer holds no epoch yet.
     pub fn on_sealer_origin(&mut self, origin: u64) {
         let Some(block) = NonZeroU64::new(origin) else {
             return;
         };
         let followed = match &mut self.position {
-            Position::Anchored(window) => window.confirm(origin) == Confirm::Inside,
+            Position::Anchored(window, _) => window.confirm(origin) == Confirm::Inside,
             Position::After(after) => after.block() == origin,
             Position::Tip => false,
         };
@@ -167,7 +169,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
                 published = ?self.cursor(),
                 "the sealer's L1 origin is outside the published range; anchoring at it"
             );
-            self.position = Position::After(block.into());
+            self.resume_after(block.into());
         }
         self.record_window();
     }
@@ -183,7 +185,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// When the next re-publish is due: `None` while no epoch waits.
     pub(super) fn republish_at(&self) -> Option<Instant> {
         match &self.position {
-            Position::Anchored(window) => window.republish_at(),
+            Position::Anchored(window, _) => window.republish_at(),
             Position::Tip | Position::After(_) => None,
         }
     }
@@ -198,7 +200,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// shut.
     pub fn republish_due(&mut self) -> Result<usize, MonitorError> {
         let now = Instant::now();
-        let Position::Anchored(window) = &mut self.position else {
+        let Position::Anchored(window, _) = &mut self.position else {
             return Ok(0);
         };
         if window.republish_at().is_none_or(|due| due > now) {
@@ -256,7 +258,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
     /// Keep a published epoch in the window. Without a sealer feed, the
     /// publish confirms it at once.
     pub(super) fn keep_published(&mut self, epoch: EpochRecord) {
-        let Position::Anchored(window) = &mut self.position else {
+        let Position::Anchored(window, _) = &mut self.position else {
             return;
         };
         let number = epoch.l1_number;
@@ -272,7 +274,7 @@ impl<S: L1Source, P: EpochPublisher> L1Watcher<S, P> {
         reason = "metric values; an L1 block number and a window length never near 2^52"
     )]
     pub(super) fn record_window(&self) {
-        let Position::Anchored(window) = &self.position else {
+        let Position::Anchored(window, _) = &self.position else {
             return;
         };
         ::metrics::gauge!(metrics::L1_CONFIRMED_ORIGIN).set(window.base().number as f64);

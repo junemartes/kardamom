@@ -115,6 +115,19 @@ public final class SealerClusteredService implements ClusteredService {
     private long droppedFrameCount = 0;
 
     /**
+     * Ingress frames of a kind this release does not know, dropped (logged
+     * at power-of-two counts). The admin thread and the tests read it.
+     */
+    private volatile long unknownKindCount = 0;
+
+    /**
+     * The version of the newest snapshot this member restored or took, or
+     * 0 before either. The admin thread reads it: a deploy refuses a
+     * release that cannot read this version.
+     */
+    private volatile int latestSnapshotVersion = 0;
+
+    /**
      * Cluster time of the last boundary tick or timer arm.
      * This is the liveness watermark for the boundary clock. Pending cluster
      * timers live in the leader's wheel only. Rapid election churn (a killed
@@ -336,6 +349,7 @@ public final class SealerClusteredService implements ClusteredService {
         this.state = CanonicalSealerState.load(
             buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
             budgets);
+        latestSnapshotVersion = state.restoredSnapshotVersion();
         openEgress(buf);
     }
 
@@ -527,22 +541,35 @@ public final class SealerClusteredService implements ClusteredService {
             case SealerWire.KIND_BATCH:
                 onBatch(session, buffer, offset, length);
                 return;
+            case SealerWire.KIND_INGRESS_RECORD:
+                onIngressRecord(session, buffer, offset, length);
+                return;
             default:
-                // KIND_INGRESS_RECORD, and any unrecognized kind: the length
-                // check is the only envelope guard on this path.
-                if (length < SealerWire.MIN_INGRESS_LEN) {
-                    // Malformed or too-short envelope: it cannot hold kind
-                    // plus a 32-byte id.
-                    onMalformedFrame("ingress-envelope", length);
-                    return;
-                }
-                processRecord(session, buffer, offset, length);
-                // Records relaying while blocks never seal is the sign of a
-                // dead clock: the canonical stream advances, but the boundary
-                // cadence is gone. Revive here so sustained ingress load heals
-                // the clock without waiting for a consumer reconnect.
-                maybeReviveBoundaryClock();
+                // A kind this release does not know. Only a known kind
+                // reaches the replicated state, so members of two releases
+                // decide alike: every member drops the frame and counts it.
+                onUnknownKind(kind, length);
         }
+    }
+
+    /**
+     * Handle a {@link SealerWire#KIND_INGRESS_RECORD} frame: the length
+     * check is the only envelope guard on this path.
+     */
+    private void onIngressRecord(
+            final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
+        if (length < SealerWire.MIN_INGRESS_LEN) {
+            // Malformed or too-short envelope: it cannot hold kind
+            // plus a 32-byte id.
+            onMalformedFrame("ingress-envelope", length);
+            return;
+        }
+        processRecord(session, buffer, offset, length);
+        // Records relaying while blocks never seal is the sign of a
+        // dead clock: the canonical stream advances, but the boundary
+        // cadence is gone. Revive here so sustained ingress load heals
+        // the clock without waiting for a consumer reconnect.
+        maybeReviveBoundaryClock();
     }
 
     /**
@@ -1088,6 +1115,7 @@ public final class SealerClusteredService implements ClusteredService {
         // window here, and the snapshot never has to carry held records.
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
+        latestSnapshotVersion = CanonicalSealerState.snapshotWriteVersion();
         purgeView = purgeView.withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()));
         // Log to stdout, like the role line below. The block= value is the
         // proof of catch-up. The SNAPSHOT action is itself a replicated-log
@@ -1126,6 +1154,16 @@ public final class SealerClusteredService implements ClusteredService {
     /** The log position of the last applied entry; 0 before the first. */
     long servicePosition() {
         return servicePosition;
+    }
+
+    /** The version of the newest snapshot this member restored or took; 0 before either. */
+    int latestSnapshotVersion() {
+        return latestSnapshotVersion;
+    }
+
+    /** Ingress frames of an unknown kind this member dropped. */
+    long droppedUnknownKindCount() {
+        return unknownKindCount;
     }
 
     /** The snapshot marks and the posted head that the log purge plans with. */
@@ -1204,9 +1242,24 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onMalformedFrame(final String what, final int length) {
         droppedFrameCount++;
-        if (Long.bitCount(droppedFrameCount) == 1) {
-            System.out.println("cluster DROPPED malformed " + what + " memberId=" + memberId
-                + " length=" + length + " totalDropped=" + droppedFrameCount);
+        logDrop(droppedFrameCount, "malformed " + what, length);
+    }
+
+    /**
+     * Count and log a dropped frame of an unknown kind. The drop is part
+     * of the replicated state machine: every member drops the same frame,
+     * so the counters of the members agree.
+     */
+    private void onUnknownKind(final byte kind, final int length) {
+        unknownKindCount++;
+        logDrop(unknownKindCount, "unknown-kind kind=" + kind, length);
+    }
+
+    /** One log line per power of two of {@code total}, so a flood cannot drown stdout. */
+    private void logDrop(final long total, final String what, final int length) {
+        if (Long.bitCount(total) == 1) {
+            System.out.println("cluster DROPPED " + what + " memberId=" + memberId
+                + " length=" + length + " totalDropped=" + total);
         }
     }
 }

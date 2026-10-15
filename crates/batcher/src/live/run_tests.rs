@@ -99,6 +99,7 @@ fn feed_over(spool: Spool, restored: Restored) -> FeedLoop<impl Provider> {
         idle_flush: Duration::from_secs(3600),
         target_payload_bytes: NonZeroUsize::new(1 << 20).unwrap(),
         skip_through_block: 0,
+        da_lag_due: None,
     };
     FeedLoop::new(sender, cfg, spool, restored, 0)
 }

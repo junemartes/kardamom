@@ -19,11 +19,13 @@ use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 use crate::stages::rebuild::{Output, Rebuild, Rebuilt, Target};
 
+mod exporter_back;
 mod sealer_wipe;
 mod seed_evidence;
 mod seeding;
 mod storm;
 
+pub(crate) use exporter_back::await_exporter_back;
 pub(crate) use sealer_wipe::sealer_fleet_total_wipe_recover;
 pub(crate) use storm::{ROUNDS, executor_restart_storm};
 
@@ -420,28 +422,6 @@ pub(crate) async fn await_exporters_dark(h: &Harness, ctx: &str) -> anyhow::Resu
     })?;
     crate::log(format!(
         "{ctx}: outage observed (every executor exporter dark after {}s)",
-        elapsed.as_secs()
-    ));
-    Ok(())
-}
-
-/// Wait until an executor exporter answers again. A returned node's
-/// allocation runs before its exporter binds, and the progress check
-/// needs a baseline from a live exporter.
-pub(crate) async fn await_exporter_back(h: &Harness, ctx: &str) -> anyhow::Result<()> {
-    let outcome = poll::until(
-        Budget::new(h.knobs.reschedule_slo, Duration::from_secs(3)),
-        |_| async move { Ok(h.probes.executor_progress().await.map(|_| ())) },
-    )
-    .await?;
-    let ((), elapsed) = outcome.or_fail(|t| {
-        crate::chaos_fail!(
-            "{ctx}: no executor exporter answers {}s after the fleet returned",
-            t.as_secs()
-        )
-    })?;
-    crate::log(format!(
-        "{ctx}: an executor exporter answers again after {}s",
         elapsed.as_secs()
     ));
     Ok(())

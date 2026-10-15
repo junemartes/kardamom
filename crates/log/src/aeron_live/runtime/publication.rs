@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use crossbeam_channel::Sender as CbSender;
 use rkyv::util::AlignedVec;
 
-use super::{AeronRuntime, RuntimeCmd, request};
+use super::{AeronRuntime, RuntimeCmd, request, request_within};
+use crate::aeron_live::ADD_PUB_TIMEOUT;
+use crate::aeron_live::add_wait::AddWait;
 use crate::codec;
 use crate::error::LogError;
 use crate::term_layout::TermLayout;
@@ -75,15 +77,35 @@ impl AeronRuntime {
         uri: &str,
         stream_id: i32,
     ) -> Result<(PubHandle, SocketAddr), LogError> {
+        self.open_mdc_publication_within(uri, stream_id, AddWait::run_time(ADD_PUB_TIMEOUT))
+    }
+
+    /// [`Self::open_mdc_publication`] with an add that waits as `wait`
+    /// says: a start-up open waits [`Self::start_open_limit`], and a stop
+    /// ends it at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error as [`Self::open_mdc_publication`] does, or on a
+    /// stop.
+    pub fn open_mdc_publication_within(
+        &self,
+        uri: &str,
+        stream_id: i32,
+        wait: AddWait,
+    ) -> Result<(PubHandle, SocketAddr), LogError> {
         let uri = uri.to_string();
-        let (opened, control) = request(
+        let reply_wait = wait.reply_wait();
+        let (opened, control) = request_within(
             &self.cmd_tx,
             |ack| RuntimeCmd::OpenMdcPublication {
                 uri,
                 stream_id,
+                wait,
                 ack,
             },
             "open_mdc_publication",
+            reply_wait,
         )?;
         Ok((self.pub_handle(opened), control))
     }

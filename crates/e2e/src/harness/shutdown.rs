@@ -46,6 +46,9 @@ impl LocalStack {
         if let Some(w) = &mut self.da_watcher {
             w.proc.terminate(Duration::from_secs(10));
         }
+        if let Some(f) = &mut self.l1_follower {
+            f.service.proc.terminate(Duration::from_secs(10));
+        }
         for s in &mut self.sequencers {
             s.proc.terminate(Duration::from_secs(10));
         }
@@ -189,7 +192,8 @@ impl LocalStack {
     }
 
     /// Print the last lines of every process log of the stack: the
-    /// ingress, the executor, the validator, the da-watcher, the
+    /// ingress, the executor, the validator, the da-watcher, the L1
+    /// follower, the
     /// sequencers, the sealer members and the media driver.
     pub fn dump_tails(&self) {
         eprintln!("=== stack log tails ({}) ===", self.root.path().display());
@@ -197,6 +201,7 @@ impl LocalStack {
             .chain(std::iter::once(&self.executor.proc))
             .chain(self.validator.as_ref().map(|v| &v.proc))
             .chain(self.da_watcher.as_ref().map(|w| &w.proc))
+            .chain(self.l1_follower.as_ref().map(|f| &f.service.proc))
             .chain(self.sequencers.iter().map(|s| &s.proc))
             .chain(self.sealer.procs.iter())
             .chain(std::iter::once(&self.driver.proc))

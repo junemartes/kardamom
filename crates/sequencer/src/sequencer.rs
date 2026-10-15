@@ -69,6 +69,8 @@ use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
 use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
 
+mod sealer_answers;
+
 // Re-export: the bin (and external callers) import
 // `kardamom_sequencer::sequencer::Shutdown`.
 pub use crate::shutdown::Shutdown;
@@ -485,7 +487,7 @@ impl Sequencer {
             None => ControlFlow::Continue(()),
             Some(SequencerError::Backpressure) => {
                 self.hot.backpressure.increment(1);
-                self.rebuffer_rest(rest);
+                self.rebuffer_rest(rc, rest);
                 ControlFlow::Break(Err(SequencerError::Backpressure))
             }
             Some(e) => ControlFlow::Break(Err(e)),
@@ -532,6 +534,7 @@ impl Sequencer {
             "published ref"
         );
         rc.publish_status(TxStatus::offered(meta.tx_hash, sender, n));
+        self.state.clear_refused(sender, n);
         if self.resync.is_some() {
             self.unconfirmed.record_published(sender, n, meta);
         }
@@ -539,13 +542,32 @@ impl Sequencer {
 
     /// Rebuffer everything left in `rest`, in reverse, so each sender's
     /// floor ends rewound to its lowest unpublished nonce.
-    fn rebuffer_rest(
+    fn rebuffer_rest<R: SideChannelPublisher>(
         &mut self,
+        rc: &mut R,
         rest: &mut std::collections::VecDeque<(Address, u64, RefMetadata)>,
     ) {
         while let Some((s, n2, m)) = rest.pop_back() {
-            self.state.reinsert_for_retry(s, n2, m);
+            self.rebuffer_one(rc, s, n2, m);
         }
+    }
+
+    /// One ref of [`Self::rebuffer_rest`]. A reoffer of a refused nonce
+    /// sits below the floor, and a rebuffer would lower the floor to it.
+    /// So it does not rebuffer: its client hears `Evicted` and resubmits,
+    /// and the mark stays.
+    fn rebuffer_one<R: SideChannelPublisher>(
+        &mut self,
+        rc: &mut R,
+        sender: Address,
+        nonce: u64,
+        meta: RefMetadata,
+    ) {
+        if self.state.is_refused(sender, nonce) {
+            self.report_evicted(rc, sender, nonce, meta.tx_hash);
+            return;
+        }
+        self.state.reinsert_for_retry(sender, nonce, meta);
     }
 
     /// Resync and unconfirmed-ledger bookkeeping. Runs first, on every
@@ -560,8 +582,15 @@ impl Sequencer {
             return;
         };
         self.apply_receipt_drain(&mut r);
-        self.apply_contiguity_rejects(&mut r);
+        // The refusals go before the contiguity rejects, so a refused ref
+        // and the rejects of the later refs settle in one iteration. The
+        // two arrive on different channels, so the order is not certain,
+        // and the end state does not depend on it. A gap rewind that runs
+        // first republishes the refused ref. The sealer refuses that copy
+        // again, the refusal takes it out of the ledger, and the next
+        // contiguity reject finds no ref at the expected nonce.
         self.apply_deadline_rejects(&mut r, ports);
+        self.apply_contiguity_rejects(&mut r);
         self.resync = Some(r);
         self.sweep_confirm_timeouts();
     }
@@ -607,104 +636,6 @@ impl Sequencer {
             dropped,
             "resync: receipt floor advanced nonce state"
         );
-    }
-
-    /// The sealer rejected this sequencer's ref because its nonce was not
-    /// the sender's expected next one. Two cases, split in the drain:
-    ///
-    /// - Committed-proof (nonce < expected): drop the ledger entry
-    ///   exactly like a receipt confirmation. See
-    ///   `UnconfirmedLedger::drop_committed` for the full story.
-    /// - Gap (nonce >= expected): refs for expected..nonce-1 vanished
-    ///   (voided offers). They are all in the unconfirmed ledger. Rewind
-    ///   them now instead of waiting out the confirm timeout. The ledger
-    ///   hands them back in rewind-safe descending order.
-    fn apply_contiguity_rejects(&mut self, r: &mut crate::resync::ResyncController) {
-        let (drops, rewinds) = r.drain_contiguity_rejects();
-        for (sender, n) in drops {
-            self.drop_committed_and_trace(sender, n);
-        }
-        for (sender, expected) in rewinds {
-            self.rewind_one_gap(sender, expected);
-        }
-    }
-
-    /// Apply the terminal refusals the sealer answered this shard with: a
-    /// ref past its inclusion deadline, or one the DA-lag guard or the
-    /// record-lag guard refused. No republish can order it now: drop it from the unconfirmed
-    /// ledger, so it never republishes, and tell the client, so it can
-    /// resubmit instead of waiting out its timeout.
-    fn apply_deadline_rejects<P: SequencerPorts>(
-        &mut self,
-        r: &mut crate::resync::ResyncController,
-        ports: &mut P,
-    ) {
-        for refusal in r.drain_deadline_rejects() {
-            self.report_refusal(ports, refusal);
-        }
-    }
-
-    /// One sealer refusal (past its deadline, on a DA lag, or on a record
-    /// lag), for [`Self::apply_deadline_rejects`]'s loop. The ledger entry
-    /// carries the transaction's hash, so the `Rejected` status goes out
-    /// with the error. An entry a receipt or a rewind already took gets
-    /// the error only.
-    fn report_refusal<P: SequencerPorts>(
-        &mut self,
-        ports: &mut P,
-        refusal: crate::resync::SealerRefusal,
-    ) {
-        let tx_hash = self
-            .unconfirmed
-            .drop_committed(refusal.sender, refusal.nonce)
-            .map(|meta| meta.tx_hash);
-        warn!(
-            sender = ?refusal.sender,
-            nonce = refusal.nonce,
-            reason = ?refusal.reason,
-            "the sealer refused the ref; reporting it to the client"
-        );
-        let err = TxError {
-            sender: refusal.sender,
-            nonce: refusal.nonce,
-            reason: refusal.reason,
-        };
-        let (_, _, rc) = ports.split();
-        match tx_hash {
-            Some(tx_hash) => self.publish_rejection(rc, tx_hash, err),
-            None => self.publish_error(rc, err),
-        }
-    }
-
-    /// One committed-proof contiguity reject, for
-    /// [`Self::apply_contiguity_rejects`]'s first loop.
-    fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
-        if self.unconfirmed.drop_committed(sender, n).is_some() {
-            trace!(
-                sender = ?sender,
-                nonce = n,
-                "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
-            );
-        }
-    }
-
-    /// One gap contiguity reject, for
-    /// [`Self::apply_contiguity_rejects`]'s second loop: rewind every
-    /// unconfirmed ref the ledger holds for `sender` at or after
-    /// `expected`, if any.
-    fn rewind_one_gap(&mut self, sender: Address, expected: u64) {
-        let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
-        if taken.is_empty() {
-            return;
-        }
-        metrics::record_ref_republished(self.cfg.partition_index, taken.len());
-        warn!(
-            sender = ?sender,
-            expected,
-            count = taken.len(),
-            "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
-        );
-        self.rewind_for_republish(taken);
     }
 
     /// Rewind refs past the confirm timeout for republish. See
@@ -997,7 +928,7 @@ impl Sequencer {
             tx_hash,
         } = observed;
         match result.outcome {
-            NonceOutcome::Matched => {}
+            NonceOutcome::Matched | NonceOutcome::Reoffered => {}
             NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
                 self.hot.buffered_future.increment(1);
                 self.request_lookup(sender);

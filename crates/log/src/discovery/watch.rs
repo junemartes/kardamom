@@ -94,6 +94,17 @@ impl WatchTiming {
             backoff_max: cfg.backoff_max(),
         }
     }
+
+    /// The pause after `failures` failures in a row: doubling from the
+    /// minimum, capped at the maximum.
+    pub(crate) fn backoff(&self, failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        let scaled = self
+            .backoff_min
+            .checked_mul(1u32 << doublings)
+            .unwrap_or(self.backoff_max);
+        scaled.min(self.backoff_max)
+    }
 }
 
 /// The blocking-query loop over one service filter.
@@ -201,7 +212,7 @@ impl MembershipWatch {
 
     fn on_error(&mut self, error: &LogError) -> Step {
         self.consecutive_errors = self.consecutive_errors.saturating_add(1);
-        let delay = self.backoff();
+        let delay = self.timing.backoff(self.consecutive_errors);
         warn!(
             service = %self.query.service,
             error = %error,
@@ -214,17 +225,6 @@ impl MembershipWatch {
             m.health = CatalogHealth::Degraded { consecutive_errors };
         });
         Step::After(delay)
-    }
-
-    /// Doubling backoff from the minimum, capped at the maximum.
-    fn backoff(&self) -> Duration {
-        let doublings = self.consecutive_errors.saturating_sub(1).min(16);
-        let scaled = self
-            .timing
-            .backoff_min
-            .checked_mul(1u32 << doublings)
-            .unwrap_or(self.timing.backoff_max);
-        scaled.min(self.timing.backoff_max)
     }
 }
 

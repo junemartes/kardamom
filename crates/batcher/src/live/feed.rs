@@ -1,6 +1,6 @@
 //! The live feed loop: `ReaderToExec` records to packed, posted batches.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use alloy_provider::Provider;
@@ -45,6 +45,11 @@ pub(crate) struct FeedConfig {
     /// Drop closed blocks at or below this number without posting. L1
     /// already covers them, from the startup reconcile.
     pub skip_through_block: u64,
+    /// Post the group once the sealed head is this many blocks past the
+    /// posted head: half the sealer's DA-lag budget, so the sealer's
+    /// guard stays a backstop and never halts an idle chain between
+    /// posts. `None` when the guard is off.
+    pub da_lag_due: Option<NonZeroU64>,
 }
 
 /// A pending close-policy group: the blocks buffered so far, when the
@@ -78,17 +83,23 @@ fn raw_bytes_of(block: &ClosedBlock) -> usize {
 }
 
 impl PendingGroup {
-    /// The group is due: it is full by count or by bytes, or its oldest
-    /// block has waited past the timer its contents select.
-    fn due(&self, cfg: &FeedConfig) -> bool {
+    /// The group is due: it is full by count or by bytes, its oldest
+    /// block has waited past the timer its contents select, or its last
+    /// block is half the DA-lag budget past `posted_head`.
+    fn due(&self, cfg: &FeedConfig, posted_head: u64) -> bool {
         let timer = if self.has_traffic {
             cfg.flush
         } else {
             cfg.idle_flush
         };
+        let sealed_head = self.blocks.last().map_or(0, |b| b.block_number);
+        let lagging = cfg
+            .da_lag_due
+            .is_some_and(|due| sealed_head.saturating_sub(posted_head) >= due.get());
         self.blocks.len() >= cfg.blocks_per_batch.get()
             || self.raw_bytes >= cfg.target_payload_bytes.get()
             || self.since.elapsed() >= timer
+            || lagging
     }
 
     /// The cursor a post that ends at `block_number` confirms: the group's
@@ -372,7 +383,8 @@ impl<P: Provider> FeedLoop<P> {
     /// Post the pending group if it is due.
     async fn flush_if_due(&mut self) -> Result<()> {
         let cfg = &self.cfg;
-        if let Some(group) = self.pending.take_if(|g| g.due(cfg)) {
+        let posted_head = *self.posted.borrow();
+        if let Some(group) = self.pending.take_if(|g| g.due(cfg, posted_head)) {
             self.post_group(group).await?;
         }
         Ok(())
@@ -444,6 +456,7 @@ mod tests {
             idle_flush: Duration::from_secs(3600),
             target_payload_bytes: NonZeroUsize::new(1000).unwrap(),
             skip_through_block: 0,
+            da_lag_due: NonZeroU64::new(50),
         }
     }
 
@@ -473,29 +486,47 @@ mod tests {
 
     #[test]
     fn a_group_with_traffic_waits_the_short_timer() {
-        assert!(!group(Duration::from_secs(59), 1, true).due(&cfg()));
-        assert!(group(Duration::from_secs(60), 1, true).due(&cfg()));
+        assert!(!group(Duration::from_secs(59), 1, true).due(&cfg(), 0));
+        assert!(group(Duration::from_secs(60), 1, true).due(&cfg(), 0));
     }
 
     #[test]
     fn an_idle_group_waits_the_long_timer() {
-        assert!(!group(Duration::from_secs(60), 1, false).due(&cfg()));
-        assert!(!group(Duration::from_secs(3599), 1, false).due(&cfg()));
-        assert!(group(Duration::from_secs(3600), 1, false).due(&cfg()));
+        assert!(!group(Duration::from_secs(60), 1, false).due(&cfg(), 0));
+        assert!(!group(Duration::from_secs(3599), 1, false).due(&cfg(), 0));
+        assert!(group(Duration::from_secs(3600), 1, false).due(&cfg(), 0));
     }
 
     #[test]
     fn a_full_group_is_due_at_once() {
-        assert!(group(Duration::ZERO, 3, false).due(&cfg()));
-        assert!(!group(Duration::ZERO, 2, true).due(&cfg()));
+        assert!(group(Duration::ZERO, 3, false).due(&cfg(), 0));
+        assert!(!group(Duration::ZERO, 2, true).due(&cfg(), 0));
     }
 
     #[test]
     fn a_group_at_the_byte_target_is_due_at_once() {
         let mut g = group(Duration::ZERO, 1, true);
         g.raw_bytes = 999;
-        assert!(!g.due(&cfg()));
+        assert!(!g.due(&cfg(), 0));
         g.raw_bytes = 1000;
-        assert!(g.due(&cfg()));
+        assert!(g.due(&cfg(), 0));
+    }
+
+    /// A quiet group of a young age is due once the sealed head is half
+    /// the DA-lag budget past the posted head; with the guard off, never.
+    #[test]
+    fn a_quiet_group_is_due_at_half_the_da_lag_budget() {
+        let g = group(Duration::from_secs(1), 2, false);
+        assert!(!g.due(&cfg(), 0), "two blocks past an empty chain");
+        let mut far = group(Duration::from_secs(1), 1, false);
+        far.blocks = vec![empty_block(149)];
+        assert!(!far.due(&cfg(), 100), "49 blocks of lag");
+        far.blocks = vec![empty_block(150)];
+        assert!(far.due(&cfg(), 100), "50 blocks of lag: half the budget");
+        let off = FeedConfig {
+            da_lag_due: None,
+            ..cfg()
+        };
+        assert!(!far.due(&off, 0));
     }
 }

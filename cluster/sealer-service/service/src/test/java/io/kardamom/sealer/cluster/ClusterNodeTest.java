@@ -6,6 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -157,5 +162,25 @@ final class ClusterNodeTest {
         assertFalse(io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors());
         assertThrows(IllegalStateException.class, () -> ClusterNode.requireRecordLagBudgetAllowed(
             1L, io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors()));
+    }
+
+    @Test
+    void theDecisionVersionMustBeTheVersionOfTheImage() {
+        final int image = io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION;
+        assertEquals(image, ClusterNode.requireDecisionVersion(null), "an absent setting is the image version");
+        assertEquals(image, ClusterNode.requireDecisionVersion(Integer.toString(image)));
+        assertThrows(IllegalStateException.class,
+            () -> ClusterNode.requireDecisionVersion(Integer.toString(image - 1)));
+        assertThrows(NumberFormatException.class, () -> ClusterNode.requireDecisionVersion(""));
+    }
+
+    @Test
+    void theSealerJobPassesTheDecisionVersionOfTheCode() throws IOException {
+        final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));
+        final Matcher setting =
+            Pattern.compile("-D" + Pattern.quote(ClusterNode.DECISION_VERSION_SETTING) + "=(\\d+)").matcher(job);
+        assertTrue(setting.find(), "the sealer job passes the decision version");
+        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, Integer.parseInt(setting.group(1)));
+        assertFalse(setting.find(), "the sealer job passes the decision version once");
     }
 }

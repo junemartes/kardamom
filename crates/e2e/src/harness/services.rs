@@ -77,7 +77,7 @@ pub fn bin(name: &str) -> Result<ExistingFile> {
         bin_dir()?.join(name),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary` (or just \
+         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary` (or just \
          `just test-e2e-local`)",
     )
 }
@@ -210,21 +210,71 @@ pub struct L1Wiring {
     pub attester_key: String,
 }
 
-/// Spawn `kardamom-da-watcher` against the anvil L1.
-/// `--poll-interval-secs 1` (the production default is 12 s) keeps
-/// deposit latency inside a test's patience. The watcher follows the
-/// sealer's boundaries through the stack's cluster, as in the deploy.
+/// A running L1 follower: the process, and the URL of its API.
+pub struct SpawnedFollower {
+    pub service: Spawned,
+    pub api_url: String,
+}
+
+/// Spawn `kardamom-l1-indexer`, the L1 follower, against the anvil L1. It
+/// publishes `l1_blocks` into the stack's Aeron dir and serves its archive
+/// on its API, the da-watcher's history. No batch is posted in a test
+/// stack, so the DA proxy is never asked; the settlement is the zero
+/// address. `--poll-interval-secs 1` keeps deposit latency inside a
+/// test's patience: anvil has no beacon API, so the follower reads every
+/// slot.
+///
+/// # Errors
+/// Returns an error when the binary is not built or the process fails to
+/// spawn.
+pub fn spawn_l1_follower(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<SpawnedFollower> {
+    let metrics_port = free_port().port();
+    let api_port = free_port().port();
+    let mut cmd = Command::new(bin("kardamom-l1-indexer")?);
+    cmd.args(["--l1-rpc", &l1.rpc_url])
+        .args(["--lockbox", &l1.lockbox])
+        .args(["--settlement", "0x0000000000000000000000000000000000000000"])
+        .args(["--da-proxy", "http://127.0.0.1:9"])
+        .args(["--poll-interval-secs", "1"])
+        .arg("--data-dir")
+        .arg(spec.root.join("l1-follower"))
+        .args(["--listen", &format!("127.0.0.1:{api_port}")])
+        .arg("--aeron-dir")
+        .arg(spec.aeron_dir);
+    with_log_config(&mut cmd, spec);
+    cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-l1-follower"]);
+    common_service_env(&mut cmd);
+    let service = SpawnPlan {
+        name: "l1-follower".to_string(),
+        cmd,
+        log: spec.root.join("l1-follower.log"),
+        metrics_port,
+        state_dir: None,
+    }
+    .spawn()?;
+    Ok(SpawnedFollower {
+        service,
+        api_url: format!("http://127.0.0.1:{api_port}"),
+    })
+}
+
+/// Spawn `kardamom-da-watcher` on the follower's `l1_blocks` stream, with
+/// the follower's API (`indexer_url`) as its history.
+/// `--poll-interval-secs 1` (the production default is 12 s) is its
+/// housekeeping tick. The watcher follows the sealer's boundaries through
+/// the stack's cluster, as in the deploy.
 ///
 /// # Errors
 /// Returns an error when the binary is not built, when writing the config
 /// file fails, or when the process fails to spawn.
-pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned> {
+pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, indexer_url: &str) -> Result<Spawned> {
     let metrics_port = free_port().port();
     let egress_port = free_udp_port().port();
     let cfg_path = spec.write_cluster_config("da-watcher", "")?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
-    cmd.args(["--l1-rpc", &l1.rpc_url])
-        .args(["--lockbox", &l1.lockbox])
+    cmd.arg("--l1-blocks")
+        .args(["--indexer-url", indexer_url])
         .args(["--poll-interval-secs", "1"])
         .arg("--config")
         .arg(&cfg_path)

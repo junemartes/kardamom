@@ -19,6 +19,23 @@
   when: workloads_alertmanager_config_file | length > 0
   no_log: true
 
+# The sealer refuses user transactions once the sealed head is the
+# DA-lag budget past the posted head. An idle chain seals a block about
+# every second, so the idle posting interval, in seconds, must stay
+# below the budget, or the guard halts the chain between two posts.
+- name: Validate the batcher's idle interval against the DA-lag budget
+  vars:
+    workloads_budget: "{{ (workloads_da_lag_budget_blocks | default('10000', true)) | int }}"
+    workloads_idle_ms: >-
+      {{ (workloads_batcher_idle_flush_ms | default(workloads_batcher_flush_ms, true) | default('3000', true)) | int }}
+  ansible.builtin.assert:
+    that:
+      - workloads_budget | int == 0 or (workloads_idle_ms | int) // 1000 < workloads_budget | int
+    fail_msg: >-
+      BATCHER_IDLE_FLUSH_MS ({{ workloads_idle_ms }}) must be below the DA-lag budget
+      ({{ workloads_budget }} blocks) at one block a second, or the guard halts an idle chain
+      between posts. Lower the idle flush or raise KARDAMOM_DA_LAG_BUDGET_BLOCKS.
+
 - name: Validate image provenance
   ansible.builtin.import_tasks: provenance.yml
 

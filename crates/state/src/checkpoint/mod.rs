@@ -37,7 +37,7 @@ pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
 use manifest::stored_genesis_digest;
-pub(crate) use manifest::{check_image_identity, file_keccak, publish_checkpoint};
+pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
 
 use std::path::{Path, PathBuf};
 
@@ -189,6 +189,7 @@ pub fn create_checkpoint(
         block,
         image_keccak: file_keccak(&tmp_data)?,
         genesis_digest: stored_genesis_digest(env)?,
+        schema_version: ImageSchema::CURRENT,
     };
     publish_checkpoint(&tmp, &dest, &manifest)?;
     info!(block, path = %dest.display(), "created state checkpoint");
@@ -355,7 +356,9 @@ pub(crate) fn restore_checkpoint(
 ///
 /// A checkpoint that fails verification is quarantined: renamed to a
 /// hidden `.rejected-<name>` that the scanners never pick up. The
-/// function then tries the next-newest checkpoint.
+/// function then tries the next-newest checkpoint. A checkpoint of a
+/// state schema this release does not read is not bad: a later release
+/// reads it. It keeps its name, and the function tries the next-newest.
 ///
 /// A bad image must cost the node only one rung of its fallback ladder
 /// (older checkpoint, then peer fetch, then genesis). It must never
@@ -372,13 +375,29 @@ pub fn restore_best_checkpoint(
     state_dir: &Path,
     expected_genesis: Option<B256>,
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
-    loop {
-        let Some(ckpt) = latest_checkpoint(checkpoints_dir)? else {
-            return Ok(None);
-        };
-        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
-            Ok(block) => return Ok(Some((block, ckpt.path))),
-            Err(e) => quarantine_checkpoint(&ckpt.path, state_dir, &e)?,
+    for ckpt in checkpoints_newest_first(checkpoints_dir)? {
+        if let Some(block) = ckpt.restore_or_set_aside(state_dir, expected_genesis)? {
+            return Ok(Some((block, ckpt.path)));
+        }
+    }
+    Ok(None)
+}
+
+impl CheckpointInfo {
+    /// Restore this checkpoint into `state_dir`, and return its block. When
+    /// it does not restore, set it aside and return `None`, so the caller
+    /// tries the next-newest. A checkpoint of a schema this release does
+    /// not read stays in place for a release that reads it. Every other
+    /// refusal quarantines the checkpoint.
+    fn restore_or_set_aside(
+        &self,
+        state_dir: &Path,
+        expected_genesis: Option<B256>,
+    ) -> Result<Option<u64>, StateError> {
+        match restore_checkpoint(&self.path, state_dir, expected_genesis) {
+            Ok(block) => Ok(Some(block)),
+            Err(StateError::UnreadableCheckpointSchema { .. }) => Ok(None),
+            Err(e) => quarantine_checkpoint(&self.path, state_dir, &e).map(|()| None),
         }
     }
 }

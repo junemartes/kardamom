@@ -111,8 +111,25 @@ pub fn sum_where(body: &str, metric: &str, label_fragment: &str) -> Option<i64> 
 /// family like `pending_depth{vslot=...}` would drown the report.
 #[must_use]
 pub fn samples_of_interest(body: &str, metrics: &[&str]) -> Vec<String> {
+    nonzero_samples(body, |l| metrics.iter().any(|m| is_sample_of(l, m)))
+}
+
+/// The non-zero sample lines whose metric name contains `fragment`,
+/// such as `void`. A probe uses it for a gauge it does not name.
+#[must_use]
+pub fn samples_named_with(body: &str, fragment: &str) -> Vec<String> {
+    nonzero_samples(body, |l| {
+        !l.starts_with('#')
+            && l.split(['{', ' '])
+                .next()
+                .is_some_and(|name| name.contains(fragment))
+    })
+}
+
+/// The sample lines that `keep` selects and whose value is not zero.
+fn nonzero_samples(body: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
     body.lines()
-        .filter(|l| metrics.iter().any(|m| is_sample_of(l, m)))
+        .filter(|l| keep(l))
         .filter(|l| sample_value(l).is_some_and(|v| v != 0))
         .map(str::to_string)
         .collect()
@@ -189,6 +206,18 @@ mod tests {
                 "kardamom_sequencer_pending_depth{vslot=\"4\"} 3",
                 "kardamom_sequencer_nonce_lookups_total{outcome=\"ok\"} 12",
             ]
+        );
+    }
+
+    #[test]
+    fn samples_named_with_matches_the_name_only() {
+        let body = "# HELP kardamom_void_pending entries\n\
+            kardamom_void_pending 2\n\
+            kardamom_executor_void_total 0\n\
+            kardamom_executor_block_number{reason=\"void\"} 9\n";
+        assert_eq!(
+            samples_named_with(body, "void"),
+            vec!["kardamom_void_pending 2"]
         );
     }
 }

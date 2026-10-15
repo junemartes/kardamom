@@ -54,3 +54,35 @@ class ProfileTest(unittest.TestCase):
 
     def test_local_defaults_are_unchanged(self):
         self.inventory('localhost,', 'localhost', production=False)
+
+
+@unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible required')
+class RedisPrimaryTest(unittest.TestCase):
+    """The sentinels name the first catalog node with redis-primary, and the
+    primary group places on any node with it: one node must hold it."""
+
+    def check(self, hosts):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'group_vars').symlink_to(ANSIBLE / 'group_vars')
+            (root / 'hosts.ini').write_text('localhost\n' + ''.join(f'{h}\n' for h in hosts))
+            (root / 'play.yml').write_text(json.dumps([{
+                'hosts': 'all', 'gather_facts': False, 'connection': 'local',
+                'tasks': [{'ansible.builtin.include_role': {'name': 'profile', 'tasks_from': 'redis_primary'}}],
+            }]))
+            env = {k: v for k, v in os.environ.items() if not k.startswith('ANSIBLE_')}
+            env['ANSIBLE_ROLES_PATH'] = str(ANSIBLE / 'roles')
+            return subprocess.run(['ansible-playbook', '-i', str(root / 'hosts.ini'), str(root / 'play.yml')],
+                                  env=env, text=True, capture_output=True, timeout=60)
+
+    def test_one_redis_primary_passes(self):
+        result = self.check(['aux-0 role=aux node_roles=aux,redis,redis-primary', 'ingress-0 role=ingress node_roles=redis'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_no_or_two_redis_primaries_fail(self):
+        for hosts in (['aux-0 role=aux node_roles=aux,redis'],
+                      ['aux-0 role=aux node_roles=redis-primary', 'redis-0 role=redis node_roles=redis,redis-primary']):
+            with self.subTest(hosts=hosts):
+                result = self.check(hosts)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('exactly one node must hold the role redis-primary', result.stdout)

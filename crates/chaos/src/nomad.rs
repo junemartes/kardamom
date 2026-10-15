@@ -103,6 +103,14 @@ impl Alloc {
             .filter_map(|state| state["Restarts"].as_u64())
             .sum()
     }
+
+    /// `"<short id> restarted <n> times"` when a task of the allocation
+    /// restarted, else `None`.
+    #[must_use]
+    pub fn restart_note(&self) -> Option<String> {
+        let restarts = self.task_restarts();
+        (restarts > 0).then(|| format!("{} restarted {restarts} times", self.short_id()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -446,5 +454,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restarted.task_restarts(), 3);
+        assert_eq!(allocs[0].restart_note(), None);
+        assert_eq!(
+            restarted.restart_note().as_deref(),
+            Some("a restarted 3 times")
+        );
     }
 }

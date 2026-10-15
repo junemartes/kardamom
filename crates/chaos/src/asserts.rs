@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::harness::Harness;
 use crate::inject::Killed;
 use crate::metrics;
+use crate::nomad::Alloc;
 use crate::poll::{self, Budget};
 use crate::probes::EXECUTOR_BLOCK_METRIC;
 
@@ -110,6 +111,36 @@ impl Harness {
             "{job} has >= {min} running alloc(s) after {}s{detail}",
             elapsed.as_secs()
         ));
+        Ok(())
+    }
+
+    /// No running allocation of the task group `group` of `job` restarted
+    /// a task. A crash loop that ended keeps its restart count, so the
+    /// check holds after the fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the listing fails or a task restarted.
+    pub async fn assert_group_never_restarted(
+        &self,
+        job: &str,
+        group: &str,
+        ctx: &str,
+    ) -> anyhow::Result<()> {
+        let restarted: Vec<String> = self
+            .nomad
+            .running_in_group(job, group)
+            .await?
+            .iter()
+            .filter_map(Alloc::restart_note)
+            .collect();
+        anyhow::ensure!(
+            restarted.is_empty(),
+            "{}: {ctx}: a {job} {group} task restarted: {}",
+            crate::FAIL_PREFIX,
+            restarted.join(", ")
+        );
+        crate::log(format!("{ctx}: no {job} {group} task restarted"));
         Ok(())
     }
 

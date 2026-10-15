@@ -89,7 +89,7 @@ jobs:
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
         run: |
-          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","semantics"'
+          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","semantics"'
           nightly='"chaos-integrity"'
           if [ "$NIGHTLY" = true ]; then
             shards="[$nightly]"
@@ -192,7 +192,9 @@ jobs:
     # that audit and holds two adaptive freezes, so it runs about 65
     # minutes. The chaos-fleet shard ends with the sealer fleet wipe, two
     # rebuilds from L1 and a seeded restart, and it runs about 92 minutes
-    # on a slow runner. 120 keeps a real hang bounded.
+    # on a slow runner. The chaos-combined-exec shard runs about 45 minutes
+    # after a 21-minute bring-up on a local host. 120 keeps a real hang
+    # bounded.
     timeout-minutes: 120
     strategy:
       # Don't cancel the other shards if one fails — we want every shard's
@@ -215,11 +217,13 @@ jobs:
         # (ingresses, sequencers, sealers) and brings them back in
         # dependency order and against it.
         # chaos-combined-exec takes the executors down with another class
-        # (the sealers, the sealers and the validator, the ingresses) and
-        # brings them back in both orders.
+        # (the sealers, the sealers and the validator, the ingresses, Redis
+        # and the state mirrors) and brings them back in both orders.
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the
         # staging incident's faults, the batcher's resume through them, and
         # an outage past the sealer's retention.
+        # chaos-follower runs behind the same lying L1: the loss of one and
+        # of both L1 follower instances, and the disagreement of the two.
         # chaos-integrity (nightly) stops and restores the executor job ten
         # times under load; every executor must advance after each round.
         # The build job picks the list (see "Pick the shards").

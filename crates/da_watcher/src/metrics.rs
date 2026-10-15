@@ -4,13 +4,13 @@
 //! only declares the canonical constant names and the `describe` call that
 //! registers help strings with the Prometheus recorder.
 
+/// The newest finalized L1 block the `l1_blocks` stream carried to the
+/// watcher.
 pub const L1_FINALIZED: &str = "kardamom_da_watcher_l1_finalized_block_number";
 pub const DEPOSITS_DETECTED_TOTAL: &str = "kardamom_da_watcher_deposits_detected_total";
 pub const TICK_TOTAL: &str = "kardamom_da_watcher_tick_total";
 pub const EPOCHS_PUBLISHED_TOTAL: &str = "kardamom_da_watcher_epochs_published_total";
-/// Highest L1 block number the watcher has published an epoch for. With
-/// `L1_FINALIZED`, this gives the origin lag used by the rule-5 liveness
-/// alarm.
+/// Highest L1 block number the watcher has published an epoch for.
 pub const EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 /// Two L1 sources answered differently for one block or one log query,
 /// and no light client settled it. Any increase is an alert: one of the
@@ -53,11 +53,18 @@ pub const L1_CONFIRMED_ORIGIN: &str = "kardamom_da_watcher_l1_confirmed_origin";
 /// while the sealer commits; at the publish window's bound the watcher
 /// publishes no new epoch.
 pub const EPOCHS_UNCONFIRMED: &str = "kardamom_da_watcher_epochs_unconfirmed";
+/// 1 while the watcher waits for the `l1_blocks` record of the block
+/// its `number` label names: no archive holds it, and it is not on the
+/// stream.
+pub const WAITING_FOR_L1_BLOCK: &str = "kardamom_da_watcher_waiting_for_l1_block";
 /// Epochs published again because no boundary confirmed them in time.
 pub const EPOCHS_REPUBLISHED_TOTAL: &str = "kardamom_da_watcher_epochs_republished_total";
 
 pub fn describe() {
-    metrics::describe_gauge!(L1_FINALIZED, "latest finalised L1 block number observed");
+    metrics::describe_gauge!(
+        L1_FINALIZED,
+        "newest finalized L1 block the l1_blocks stream carried"
+    );
     metrics::describe_counter!(
         DEPOSITS_DETECTED_TOTAL,
         "deposit publishes; a range retried after backpressure re-counts its already-published deposits"
@@ -69,7 +76,7 @@ pub fn describe() {
     );
     metrics::describe_gauge!(
         EPOCH_ORIGIN,
-        "highest L1 block number an epoch has been published for; L1_FINALIZED minus this is the origin lag"
+        "highest L1 block number an epoch has been published for"
     );
     metrics::describe_counter!(
         L1_SOURCE_DISAGREEMENT_TOTAL,
@@ -118,6 +125,10 @@ pub fn describe() {
     metrics::describe_counter!(
         EPOCHS_REPUBLISHED_TOTAL,
         "epochs published again because no boundary confirmed them within the re-publish timeout"
+    );
+    metrics::describe_gauge!(
+        WAITING_FOR_L1_BLOCK,
+        "1 while the watcher waits for the l1_blocks record of the block its number label names"
     );
     metrics::describe_counter!(
         L1_CURSOR_PERSIST_FAILURES_TOTAL,

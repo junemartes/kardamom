@@ -61,7 +61,11 @@ public final class SealerWire {
     /** Minimum valid ingress length: kind + canonical id (payload may be empty). */
     static final int MIN_INGRESS_LEN = CANONICAL_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
 
-    /** Ingress message kinds (first byte of every ingress app message). */
+    /**
+     * Ingress message kinds (first byte of every ingress app message). The
+     * service dispatches on the kind alone. A kind it does not know is
+     * dropped on every member and counted, never ordered.
+     */
     public static final byte KIND_INGRESS_RECORD = 0;
     /** Replay request: {@code [kind:1][from_index:u64 LE][from_block:u64 LE]}. */
     public static final byte KIND_REPLAY_REQUEST = 1;
@@ -174,9 +178,8 @@ public final class SealerWire {
      * record-lag guard, and fans the resulting {@link #EGRESS_KIND_STATUS}
      * out to every session when the best cursor moves up.
      *
-     * <p>The frame is shorter than {@link #MIN_INGRESS_LEN}, so a member
-     * that does not know the kind drops it as malformed and never orders
-     * it as a record. Matches Rust {@code KIND_RECORDED_CURSOR}.</p>
+     * <p>A member that does not know the kind drops the frame and never
+     * orders it as a record. Matches Rust {@code KIND_RECORDED_CURSOR}.</p>
      */
     public static final byte KIND_RECORDED_CURSOR = 9;
     /** Offset of the u8 executor id within a {@link #KIND_RECORDED_CURSOR} frame. */

@@ -540,15 +540,31 @@ impl Args {
             );
             return observer;
         };
-        let provider = alloy_provider::ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(l1_rpc_url);
-        let source = Arc::new(kardamom_da_watcher::RpcL1Source::new(provider));
+        let source = |url: reqwest::Url| {
+            Arc::new(kardamom_da_watcher::RpcL1Source::new(
+                alloy_provider::ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .connect_http(url),
+            ))
+        };
+        let logs_url = self
+            .l1_logs_rpc_url
+            .clone()
+            .unwrap_or_else(|| l1_rpc_url.clone());
         tracing::info!(
             %lockbox,
-            "epoch verification enabled: epochs are re-derived from L1"
+            logs_source_is_the_anchor = self.l1_logs_rpc_url.is_none(),
+            "epoch verification enabled: epochs are re-derived from L1, one finality step at a time"
         );
-        observer.with_content_check(source, lockbox, &tokio::runtime::Handle::current())
+        observer.with_content_check(
+            epoch_verify::ContentSources {
+                anchor: source(l1_rpc_url),
+                logs: source(logs_url),
+                lockbox,
+                max_log_range: self.l1_max_log_range,
+            },
+            &tokio::runtime::Handle::current(),
+        )
     }
 }
 

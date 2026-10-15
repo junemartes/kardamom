@@ -1,7 +1,8 @@
-//! DA watcher: an async task that tails finalized L1 blocks, decodes
-//! `DepositInitiated` events from the per-L2 `ETHLockbox` proxy, and
-//! republishes each one on the dedicated `tx_deposits` Aeron channel as a
-//! [`kardamom_types::Deposit`].
+//! DA watcher: an async task that takes the records of the `l1_blocks`
+//! stream, one per finalized L1 block, and publishes each record's epoch,
+//! with its [`kardamom_types::Deposit`]s, on the dedicated `tx_deposits`
+//! Aeron channel. The L1 follower (`kardamom-l1-indexer`) reads L1 and
+//! derives the epochs; the watcher has no L1 access.
 //!
 //! Sequencers subscribe to `tx_deposits`, derive a [`kardamom_types::DepositRef`]
 //! `(source_hash, deposit_position)`, and emit that ref on the canonical
@@ -12,10 +13,13 @@
 //!
 //! ## Layering
 //!
-//! - [`source::L1Source`]: an async trait for the L1 reads the followers
-//!   need (`finalized_block_number`, `block_ids`, `logs`). The trait is the
-//!   seam for tests (a mock impl) and for production
-//!   ([`rpc_source::RpcL1Source`], backed by an alloy provider).
+//! - [`feed::BlockFeed`]: the watcher's view of `l1_blocks`: the live
+//!   records, and the history of a block range from the stream's archives.
+//!   The binary reads the Aeron stream; tests use a scripted fake.
+//! - [`source::L1Source`]: an async trait for the L1 reads of the L1
+//!   follower and the validator (`finalized_block_number`, `block_ids`,
+//!   `headers`, `logs`), with production on an alloy provider
+//!   ([`rpc_source::RpcL1Source`]). The watcher does not use it.
 //! - [`sources::L1Sources`]: the set of sources a follower runs on. Two
 //!   sources must agree on a block or a log query, or the light client
 //!   serves it; a source that fails or lies rotates out for a backoff.
@@ -24,11 +28,11 @@
 //!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`. Tests use the
 //!   in-memory fake in [`publisher::fakes`].
 //! - [`watcher::L1Watcher`]: the watcher state. `process_once` is one
-//!   pass for one tick. It reads the finalized tip, fetches logs in
-//!   `(cursor, tip]`, builds a `Deposit` from each log, publishes on
-//!   `tx_deposits`, and advances the cursor. `spawn` wraps it in a
-//!   `tokio::time::interval` loop with structured logging. Returns a
-//!   [`watcher::WatcherHandle`].
+//!   pass: it takes the records that arrived, in order, checks each
+//!   record's parent link, publishes its epoch on `tx_deposits`, and
+//!   advances the cursor. `spawn` wraps it in a loop that selects on the
+//!   next record, the sealer's origin, the re-publish deadline, and a
+//!   housekeeping tick. Returns a [`watcher::WatcherHandle`].
 //! - [`cursor::CursorFile`]: the durable cursor of a watcher. The L1
 //!   watcher keeps the sealer's confirmed L1 origin there
 //!   ([`l1_cursor::L1Cursor`]), so a restart resumes after it and checks
@@ -40,18 +44,18 @@
 //!
 //! ## Semantics
 //!
-//! The cursor lifecycle, `NotFinalized` handling, per-log error
-//! continuation, OP source-hash derivation, and address aliasing follow the
-//! deposit-monitor contract. This crate owns the L1-side logic and
-//! publishes to the Aeron `tx_deposits` channel.
+//! The cursor lifecycle, OP source-hash derivation, and address aliasing
+//! follow the deposit-monitor contract. The follower derives the epochs
+//! with the same [`kardamom_types::epoch::derive_epoch`]; this crate
+//! publishes them to the Aeron `tx_deposits` channel.
 //!
 //! Out of scope for this crate:
 //! - Executor deposit execution (mint pre-credit plus the inner EVM call).
 //!   That lives downstream, in `executor`: the executor consumes
 //!   `tx_ordering`, dedups `DepositRef` by `source_hash`, resolves the
 //!   `Deposit` from `tx_deposits`, and runs the deposit.
-//! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
-//!   operation; the watcher trusts finality.
+//! - Reorg handling. The stream carries finalized blocks only, so a record
+//!   never changes.
 //! - L1-attributes / system txs (OP `is_system_transaction = true`).
 //!
 //! ## Interop
@@ -73,6 +77,7 @@
 #![allow(clippy::double_must_use)]
 pub mod boundaries;
 pub mod cursor;
+pub mod feed;
 pub mod interop;
 pub mod l1_cursor;
 pub mod metrics;
@@ -87,6 +92,7 @@ mod window;
 // verifier shares it. A second copy would verify nothing.
 pub use boundaries::BoundaryFeed;
 pub use cursor::{CursorError, CursorFile};
+pub use feed::BlockFeed;
 pub use kardamom_types::epoch::{
     DepositLog, LockboxLog, UpgradeLog, alias_l1_address, source_hash, source_hash_system,
 };

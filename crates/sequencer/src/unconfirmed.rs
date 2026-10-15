@@ -66,6 +66,11 @@ impl<T> UnconfirmedLedger<T> {
             .collect()
     }
 
+    /// Whether the ledger holds the ref of `sender` at `nonce`.
+    pub(crate) fn contains(&self, sender: Address, nonce: u64) -> bool {
+        self.entries.contains_key(&(sender, nonce))
+    }
+
     /// Retain a just-published ref until a receipt proves canonical
     /// commitment, and queue it for the confirm-timeout sweep.
     pub(crate) fn record_published(&mut self, sender: Address, nonce: u64, meta: T) {
@@ -97,6 +102,21 @@ impl<T> UnconfirmedLedger<T> {
     /// Returns the dropped ref's metadata when the entry was present.
     pub(crate) fn drop_committed(&mut self, sender: Address, nonce: u64) -> Option<T> {
         self.entries.remove(&(sender, nonce)).map(|(meta, _)| meta)
+    }
+
+    /// Drop the ledger entry of `sender` at `nonce` when `named` holds
+    /// for its metadata, and return the metadata.
+    pub(crate) fn take_named<F: Fn(&T) -> bool>(
+        &mut self,
+        sender: Address,
+        nonce: u64,
+        named: F,
+    ) -> Option<T> {
+        let held = self
+            .entries
+            .get(&(sender, nonce))
+            .is_some_and(|(meta, _)| named(meta));
+        held.then(|| self.drop_committed(sender, nonce)).flatten()
     }
 
     /// A sealer contiguity gap: refs for `sender` at `expected..nonce-1`

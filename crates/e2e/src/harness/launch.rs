@@ -344,10 +344,15 @@ impl LocalStack {
         } else {
             None
         };
-        let da_watcher = match &wirings.da_watcher {
-            Some(w) => Some(services::spawn_da_watcher(&spec, w)?),
-            None => None,
-        };
+        let l1_follower = wirings
+            .da_watcher
+            .as_ref()
+            .map(|w| services::spawn_l1_follower(&spec, w))
+            .transpose()?;
+        let da_watcher = l1_follower
+            .as_ref()
+            .map(|f| services::spawn_da_watcher(&spec, &f.api_url))
+            .transpose()?;
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
         let notifier = cfg
             .notifier
@@ -359,6 +364,7 @@ impl LocalStack {
             notifier,
             ingress,
             da_watcher,
+            l1_follower,
             verified_l1: wirings.verified_l1,
             executor,
             validator,
@@ -402,6 +408,11 @@ impl LocalStack {
                 self.da_watcher
                     .as_ref()
                     .map(|w| ("da-watcher".to_string(), w.metrics_addr)),
+            )
+            .chain(
+                self.l1_follower
+                    .as_ref()
+                    .map(|f| ("l1-follower".to_string(), f.service.metrics_addr)),
             )
             .chain(
                 self.notifier
