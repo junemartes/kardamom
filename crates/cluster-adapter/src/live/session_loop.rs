@@ -447,7 +447,7 @@ impl SessionLoop {
             &self.rt,
             &ingress_endpoints,
             leader_member_id,
-            self.cfg.ingress_stream_id,
+            self.cfg.ingress_stream(),
         ) else {
             tracing::warn!(
                 leader_member_id,
@@ -578,7 +578,7 @@ impl SessionLoop {
                 &self.rt,
                 &self.endpoints,
                 self.target_member,
-                self.cfg.ingress_stream_id,
+                self.cfg.ingress_stream(),
             )
         {
             self.target_member = next_member;

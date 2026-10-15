@@ -28,4 +28,4 @@ pub use config::ClusterConfig;
 pub use gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
 pub use watermark::ClusterWatermark;
 
-pub use live::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress};
+pub use live::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, SessionTerm};

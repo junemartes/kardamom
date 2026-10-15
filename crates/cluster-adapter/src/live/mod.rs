@@ -25,20 +25,24 @@
 //! [`SessionDriver`]: kardamom_cluster_client::session::SessionDriver
 
 mod endpoints;
+#[cfg(all(test, feature = "docker-e2e"))]
+mod fragmented_tests;
 mod session_loop;
+mod term;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use kardamom_cluster_client::message::{AppPayload, PayloadTooLarge};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use thiserror::Error;
 
 use crate::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
-use endpoints::{member_ids, open_leader_pub, open_next_member_pub};
+use endpoints::{IngressStream, member_ids, open_leader_pub, open_next_member_pub};
 use session_loop::SessionSeams;
+use term::AppPayload;
+pub use term::{PayloadTooLarge, SessionTerm};
 
 #[derive(Debug, Error)]
 #[error("live cluster gateway: {0}")]
@@ -60,6 +64,22 @@ pub struct LiveClusterConfig {
     /// Keep-alive cadence, in ms. It must be less than the cluster's
     /// session timeout.
     pub keep_alive_interval_ms: u64,
+    /// The term of the ingress publication. It bounds the payload that
+    /// [`LiveIngress`] offers.
+    pub ingress_term: SessionTerm,
+    /// The term of the egress channel. It bounds the frames the cluster
+    /// can send to this session.
+    pub egress_term: SessionTerm,
+}
+
+impl LiveClusterConfig {
+    /// The stream and term of every ingress publication.
+    fn ingress_stream(&self) -> IngressStream {
+        IngressStream {
+            stream_id: self.ingress_stream_id,
+            term: self.ingress_term,
+        }
+    }
 }
 
 struct OfferReq {
@@ -92,16 +112,17 @@ impl Drop for LiveCluster {
 #[derive(Clone)]
 pub struct LiveIngress {
     req_tx: Sender<OfferReq>,
+    term: SessionTerm,
 }
 
 impl ClusterIngress for LiveIngress {
-    /// Refuse a payload above the session message bound here, before it
-    /// reaches the session thread: Aeron refuses an offer above its
+    /// Refuse a payload above the bound of the ingress term here, before
+    /// it reaches the session thread: Aeron refuses an offer above its
     /// maximum message length, and a retry cannot succeed.
     fn offer(&mut self, payload: &[u8]) -> OfferOutcome {
-        let payload = match AppPayload::try_from(payload) {
+        let payload: AppPayload = match self.term.payload(payload) {
             Ok(payload) => payload,
-            Err(PayloadTooLarge { len }) => return OfferOutcome::TooLarge { len },
+            Err(PayloadTooLarge { len, .. }) => return OfferOutcome::TooLarge { len },
         };
         let (reply_tx, reply_rx) = bounded(1);
         if self
@@ -219,35 +240,6 @@ pub fn connect_with(
         .spawn_thread()
 }
 
-/// The term length of the cluster control channels. Aeron takes one
-/// message of at most a term length divided by 8, so an 8 MiB term
-/// carries a session message of [`MAX_SESSION_MESSAGE_LEN`], the same
-/// bound as the cluster log.
-///
-/// [`MAX_SESSION_MESSAGE_LEN`]: kardamom_cluster_client::message::MAX_SESSION_MESSAGE_LEN
-const CONTROL_TERM_LENGTH: &str = "8m";
-
-/// Append the control term length and sparse log buffers to a cluster
-/// control channel, unless the URI already pins a term length. The
-/// egress channel ([`SessionConnect::open_egress`]) and every ingress
-/// publication ([`endpoints::open_leader_pub`]) use it.
-///
-/// A log buffer is three terms. It lives on the tmpfs of the client and,
-/// as the matching image or egress publication, on the tmpfs of each
-/// cluster member. Session churn (chaos failovers, zombie-close
-/// reconnects) keeps old logs alive for a while. A full tmpfs kills the
-/// clustered service with "insufficient usable storage", while Raft stays
-/// healthy. Sparse log buffers take tmpfs pages only as the stream writes
-/// them, so a log of a quiet or short-lived session stays small.
-#[must_use]
-pub fn control_channel(uri: &str) -> String {
-    if uri.contains("term-length") {
-        uri.to_string()
-    } else {
-        format!("{uri}|term-length={CONTROL_TERM_LENGTH}|sparse=true")
-    }
-}
-
 /// Startup config validation. Both fields come from the operator's
 /// `[cluster]` TOML section (`egress_channel` usually through
 /// `--cluster-egress-endpoint`). [`connect`] fails startup with a config
@@ -288,7 +280,7 @@ impl SessionConnect {
         opts: ConnectOptions,
     ) -> Result<Self, LiveError> {
         validate_config(&cfg)?;
-        cfg.egress_channel = control_channel(&cfg.egress_channel);
+        cfg.egress_channel = cfg.egress_term.channel(&cfg.egress_channel);
         Ok(Self { rt, cfg, opts })
     }
 
@@ -332,7 +324,7 @@ impl EgressOpened {
             &self.base.rt,
             &cfg.ingress_endpoints,
             cfg.initial_leader_member_id,
-            cfg.ingress_stream_id,
+            cfg.ingress_stream(),
         )
         .map(|p| (cfg.initial_leader_member_id, p))
         .or_else(|| {
@@ -340,7 +332,7 @@ impl EgressOpened {
                 &self.base.rt,
                 &cfg.ingress_endpoints,
                 cfg.initial_leader_member_id,
-                cfg.ingress_stream_id,
+                cfg.ingress_stream(),
             )
         })
         .ok_or_else(|| {
@@ -379,6 +371,7 @@ impl IngressOpened {
         let (out_tx, out_rx) = unbounded::<Vec<u8>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let ingress_term = cfg.ingress_term;
 
         let join = thread::Builder::new()
             .name("cluster-session".into())
@@ -405,7 +398,10 @@ impl IngressOpened {
                 stop,
                 join: Some(join),
             },
-            LiveIngress { req_tx },
+            LiveIngress {
+                req_tx,
+                term: ingress_term,
+            },
             LiveEgress { out_rx },
         ))
     }
@@ -423,29 +419,19 @@ mod tests {
             egress_channel: "aeron:udp?endpoint=127.0.0.1:9050".into(),
             egress_stream_id: 102,
             keep_alive_interval_ms: 1000,
+            ingress_term: SessionTerm::Control,
+            egress_term: SessionTerm::Control,
         }
-    }
-
-    #[test]
-    fn a_control_channel_has_an_8_mib_sparse_term() {
-        let uri = control_channel("aeron:udp?endpoint=127.0.0.1:9050");
-        assert_eq!(
-            uri,
-            "aeron:udp?endpoint=127.0.0.1:9050|term-length=8m|sparse=true"
-        );
-    }
-
-    #[test]
-    fn a_control_channel_keeps_a_pinned_term_length() {
-        let pinned = "aeron:udp?endpoint=127.0.0.1:9050|term-length=64k";
-        assert_eq!(control_channel(pinned), pinned);
     }
 
     #[test]
     fn an_offer_above_the_bound_is_refused_before_the_session_thread() {
         let (req_tx, req_rx) = unbounded();
-        let mut ingress = LiveIngress { req_tx };
-        let len = kardamom_cluster_client::message::MAX_APP_PAYLOAD_LEN + 1;
+        let mut ingress = LiveIngress {
+            req_tx,
+            term: SessionTerm::Control,
+        };
+        let len = SessionTerm::Control.max_payload_len() + 1;
         assert_eq!(ingress.offer(&vec![0; len]), OfferOutcome::TooLarge { len });
         assert!(req_rx.is_empty(), "no request reaches the session thread");
     }

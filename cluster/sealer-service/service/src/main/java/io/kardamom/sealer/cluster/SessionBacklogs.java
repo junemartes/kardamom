@@ -2,7 +2,10 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.Publication;
 import io.aeron.cluster.service.ClientSession;
+import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.agrona.collections.Long2ObjectHashMap;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -109,7 +112,7 @@ final class SessionBacklogs {
                 return true;
             }
             if (!retryable(result)) {
-                closeOnTerminal(session, result);
+                closeOnTerminal(session, result, frames.peekFirst());
                 return true;
             }
             if (nowNs - progressNs > stallDeadlineNs) {
@@ -139,6 +142,22 @@ final class SessionBacklogs {
             return result;
         }
     }
+
+    /**
+     * The relayed index that last closed a session of a response channel as
+     * too long, and how many closes in a row it caused after the first.
+     */
+    private record TooLong(long index, long repeats) {
+    }
+
+    /**
+     * The last {@link TooLong} close of each response channel. A client
+     * keeps its response channel across reconnects, so a client whose
+     * egress term cannot take a frame shows here as a run of repeats on one
+     * index. This is member-local IO state, like the backlogs. Only the
+     * leader closes sessions, so a follower keeps no entry.
+     */
+    private final Map<String, TooLong> tooLongByChannel = new HashMap<>();
 
     /** This cluster member's id, logged on each close. */
     private final int memberId;
@@ -178,7 +197,7 @@ final class SessionBacklogs {
         if (retryable(result)) {
             return append(open(session), frame);
         }
-        closeOnTerminal(session, result);
+        closeOnTerminal(session, result, frame);
         return Outcome.DROPPED;
     }
 
@@ -261,12 +280,41 @@ final class SessionBacklogs {
      * so the session must close. Otherwise ingress keep-alives keep it open
      * while it gets no frames.
      */
-    private void closeOnTerminal(final ClientSession session, final long result) {
+    private void closeOnTerminal(final ClientSession session, final long result, final byte[] frame) {
         if (result == FRAME_TOO_LONG) {
-            closeLoudly(session, "frame above the max message length of the egress publication");
+            closeTooLong(session, frame);
         } else if (result != Publication.CLOSED) {
             closeLoudly(session, "terminal offer result " + result);
         }
+    }
+
+    /**
+     * Close a session whose egress publication cannot take {@code frame}.
+     * A client that reconnects with the same small term replays the same
+     * frame and is closed again. The log line counts these repeats for the
+     * response channel, so the loop is visible.
+     */
+    private void closeTooLong(final ClientSession session, final byte[] frame) {
+        final long index = relayedIndex(frame);
+        final TooLong last = tooLongByChannel.get(session.responseChannel());
+        final long repeats = last != null && last.index() == index ? last.repeats() + 1 : 0;
+        tooLongByChannel.put(session.responseChannel(), new TooLong(index, repeats));
+        closeLoudly(session, "frame above the max message length of the egress publication"
+            + " index=" + index + " length=" + frame.length + " repeats=" + repeats
+            + " channel=" + session.responseChannel());
+    }
+
+    /** The canonical index of a relayed frame, or -1 for any other frame. */
+    private static long relayedIndex(final byte[] frame) {
+        return frame[0] == SealerWire.EGRESS_KIND_RELAYED
+            ? new UnsafeBuffer(frame).getLong(Byte.BYTES, ByteOrder.LITTLE_ENDIAN)
+            : -1L;
+    }
+
+    /** How many closes in a row the frame at {@code index} caused for {@code channel}, after the first. */
+    long tooLongRepeats(final String channel, final long index) {
+        final TooLong last = tooLongByChannel.get(channel);
+        return last != null && last.index() == index ? last.repeats() : -1L;
     }
 
     /**

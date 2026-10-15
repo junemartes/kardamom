@@ -157,7 +157,7 @@ An offer to a session never waits. The service thread also runs the boundary tic
 | No frame leaves the backlog | 1 second. The clock restarts each time a frame leaves. | `offer deadline exhausted (back-pressure)` |
 | The backlog holds more bytes | 64 MiB. A replay of the default retention fits well below it. | `egress backlog over <n> bytes` |
 | A terminal offer result (not `CLOSED`) | at once | `terminal offer result <n>` |
-| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication` |
+| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication index=<i> length=<n> repeats=<r> channel=<c>`. `repeats` counts the closes in a row on the same index for the response channel. A value above 0 means the client reconnects with an egress term that is too small. |
 
 - A session that is closing gets no more frames. The client reconnects, replays and recovers.
 - A role change drops all backlogs. The clients of a leader that steps down reconnect to the new leader and replay.
@@ -395,8 +395,17 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - The Aeron settings that the node fixes: client sessions time out after 90 s, at most 256 sessions, an 8 MB log term, sparse ingress images, and the application version is 0.3.0.
 - One session message, its 32-byte session header included, holds at most 1 MiB: the 8 MB log term divided by 8.
   - A message above one MTU travels as many Aeron fragments. The consensus module and the service reassemble them.
-  - The Rust client opens its ingress publication and its egress channel with 8 MB sparse terms, so both directions carry 1 MiB. It refuses a larger payload before the offer.
+  - A channel carries at most its own term divided by 8. Each Rust client sets the term of its ingress publication and of its egress channel in `[cluster]`, with `ingress_term` and `egress_term`. The client refuses a payload above its ingress bound before the offer.
+
+    | Name | Term | Largest message | Busy log (3 terms) |
+    |---|---|---|---|
+    | `control` (default) | 1 MiB | 128 KiB | 3 MiB |
+    | `entries` | 2 MiB | 256 KiB | 6 MiB |
+    | `large` | 8 MiB | 1 MiB | 24 MiB |
+
+  - The member runs an embedded media driver. The ingress image and the egress publication of each session live on its tmpfs and count against the 1024 MB memory limit of the job, with the 384 MB heap. All logs are sparse, so a quiet or short-lived session takes only the pages it writes. A session asks for a larger term only on the channel that carries large messages.
   - An egress frame above the maximum message length of a session's egress publication closes that session. See [Egress back-pressure](#egress-back-pressure).
+  - Deploy order: deploy the clients before the sealers, and raise a consumer's `egress_term` before any producer sends larger entries. A client with a smaller egress term than a frame (an older client, or a pinned `term-length`) is closed, reconnects, replays the same frame, and is closed again. The `EGRESS-CLOSE` line counts these repeats (`repeats=<n>`) for each response channel.
 
 ### Decision version
 

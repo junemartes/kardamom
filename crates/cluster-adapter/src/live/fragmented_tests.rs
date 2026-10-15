@@ -2,21 +2,20 @@
 //! message (1 MiB) through a real media driver at the deployed MTU. The
 //! publication fragments the message, and the fragment assembler of the
 //! subscription hands the whole message over, intact and in order. The
-//! channel and the subscription call are the ones the session thread uses
-//! for the cluster ingress and egress.
+//! channel (on the `large` term) and the subscription call are the ones
+//! the session thread uses for the cluster ingress and egress.
 //!
 //! Gated on the `docker-e2e` feature and on Docker: the media driver runs
 //! in a container, as for the `kardamom-log` live tests.
 
-#![cfg(feature = "docker-e2e")]
-
 use std::time::{Duration, Instant};
 
-use kardamom_cluster_adapter::live::control_channel;
 use kardamom_cluster_client::message::MAX_SESSION_MESSAGE_LEN;
 use kardamom_log::aeron_live::PubHandle;
 use kardamom_log::testing::{AeronTestCluster, SingleNodeRig};
 use rkyv::util::AlignedVec;
+
+use super::SessionTerm;
 
 const STREAM_ID: i32 = 5_586;
 /// The deployed MTU (`aeron.mtu.length`), so that each message fragments.
@@ -45,7 +44,7 @@ fn publish_until_connected(publication: &PubHandle, bytes: &AlignedVec) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker; run with `cargo test -p kardamom-cluster-adapter --features docker-e2e --test fragmented_control -- --ignored`"]
+#[ignore = "requires Docker; run with `cargo test -p kardamom-cluster-adapter --features docker-e2e --lib fragmented -- --ignored`"]
 async fn a_control_channel_carries_messages_up_to_one_mib_whole_and_in_order() {
     kardamom_log::testing::require_docker().await;
     let SingleNodeRig {
@@ -53,7 +52,7 @@ async fn a_control_channel_carries_messages_up_to_one_mib_whole_and_in_order() {
         rt,
         cfg: _cfg,
     } = AeronTestCluster::single_node_runtime(STREAM_ID).await;
-    let uri = control_channel(CHANNEL);
+    let uri = SessionTerm::Large.channel(CHANNEL);
     let (_sub_id, frames) = rt
         .open_subscription_raw_crossbeam(&uri, STREAM_ID)
         .expect("subscription");

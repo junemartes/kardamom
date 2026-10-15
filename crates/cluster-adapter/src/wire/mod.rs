@@ -437,7 +437,7 @@ pub enum WireError {
     BadRemoteEpoch(String),
     #[error("batch entry count {entries} overflows the u16 wire count")]
     BatchTooLarge { entries: usize },
-    #[error("entry of {len} bytes does not fit its length prefix or one session message")]
+    #[error("length {len} overflows the u32 wire length prefix")]
     EntryTooLarge { len: usize },
     #[error("declared length {declared} does not fit in this platform's usize")]
     LenOverflow { declared: u32 },

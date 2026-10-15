@@ -487,9 +487,10 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .fileSyncLevel(fileSyncLevel())
-            // The Rust clients publish ingress with 8 MiB terms, so that
-            // one session message can reach 1 MiB. Sparse images take
-            // tmpfs pages only as a session writes them.
+            // A Rust client picks the ingress term of its session, up to
+            // 8 MiB for a 1 MiB message. The images live on this JVM's
+            // tmpfs and count against its memory limit. Sparse images take
+            // pages only as a session writes them.
             .ingressChannel("aeron:udp?sparse=true")
             // The cluster log uses Aeron's 64MB default term length. That
             // gives a 192MB log buffer for the log publication, plus 192MB
