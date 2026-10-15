@@ -65,7 +65,8 @@ There are fourteen shards. `just container-test` lists their names. Thirteen run
 | `chaos-combined-exec` | `executor-sealer-loss-recover`, `executor-sealer-validator-recover`, `ingress-executor-loss-recover`, `read-path-loss-recover` | `RUN_LOAD=0` |
 | `chaos-retention` | `retention-overrun`, `retention-overrun-validator` | `RUN_LOAD=0`, egress retention 6144 frames (`KARDAMOM_CLUSTER_RETENTION=6144`) |
 | `chaos-cache` | `redis-partition-ingress`, `redis-primary-kill`, `redis-primary-freeze`, `mirror-kill-rebuild` | `RUN_LOAD=0` |
-| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `follower-instance-loss`, `follower-total-loss`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-l1` | `l1-liar`, `l1-null-receipts`, `two-day-outage`, `batcher-outage-past-retention` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
+| `chaos-follower` | `follower-instance-loss`, `follower-total-loss`, `follower-disagreement` | `RUN_LOAD=0`, retention 6144, snapshot interval 60 s, `L1_FAULT_S=60`, indexer poll 2 s, da-watcher silence 30 s, the L1 fault proxy on |
 | `chaos-integrity` (nightly) | `executor-restart-storm` | `RUN_LOAD=0` |
 
 Case order matters in five places.
@@ -76,7 +77,7 @@ Case order matters in five places.
 - `mirror-kill-rebuild` runs last in `chaos-cache`. It flushes the projection.
 - `executor-sealer-loss-recover` runs first in `chaos-combined-exec`. The persisted-state audit runs after it, before the other cases build on the state it leaves.
 
-`chaos-l1` runs the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
+`chaos-l1` and `chaos-follower` run the persisted-state audit after every case, not only at the end of the shard. Each case leaves a DA record that a silent gap could hide in. `chaos-combined-exec` runs it after `executor-sealer-loss-recover`: the executor nodes and the sealer nodes die at once, so the state every executor kept is compared with the validator's before the next case.
 
 After each of these audits, the next case waits until the chain runs again. See [Recovery after an audit](#recovery-after-an-audit).
 
@@ -192,6 +193,7 @@ The executors are dark in every case, so the head the judgement reads is the hig
   - Each one resumes by itself when the lie stops. No operator step.
 - [`l1-null-receipts`](failure-modes.md#batcher-live-service-cluster-egress-driven): serves null receipts and swallowed logs, with a batcher restart inside the fault.
 - [`follower-instance-loss`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0` for the fault window, during load. The da-watcher must not pause or wait, must publish past its start, and must publish one epoch for each block. The batcher must post, and no origin gap may remain.
+- [`follower-disagreement`](failure-modes.md#l1-follower): freezes the follower instance on `ingress-0`, then serves it a fork that is consistent in itself (`Fault::ForkedChain`, scoped to that node's address). The honest instance leads past the fork's first block; the thawed liar's records must halt the da-watcher on `l1_follower_disagreement`. The validator's own L1 read must verify epochs with no epoch fault. The case then runs the runbook: the fault ends, the liar's archive is wiped, the follower restarts, the da-watcher's halt is cleared. The da-watcher must publish again, and no origin gap may remain.
 - [`follower-total-loss`](failure-modes.md#l1-follower): stops the `l1-indexer` job for 75 s, past the da-watcher's silence window. The da-watcher must pause with the follower as its root. After the restart, it must resume with one epoch for each block since the start, and no origin gap may remain.
 - [`two-day-outage`](failure-modes.md#batcher-live-service-cluster-egress-driven): replays the events of a two-day L1 outage.
   - The redeploy of the followers restarts the da-watcher. Its cursor file must stand at or before the L1 origin of the sealer, within 60 s.
@@ -380,7 +382,7 @@ The steps share one budget of 300 s. A failure names the first step that did not
 
 ## The L1 fault proxy
 
-`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` shard uses it. The code is in `crates/l1_fault_proxy`.
+`kardamom-l1-fault-proxy` is an L1 JSON-RPC proxy that lies on command. The `chaos-l1` and `chaos-follower` shards use it. The code is in `crates/l1_fault_proxy`.
 
 - The proxy forwards every call to the upstream L1 (`--upstream`, env `KARDAMOM_L1_UPSTREAM`).
 - It changes the reply as the active faults say.
@@ -420,7 +422,7 @@ Several faults can be active at once. They model one bad endpoint.
 - A lie of the proxy is therefore a disagreement for the follower: it halts and publishes none of it.
 - The in-cluster anvil finalizes two blocks behind its head (one slot in each epoch). The followers walk finalized blocks.
 - The inbox indexer starts at block 1, so its archive holds every batch.
-- The `chaos-l1` shard sets the switch itself. The default is `0`.
+- The `chaos-l1` and `chaos-follower` shards set the switch themselves. The default is `0`.
 
 [`failure-modes.md`](failure-modes.md#batcher-live-service-cluster-egress-driven) lists what the cases prove, and which two-source checks stay open.
 
@@ -462,8 +464,8 @@ A value that does not parse fails the run at start. A zero value fails for a kno
 | `KARDAMOM_EXEC_CURSOR` | `off` (`on` in `chaos-executor`) | `on` when the deployed executors send their recorded cursor to the sealer. The bring-up of `chaos-executor` deploys it on. `hard-executor` checks the sealer's best cursor only when it is `on`. |
 | `KARDAMOM_DA_LAG_BUDGET_BLOCKS` | unset | The DA-lag budget of the deployed sealer, in blocks. `da-lag-halt` needs it. It must be a positive number, so the knob cannot pass 0. |
 | `RETENTION_FREEZE_CAP_S` | `600` | The hard cap of the adaptive retention freeze. |
-| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` cases stays active. |
-| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
+| `L1_FAULT_S` | `60` | The time one L1 fault of the `chaos-l1` and `chaos-follower` cases stays active. |
+| `L1_CASE_TPS` | `50` | The case load rate of the `chaos-l1` and `chaos-follower` cases. It is below the steady rate. A fault that stops the batcher must not push its cursor past the small retention. |
 | `RUN_LOAD` | `1` | `1` when the load stage ran on this cluster. The chaos shards set `0`. The resize case then takes a load-reserve account. |
 
 ### CPU squeeze knobs

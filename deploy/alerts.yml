@@ -76,8 +76,10 @@ groups:
       # before any downstream symptom of a stalled follower, such as the
       # batcher's post age, so the page points at the cause.
       - alert: KardamomL1FollowerLag
+        # The tip is the validator's own L1 view, independent of the
+        # follower; without a validator L1 check, the follower's own.
         expr: >-
-          max(kardamom_l1_indexer_l1_finalized_block_number)
+          (max(validator_l1_finalized_block_number) or max(kardamom_l1_indexer_l1_finalized_block_number))
           - max(kardamom_l1_follower_published_block_number) > 64
         for: 5m
         labels:

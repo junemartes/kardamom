@@ -260,6 +260,12 @@ async fn chaos_l1() {
     shard_test(Shard::L1).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "brings a container cluster up; needs Docker, OpenTofu, Ansible, and the prebuilt artifacts"]
+async fn chaos_follower() {
+    shard_test(Shard::Follower).await;
+}
+
 /// The nightly shard. CI runs it on the schedule and on a pull request
 /// with the `chaos-nightly` label.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
