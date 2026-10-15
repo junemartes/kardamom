@@ -27,15 +27,16 @@ pub(super) struct StartReport {
 
 impl StartReport {
     /// Build the context with `make_ctx`, report the budget, then build
-    /// and start the client and report the result. Returns the client, or
-    /// `None` after a failure report.
-    pub(super) fn start<F>(&self, make_ctx: F) -> Option<Rc<AeronClient>>
+    /// and start the client and report the result. Returns the client and
+    /// its budget, or `None` after a failure report.
+    pub(super) fn start<F>(&self, make_ctx: F) -> Option<(Rc<AeronClient>, DriverBudget)>
     where
         F: FnOnce() -> Result<AeronContext, LogError>,
     {
         let built = make_ctx().and_then(|ctx| Ok((DriverBudget::of_client(&ctx)?, ctx)));
-        let (_, ctx) = Self::step(&self.budget, built, |(budget, _)| *budget)?;
-        Self::step(&self.started, build_aeron(&ctx), |_| ())
+        let (budget, ctx) = Self::step(&self.budget, built, |(budget, _)| *budget)?;
+        let aeron = Self::step(&self.started, build_aeron(&ctx), |_| ())?;
+        Some((aeron, budget))
     }
 
     /// Send the outcome of one start step on `tx`: the error, or the

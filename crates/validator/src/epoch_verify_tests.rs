@@ -2,6 +2,7 @@ use alloy_primitives::{B256, U256, address};
 use kardamom_types::DepositLog;
 use kardamom_types::epoch::{LockboxLog, UpgradeLog};
 
+use super::step::{VerifyOutcome, VerifyVerdict};
 use super::*;
 
 fn log(number: u64, hash: B256, index: u64, mint: u128) -> LockboxLog {
@@ -248,7 +249,8 @@ fn a_missing_block_is_told_apart_from_an_unreachable_l1() {
     // not have this block" is a statement about the chain (rule 4, a
     // fault). "L1 did not answer" is about the network, a coverage gap.
     let e52 = derive_epoch(52, B256::repeat_byte(0x52), &[]).unwrap();
-    let verdict = |msg: &str| Verifier::<FakeL1>::give_up(&e52, 8, &anyhow::anyhow!("{msg}"));
+    let range = [e52];
+    let verdict = |msg: &str| Verifier::<FakeL1>::give_up(&range, 8, &anyhow::anyhow!("{msg}"));
     assert!(matches!(
         verdict("L1 provider error: finalized L1 block 52 not found"),
         VerifyVerdict::Fault(EpochFault::BlockBeyondFinality {
@@ -275,18 +277,54 @@ fn beyond_finality_message_names_the_block_and_the_effort() {
 
 /// A fake L1 whose blocks are whatever the test says they are. This is
 /// the shape a lying or buggy endpoint takes.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct FakeL1 {
     blocks: std::collections::BTreeMap<u64, (B256, B256)>,
 }
 
-#[async_trait::async_trait]
-impl L1EpochSource for FakeL1 {
-    async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
+impl FakeL1 {
+    fn ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
         self.blocks
             .get(&number)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("finalized L1 block {number} not found"))
+    }
+
+    fn of(blocks: &[(u64, B256, B256)]) -> Self {
+        Self {
+            blocks: blocks.iter().map(|&(n, h, p)| (n, (h, p))).collect(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl L1EpochSource for FakeL1 {
+    async fn finalized_block_number(&self) -> anyhow::Result<u64> {
+        self.blocks
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no block"))
+    }
+    async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
+        self.ids(number)
+    }
+    async fn headers(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> anyhow::Result<Vec<kardamom_da_watcher::L1Header>> {
+        (from..=to)
+            .map(|number| {
+                let (hash, parent_hash) = self.ids(number)?;
+                Ok(kardamom_da_watcher::L1Header {
+                    number,
+                    hash,
+                    parent_hash,
+                    timestamp: 0,
+                })
+            })
+            .collect()
     }
     async fn lockbox_logs(
         &self,
@@ -302,114 +340,141 @@ fn lockbox() -> Address {
     address!("0000000000000000000000000000000000C0DE01")
 }
 
-/// A verifier over `l1` with `anchor` as its last verified epoch. The
-/// queue and the divergence sink are unused by `verify_one`.
-fn verifier(l1: FakeL1, anchor: Option<Anchor>) -> Verifier<FakeL1> {
+/// A verifier whose anchor is `anchor_l1` and whose logs source is
+/// `logs_l1`, with `last` as its last verified epoch.
+fn verifier(anchor_l1: FakeL1, logs_l1: FakeL1, last: Option<Anchor>) -> Verifier<FakeL1> {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut v = Verifier::new(
-        std::sync::Arc::new(l1),
-        lockbox(),
+        ContentSources {
+            anchor: std::sync::Arc::new(anchor_l1),
+            logs: std::sync::Arc::new(logs_l1),
+            lockbox: lockbox(),
+            max_log_range: std::num::NonZeroU64::new(10).unwrap(),
+        },
         std::sync::Arc::new(Divergence::default()),
         rx,
     );
-    v.anchor = anchor;
+    v.anchor = last;
     v
 }
 
-#[tokio::test]
-async fn a_properly_chained_pair_of_epochs_verifies() {
-    let (h7, h8) = (B256::repeat_byte(0x77), B256::repeat_byte(0x88));
-    let l1 = FakeL1 {
-        blocks: [(7, (h7, B256::repeat_byte(0x66))), (8, (h8, h7))]
-            .into_iter()
-            .collect(),
-    };
-    let e7 = derive_epoch(7, h7, &[]).unwrap();
-    let e8 = derive_epoch(8, h8, &[]).unwrap();
-
-    assert!(verifier(l1.clone(), None).verify_one(&e7).await.is_ok());
-    assert!(
-        verifier(
-            l1,
-            Some(Anchor {
-                number: 7,
-                hash: h7
-            })
-        )
-        .verify_one(&e8)
-        .await
-        .is_ok()
-    );
+fn h(n: u8) -> B256 {
+    B256::repeat_byte(n)
 }
 
-#[tokio::test]
-async fn an_epoch_that_does_not_descend_from_its_predecessor_is_caught() {
-    // This is the lie the per-block check cannot see: block 8 exists,
-    // its hash matches what the epoch claims, and its deposits match,
-    // but it is not built on block 7. The numbers are consecutive, but
-    // it is not one chain.
-    let (h7, h8) = (B256::repeat_byte(0x77), B256::repeat_byte(0x88));
-    let orphan_parent = B256::repeat_byte(0xEE);
-    let l1 = FakeL1 {
-        blocks: [(8, (h8, orphan_parent))].into_iter().collect(),
-    };
-    let e8 = derive_epoch(8, h8, &[]).unwrap();
+/// One chain of blocks 7..=9 with hashes 0x77, 0x88, 0x99.
+fn chain() -> FakeL1 {
+    FakeL1::of(&[
+        (7, h(0x77), h(0x66)),
+        (8, h(0x88), h(0x77)),
+        (9, h(0x99), h(0x88)),
+    ])
+}
 
-    // Without an anchor, the epoch passes: there is nothing to chain against.
-    assert!(verifier(l1.clone(), None).verify_one(&e8).await.is_ok());
+fn epochs(blocks: &[(u64, B256)]) -> Vec<EpochRecord> {
+    blocks
+        .iter()
+        .map(|&(n, hash)| derive_epoch(n, hash, &[]).unwrap())
+        .collect()
+}
 
-    // With an anchor, the break is caught.
-    let err = verifier(
-        l1,
-        Some(Anchor {
-            number: 7,
-            hash: h7,
-        }),
-    )
-    .verify_one(&e8)
-    .await
-    .unwrap_err();
-    match err {
-        VerifyOutcome::Fault(EpochFault::ParentMismatch {
-            l1_number,
-            expected_parent,
-            got_parent,
-        }) => {
-            assert_eq!(l1_number, 8);
-            assert_eq!(expected_parent, h7);
-            assert_eq!(got_parent, orphan_parent);
-        }
-        VerifyOutcome::Fault(other) => panic!("wrong fault: {other}"),
-        VerifyOutcome::Unavailable(e) => panic!("expected a fault, got {e}"),
+fn fault(outcome: Result<Anchor, VerifyOutcome>) -> EpochFault {
+    match outcome {
+        Err(VerifyOutcome::Fault(fault)) => fault,
+        Err(VerifyOutcome::Unavailable(e)) => panic!("expected a fault, got {e}"),
+        Ok(anchor) => panic!("expected a fault, got {anchor:?}"),
     }
 }
 
+/// A range of one chain that ends at the anchor's header verifies in one
+/// check, and its last epoch is the new anchor.
+#[tokio::test]
+async fn a_chained_range_ending_at_the_anchor_verifies() {
+    let range = epochs(&[(8, h(0x88)), (9, h(0x99))]);
+    let last = Some(Anchor {
+        number: 7,
+        hash: h(0x77),
+    });
+    let anchor = verifier(chain(), chain(), last)
+        .verify_range(&range)
+        .await
+        .ok()
+        .unwrap();
+    assert_eq!(
+        anchor,
+        Anchor {
+            number: 9,
+            hash: h(0x99)
+        }
+    );
+}
+
+/// The range's last header is not the light client's: the logs source
+/// serves another chain, consistent in itself.
+#[tokio::test]
+async fn a_range_that_does_not_end_at_the_anchor_is_caught() {
+    let forked = FakeL1::of(&[(8, h(0xA8), h(0x77)), (9, h(0xA9), h(0xA8))]);
+    let range = epochs(&[(8, h(0xA8)), (9, h(0xA9))]);
+    let f = fault(verifier(chain(), forked, None).verify_range(&range).await);
+    assert_eq!(f, EpochFault::HashMismatch { l1_number: 9 });
+}
+
+/// An epoch that names another hash than its block's is caught, also in
+/// the middle of a range.
+#[tokio::test]
+async fn an_epoch_naming_another_hash_in_the_range_is_caught() {
+    let range = epochs(&[(7, h(0x77)), (8, h(0xEE)), (9, h(0x99))]);
+    let f = fault(verifier(chain(), chain(), None).verify_range(&range).await);
+    assert_eq!(f, EpochFault::HashMismatch { l1_number: 8 });
+}
+
+/// The range must descend from the last verified epoch. This is the lie
+/// the per-block check cannot see: the numbers are consecutive, but it
+/// is not one chain.
+#[tokio::test]
+async fn a_range_that_does_not_descend_from_the_last_epoch_is_caught() {
+    let range = epochs(&[(8, h(0x88)), (9, h(0x99))]);
+    let last = Some(Anchor {
+        number: 7,
+        hash: h(0x70),
+    });
+    let f = fault(verifier(chain(), chain(), last).verify_range(&range).await);
+    assert_eq!(
+        f,
+        EpochFault::ParentMismatch {
+            l1_number: 8,
+            expected_parent: h(0x70),
+            got_parent: h(0x77),
+        }
+    );
+}
+
+/// After an unverified range the anchor is not the predecessor; the chain
+/// check starts at the range, with no false parent mismatch.
 #[tokio::test]
 async fn chaining_is_skipped_across_a_gap_in_the_anchor() {
-    // After a deferred, unverified epoch, the anchor goes stale, so the
-    // next epoch is not the anchor's successor. Chaining must skip
-    // rather than report a false parent mismatch. The sequence rules
-    // already reject real gaps, and inventing a divergence here would
-    // stop a healthy validator over an L1 blip.
-    let h9 = B256::repeat_byte(0x99);
-    let l1 = FakeL1 {
-        blocks: [(9, (h9, B256::repeat_byte(0xAB)))].into_iter().collect(),
-    };
-    let e9 = derive_epoch(9, h9, &[]).unwrap();
-
-    // The anchor is block 7, this is block 9: not adjacent, so no chain check.
+    let range = epochs(&[(9, h(0x99))]);
+    let last = Some(Anchor {
+        number: 7,
+        hash: h(0x70),
+    });
     assert!(
-        verifier(
-            l1,
-            Some(Anchor {
-                number: 7,
-                hash: B256::repeat_byte(0x77),
-            }),
-        )
-        .verify_one(&e9)
-        .await
-        .is_ok()
+        verifier(chain(), chain(), last)
+            .verify_range(&range)
+            .await
+            .is_ok()
     );
+}
+
+/// A range splits at a gap that a dropped epoch leaves.
+#[test]
+fn a_gap_splits_the_range() {
+    let gathered = epochs(&[(7, h(1)), (8, h(2)), (10, h(3)), (11, h(4))]);
+    let runs: Vec<Vec<u64>> = Verifier::<FakeL1>::runs(gathered)
+        .iter()
+        .map(|run| run.iter().map(|e| e.l1_number).collect())
+        .collect();
+    assert_eq!(runs, [vec![7, 8], vec![10, 11]]);
 }
 
 #[test]
@@ -479,12 +544,13 @@ fn a_regressed_origin_without_an_l1_source_is_a_divergence() {
 
 #[tokio::test]
 async fn an_l1_source_turns_the_content_check_on() {
-    let l1 = FakeL1 {
-        blocks: std::collections::BTreeMap::new(),
-    };
     let verifier = EpochVerifier::new(Divergence::new()).with_content_check(
-        std::sync::Arc::new(l1),
-        lockbox(),
+        ContentSources {
+            anchor: std::sync::Arc::new(FakeL1::default()),
+            logs: std::sync::Arc::new(FakeL1::default()),
+            lockbox: lockbox(),
+            max_log_range: std::num::NonZeroU64::new(10).unwrap(),
+        },
         &tokio::runtime::Handle::current(),
     );
     assert!(verifier.content.is_some());

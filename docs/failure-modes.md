@@ -644,6 +644,16 @@ The failure philosophy is inverted here: **halting is the feature**. A divergenc
   - A divergence that replica results proved is not checked again. The resumed run opens new buffers, and the streams do not replay. The halted block, and every block published during the halt, commit unverified. The runbook says what to do before the clear.
 - Proof: the chain-semantics test `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta` on the real `tx_bal` channel. The executor is stopped with SIGSTOP, so nothing competes. The test asserts the halting log line and the halt record with the divergence cause.
 - The validator exits on SIGTERM. The graceful shutdown of the chain-semantics suite bounds it at 20 s.
+**The epoch check, an independent L1 read.** With `--l1-rpc-url` and `--lockbox`, the validator checks every epoch on the canonical stream against L1. It never reads the L1 follower's `l1_blocks` stream: a lie that passed the follower would pass the check too.
+
+- It checks one range of epochs at a time: the epochs that arrive together, about one finality step, at most 64.
+- The anchor, `--l1-rpc-url` (the light client), gives the hash of the range's last block. The range's last epoch must name it.
+- The logs source, `--l1-logs-rpc-url` (default: the anchor), gives the headers of the range in one batch and the lockbox logs in chunks of `--l1-max-log-range` blocks. It must not be the follower's first source.
+- Each header names the one before it as its parent; the first names the last verified epoch's block. Each epoch's hash is its header's, and each epoch derives from its block's logs through the producer's own rule.
+- A mismatch is an epoch fault: `validator_epoch_faults_total` and the `validator_divergence` halt. An L1 that does not answer through the retries leaves the range unverified (`validator_epochs_unverified_total`).
+- Every minute the validator reads the anchor's finalized tip, `validator_l1_finalized_block_number`. The follower-lag alert compares the newest `l1_blocks` record with it.
+- Proof: the unit tests of `epoch_verify_tests.rs` (a forked range that does not end at the anchor, an epoch that names another hash, a range that does not descend from the last epoch). The `chaos-l1` case `follower-disagreement` serves one follower instance a consistent fork: the da-watcher halts on `l1_follower_disagreement`, and the validator's own read verifies the true epochs with no fault.
+
 - The attester is on only when `--output-oracle` and `--attester-key` are both set. It then needs `--l1-rpc-url`.
   - `--l1-rpc-url` serves two features: the epoch check (with `--lockbox`) and the attester. `--l1-rpc-url` alone, or with `--lockbox`, leaves the attester off.
   - Only one of `--output-oracle` and `--attester-key`, or both without `--l1-rpc-url`, stops the start.
@@ -1085,6 +1095,7 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - The follower is the one reader of L1. With two sources, a lie of one is a disagreement: the follower halts (`l1_source_disagreement`), publishes none of it, and resumes by itself when the sources agree again. The da-watcher pauses on it.
 - With one source, the follower chains every header of a range, to its cursor, and halts on a break (`l1_chain_break`). A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores and publishes its hash. A light client anchor closes this case at the finalized tip; two sources close it everywhere.
 - A swallowed log is invisible to one source. Two sources see it.
+- After an operator clears `l1_follower_disagreement`, the archives still hold both instances' records. A history read keeps the chain that descends from the da-watcher's head, so the lie is never taken, and the old conflict does not halt it again.
 - Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 
 ## Notifier
@@ -1288,7 +1299,8 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - The reason: an add that times out leaves its request with the driver. The Aeron client drops its poller with no cleanup, the driver completes the late add, and the publication or subscription stays registered on its own port and session until the process exits. A retry after each short timeout would leak one for each try. One long wait has the same bound and leaks nothing.
     - A wait that ends with no answer (the limit, or a stop) cancels the add (`aeron_async_add_publication_cancel`, `aeron_async_add_subscription_cancel`), so the driver removes a late publication or subscription.
     - The Aeron thread of the runtime polls the add, so the wait blocks the other work of that runtime: the subscriptions it already holds are not polled, and its other commands queue. This happens only at start-up, and only while the driver does not answer.
-    - An add at run time keeps the 5 s timeout: a reopen of a publication (`PublisherReopen`), and every static open.
+    - An add at run time keeps the 5 s timeout: a reopen of a publication (`PublisherReopen`), every static open, and the attach of a publisher destination.
+    - A destination is its own Aeron subscription (see [aeron-discovery.md](aeron-discovery.md#transport)). A destination add that gets no answer in 5 s is cancelled, so the driver keeps no subscription that nothing polls. Such a subscription would hold back a publication with `fc=min`.
   - Consul registration of a record (publisher records and subscriber records): a retry with a bounded backoff (`StartRetry` in `crates/log/src/discovery/start_retry.rs`), for the same limit. A registration is idempotent and leaks nothing.
     - Only an unavailable agent starts a retry: a connect error, a timeout, a broken transfer, or a 5xx status. A refused permission (a 4xx status, an ACL denial) or a malformed request fails at once.
     - The pauses follow the catalog backoff of `[discovery]` (`backoff_min_ms` to `backoff_max_ms`, doubling).
@@ -1306,6 +1318,15 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - The `start_retry` unit tests: the retry succeeds after transient failures, gives up at the limit, fails at once on a refusal, and ends at once on a stop (during a pause, and before a pause).
     - `consul_register_retry`: a fake Consul agent drops one request and answers 503 once, then accepts.
     - `a_publication_open_outlasts_a_driver_stall` in `discovered_exec_txs` (docker-e2e): the test freezes the driver for 7 s during a publication open. The open succeeds with one add, and the driver holds one publication.
+- **Catalog flap of a live publisher**
+  - Trigger: the Consul catalog misses a live publisher for longer than `removal_grace_ms` (5 s by default) and lists it again. For example, a read that returns a malformed body, or a record whose check is late. The publisher does not restart.
+  - Effect: every subscriber and every discovered recorder detaches the publisher, and attaches it again when the catalog lists it.
+  - Rule for a subscriber: a detach lingers until the image goes. The subscription of the destination stays open while its image is connected, for up to one stall budget. An attach of the same endpoint during that time keeps the subscription and the image. A short flap thus loses nothing: the consumers keep the same session and position, and the driver repairs any loss from the term buffer of the publisher.
+  - Rule for a recorder: a catalog change never ends a live recording. A departed publisher keeps its recording subscription until the archive ends the recording (the image went), with no time limit. An own publication never departs. An archive that ends the recording of a listed publisher logs a WARN line with the stop position.
+  - Without the linger, a detach closes the image at once, and the next attach joins at the live position. The frames between the detach and the attach reach no consumer and no archive, so every executor stops on a join miss that no refetch can serve.
+  - A publisher that stopped loses its image within the image liveness timeout, so its subscription and recording subscription close then.
+  - A flap that outlasts the linger closes the subscriber's destination of a live publisher. The next attach then forms a new image at the live position. The recordings keep the frames, so a consumer repairs that gap by refetch.
+  - Proof: `a_detach_and_attach_keep_one_image_with_no_gap` and `a_detached_destination_closes_once_its_publisher_stops` in `mds_destination_removal` (docker-e2e); the departure tests of the recorder in `discovery/recording/tests.rs`, among them `a_catalog_lapse_of_an_own_publication_keeps_its_recording`.
 - **The observation path itself**
   - A `docker kill` of a privileged DinD node stalls `docker exec` on the host dockerd for minutes, runner-wide. Every exec-based probe goes dark at once. This looks like "all executors dead" while the pipeline is healthy.
   - The chaos probes hit the exporters of the executors **directly over the cluster bridge**. The exporters bind `0.0.0.0:9004`. Exec is the fallback.

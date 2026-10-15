@@ -13,11 +13,39 @@ cluster.
 
 Every application stream is a dynamic Aeron MDC publication. A publisher
 binds one control endpoint per publication on the advertised interface and
-registers it. A consumer opens one multi-destination subscription per
-stream and attaches one destination per publisher the catalog lists. The
-publishers stay separate Aeron images, so a transaction keeps its
+registers it. A consumer opens one subscription per stream and attaches
+one destination per publisher the catalog lists. The publishers stay
+separate Aeron images, so a transaction keeps its
 `(shard, session, position)` identity at the publisher, at every live
 consumer, and in the recording refetch reads.
+
+A destination is its own Aeron subscription on the destination URI. All
+the destinations of a stream feed one frame stream.
+
+A detach does not close the subscription of the destination at once:
+
+- The subscription lingers. It stays open and polled until it has no
+  image, or until one stall budget of the client ends (at least the image
+  liveness timeout of the driver, 10 s by default).
+- A publisher that stopped loses its image within that time, so its
+  subscription closes as soon as the image goes.
+- An attach of the same URI during the linger keeps the open subscription
+  and its image. A catalog flap that detaches a live publisher for a few
+  seconds thus leaves the image, the session and the position unchanged.
+  The driver repairs any loss from the term buffer of the publisher, and
+  no gap reaches the consumer.
+
+The runtime never uses an Aeron multi-destination subscription:
+
+- The Java media driver sizes the connection table of an image from the
+  destination index of that image. It grows the table only for a
+  destination that is added after the image forms.
+- The removal of a destination with a higher index than that table throws
+  `ArrayIndexOutOfBoundsException` in `PublicationImage.removeDestination`.
+  The other images of the subscription then keep a stale connection.
+- An image usually forms after the destinations of a stream attach, so each
+  detach after a publisher leaves hits this fault. Aeron 1.45 to 1.53 have
+  the fault.
 
 Consul is the discovery control plane only. Messages travel between Aeron
 media drivers. Consul never relays a message, answers a per-message
@@ -167,7 +195,8 @@ procedure.
 - A read error keeps the last membership and retries with bounded backoff.
   An error is never an empty set.
 - A successful empty read is a distinct state. Every attached publisher is
-  detached after the removal grace.
+  detached after the removal grace. A detached destination lingers until
+  its image goes (see "Transport").
 - An index that moves backwards restarts the blocking query.
 - Attachments are keyed by destination URI. A replacement incarnation on
   the same endpoint keeps its destination; the driver forms a new image
@@ -188,6 +217,21 @@ readiness waits for the new session's recording. The ingress serves only
 once every one of its own lanes has a live recording. The DA watcher
 records its own `tx_deposits` publication the same way, and the L1 follower
 its `l1_blocks` publication, through `StreamPlane::record_own`.
+
+A catalog change alone never ends a live recording:
+
+- A publisher of another process that leaves the catalog for the removal
+  grace keeps its recording subscription until the archive ends its
+  recording. The archive ends a recording when the image goes. A
+  publisher that is listed again keeps the same recording, with no hole.
+- The recorder never treats an own publication as departed. The process
+  knows its own publications, so a lapse of their records in the catalog
+  (a late TTL check, a flap) changes nothing.
+- When the archive ends the recording of a publisher that is still
+  listed, the recorder logs the WARN line `discovered recorder: the
+  archive ended the recording of a listed publisher` with the stop
+  position. The recording subscription stays, and the next image of the
+  publisher starts a new recording.
 
 Each executor records its own recorded `exec_txs` publication on the
 archive of its node. The recorder adopts only the recording of the

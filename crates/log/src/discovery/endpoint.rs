@@ -7,8 +7,10 @@ use super::record::Topic;
 use crate::config::InterfaceSelector;
 use crate::error::LogError;
 
-/// The URI of every discovered subscription: a multi-destination
-/// subscription with no destination until the reconciler attaches one.
+/// The URI of every discovered subscription. The subscription receives
+/// nothing itself. Each publisher the reconciler attaches gets its own
+/// Aeron subscription that feeds the same frame stream (see
+/// [`AeronRuntime::add_destination`](crate::aeron_live::AeronRuntime::add_destination)).
 pub const MANUAL_SUBSCRIPTION_URI: &str = "aeron:udp?control-mode=manual";
 
 /// Resolve the one IPv4 address `selector` names on this host. Zero or
