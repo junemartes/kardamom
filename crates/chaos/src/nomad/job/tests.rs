@@ -69,3 +69,53 @@ fn empty_jobs_and_unknown_groups_cannot_pass() {
     allocs.push(alloc("extra", "seq-2", 3, "run", "running"));
     assert!(job().running(&allocs).is_none());
 }
+
+/// One executor allocation per node. The allocation on `executor-2` is
+/// `pending`: it waits in a restart delay.
+fn executors() -> (Job, Vec<Alloc>) {
+    let job = serde_json::from_value(serde_json::json!({
+        "Version": 6, "TaskGroups": [{"Name":"executor","Count":3}]
+    }))
+    .unwrap();
+    let allocs = [
+        ("executor-0", "running"),
+        ("executor-1", "running"),
+        ("executor-2", "pending"),
+    ]
+    .into_iter()
+    .map(|(node, status)| Alloc {
+        node_name: node.into(),
+        ..alloc(node, "executor", 6, "run", status)
+    })
+    .collect();
+    (job, allocs)
+}
+
+fn nodes<const N: usize>(names: [&str; N]) -> Nodes {
+    Nodes::new(names.map(String::from)).unwrap()
+}
+
+#[test]
+fn a_node_set_holds_at_least_one_node() {
+    assert!(Nodes::new(Vec::new()).is_none());
+}
+
+#[test]
+fn a_replica_that_restarts_by_design_does_not_hold_back_the_named_nodes() {
+    let (job, allocs) = executors();
+    assert!(job.running(&allocs).is_none());
+    assert!(job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-2"])));
+}
+
+#[test]
+fn a_named_node_needs_a_current_running_allocation() {
+    let (job, mut allocs) = executors();
+    allocs[1].client_status = "pending".into();
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
+    allocs[1] = Alloc {
+        node_name: "executor-1".into(),
+        ..alloc("old", "executor", 5, "run", "running")
+    };
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
+}

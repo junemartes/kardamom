@@ -12,6 +12,7 @@ import io.aeron.test.InterruptingTestCallback;
 import io.aeron.test.Tests;
 import java.io.File;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -76,7 +77,8 @@ final class ComponentCloseTest {
                     .clusterDir(new File(dir.resolve("cluster").toString()))
                     .clusteredService(new SealerClusteredService()));
             final JoinWatchdogThread.Member member =
-                    new JoinWatchdogThread.Member(MEMBER_ID, consensus, container.context(), stop);
+                    new JoinWatchdogThread.Member(MEMBER_ID, consensus, container.context(), stop,
+                            new PeerProbe(List.of()));
             while (member.closedComponent().isEmpty()) {
                 Tests.sleep(50);
             }
@@ -84,6 +86,12 @@ final class ComponentCloseTest {
             assertEquals(Optional.of("CONSENSUS_MODULE"), member.closedComponent());
             assertFalse(hookRan.get(), "Aeron calls no termination hook for a module that fails in its start");
             assertFalse(stop.isRequested(), "a failed start is not a stop request");
+            assertEquals(new JoinWatchdog.Timeouts(
+                            TimeUnit.NANOSECONDS.toMillis(consensus.leaderHeartbeatTimeoutNs()),
+                            TimeUnit.NANOSECONDS.toMillis(ARCHIVE_TIMEOUT_NS),
+                            consensus.aeron().context().driverTimeoutMs()),
+                    member.timeouts(),
+                    "the watchdog limits follow the member's configured timeouts");
         } finally {
             CloseHelper.quietCloseAll(container, driver);
         }

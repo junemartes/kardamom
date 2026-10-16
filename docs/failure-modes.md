@@ -229,12 +229,29 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Follower below the purge point**
   - Trigger: a follower stops for longer than the purge margin. It restarts with a log that ends below the purge point of the leader.
   - Effect: the archive of the leader refuses the catch-up of the follower. The election of the follower cycles, while Nomad sees a live container.
-  - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off).
-    - It logs `cluster CATCHUP STALL`.
+  - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off), and only when a peer has a closed election.
+    - At the stall limit (see the next entry) the member asks its peers for their admin status. When every peer answers with an open election, it relaunches and keeps its log (exit code 8).
+    - Otherwise it waits until 300 s and logs `cluster CATCHUP STALL`. A peer with a closed election, a peer that does not answer, and a member with no admin port (`adminPort` 0) all lead here.
     - It deletes the recording log of the member and exits with code 4.
     - The relaunch finds no recording log. So the member seeds from a peer and rejoins.
-    - The member holds no committed entry that the leader does not have, because it was behind the leader.
-  - Proof: the in-JVM tests `ClusterLogPurgeTest` and `JoinWatchdogTest`.
+    - The member holds no committed entry that the leader does not have, because it was behind the live leader.
+  - Proof: the in-JVM tests `ClusterLogPurgeTest`, `JoinWatchdogTest` and `PeerProbeTest`.
+- **Election stall after a full restart**
+  - Trigger: all members restart together with different log tails. Two members win two different terms. Aeron 1.44 lets a member vote in a higher term, then accept the leader of the lower term in `CANVASS`. So one member can give a quorum to both leaders. The leader of the lower term replays its longer log into its service before it learns of the higher term.
+  - Effect: the cluster stays without a closed election, while Nomad sees three live containers.
+    - The leader of the higher term waits in `LEADER_READY` for ever: Aeron 1.44 gives that state no timeout, and a member that voted must join.
+    - The old leader cannot join: its service is ahead of the new leader's log. Each join fails at once (`followerLogAwait - joinPosition=... less than logPosition=...`), and each new election takes the position from the commit counter again.
+    - A third member can wait in `FOLLOWER_LOG_REPLICATION` for ever: Aeron 1.44 checks that deadline only after the archive signals both the end of the replication and the stop of the recording, and a replication that fails before its recording starts sends no stop.
+  - Recovery: the join watchdog acts after the stall limit with no progress. The limit is two join attempts of a follower: 2 x (2 x leader heartbeat timeout + archive message timeout + driver timeout). That is 80 s at the defaults and 160 s at the CI stall tolerance of 30 s.
+    - A leader in `LEADER_READY` with no progress on itself or its peers logs `cluster LEADER STALL` and exits with code 7.
+    - A member that found a leader and makes no progress logs `cluster FOLLOWER STALL` and exits with code 8. It keeps its recording log.
+    - Each relaunch starts from the member's own state. A member replays its log after the new leader truncates its log tail, so it joins at the leader's position.
+    - Data: the truncated tail can be committed in the lower term. In #620, member 2 closed term T0 at 15027712 with member 0, and the leader of T1 holds the log only to 15027008. The members then keep the log of T1, and the entries from 15027008 to 15027712 go. This is the behavior of Aeron 1.44 after the double vote, not of the watchdog.
+    - With `adminPort` 0 the leader reads no peer progress. Then the leader stall can also fire while a slow follower replays for longer than the stall limit. The relaunch costs one more election.
+    - Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44, and no rule acts on it.
+    - Before each exit, the member prints its Aeron error logs (`cluster ERROR LOG`).
+  - Not a stall (with the admin port set): a slow follower that replays or catches up moves its commit position. A waiting leader reads the commit positions of its peers from their admin servers every 5 s, and counts a new highest one as progress. A coordinated restart and a lone member wait in `CANVASS`, which is no follower state. A snapshot runs with a closed election.
+  - Proof: the in-JVM tests `JoinWatchdogTest`, `PeerProbeTest` and `ComponentCloseTest` (the limits follow the member's configured timeouts).
 - **Component fails in its start**
   - Trigger: the consensus module or the service container throws while it starts. The usual cause is a slow host at a full restart: the snapshot load waits for the archive past an Aeron timeout.
   - Effect: the component records the error in its error log and closes. Aeron calls no termination hook, and the media driver and the archive keep the process alive. The member never joins and takes no snapshot. At the next restart it restores an old snapshot, and its log can end below the purge point of the leader.
@@ -254,7 +271,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Recovery: the join watchdog acts when the control toggle is active and the election state is not `CLOSED` for longer than the two blocking waits of a completion: the archive message timeout plus the driver timeout (20 s at the defaults, 60 s at the CI stall tolerance of 30 s). A completion that succeeds moves the state to `CLOSED` within those waits. A new election sets the state to `INIT` first, and its first step then sets the toggle to `INACTIVE`; the first election after a start does not set the toggle, but a new consensus module starts with an `INACTIVE` toggle. So only a failed completion keeps that combination past the limit.
     - It logs `cluster LEADER WEDGE`.
     - It exits with code 6. The relaunch starts from the member's own state, and the members elect again.
-  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, and the watchdog does not act.
+  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, so this rule does not act. The leader stall rule (see "Election stall after a full restart") counts the follower's replay as progress.
   - Proof: the in-JVM test `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.
