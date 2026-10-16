@@ -187,6 +187,19 @@ impl<'a> FleetWipe<'a> {
             .map_or(&[][..], |(_, fresh)| fresh)
     }
 
+    /// The Nomad node of each fresh executor: its container name without
+    /// the `kardamom-` prefix.
+    fn fresh_nodes(&self) -> anyhow::Result<Vec<&str>> {
+        self.fresh()
+            .iter()
+            .map(|container| {
+                container.strip_prefix("kardamom-").ok_or_else(|| {
+                    crate::chaos_fail!("{CTX}: executor container {container} names no node")
+                })
+            })
+            .collect()
+    }
+
     /// Stop the ingress and let the blocks in flight land and post. Then
     /// stop the batcher, so H stays where it is, and seal a few more
     /// blocks with an epoch in them: a consumer of the old chain then
@@ -426,9 +439,13 @@ impl<'a> FleetWipe<'a> {
     /// Start the executors. The fresh ones resume at `(E_H, H + 1)`; the
     /// stale one asks for a cursor past the head and gets `REPLAY_AHEAD`.
     /// Then the stale one gets the image too, and all of them resume.
+    ///
+    /// The stale executor exits at each start, and Nomad holds it in a
+    /// restart delay for most of the time. So the first start waits for
+    /// the fresh executors' allocations only.
     async fn resume_executors(&self, seeded: &Seeded) -> anyhow::Result<()> {
         let base = ResumeCounts::read(self.h, &seeded.head).await?;
-        self.jobs.executor.restore().await?;
+        self.jobs.executor.restore_on(&self.fresh_nodes()?).await?;
         base.await_resumed(self.h, &seeded.head, self.fresh().len())
             .await?;
         base.await_ahead(self.h).await?;

@@ -3,7 +3,7 @@
 use anyhow::Context;
 use serde_json::Value;
 
-use super::{Job, Nomad};
+use super::{Alloc, Job, Nomad};
 use crate::poll::{self, Budget};
 
 pub(crate) struct SavedJob {
@@ -79,12 +79,30 @@ impl SavedJob {
         self.nomad.job(&self.id).await
     }
 
+    /// Register the saved definition again, and wait until its allocation
+    /// runs on each node of `nodes`. The allocations on the other nodes
+    /// can stop and restart: the caller expects them to.
+    pub(crate) async fn restore_on(&self, nodes: &[&str]) -> anyhow::Result<()> {
+        let desired = self.post(&self.definition).await?;
+        self.await_allocs(&desired, |allocs| desired.runs_on(allocs, nodes))
+            .await
+    }
+
     /// Wait until the allocations of `desired` run.
     pub(crate) async fn await_running(&self, desired: &Job) -> anyhow::Result<()> {
-        let outcome = poll::until(Budget::secs(180, 3), |_| async {
-            Ok(desired
-                .running(&self.nomad.allocations(&self.id).await?)
-                .map(|_| ()))
+        self.await_allocs(desired, |allocs| desired.running(allocs).is_some())
+            .await
+    }
+
+    /// Wait until the job's allocations satisfy `ready`.
+    async fn await_allocs(
+        &self,
+        desired: &Job,
+        ready: impl Fn(&[Alloc]) -> bool,
+    ) -> anyhow::Result<()> {
+        let ready = &ready;
+        let outcome = poll::until(Budget::secs(180, 3), |_| async move {
+            Ok(ready(&self.nomad.allocations(&self.id).await?).then_some(()))
         })
         .await?;
         outcome.or_fail(|_| {

@@ -24,14 +24,29 @@ impl Job {
     /// A complete set of current, desired-running allocations. Historical
     /// failed allocations cannot replace a missing replica or block its replacement.
     pub(crate) fn running<'a>(&self, allocs: &'a [Alloc]) -> Option<Vec<&'a Alloc>> {
-        let current: Vec<&Alloc> = allocs
-            .iter()
-            .filter(|a| a.job_version == self.version && a.is_desired_running())
-            .collect();
+        let current: Vec<&Alloc> = allocs.iter().filter(|a| self.current(a)).collect();
         let complete = !self.groups.is_empty()
             && self.groups.iter().all(|g| g.satisfied(&current))
             && current.iter().all(|a| self.has_group(&a.task_group));
         complete.then_some(current)
+    }
+
+    /// Whether an allocation of this version runs on each node of
+    /// `nodes`. An allocation on another node does not count, so a
+    /// replica that stops by design on its own node does not hold back
+    /// the others.
+    pub(crate) fn runs_on(&self, allocs: &[Alloc], nodes: &[&str]) -> bool {
+        nodes.iter().all(|node| {
+            allocs
+                .iter()
+                .any(|a| a.node_name == *node && self.current(a))
+        })
+    }
+
+    /// Whether `alloc` belongs to this version and is meant to keep
+    /// running.
+    fn current(&self, alloc: &Alloc) -> bool {
+        alloc.job_version == self.version && alloc.is_desired_running()
     }
 
     pub(crate) fn has_group(&self, name: &str) -> bool {
