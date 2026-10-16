@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import socket
 import time
+import urllib.parse
 import urllib.request
 import subprocess
 import tempfile
@@ -121,6 +122,15 @@ class NomadAPI(BaseHTTPRequestHandler):
         # The registry: the manifest of an image, by digest.
         assert self.path.startswith('/v2/') and '/manifests/sha256:' in self.path, self.path
         name = self.path.removeprefix('/v2/').split('/manifests/')[0]
+        token = self.server.state.get('registry_token')
+        if token and self.headers.get('Authorization') != f'Bearer {token}':
+            # A registry such as ghcr.io: no manifest without a pull token,
+            # also for a public image.
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', f'Bearer realm="http://127.0.0.1:{self.server.server_port}/token",'
+                                                 f'service="registry.example",scope="repository:{name}:pull"')
+            self.end_headers()
+            return
         self.send_response(404 if name in self.server.state.get('missing_images', ()) else 200)
         self.end_headers()
 
@@ -168,6 +178,14 @@ class NomadAPI(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith('/token?'):
+            # The token service of the registry: an anonymous pull token
+            # for the scope of the challenge.
+            query = urllib.parse.parse_qs(self.path.split('?')[1])
+            assert query['service'] == ['registry.example'] and query['scope'][0].endswith(':pull'), query
+            self.server.state.setdefault('token_scopes', []).append(query['scope'][0])
+            self.respond({'token': self.server.state['registry_token']})
+            return
         parts = self.path.split('?')[0].split('/')
         parts += [''] * (6 - len(parts))
         state = self.server.state
@@ -1038,6 +1056,17 @@ class RecordTest(Deploys):
         output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
         self.assertIn('the production profile does not allow that', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_the_image_check_reads_a_registry_that_wants_a_pull_token(self):
+        self.api.state['registry_token'] = 'anonymous-pull'
+        self.api.state['missing_images'] = {'kardamom-executor'}
+        output = self.run_deploy(success=False)
+        self.assertIn('does not hold the image of executor', output)
+        self.assertIn('repository:kardamom-executor:pull', self.api.state['token_scopes'])
+        self.assertEqual(self.api.state['writes'], [])
+        self.api.state['missing_images'] = set()
+        self.run_deploy()
+        self.assertIn('cluster', self.api.state['writes'])
 
     def test_a_coordinated_format_change_refuses_the_rolling_path(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'sealer-snapshot', 'head': 11, 'base': 10},

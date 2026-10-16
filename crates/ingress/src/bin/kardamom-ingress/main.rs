@@ -29,7 +29,7 @@ use clap::Parser;
 use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
-use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
+use kardamom_ingress::config::{DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
@@ -189,6 +189,15 @@ struct Args {
         default_value = "64"
     )]
     inclusion_horizon_blocks: NonZeroU64,
+    /// The largest `raw_tx` that a submit accepts, in bytes. The ingress
+    /// refuses a larger transaction with a `-32602` error that states the
+    /// size and the cap. See `IngressConfig::max_tx_bytes`.
+    #[arg(
+        long = "max-tx-bytes",
+        env = "KARDAMOM_MAX_TX_BYTES",
+        default_value_t = DEFAULT_MAX_TX_BYTES
+    )]
+    max_tx_bytes: NonZeroUsize,
     /// The executor query endpoints, `http://host:port`, comma
     /// separated. `eth_getBalance` and `eth_getTransactionCount` ask one
     /// of them when the local account layer misses. Empty means no
@@ -298,6 +307,7 @@ impl IngressService {
             // is known: the Redis reader then polls `head:0` only.
             mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             inclusion_horizon_blocks: args.inclusion_horizon_blocks,
+            max_tx_bytes: args.max_tx_bytes,
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
