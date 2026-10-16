@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kardamom_obs::events::{Board, BoardView, Delivery, Publisher};
+use kardamom_obs::events::{Board, BoardView, Delivery};
 use kardamom_obs::halt::{Halt, HaltCause, ServiceEvent, ServiceState};
 use kardamom_obs::lifecycle::{Lifecycle, Slots};
 use kardamom_types::ClusterStatus;
@@ -28,13 +28,7 @@ fn board(events: Vec<ServiceEvent>) -> BoardView {
     let now = Instant::now();
     let mut board = Board::default();
     for event in events {
-        board.observe(
-            Delivery {
-                publisher: Publisher(1),
-                event,
-            },
-            now,
-        );
+        board.observe(Delivery::of_one_publisher(event), now);
     }
     board.view(now)
 }

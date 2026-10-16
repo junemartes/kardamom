@@ -142,12 +142,6 @@ macro_rules! declare_channel_handles {
             pub fn try_recv(&mut self) -> Option<(BPosition, $msg)> {
                 self.rx.try_recv()
             }
-
-            /// The next record, with the Aeron session id of the
-            /// publication that sent it.
-            pub async fn recv_from(&mut self) -> Option<(i32, $msg)> {
-                self.rx.recv_from().await
-            }
         }
     };
 
@@ -325,6 +319,14 @@ declare_channel_handles! {
     /// `events` subscriber (every service → the ingress and the validator).
     subscriber ServiceEventsSubscriberHandle(ServiceEvent);
     open(ch) = (ch.events_channel, ch.events_stream_id);
+}
+
+impl ServiceEventsSubscriberHandle {
+    /// The next record, with the Aeron session id of the publication
+    /// that sent it.
+    pub(super) async fn recv_from(&mut self) -> Option<(i32, ServiceEvent)> {
+        self.rx.recv_from().await
+    }
 }
 
 declare_channel_handles! {

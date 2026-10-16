@@ -13,8 +13,8 @@
 //!
 //! More than one [`Publisher`] can write one `(service, instance)`: each
 //! ingress publishes the sealer as it observes it, with its own `seq`. So
-//! the board compares `seq` per publisher. A restart is a `seq` that goes
-//! down in the records of one publisher.
+//! the board keeps the last `seq` per publisher. [`Board::observe`] states
+//! the restart rule.
 //!
 //! The transport is the caller's: the beacon hands each record to a
 //! publish function, and the [`BoardFeed`] reads records from a channel.
@@ -142,16 +142,34 @@ impl Beacon {
     }
 }
 
-/// The transport's id of the publication that carries a record. Two
-/// publishers of one `(service, instance)` on two hosts have two ids.
+/// The transport's id of the publication that carries a record. A
+/// restarted process opens a new publication, so it has a new id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Publisher(pub i32);
+
+impl Publisher {
+    const FIRST: Self = Self(i32::MIN);
+    const LAST: Self = Self(i32::MAX);
+}
 
 /// One record and the publisher that sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub publisher: Publisher,
     pub event: ServiceEvent,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Delivery {
+    /// `event` from one fixed publisher, for a test with one publisher
+    /// per `(service, instance)`.
+    #[must_use]
+    pub fn of_one_publisher(event: ServiceEvent) -> Self {
+        Self {
+            publisher: Publisher(1),
+            event,
+        }
+    }
 }
 
 /// One value as the board last saw it.
@@ -162,6 +180,10 @@ struct Seen<T> {
 }
 
 impl<T> Seen<T> {
+    fn new(value: T, at: Instant) -> Self {
+        Self { value, at }
+    }
+
     /// Whether the board still keeps the value at `now`.
     fn kept(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.at) < FORGET
@@ -177,31 +199,74 @@ pub struct Board {
 }
 
 impl Board {
-    /// Take the delivered record as the latest state of its process.
+    /// Take the delivered record as the latest state of its process, and
+    /// log a restart.
+    ///
+    /// A record shows a restart in two cases:
+    ///
+    /// - Its `seq` is lower than the last `seq` of the same publisher.
+    /// - Its publisher is new, the key had exactly one publisher within
+    ///   [`FORGET`], and its `seq` is lower than the last `seq` of that
+    ///   publisher. A restarted process opens a new publication, so a
+    ///   self-reporting service restarts as a new publisher of its key.
+    ///
+    /// A key with two live publishers, such as `sealer/cluster` from two
+    /// ingresses, logs no restart for a new publisher. So a restarted
+    /// ingress logs no sealer restart, and two `seq` counters that drift
+    /// apart log nothing. The limit: a service that restarts twice within
+    /// [`FORGET`] logs only the first restart, because the old publisher
+    /// still counts. An ingress that joins after the other ingress ran
+    /// alone for [`FORGET`] logs one sealer restart.
     pub fn observe(&mut self, delivery: Delivery, now: Instant) {
         let Delivery { publisher, event } = delivery;
-        let seq = Seen {
-            value: event.seq,
-            at: now,
-        };
-        let last = self.seqs.insert(
-            (event.service.clone(), event.instance.clone(), publisher),
-            seq,
-        );
-        if last.is_some_and(|last| event.seq < last.value) {
+        if self.restarted(publisher, &event, now) {
             tracing::info!(
                 service = %event.service,
                 instance = %event.instance,
                 "service events: the process restarted"
             );
         }
+        self.seqs.insert(
+            (event.service.clone(), event.instance.clone(), publisher),
+            Seen::new(event.seq, now),
+        );
         self.entries.insert(
             (event.service.clone(), event.instance.clone()),
-            Seen {
-                value: event,
-                at: now,
-            },
+            Seen::new(event, now),
         );
+    }
+
+    /// Whether `event` from `publisher` shows a restart. See
+    /// [`Self::observe`] for the rule.
+    fn restarted(&self, publisher: Publisher, event: &ServiceEvent, now: Instant) -> bool {
+        self.seqs
+            .get(&(event.service.clone(), event.instance.clone(), publisher))
+            .or_else(|| self.only_publisher(event, now))
+            .is_some_and(|last| event.seq < last.value)
+    }
+
+    /// The last `seq` of the one publisher of `event`'s key within
+    /// [`FORGET`]. `None` when the key has no publisher or more than one.
+    fn only_publisher(&self, event: &ServiceEvent, now: Instant) -> Option<&Seen<u64>> {
+        let first = (
+            event.service.clone(),
+            event.instance.clone(),
+            Publisher::FIRST,
+        );
+        let last = (
+            event.service.clone(),
+            event.instance.clone(),
+            Publisher::LAST,
+        );
+        let mut kept = self
+            .seqs
+            .range(first..=last)
+            .map(|(_, seen)| seen)
+            .filter(|seen| seen.kept(now));
+        match (kept.next(), kept.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
     }
 
     /// Drop the records gone for longer than the board keeps them.

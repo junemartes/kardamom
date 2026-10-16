@@ -254,8 +254,20 @@ HaltRef      { service, instance, cause }
 
 `service` is the exporter's service name and `instance` is the host id. `seq` increases
 with each record of one process. Aeron delivers the records of one publisher in order, so
-the latest record of a `(service, instance)` is its state; a `seq` lower than the last one
-means the process restarted.
+the latest record of a `(service, instance)` is its state. More than one publisher can
+write one key: each ingress publishes `sealer/cluster` with its own `seq`. The board
+keeps the last `seq` per publisher (the Aeron session of the publication), and logs a
+restart in two cases:
+
+- The `seq` of one publisher goes down.
+- A new publisher appears for a key that had exactly one publisher within the board's
+  forget window, and its first `seq` is lower than the last `seq` of that publisher. A
+  restarted process opens a new publication, so a self-reporting service restarts this
+  way.
+
+A key with two live publishers logs no restart for a new publisher. So a restarted ingress
+logs no sealer restart. A service that restarts twice within the forget window logs only
+the first restart.
 
 **The states.**
 

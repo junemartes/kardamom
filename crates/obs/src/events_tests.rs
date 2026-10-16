@@ -19,23 +19,33 @@ fn identity() -> Identity {
 }
 
 fn event(service: &str, instance: &str, seq: u64, state: ServiceState) -> Delivery {
+    Delivery::of_one_publisher(ServiceEvent {
+        service: service.into(),
+        instance: instance.into(),
+        seq,
+        state,
+    })
+}
+
+/// A running record of `key` from `publisher`.
+fn from(publisher: i32, key: (&str, &str), seq: u64) -> Delivery {
     Delivery {
-        publisher: Publisher(1),
-        event: ServiceEvent {
-            service: service.into(),
-            instance: instance.into(),
-            seq,
-            state,
-        },
+        publisher: Publisher(publisher),
+        ..event(key.0, key.1, seq, ServiceState::Running)
     }
 }
 
-/// A `sealer/cluster` record of `publisher`, as an ingress sends it.
-fn sealer_from(publisher: i32, seq: u64) -> Delivery {
-    Delivery {
-        publisher: Publisher(publisher),
-        ..event("sealer", "cluster", seq, ServiceState::Running)
-    }
+const SEALER: (&str, &str) = ("sealer", "cluster");
+const EXECUTOR: (&str, &str) = ("executor", "e1");
+
+/// The restart logs while `run` feeds a board.
+fn restarts_in(run: impl FnOnce(&mut Board, Instant)) -> usize {
+    let restarts = Restarts::default();
+    let subscriber = tracing_subscriber::registry().with(restarts.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        run(&mut Board::default(), Instant::now());
+    });
+    restarts.count()
 }
 
 /// A layer that counts the restart logs.
@@ -153,21 +163,53 @@ fn the_latest_record_wins_and_a_restart_is_taken() {
 
 #[test]
 fn two_publishers_of_one_key_restart_only_when_one_seq_goes_down() {
-    let restarts = Restarts::default();
-    let subscriber = tracing_subscriber::registry().with(restarts.clone());
-    tracing::subscriber::with_default(subscriber, || {
-        let now = Instant::now();
-        let mut board = Board::default();
+    let drift = |board: &mut Board, now| {
         (8..=10).zip(498..=500).for_each(|(low, high)| {
-            board.observe(sealer_from(1, low), now);
-            board.observe(sealer_from(2, high), now);
+            board.observe(from(1, SEALER, low), now);
+            board.observe(from(2, SEALER, high), now);
         });
-        assert_eq!(restarts.count(), 0, "two counters interleave");
         assert_eq!(board.view(now).services.len(), 1, "one sealer/cluster row");
-        board.observe(sealer_from(1, 0), now);
-        board.observe(sealer_from(2, 501), now);
-        assert_eq!(restarts.count(), 1, "one publisher's seq went down");
-    });
+    };
+    assert_eq!(restarts_in(drift), 0, "two counters interleave");
+    let drop = |board: &mut Board, now| {
+        drift(board, now);
+        board.observe(from(1, SEALER, 0), now);
+        board.observe(from(2, SEALER, 501), now);
+    };
+    assert_eq!(restarts_in(drop), 1, "one publisher's seq went down");
+}
+
+#[test]
+fn a_self_reporting_service_restarts_as_a_new_publisher() {
+    let restart = |board: &mut Board, now| {
+        board.observe(from(1, EXECUTOR, 9), now);
+        board.observe(from(2, EXECUTOR, 1), now);
+        board.observe(from(2, EXECUTOR, 2), now);
+    };
+    assert_eq!(restarts_in(restart), 1);
+}
+
+#[test]
+fn a_restarted_ingress_of_two_logs_no_sealer_restart() {
+    let restart = |board: &mut Board, now| {
+        board.observe(from(1, SEALER, 10), now);
+        board.observe(from(2, SEALER, 500), now);
+        board.observe(from(3, SEALER, 1), now);
+    };
+    assert_eq!(restarts_in(restart), 0, "two publishers were live");
+}
+
+#[test]
+fn forget_drops_the_seq_of_a_gone_publisher() {
+    let start = Instant::now();
+    let mut board = Board::default();
+    board.observe(from(1, EXECUTOR, 9), start);
+    board.observe(from(2, EXECUTOR, 1), start + FORGET);
+    board.forget(start + FORGET);
+    assert_eq!(
+        board.seqs.keys().map(|key| key.2).collect::<Vec<_>>(),
+        [Publisher(2)]
+    );
 }
 
 #[test]

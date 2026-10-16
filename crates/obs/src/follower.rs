@@ -83,18 +83,15 @@ mod tests {
     use tokio::time::Instant;
 
     use super::FollowerWatch;
-    use crate::events::{Board, Delivery, Publisher};
+    use crate::events::{Board, Delivery};
 
     fn record(instance: &str, state: ServiceState) -> Delivery {
-        Delivery {
-            publisher: Publisher(1),
-            event: ServiceEvent {
-                service: HaltRef::L1_FOLLOWER.into(),
-                instance: instance.into(),
-                seq: 1,
-                state,
-            },
-        }
+        Delivery::of_one_publisher(ServiceEvent {
+            service: HaltRef::L1_FOLLOWER.into(),
+            instance: instance.into(),
+            seq: 1,
+            state,
+        })
     }
 
     fn halted(instance: &str) -> Delivery {

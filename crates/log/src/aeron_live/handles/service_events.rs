@@ -48,9 +48,10 @@ impl ServiceEventsSubscriberHandle {
     }
 
     /// Move one record from the stream to the board, with its publisher.
-    /// The Aeron session id names the publisher. Each node has its own
-    /// media driver, so the publishers on two nodes have two sessions.
-    /// `Break` when the stream or the board ends.
+    /// The Aeron session id names the publisher. A discovered publication
+    /// has its own channel in each process, so each process has its own
+    /// session, and a restarted process has a new one. `Break` when the
+    /// stream or the board ends.
     async fn forward(&mut self, tx: &mpsc::Sender<Delivery>) -> ControlFlow<()> {
         let Some((session, event)) = self.recv_from().await else {
             return ControlFlow::Break(());
