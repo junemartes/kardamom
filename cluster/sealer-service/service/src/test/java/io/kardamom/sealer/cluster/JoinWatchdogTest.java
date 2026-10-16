@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.ElectionState;
+import io.kardamom.sealer.cluster.JoinWatchdog.PeerElections;
 import io.kardamom.sealer.cluster.JoinWatchdog.Verdict;
 import java.util.List;
 import java.util.function.LongFunction;
@@ -80,22 +81,22 @@ final class JoinWatchdogTest {
         return cycle.get((int) (t % cycle.size()));
     }
 
-    /** The first exit of a member that sees {@code samples}, with the peer checks answered by {@code peerClosed}. */
+    /** The first exit of a member that sees {@code samples}, with the peer checks answered by {@code peers}. */
     private record Exit(Verdict verdict, long second) {
         static final Exit NEVER = new Exit(Verdict.NONE, -1L);
     }
 
     private static Exit firstExit(
-            final JoinWatchdog w, final LongFunction<JoinWatchdog.Sample> samples, final boolean peerClosed) {
+            final JoinWatchdog w, final LongFunction<JoinWatchdog.Sample> samples, final PeerElections peers) {
         return LongStream.range(0, SECONDS)
-                .mapToObj(t -> new Exit(resolve(w, w.observe(samples.apply(t)), peerClosed, t), t))
+                .mapToObj(t -> new Exit(resolve(w, w.observe(samples.apply(t)), peers, t), t))
                 .filter(exit -> exit.verdict() != Verdict.NONE)
                 .findFirst()
                 .orElse(Exit.NEVER);
     }
 
-    private static Verdict resolve(final JoinWatchdog w, final Verdict verdict, final boolean peerClosed, final long t) {
-        return verdict == Verdict.PEER_CHECK ? w.afterPeerCheck(peerClosed, t * 1_000L) : verdict;
+    private static Verdict resolve(final JoinWatchdog w, final Verdict verdict, final PeerElections peers, final long t) {
+        return verdict == Verdict.PEER_CHECK ? w.afterPeerCheck(peers, t * 1_000L) : verdict;
     }
 
     @Test
@@ -133,7 +134,7 @@ final class JoinWatchdogTest {
         // A lone member with quorum lost canvasses for minutes. CANVASS is
         // not INIT, and it never reaches a follower state without a leader.
         assertEquals(Exit.NEVER,
-                firstExit(watchdog(), t -> at(ElectionState.CANVASS, COMMIT, t * 1_000L), false));
+                firstExit(watchdog(), t -> at(ElectionState.CANVASS, COMMIT, t * 1_000L), PeerElections.NONE_CLOSED));
     }
 
     @Test
@@ -146,7 +147,7 @@ final class JoinWatchdogTest {
                 : t < 180
                 ? at(ElectionState.FOLLOWER_REPLAY, COMMIT + (t - 120) * 1_000L, t * 1_000L)
                 : at(ElectionState.CLOSED, COMMIT + 60_000L + t, t * 1_000L);
-        assertEquals(Exit.NEVER, firstExit(w, restart, false));
+        assertEquals(Exit.NEVER, firstExit(w, restart, PeerElections.NONE_CLOSED));
     }
 
     @Test
@@ -171,7 +172,7 @@ final class JoinWatchdogTest {
         // The leader that the member found is not live, so its log tail is
         // not the cause, and a seed would find no peer. The relaunch keeps the log.
         final JoinWatchdog w = watchdog();
-        final Exit exit = firstExit(w, t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L), false);
+        final Exit exit = firstExit(w, t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L), PeerElections.NONE_CLOSED);
         assertEquals(Verdict.FOLLOWER_STALL, exit.verdict());
         assertEquals(LIMIT_MS / 1_000L, exit.second(), "the first sample at the stall limit relaunches");
     }
@@ -179,7 +180,7 @@ final class JoinWatchdogTest {
     @Test
     void aStuckCatchupWithALivePeerSeedsAtTheCatchupWindow() {
         final JoinWatchdog w = watchdog();
-        final Exit exit = firstExit(w, t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L), true);
+        final Exit exit = firstExit(w, t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L), PeerElections.CLOSED);
         assertEquals(Verdict.CATCHUP_STALL, exit.verdict());
         assertEquals(STALL_MS / 1_000L, exit.second(), "the first sample at the catch-up window seeds");
         assertEquals(STALL_MS, w.stallForMs(exit.second() * 1_000L));
@@ -192,11 +193,11 @@ final class JoinWatchdogTest {
         final JoinWatchdog w = watchdog();
         final long checks = LongStream.range(0, STALL_MS / 1_000L)
                 .filter(t -> w.observe(at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L)) == Verdict.PEER_CHECK)
-                .peek(t -> assertEquals(Verdict.NONE, w.afterPeerCheck(true, t * 1_000L)))
+                .peek(t -> assertEquals(Verdict.NONE, w.afterPeerCheck(PeerElections.CLOSED, t * 1_000L)))
                 .count();
         assertEquals(1L, checks);
         assertEquals(Verdict.PEER_CHECK, w.observe(at(cycleAt(STUCK_CYCLE, STALL_MS / 1_000L), COMMIT, STALL_MS)));
-        assertEquals(Verdict.FOLLOWER_STALL, w.afterPeerCheck(false, STALL_MS),
+        assertEquals(Verdict.FOLLOWER_STALL, w.afterPeerCheck(PeerElections.NONE_CLOSED, STALL_MS),
                 "a peer that is gone when the seed is due cannot seed the member");
     }
 
@@ -211,13 +212,13 @@ final class JoinWatchdogTest {
         assertEquals(Verdict.NONE, w.observe(at(ElectionState.FOLLOWER_REPLAY, 0L, 2_000L)));
         assertEquals(Verdict.NONE, w.observe(at(ElectionState.FOLLOWER_REPLAY, COMMIT, 3_000L)));
         assertEquals(Verdict.PEER_CHECK, w.observe(at(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS)));
-        assertEquals(Verdict.CATCHUP_STALL, w.afterPeerCheck(true, STALL_MS));
+        assertEquals(Verdict.CATCHUP_STALL, w.afterPeerCheck(PeerElections.CLOSED, STALL_MS));
     }
 
     @Test
     void aCatchupThatReceivesLogNeverStalls() {
         assertEquals(Exit.NEVER, firstExit(watchdog(),
-                t -> at(cycleAt(STUCK_CYCLE, t), COMMIT + t / 30L, t * 1_000L), true));
+                t -> at(cycleAt(STUCK_CYCLE, t), COMMIT + t / 30L, t * 1_000L), PeerElections.CLOSED));
     }
 
     @Test
@@ -226,8 +227,8 @@ final class JoinWatchdogTest {
         assertEquals(Verdict.NONE, w.observe(at(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, 0L)));
         assertEquals(Verdict.NONE, w.observe(at(ElectionState.CLOSED, COMMIT, STALL_MS / 2)));
         assertEquals(Verdict.NONE, w.observe(at(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, STALL_MS)));
-        assertEquals(Verdict.PEER_CHECK, w.observe(at(ElectionState.INIT, COMMIT, STALL_MS + STALL_MS / 2)));
-        assertEquals(Verdict.CATCHUP_STALL, w.afterPeerCheck(true, STALL_MS + STALL_MS / 2));
+        assertEquals(Verdict.PEER_CHECK, w.observe(at(ElectionState.CANVASS, COMMIT, STALL_MS + STALL_MS / 2)));
+        assertEquals(Verdict.CATCHUP_STALL, w.afterPeerCheck(PeerElections.CLOSED, STALL_MS + STALL_MS / 2));
     }
 
     @Test
@@ -238,16 +239,16 @@ final class JoinWatchdogTest {
         final JoinWatchdog w = watchdog();
         final LongFunction<JoinWatchdog.Sample> waits = t -> at(
                 t == 0 ? ElectionState.FOLLOWER_CATCHUP : ElectionState.FOLLOWER_LOG_AWAIT, COMMIT, t * 1_000L);
-        assertEquals(Exit.NEVER, firstExit(w, waits, true));
-        assertEquals(Verdict.FOLLOWER_STALL, firstExit(watchdog(), waits, false).verdict(),
+        assertEquals(Exit.NEVER, firstExit(w, waits, PeerElections.CLOSED));
+        assertEquals(Verdict.FOLLOWER_STALL, firstExit(watchdog(), waits, PeerElections.NONE_CLOSED).verdict(),
                 "with no live leader the member relaunches and keeps its log");
     }
 
     @Test
     void aZeroCatchupWindowNeverDropsTheLog() {
         final LongFunction<JoinWatchdog.Sample> stuck = t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L);
-        assertEquals(Exit.NEVER, firstExit(watchdog(0L), stuck, true));
-        assertEquals(Verdict.FOLLOWER_STALL, firstExit(watchdog(0L), stuck, false).verdict());
+        assertEquals(Exit.NEVER, firstExit(watchdog(0L), stuck, PeerElections.CLOSED));
+        assertEquals(Verdict.FOLLOWER_STALL, firstExit(watchdog(0L), stuck, PeerElections.NONE_CLOSED).verdict());
     }
 
     @Test
@@ -256,9 +257,10 @@ final class JoinWatchdogTest {
         // relaunch replays its own log, and the next join meets the leader's
         // log at the same position. No peer check is needed.
         final JoinWatchdog w = watchdog();
-        final Exit exit = firstExit(w, t -> at(cycleAt(JOIN_CYCLE, t), COMMIT, t * 1_000L), true);
+        final Exit exit = firstExit(w, t -> at(cycleAt(JOIN_CYCLE, t), COMMIT, t * 1_000L), PeerElections.CLOSED);
         assertEquals(Verdict.FOLLOWER_STALL, exit.verdict());
-        assertEquals(LIMIT_MS / 1_000L, exit.second());
+        assertEquals(ElectionState.INIT, cycleAt(JOIN_CYCLE, LIMIT_MS / 1_000L));
+        assertEquals(LIMIT_MS / 1_000L + 1L, exit.second(), "a sample in INIT leaves the member to the INIT rule");
     }
 
     @Test
@@ -268,9 +270,60 @@ final class JoinWatchdogTest {
         // ever. The leader it waits for has no closed election.
         final JoinWatchdog w = watchdog();
         final Exit exit = firstExit(w, t -> new JoinWatchdog.Sample(
-                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, INACTIVE, t * 1_000L), false);
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED);
         assertEquals(Verdict.FOLLOWER_STALL, exit.verdict());
         assertEquals(LIMIT_MS / 1_000L, exit.second());
+    }
+
+    @Test
+    void withNoAdminPortAPurgedFollowerSeedsAtTheCatchupWindow() {
+        // With no admin server the probe knows no peer, so the answer is
+        // unknown. The member keeps the seed of a member with no probe.
+        final JoinWatchdog w = watchdog();
+        final Exit exit = firstExit(w, t -> new JoinWatchdog.Sample(
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, -1L, 0L, INACTIVE, t * 1_000L),
+                new PeerProbe.Round(0, List.of()).elections());
+        assertEquals(Verdict.CATCHUP_STALL, exit.verdict());
+        assertEquals(STALL_MS / 1_000L, exit.second());
+    }
+
+    @Test
+    void aSilentPeerIsCheckedAgainAtEachSample() {
+        // One of two peers does not answer, and the other has an open
+        // election: no relaunch yet. The check repeats; when the silent peer
+        // answers with an open election, the member relaunches and keeps
+        // its log. If it never answers, the member seeds at the window.
+        final PeerProbe.PeerStatus electing = new PeerProbe.PeerStatus(1, "FOLLOWER", "CANVASS", COMMIT);
+        final PeerElections silent = new PeerProbe.Round(2, List.of(electing)).elections();
+        final PeerElections answered = new PeerProbe.Round(2, List.of(electing, electing)).elections();
+        assertEquals(PeerElections.UNKNOWN, silent);
+        assertEquals(PeerElections.NONE_CLOSED, answered);
+
+        final JoinWatchdog w = watchdog();
+        final long limit = LIMIT_MS / 1_000L;
+        LongStream.range(0, limit).forEach(t ->
+                assertEquals(Verdict.NONE, w.observe(at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L))));
+        LongStream.range(limit, limit + 3).forEach(t -> {
+            assertEquals(Verdict.PEER_CHECK, w.observe(at(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, t * 1_000L)));
+            assertEquals(Verdict.NONE, w.afterPeerCheck(silent, t * 1_000L));
+        });
+        assertEquals(Verdict.PEER_CHECK, w.observe(at(ElectionState.FOLLOWER_CATCHUP_AWAIT, COMMIT, (limit + 3) * 1_000L)));
+        assertEquals(Verdict.FOLLOWER_STALL, w.afterPeerCheck(answered, (limit + 3) * 1_000L));
+
+        final Exit never = firstExit(watchdog(), t -> at(cycleAt(STUCK_CYCLE, t), COMMIT, t * 1_000L), silent);
+        assertEquals(new Exit(Verdict.CATCHUP_STALL, STALL_MS / 1_000L), never);
+    }
+
+    @Test
+    void theInitWedgeWinsOverTheFollowerStall() {
+        // A member that cycled through a catch-up, and then wedges in INIT.
+        final JoinWatchdog w = watchdog();
+        final long limit = LIMIT_MS / 1_000L;
+        LongStream.range(0, limit).forEach(t ->
+                assertEquals(Verdict.NONE, w.observe(at(cycleAt(JOIN_CYCLE, t), COMMIT, t * 1_000L))));
+        final Exit exit = firstExit(w, t -> at(ElectionState.INIT, COMMIT, (limit + t) * 1_000L),
+                PeerElections.NONE_CLOSED);
+        assertEquals(Verdict.INIT_WEDGE, exit.verdict());
     }
 
     @Test
@@ -278,7 +331,7 @@ final class JoinWatchdogTest {
         // A follower far behind copies the leader's log: the commit position
         // stays, and the position of its log recording grows.
         assertEquals(Exit.NEVER, firstExit(watchdog(), t -> new JoinWatchdog.Sample(
-                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, t / 10L, 0L, INACTIVE, t * 1_000L), false));
+                ElectionState.FOLLOWER_LOG_REPLICATION, COMMIT, t / 10L, 0L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
     }
 
     @Test
@@ -286,7 +339,7 @@ final class JoinWatchdogTest {
         // A member that voted cannot join, and no peer makes progress: the
         // leader waits in LEADER_READY with its toggle INACTIVE.
         final JoinWatchdog w = watchdog();
-        final Exit exit = firstExit(w, t -> at(ElectionState.LEADER_READY, COMMIT, t * 1_000L), false);
+        final Exit exit = firstExit(w, t -> at(ElectionState.LEADER_READY, COMMIT, t * 1_000L), PeerElections.NONE_CLOSED);
         assertEquals(Verdict.LEADER_STALL, exit.verdict());
         assertEquals(LIMIT_MS / 1_000L + 1L, exit.second(), "the first sample past the stall limit");
         assertEquals(LIMIT_MS + 1_000L, w.sinceProgressMs(exit.second() * 1_000L));
@@ -300,7 +353,7 @@ final class JoinWatchdogTest {
         // reads it every five seconds.
         final JoinWatchdog w = watchdog();
         assertEquals(Exit.NEVER, firstExit(w, t -> new JoinWatchdog.Sample(
-                ElectionState.LEADER_READY, COMMIT, -1L, COMMIT + t / 5L, INACTIVE, t * 1_000L), false));
+                ElectionState.LEADER_READY, COMMIT, -1L, COMMIT + t / 5L, INACTIVE, t * 1_000L), PeerElections.NONE_CLOSED));
         assertEquals(Verdict.NONE, w.observe(toggled(ElectionState.CLOSED, COMMIT, SECONDS * 1_000L, NEUTRAL)));
     }
 
@@ -361,7 +414,7 @@ final class JoinWatchdogTest {
         Stream.of(ClusterControl.ToggleState.SNAPSHOT, ClusterControl.ToggleState.SUSPEND,
                 ClusterControl.ToggleState.SHUTDOWN).forEach(toggle -> {
                     assertEquals(Exit.NEVER, firstExit(watchdog(),
-                            t -> toggled(ElectionState.CLOSED, COMMIT, t * 1_000L, toggle.code()), false));
+                            t -> toggled(ElectionState.CLOSED, COMMIT, t * 1_000L, toggle.code()), PeerElections.NONE_CLOSED));
                     final JoinWatchdog open = watchdog();
                     assertEquals(Verdict.NONE,
                             open.observe(toggled(ElectionState.LEADER_READY, COMMIT, 0L, toggle.code())));

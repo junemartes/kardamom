@@ -38,10 +38,10 @@ import org.agrona.concurrent.status.CountersReader;
  *   <li>A catch-up stall first deletes the recording log, then exits with
  *       code {@link #CATCHUP_STALL_EXIT_CODE}. The relaunch finds no
  *       recording log, so it seeds the member from a peer's latest
- *       snapshot. The rule acts only when a peer has a closed election:
- *       that peer follows a live leader, and it answers the seed. The
- *       member loses no data that the cluster needs: the live leader's log
- *       holds every committed entry.</li>
+ *       snapshot. The rule does not act when every peer answers with an
+ *       open election: then no leader is live, and no peer can seed the
+ *       member. A peer with a closed election follows a live leader, and
+ *       the live leader's log holds every committed entry.</li>
  *   <li>A leader wedge exits with code {@link #LEADER_WEDGE_EXIT_CODE}.
  *       The completion of a leader's election failed, so the leader has
  *       no ingress. The relaunch starts from the member's own state, and
@@ -280,12 +280,12 @@ final class JoinWatchdogThread {
 
     /**
      * Ask the peers whether one of them has a closed election, and act on
-     * the verdict that follows. A deferred seed logs once.
+     * the verdict that follows. A seed that waits for a live peer logs once.
      */
     private void peerCheck(final long commit, final long nowMs) {
-        final Optional<PeerProbe.PeerStatus> closed = member.peers().closedPeer();
-        final JoinWatchdog.Verdict verdict = watchdog.afterPeerCheck(closed.isPresent(), nowMs);
-        closed.filter(peer -> verdict == JoinWatchdog.Verdict.NONE).ifPresent(peer ->
+        final PeerProbe.Round round = member.peers().ask();
+        final JoinWatchdog.Verdict verdict = watchdog.afterPeerCheck(round.elections(), nowMs);
+        round.closedPeer().filter(peer -> verdict == JoinWatchdog.Verdict.NONE).ifPresent(peer ->
             System.out.println("cluster FOLLOWER STALL memberId=" + member.memberId()
                 + " deferred: peer memberId=" + peer.memberId() + " has a closed election, so a seed"
                 + " can recover this member; the CATCHUP STALL rule decides at " + stallWindowS + "s"));
@@ -323,7 +323,7 @@ final class JoinWatchdogThread {
             + " commitPosition=" + commit
             + " state=" + lastState
             + " no progress for " + watchdog.stallForMs(nowMs) / 1000L + "s after the member found a leader"
-            + " (limit " + stallLimitS + "s), and no peer is known to have a closed election, or the member"
+            + " (limit " + stallLimitS + "s), and every peer answered with an open election, or the member"
             + " never reached a catch-up; exiting for a relaunch that keeps the recording log");
         exit(FOLLOWER_STALL_EXIT_CODE);
     }
@@ -334,7 +334,7 @@ final class JoinWatchdogThread {
             + " no commit progress for " + watchdog.stallForMs(nowMs) / 1000L
             + "s while the election cycles through catch-up (window " + stallWindowS
             + "s): the leader no longer holds this member's log tail; dropping the recording log"
-            + " so the relaunch seeds from a peer with a closed election");
+            + " so the relaunch seeds from a peer");
         clusterDir.dropRecordingLog();
         exit(CATCHUP_STALL_EXIT_CODE);
     }

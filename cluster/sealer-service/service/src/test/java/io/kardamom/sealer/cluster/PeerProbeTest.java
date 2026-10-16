@@ -36,7 +36,7 @@ final class PeerProbeTest {
         try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG);
              AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG)) {
             final PeerProbe probe = new PeerProbe(List.of(deadUri(), statusUri(electing), statusUri(joined)));
-            assertEquals(Optional.of(2), probe.closedPeer().map(PeerProbe.PeerStatus::memberId));
+            assertEquals(Optional.of(2), probe.ask().closedPeer().map(PeerProbe.PeerStatus::memberId));
         }
     }
 
@@ -49,7 +49,34 @@ final class PeerProbeTest {
                  throw new IllegalStateException("counters gone");
              }, LAG)) {
             final PeerProbe probe = new PeerProbe(List.of(statusUri(stopping), statusUri(failing), deadUri()));
-            assertEquals(Optional.empty(), probe.closedPeer());
+            assertEquals(Optional.empty(), probe.ask().closedPeer());
+        }
+    }
+
+    @Test
+    void everyPeerMustAnswerForNoClosedElection() throws IOException {
+        try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG);
+             AdminServer leading = AdminServer.start(0, () -> status(2, "LEADER", "LEADER_READY", 10), LAG)) {
+            assertEquals(JoinWatchdog.PeerElections.NONE_CLOSED,
+                new PeerProbe(List.of(statusUri(electing), statusUri(leading))).ask().elections());
+            assertEquals(JoinWatchdog.PeerElections.UNKNOWN,
+                new PeerProbe(List.of(statusUri(electing), deadUri())).ask().elections(),
+                "a peer that does not answer may have a closed election");
+        }
+    }
+
+    @Test
+    void aSilentPeerEndsTheRoundWithinItsBound() throws IOException {
+        // The socket accepts the connection, and nobody answers.
+        try (ServerSocket silent = new ServerSocket(0);
+             AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG)) {
+            final URI silentUri = URI.create("http://127.0.0.1:" + silent.getLocalPort() + "/status");
+            final long startNs = System.nanoTime();
+            final PeerProbe.Round round = new PeerProbe(List.of(silentUri, statusUri(joined))).ask();
+            final long tookMs = (System.nanoTime() - startNs) / 1_000_000L;
+            assertEquals(JoinWatchdog.PeerElections.CLOSED, round.elections());
+            assertEquals(1, round.answers().size());
+            assertTrue(tookMs < 3_000L, "the round took " + tookMs + " ms");
         }
     }
 
@@ -73,9 +100,9 @@ final class PeerProbeTest {
             final String members = "0,10.9.9.9:40200,10.9.9.9:40201,10.9.9.9:40202,10.9.9.9:40203,10.9.9.9:40204"
                 + "|1,127.0.0.1:40200,127.0.0.1:40201,127.0.0.1:40202,127.0.0.1:40203,127.0.0.1:40204";
             assertEquals(Optional.of(1),
-                PeerProbe.forMembers(members, 0, peer.port()).closedPeer().map(PeerProbe.PeerStatus::memberId));
-            assertEquals(Optional.empty(), PeerProbe.forMembers(members, 0, 0).closedPeer(),
-                "with the admin port off the probe knows no peer");
+                PeerProbe.forMembers(members, 0, peer.port()).ask().closedPeer().map(PeerProbe.PeerStatus::memberId));
+            assertEquals(JoinWatchdog.PeerElections.UNKNOWN, PeerProbe.forMembers(members, 0, 0).ask().elections(),
+                "with the admin port off the probe knows no peer, so it has no answer");
             assertEquals(0L, PeerProbe.forMembers(members, 0, 0).commitMark());
         }
     }

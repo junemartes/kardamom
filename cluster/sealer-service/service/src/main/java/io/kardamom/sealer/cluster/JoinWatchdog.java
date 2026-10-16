@@ -65,14 +65,15 @@ import java.util.Set;
  * from the follower's log end. The election then cycles through its
  * catch-up, or waits in log replication, and the commit position never
  * passes its highest value. A relaunch replays the same log and sticks the
- * same way, so only a seed from a peer recovers the member. A seed needs a
- * peer with a closed election. When the member reached a catch-up state,
- * the follower stall first asks for a peer check. With no peer that has a
- * closed election, the member relaunches and keeps its log: the leader that
- * it found is not live, so its log tail is not the cause. With such a peer,
- * the member waits until the catch-up stall window, checks the peers again,
- * and then drops its recording log so that the relaunch seeds from that
- * peer.</p>
+ * same way, so only a seed from a peer recovers the member. When the member
+ * reached a catch-up state, the follower stall first asks for a peer check.
+ * When every peer answers with an open election, the leader that the member
+ * found is not live, so its log tail is not the cause, and no peer can seed
+ * it: the member relaunches and keeps its log. In all other cases the
+ * member waits until the catch-up stall window and then drops its recording
+ * log, so that the relaunch seeds from a peer. A peer that does not answer,
+ * or a member with no admin port, gives no answer, and the member then
+ * seeds as it does with no probe.</p>
  *
  * <p>Every other long election state has a good reason. A lone member
  * with quorum lost sits in CANVASS, and never reaches a follower state
@@ -190,29 +191,63 @@ final class JoinWatchdog {
             long nowMs) {
     }
 
+    /**
+     * What a peer check shows about the elections of the other members.
+     */
+    enum PeerElections {
+        /** A peer answered with a closed election: it follows a live leader and can seed this member. */
+        CLOSED,
+        /** The probe knows peers, and every one answered with an open election. */
+        NONE_CLOSED,
+        /** The probe knows no peer, or a peer did not answer. */
+        UNKNOWN
+    }
+
+    /** A set of election states. */
+    private record States(Set<ElectionState> set) {
+        static States of(final ElectionState first, final ElectionState... rest) {
+            return new States(EnumSet.of(first, rest));
+        }
+
+        States plus(final States other) {
+            final Set<ElectionState> both = EnumSet.copyOf(set);
+            both.addAll(other.set);
+            return new States(both);
+        }
+
+        boolean contains(final ElectionState state) {
+            return set.contains(state);
+        }
+    }
+
     /** The states in which a follower fetches the leader's log from the leader's archive. */
-    private static final Set<ElectionState> CATCHUP_STATES = EnumSet.of(
+    private static final States CATCHUP_STATES = States.of(
             ElectionState.FOLLOWER_LOG_REPLICATION,
             ElectionState.FOLLOWER_CATCHUP_INIT,
             ElectionState.FOLLOWER_CATCHUP_AWAIT,
             ElectionState.FOLLOWER_CATCHUP);
 
     /** The states in which a follower joins the leader's live log. */
-    private static final Set<ElectionState> JOIN_STATES = EnumSet.of(
+    private static final States JOIN_STATES = States.of(
             ElectionState.FOLLOWER_LOG_INIT,
             ElectionState.FOLLOWER_LOG_AWAIT,
             ElectionState.FOLLOWER_READY);
 
-    /** The states of the cycle of a member that cannot catch up: its catch-up, its own replay, and a new election. */
-    private static final Set<ElectionState> CYCLE_STATES = union(
-            CATCHUP_STATES, EnumSet.of(ElectionState.INIT, ElectionState.CANVASS, ElectionState.FOLLOWER_REPLAY));
+    /**
+     * The states of the cycle of a member that cannot catch up: its
+     * catch-up, its own replay, and a new election. INIT is not one of
+     * them: an election that stays in INIT is the INIT wedge, and the INIT
+     * rule acts on it at its own window.
+     */
+    private static final States CYCLE_STATES = CATCHUP_STATES.plus(
+            States.of(ElectionState.CANVASS, ElectionState.FOLLOWER_REPLAY));
 
     /** The states that a member reaches only after it found a leader. */
-    private static final Set<ElectionState> FOLLOWER_STATES = union(
-            union(CATCHUP_STATES, JOIN_STATES), EnumSet.of(ElectionState.FOLLOWER_REPLAY));
+    private static final States FOLLOWER_STATES = CATCHUP_STATES.plus(JOIN_STATES)
+            .plus(States.of(ElectionState.FOLLOWER_REPLAY));
 
     /** The cycle states, and the states of a join to the live log that fails. */
-    private static final Set<ElectionState> FOLLOWER_CYCLE_STATES = union(CYCLE_STATES, JOIN_STATES);
+    private static final States FOLLOWER_CYCLE_STATES = CYCLE_STATES.plus(JOIN_STATES);
 
     private final Limits limits;
     private final Persistence init = new Persistence();
@@ -261,16 +296,26 @@ final class JoinWatchdog {
     }
 
     /**
-     * The verdict after a {@link Verdict#PEER_CHECK}. With no peer that has
-     * a closed election, the member relaunches and keeps its log. With such
-     * a peer, the member drops its log once the catch-up stall window has
-     * passed, and waits until then.
+     * The verdict after a {@link Verdict#PEER_CHECK}.
+     *
+     * <ul>
+     *   <li>A peer has a closed election: the member drops its log once the
+     *       catch-up stall window has passed, and waits until then with no
+     *       more checks.</li>
+     *   <li>Every peer answered with an open election: the leader that the
+     *       member found is not live, so its log tail is not the cause. The
+     *       member relaunches and keeps its log.</li>
+     *   <li>The answer is unknown: the member checks again at the next
+     *       sample, and drops its log once the catch-up stall window has
+     *       passed. With no admin server, or with a peer that stays silent,
+     *       the member seeds as it does with no probe at all.</li>
+     * </ul>
      */
-    Verdict afterPeerCheck(final boolean peerElectionClosed, final long nowMs) {
-        if (!peerElectionClosed) {
+    Verdict afterPeerCheck(final PeerElections peers, final long nowMs) {
+        if (peers == PeerElections.NONE_CLOSED) {
             return Verdict.FOLLOWER_STALL;
         }
-        peerSeen = true;
+        peerSeen = peers == PeerElections.CLOSED;
         return seedDue(nowMs) ? Verdict.CATCHUP_STALL : Verdict.NONE;
     }
 
@@ -317,7 +362,8 @@ final class JoinWatchdog {
     /**
      * The follower stall and the catch-up stall. A member that never tried
      * a catch-up relaunches at the stall limit. A member that tried one asks
-     * for a peer check at the stall limit, and again when the seed is due.
+     * for a peer check at the stall limit, at each sample while the answer
+     * is unknown, and again when the seed is due.
      */
     private Verdict followerVerdict(final ElectionState state, final long nowMs) {
         if (!triedFollower || !FOLLOWER_CYCLE_STATES.contains(state) || stallForMs(nowMs) < limits.stallMs()) {
@@ -327,12 +373,6 @@ final class JoinWatchdog {
             return Verdict.FOLLOWER_STALL;
         }
         return !peerSeen || seedDue(nowMs) ? Verdict.PEER_CHECK : Verdict.NONE;
-    }
-
-    private static Set<ElectionState> union(final Set<ElectionState> a, final Set<ElectionState> b) {
-        final Set<ElectionState> both = EnumSet.copyOf(a);
-        both.addAll(b);
-        return both;
     }
 
     /** Whether the catch-up stall window has passed in a cycle state, after a catch-up. */

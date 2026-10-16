@@ -10,6 +10,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -23,19 +27,25 @@ import java.util.regex.Pattern;
  * member that replays or catches up moves its commit position, so a leader
  * that waits for it waits for a good reason.</p>
  *
- * <p>A peer that does not answer within the timeout counts as unknown: it
- * has no closed election and no progress. The probe runs on the watchdog
- * thread only.</p>
+ * <p>Each round asks every peer at once and waits at most {@link #ROUND}.
+ * The lookup of a peer name has no timeout of its own, so each request
+ * runs on a thread of the probe: a lookup that hangs blocks that thread,
+ * not the watchdog. A peer that does not answer within the round counts as
+ * unknown.</p>
  */
 final class PeerProbe {
 
     /** The bound on the connect and on the answer of one peer. */
     private static final Duration TIMEOUT = Duration.ofSeconds(1);
+    /** The bound on one round, the name lookups included. */
+    private static final Duration ROUND = Duration.ofSeconds(2);
 
     /** The admin status URL of each other member. */
     private final List<URI> peers;
     private final HttpClient http;
-    /** The highest commit position that each peer reported. */
+    /** The threads of the requests. A thread lives only while a lookup or a request runs. */
+    private final ExecutorService requests = Executors.newCachedThreadPool(PeerProbe::daemon);
+    /** The highest commit position that each peer reported; only the watchdog thread uses it. */
     private final Map<URI, Long> highestCommit = new HashMap<>();
 
     PeerProbe(final List<URI> peers) {
@@ -59,12 +69,9 @@ final class PeerProbe {
             .toList());
     }
 
-    /** The first peer that reports a closed election, or empty when none does. */
-    Optional<PeerStatus> closedPeer() {
-        return peers.stream()
-            .flatMap(peer -> status(peer).stream())
-            .filter(PeerStatus::electionClosed)
-            .findFirst();
+    /** Ask every peer once. */
+    Round ask() {
+        return new Round(peers.size(), answers().values().stream().flatMap(Optional::stream).toList());
     }
 
     /**
@@ -73,9 +80,20 @@ final class PeerProbe {
      * commit progress, and a peer that does not answer keeps its last value.
      */
     long commitMark() {
-        peers.forEach(peer -> status(peer).ifPresent(answer ->
-            highestCommit.merge(peer, answer.commitPosition(), Math::max)));
+        answers().forEach((peer, answer) -> answer.ifPresent(status ->
+            highestCommit.merge(peer, status.commitPosition(), Math::max)));
         return highestCommit.values().stream().mapToLong(Long::longValue).sum();
+    }
+
+    /** The answer of each peer within one round, or empty for a peer that did not answer. */
+    private Map<URI, Optional<PeerStatus>> answers() {
+        final Map<URI, CompletableFuture<Optional<PeerStatus>>> pending = new HashMap<>();
+        peers.forEach(peer -> pending.put(peer, CompletableFuture
+            .supplyAsync(() -> status(peer), requests)
+            .completeOnTimeout(Optional.empty(), ROUND.toMillis(), TimeUnit.MILLISECONDS)));
+        final Map<URI, Optional<PeerStatus>> answers = new HashMap<>();
+        pending.forEach((peer, answer) -> answers.put(peer, answer.join()));
+        return answers;
     }
 
     private Optional<PeerStatus> status(final URI peer) {
@@ -87,6 +105,40 @@ final class PeerProbe {
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
             return Optional.empty();
+        }
+    }
+
+    private static Thread daemon(final Runnable task) {
+        final Thread thread = new Thread(task, "kardamom-peer-probe");
+        thread.setDaemon(true);
+        return thread;
+    }
+
+    /**
+     * The answers of one round.
+     *
+     * @param peers how many peers the probe asked.
+     * @param answers the status of each peer that answered.
+     */
+    record Round(int peers, List<PeerStatus> answers) {
+
+        /** The first peer that reports a closed election, or empty when none does. */
+        Optional<PeerStatus> closedPeer() {
+            return answers.stream().filter(PeerStatus::electionClosed).findFirst();
+        }
+
+        /**
+         * What the round shows about the elections of the peers. It shows
+         * no closed election only when the probe knows peers and every one
+         * answered without one.
+         */
+        JoinWatchdog.PeerElections elections() {
+            if (closedPeer().isPresent()) {
+                return JoinWatchdog.PeerElections.CLOSED;
+            }
+            return peers > 0 && answers.size() == peers
+                ? JoinWatchdog.PeerElections.NONE_CLOSED
+                : JoinWatchdog.PeerElections.UNKNOWN;
         }
     }
 

@@ -14,6 +14,9 @@ import io.aeron.test.SystemTestWatcher;
 import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
@@ -122,9 +125,10 @@ class ClusterLogPurgeTest {
             snapshots(run, 3);
             run.postNewestSnapshotBlock();
             final long logStart = purge(run);
+            final List<TestNode> peers = run.running();
             final TestNode stuck = run.cluster.startStaticNode(memberId, false);
 
-            final long stalledAt = awaitStall(stuck);
+            final long stalledAt = awaitStall(stuck, peers);
             run.clusterState(memberId).dropRecordingLog();
             run.cluster.stopNode(stuck);
             final StartMode mode = StartMode.of(run.clusterState(memberId).holdsRecordingLog(), false);
@@ -153,26 +157,64 @@ class ClusterLogPurgeTest {
 
     /**
      * Feed the watchdog samples of {@code member} until it names a catch-up
-     * stall. Return the member's commit position at the stall.
+     * stall. The peer checks run the production probe against an admin
+     * server for each of {@code peers}. Return the member's commit position
+     * at the stall.
      */
-    private static long awaitStall(final TestNode member) {
-        final JoinWatchdog watchdog = new JoinWatchdog(new JoinWatchdog.Limits(
-                STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4, STALL_WINDOW_MS));
-        while (verdict(watchdog, member) != JoinWatchdog.Verdict.CATCHUP_STALL) {
-            Tests.sleep(100);
+    private static long awaitStall(final TestNode member, final List<TestNode> peers) {
+        final List<AdminServer> admins = peers.stream().map(ClusterLogPurgeTest::adminServer).toList();
+        try {
+            final PeerProbe probe = new PeerProbe(admins.stream()
+                    .map(admin -> URI.create("http://127.0.0.1:" + admin.port() + "/status"))
+                    .toList());
+            final StallRun stall = new StallRun(new JoinWatchdog(new JoinWatchdog.Limits(
+                    STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4, STALL_WINDOW_MS)), member, probe);
+            while (stall.verdict() != JoinWatchdog.Verdict.CATCHUP_STALL) {
+                Tests.sleep(100);
+            }
+            assertEquals(JoinWatchdog.PeerElections.CLOSED, stall.lastAnswer,
+                    "the probe found the leader's closed election through its admin server");
+            return member.commitPosition();
+        } finally {
+            admins.forEach(AdminServer::close);
         }
-        return member.commitPosition();
     }
 
-    /**
-     * One sample of {@code member}. The cluster runs a live leader, so a peer
-     * check finds a peer with a closed election.
-     */
-    private static JoinWatchdog.Verdict verdict(final JoinWatchdog watchdog, final TestNode member) {
-        final long nowMs = System.currentTimeMillis();
-        final JoinWatchdog.Verdict verdict = watchdog.observe(new JoinWatchdog.Sample(
-                member.electionState(), member.commitPosition(), -1L, 0L,
-                ClusterControl.ToggleState.INACTIVE.code(), nowMs));
-        return verdict == JoinWatchdog.Verdict.PEER_CHECK ? watchdog.afterPeerCheck(true, nowMs) : verdict;
+    /** An admin server that reports the live counters of a TestCluster member. */
+    private static AdminServer adminServer(final TestNode node) {
+        try {
+            return AdminServer.start(0, () -> new MemberStatus(node.index(), String.valueOf(node.role()),
+                    String.valueOf(node.electionState()), node.commitPosition(), node.commitPosition(),
+                    MemberStatus.SnapshotVersions.of(0)), 0L);
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** The watchdog of the stuck member, and the answer of its last peer check. */
+    private static final class StallRun {
+        private final JoinWatchdog watchdog;
+        private final TestNode member;
+        private final PeerProbe probe;
+        private JoinWatchdog.PeerElections lastAnswer = JoinWatchdog.PeerElections.UNKNOWN;
+
+        StallRun(final JoinWatchdog watchdog, final TestNode member, final PeerProbe probe) {
+            this.watchdog = watchdog;
+            this.member = member;
+            this.probe = probe;
+        }
+
+        /** One sample of the member, with a real peer check when the watchdog asks for one. */
+        JoinWatchdog.Verdict verdict() {
+            final long nowMs = System.currentTimeMillis();
+            final JoinWatchdog.Verdict verdict = watchdog.observe(new JoinWatchdog.Sample(
+                    member.electionState(), member.commitPosition(), -1L, 0L,
+                    ClusterControl.ToggleState.INACTIVE.code(), nowMs));
+            if (verdict != JoinWatchdog.Verdict.PEER_CHECK) {
+                return verdict;
+            }
+            lastAnswer = probe.ask().elections();
+            return watchdog.afterPeerCheck(lastAnswer, nowMs);
+        }
     }
 }

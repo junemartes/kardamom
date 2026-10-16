@@ -230,10 +230,10 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Trigger: a follower stops for longer than the purge margin. It restarts with a log that ends below the purge point of the leader.
   - Effect: the archive of the leader refuses the catch-up of the follower. The election of the follower cycles, while Nomad sees a live container.
   - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off), and only when a peer has a closed election.
-    - At the stall limit (see the next entry) the member asks its peers for their admin status. With no peer that has a closed election, it relaunches and keeps its log (exit code 8).
-    - With such a peer, it waits until 300 s, asks again, and logs `cluster CATCHUP STALL`.
+    - At the stall limit (see the next entry) the member asks its peers for their admin status. When every peer answers with an open election, it relaunches and keeps its log (exit code 8).
+    - Otherwise it waits until 300 s and logs `cluster CATCHUP STALL`. A peer with a closed election, a peer that does not answer, and a member with no admin port (`adminPort` 0) all lead here.
     - It deletes the recording log of the member and exits with code 4.
-    - The relaunch finds no recording log. So the member seeds from the peer with the closed election and rejoins.
+    - The relaunch finds no recording log. So the member seeds from a peer and rejoins.
     - The member holds no committed entry that the leader does not have, because it was behind the live leader.
   - Proof: the in-JVM tests `ClusterLogPurgeTest`, `JoinWatchdogTest` and `PeerProbeTest`.
 - **Election stall after a full restart**
@@ -245,9 +245,12 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Recovery: the join watchdog acts after the stall limit with no progress. The limit is two join attempts of a follower: 2 x (2 x leader heartbeat timeout + archive message timeout + driver timeout). That is 80 s at the defaults and 160 s at the CI stall tolerance of 30 s.
     - A leader in `LEADER_READY` with no progress on itself or its peers logs `cluster LEADER STALL` and exits with code 7.
     - A member that found a leader and makes no progress logs `cluster FOLLOWER STALL` and exits with code 8. It keeps its recording log.
-    - Each relaunch starts from the member's own state. A member replays its log after the new leader truncates its uncommitted tail, so it joins at the leader's position.
+    - Each relaunch starts from the member's own state. A member replays its log after the new leader truncates its log tail, so it joins at the leader's position.
+    - Data: the truncated tail can be committed in the lower term. In #620, member 2 closed term T0 at 15027712 with member 0, and the leader of T1 holds the log only to 15027008. The members then keep the log of T1, and the entries from 15027008 to 15027712 go. This is the behavior of Aeron 1.44 after the double vote, not of the watchdog.
+    - With `adminPort` 0 the leader reads no peer progress. Then the leader stall can also fire while a slow follower replays for longer than the stall limit. The relaunch costs one more election.
+    - Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44, and no rule acts on it.
     - Before each exit, the member prints its Aeron error logs (`cluster ERROR LOG`).
-  - Not a stall: a slow follower that replays or catches up moves its commit position. A waiting leader reads the commit positions of its peers from their admin servers every 5 s, and counts a new highest one as progress. A coordinated restart and a lone member wait in `CANVASS`, which is no follower state. A snapshot runs with a closed election.
+  - Not a stall (with the admin port set): a slow follower that replays or catches up moves its commit position. A waiting leader reads the commit positions of its peers from their admin servers every 5 s, and counts a new highest one as progress. A coordinated restart and a lone member wait in `CANVASS`, which is no follower state. A snapshot runs with a closed election.
   - Proof: the in-JVM tests `JoinWatchdogTest`, `PeerProbeTest` and `ComponentCloseTest` (the limits follow the member's configured timeouts).
 - **Component fails in its start**
   - Trigger: the consensus module or the service container throws while it starts. The usual cause is a slow host at a full restart: the snapshot load waits for the archive past an Aeron timeout.
