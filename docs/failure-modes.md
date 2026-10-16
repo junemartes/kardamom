@@ -485,13 +485,14 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
 - **Admission of a cold sender**
   - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
   - For such a cold sender, the ingress asks an executor for the nonce and the balance (two queries). It keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.
-  - Only a fresh answer can refuse. The answer is fresh when its `x-state-tx-idx` is within `[cache] max_stale_txs` (default 8,192) of the newest position that the ingress has seen, the same rule as for Redis. An answer with no position is stale.
+  - Only a fresh answer can refuse. The answer is fresh when its `x-state-tx-idx` is within `[cache] max_stale_txs` (default 8,192) of the newest position that the ingress has seen, the same rule as for Redis. An answer with no position is stale. Before the first receipt frame, the ingress has no head to measure against (for example after a restart on an idle chain), so every answer is stale.
+  - The Redis freshness check (`CacheReader::fresh`) does not have this rule yet: with no head seen, a Redis value counts as fresh.
   - A stale answer, a failed or timed-out query, and a shed query admit. The ingress keeps that outcome for 3 s, so a hung or lagging executor costs one wait for each sender, not one for each submit. The executors then skip an unpayable transaction, as before.
   - The admission has its own query client, with at most 16 queries in flight for each ingress. It sheds the next query at once. A flood of cold submits can only make the admission fail open. It does not shed the account RPCs or the receipt lookups, which keep their own client (`max_in_flight`, default 64).
   - A cold sender that cannot pay the fee cap gets `InsufficientFunds` (JSON-RPC `-32000`).
   - The counter is `kardamom_cache_lookups_total{layer="cold", outcome}`. The outcomes are `hit` (a kept answer or outcome), `miss` (a fresh answer), `stale` and `error` (a shed or failed query).
   - Each admission refusal counts `kardamom_ingress_tx_rejected_total{reason}` and logs `submit refused` at debug level, with the sender, the nonce and the reason.
-  - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_lagging_executor_answer_admits`, `a_cold_funded_sender_or_a_failed_query_admits`).
+  - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_lagging_executor_answer_admits`, `an_answer_before_the_first_head_admits`, `a_cold_funded_sender_or_a_failed_query_admits`).
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)

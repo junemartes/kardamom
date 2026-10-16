@@ -335,6 +335,30 @@ async fn a_lagging_executor_answer_admits() {
     assert_eq!(stub.calls(), 2, "the stale outcome is kept");
 }
 
+/// A restarted ingress on an idle chain has seen no receipt frame, so it
+/// has no head to measure an executor answer against. An unfunded answer
+/// admits and is not kept as a refusal.
+#[tokio::test]
+async fn an_answer_before_the_first_head_admits() {
+    let stub = ExecutorStub::start("0x0", 100).await;
+    let cfg = IngressConfig {
+        executor_query: kardamom_cache::ExecutorQueryConfig {
+            endpoints: vec![stub.url.clone()],
+            ..kardamom_cache::ExecutorQueryConfig::default()
+        },
+        ..IngressConfig::default()
+    };
+    let f = Fixture::with(cfg, &LiveAccountsConfig::default());
+    let signer = PrivateKeySigner::random();
+    for nonce in [0, 1] {
+        f.proxy
+            .submit_raw_async(IP, sign_legacy(&signer, nonce))
+            .await
+            .expect("no head: the answer is stale");
+    }
+    assert_eq!(stub.calls(), 2, "the stale outcome is kept");
+}
+
 /// A cold sender that the executor shows funded is admitted. A failed
 /// query admits, and the next submit of the sender admits at once with
 /// no new query.

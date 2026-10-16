@@ -127,14 +127,14 @@ impl ColdAccounts {
 
     /// The slot for one answer pair. The older snapshot of the two
     /// decides the staleness. A snapshot with no position header is
-    /// stale.
+    /// stale. Before the first receipt frame, this ingress knows no head
+    /// to measure the lag against, for example after a restart on an idle
+    /// chain, so every answer is stale.
     fn judge(&self, nonce: &QueryAnswer, balance: &QueryAnswer) -> Slot {
         let tx_idx = nonce.tx_idx.min(balance.tx_idx);
-        let lag = self.live.head().saturating_sub(tx_idx);
-        let (Ok(nonce), true) = (
-            u64::try_from(nonce.value),
-            tx_idx > 0 && lag <= self.max_stale,
-        ) else {
+        let head = self.live.head();
+        let fresh = tx_idx > 0 && head > 0 && head.saturating_sub(tx_idx) <= self.max_stale;
+        let (Ok(nonce), true) = (u64::try_from(nonce.value), fresh) else {
             cache_metrics::record_lookup("cold", "stale");
             return Slot::Unknown;
         };
@@ -180,12 +180,18 @@ mod tests {
     }
 
     fn cold() -> ColdAccounts {
-        let (live, _writer) = LiveAccounts::new(&LiveAccountsConfig::default());
-        ColdAccounts::new(
+        with_writer().0
+    }
+
+    /// The map, and the writer of its local layer, with `max_stale` 8.
+    fn with_writer() -> (ColdAccounts, kardamom_cache::LiveAccountsWriter) {
+        let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let cold = ColdAccounts::new(
             &ExecutorQueryConfig::default(),
             NonZeroU64::new(8).unwrap(),
             live,
-        )
+        );
+        (cold, writer)
     }
 
     fn known_nonce(cold: &ColdAccounts, address: Address) -> Option<u64> {
@@ -210,17 +216,23 @@ mod tests {
         assert_eq!(cold.map.len(), CAPACITY.get());
     }
 
-    /// An answer with no position header, or one far behind the head,
-    /// cannot refuse a submit.
+    /// An answer with no position header, an answer before the first
+    /// head, and an answer far behind the head cannot refuse a submit.
     #[test]
     fn a_stale_answer_is_unknown() {
-        let cold = cold();
+        let (cold, mut writer) = with_writer();
         let answer = |tx_idx| QueryAnswer {
             value: U256::ZERO,
             block: 0,
             tx_idx,
         };
+        assert!(
+            matches!(cold.judge(&answer(5), &answer(5)), Slot::Unknown),
+            "no head seen yet"
+        );
+        writer.apply(kardamom_types::BPosition::from_index(10), &[]);
         assert!(matches!(cold.judge(&answer(0), &answer(0)), Slot::Unknown));
+        assert!(matches!(cold.judge(&answer(1), &answer(5)), Slot::Unknown));
         assert!(matches!(cold.judge(&answer(5), &answer(5)), Slot::Known(_)));
     }
 }
