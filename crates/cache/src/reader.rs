@@ -90,13 +90,19 @@ impl CacheReader {
         }
     }
 
-    /// Whether a Redis value is fresh: a live head exists and the local
-    /// layer's newest position is within `max_stale_txs` of it. Only the
-    /// balance check needs this. A nonce is a lower bound at any lag.
+    /// Whether a Redis value is fresh: a live mirror head exists, the
+    /// local layer has seen a receipt frame, and its newest position is
+    /// within `max_stale_txs` of the mirror head. Before the first frame,
+    /// for example after a restart on an idle chain, the local layer has
+    /// no position to measure the lag against, so no value is fresh. Only
+    /// the balance check needs this. A nonce is a lower bound at any lag.
     #[must_use]
     pub fn fresh(&self) -> bool {
-        self.head()
-            .is_some_and(|head| self.live.head().saturating_sub(head) <= self.max_stale)
+        let local = self.live.head();
+        local > 0
+            && self
+                .head()
+                .is_some_and(|head| local.saturating_sub(head) <= self.max_stale)
     }
 
     /// The account's projected state. `None` on a miss and on every
@@ -205,5 +211,28 @@ impl HeadPoll {
             metrics::set_head_lag(self.live.head().saturating_sub(head));
         }
         HEAD_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kardamom_types::BPosition;
+
+    use super::*;
+    use crate::config::LiveAccountsConfig;
+
+    /// A mirror head alone is not enough: before the local layer sees a
+    /// receipt frame, no value is fresh. After it, a value within the
+    /// bound is fresh, and one beyond it is stale.
+    #[tokio::test]
+    async fn no_local_head_means_stale() {
+        let (live, mut writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let reader = CacheReader::spawn(&CacheConfig::default(), NonZeroU32::new(1).unwrap(), live);
+        reader.head.store(10, Ordering::Release);
+        assert!(!reader.fresh(), "no local head yet");
+        writer.apply(BPosition::from_index(10), &[]);
+        assert!(reader.fresh());
+        writer.apply(BPosition::from_index(10 + reader.max_stale + 1), &[]);
+        assert!(!reader.fresh(), "beyond max_stale_txs");
     }
 }
