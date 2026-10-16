@@ -111,11 +111,7 @@ impl TransferShape {
             .and_then(|g| g.checked_add(TRANSFER_GAS))
             .ok_or_else(|| anyhow::anyhow!("the gas of {bytes} calldata bytes overflows u64"))?;
         // The byte value cycles through 1..=255, so no byte is zero.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "i % 255 + 1 is at most 255"
-        )]
-        let input = (0..bytes).map(|i| (i % 255 + 1) as u8).collect();
+        let input = (1..=255u8).cycle().take(bytes).collect();
         Ok(Self {
             to,
             value,
@@ -156,7 +152,7 @@ pub struct TransferMix {
     shapes: Vec<TransferShape>,
     /// The end of the places of each shape: the sum of the weights up to
     /// and including it. It increases strictly.
-    ends: Vec<u64>,
+    ends: Vec<NonZeroU64>,
     /// The length of the cycle: the last value of `ends`.
     total: NonZeroU64,
 }
@@ -167,7 +163,7 @@ impl TransferMix {
     pub fn single(shape: TransferShape) -> Self {
         Self {
             shapes: vec![shape],
-            ends: vec![1],
+            ends: vec![NonZeroU64::MIN],
             total: NonZeroU64::MIN,
         }
     }
@@ -182,29 +178,20 @@ impl TransferMix {
     pub fn calldata(to: Address, value: U256, mix: &CalldataMix) -> anyhow::Result<Self> {
         let shapes = mix
             .parts()
-            .iter()
             .map(|part| TransferShape::with_calldata(to, value, part.bytes))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let ends = mix
-            .parts()
+        // The fold starts at the weight of the first part, so every end,
+        // and the total, is non-zero.
+        let first = NonZeroU64::from(mix.first().weight);
+        let (ends, total) = mix
+            .rest()
             .iter()
-            .try_fold(Vec::new(), |mut ends: Vec<u64>, part| {
-                let end = ends
-                    .last()
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(u64::from(part.weight.get()))?;
+            .try_fold((vec![first], first), |(mut ends, total), part| {
+                let end = total.checked_add(u64::from(part.weight.get()))?;
                 ends.push(end);
-                Some(ends)
+                Some((ends, end))
             })
             .ok_or_else(|| anyhow::anyhow!("the sum of the calldata weights overflows u64"))?;
-        // A `CalldataMix` has one part or more, and every weight is
-        // non-zero, so the last end is non-zero.
-        let total = ends
-            .last()
-            .copied()
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| anyhow::anyhow!("the calldata mix is empty"))?;
         Ok(Self {
             shapes,
             ends,
@@ -257,7 +244,7 @@ impl TransferMix {
         // The place wraps on purpose: the cycle repeats.
         let place = (sender as u64).wrapping_add(i as u64) % self.total;
         // `place < total`, the last end, so the index is in range.
-        &self.shapes[self.ends.partition_point(|&end| end <= place)]
+        &self.shapes[self.ends.partition_point(|end| end.get() <= place)]
     }
 }
 

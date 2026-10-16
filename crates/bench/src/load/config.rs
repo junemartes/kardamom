@@ -339,11 +339,12 @@ impl std::str::FromStr for NonceStart {
     }
 }
 
-/// The calldata sizes of the calldata workload, with their weights. It
-/// has one part or more.
+/// The calldata sizes of the calldata workload, with their weights. The
+/// type holds the first part apart, so a mix always has one part or more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalldataMix {
-    parts: Vec<CalldataPart>,
+    first: CalldataPart,
+    rest: Vec<CalldataPart>,
 }
 
 /// One calldata size of a [`CalldataMix`], and its share of the cycle.
@@ -354,10 +355,21 @@ pub struct CalldataPart {
 }
 
 impl CalldataMix {
-    /// The parts, in the order of the flag.
+    /// The first part.
     #[must_use]
-    pub fn parts(&self) -> &[CalldataPart] {
-        &self.parts
+    pub fn first(&self) -> CalldataPart {
+        self.first
+    }
+
+    /// The parts after the first, in the order of the flag.
+    #[must_use]
+    pub fn rest(&self) -> &[CalldataPart] {
+        &self.rest
+    }
+
+    /// All parts, in the order of the flag.
+    pub fn parts(&self) -> impl Iterator<Item = CalldataPart> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
     }
 }
 
@@ -365,10 +377,11 @@ impl Default for CalldataMix {
     /// One part: no calldata.
     fn default() -> Self {
         Self {
-            parts: vec![CalldataPart {
+            first: CalldataPart {
                 bytes: 0,
                 weight: NonZeroU32::MIN,
-            }],
+            },
+            rest: Vec::new(),
         }
     }
 }
@@ -396,12 +409,12 @@ impl std::str::FromStr for CalldataMix {
     /// A comma-separated list of [`CalldataPart`]: `8082`, or
     /// `0:16,1938:3,8082:1`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // `split` yields one item or more, so the mix is never empty.
-        let parts = s
-            .split(',')
-            .map(str::parse)
-            .collect::<anyhow::Result<Vec<CalldataPart>>>()?;
-        Ok(Self { parts })
+        let mut parts = s.split(',').map(str::parse::<CalldataPart>);
+        let first = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the calldata mix is empty"))??;
+        let rest = parts.collect::<anyhow::Result<Vec<CalldataPart>>>()?;
+        Ok(Self { first, rest })
     }
 }
 
@@ -480,18 +493,14 @@ mod tests {
     fn calldata_mix_parses_one_size_and_a_weighted_list() {
         let one: CalldataMix = "8082".parse().unwrap();
         assert_eq!(
-            one.parts(),
+            one.parts().collect::<Vec<_>>(),
             [CalldataPart {
                 bytes: 8082,
                 weight: NonZeroU32::MIN,
             }]
         );
         let mix: CalldataMix = "0:16, 1938:3,8082:1".parse().unwrap();
-        let sizes: Vec<(usize, u32)> = mix
-            .parts()
-            .iter()
-            .map(|p| (p.bytes, p.weight.get()))
-            .collect();
+        let sizes: Vec<(usize, u32)> = mix.parts().map(|p| (p.bytes, p.weight.get())).collect();
         assert_eq!(sizes, vec![(0, 16), (1938, 3), (8082, 1)]);
     }
 

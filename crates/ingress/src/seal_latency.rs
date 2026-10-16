@@ -10,7 +10,7 @@
 //! here, so it gives no sample.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
@@ -39,11 +39,15 @@ pub struct SealStamps {
 }
 
 impl SealStamps {
-    /// Stamp `tx_hash` with the current instant. A full channel, or a
-    /// clock that is gone, drops the stamp: the histogram then misses one
-    /// sample, and the submit never waits.
+    /// Stamp `tx_hash` with the current instant. A full channel drops the
+    /// stamp and counts it in
+    /// [`crate::metrics::SEAL_STAMPS_DROPPED_TOTAL`]: the histogram then
+    /// misses one sample, and the submit never waits. A clock that is gone
+    /// (no egress tap) drops the stamp with no count.
     pub fn stamp(&self, tx_hash: B256) {
-        let _ = self.tx.try_send((tx_hash, Instant::now()));
+        if let Err(TrySendError::Full(_)) = self.tx.try_send((tx_hash, Instant::now())) {
+            metrics::counter!(crate::metrics::SEAL_STAMPS_DROPPED_TOTAL).increment(1);
+        }
     }
 }
 
@@ -92,13 +96,14 @@ impl SealClock {
             return;
         }
         self.last_sweep = now;
-        let before = self.open.len();
-        self.open
-            .retain(|_, stamped| now.saturating_duration_since(*stamped) < STAMP_TTL);
-        // `retain` only removes, so the length never grows.
-        let expired = before.saturating_sub(self.open.len());
-        metrics::counter!(crate::metrics::SEAL_STAMPS_EXPIRED_TOTAL)
-            .increment(u64::try_from(expired).unwrap_or(u64::MAX));
+        // The count is at most the length of the map, so it cannot overflow.
+        let mut expired = 0u64;
+        self.open.retain(|_, stamped| {
+            let keep = now.saturating_duration_since(*stamped) < STAMP_TTL;
+            expired += u64::from(!keep);
+            keep
+        });
+        metrics::counter!(crate::metrics::SEAL_STAMPS_EXPIRED_TOTAL).increment(expired);
     }
 }
 
