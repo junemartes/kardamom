@@ -411,8 +411,7 @@ where
 /// # Errors
 ///
 /// Returns [`WireError::EntryTooLarge`] if `payload.len()` does not fit
-/// in a `u32`. Every relayed payload rides one Aeron frame (MTU about
-/// 1408 bytes), far under that bound.
+/// in a `u32`.
 pub fn encode_egress_record(index: u64, payload: &[u8]) -> Result<Vec<u8>, WireError> {
     let len = u32::try_from(payload.len())
         .map_err(|_| WireError::EntryTooLarge { len: payload.len() })?;

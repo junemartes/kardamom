@@ -273,3 +273,40 @@ async fn a_refused_publish_holds_the_record_and_retries_after_a_tick() {
     assert_eq!(w.process_once().await.unwrap(), 3);
     assert_eq!(numbers(&tap), [101, 102, 103]);
 }
+
+/// After an operator clears a disagreement, the archives still hold both
+/// instances' records. The history keeps the chain that descends from
+/// the head, so the lie is never taken, and the old conflict does not
+/// halt the watcher again.
+#[tokio::test]
+async fn after_a_clear_the_history_keeps_the_chain_of_the_head() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 101]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.hash = B256::repeat_byte(0xAB);
+    stream.inject(lie.clone());
+    assert!(w.process_once().await.is_err());
+    // The archives now hold the lying chain from 101 on beside the true one.
+    let mut next = stream.record(102);
+    next.parent_hash = lie.hash;
+    next.hash = B256::repeat_byte(0xAC);
+    stream.archive_up_to(104);
+    stream.add_archived(lie);
+    stream.add_archived(next);
+    w.on_halt_cleared();
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 3);
+    let published: Vec<_> = tap.epochs();
+    assert_eq!(
+        published.iter().map(|e| e.l1_number).collect::<Vec<_>>(),
+        [101, 102, 103, 104]
+    );
+    assert!(
+        published
+            .iter()
+            .all(|e| e.l1_hash == ScriptedStream::hash(e.l1_number))
+    );
+}

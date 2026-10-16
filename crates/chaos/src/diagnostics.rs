@@ -63,8 +63,22 @@ const LIFECYCLE_MARKERS: &[&str] = &[
     "rebuild:",
 ];
 const LIFECYCLE_EVENTS: usize = 60;
-/// The sealer's consensus history: roles, leadership terms, snapshots,
-/// the boundary clock's heartbeat and its revivals. Session and
+/// Discovery lines: the recorder's starts, departures and ended
+/// recordings, the reconciler's attach and detach of each publisher, and
+/// the destination and image events of the Aeron runtime. A gap in a
+/// stream starts with one of these, often minutes before the tail.
+const DISCOVERY_MARKERS: &[&str] = &[
+    "discovery::recording",
+    "discovery::reconcile",
+    "discovery: reconciling",
+    "aeron: destination",
+    "detached destination",
+    "aeron: image",
+];
+const DISCOVERY_EVENTS: usize = 80;
+/// The sealer's consensus history: roles, leadership terms, election
+/// states, failed member name lookups, snapshots, the boundary clock's
+/// heartbeat and its revivals. Session and
 /// contiguity lines flood a sealer's head and tail, and these few lines
 /// are the ones that tell which member led when and whether its clock
 /// ran. Each line carries its own time.
@@ -78,6 +92,9 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "cluster JOIN WEDGE",
     "cluster CATCHUP STALL",
     "cluster COMPONENT CLOSED",
+    "cluster LEADER WEDGE",
+    "cluster ELECTION",
+    "cluster DNS",
     "cluster LOG PURGE",
     "cluster SEED",
 ];
@@ -298,6 +315,14 @@ impl Diagnostics {
         println!(
             "{}",
             matching_lines(&logs, LIFECYCLE_MARKERS, LIFECYCLE_EVENTS)
+        );
+        println!(
+            "----- {job} alloc {}: discovery events (last {DISCOVERY_EVENTS}) -----",
+            alloc.short_id()
+        );
+        println!(
+            "{}",
+            matching_lines(&logs, DISCOVERY_MARKERS, DISCOVERY_EVENTS)
         );
         if job == "cluster" {
             println!(

@@ -16,7 +16,8 @@ use alloy_primitives::{Address, U256};
 use clap::Parser;
 
 use kardamom_bench::load::{
-    self, ANVIL_MNEMONIC, Completeness, LoadConfig, MetricsTargets, SenderRange,
+    self, ANVIL_MNEMONIC, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart,
+    SenderRange,
 };
 
 /// Default `--target-tps`.
@@ -65,9 +66,10 @@ struct Args {
     #[arg(long = "sender-offset", default_value_t = 0)]
     sender_offset: u32,
 
-    /// The starting nonce for each sender.
-    #[arg(long = "nonce-start", default_value_t = 0)]
-    nonce_start: u64,
+    /// The first nonce of each sender: a number, or `chain` for the
+    /// nonce of each sender at the head of the chain.
+    #[arg(long = "nonce-start", default_value = "0", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<NonceStart>().map_err(|e| e.to_string())))]
+    nonce_start: NonceStart,
 
     /// The BIP-39 mnemonic the senders derive from.
     #[arg(long, default_value = ANVIL_MNEMONIC)]
@@ -108,10 +110,16 @@ struct Args {
     /// This halves the HTTP request load.
     #[arg(long, default_value_t = false)]
     feed_confirm: bool,
-    /// The workload family: plain transfers, or the `DeFi` mix of a
-    /// CLOB, a swap pool, and a vault, with gas-centric reporting.
+    /// The workload family: plain transfers, the `DeFi` mix of a CLOB, a
+    /// swap pool, and a vault, with gas-centric reporting, or calldata:
+    /// transfers with `--calldata-bytes` of calldata each.
     #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
     workload: kardamom_bench::load::Workload,
+
+    /// The calldata bytes of each transaction of the calldata workload:
+    /// `N`, or a weighted mix such as `0:16,1938:3,8082:1`.
+    #[arg(long = "calldata-bytes", default_value = "0", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<CalldataMix>().map_err(|e| e.to_string())))]
+    calldata_bytes: CalldataMix,
 
     /// The number of per-submit retry attempts on a transient failure.
     #[arg(long = "retry-submit", default_value_t = 2)]
@@ -224,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = LoadConfig {
         workload: args.workload,
+        calldata: args.calldata_bytes,
         rpc: args.rpc,
         receipt_rpcs: Vec::new(),
         chain_id: args.chain_id,

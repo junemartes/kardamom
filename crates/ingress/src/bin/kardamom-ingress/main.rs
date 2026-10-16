@@ -29,8 +29,9 @@ use clap::Parser;
 use kardamom_cache::{ExecutorQueryConfig, LiveAccountsConfig};
 use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
-use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
+use kardamom_ingress::config::{DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
+use kardamom_ingress::seal_latency::{SealClock, SealStamps};
 use kardamom_log::aeron_live::{
     AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
 };
@@ -189,6 +190,15 @@ struct Args {
         default_value = "64"
     )]
     inclusion_horizon_blocks: NonZeroU64,
+    /// The largest `raw_tx` that a submit accepts, in bytes. The ingress
+    /// refuses a larger transaction with a `-32602` error that states the
+    /// size and the cap. See `IngressConfig::max_tx_bytes`.
+    #[arg(
+        long = "max-tx-bytes",
+        env = "KARDAMOM_MAX_TX_BYTES",
+        default_value_t = DEFAULT_MAX_TX_BYTES
+    )]
+    max_tx_bytes: NonZeroUsize,
     /// The executor query endpoints, `http://host:port`, comma
     /// separated. `eth_getBalance` and `eth_getTransactionCount` ask one
     /// of them when the local account layer misses. Empty means no
@@ -298,6 +308,7 @@ impl IngressService {
             // is known: the Redis reader then polls `head:0` only.
             mirror_count: self.executor_count().unwrap_or(NonZeroU32::MIN),
             inclusion_horizon_blocks: args.inclusion_horizon_blocks,
+            max_tx_bytes: args.max_tx_bytes,
             ..IngressConfig::default()
         };
         cfg.binary_tcp_bind = None;
@@ -383,7 +394,11 @@ impl IngressService {
     /// executor crash recovery. A recorder startup failure is fatal: the
     /// operator asked for `--archive-durability`, so serving without it
     /// would be a silent lie.
-    async fn open_aeron_side(&self, live_cfg: &LiveAccountsConfig) -> Result<OpenedAeron> {
+    async fn open_aeron_side(
+        &self,
+        live_cfg: &LiveAccountsConfig,
+        stamps: SealStamps,
+    ) -> Result<OpenedAeron> {
         let args = &self.args;
         let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
         let mut plane =
@@ -397,7 +412,7 @@ impl IngressService {
         // count). The proxy reads this only when MDS is enabled.
         let executor_count = self.executor_count();
 
-        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE)
+        let publication = LiveIngressPublication::open(&rt, &mut plane, LANE_PLANE, stamps)
             .await
             .context("open IngressPublication")?;
 
@@ -444,6 +459,7 @@ impl IngressService {
         subscription: &LiveIngressSubscription,
         ingress_endpoints: Option<String>,
         status: TxStatusPublisherHandle,
+        seal_clock: SealClock,
     ) -> Result<watermark::ClusterWatermark> {
         let args = &self.args;
         let mut live = self.file_cfg.cluster.to_live();
@@ -465,6 +481,7 @@ impl IngressService {
         // is not an error here.
         let running = watermark::ClusterWatermarkPump::new(
             observer,
+            seal_clock,
             subscription.watermark_sender(),
             subscription.cluster_status_sender(),
             status,
@@ -502,6 +519,7 @@ impl IngressService {
     async fn spawn_egress_tap(
         &self,
         opened: &mut OpenedAeron,
+        seal_clock: SealClock,
     ) -> Result<watermark::ClusterWatermark> {
         let members = opened.plane.cluster_ingress_endpoints().await?;
         let status = opened
@@ -509,7 +527,7 @@ impl IngressService {
             .publisher::<TxStatusPublisherHandle>(&opened.rt)
             .await
             .context("open TxStatusPublisherHandle")?;
-        self.spawn_cluster_watermark(&opened.subscription, members, status)
+        self.spawn_cluster_watermark(&opened.subscription, members, status, seal_clock)
     }
 
     /// Whether the CLI or the config file names a cluster egress channel.
@@ -537,7 +555,11 @@ impl IngressService {
             "kardamom-ingress starting"
         );
 
-        let mut opened = self.open_aeron_side(&cfg.live_accounts).await?;
+        // The publication stamps each transaction, and the egress tap
+        // records its seal latency. Without a tap nothing reads the
+        // stamps: the full or closed channel drops them.
+        let (stamps, seal_clock) = SealClock::pair();
+        let mut opened = self.open_aeron_side(&cfg.live_accounts, stamps).await?;
         // The egress tap is the `Sealed` publisher of the status stream,
         // and under a quorum policy also the source of the durable
         // watermark. It runs whenever an egress channel is configured. A
@@ -545,9 +567,9 @@ impl IngressService {
         // under any other policy the ingress serves without it, so a
         // cluster that is down at start never keeps the front door shut.
         let cluster_watermark = if cfg.ack_policy.requires_quorum() {
-            Some(self.spawn_egress_tap(&mut opened).await?)
+            Some(self.spawn_egress_tap(&mut opened, seal_clock).await?)
         } else if self.has_egress_channel() {
-            self.spawn_egress_tap(&mut opened)
+            self.spawn_egress_tap(&mut opened, seal_clock)
                 .await
                 .inspect_err(|e| {
                     tracing::warn!(error = %e, "kardamom-ingress: cluster egress tap not started; tx_status Sealed is not published");

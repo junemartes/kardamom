@@ -89,7 +89,7 @@ jobs:
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event.action == 'labeled' }}
         run: |
-          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","semantics"'
+          regular='"load","chaos-executor","chaos-ingress","chaos-sequencer","chaos-cluster","chaos-fleet","chaos-coordinated","chaos-combined-ordering","chaos-combined-exec","chaos-retention","chaos-cache","chaos-l1","chaos-follower","semantics"'
           nightly='"chaos-integrity"'
           if [ "$NIGHTLY" = true ]; then
             shards="[$nightly]"
@@ -164,9 +164,16 @@ jobs:
           cargo test -p kardamom-chaos --release --features cluster-e2e --locked --no-run
           cargo build --release -p kardamom-chaos --locked --bin kardamom-cluster
 
+      # One download of the Aeron jar for the whole run. The artifact
+      # carries it to every shard, where the images role builds the Aeron
+      # image from that context with no request to Maven Central.
+      - uses: ./.github/actions/aeron-jar
+
       - name: Stage the artifact
         run: |
           just stage-dist dist
+          install -D -m 0644 crates/log/docker/aeron/aeron-all.jar \
+            dist/crates/log/docker/aeron/aeron-all.jar
           tar -C dist -czf cluster-dist.tgz .
           ls -l cluster-dist.tgz
 
@@ -222,6 +229,8 @@ jobs:
         # chaos-l1 puts a lying L1 endpoint in front of the followers: the
         # staging incident's faults, the batcher's resume through them, and
         # an outage past the sealer's retention.
+        # chaos-follower runs behind the same lying L1: the loss of one and
+        # of both L1 follower instances, and the disagreement of the two.
         # chaos-integrity (nightly) stops and restores the executor job ten
         # times under load; every executor must advance after each round.
         # The build job picks the list (see "Pick the shards").

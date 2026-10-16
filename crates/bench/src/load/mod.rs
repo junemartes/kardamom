@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
+use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use tokio::sync::Semaphore;
 
@@ -35,12 +36,13 @@ use crate::load::engine::{
     Queues, RunHandles, SubmitMode, SubmitOpts, Tracker, join_submit_tasks, pacer,
 };
 use crate::load::feed::receipt_feed_task;
-use crate::load::plan::{PlannedTx, TxPlanParams};
+use crate::load::plan::{PlannedTx, TransferMix, TransferShape, TxPlanParams};
 use crate::load::scrape::{MetricsSnapshot, ScrapeSet, Scraper};
 use crate::signers::{DerivedSigner, SignerSet};
 
 pub use config::{
-    ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, SenderRange, Workload,
+    ANVIL_MNEMONIC, CalldataMix, CalldataPart, Completeness, LoadConfig, LoadReport, NonceStart,
+    RampStep, SenderRange, Workload,
 };
 pub use exporter::{ExporterRead, ExporterReader, MetricsTarget, MetricsTargets};
 
@@ -107,23 +109,38 @@ impl LoadConfig {
     /// Build the presigned per-sender queues for `self.workload`, and
     /// the `DeFi` deployment transactions to land first, if the
     /// workload needs them.
-    fn build_queues(
-        &self,
-        signers: &SignerSet,
-        chain_id: u64,
-        per_sender: usize,
-    ) -> anyhow::Result<BuiltQueues> {
-        let plan_params = TxPlanParams {
-            chain_id,
-            nonce_start: self.nonce_start,
+    fn build_queues(&self, signers: &SignerSet, plan: &QueuePlan) -> anyhow::Result<BuiltQueues> {
+        let params = |nonce_start| TxPlanParams {
+            chain_id: plan.chain_id,
+            nonce_start,
             gas_price: self.gas_price,
         };
+        // A transfer queue reads the nonce of each sender from `starts`.
+        let transfer_params = params(0);
         let (queues_vec, defi_deploys) = match self.workload {
             Workload::Transfers => (
-                plan::pregenerate(signers, self.to, self.value, per_sender, plan_params)?,
+                TransferMix::single(TransferShape::plain(self.to, self.value)).pregenerate(
+                    signers,
+                    plan.per_sender,
+                    transfer_params,
+                    &plan.starts,
+                )?,
+                None,
+            ),
+            Workload::Calldata => (
+                TransferMix::calldata(self.to, self.value, &self.calldata)?.pregenerate(
+                    signers,
+                    plan.per_sender,
+                    transfer_params,
+                    &plan.starts,
+                )?,
                 None,
             ),
             Workload::Defi => {
+                let NonceStart::Fixed(nonce_start) = self.nonce_start else {
+                    anyhow::bail!("the defi workload needs a fixed --nonce-start");
+                };
+                let plan_params = params(nonce_start);
                 let dep = defi::deployment_txs(signers, plan_params)?;
                 tracing::info!(
                     pool = %dep.contracts.pool,
@@ -132,7 +149,7 @@ impl LoadConfig {
                     "defi workload: deploying bench contracts"
                 );
                 let queues =
-                    defi::pregenerate_defi(signers, &dep.contracts, per_sender, plan_params)?;
+                    defi::pregenerate_defi(signers, &dep.contracts, plan.per_sender, plan_params)?;
                 (queues, Some(dep.txs))
             }
         };
@@ -140,6 +157,45 @@ impl LoadConfig {
             queues: Queues::new(queues_vec),
             defi_deploys,
         })
+    }
+}
+
+/// What [`LoadConfig::build_queues`] signs: the chain, the queue depth
+/// of each sender, and the first nonce of each sender.
+struct QueuePlan {
+    chain_id: u64,
+    per_sender: usize,
+    starts: Vec<u64>,
+}
+
+impl NonceStart {
+    /// The first nonce of each signer, in signer order.
+    async fn per_sender(
+        self,
+        client: &HttpClient,
+        signers: &SignerSet,
+    ) -> anyhow::Result<Vec<u64>> {
+        match self {
+            Self::Fixed(nonce) => Ok(vec![nonce; signers.len()]),
+            Self::Chain => {
+                futures::future::try_join_all(
+                    signers.iter().map(|s| Self::chain_nonce(client, s.address)),
+                )
+                .await
+            }
+        }
+    }
+
+    /// The nonce of `address` at the head of the chain.
+    async fn chain_nonce(client: &HttpClient, address: Address) -> anyhow::Result<u64> {
+        let nonce: String = client
+            .request(
+                "eth_getTransactionCount",
+                jsonrpsee::rpc_params![address, "latest"],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("eth_getTransactionCount {address}: {e}"))?;
+        hex_u64(&nonce).ok_or_else(|| anyhow::anyhow!("nonce {nonce:?} of {address} is not hex"))
     }
 }
 
@@ -397,6 +453,7 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
     let signers = SignerSet::new(signers[cfg.sender_range.offset() as usize..].to_vec())?;
 
     let per_sender = cfg.per_sender_estimate();
+    let starts = cfg.nonce_start.per_sender(&client, &signers).await?;
     tracing::info!(
         senders = cfg.sender_range.count(),
         per_sender,
@@ -410,7 +467,16 @@ async fn prepare_run(cfg: &LoadConfig) -> anyhow::Result<RunSetup> {
     let built = tokio::task::spawn_blocking({
         let cfg = cfg.clone();
         let signers = signers.clone();
-        move || cfg.build_queues(&signers, chain_id, per_sender)
+        move || {
+            cfg.build_queues(
+                &signers,
+                &QueuePlan {
+                    chain_id,
+                    per_sender,
+                    starts,
+                },
+            )
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("join the pre-generation: {e}"))??;

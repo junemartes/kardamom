@@ -109,6 +109,42 @@ pub fn sign_legacy_with_gas(signer: &PrivateKeySigner, nonce: u64, gas_limit: u6
     sign_and_encode(legacy_tx(nonce, gas_limit), signer).1
 }
 
+/// Signs a legacy tx whose RLP bytes are exactly `size` long. Calldata
+/// pads the tx. A signature scalar drops its leading zero bytes, so one
+/// signature in about a hundred is a byte short. The search signs the
+/// estimated calldata length and its two neighbours, with one fill byte
+/// after another, and keeps the first exact one.
+///
+/// # Panics
+///
+/// Panics if `size` is below the size of an empty legacy tx, or if no
+/// candidate gives `size`.
+#[must_use]
+pub fn sign_legacy_sized(signer: &PrivateKeySigner, nonce: u64, size: usize) -> Bytes {
+    let padded = |input_len: usize, fill: u8| {
+        let tx = TxLegacy {
+            input: Bytes::from(vec![fill; input_len]),
+            ..legacy_tx(nonce, 3_000_000)
+        };
+        sign_and_encode(tx, signer).1
+    };
+    let overhead = padded(size, 1)
+        .len()
+        .checked_sub(size)
+        .expect("RLP adds a header");
+    let estimate = size.checked_sub(overhead).expect("size fits an empty tx");
+    let lens = [
+        estimate,
+        estimate.saturating_sub(1),
+        estimate.saturating_add(1),
+    ];
+    (1..=u8::MAX)
+        .flat_map(|fill| lens.map(|input_len| (input_len, fill)))
+        .map(|(input_len, fill)| padded(input_len, fill))
+        .find(|raw| raw.len() == size)
+        .expect("a candidate near the estimate gives the exact size")
+}
+
 /// Signs a minimal EIP-4844 (type-3) tx and returns the encoded bytes.
 #[must_use]
 pub fn sign_eip4844(signer: &PrivateKeySigner, nonce: u64) -> Bytes {

@@ -25,7 +25,10 @@
 //! [`SessionDriver`]: kardamom_cluster_client::session::SessionDriver
 
 mod endpoints;
+#[cfg(all(test, feature = "docker-e2e"))]
+mod fragmented_tests;
 mod session_loop;
+mod term;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +39,10 @@ use kardamom_log::aeron_live::{AeronRuntime, PubHandle, RawFrame};
 use thiserror::Error;
 
 use crate::gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
-use endpoints::{member_ids, open_leader_pub, open_next_member_pub};
+use endpoints::{IngressStream, member_ids, open_leader_pub, open_next_member_pub};
 use session_loop::SessionSeams;
+use term::AppPayload;
+pub use term::{PayloadTooLarge, SessionTerm};
 
 #[derive(Debug, Error)]
 #[error("live cluster gateway: {0}")]
@@ -59,10 +64,26 @@ pub struct LiveClusterConfig {
     /// Keep-alive cadence, in ms. It must be less than the cluster's
     /// session timeout.
     pub keep_alive_interval_ms: u64,
+    /// The term of the ingress publication. It bounds the payload that
+    /// [`LiveIngress`] offers.
+    pub ingress_term: SessionTerm,
+    /// The term of the egress channel. It bounds the frames the cluster
+    /// can send to this session.
+    pub egress_term: SessionTerm,
+}
+
+impl LiveClusterConfig {
+    /// The stream and term of every ingress publication.
+    fn ingress_stream(&self) -> IngressStream {
+        IngressStream {
+            stream_id: self.ingress_stream_id,
+            term: self.ingress_term,
+        }
+    }
 }
 
 struct OfferReq {
-    payload: Vec<u8>,
+    payload: AppPayload,
     reply: Sender<OfferOutcome>,
 }
 
@@ -91,15 +112,23 @@ impl Drop for LiveCluster {
 #[derive(Clone)]
 pub struct LiveIngress {
     req_tx: Sender<OfferReq>,
+    term: SessionTerm,
 }
 
 impl ClusterIngress for LiveIngress {
+    /// Refuse a payload above the bound of the ingress term here, before
+    /// it reaches the session thread: Aeron refuses an offer above its
+    /// maximum message length, and a retry cannot succeed.
     fn offer(&mut self, payload: &[u8]) -> OfferOutcome {
+        let payload: AppPayload = match self.term.payload(payload) {
+            Ok(payload) => payload,
+            Err(PayloadTooLarge { len, .. }) => return OfferOutcome::TooLarge { len },
+        };
         let (reply_tx, reply_rx) = bounded(1);
         if self
             .req_tx
             .send(OfferReq {
-                payload: payload.to_vec(),
+                payload,
                 reply: reply_tx,
             })
             .is_err()
@@ -211,27 +240,6 @@ pub fn connect_with(
         .spawn_thread()
 }
 
-/// Append a small term length to a cluster control channel, unless the
-/// URI already pins one. Used for both the egress channel
-/// ([`SessionConnect::open_egress`]) and every ingress publication
-/// ([`endpoints::open_leader_pub`]). Small terms matter on both sides: a
-/// publication's log allocates at its term length on the client, and as
-/// the matching image on every cluster member's tmpfs. Cluster ingress
-/// and egress carry only a few KB/s of control and canonical frames, but
-/// Aeron's default 16 MB term allocates a log of about 50 MB per
-/// publication image. Session churn (chaos failovers, zombie-close
-/// reconnects) at 50 MB each exhausts the 1 GB tmpfs. The clustered
-/// service then dies with "insufficient usable storage", while Raft
-/// itself stays healthy: this shows up as a pipeline freeze right after
-/// failover. A 1 MB term cuts every such log by 16x.
-fn with_control_term_length(uri: &str) -> String {
-    if uri.contains("term-length") {
-        uri.to_string()
-    } else {
-        format!("{uri}|term-length=1m")
-    }
-}
-
 /// Startup config validation. Both fields come from the operator's
 /// `[cluster]` TOML section (`egress_channel` usually through
 /// `--cluster-egress-endpoint`). [`connect`] fails startup with a config
@@ -272,7 +280,7 @@ impl SessionConnect {
         opts: ConnectOptions,
     ) -> Result<Self, LiveError> {
         validate_config(&cfg)?;
-        cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
+        cfg.egress_channel = cfg.egress_term.channel(&cfg.egress_channel);
         Ok(Self { rt, cfg, opts })
     }
 
@@ -316,7 +324,7 @@ impl EgressOpened {
             &self.base.rt,
             &cfg.ingress_endpoints,
             cfg.initial_leader_member_id,
-            cfg.ingress_stream_id,
+            cfg.ingress_stream(),
         )
         .map(|p| (cfg.initial_leader_member_id, p))
         .or_else(|| {
@@ -324,7 +332,7 @@ impl EgressOpened {
                 &self.base.rt,
                 &cfg.ingress_endpoints,
                 cfg.initial_leader_member_id,
-                cfg.ingress_stream_id,
+                cfg.ingress_stream(),
             )
         })
         .ok_or_else(|| {
@@ -363,6 +371,7 @@ impl IngressOpened {
         let (out_tx, out_rx) = unbounded::<Vec<u8>>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let ingress_term = cfg.ingress_term;
 
         let join = thread::Builder::new()
             .name("cluster-session".into())
@@ -389,7 +398,10 @@ impl IngressOpened {
                 stop,
                 join: Some(join),
             },
-            LiveIngress { req_tx },
+            LiveIngress {
+                req_tx,
+                term: ingress_term,
+            },
             LiveEgress { out_rx },
         ))
     }
@@ -407,7 +419,21 @@ mod tests {
             egress_channel: "aeron:udp?endpoint=127.0.0.1:9050".into(),
             egress_stream_id: 102,
             keep_alive_interval_ms: 1000,
+            ingress_term: SessionTerm::Control,
+            egress_term: SessionTerm::Control,
         }
+    }
+
+    #[test]
+    fn an_offer_above_the_bound_is_refused_before_the_session_thread() {
+        let (req_tx, req_rx) = unbounded();
+        let mut ingress = LiveIngress {
+            req_tx,
+            term: SessionTerm::Control,
+        };
+        let len = SessionTerm::Control.max_payload_len() + 1;
+        assert_eq!(ingress.offer(&vec![0; len]), OfferOutcome::TooLarge { len });
+        assert!(req_rx.is_empty(), "no request reaches the session thread");
     }
 
     #[test]

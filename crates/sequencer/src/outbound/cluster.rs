@@ -55,6 +55,9 @@ impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
             OfferOutcome::BackPressured | OfferOutcome::NotConnected => {
                 Err(SequencerError::Backpressure)
             }
+            OfferOutcome::TooLarge { len } => Err(SequencerError::EncodeFailed(format!(
+                "cluster frame of {len} bytes exceeds one session message"
+            ))),
         }
     }
 
@@ -327,6 +330,17 @@ mod tests {
         ));
         // Nothing was accepted by the gateway.
         assert!(ingress.accepted().is_empty());
+    }
+
+    #[test]
+    fn a_frame_too_large_for_the_cluster_is_not_retried() {
+        let ingress = FakeIngress::new();
+        ingress.set_outcome(OfferOutcome::TooLarge { len: 2 << 20 });
+        let mut pubr = ClusterRefPublisher::new(ingress);
+        assert!(matches!(
+            pubr.try_publish_ref(&offer(txref(0x11), alloy_primitives::Address::ZERO, 0)),
+            Err(SequencerError::EncodeFailed(_))
+        ));
     }
 
     #[test]

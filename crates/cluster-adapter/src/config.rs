@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::live::LiveClusterConfig;
+use crate::live::{LiveClusterConfig, SessionTerm};
 
 /// Default Aeron ingress stream ID, used when the TOML omits `ingress_stream_id`.
 const DEFAULT_INGRESS_STREAM_ID: i32 = 101;
@@ -49,6 +49,13 @@ pub struct ClusterConfig {
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`]. Never zero when set: a
     /// zero-length keep-alive interval is not a meaningful setting.
     pub keep_alive_interval_ms: Option<NonZeroU64>,
+    /// The term of the ingress publication: `control` (the default, a
+    /// message of up to 128 KiB), `entries` (256 KiB) or `large` (1 MiB).
+    /// Only a session that offers large messages sets `large`.
+    pub ingress_term: SessionTerm,
+    /// The term of the egress channel, with the same names. A consumer
+    /// that reads full transaction entries sets `entries`.
+    pub egress_term: SessionTerm,
 }
 
 impl ClusterConfig {
@@ -82,7 +89,7 @@ impl ClusterConfig {
 }
 
 impl From<ClusterConfig> for LiveClusterConfig {
-    /// Maps the six `[cluster]` TOML fields onto their `LiveClusterConfig`
+    /// Maps the eight `[cluster]` TOML fields onto their `LiveClusterConfig`
     /// counterparts, filling in defaults for whichever were omitted.
     fn from(cfg: ClusterConfig) -> Self {
         Self {
@@ -95,6 +102,8 @@ impl From<ClusterConfig> for LiveClusterConfig {
                 .keep_alive_interval_ms
                 .unwrap_or(DEFAULT_KEEP_ALIVE_INTERVAL_MS)
                 .get(),
+            ingress_term: cfg.ingress_term,
+            egress_term: cfg.egress_term,
         }
     }
 }
@@ -154,6 +163,8 @@ mod tests {
             egress_channel: "aeron:udp?endpoint=1.2.3.4:9050".into(),
             egress_stream_id: Some(112),
             keep_alive_interval_ms: Some(NonZeroU64::new(250).unwrap()),
+            ingress_term: SessionTerm::Large,
+            egress_term: SessionTerm::Entries,
         };
         let live = cfg.to_live();
         assert_eq!(live.ingress_endpoints, cfg.ingress_endpoints);
@@ -162,5 +173,23 @@ mod tests {
         assert_eq!(live.egress_channel, cfg.egress_channel);
         assert_eq!(live.egress_stream_id, 112);
         assert_eq!(live.keep_alive_interval_ms, 250);
+        assert_eq!(live.ingress_term, SessionTerm::Large);
+        assert_eq!(live.egress_term, SessionTerm::Entries);
+    }
+
+    #[test]
+    fn the_terms_default_to_control_and_parse_by_name() {
+        let omitted: ClusterConfig = toml::from_str(r#"ingress_endpoints = "0=h0:9000""#).unwrap();
+        assert_eq!(omitted.ingress_term, SessionTerm::Control);
+        assert_eq!(omitted.egress_term, SessionTerm::Control);
+        let named: ClusterConfig = toml::from_str(
+            r#"
+            ingress_term = "large"
+            egress_term = "entries"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(named.ingress_term, SessionTerm::Large);
+        assert_eq!(named.egress_term, SessionTerm::Entries);
     }
 }

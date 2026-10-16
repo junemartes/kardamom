@@ -5,6 +5,7 @@ import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import org.agrona.concurrent.status.AtomicCounter;
 
@@ -29,6 +30,10 @@ import org.agrona.concurrent.status.AtomicCounter;
  *       snapshot. The member loses no data that the cluster needs: it
  *       reached a catch-up state, so a leader holds a longer log, and the
  *       leader's log holds every committed entry.</li>
+ *   <li>A leader wedge exits with code {@link #LEADER_WEDGE_EXIT_CODE}.
+ *       The completion of a leader's election failed, so the leader has
+ *       no ingress. The relaunch starts from the member's own state, and
+ *       the members elect again.</li>
  *   <li>A closed component exits with code {@link #COMPONENT_CLOSED_EXIT_CODE}.
  *       An agent that throws in its start, for example on an archive
  *       request that times out while it loads its snapshot, records the
@@ -48,6 +53,8 @@ final class JoinWatchdogThread {
     static final int CATCHUP_STALL_EXIT_CODE = 4;
     /** Process exit code when a component closes with no stop request. */
     static final int COMPONENT_CLOSED_EXIT_CODE = 5;
+    /** Process exit code when the completion of a leader's election fails. */
+    static final int LEADER_WEDGE_EXIT_CODE = 6;
 
     /**
      * The member that the thread watches: its id, its two components, and
@@ -71,13 +78,29 @@ final class JoinWatchdogThread {
                 .map(Map.Entry::getKey)
                 .findFirst();
         }
+
+        /**
+         * The half-elected limit of the leader wedge: longer than the two
+         * blocking waits of an election completion that succeeds. The
+         * archive requests of the recovery plan wait up to the archive
+         * message timeout, and the ingress add waits up to the driver
+         * timeout. Both come from the member's configuration, which the job
+         * scales with the Aeron stall tolerance.
+         */
+        long halfElectedLimitMs() {
+            return TimeUnit.NANOSECONDS.toMillis(consensus.archiveContext().messageTimeoutNs())
+                + consensus.aeron().context().driverTimeoutMs();
+        }
     }
 
     private final Member member;
     private final JoinWatchdog watchdog;
     private final AtomicCounter electionState;
     private final AtomicCounter commitPosition;
+    private final AtomicCounter controlToggle;
     private final StateDir clusterDir;
+    /** The election state of the last sample; only this thread reads and writes it. */
+    private ElectionState lastState;
     /** The INIT window and the stall window, for the log lines. */
     private final long windowS;
     private final long stallWindowS;
@@ -88,9 +111,10 @@ final class JoinWatchdogThread {
             final long windowS,
             final long stallWindowS) {
         this.member = member;
-        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L);
+        this.watchdog = new JoinWatchdog(windowS * 1000L, stallWindowS * 1000L, member.halfElectedLimitMs());
         this.electionState = member.consensus().electionStateCounter();
         this.commitPosition = member.consensus().commitPositionCounter();
+        this.controlToggle = member.consensus().controlToggleCounter();
         this.clusterDir = clusterDir;
         this.windowS = windowS;
         this.stallWindowS = stallWindowS;
@@ -133,11 +157,28 @@ final class JoinWatchdogThread {
     private void observe() {
         final long nowMs = System.currentTimeMillis();
         final long commit = commitPosition.get();
-        switch (watchdog.observe(ElectionState.get(electionState), commit, nowMs)) {
+        final ElectionState state = ElectionState.get(electionState);
+        logStateChange(state, commit);
+        switch (watchdog.observe(state, commit, nowMs, controlToggle.get())) {
             case INIT_WEDGE -> initWedge(nowMs);
             case CATCHUP_STALL -> catchupStall(commit, nowMs);
+            case LEADER_WEDGE -> leaderWedge(nowMs);
             case NONE -> { }
         }
+    }
+
+    /**
+     * Log the election state when it differs from the last sample. The
+     * samples are one second apart, so a short state can pass unlogged.
+     * The lines show where an election waits.
+     */
+    private void logStateChange(final ElectionState state, final long commit) {
+        if (state == lastState) {
+            return;
+        }
+        lastState = state;
+        System.out.println("cluster ELECTION memberId=" + member.memberId() + " state=" + state
+            + " commitPosition=" + commit);
     }
 
     private void initWedge(final long nowMs) {
@@ -145,6 +186,15 @@ final class JoinWatchdogThread {
             + " election stuck in INIT for " + watchdog.initForMs(nowMs) / 1000L
             + "s (window " + windowS + "s); exiting for a clean relaunch (issue #195)");
         halt(JOIN_WEDGE_EXIT_CODE);
+    }
+
+    private void leaderWedge(final long nowMs) {
+        System.out.println("cluster LEADER WEDGE memberId=" + member.memberId()
+            + " election stuck in " + lastState + " with an active control toggle for "
+            + watchdog.halfElectedForMs(nowMs) / 1000L
+            + "s: the completion of the election failed and the leader has no ingress;"
+            + " exiting for a clean relaunch so the members elect again");
+        halt(LEADER_WEDGE_EXIT_CODE);
     }
 
     private void catchupStall(final long commit, final long nowMs) {

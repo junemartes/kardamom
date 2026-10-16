@@ -96,6 +96,7 @@ impl FeeHistory {
     pub(crate) fn on_receipt(&self, block_number: u64, tip_rate: u128) {
         let mut blocks = self.blocks.lock_ignore_poison();
         Self::entry(&mut blocks, block_number).tips.push(tip_rate);
+        Self::trim(&mut blocks);
     }
 
     /// Close a block with its boundary. Every executor publishes the same
@@ -106,24 +107,29 @@ impl FeeHistory {
         block.base_fee = boundary.base_fee;
         block.gas_used = boundary.gas_used;
         block.closed = true;
+        Self::trim(&mut blocks);
     }
 
-    /// The block's entry, opened at the back when it is new. Blocks
-    /// arrive in order, so a number below the back is a late copy of an
-    /// earlier block and finds its entry by search.
+    /// The entry of block `number`, opened at its place in number order
+    /// when it is new. The order of arrival is not the order of the
+    /// blocks: an executor streams a receipt when it executes the
+    /// transaction, but publishes a boundary only when the block is
+    /// durable. So the receipts of block N+1 can come before the boundary
+    /// of block N, and block N has no entry yet when it has no receipts.
     fn entry(blocks: &mut VecDeque<FeeBlock>, number: u64) -> &mut FeeBlock {
-        let newer = blocks.back().is_none_or(|b| b.number < number);
-        if newer {
-            blocks.push_back(FeeBlock::open(number));
-            if blocks.len() > CAPACITY {
-                blocks.pop_front();
-            }
-        }
         let at = blocks
-            .iter()
-            .rposition(|b| b.number == number)
-            .unwrap_or(blocks.len() - 1);
+            .binary_search_by_key(&number, |b| b.number)
+            .unwrap_or_else(|at| {
+                blocks.insert(at, FeeBlock::open(number));
+                at
+            });
         &mut blocks[at]
+    }
+
+    /// Drop the oldest blocks past the capacity.
+    fn trim(blocks: &mut VecDeque<FeeBlock>) {
+        let excess = blocks.len().saturating_sub(CAPACITY);
+        blocks.drain(..excess);
     }
 
     /// The newest closed block's number. Zero before the first boundary.
@@ -258,6 +264,39 @@ mod tests {
         // A late copy of a boundary rewrites the same block.
         h.on_boundary(&boundary(1, 1, 0));
         assert_eq!(h.latest(), 2);
+    }
+
+    /// An executor streams a receipt at execution, and publishes the
+    /// boundary only when the block is durable. So the receipt of block 3
+    /// comes before the boundary of block 2, an empty block. The boundary
+    /// of block 2 must close block 2, not block 3.
+    #[test]
+    fn a_boundary_after_a_newer_receipt_closes_its_own_block() {
+        let h = FeeHistory::default();
+        h.on_boundary(&boundary(1, 1_000, 0));
+        h.on_receipt(3, 4);
+        h.on_boundary(&boundary(2, 875, 0));
+        assert_eq!(h.latest(), 2);
+        assert_eq!(h.query(1, 2, &[]).unwrap().base_fee_per_gas, vec![875, 766]);
+        // Block 3 is open until its own boundary comes.
+        assert!(h.query(1, 3, &[]).is_none());
+        h.on_boundary(&boundary(3, 766, 21_000));
+        let history = h.query(3, 3, &[50.0]).unwrap();
+        assert_eq!(history.oldest_block, 1);
+        assert_eq!(history.base_fee_per_gas, vec![1_000, 875, 766, 671]);
+        assert_eq!(history.reward, Some(vec![vec![0], vec![0], vec![4]]));
+    }
+
+    /// A late block older than a full ring does not displace a newer one.
+    #[test]
+    fn a_late_block_older_than_a_full_ring_is_dropped() {
+        let h = FeeHistory::default();
+        for n in 2..=u64::try_from(CAPACITY + 1).unwrap() {
+            h.on_boundary(&boundary(n, 1, 0));
+        }
+        h.on_boundary(&boundary(1, 1, 0));
+        assert!(h.query(1, 1, &[]).is_none());
+        assert_eq!(h.query(1, 2, &[]).unwrap().oldest_block, 2);
     }
 
     #[test]

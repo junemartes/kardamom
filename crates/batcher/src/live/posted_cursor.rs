@@ -50,7 +50,9 @@ impl PostedCursor {
             OfferOutcome::Accepted => {
                 tracing::info!(posted_head, "posted cursor published to the cluster");
             }
-            refused @ (OfferOutcome::BackPressured | OfferOutcome::NotConnected) => {
+            refused @ (OfferOutcome::BackPressured
+            | OfferOutcome::NotConnected
+            | OfferOutcome::TooLarge { .. }) => {
                 warn!(
                     posted_head,
                     ?refused,

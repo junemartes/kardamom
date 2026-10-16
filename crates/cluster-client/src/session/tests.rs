@@ -250,6 +250,25 @@ fn session_message_for_other_session_ignored() {
     );
 }
 
+/// The fragment assembler hands the driver one whole session message, up
+/// to the bound. The driver surfaces every payload byte, in order.
+#[test]
+fn a_reassembled_session_message_at_the_bound_surfaces_whole() {
+    let (mut d, corr) = connecting();
+    d.on_egress(&ok_event(corr, 5, 9, 0));
+    for (tag, len) in [
+        (1u8, 64 << 10),
+        (
+            2u8,
+            crate::message::MAX_SESSION_MESSAGE_LEN - crate::message::SESSION_HEADER_LEN,
+        ),
+    ] {
+        let payload: Vec<u8> = (0..len).map(|n| n.to_le_bytes()[0] ^ tag).collect();
+        let framed = wrap_session_message(9, 5, 0, &payload);
+        assert_eq!(d.on_egress(&framed), vec![DriverEvent::AppMessage(payload)]);
+    }
+}
+
 #[test]
 fn failed_session_reconnects_after_backoff() {
     let (mut d, corr) = connecting();

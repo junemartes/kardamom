@@ -8,20 +8,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kardamom_log::aeron_live::{AeronRuntime, PubHandle};
 use rkyv::util::AlignedVec;
 
-use super::with_control_term_length;
+use super::SessionTerm;
+
+/// The stream id and the term of every ingress publication of a session.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IngressStream {
+    pub(super) stream_id: i32,
+    pub(super) term: SessionTerm,
+}
 
 /// Parse a `memberId=host:port,…` list and open an ingress publication to
-/// the given member. Use small terms through [`with_control_term_length`]
-/// (see its doc for the reason).
+/// the given member, on the stream and term of `stream`.
 pub(super) fn open_leader_pub(
     rt: &AeronRuntime,
     endpoints: &str,
     member_id: i32,
-    stream_id: i32,
+    stream: IngressStream,
 ) -> Option<PubHandle> {
     let endpoint = endpoint_for_member(endpoints, member_id)?;
-    let uri = with_control_term_length(&format!("aeron:udp?endpoint={endpoint}"));
-    rt.open_publication(&uri, stream_id).ok()
+    let uri = stream
+        .term
+        .channel(&format!("aeron:udp?endpoint={endpoint}"));
+    rt.open_publication(&uri, stream.stream_id).ok()
 }
 
 /// Extract `host:port` for `member_id` from a `memberId=host:port,…` list.
@@ -51,7 +59,7 @@ pub(super) fn open_next_member_pub(
     rt: &AeronRuntime,
     endpoints: &str,
     current: i32,
-    stream_id: i32,
+    stream: IngressStream,
 ) -> Option<(i32, PubHandle)> {
     let ids = member_ids(endpoints);
     if ids.is_empty() {
@@ -61,7 +69,7 @@ pub(super) fn open_next_member_pub(
     // Try every member once, starting from the one after `current`.
     (1..=ids.len())
         .map(|step| ids[(start + step) % ids.len()])
-        .find_map(|id| open_leader_pub(rt, endpoints, id, stream_id).map(|p| (id, p)))
+        .find_map(|id| open_leader_pub(rt, endpoints, id, stream).map(|p| (id, p)))
 }
 
 pub(super) fn to_aligned(bytes: &[u8]) -> AlignedVec {

@@ -122,9 +122,11 @@ async fn a_discovered_subscriber_follows_publishers_that_join_and_leave() {
         "a late publisher is joined without a reopen"
     );
 
-    // Publisher b leaves gracefully: after the grace, its frames stop.
+    // Publisher b leaves the catalog gracefully, and its publication
+    // stays open. The detached destination keeps its live image for one
+    // stall budget, then closes, and the frames of b stop.
     plane_b.shutdown().await;
-    tokio::time::sleep(GRACE * 4).await;
+    tokio::time::sleep(GRACE * 4 + rt.stall_budget()).await;
     let late = tokio::task::spawn_blocking(move || pub_b.publish(&tx_error(3)))
         .await
         .expect("publish task");

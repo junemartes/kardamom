@@ -37,6 +37,7 @@ pub mod proxy;
 pub(crate) mod rate_limit;
 pub(crate) mod receipt_cache;
 pub mod routing;
+pub mod seal_latency;
 pub(crate) mod seen_receipts;
 pub mod sig_verify;
 pub(crate) mod sync_util;

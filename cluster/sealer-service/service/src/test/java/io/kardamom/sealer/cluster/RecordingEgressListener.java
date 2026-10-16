@@ -24,6 +24,8 @@ import org.agrona.DirectBuffer;
  */
 final class RecordingEgressListener implements EgressListener {
     final List<Long> relayedIndexes = new ArrayList<>();
+    /** The relayed {@code [canonical_id|payload]} of every RELAYED frame, in arrival order. */
+    final List<byte[]> relayedPayloads = new ArrayList<>();
     long maxBoundaryBlockNumber = Long.MIN_VALUE;
     long minBoundaryBlockNumber = Long.MAX_VALUE;
     // Count of BOUNDARY frames seen. A yield-await loop can poll for "at least
@@ -49,6 +51,11 @@ final class RecordingEgressListener implements EgressListener {
         if (kind == SealerWire.EGRESS_KIND_RELAYED) {
             // kind(1) | index(8 LE) | payloadLen(4 LE) | payload[]
             relayedIndexes.add(buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN));
+            final int payloadOffset = offset + Byte.BYTES + Long.BYTES + Integer.BYTES;
+            final byte[] payload =
+                    new byte[buffer.getInt(offset + Byte.BYTES + Long.BYTES, ByteOrder.LITTLE_ENDIAN)];
+            buffer.getBytes(payloadOffset, payload);
+            relayedPayloads.add(payload);
         } else if (kind == SealerWire.EGRESS_KIND_BOUNDARY) {
             // kind(1) | blockNumber(8 LE) | endTxIdx(8 LE) | l2Timestamp(8 LE)
             final long blockNumber =

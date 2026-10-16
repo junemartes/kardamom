@@ -322,3 +322,7 @@ workloads_ingress_rpc_port: "{{ ports.ingress_rpc }}"
 workloads_registry_url: >-
   {{ lookup('env', 'KARDAMOM_REGISTRY_URL')
      | default(workloads_nomad_addr | regex_replace(':[0-9]+$', '') ~ ':' ~ ports.registry, true) }}
+# The manifest media types the image check accepts from the registry.
+workloads_gate_manifest_types: >-
+  application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json,
+  application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json

@@ -269,7 +269,7 @@ nomad var put nomad/jobs/monitoring rules=@rules.yml alertmanager=@alertmanager.
 | `KardamomBatcherResumeFailures` | critical | A batcher start failed to read L1 in the last 10 minutes. |
 | `KardamomL1IndexerTickErrors` | critical | More than half of the indexer ticks fail for 15 minutes. |
 | `KardamomDaWatcherTickErrors` | critical | More than half of the da-watcher ticks have an outcome other than `ok` for 15 minutes. |
-| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
+| `KardamomL1FollowerLag` | critical | The newest `l1_blocks` record is more than 64 blocks (two finality steps) behind the finalized tip that the validator's own L1 read sees (`validator_l1_finalized_block_number`; the follower's own tip without a validator L1 check) for 5 minutes. Runbook: [`l1_follower_lag`](runbooks/l1_follower_lag.md). |
 | `KardamomL1FollowerWakeOverdue` | critical | A follower instance is more than 2 minutes past its planned wake time for 2 minutes. Runbook: [`l1_follower_wake_overdue`](runbooks/l1_follower_wake_overdue.md). |
 | `KardamomL1SourceDisagreement` | critical | Two L1 sources gave different answers in the last 10 minutes. The follower halts. |
 | `KardamomValidatorEpochsUnverified` | warning | The validator committed an epoch without an L1 check in the last 10 minutes. |
@@ -458,6 +458,10 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_cluster_recorded_head` | The best recorded cursor of the executors: the highest canonical index that one executor or more recorded. `-1` while no executor sent a cursor, and for a status frame of a sealer that sends no record-lag tail. |
 | `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
+| `kardamom_ingress_tx_rejected_total{reason="too-large"}` | Submits above the size cap, `--max-tx-bytes`. |
+| `kardamom_ingress_seal_latency_seconds` | A histogram: the time from the `tx_data` publish of a transaction to the egress frame that gives it a canonical index. Only the ingress that published the transaction records it. A seal later than 180 s gives no sample. The buckets are the shared service buckets of 100 µs to 5 s. Above 10 ms their bounds are 25, 50, 100, 250 and 500 ms, then 1, 2.5 and 5 s. |
+| `kardamom_ingress_seal_stamps_expired_total` | The publish stamps that no seal matched within 180 s. Most are of refused transactions. A non-zero rate under load means that the seal latency histogram undercounts the tail. |
+| `kardamom_ingress_seal_stamps_dropped_total` | The publish stamps that the submit path dropped because the channel to the seal clock (65,536 stamps) was full. Each one is a seal with no latency sample. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
 - The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.

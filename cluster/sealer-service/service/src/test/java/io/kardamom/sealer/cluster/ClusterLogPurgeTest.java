@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
@@ -155,8 +156,9 @@ class ClusterLogPurgeTest {
      * stall. Return the member's commit position at the stall.
      */
     private static long awaitStall(final TestNode member) {
-        final JoinWatchdog watchdog = new JoinWatchdog(STALL_WINDOW_MS * 4, STALL_WINDOW_MS);
-        while (watchdog.observe(member.electionState(), member.commitPosition(), System.currentTimeMillis())
+        final JoinWatchdog watchdog = new JoinWatchdog(STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4);
+        final long inactive = ClusterControl.ToggleState.INACTIVE.code();
+        while (watchdog.observe(member.electionState(), member.commitPosition(), System.currentTimeMillis(), inactive)
                 != JoinWatchdog.Verdict.CATCHUP_STALL) {
             Tests.sleep(100);
         }

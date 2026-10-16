@@ -3818,6 +3818,7 @@ dependencies = [
  "core_affinity",
  "crossbeam-channel",
  "dhat",
+ "futures",
  "hdrhistogram",
  "humantime",
  "jsonrpsee",
@@ -3934,6 +3935,7 @@ dependencies = [
  "rkyv",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "tracing",
 ]

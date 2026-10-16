@@ -21,6 +21,7 @@ import java.nio.ByteOrder;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.AgentTerminationException;
 
@@ -1111,6 +1112,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        final long startNs = System.nanoTime();
         // The snapshot action is a log event, so every member closes the
         // window here, and the snapshot never has to carry held records.
         flushWindow();
@@ -1126,8 +1128,12 @@ public final class SealerClusteredService implements ClusteredService {
         // latest post-wipe TAKEN block reaches the head seen at wipe time.
         // A follower that starts as a follower never gets an onRoleChange
         // call, so role lines cannot prove rejoin.
+        // The ms= value is the wall time of this method: the window flush
+        // and the snapshot write.
+        final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
         System.out.println("sealer snapshot TAKEN memberId=" + memberId
-            + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
+            + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount()
+            + " ms=" + ms);
     }
 
     @Override
