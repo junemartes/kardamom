@@ -157,7 +157,7 @@ An offer to a session never waits. The service thread also runs the boundary tic
 | No frame leaves the backlog | 1 second. The clock restarts each time a frame leaves. | `offer deadline exhausted (back-pressure)` |
 | The backlog holds more bytes | 64 MiB. A replay of the default retention fits well below it. | `egress backlog over <n> bytes` |
 | A terminal offer result (not `CLOSED`) | at once | `terminal offer result <n>` |
-| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication index=<i> length=<n> repeats=<r> channel=<c>`. `repeats` counts the closes in a row on the same index for the response channel. A value above 0 means the client reconnects with an egress term that is too small. |
+| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication kind=<k> index=<i> length=<n> repeats=<r> channel=<c>`. `index` is the canonical index of a relayed frame, or `-1` for a kind with no index. `repeats` counts the closes in a row on the same frame (the same kind and index) for the response channel. A value above 0 means the client reconnects with an egress term that is too small. A session close that the service did not ask for clears the count of its channel, and so does a role change. |
 
 - A session that is closing gets no more frames. The client reconnects, replays and recovers.
 - A role change drops all backlogs. The clients of a leader that steps down reconnect to the new leader and replay.

@@ -45,10 +45,15 @@ fn the_ingress_kinds_stay_within_the_sealer_reader() {
     assert!(kinds.into_iter().all(|kind| u32::from(kind) <= reads_max));
 }
 
+/// The egress kinds with no frame. A reader drops them as unknown kinds.
+const UNUSED_EGRESS_KINDS: [u32; 1] = [14];
+
 #[test]
 fn the_egress_reader_knows_exactly_the_registry_range() {
     let egress = Registry::workspace_versions("sealer-egress-kinds");
-    let expected: Vec<u32> = (egress.reads_min..=egress.reads_max).collect();
+    let expected: Vec<u32> = (egress.reads_min..=egress.reads_max)
+        .filter(|kind| !UNUSED_EGRESS_KINDS.contains(kind))
+        .collect();
     assert_eq!(known_bytes(is_known_egress_kind), expected);
 }
 

@@ -17,6 +17,7 @@ import java.util.IntSummaryStatistics;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -75,16 +76,25 @@ final class FormatRegistryTest {
     }
 
     @Test
+    void recordTypeReadersReachTheRegistryMaximum() {
+        // The sealer names only the record types it writes or reads.
+        assertEquals(version("sealer-record-types", "reads_max"),
+            kinds("RT_", name -> true).getMax());
+    }
+
+    @Test
     void ingressKindsMatchTheRegistry() {
         // The sealer reads the recorded cursor, but no service sends it yet.
-        assertKinds("sealer-ingress-kinds", "KIND_", "KIND_RECORDED_CURSOR");
+        assertKinds("sealer-ingress-kinds", "KIND_", Set.of("KIND_RECORDED_CURSOR"));
     }
 
     @Test
     void egressKindsMatchTheRegistry() {
         // The record-lag reject waits for recordLagBudget: the activation
-        // of the format in formats.toml.
-        assertKinds("sealer-egress-kinds", "EGRESS_KIND_", "EGRESS_KIND_RECORD_LAG_REJECT");
+        // of the format in formats.toml. The sealer has the codecs of the
+        // relayed reference and the feed gap, but sends neither.
+        assertKinds("sealer-egress-kinds", "EGRESS_KIND_", Set.of(
+            "EGRESS_KIND_RECORD_LAG_REJECT", "EGRESS_KIND_RELAYED_REF", "EGRESS_KIND_FEED_GAP"));
     }
 
     @Test
@@ -121,11 +131,11 @@ final class FormatRegistryTest {
 
     /**
      * The sealer reads every kind from the lowest to the highest. The
-     * default writers send every kind except {@code unsent}.
+     * default writers send every kind except the {@code unsent} ones.
      */
-    private static void assertKinds(final String id, final String prefix, final String unsent) {
+    private static void assertKinds(final String id, final String prefix, final Set<String> unsent) {
         final IntSummaryStatistics read = kinds(prefix, name -> true);
-        final IntSummaryStatistics written = kinds(prefix, name -> !name.equals(unsent));
+        final IntSummaryStatistics written = kinds(prefix, name -> !unsent.contains(name));
         assertEquals(
             Map.of("writes", written.getMax(), "reads_min", read.getMin(), "reads_max", read.getMax()),
             registry.get(id), id);

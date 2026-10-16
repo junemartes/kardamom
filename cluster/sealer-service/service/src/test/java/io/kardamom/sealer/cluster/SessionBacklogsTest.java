@@ -124,10 +124,51 @@ class SessionBacklogsTest {
     @Test
     void repeatedClosesOnOneIndexAreCountedForTheResponseChannel() {
         LongStream.range(1, 4).forEach(id -> backlogs.offer(small(id, 64), relayed(7, 65)));
-        assertEquals(2, backlogs.tooLongRepeats("aeron:ipc", 7));
+        assertEquals(2, backlogs.tooLongRepeats(CHANNEL, RELAYED, 7));
 
         backlogs.offer(small(4, 64), relayed(8, 65));
-        assertEquals(0, backlogs.tooLongRepeats("aeron:ipc", 8));
-        assertEquals(-1, backlogs.tooLongRepeats("aeron:ipc", 7));
+        assertEquals(0, backlogs.tooLongRepeats(CHANNEL, RELAYED, 8));
+        assertEquals(-1, backlogs.tooLongRepeats(CHANNEL, RELAYED, 7));
+    }
+
+    private static final String CHANNEL = "aeron:ipc";
+    private static final byte RELAYED = SealerWire.EGRESS_KIND_RELAYED;
+
+    /** A frame of {@code kind} with no canonical index, {@code length} bytes long. */
+    private static byte[] unindexed(final byte kind, final int length) {
+        final byte[] frame = new byte[length];
+        frame[0] = kind;
+        return frame;
+    }
+
+    @Test
+    void framesOfTwoKindsWithNoIndexAreNotRepeats() {
+        backlogs.offer(small(1, 64), unindexed(SealerWire.EGRESS_KIND_STATUS, 65));
+        backlogs.offer(small(2, 64), unindexed(SealerWire.EGRESS_KIND_BOUNDARY, 65));
+
+        assertEquals(0, backlogs.tooLongRepeats(CHANNEL, SealerWire.EGRESS_KIND_BOUNDARY, -1));
+        assertEquals(-1, backlogs.tooLongRepeats(CHANNEL, SealerWire.EGRESS_KIND_STATUS, -1));
+    }
+
+    @Test
+    void aRelayedReferenceIsKeyedByItsIndex() {
+        final byte[] reference = relayed(7, 65);
+        reference[0] = SealerWire.EGRESS_KIND_RELAYED_REF;
+        backlogs.offer(small(1, 64), reference);
+        backlogs.offer(small(2, 64), relayed(7, 65));
+
+        assertEquals(0, backlogs.tooLongRepeats(CHANNEL, RELAYED, 7),
+            "a relayed frame after a reference of the same index is no repeat");
+    }
+
+    @Test
+    void forgettingTheChannelOrARoleChangeClearsTheCount() {
+        backlogs.offer(small(1, 64), relayed(7, 65));
+        backlogs.forgetChannel(CHANNEL);
+        assertEquals(-1, backlogs.tooLongRepeats(CHANNEL, RELAYED, 7));
+
+        backlogs.offer(small(2, 64), relayed(7, 65));
+        backlogs.dropAll();
+        assertEquals(-1, backlogs.tooLongRepeats(CHANNEL, RELAYED, 7));
     }
 }

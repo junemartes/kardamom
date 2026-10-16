@@ -457,7 +457,7 @@ public final class SealerClusteredService implements ClusteredService {
         System.out.println("cluster SESSION close memberId=" + memberId
             + " session=" + session.id() + " reason=" + closeReason);
         egress.removeConsumer(session.id());
-        egress.dropBacklog(session.id());
+        egress.dropBacklog(session, closeReason);
     }
 
     @Override
@@ -629,21 +629,8 @@ public final class SealerClusteredService implements ClusteredService {
                 buffer.getInt(offset + SealerWire.SLOT_COUNT_OFFSET, ByteOrder.LITTLE_ENDIAN) & 0xFFFF_FFFFL;
 
         // The relayed payload keeps the same shape as an ordinary record:
-        // [canonical_id:32][record_type][fields…]. Everything after the slot
-        // count is the tail. Measuring from the id offset would count the
-        // 32 id bytes twice, and the extra bytes would land where rkyv looks
-        // for its root.
-        final int tailLength = length - (SealerWire.SLOT_COUNT_OFFSET + Integer.BYTES);
-        final byte[] payload = new byte[CanonicalSealerState.CANONICAL_ID_LEN + tailLength];
-        buffer.getBytes(
-                offset + SealerWire.ORIGIN_ID_OFFSET, payload, 0, CanonicalSealerState.CANONICAL_ID_LEN);
-        if (tailLength > 0) {
-            buffer.getBytes(
-                    offset + SealerWire.SLOT_COUNT_OFFSET + Integer.BYTES,
-                    payload,
-                    CanonicalSealerState.CANONICAL_ID_LEN,
-                    tailLength);
-        }
+        // [canonical_id:32][record_type][fields…].
+        final byte[] payload = RelayShape.ORIGIN_RECORD.payload(buffer, offset, length);
 
         // The record closes the open block, so the window closes with it:
         // a reorder never crosses a block.
@@ -724,20 +711,8 @@ public final class SealerClusteredService implements ClusteredService {
         final long lastSeq =
                 buffer.getLong(offset + SealerWire.REMOTE_LAST_SEQ_OFFSET, ByteOrder.LITTLE_ENDIAN);
 
-        // Same relay shape as an epoch: [canonical_id:32][record_type][fields…],
-        // measured from the END of the header so no slack lands where rkyv
-        // looks for its root.
-        final int tailLength = length - SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN;
-        final byte[] payload = new byte[CanonicalSealerState.CANONICAL_ID_LEN + tailLength];
-        buffer.getBytes(
-                offset + SealerWire.REMOTE_ID_OFFSET, payload, 0, CanonicalSealerState.CANONICAL_ID_LEN);
-        if (tailLength > 0) {
-            buffer.getBytes(
-                    offset + SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN,
-                    payload,
-                    CanonicalSealerState.CANONICAL_ID_LEN,
-                    tailLength);
-        }
+        // Same relay shape as an epoch: [canonical_id:32][record_type][fields…].
+        final byte[] payload = RelayShape.REMOTE_ORIGIN_RECORD.payload(buffer, offset, length);
 
         // Same as an epoch: the window closes with the block.
         flushWindow();
@@ -802,12 +777,7 @@ public final class SealerClusteredService implements ClusteredService {
         final long tipLo = buffer.getLong(offset + SealerWire.TIP_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final long tipHi =
             buffer.getLong(offset + SealerWire.TIP_OFFSET + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
-        final int payloadOffset = offset + SealerWire.RELAY_OFFSET;
-        final int payloadLength = length - SealerWire.RELAY_OFFSET;
-        final byte[] payload = new byte[payloadLength];
-        if (payloadLength > 0) {
-            buffer.getBytes(payloadOffset, payload);
-        }
+        final byte[] payload = RelayShape.INGRESS_RECORD.payload(buffer, offset, length);
         final boolean opened = window.isEmpty();
         final boolean full = window.add(
             sender, tipHi, tipLo, new HeldRecord(session, canonicalId, sender, nonce, deadline, payload));

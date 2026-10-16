@@ -10,6 +10,8 @@
 //! channel that carries large messages.
 
 use kardamom_cluster_client::message::SESSION_HEADER_LEN;
+
+use crate::wire::MAX_INGRESS_PAYLOAD_LEN;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -78,9 +80,21 @@ impl SessionTerm {
         }
     }
 
-    /// Parse `bytes` into a payload that fits this term.
+    /// The longest payload that a session with this ingress term offers:
+    /// the bound of the term, and at most the ingress cap, so that the
+    /// relayed frame of the payload fits one egress session message.
+    const fn max_ingress_len(self) -> usize {
+        let term = self.max_payload_len();
+        if term < MAX_INGRESS_PAYLOAD_LEN {
+            term
+        } else {
+            MAX_INGRESS_PAYLOAD_LEN
+        }
+    }
+
+    /// Parse `bytes` into a payload that fits this term and the ingress cap.
     pub(crate) fn payload(self, bytes: &[u8]) -> Result<AppPayload, PayloadTooLarge> {
-        let max = self.max_payload_len();
+        let max = self.max_ingress_len();
         if bytes.len() > max {
             return Err(PayloadTooLarge {
                 len: bytes.len(),
@@ -104,6 +118,18 @@ mod tests {
         assert_eq!(
             SessionTerm::Large.max_payload_len(),
             MAX_SESSION_MESSAGE_LEN - 32
+        );
+    }
+
+    #[test]
+    fn the_large_term_offers_up_to_the_ingress_cap() {
+        assert_eq!(
+            SessionTerm::Large.max_ingress_len(),
+            MAX_INGRESS_PAYLOAD_LEN
+        );
+        assert_eq!(
+            SessionTerm::Control.max_ingress_len(),
+            SessionTerm::Control.max_payload_len()
         );
     }
 
