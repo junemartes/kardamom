@@ -139,7 +139,7 @@ where
         Ok(v.tx_hash)
     }
 
-    /// Shared head of both submit paths: rate-limit, decode, batch
+    /// Shared head of both submit paths: rate-limit, size cap, decode, batch
     /// sig-verify, and receipt-cache lookup. Does not publish and rejects
     /// nothing on account state; see [`Self::admit`].
     async fn validate_submission(
@@ -181,6 +181,10 @@ where
             count_reject("rate-limited");
             return Err(IngressError::RateLimited(client_ip.to_string()));
         }
+
+        // The size cap runs before the decode: an oversized transaction
+        // costs no decode and no recovery.
+        self.cfg.check_tx_size(raw_tx)?;
 
         let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
             count_reject("decode-error");

@@ -44,11 +44,12 @@ receipt fields, the errors and the limits.
   2. Drain: refuse if the ingress is in shutdown drain.
   3. Pause: refuse if the ingress is paused. The error is `-32010`. See [Chain halts](#chain-halts).
   4. Rate limit: one token from the bucket of the client IP.
-  5. Decode: the bytes must be an EIP-2718 transaction.
-  6. Protocol limits: refuse a blob transaction (type `0x03`). Refuse a gas limit above 16777216 (the EIP-7825 cap).
-  7. Signature: recover the sender.
-  8. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error.
-  9. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`.
+  5. Size: refuse a transaction above 131072 bytes (128 KiB). See [Rate limits](#rate-limits).
+  6. Decode: the bytes must be an EIP-2718 transaction.
+  7. Protocol limits: refuse a blob transaction (type `0x03`). Refuse a gas limit above 16777216 (the EIP-7825 cap).
+  8. Signature: recover the sender.
+  9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error.
+  10. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`.
 - The ingress publishes the transaction with an inclusion deadline: the newest block it has seen plus `--inclusion-horizon-blocks` (default 64).
   - The sealer refuses the transaction after that block. See `past deadline` in [Errors](#errors).
 - Blob (EIP-4844) transactions are not supported.
@@ -226,6 +227,7 @@ An error has a JSON-RPC `code` and a `message`. Most errors have no `data` field
 | `-32602` | `duplicate (sender, nonce)` | The nonce has a receipt for another transaction, or it is below the next nonce of the sender. | No. Use a new nonce. |
 | `-32602` | `transaction gas limit N exceeds the EIP-7825 per-tx cap` | The gas limit is above 16777216. | No. Lower the gas limit. |
 | `-32602` | `unsupported transaction type 0x03` | A blob transaction. | No. |
+| `-32602` | `oversized data: transaction size N bytes, limit C bytes` | The signed transaction is above the size cap. The message has the size and the cap. | No. Send less calldata. |
 | `-32000` | `evicted by sequencer overload shed` | The sequencer shed the transaction. | Yes, when the nonce is within the reorder window. |
 | `-32000` | `expired: the sequencer dropped` | The transaction waited on a nonce gap for the sequencer lifetime. | Yes, when the gap is filled. |
 | `-32000` | `past deadline: the sealer refused` | The sealer block passed the inclusion deadline. The message has the block numbers. | Yes, at once. The new submission gets a new deadline. |
@@ -241,6 +243,7 @@ An error has a JSON-RPC `code` and a `message`. Most errors have no `data` field
 | `-32603` | `internal server error` | An internal fault. | Yes. |
 
 - The fee and funds messages use the shape of the geth messages, so a wallet handles them as on Ethereum.
+- `oversized data`: geth sends this error with the code `-32000`. Kardamom uses `-32602`, as for the gas cap, because the request can never succeed as sent. The message has the geth prefix.
 - The sequencer errors reach `eth_sendRawTransaction` as an error response. Every such error also appears as a `txError` frame and as a `rejected` status event.
 - `past deadline`: the sealer did not order the transaction. A new submission of the same signed bytes gets a new deadline.
 - A resubmission of a transaction that already has a receipt is not an error. The call returns its hash.
@@ -275,7 +278,8 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
 - Other limits:
   - Connections: 8192 at the same time. The `--rpc-max-connections` flag (env `KARDAMOM_RPC_MAX_CONNECTIONS`) sets it. A held `eth_sendRawTransaction` uses a connection, so keep the limit above the submit rate times the receipt latency.
   - Waiting submissions: 16384. More than this gives `-32005`.
-- Metrics: `kardamom_ingress_tx_rejected_total` has a `reason` label for each refusal. See [Observability](observability.md).
+  - Transaction size: 131072 bytes (128 KiB) for the signed transaction. A larger one gives `-32602` with the message `oversized data`. The `--max-tx-bytes` flag (env `KARDAMOM_MAX_TX_BYTES`) sets it. The binary protocol answers a larger one with the decode status `2` and the same message.
+- Metrics: `kardamom_ingress_tx_rejected_total` has a `reason` label for each refusal. The size cap uses `reason="too-large"`. See [Observability](observability.md).
 
 ## Further reading
 

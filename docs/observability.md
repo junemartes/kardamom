@@ -458,6 +458,7 @@ the replay retention of the sealer, and the record-lag guard. See [l1-data-path.
 | `kardamom_ingress_cluster_recorded_head` | The best recorded cursor of the executors: the highest canonical index that one executor or more recorded. `-1` while no executor sent a cursor, and for a status frame of a sealer that sends no record-lag tail. |
 | `kardamom_ingress_cluster_record_lag` | The canonical records past the best recorded cursor when the status frame arrived. The record-lag guard compares this value with its budget. `0` while no executor sent a cursor, because the guard then refuses nothing. |
 | `kardamom_ingress_tx_rejected_total{reason="paused"}` | Submits that a paused ingress refused. |
+| `kardamom_ingress_tx_rejected_total{reason="too-large"}` | Submits above the size cap, `--max-tx-bytes`. |
 
 - The sealed head minus the posted head is the DA lag. The sealer refuses new transactions when it passes the DA-lag budget.
 - The record lag is the canonical count minus the best recorded cursor plus one. The ingress takes the count from the records and boundaries that it observed before the status frame. The sealer refuses user transactions when the record lag passes `recordLagBudget`. A flat recorded head while the lag grows means that no executor records.

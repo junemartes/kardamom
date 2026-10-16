@@ -6,8 +6,9 @@
 //! - `len` bytes: RLP-encoded `TxEnvelope`.
 //!
 //! Reply frame:
-//! - `u8 status`: 0 = ok, 1 = rate-limited, 2 = decode, 3 = sig,
-//!   4 = timeout, 5 = duplicate, 9 = internal.
+//! - `u8 status`: 0 = ok, 1 = rate-limited, 2 = decode or a transaction
+//!   above the size cap, 3 = sig, 4 = timeout, 5 = duplicate,
+//!   9 = internal.
 //! - `u32 payload_len`.
 //! - `payload_len` bytes: on ok, the 32-byte `tx_hash`; on error, the
 //!   UTF-8 error message.
@@ -304,7 +305,7 @@ where
 fn map_err(e: &IngressError) -> (u8, String) {
     match e {
         IngressError::RateLimited(_) => (STATUS_RATE_LIMITED, e.to_string()),
-        IngressError::Decode(_) => (STATUS_DECODE, e.to_string()),
+        IngressError::Decode(_) | IngressError::TxTooLarge { .. } => (STATUS_DECODE, e.to_string()),
         IngressError::SignatureInvalid => (STATUS_SIG, e.to_string()),
         IngressError::Timeout => (STATUS_TIMEOUT, e.to_string()),
         IngressError::Duplicate(_) => (STATUS_DUPLICATE, e.to_string()),
@@ -313,86 +314,5 @@ fn map_err(e: &IngressError) -> (u8, String) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::channels::MockChannels;
-    use crate::config::IngressConfig;
-
-    #[tokio::test]
-    async fn empty_rlp_returns_decode_error() {
-        let cfg = IngressConfig::default();
-        let (mock, _rx) = MockChannels::new(std::num::NonZeroUsize::new(8).unwrap());
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
-        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = TcpListener::bind(bind).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let p2 = proxy.clone();
-        tokio::spawn(async move {
-            let (sock, peer) = listener.accept().await.unwrap();
-            ConnectionLoop::new(sock, peer.ip(), p2)
-                .run()
-                .await
-                .unwrap();
-        });
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        // Send an empty RLP list, `0xc0`.
-        client.write_all(&1u32.to_be_bytes()).await.unwrap();
-        client.write_all(&[0xc0]).await.unwrap();
-        let mut status = [0u8; 1];
-        client.read_exact(&mut status).await.unwrap();
-        assert_eq!(status[0], STATUS_DECODE);
-    }
-
-    /// An over-length frame header gets a decode-error reply, and the
-    /// connection stays open for the next frame: `HeaderOutcome::TooLarge`
-    /// must `continue` the loop, not close it. This pins the framing
-    /// behavior `ConnectionLoop::step`/`read_header` implement, across
-    /// the boundary from one frame to the next.
-    #[tokio::test]
-    async fn oversized_frame_gets_a_reply_and_the_connection_stays_open() {
-        let cfg = IngressConfig::default();
-        let (mock, _rx) = MockChannels::new(std::num::NonZeroUsize::new(8).unwrap());
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
-        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = TcpListener::bind(bind).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let p2 = proxy.clone();
-        tokio::spawn(async move {
-            let (sock, peer) = listener.accept().await.unwrap();
-            ConnectionLoop::new(sock, peer.ip(), p2)
-                .run()
-                .await
-                .unwrap();
-        });
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-
-        // First frame: a declared length past MAX_FRAME_BYTES. No body
-        // bytes follow it; a frame this large is rejected on the header
-        // alone.
-        let too_large = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
-        client.write_all(&too_large.to_be_bytes()).await.unwrap();
-        assert_eq!(read_reply_status(&mut client).await, STATUS_DECODE);
-
-        // Second frame, on the same connection: an empty RLP list, same
-        // as `empty_rlp_returns_decode_error`. If the loop had ended the
-        // connection instead of continuing, this reply would never
-        // arrive and the test would hang until its own timeout.
-        client.write_all(&1u32.to_be_bytes()).await.unwrap();
-        client.write_all(&[0xc0]).await.unwrap();
-        assert_eq!(read_reply_status(&mut client).await, STATUS_DECODE);
-    }
-
-    /// Read one full reply frame (status, length, payload) and return
-    /// just the status, draining the payload so the stream is positioned
-    /// at the start of the next reply.
-    async fn read_reply_status(client: &mut tokio::net::TcpStream) -> u8 {
-        let mut status = [0u8; 1];
-        client.read_exact(&mut status).await.unwrap();
-        let mut len_buf = [0u8; 4];
-        client.read_exact(&mut len_buf).await.unwrap();
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        client.read_exact(&mut payload).await.unwrap();
-        status[0]
-    }
-}
+#[path = "binary_tests.rs"]
+mod tests;
