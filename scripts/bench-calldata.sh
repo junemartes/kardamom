@@ -7,14 +7,22 @@
 # load starts every sender at its nonce on the chain, so the cells run one
 # after the other on one chain.
 #
+# The defaults are the cells that the container cluster held on a shared
+# 12-CPU host. A cell that overloads the cluster can stall the chain until
+# a `just container-reset`, so the cells that can overload run last.
+#
 # The settings come from the environment:
-#   RATES      the rates in tx/s (default "500 1000 2000 4000 6000")
+#   FULL       1 runs the full matrix of the spec: the rates 500, 1000,
+#              2000, 4000 and 6000, and the 5,000 tx/s target rows. It
+#              overloads a shared host. RATES and EXTRA still override it.
+#   RATES      the rates in tx/s (default "250 500")
 #   SIZES      the calldata sizes in bytes (default "0 1938 8082"). The raw
 #              size of a transfer is about the calldata size + 110 bytes, so
 #              the defaults give raw sizes of about 110, 2048 and 8192 bytes.
-#   EXTRA      more cells, as "rate/calldata" words; empty for none. The calldata is a size or
-#              a weighted mix (default: the 5,000 tx/s target rows, 8 KB only
-#              and the mix of 80 % transfers, 15 % 2 KB and 5 % 8 KB).
+#   EXTRA      more cells, as "rate/calldata" words; empty for none. The
+#              calldata is a size or a weighted mix (default "1000/0"; with
+#              FULL=1 the 5,000 tx/s rows: 8 KB only, and the mix of 80 %
+#              transfers, 15 % 2 KB and 5 % 8 KB).
 #   WARMUP     the warm-up of each cell (default 60s)
 #   DURATION   the measured part of each cell (default 300s)
 #   SENDERS    the sender count (default 15); the first sender is account 1
@@ -24,9 +32,14 @@
 set -euo pipefail
 
 out=${1:?usage: bench-calldata.sh OUT.md}
-RATES=${RATES:-500 1000 2000 4000 6000}
+if [[ "${FULL:-0}" == 1 ]]; then
+    echo ">> FULL=1: the spec matrix overloads a shared host; an overload can stall the chain until a reset" >&2
+    RATES=${RATES:-500 1000 2000 4000 6000}
+    EXTRA=${EXTRA-5000/8082 5000/0:16,1938:3,8082:1}
+fi
+RATES=${RATES:-250 500}
 SIZES=${SIZES:-0 1938 8082}
-EXTRA=${EXTRA-5000/8082 5000/0:16,1938:3,8082:1}
+EXTRA=${EXTRA-1000/0}
 WARMUP=${WARMUP:-60s}
 DURATION=${DURATION:-300s}
 SENDERS=${SENDERS:-15}
@@ -34,28 +47,43 @@ MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-4096}
 NODE_CONTRACT=${NODE_CONTRACT:-deploy/cluster/terraform/containers/node-contract.json}
 LOAD_BIN=${LOAD_BIN:-target/release/kardamom-load}
 METRIC=kardamom_ingress_seal_latency_seconds
+EXPIRED=kardamom_ingress_seal_stamps_expired_total
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+sampler=""
+# The exit also stops the CPU sampler of a cell that a signal ended.
+trap '[[ -n "$sampler" ]] && kill "$sampler" 2>/dev/null; rm -rf "$work"' EXIT
 
 ip_of() { jq -er --arg n "$1" '.nodes[$n].ip' "$NODE_CONTRACT"; }
 ingress_ip=$(ip_of ingress-0)
 rpc="http://$ingress_ip:8545"
 mapfile -t sealers < <(jq -r '.nodes[] | select(.role == "sealer") | .container' "$NODE_CONTRACT" | sort)
 
-# The cumulative buckets of the seal latency histogram on ingress-0, as
-# "le count" lines.
-scrape_buckets() {
-    curl -sf "http://$ingress_ip:9006/metrics" \
-        | awk -v m="${METRIC}_bucket" 'index($0, m "{") == 1 {
-            match($0, /le="[^"]*"/); le = substr($0, RSTART + 4, RLENGTH - 5); print le, $NF }'
+# The metrics of ingress-0. A failed read gives no lines, not an exit.
+scrape() { curl -sf "http://$ingress_ip:9006/metrics" || true; }
+
+# The cumulative buckets of the seal latency histogram in the metrics file
+# $1, as "le count" lines, and then the expired stamps as "expired count".
+# A missing metric gives no line.
+buckets_of() {
+    awk -v m="${METRIC}_bucket" -v e="$EXPIRED" '
+        index($0, m "{") == 1 {
+            match($0, /le="[^"]*"/); print substr($0, RSTART + 4, RLENGTH - 5), $NF }
+        index($0, e "{") == 1 || index($0, e " ") == 1 { print "expired", $NF }' "$1"
+}
+
+# The expired stamps of the measured part: the counter in $2 minus that in $1.
+expired_between() {
+    # A missing counter counts as 0: the ingress exports it at the first expiry.
+    local count='$1 == "expired" { v = $2 } END { print v + 0 }'
+    echo $(($(awk "$count" "$2") - $(awk "$count" "$1")))
 }
 
 # The quantile q of the bucket counts in $2 minus those in $1, in
 # milliseconds. A value inside a bucket is interpolated linearly. A value
 # above the top bucket prints as ">top". "-" means no sample.
 quantile_ms() {
-    join <(sort "$1") <(sort "$2") | sort -g -k1,1 | awk -v q="$3" '
+    join <(sort "$1") <(sort "$2") | awk '$1 != "expired"' | sort -g -k1,1 | awk -v q="$3" '
         { le[NR] = $1; n[NR] = $3 - $2 }
         END {
             total = n[NR]
@@ -78,20 +106,22 @@ quantile_ms() {
 # The busy and total jiffies of the host, from /proc/stat.
 host_jiffies() { awk '/^cpu / { print $2 + $3 + $4 + $7 + $8, $2 + $3 + $4 + $5 + $6 + $7 + $8 }' /proc/stat; }
 
-# The member that logged LEADER last, as its container name.
+# The member that logged LEADER last, as its container name. A failed
+# read gives no name. awk reads all its input, so no writer gets SIGPIPE.
 leader() {
     local c
     for c in "${sealers[@]}"; do
-        docker exec "$c" sh -c 'grep -h "role=" /opt/nomad/alloc/*/alloc/logs/cluster.stdout.* 2>/dev/null | tail -1' \
+        { docker exec "$c" sh -c 'grep -h "role=" /opt/nomad/alloc/*/alloc/logs/cluster.stdout.* 2>/dev/null | tail -1' || true; } \
             | awk -v c="$c" '/role=LEADER/ { print c }'
-    done | head -1
+    done | awk 'NR == 1'
 }
 
-# The "sealer snapshot TAKEN" lines that every member logged after $1.
+# The "sealer snapshot TAKEN" lines that every member logged after $1. No
+# line, or a failed read, gives no output and no exit.
 snapshots_since() {
     local c
     for c in "${sealers[@]}"; do
-        docker exec "$c" sh -c 'grep -h "sealer snapshot TAKEN" /opt/nomad/alloc/*/alloc/logs/cluster.stdout.* 2>/dev/null' \
+        { docker exec "$c" sh -c 'grep -h "sealer snapshot TAKEN" /opt/nomad/alloc/*/alloc/logs/cluster.stdout.* 2>/dev/null' || true; } \
             | awk -v t="$1" 'substr($1, 1, 19) >= t'
     done
 }
@@ -99,7 +129,7 @@ snapshots_since() {
 # Sample the CPU of one container every 5 s until killed.
 sample_cpu() {
     while sleep 5; do
-        docker stats --no-stream --format '{{.CPUPerc}}' "$1" | tr -d '%'
+        { docker stats --no-stream --format '{{.CPUPerc}}' "$1" || true; } | tr -d '%'
     done
 }
 
@@ -137,28 +167,32 @@ cell() {
     local lead since
     lead=$(leader)
     since=$(date -u +%Y-%m-%dT%H:%M:%S)
-    scrape_buckets >"$dir/before"
+    scrape >"$dir/metrics-before"
+    buckets_of "$dir/metrics-before" >"$dir/before"
     read -r busy0 total0 < <(host_jiffies)
     sample_cpu "$lead" >"$dir/cpu" &
-    local sampler=$!
+    sampler=$!
     echo ">> cell rate=$rate calldata=$calldata: measure $DURATION, leader $lead" >&2
     load "$rate" "$calldata" "$DURATION" --assert-all-delivered --output "$dir/report.json" \
         >"$dir/load.log" 2>&1 || true
     kill "$sampler" 2>/dev/null || true
-    scrape_buckets >"$dir/after"
+    sampler=""
+    scrape >"$dir/metrics-after"
+    buckets_of "$dir/metrics-after" >"$dir/after"
     read -r busy1 total1 < <(host_jiffies)
-    local verdict delivered offered receipt seal cpu snap load1 host_cpu
+    local verdict delivered offered receipt seal expired cpu snap load1 host_cpu
     verdict=$(jq -r 'if .verdict.pass then "PASS" else "FAIL" end' "$dir/report.json" 2>/dev/null || echo "NO REPORT")
     delivered=$(jq -r '"\(.verdict.receipted)/\(.verdict.offered)"' "$dir/report.json" 2>/dev/null || echo "-")
     offered=$(jq -r '.verdict.offered / .duration_secs | floor' "$dir/report.json" 2>/dev/null || echo "-")
     receipt=$(jq -r '"\(.lat_p50_us / 1000 | floor) / \(.lat_p99_us / 1000 | floor)"' "$dir/report.json" 2>/dev/null || echo "-")
     seal="$(quantile_ms "$dir/before" "$dir/after" 0.5) / $(quantile_ms "$dir/before" "$dir/after" 0.99)"
+    expired=$(expired_between "$dir/before" "$dir/after")
     cpu=$(awk '{ s += $1; if ($1 > m) m = $1 } END { if (NR) printf "%.0f / %.0f", s / NR, m; else print "-" }' "$dir/cpu")
     snap=$(snapshots_since "$since" | sed -n 's/.* ms=\([0-9]*\).*/\1/p' \
         | awk '{ if ($1 > m) m = $1 } END { if (NR) printf "%d (%d)", m, NR; else print "-" }')
     load1=$(cut -d' ' -f1 /proc/loadavg)
     host_cpu=$(awk -v b="$((busy1 - busy0))" -v t="$((total1 - total0))" 'BEGIN { printf "%.0f", t ? 100 * b / t : 0 }')
-    echo "| $rate | $offered | $calldata | $verdict | $delivered | $receipt | $seal | $cpu | $snap | $load1 | $host_cpu |"
+    echo "| $rate | $offered | $calldata | $verdict | $delivered | $receipt | $seal | $expired | $cpu | $snap | $load1 | $host_cpu |"
 }
 
 cells=()
@@ -175,13 +209,13 @@ cells+=("${extra[@]}")
     echo "- Host: $(nproc) CPUs, $(awk '/MemTotal/ { printf "%.0f GiB", $2 / 1048576 }' /proc/meminfo), load average at start $(cut -d' ' -f1-3 /proc/loadavg)"
     echo "- Each cell: warm-up $WARMUP, then $DURATION measured, $SENDERS senders, \`--fixed-rate --subscribe --max-in-flight $MAX_IN_FLIGHT\`. Offered tx/s is the offered count over the measured time."
     echo "- Calldata: the calldata bytes of each transaction. The raw size is about the calldata + 110 bytes. \`a:w,b:w\` is a weighted mix."
-    echo "- Receipt latency: \`kardamom-load\`, p50 / p99 in ms. Seal latency: \`$METRIC\` on ingress-0, p50 / p99 in ms, interpolated in the histogram buckets."
+    echo "- Receipt latency: \`kardamom-load\`, p50 / p99 in ms. Seal latency: \`$METRIC\` on ingress-0, p50 / p99 in ms. The value is a linear guess inside its bucket; above 10 ms the bucket bounds are 25, 50, 100, 250 and 500 ms, then 1, 2.5 and 5 s. A seal later than 180 s gives no sample: \`$EXPIRED\` counts those as expired stamps, and a non-zero count means the seal tail is too low."
     echo "- Leader CPU: \`docker stats\` of the leader node container every 5 s, mean / max in % of one CPU."
     echo "- Snapshot: the largest \`ms=\` of the \`sealer snapshot TAKEN\` lines of all members in the measured part, and the line count."
     echo "- Host load and host CPU: the 1-minute load average at the end of the cell, and the busy % of all host CPUs in the measured part."
     echo
-    echo "| tx/s | offered tx/s | calldata | verdict | receipted/offered | receipt ms | seal ms | leader CPU % | snapshot ms (n) | host load | host CPU % |"
-    echo "|---|---|---|---|---|---|---|---|---|---|---|"
+    echo "| tx/s | offered tx/s | calldata | verdict | receipted/offered | receipt ms | seal ms | expired stamps | leader CPU % | snapshot ms (n) | host load | host CPU % |"
+    echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
 } >"$out"
 
 for c in "${cells[@]}"; do

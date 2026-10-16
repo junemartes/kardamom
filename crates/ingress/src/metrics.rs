@@ -52,6 +52,11 @@ pub const CLUSTER_RECORD_LAG: &str = "kardamom_ingress_cluster_record_lag";
 /// cluster egress frame that gives it a canonical index, in seconds. Only
 /// the ingress that published the transaction records it.
 pub const SEAL_LATENCY_SECONDS: &str = "kardamom_ingress_seal_latency_seconds";
+/// The publish stamps that no seal matched within the age bound of the
+/// seal clock. A seal after the bound gives no latency sample, so a
+/// non-zero rate under load means that the histogram undercounts the
+/// tail.
+pub const SEAL_STAMPS_EXPIRED_TOTAL: &str = "kardamom_ingress_seal_stamps_expired_total";
 /// 0 while the proxy serves, 1 from the first moment of the shutdown
 /// drain. The readiness rule requires 0: a draining replica refuses new
 /// submits, so a health check must take it out of rotation at once. The
@@ -94,6 +99,10 @@ pub fn describe() {
         SEAL_LATENCY_SECONDS,
         metrics::Unit::Seconds,
         "time from the tx_data publish to the egress frame that seals the transaction"
+    );
+    metrics::describe_counter!(
+        SEAL_STAMPS_EXPIRED_TOTAL,
+        "publish stamps with no seal within 180 s; the seal latency histogram has no sample for them"
     );
     metrics::describe_gauge!(DRAINING, "1 while the shutdown drain refuses new submits");
     metrics::describe_gauge!(
@@ -202,6 +211,7 @@ mod tests {
             TX_ERROR_DUPLICATE_TOTAL,
             CLUSTER_FRAME_DROPPED_TOTAL,
             SEAL_LATENCY_SECONDS,
+            SEAL_STAMPS_EXPIRED_TOTAL,
         ] {
             assert!(
                 name.starts_with("kardamom_ingress_"),

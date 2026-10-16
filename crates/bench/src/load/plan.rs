@@ -10,6 +10,8 @@
 //! - track every transaction by hash to a receipt, independent of the
 //!   submit response.
 
+use std::num::NonZeroU64;
+
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use kardamom_types::TxEnvelope;
@@ -109,9 +111,11 @@ impl TransferShape {
             .and_then(|g| g.checked_add(TRANSFER_GAS))
             .ok_or_else(|| anyhow::anyhow!("the gas of {bytes} calldata bytes overflows u64"))?;
         // The byte value cycles through 1..=255, so no byte is zero.
-        let input = (0..bytes)
-            .map(|i| u8::try_from(i % 255).map_or(1, |b| b.wrapping_add(1)))
-            .collect();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "i % 255 + 1 is at most 255"
+        )]
+        let input = (0..bytes).map(|i| (i % 255 + 1) as u8).collect();
         Ok(Self {
             to,
             value,
@@ -145,17 +149,27 @@ impl TransferShape {
 }
 
 /// The transfers a run signs, in a fixed cycle. A shape with weight `w`
-/// takes `w` places of the cycle.
+/// takes `w` places of the cycle. The mix keeps each shape once, with the
+/// end of its places, so a large weight costs no memory.
 #[derive(Debug, Clone)]
 pub struct TransferMix {
-    cycle: Vec<TransferShape>,
+    shapes: Vec<TransferShape>,
+    /// The end of the places of each shape: the sum of the weights up to
+    /// and including it. It increases strictly.
+    ends: Vec<u64>,
+    /// The length of the cycle: the last value of `ends`.
+    total: NonZeroU64,
 }
 
 impl TransferMix {
     /// A mix of one shape.
     #[must_use]
     pub fn single(shape: TransferShape) -> Self {
-        Self { cycle: vec![shape] }
+        Self {
+            shapes: vec![shape],
+            ends: vec![1],
+            total: NonZeroU64::MIN,
+        }
     }
 
     /// A mix of value transfers to `to`, with the calldata sizes and the
@@ -163,20 +177,39 @@ impl TransferMix {
     ///
     /// # Errors
     ///
-    /// Returns an error if the gas of a size overflows `u64`.
+    /// Returns an error if the gas of a size overflows `u64`, or if the
+    /// sum of the weights overflows `u64`.
     pub fn calldata(to: Address, value: U256, mix: &CalldataMix) -> anyhow::Result<Self> {
-        let cycle = mix
+        let shapes = mix
             .parts()
             .iter()
-            .map(|part| {
-                let shape = TransferShape::with_calldata(to, value, part.bytes)?;
-                Ok(std::iter::repeat_n(shape, part.weight.get() as usize))
+            .map(|part| TransferShape::with_calldata(to, value, part.bytes))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ends = mix
+            .parts()
+            .iter()
+            .try_fold(Vec::new(), |mut ends: Vec<u64>, part| {
+                let end = ends
+                    .last()
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(u64::from(part.weight.get()))?;
+                ends.push(end);
+                Some(ends)
             })
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        Ok(Self { cycle })
+            .ok_or_else(|| anyhow::anyhow!("the sum of the calldata weights overflows u64"))?;
+        // A `CalldataMix` has one part or more, and every weight is
+        // non-zero, so the last end is non-zero.
+        let total = ends
+            .last()
+            .copied()
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| anyhow::anyhow!("the calldata mix is empty"))?;
+        Ok(Self {
+            shapes,
+            ends,
+            total,
+        })
     }
 
     /// Pre-sign `per_sender` transfers for each signer. Returns one queue
@@ -221,7 +254,10 @@ impl TransferMix {
 
     /// The shape of transfer `i` of `sender`.
     fn shape(&self, sender: usize, i: usize) -> &TransferShape {
-        &self.cycle[sender.wrapping_add(i) % self.cycle.len()]
+        // The place wraps on purpose: the cycle repeats.
+        let place = (sender as u64).wrapping_add(i as u64) % self.total;
+        // `place < total`, the last end, so the index is in range.
+        &self.shapes[self.ends.partition_point(|&end| end <= place)]
     }
 }
 
@@ -327,6 +363,51 @@ mod tests {
         assert_eq!(tx.input().len(), 2_000);
         assert!(tx.input().iter().all(|b| *b != 0), "every byte is non-zero");
         assert_eq!(tx.gas_limit(), 21_000 + 40 * 2_000);
+    }
+
+    #[test]
+    fn a_mix_cycles_its_weighted_sizes() {
+        use alloy_consensus::Transaction;
+        use alloy_eips::eip2718::Decodable2718;
+
+        let signers = SignerSet::derive(ANVIL_PHRASE, 2).unwrap();
+        let params = TxPlanParams {
+            chain_id: 1,
+            nonce_start: 0,
+            gas_price: 1,
+        };
+        let mix =
+            TransferMix::calldata(Address::ZERO, U256::ZERO, &"0:2,64:1".parse().unwrap()).unwrap();
+        let q = mix.pregenerate(&signers, 3, params, &[0, 0]).unwrap();
+        let sizes: Vec<Vec<usize>> = q
+            .iter()
+            .map(|queue| {
+                queue
+                    .iter()
+                    .map(|tx| {
+                        alloy_consensus::TxEnvelope::decode_2718(&mut tx.raw.as_ref())
+                            .unwrap()
+                            .input()
+                            .len()
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(sizes, vec![vec![0, 0, 64], vec![0, 64, 0]]);
+    }
+
+    #[test]
+    fn a_huge_weight_keeps_one_shape() {
+        let mix = TransferMix::calldata(
+            Address::ZERO,
+            U256::ZERO,
+            &"0:4000000000,8:1".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mix.shapes.len(), 2);
+        assert_eq!(mix.shape(0, 0).input.len(), 0);
+        assert_eq!(mix.shape(3_999_999_999, 0).input.len(), 0);
+        assert_eq!(mix.shape(4_000_000_000, 0).input.len(), 8);
     }
 
     #[test]

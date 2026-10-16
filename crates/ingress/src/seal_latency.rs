@@ -15,15 +15,19 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
 
-/// The stamps the channel holds between two egress frames. The sealer
-/// sends a boundary at each tick, so the tap empties the channel many
-/// times a second. At 6,000 tx/s this capacity holds about 10 s of
-/// stamps.
+/// The stamps the channel holds between two seals. Only
+/// [`SealClock::sealed`] empties the channel, so the channel fills only
+/// while no transaction of this ingress seals. At 6,000 tx/s this
+/// capacity holds about 10 s of stamps.
 const STAMP_CAPACITY: usize = 64 * 1024;
 
-/// A stamp older than this has no seal to come: the sequencer refused
-/// the transaction. The clock removes it.
-const STAMP_TTL: Duration = Duration::from_secs(30);
+/// The clock removes a stamp older than this, and counts it in
+/// [`crate::metrics::SEAL_STAMPS_EXPIRED_TOTAL`]. Most such stamps are of
+/// transactions that the sequencer refused. A seal that comes later gives
+/// no sample, so the histogram has no value above this age: a non-zero
+/// counter under load means that the histogram undercounts the tail. The
+/// age is above the 90 s receipt drain of `kardamom-load`.
+const STAMP_TTL: Duration = Duration::from_secs(180);
 
 /// The clock removes old stamps at most this often.
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
@@ -81,15 +85,20 @@ impl SealClock {
             .map(|stamped| now.saturating_duration_since(stamped))
     }
 
-    /// Remove the stamps older than [`STAMP_TTL`], at most once in each
-    /// [`SWEEP_EVERY`].
+    /// Remove and count the stamps older than [`STAMP_TTL`], at most
+    /// once in each [`SWEEP_EVERY`].
     fn sweep(&mut self, now: Instant) {
         if now.saturating_duration_since(self.last_sweep) < SWEEP_EVERY {
             return;
         }
         self.last_sweep = now;
+        let before = self.open.len();
         self.open
             .retain(|_, stamped| now.saturating_duration_since(*stamped) < STAMP_TTL);
+        // `retain` only removes, so the length never grows.
+        let expired = before.saturating_sub(self.open.len());
+        metrics::counter!(crate::metrics::SEAL_STAMPS_EXPIRED_TOTAL)
+            .increment(u64::try_from(expired).unwrap_or(u64::MAX));
     }
 }
 
@@ -106,6 +115,15 @@ mod tests {
         let latency = clock.latency_at(hash, later).expect("the hash has a stamp");
         assert!(latency >= Duration::from_millis(40));
         assert_eq!(clock.latency_at(hash, later), None, "one sample per seal");
+    }
+
+    #[test]
+    fn a_seal_after_a_minute_still_gives_a_sample() {
+        let (stamps, mut clock) = SealClock::pair();
+        let hash = B256::repeat_byte(5);
+        stamps.stamp(hash);
+        let late = Instant::now() + Duration::from_secs(60);
+        assert!(clock.latency_at(hash, late).is_some());
     }
 
     #[test]
