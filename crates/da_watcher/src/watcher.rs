@@ -451,10 +451,22 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
         ::metrics::gauge!(metrics::L1_FINALIZED).set(number as f64);
     }
 
-    /// The operator cleared the halt: forget the records seen before the
-    /// head, and read the records after it again.
+    /// The operator cleared the halt: drop the records that arrived before
+    /// the clear, forget the records seen before the head, and read the
+    /// records after it again.
+    ///
+    /// The clear covers every record that arrived before it. A record of
+    /// the lying instance can wait in the inbox through the halt; judged
+    /// after the clear, against the true record the history gives for its
+    /// block, it raises the halt again. The history after the head gives
+    /// every block again, by the parent chain.
     pub fn on_halt_cleared(&mut self) {
-        info!(target: "da_watcher", "the operator cleared the halt; reading l1_blocks again");
+        let dropped = self.drop_arrived();
+        info!(
+            target: "da_watcher",
+            dropped,
+            "the operator cleared the halt; reading l1_blocks again"
+        );
         self.held = false;
         self.forget_seen();
         if let Some(head) = self.cursor() {
@@ -526,6 +538,15 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
         while let Some(record) = self.feed.try_next() {
             self.arrived(record);
         }
+    }
+
+    /// Drop every live record that already arrived, in the inbox or not
+    /// yet read. Returns how many were dropped.
+    fn drop_arrived(&mut self) -> usize {
+        self.take_arrived();
+        let dropped = self.inbox.len();
+        self.inbox.clear();
+        dropped
     }
 
     /// Ask the archives for the records from `number` on, at the next

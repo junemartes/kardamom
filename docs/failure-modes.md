@@ -1111,6 +1111,7 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 - With one source, the follower chains every header of a range, to its cursor, and halts on a break (`l1_chain_break`). A wrong block hash shows within the range: the next header names the true hash as its parent. Only a range that ends at the lying block stores and publishes its hash. A light client anchor closes this case at the finalized tip; two sources close it everywhere.
 - A swallowed log is invisible to one source. Two sources see it.
 - After an operator clears `l1_follower_disagreement`, the archives still hold both instances' records. A history read keeps the chain that descends from the da-watcher's head, so the lie is never taken, and the old conflict does not halt it again.
+- The clear also drops every live record that arrived before it. A lying record can wait through the halt. Judged after the clear, against the true record of its block, it raises the halt again. A record that arrives after the clear and disagrees with a published block still halts the da-watcher.
 - Proof: the `chaos-l1` cases `l1-liar` and `two-day-outage` serve each lie through the fault proxy. They check that the follower halts and the da-watcher pauses on it, and that both resume. `follower-instance-loss` and `follower-total-loss` check the two instances: one down costs nothing, both down pause the da-watcher, and the restart resumes it with no gap and no double epoch.
 
 ## Notifier

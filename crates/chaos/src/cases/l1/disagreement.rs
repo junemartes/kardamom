@@ -42,6 +42,10 @@ const EPOCHS_VERIFIED: &str = "validator_epochs_verified_total";
 /// before the liar is thawed.
 const TRUE_LEAD: u64 = 3;
 const BUDGET: Duration = Duration::from_secs(180);
+/// How long the da-watcher's halt must stay clear after it publishes
+/// again. A record that waited through the halt is judged in the pass
+/// after the clear, so one sample can come before the halt returns.
+const CLEAR_HOLD: Duration = Duration::from_secs(20);
 
 pub(crate) async fn follower_disagreement(h: &mut Harness) -> anyhow::Result<()> {
     let ctx = "follower-disagreement";
@@ -153,7 +157,35 @@ async fn heal(h: &Harness, l1: &L1, node: &str, ctx: &str) -> anyhow::Result<()>
         "publish again after the clear",
     )
     .await?;
-    await_metric(h, HALT, DISAGREEMENT, |v| v == 0, ctx, "stay clear").await
+    await_metric(h, HALT, DISAGREEMENT, |v| v == 0, ctx, "clear the halt").await?;
+    assert_stays_clear(h, ctx).await
+}
+
+/// The da-watcher's halt stays clear through [`CLEAR_HOLD`]. A failed
+/// scrape is no evidence either way: it does not break the hold.
+async fn assert_stays_clear(h: &Harness, ctx: &str) -> anyhow::Result<()> {
+    let broken = poll::first_break(
+        Budget::new(CLEAR_HOLD, Duration::from_secs(2)),
+        |_| async move {
+            let halt = h
+                .probes
+                .aux_metric_where(DA_WATCHER_PORT, HALT, DISAGREEMENT)
+                .await;
+            Ok::<_, anyhow::Error>(halt.filter(|v| *v != 0))
+        },
+    )
+    .await?;
+    if let Some((value, elapsed)) = broken {
+        return Err(crate::chaos_fail!(
+            "{ctx}: the da-watcher halted again {}s after the clear showed ({HALT}={value})",
+            elapsed.as_secs()
+        ));
+    }
+    crate::log(format!(
+        "{ctx}: the da-watcher's halt stayed clear for {}s",
+        CLEAR_HOLD.as_secs()
+    ));
+    Ok(())
 }
 
 /// The validator's own L1 read verified epochs during the case, and no

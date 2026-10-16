@@ -43,5 +43,7 @@ consumer's node:
 curl -s -X POST http://127.0.0.1:<port>/halt/clear
 ```
 
-The consumer takes records again from its cursor. A second disagreement raises
-the halt again.
+The consumer takes records again from its cursor. The da-watcher drops the live
+records that arrived before the clear, and reads the records after its cursor
+again from the archives. A second disagreement after the clear raises the halt
+again.

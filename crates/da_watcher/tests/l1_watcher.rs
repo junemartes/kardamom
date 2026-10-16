@@ -310,3 +310,39 @@ async fn after_a_clear_the_history_keeps_the_chain_of_the_head() {
             .all(|e| e.l1_hash == ScriptedStream::hash(e.l1_number))
     );
 }
+
+/// The lying instance's next record arrives while the halt stands. The
+/// operator's clear covers it: the history after the head publishes the
+/// true blocks, and the old lie does not halt the watcher again. A lie
+/// that arrives after the clear still halts it.
+#[tokio::test]
+async fn a_lie_that_arrived_before_the_clear_does_not_halt_the_watcher_again() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 101]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.hash = B256::repeat_byte(0xAB);
+    stream.inject(lie.clone());
+    assert!(w.process_once().await.is_err());
+    let mut next = stream.record(102);
+    next.parent_hash = lie.hash;
+    next.hash = B256::repeat_byte(0xAC);
+    stream.inject(next);
+    assert_eq!(w.process_once().await.unwrap(), 0, "held until the clear");
+    stream.archive_up_to(104);
+    w.on_halt_cleared();
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 3);
+    assert_eq!(numbers(&tap), [101, 102, 103, 104]);
+
+    let mut later = stream.record(103);
+    later.hash = B256::repeat_byte(0xAD);
+    stream.inject(later);
+    let err = w.process_once().await.unwrap_err();
+    assert!(
+        matches!(err, MonitorError::Disagreement { number: 103, .. }),
+        "got {err}"
+    );
+}
