@@ -15,8 +15,9 @@ pub enum SequencerError {
     MalformedFrame(String),
 
     /// An outbound record could not be encoded. This can happen only after
-    /// an rkyv failure, or when an epoch has more deposits than a u32 can
-    /// hold. It is a bug, not a transport error, but it must not panic the
+    /// an rkyv failure, when an epoch has more deposits than a u32 can
+    /// hold, or when a frame does not fit one cluster session message. It
+    /// is a bug, not a transport error, but it must not panic the
     /// sequencer's pump.
     #[error("encode failed: {0}")]
     EncodeFailed(String),

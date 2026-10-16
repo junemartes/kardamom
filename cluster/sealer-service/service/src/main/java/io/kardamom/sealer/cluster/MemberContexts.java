@@ -7,7 +7,10 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.NameResolver;
 import io.aeron.driver.ThreadingMode;
 import java.io.File;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.file.Path;
+import java.util.Map;
 
 /**
  * The directories of one member, and the media driver and archive
@@ -51,6 +54,27 @@ final class MemberContexts {
         this.archiveDir = archiveDir;
         this.endpoints = endpoints;
         this.nameResolver = nameResolver;
+    }
+
+    /**
+     * These contexts with the member's name resolver: it keeps the last
+     * address of each name, and with a node address it resolves the
+     * member's own name to that address with no lookup.
+     */
+    MemberContexts withPeerNames(final int memberId, final String nodeIp) {
+        return new MemberContexts(
+            aeronDir, clusterDir, archiveDir, endpoints, new PeerNameResolver(memberId, ownAddress(nodeIp)));
+    }
+
+    private Map<String, InetAddress> ownAddress(final String nodeIp) {
+        if (nodeIp == null || nodeIp.isBlank()) {
+            return Map.of();
+        }
+        try {
+            return Map.of(host(), InetAddress.getByName(nodeIp.trim()));
+        } catch (final UnknownHostException e) {
+            throw new IllegalArgumentException("kardamom.cluster.nodeIp is not an address: " + nodeIp, e);
+        }
     }
 
     /** The consensus module directory, which the service container shares. */

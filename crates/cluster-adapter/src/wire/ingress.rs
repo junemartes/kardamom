@@ -182,7 +182,7 @@ pub fn encode_subscribe() -> Vec<u8> {
 /// Returns [`WireError::BatchTooLarge`] if `entries.len()` does not fit
 /// in a `u16`, or [`WireError::EntryTooLarge`] if any entry's length
 /// does not fit in a `u32`. The caller chunks batches far below either
-/// bound (one Aeron MTU holds a few dozen refs at most).
+/// bound.
 pub fn encode_ingress_batch(entries: &[Vec<u8>]) -> Result<Vec<u8>, WireError> {
     let count = u16::try_from(entries.len()).map_err(|_| WireError::BatchTooLarge {
         entries: entries.len(),

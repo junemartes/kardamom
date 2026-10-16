@@ -151,7 +151,11 @@ public final class ClusterNode {
             PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
-        final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me);
+        // The driver keeps the last address of each member name, so a short
+        // outage of the node's DNS agent does not fail an add in an election.
+        // The member's own name resolves to the node address with no lookup.
+        final MemberContexts contexts =
+            new MemberContexts(aeronDir, clusterDir, archiveDir, me).withPeerNames(memberId, nodeIp);
         prepareState(contexts, clusterMembers, memberId);
 
         // Launch with a retry past the mark-file liveness window. A member
@@ -487,7 +491,11 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .fileSyncLevel(fileSyncLevel())
-            .ingressChannel("aeron:udp")
+            // A Rust client picks the ingress term of its session, up to
+            // 8 MiB for a 1 MiB message. The images live on this JVM's
+            // tmpfs and count against its memory limit. Sparse images take
+            // pages only as a session writes them.
+            .ingressChannel("aeron:udp?sparse=true")
             // The cluster log uses Aeron's 64MB default term length. That
             // gives a 192MB log buffer for the log publication, plus 192MB
             // per member image, plus 192MB per election LogReplay, all on

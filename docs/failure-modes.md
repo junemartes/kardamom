@@ -243,6 +243,19 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
     - It exits with code 5. The relaunch starts from the member's own state.
   - Prevention: the archive waits of a snapshot load scale with the Aeron stall tolerance. The message timeout is the tolerance, and the replay connect timeout is half of it.
   - Proof: the in-JVM test `ComponentCloseTest`.
+- **Member name lookup fails**
+  - Trigger: the Consul agent of a sealer node does not answer for a time, for example while it has no Consul server after a node restart, or while the server is overloaded. A lookup of a member name (`sealer-N.node.<dc>.consul`) then fails.
+  - Effect: each election adds Aeron channels by member name. Without a fallback, a failed add stops the election half way. A failed add of the ingress subscription at the end of an election leaves a leader that no client can reach (see the next entry).
+  - Recovery: the media driver of each member keeps the last address of each member name. A failed lookup uses that address and logs `cluster DNS FAILED`. A good lookup replaces it. The member's own name resolves to the node address with no lookup, so a slow DNS agent never delays the adds of the member's own endpoints.
+  - Proof: the in-JVM test `PeerNameResolverTest`, and the chaos cases `cluster-total-loss-recover`, `sequencer-sealer-loss-recover` and `ingress-sealer-loss-recover` with the Consul agent of one sealer node cut from the server on and off after its restart.
+- **Leader election that fails at its completion**
+  - Trigger: the completion of a leader's election throws, for example when the add of the ingress subscription fails on a name lookup. Aeron 1.44 activates the control toggle and clears the election before that add.
+  - Effect: the member runs as the leader with no ingress subscription. Its election state stays in the last election state (usually `LEADER_READY`). No client can open a session, and the pipeline stalls. The members show one leader for the term, so the stall is not visible in the roles.
+  - Recovery: the join watchdog acts when the control toggle is active and the election state is not `CLOSED` for longer than the two blocking waits of a completion: the archive message timeout plus the driver timeout (20 s at the defaults, 60 s at the CI stall tolerance of 30 s). A completion that succeeds moves the state to `CLOSED` within those waits. A new election sets the state to `INIT` first, and its first step then sets the toggle to `INACTIVE`; the first election after a start does not set the toggle, but a new consensus module starts with an `INACTIVE` toggle. So only a failed completion keeps that combination past the limit.
+    - It logs `cluster LEADER WEDGE`.
+    - It exits with code 6. The relaunch starts from the member's own state, and the members elect again.
+  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, and the watchdog does not act.
+  - Proof: the in-JVM test `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.
   - Effect: the pipeline must stall. Progress without a quorum would be unreplicated ordering, which is unsafe. Client cluster sessions die, because the outage is longer than the session timeout.
@@ -1129,7 +1142,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - A submit with no answer, or an accepted one, stays in flight. The next lease asks for its receipt and the committed nonce. If neither shows it, the lease sends the same bytes again, and the account stays blocked. The other accounts serve the probes.
   - A sealer refusal on the status feed (`past-deadline`, `da-lag`, `record-lag`) frees the nonce when the committed nonce has not passed it. The sealer is the one orderer, and it drops a hash that it saw again, so a resend of a refused transaction never lands. The status board is in memory: after a restart, such an account stays blocked until an operator clears its journal.
   - A restart reads the journal, so the rule holds across a restart.
-  - Proof: S19 (`s19_canary_probes_succeed_and_the_ring_resolves_in_flight`) in the chain-semantics suite: every probe on a local stack with an L1, a lost submit answer, a restart with an unsent transaction, and six concurrent leases on one account.
+  - Proof: S19 (`s19_canary_probes_succeed_and_the_ring_resolves_in_flight`) in the chain-semantics suite: every probe on a local stack with an L1, a lost submit answer, a restart with an unsent transaction, and six concurrent leases on one account. S19 also checks that each receipt agrees with its block: the block that lists the transaction, the header's base fee, and `eth_feeHistory`.
 - **Feed gaps.** A stage that a later stage implies is no failure. A missing `executed` with a receipt is a feed gap (`kardamom_canary_feed_gaps_total`), not a transaction failure.
 - **Funds.** An account under the floor is unfunded. The probes skip it, and report `unfunded` when every account is under the floor. `KardamomCanaryLowFunds` is an info alert.
   - The deposits credit the first ring account. The balance task tops the other accounts up from it when they fall under the floor (`kardamom_canary_topups_total`).
@@ -1138,7 +1151,6 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - Proof: the chaos case `canary-da-lag` freezes the batcher past the DA-lag budget. The canary reports `rpc_error{code="-32010"}`, and Alertmanager holds its page as inhibited. The case runs by name with `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, as `da-lag-halt` does, on a cluster deployed with `CANARY_LOCAL=1`.
 - **Known limits.**
   - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
-  - A receipt carries the number of the block before the block whose base fee it paid. The `fees` probe then reports `fee_mismatch{field="base_fee"}` whenever the base fee moves between two blocks. This is a defect of the chain, open in issue 553. S19 counts that outcome apart.
   - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
 
 ## Redis account cache

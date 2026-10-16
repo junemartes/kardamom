@@ -5,9 +5,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
 import io.kardamom.sealer.cluster.SessionBacklogs.Outcome;
+import java.nio.ByteOrder;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.LongStream;
+import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -92,5 +94,40 @@ class SessionBacklogsTest {
         pastTheStallDeadline();
         backlogs.drain();
         assertEquals(1, session.closes, "the deadline counts from the last frame taken");
+    }
+
+    /** A session whose egress publication takes at most {@code max} bytes in one message. */
+    private static StubSession small(final long id, final int max) {
+        final StubSession session = new StubSession(id);
+        session.maxMessageLength = max;
+        return session;
+    }
+
+    /** A relayed frame of {@code length} bytes for {@code index}. */
+    private static byte[] relayed(final long index, final int length) {
+        final byte[] frame = new byte[length];
+        frame[0] = SealerWire.EGRESS_KIND_RELAYED;
+        new UnsafeBuffer(frame).putLong(1, index, ByteOrder.LITTLE_ENDIAN);
+        return frame;
+    }
+
+    @Test
+    void aFrameAboveTheMaxMessageLengthClosesTheSessionAtOnce() {
+        final StubSession session = small(1, 64);
+
+        assertEquals(Outcome.DROPPED, backlogs.offer(session, relayed(7, 65)));
+
+        assertEquals(1, session.closes);
+        assertTrue(session.offered.isEmpty());
+    }
+
+    @Test
+    void repeatedClosesOnOneIndexAreCountedForTheResponseChannel() {
+        LongStream.range(1, 4).forEach(id -> backlogs.offer(small(id, 64), relayed(7, 65)));
+        assertEquals(2, backlogs.tooLongRepeats("aeron:ipc", 7));
+
+        backlogs.offer(small(4, 64), relayed(8, 65));
+        assertEquals(0, backlogs.tooLongRepeats("aeron:ipc", 8));
+        assertEquals(-1, backlogs.tooLongRepeats("aeron:ipc", 7));
     }
 }
