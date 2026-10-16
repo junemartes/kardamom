@@ -27,3 +27,5 @@ pub mod wait;
 
 #[cfg(test)]
 mod format_tests;
+#[cfg(test)]
+mod test_support;

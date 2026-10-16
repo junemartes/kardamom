@@ -21,7 +21,7 @@ use crate::config::Timing;
 use crate::feed::{BoardHandle, Stages};
 use crate::metrics;
 use crate::outcome::{Outcome, Stage};
-use crate::ring::{Call, Lease, Ring};
+use crate::ring::{Call, Lease, Ring, Settled};
 use crate::rpc::{Receipt, Rpc};
 use crate::store::Store;
 use crate::wait::Poll;
@@ -86,12 +86,12 @@ impl Context {
     }
 
     /// Send `call` on `lease`, wait for the receipt, and settle the lease.
-    /// Records the submit-to-receipt stage of `probe`. The receipt's
-    /// status is the caller's to judge.
+    /// Records the submit-to-receipt stage of `probe`. The status of a
+    /// receipt the chain applied is the caller's to judge.
     ///
     /// # Errors
     ///
-    /// The send's or the wait's outcome.
+    /// The send's or the wait's outcome, or `skipped`.
     pub async fn transact(
         &self,
         probe: &'static str,
@@ -102,14 +102,29 @@ impl Context {
         let sent = lease.send(rpc, call).await?;
         let landed = self.landed(rpc, sent.hash).await?;
         let gap = lease.found_gap();
-        lease.settle().await;
+        let settled = self.settle(rpc, lease, &landed).await;
         metrics::stage(
             probe,
             &rpc.endpoint.name,
             "receipt",
             landed.at.saturating_duration_since(sent.at),
         );
-        Ok(Done { landed, gap })
+        settled.map(|()| Done { landed, gap })
+    }
+
+    /// Settle `lease` on the receipt in `landed`. A status-0 receipt
+    /// waits up to the read timeout for the committed nonce to pass the
+    /// transaction's nonce.
+    ///
+    /// # Errors
+    ///
+    /// `skipped` when the chain skipped the transaction.
+    pub async fn settle(&self, rpc: &Rpc, lease: Lease, landed: &Landed) -> Result<(), Outcome> {
+        let wait = Poll::within(self.timing.read_timeout, self.timing.poll);
+        match lease.settle(rpc, &landed.receipt, wait).await {
+            Settled::Applied => Ok(()),
+            Settled::Skipped => Err(Outcome::Skipped),
+        }
     }
 
     /// Another ring account than `from`.

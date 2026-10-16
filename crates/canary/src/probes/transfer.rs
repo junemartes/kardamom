@@ -75,7 +75,7 @@ impl Transfer {
             Err(outcome) => return outcome,
         };
         let gap = lease.found_gap();
-        lease.settle().await;
+        let settled = self.ctx.settle(rpc, lease, &landed).await;
         metrics::stage(
             NAME,
             name,
@@ -83,6 +83,9 @@ impl Transfer {
             landed.at.saturating_duration_since(hashed),
         );
         record_stages(NAME, name, hashed, &self.ctx.stages(sent.hash).await);
+        if let Err(outcome) = settled {
+            return outcome;
+        }
         if !landed.receipt.succeeded() {
             return Outcome::ReceiptStatus0;
         }

@@ -6,6 +6,14 @@
 //! again, and the account stays blocked while another account serves
 //! the probe.
 //!
+//! A landed transaction uses its nonce only when the chain applied it:
+//! its receipt has status 1, or the committed nonce passes its nonce.
+//! The executors skip an invalid transaction (for example one without
+//! funds) with a status-0 receipt and leave the committed nonce. Its
+//! nonce is free, and the next send takes the committed nonce. So the
+//! next nonce goes above the committed nonce only for a transaction the
+//! chain applied.
+//!
 //! The leases are per-account async mutexes taken with `try_lock`: the
 //! probe tasks run on several threads and contend for the same
 //! accounts, and a lease never waits for a busy account.
@@ -27,7 +35,7 @@ use tokio::time::Instant;
 
 use crate::feed::BoardHandle;
 use crate::outcome::Outcome;
-use crate::rpc::{Rpc, RpcError};
+use crate::rpc::{Receipt, Rpc, RpcError};
 use crate::wait::Poll;
 use journal::{InFlight, Journal};
 
@@ -86,6 +94,15 @@ pub fn signers(phrase: &str, first: u32, count: NonZeroU32) -> anyhow::Result<Ve
         .checked_add(count.get())
         .ok_or_else(|| anyhow::anyhow!("the ring's derivation range overflows"))?;
     kardamom_bench::mnemonic::derive_range(phrase, first..end)
+}
+
+/// What a landed transaction did to its nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// The chain applied the transaction: its nonce is used.
+    Applied,
+    /// The chain skipped the transaction: its nonce is free.
+    Skipped,
 }
 
 /// One account's state, owned by its lease.
@@ -159,7 +176,8 @@ pub struct Ring {
 impl Ring {
     /// The ring of `signers` on chain `chain_id`, with each account's
     /// journal under `dir`. `board` holds the status feed's rejections.
-    /// Every account starts funded; the balance task corrects that.
+    /// Every account starts unfunded and serves no lease until the
+    /// balance task reads its balance.
     ///
     /// # Errors
     ///
@@ -188,7 +206,7 @@ impl Ring {
         let journal = Journal::new(dir, signer.address);
         let in_flight = journal.load().await?;
         Ok(Arc::new(Slot {
-            funded: AtomicBool::new(true),
+            funded: AtomicBool::new(false),
             account: Arc::new(Mutex::new(Account {
                 address: signer.address,
                 next_nonce: None,
@@ -343,13 +361,12 @@ impl Lease {
             .await
             .map_err(|e| Miss::Rpc(e.into()))?;
         if landed.is_some() || used > entry.nonce {
-            self.settle_entry(entry.nonce).await;
+            self.settle_landed(entry.nonce, landed.as_ref(), Some(used))
+                .await;
             return Ok(());
         }
         if self.sealer_refused(entry.hash).await {
-            self.account.next_nonce = Some(entry.nonce);
-            self.forget().await;
-            crate::metrics::stalled(self.address(), None);
+            self.release(Some(entry.nonce)).await;
             return Ok(());
         }
         self.resend(rpc, entry).await
@@ -444,14 +461,54 @@ impl Lease {
         }
     }
 
-    /// The in-flight transaction landed: its nonce is used.
-    pub async fn settle(mut self) {
+    /// The in-flight transaction landed with `receipt`. A status-0
+    /// receipt is a revert only when the committed nonce on `rpc` passes
+    /// the transaction's nonce within `wait`: the committed nonce can
+    /// show after the receipt. Otherwise the chain skipped the
+    /// transaction, and the next lease takes the committed nonce.
+    pub async fn settle(mut self, rpc: &Rpc, receipt: &Receipt, wait: Poll) -> Settled {
         let nonce = self.account.in_flight_nonce();
-        self.settle_entry(nonce).await;
+        let address = self.address();
+        let committed = if receipt.succeeded() {
+            None
+        } else {
+            wait.until(|| async {
+                rpc.nonce(address)
+                    .await
+                    .ok()
+                    .filter(|committed| *committed > nonce)
+            })
+            .await
+        };
+        self.settle_landed(nonce, Some(receipt), committed).await
     }
 
-    async fn settle_entry(&mut self, nonce: u64) {
-        self.account.next_nonce = Some(nonce.saturating_add(1));
+    /// Settle the in-flight transaction at `nonce`, with its `receipt`
+    /// and the `committed` nonce where known. The chain applied the
+    /// transaction when the receipt has status 1 or the committed nonce
+    /// passes `nonce`. Otherwise the chain skipped it, and the next
+    /// lease takes the committed nonce.
+    async fn settle_landed(
+        &mut self,
+        nonce: u64,
+        receipt: Option<&Receipt>,
+        committed: Option<u64>,
+    ) -> Settled {
+        let applied =
+            receipt.is_some_and(Receipt::succeeded) || committed.is_some_and(|c| c > nonce);
+        if applied {
+            self.release(nonce.checked_add(1)).await;
+            return Settled::Applied;
+        }
+        tracing::warn!(account = %self.address(), nonce, "the chain skipped the transaction");
+        self.release(None).await;
+        Settled::Skipped
+    }
+
+    /// The in-flight transaction is resolved: the next send takes
+    /// `next`, or the committed nonce when `next` is `None`.
+    async fn release(&mut self, next: Option<u64>) {
+        self.account.next_nonce = next;
         self.forget().await;
         crate::metrics::stalled(self.address(), None);
     }
@@ -487,3 +544,6 @@ impl Account {
             .unwrap_or(0)
     }
 }
+
+#[cfg(test)]
+mod tests;

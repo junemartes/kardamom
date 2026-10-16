@@ -488,7 +488,7 @@ All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-can
 
 | Metric | Meaning |
 | --- | --- |
-| `probe_total{probe,endpoint,outcome}` | Probe runs. A failure outcome adds one detail label: `code` (`rpc_error`), `reason` (`rejected`), `stage` (`timeout`) or `field` (`fee_mismatch`). |
+| `probe_total{probe,endpoint,outcome}` | Probe runs. `receipt_status_0` is a revert: the nonce is used. `skipped` is a transaction that the chain skipped: the nonce is free. A failure outcome adds one detail label: `code` (`rpc_error`), `reason` (`rejected`), `stage` (`timeout`) or `field` (`fee_mismatch`). |
 | `stage_seconds{probe,endpoint,stage}` | Stage latencies. `transfer`: `submit` (submit to hash), `offered`, `sealed`, `executed` and `receipt` (hash to each). `contract` and the market probes: `receipt` (submit to receipt); `contract` also `read`. `safe`: `safe` (receipt to the safe head). `deposit`: `l1_inclusion`, `l1_finality`, `l2_credit`. The buckets go from 5 ms to one hour. |
 | `last_success_timestamp_seconds{probe}` | The unix time of the last success. |
 | `balance_wei{layer,account}` | The balance of each canary account. |
