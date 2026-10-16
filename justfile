@@ -710,6 +710,12 @@ container-test $shard=env('SHARD', 'load'):
 shard $shard=env('SHARD', 'load'):
     @just --justfile deploy/cluster/justfile shard "$shard"
 
+# Run the calldata bench matrix on a running container cluster, and write
+# the table to `out`. scripts/bench-calldata.sh lists the settings.
+bench-calldata out=("docs/benches/calldata-" + datetime_utc("%Y-%m-%d") + ".md"):
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo build --release --locked -p kardamom-bench --bin kardamom-load
+    scripts/bench-calldata.sh "{{ out }}"
+
 # Collect node and job state after a failure.
 container-diagnostics:
     @just --justfile deploy/cluster/justfile container-diagnostics

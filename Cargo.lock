@@ -3818,6 +3818,7 @@ dependencies = [
  "core_affinity",
  "crossbeam-channel",
  "dhat",
+ "futures",
  "hdrhistogram",
  "humantime",
  "jsonrpsee",

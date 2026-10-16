@@ -28,16 +28,19 @@ use kardamom_types::{
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription};
 use crate::error::IngressError;
+use crate::seal_latency::SealStamps;
 
 // ---------------------------------------------------------------------------
 // IngressPublication adapter over M TxDataPublisherHandle.
 // ---------------------------------------------------------------------------
 
 /// M per-shard `tx_data` publisher handles behind the proxy's
-/// [`IngressPublication`] trait.
+/// [`IngressPublication`] trait, and the seal stamps of the published
+/// transactions.
 #[derive(Clone)]
 pub struct LiveIngressPublication {
     tx_data: Vec<TxDataPublisherHandle>,
+    stamps: SealStamps,
 }
 
 impl LiveIngressPublication {
@@ -52,6 +55,7 @@ impl LiveIngressPublication {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         lanes: NonZeroU8,
+        stamps: SealStamps,
     ) -> Result<Self, IngressError> {
         let mut tx_data = Vec::with_capacity(usize::from(lanes.get()));
         for lane in 0..lanes.get() {
@@ -61,7 +65,7 @@ impl LiveIngressPublication {
                 .map_err(|e| IngressError::internal(format!("open tx_data[{lane}]"), e))?;
             tx_data.push(handle);
         }
-        Ok(Self { tx_data })
+        Ok(Self { tx_data, stamps })
     }
 }
 
@@ -76,6 +80,9 @@ impl IngressPublication for LiveIngressPublication {
             .get(shard)
             .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
             .clone();
+        // The stamp comes before the publish, so the egress tap always
+        // has it when the seal arrives.
+        self.stamps.stamp(envelope.tx_hash);
         // The Aeron publish blocks through the runtime's command channel.
         // This runs it off the reactor thread, so it does not stall the
         // JSON-RPC server.
@@ -439,6 +446,7 @@ mod tests {
     async fn publication_rejects_out_of_range_shard() {
         let publication = LiveIngressPublication {
             tx_data: Vec::new(),
+            stamps: crate::seal_latency::SealClock::pair().0,
         };
         let err = publication
             .publish_tx_data(0, TxEnvelope::default())
