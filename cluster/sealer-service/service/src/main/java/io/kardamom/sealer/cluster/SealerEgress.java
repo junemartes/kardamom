@@ -451,22 +451,35 @@ final class SealerEgress {
      * Frame and broadcast the chain's status to every session, or offer it
      * to one session: {@code kind(1) | posted_head(8) | sealed_head(8) |
      * budget(8) | halted(1) | retained(8) | floor_index(8) | floor_block(8)
-     * | best_recorded(8) | record_lag_budget(8) | record_lag_halted(1)}.
-     * Not retained: a session that announces itself gets the current one.
+     * | best_recorded(8) | record_lag_budget(8) | record_lag_halted(1) |
+     * snapshot_follows(1)}. Not retained: a session that announces itself
+     * gets the current one.
      */
     void offerStatus(final ClusterStatus status) {
-        final int len = frameStatus(status);
+        broadcastStatus(status, false);
+    }
+
+    /**
+     * Broadcast the status with the snapshot notice: a snapshot follows,
+     * and no frame leaves the leader until the snapshot is complete.
+     */
+    void offerSnapshotNotice(final ClusterStatus status) {
+        broadcastStatus(status, true);
+    }
+
+    /** {@link #offerStatus(ClusterStatus)} to one session. */
+    void offerStatus(final ClientSession session, final ClusterStatus status) {
+        offerToSession(session, frameStatus(status, false));
+    }
+
+    private void broadcastStatus(final ClusterStatus status, final boolean snapshotFollows) {
+        final int len = frameStatus(status, snapshotFollows);
         for (final ClientSession session : cluster.clientSessions()) {
             offerToSession(session, len);
         }
     }
 
-    /** {@link #offerStatus(ClusterStatus)} to one session. */
-    void offerStatus(final ClientSession session, final ClusterStatus status) {
-        offerToSession(session, frameStatus(status));
-    }
-
-    private int frameStatus(final ClusterStatus status) {
+    private int frameStatus(final ClusterStatus status, final boolean snapshotFollows) {
         final MutableDirectBuffer buf = egressBuffer;
         int pos = 0;
         buf.putByte(pos, SealerWire.EGRESS_KIND_STATUS);
@@ -490,6 +503,8 @@ final class SealerEgress {
         buf.putLong(pos, status.recordLagBudget(), ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         buf.putByte(pos, status.recordLagHalted() ? (byte) 1 : (byte) 0);
+        pos += Byte.BYTES;
+        buf.putByte(pos, snapshotFollows ? (byte) 1 : (byte) 0);
         pos += Byte.BYTES;
         return pos;
     }

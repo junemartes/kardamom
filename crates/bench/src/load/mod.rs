@@ -268,18 +268,11 @@ impl LoadRun<'_> {
                 "UNRESOLVED pending tx (forensics: query per replica)"
             );
         });
-        // In `Offered` mode, an unlanded transaction, one that was
-        // offered but never receipted, is also a must-deliver
-        // violation. Fold it into `missing` for the gate.
-        let missing_gate = if self.cfg.completeness == Completeness::Offered {
-            pending.missing + pending.unlanded
-        } else {
-            pending.missing
-        };
         evaluate(&EvalInput {
             counts,
-            missing: missing_gate,
+            missing: pending.missing,
             unlanded: pending.unlanded,
+            completeness: self.cfg.completeness,
             base,
             fin,
             recheck,
@@ -552,6 +545,7 @@ impl Prepared {
             cfg.duration,
             SubmitOpts {
                 retry: cfg.retry_submit,
+                pause_wait: cfg.pause_wait,
                 mode,
                 feed_confirm,
             },
@@ -603,6 +597,7 @@ impl RampRun<'_> {
             self.step_dur,
             SubmitOpts {
                 retry: self.cfg.retry_submit,
+                pause_wait: self.cfg.pause_wait,
                 mode: self.mode,
                 feed_confirm: self.cfg.feed_confirm_on(),
             },

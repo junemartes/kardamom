@@ -116,7 +116,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 6 | Remote-origin reject | `[kind=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]` | the offering session |
 | 7 | Past deadline | `[kind=7][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]` | the offering session |
 | 8 | Window full | `[kind=8][sender:20][nonce:u64]` | the offering session |
-| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64][best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]` (67 bytes) | all sessions |
+| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64][best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8][snapshot_follows:u8]` (68 bytes) | all sessions |
 | 10 | DA-lag reject | `[kind=10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]` | the offering session |
 | 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
@@ -131,6 +131,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 - Kind 9: the status of the chain. `halted` is `1` when the DA-lag guard refuses user records.
   - The last 17 bytes are the record-lag guard. `best_recorded` is `u64::MAX` before the first recorded cursor. `record_lag_halted` is `1` when the record-lag guard refuses user records.
   - A reader that knows only the first 50 bytes ignores the last 17. The Rust reader reads a 50-byte frame as no recorded cursor and the guard off.
+  - The last byte is the snapshot notice. `snapshot_follows` is `1` on the status before a snapshot: the consensus module sends nothing until the snapshot is complete. A client then waits for the next frame for 60 s, not 10 s. See [Snapshot](#snapshot). A reader reads a 67-byte frame as no snapshot.
   - This egress kind 9 is not the ingress kind 9 (the recorded cursor).
   - The service sends it on each boundary tick, on each posted cursor that moves up, on each recorded cursor that moves the best cursor up, and to a session that announces itself with a kind 1 or a kind 2.
   - It is not retained. A session that announces itself gets the current status.
@@ -361,7 +362,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
-| `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
+| `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot, in seconds. The leader asks for a snapshot on every boundary tick whose block number is a multiple of `snapshotIntervalS * 1000 / tickMs`. `0` turns it off. An interval shorter than one tick stops the start. |
 | `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. `0` turns the join watchdog off, and with it the exit on a closed component. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
@@ -490,6 +491,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster DROPPED malformed` | The service dropped a malformed frame. The line names the frame type. A non-zero count means that the Java and Rust layouts differ. |
 | `cluster REPLAY` | A replay request. A served replay ends with `served=`, `queued=` and `dropped=`. A refusal ends with `AHEAD head=(index,block)`, `SKEWED` or `UNAVAILABLE`. `AHEAD` means that the cursor is past the head. `SKEWED` means that `from_index` is outside the block that `from_block` names. |
 | `cluster EGRESS-CLOSE` | The service closed a client session because it could not take its frames. The line has the reason. See [Egress back-pressure](#egress-back-pressure). |
+| `sealer snapshot START` | The service starts its snapshot (`block`). The archive recording of the snapshot is open. |
 | `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`). A member that replays old log entries also prints it. |
 | `sealer snapshot RESTORED` | The member started from a snapshot. The line shows `block`, `canonicalCount`, `retained` and `postedHead`. |
 | `sealer state FRESH at genesis` | The member started with no snapshot and no seed. |
@@ -502,7 +504,8 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster SEED start` / `cluster SEED from-peer` | A blank member starts to copy a snapshot from a peer, and then ends the copy (`snapshotPosition`, `round`). |
 | `cluster SEED waiting-for-peer` | A round of the peer seed ended with no result (`outcome`, `backupState`, `retryInMs`). The member waits and does not start at genesis. |
 | `cluster SEED backup error` | The ClusterBackup of the peer seed reported an error. |
-| `cluster SNAPSHOT triggered` / `cluster SNAPSHOT attempt failed` | The scheduler asked for a cluster snapshot, or the attempt failed. The next tick tries again. |
+| `cluster SNAPSHOT requested` / `cluster SNAPSHOT attempt failed` | On a due tick (`block`), the leader asked for the periodic snapshot, or its control toggle held another request. The next due tick tries again. |
+| `cluster SNAPSHOT triggered` | The snapshot of the leader is complete: the first timer after it fired. `stallMs` is the time from the boundary tick before the snapshot to that timer. No status frame left the leader in that time. |
 | `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
@@ -536,7 +539,11 @@ The chaos suite and operators read these lines. The sealer has no other observab
     - A restore drops the cursor of an executor that is not a configured voter.
 - The retained egress frames follow the state section. See `retention` in [Settings](#settings).
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
-- The Raft snapshot interval is `snapshotIntervalS`. The leader triggers it. The action is a log entry, so all members snapshot at the same position.
+- The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
+- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.
+  - So the status of the due tick carries the snapshot notice (`snapshot_follows`). The notice leaves before the leader sets its toggle.
+  - After the notice, the ingress, the sequencer and the session watchdog of each client wait 60 s (`SNAPSHOT_SILENCE`), not 10 s, for the next frame. A stall past 60 s is still a lost quorum.
+  - A snapshot that an operator asks for with `ClusterTool` carries no notice.
 
 ## Build and test
 

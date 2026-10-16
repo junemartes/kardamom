@@ -15,6 +15,7 @@ use super::{LiveClusterConfig, OfferReq, ReplayOnConnect};
 use crate::gateway::OfferOutcome;
 use crate::wire::{
     EGRESS_KIND_REPLAY_AHEAD, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
+    EGRESS_KIND_STATUS, EgressItem,
 };
 
 // Replay-request resend state. The request is published on the cluster
@@ -181,6 +182,33 @@ impl EgressWatch {
     fn on_frame(&mut self, now: u64) {
         self.alive_at_ms = now;
         self.window_ms = EGRESS_SILENCE_RESET_MS;
+    }
+
+    /// One app payload for this session. A status with the snapshot
+    /// notice sets one window to the notice's silence budget: the leader
+    /// sends nothing until the snapshot is complete, so the silence is not
+    /// a dead path. The next frame sets the window back.
+    fn on_payload(&mut self, payload: &[u8], now: u64) {
+        let Some(budget) = Self::snapshot_budget(payload) else {
+            return;
+        };
+        self.alive_at_ms = now;
+        // A budget past u64::MAX ms is no limit.
+        self.window_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    }
+
+    /// The silence budget of a status frame with the snapshot notice, or
+    /// `None` for any other payload.
+    fn snapshot_budget(payload: &[u8]) -> Option<std::time::Duration> {
+        if payload.first() != Some(&EGRESS_KIND_STATUS) {
+            return None;
+        }
+        match EgressItem::decode(payload) {
+            Ok(EgressItem::Status(status)) if status.snapshot_follows => {
+                Some(status.silence_budget())
+            }
+            _ => None,
+        }
     }
 
     /// A session was (re)established. The window restarts, so a fresh
@@ -430,6 +458,7 @@ impl SessionLoop {
         if let Some(&kind) = payload.first() {
             self.replay_ask.on_payload(kind);
         }
+        self.egress_watch.on_payload(&payload, now_ms());
         let wanted = self
             .egress_kind_filter
             .as_ref()
@@ -709,6 +738,39 @@ mod tests {
         assert_eq!(
             watch.window_ms, EGRESS_SILENCE_RESET_MAX_MS,
             "the window caps"
+        );
+    }
+
+    /// A status with the snapshot notice holds the watchdog for the
+    /// snapshot budget once. The next frame sets the window back.
+    #[test]
+    fn egress_watch_waits_out_a_snapshot_after_its_notice() {
+        let notice = crate::wire::encode_status(&kardamom_types::ClusterStatus {
+            snapshot_follows: true,
+            ..Default::default()
+        });
+        let budget_ms = 60_000;
+        let mut watch = EgressWatch::new(0);
+        watch.on_frame(100);
+        watch.on_payload(&notice, 100);
+        assert_eq!(
+            watch.expired(100 + 3 * EGRESS_SILENCE_RESET_MS),
+            None,
+            "a snapshot stall longer than the normal window does not reset the session"
+        );
+        assert_eq!(watch.expired(100 + budget_ms), Some(budget_ms));
+
+        let mut watch = EgressWatch::new(0);
+        watch.on_payload(&notice, 100);
+        watch.on_frame(200);
+        watch.on_payload(
+            &crate::wire::encode_status(&kardamom_types::ClusterStatus::default()),
+            200,
+        );
+        assert_eq!(
+            watch.expired(200 + EGRESS_SILENCE_RESET_MS),
+            Some(EGRESS_SILENCE_RESET_MS),
+            "the frame after the snapshot sets the normal window back"
         );
     }
 

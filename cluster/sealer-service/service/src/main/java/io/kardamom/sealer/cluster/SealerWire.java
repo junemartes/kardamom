@@ -294,11 +294,15 @@ public final class SealerWire {
      * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}
      * (50 bytes), then the record-lag tail
      * {@code [best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]}
-     * (17 bytes). {@code best_recorded} is {@code u64::MAX} before the
-     * first recorded cursor. A reader that knows only the first 50 bytes
-     * ignores the tail. The ingress serves {@code safe} from the posted
-     * head and raises its {@code da_lag} halt from the flag. Not retained:
-     * a session learns the current status when it announces itself.
+     * (17 bytes), then the snapshot tail {@code [snapshot_follows:u8]}
+     * (1 byte, 68 bytes in all). {@code best_recorded} is {@code u64::MAX}
+     * before the first recorded cursor. {@code snapshot_follows} is 1 on the
+     * status before a snapshot: no frame comes until the snapshot is
+     * complete, so a client waits longer for the next one. A reader ignores
+     * a tail it does not know. The ingress serves {@code safe} from the
+     * posted head and raises its {@code da_lag} halt from the flag. Not
+     * retained: a session learns the current status when it announces
+     * itself.
      */
     public static final byte EGRESS_KIND_STATUS = 9;
     /**

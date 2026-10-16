@@ -66,10 +66,11 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
 # only when recordLagBudget is above 0.
 #
-# The status frame (kind 9) is 50 bytes, or 67 bytes with the record-lag
-# fields at the tail. A reader of either release reads either size: an old
-# reader ignores the tail, and a new reader reads a frame with no tail as
-# the guard off.
+# The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
+# fields at the tail, or 68 bytes with the snapshot notice after them. A
+# reader of either release reads each size: an old reader ignores a tail
+# it does not know, and a new reader reads a frame with no tail as the
+# guard off and no snapshot.
 [format.sealer-egress-kinds]
 writes = 12
 reads_min = 1

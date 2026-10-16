@@ -119,10 +119,12 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 }
 
-/// The egress kinds a publisher session reads: the boundaries, and every
-/// reject the sealer answers an offer with.
-pub const PUBLISHER_EGRESS_KINDS: [u8; 8] = [
+/// The egress kinds a publisher session reads: the boundaries, the
+/// status (for its snapshot notice), and every reject the sealer answers
+/// an offer with.
+pub const PUBLISHER_EGRESS_KINDS: [u8; 9] = [
     wire::EGRESS_KIND_BOUNDARY,
+    wire::EGRESS_KIND_STATUS,
     wire::EGRESS_KIND_CONTIGUITY_REJECT,
     wire::EGRESS_KIND_REMOTE_ORIGIN_REJECT,
     wire::EGRESS_KIND_PAST_DEADLINE,

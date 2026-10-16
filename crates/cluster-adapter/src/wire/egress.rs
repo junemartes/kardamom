@@ -211,6 +211,9 @@ impl EgressItem {
             floor_index: rd_u64(buf, 34)?,
             floor_block: rd_u64(buf, 42)?,
             record_lag: Self::decode_record_lag_tail(buf)?,
+            snapshot_follows: buf
+                .get(super::STATUS_WITH_RECORD_LAG_LEN)
+                .is_some_and(|flag| *flag != 0),
         }))
     }
 
@@ -520,7 +523,7 @@ pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
-    let mut b = Vec::with_capacity(super::STATUS_WITH_RECORD_LAG_LEN);
+    let mut b = Vec::with_capacity(super::STATUS_WITH_SNAPSHOT_LEN);
     b.push(EGRESS_KIND_STATUS);
     b.extend_from_slice(&status.posted_head.to_le_bytes());
     b.extend_from_slice(&status.sealed_head.to_le_bytes());
@@ -533,6 +536,7 @@ pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
     b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
     b.extend_from_slice(&lag.budget.to_le_bytes());
     b.push(u8::from(lag.halted));
+    b.push(u8::from(status.snapshot_follows));
     b
 }
 

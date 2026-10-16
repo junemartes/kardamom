@@ -6,6 +6,7 @@ import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntFunction;
 
 /**
  * Shared setup for the in-JVM {@link TestCluster} tests: the cluster builder
@@ -37,6 +38,14 @@ final class ClusterTestHarness {
      */
     static TestCluster.Builder builder(
             final int memberCount, final int dedupCapacity, final long tickMs) {
+        return builder(memberCount, memberId -> new SealerTestService(dedupCapacity, tickMs, memberId));
+    }
+
+    /**
+     * A TestCluster builder for {@code memberCount} static members, where
+     * member {@code i} hosts {@code service.apply(i)}.
+     */
+    static TestCluster.Builder builder(final int memberCount, final IntFunction<SealerTestService> service) {
         return TestCluster.aCluster()
                 .withStaticNodes(memberCount)
                 .withServiceSupplier(memberId ->
@@ -44,8 +53,7 @@ final class ClusterTestHarness {
                             // Call .index(memberId): TestNode.index()/role() identity
                             // and the harness's per-node bookkeeping read
                             // services[0].index(). The default supplier sets it too.
-                            (TestNode.TestService) new SealerTestService(
-                                    dedupCapacity, tickMs, memberId).index(memberId)
+                            service.apply(memberId).index(memberId)
                         });
     }
 

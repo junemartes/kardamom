@@ -142,6 +142,11 @@ pub(crate) struct EgressWatermarkFeed {
     /// [`SEALER_SILENCE`] the replica pauses on the sealer's lost quorum;
     /// the next boundary resumes it.
     last_boundary_seen: Instant,
+    /// The end of the snapshot stall that a status with the snapshot
+    /// notice announced, until the next boundary. The leader sends no
+    /// boundary until the snapshot is complete, so a gap before this
+    /// instant is neither a lag nor a lost quorum.
+    snapshot_until: Option<Instant>,
 }
 
 impl EgressWatermarkFeed {
@@ -163,6 +168,7 @@ impl EgressWatermarkFeed {
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
             last_boundary_seen: Instant::now(),
+            snapshot_until: None,
         }
     }
 
@@ -194,6 +200,9 @@ impl EgressWatermarkFeed {
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
         let now = Instant::now();
+        if self.in_snapshot(now) {
+            return;
+        }
         self.flag(now);
         self.pause_on_silence(now);
     }
@@ -224,6 +233,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_origin_gap_frame(frame) {
+            return;
+        }
+        if self.on_status_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -404,10 +416,38 @@ impl EgressWatermarkFeed {
     /// inter-arrival gap. The backlog drains instantly on resume, but
     /// the gap between the last pre-freeze arrival and this one is real
     /// wall-clock time.
+    /// Handle one status frame. Returns `true` when `frame` was a status.
+    /// A status with the snapshot notice starts the snapshot stall: until
+    /// its budget ends or the next boundary arrives, the boundary gap
+    /// neither flags a lag nor pauses the replica.
+    fn on_status_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_STATUS) {
+            return false;
+        }
+        if let Ok(EgressItem::Status(status)) = EgressItem::decode(frame)
+            && status.snapshot_follows
+        {
+            self.snapshot_until = Instant::now().checked_add(status.silence_budget());
+            tracing::info!(
+                partition = self.partition,
+                "sequencer: the sealer takes a snapshot; the boundaries stop until it is complete"
+            );
+        }
+        true
+    }
+
+    /// Whether a snapshot stall that a notice announced covers `now`.
+    fn in_snapshot(&self, now: Instant) -> bool {
+        self.snapshot_until.is_some_and(|until| now < until)
+    }
+
     fn on_boundary_frame(&mut self, frame: &[u8]) {
         if let Ok(EgressItem::Boundary(b)) = EgressItem::decode(frame) {
             let now = Instant::now();
-            self.flag(now);
+            if !self.in_snapshot(now) {
+                self.flag(now);
+            }
+            self.snapshot_until = None;
             self.last_boundary_at = Some(now);
             self.last_boundary_seen = now;
             process().follow(None);

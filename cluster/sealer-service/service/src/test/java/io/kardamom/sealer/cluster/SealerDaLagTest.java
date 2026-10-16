@@ -89,9 +89,9 @@ class SealerDaLagTest {
         assertEquals(1, ofKind(publisher, SealerWire.EGRESS_KIND_STATUS).size(),
             "a tick broadcasts the status to every session");
         // [kind:9][posted_head][sealed_head][budget][halted:u8][retained][floor_index][floor_block]
-        // then [best_recorded][record_lag_budget][record_lag_halted:u8]
+        // then [best_recorded][record_lag_budget][record_lag_halted:u8], then [snapshot_follows:u8]
         final byte[] status = ofKind(consumer, SealerWire.EGRESS_KIND_STATUS).get(1);
-        assertEquals(1 + 8 * 6 + 1 + 8 * 2 + 1, status.length);
+        assertEquals(1 + 8 * 6 + 1 + 8 * 2 + 1 + 1, status.length);
         final ByteBuffer b = le(status);
         assertEquals(9, b.get(0));
         assertEquals(0L, b.getLong(1), "posted head: nothing posted yet");

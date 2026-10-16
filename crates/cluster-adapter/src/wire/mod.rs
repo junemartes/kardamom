@@ -246,16 +246,21 @@ pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
 /// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`
 /// ([`STATUS_LEN`] bytes), then the record-lag tail
 /// `[best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]`
-/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all). `best_recorded` is
-/// `u64::MAX` before the first recorded cursor. A frame with no tail
-/// decodes as no cursor and the guard off. The ingress serves `safe` from
-/// the posted head and raises its `da_lag` halt from the flag. Not
-/// retained. Matches Java `EGRESS_KIND_STATUS`.
+/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the snapshot tail
+/// `[snapshot_follows:u8]` ([`STATUS_WITH_SNAPSHOT_LEN`] bytes in all).
+/// `best_recorded` is `u64::MAX` before the first recorded cursor. A frame
+/// with no record-lag tail decodes as no cursor and the guard off, and a
+/// frame with no snapshot tail as no snapshot. A reader ignores a tail it
+/// does not know. The ingress serves `safe` from the posted head and
+/// raises its `da_lag` halt from the flag. Not retained. Matches Java
+/// `EGRESS_KIND_STATUS`.
 pub const EGRESS_KIND_STATUS: u8 = 9;
 /// Length of an [`EGRESS_KIND_STATUS`] frame without the record-lag tail.
 pub const STATUS_LEN: usize = 50;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the record-lag tail.
 pub const STATUS_WITH_RECORD_LAG_LEN: usize = STATUS_LEN + 8 + 8 + 1;
+/// Length of an [`EGRESS_KIND_STATUS`] frame with the snapshot tail.
+pub const STATUS_WITH_SNAPSHOT_LEN: usize = STATUS_WITH_RECORD_LAG_LEN + 1;
 
 /// Egress kind: the DA-lag guard refused a record:
 /// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.

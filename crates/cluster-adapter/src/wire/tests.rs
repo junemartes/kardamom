@@ -4,7 +4,7 @@
 //! property that must hold.
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_types::cluster_status::RecordLagStatus;
+use kardamom_types::cluster_status::{RecordLagStatus, SEALER_SILENCE, SNAPSHOT_SILENCE};
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord};
 use kardamom_types::{
@@ -303,9 +303,10 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
         floor_index: 90_000,
         floor_block: 95,
         record_lag: RecordLagStatus::default(),
+        snapshot_follows: false,
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), STATUS_WITH_RECORD_LAG_LEN);
+    assert_eq!(b.len(), STATUS_WITH_SNAPSHOT_LEN);
     assert_eq!(b[0], 9, "kind 9 is the Java EGRESS_KIND_STATUS");
     assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 100);
     assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 160);
@@ -347,11 +348,44 @@ fn recorded_cursor_and_status_tail_layouts_are_pinned_byte_for_byte() {
         ..Default::default()
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), 67);
+    assert_eq!(b.len(), 68);
     assert_eq!(u64::from_le_bytes(b[50..58].try_into().unwrap()), 77);
     assert_eq!(u64::from_le_bytes(b[58..66].try_into().unwrap()), 16_384);
     assert_eq!(b[66], 1, "the record-lag flag at offset 66");
+    assert_eq!(b[67], 0, "the snapshot flag at offset 67");
     assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+}
+
+/// The status before a snapshot carries the snapshot flag at offset 67.
+/// A frame of a sealer with no snapshot tail reads as no snapshot, and a
+/// tail that a later sealer adds after the flag is ignored.
+#[test]
+fn the_snapshot_flag_follows_the_record_lag_tail() {
+    let status = kardamom_types::ClusterStatus {
+        sealed_head: 160,
+        snapshot_follows: true,
+        ..Default::default()
+    };
+    let b = encode_status(&status);
+    assert_eq!(b[67], 1, "the snapshot flag at offset 67");
+    assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+    assert_eq!(status.silence_budget(), SNAPSHOT_SILENCE);
+
+    let EgressItem::Status(old) = EgressItem::decode(&b[..STATUS_WITH_RECORD_LAG_LEN]).unwrap()
+    else {
+        panic!("a status frame decodes as a status");
+    };
+    assert!(
+        !old.snapshot_follows,
+        "no snapshot tail reads as no snapshot"
+    );
+    assert_eq!(old.silence_budget(), SEALER_SILENCE);
+
+    let longer = [b.as_slice(), &[0xAA; 8]].concat();
+    assert_eq!(
+        EgressItem::decode(&longer).unwrap(),
+        EgressItem::Status(status)
+    );
 }
 
 /// A sealer that does not send the record-lag tail sends 50 bytes. The

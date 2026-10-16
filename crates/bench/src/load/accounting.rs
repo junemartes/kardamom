@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 
-use crate::load::config::{LoadReport, RampStep};
+use crate::load::config::{Completeness, LoadReport, RampStep};
 use crate::load::engine::Counts;
 use crate::load::scrape::MetricsSnapshot;
 
@@ -44,6 +44,10 @@ pub(crate) struct EvalInput<'a> {
     pub missing: u64,
     /// The offered transactions whose submit failed and never landed.
     pub unlanded: u64,
+    /// What must get a receipt. Under `Offered`, every offered
+    /// transaction must, acked or not, so an unlanded one is undelivered
+    /// too.
+    pub completeness: Completeness,
     /// The metric snapshot at the start of the measured window.
     pub base: &'a MetricsSnapshot,
     /// The metric snapshot at the end, after a short settle time.
@@ -77,6 +81,40 @@ pub(crate) struct EvalInput<'a> {
     pub chaos_mode: bool,
 }
 
+impl EvalInput<'_> {
+    /// The transactions that must have a receipt and have none: the
+    /// accepted ones, plus the unlanded ones under the `Offered`
+    /// completeness. The two counts are disjoint parts
+    /// of the offered count, so the sum never saturates.
+    fn undelivered(&self) -> u64 {
+        if self.completeness == Completeness::Offered {
+            self.missing.saturating_add(self.unlanded)
+        } else {
+            self.missing
+        }
+    }
+
+    /// The failure text of the undelivered transactions. It names the
+    /// accepted and the unlanded counts apart: an unlanded transaction
+    /// never got an ack, so the ingress did not lose it.
+    fn undelivered_failure(&self) -> String {
+        if self.completeness == Completeness::Offered {
+            format!(
+                "{} offered tx(s) never receipted (must-deliver violated): \
+                 {} accepted with no receipt, {} unlanded (refused through all retries, never acked)",
+                self.undelivered(),
+                self.missing,
+                self.unlanded
+            )
+        } else {
+            format!(
+                "{} accepted tx(s) never receipted (must-deliver violated)",
+                self.missing
+            )
+        }
+    }
+}
+
 /// The harness verdict, with the computed accounting, serialized into
 /// the report.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -91,8 +129,9 @@ pub struct Verdict {
     pub accepted: u64,
     /// The transactions confirmed by a receipt.
     pub receipted: u64,
-    /// The accepted transactions with no receipt. This must be 0 under
-    /// `assert_all_delivered`.
+    /// The undelivered transactions: the accepted ones with no receipt,
+    /// plus the unlanded ones when the completeness counts them. This
+    /// must be 0 under `assert_all_delivered`.
     pub missing: u64,
     /// The offered transactions that never landed, because the submit
     /// failed through all retries.
@@ -307,7 +346,8 @@ fn completeness_failures(input: &EvalInput<'_>, drops: &DropAccounting) -> Vec<S
     if c.accepted == 0 {
         failures.push("ingress accepted ZERO txs (pipeline not reachable)".to_string());
     }
-    if input.assert_all_delivered && input.missing > 0 {
+    let undelivered = input.undelivered();
+    if input.assert_all_delivered && undelivered > 0 {
         // In blocking mode, acceptance proved the receipt existed, because
         // the submit parked on it. So if the product counters prove nothing
         // was dropped anywhere, an unresolved entry is a serving-layer
@@ -323,19 +363,16 @@ fn completeness_failures(input: &EvalInput<'_>, drops: &DropAccounting) -> Vec<S
         // fraction of accepted traffic is unresolved, "every counter reads
         // zero" points to a counter blind spot, not cache eviction. That
         // case must stay a hard failure.
-        let within_eviction_tail = input.missing <= (c.accepted / 100).max(50);
+        let within_eviction_tail = undelivered <= (c.accepted / 100).max(50);
         if input.ack_proves_receipt && drops_proven_zero && within_eviction_tail {
             tracing::warn!(
-                unserved = input.missing,
+                unserved = undelivered,
                 "accepted receipts unresolved by feed/refetch (ingress cache \
                  eviction); delivery proven by blocking ack + zero drop \
                  counters — not counted as missing"
             );
         } else {
-            failures.push(format!(
-                "{} accepted tx(s) never receipted (must-deliver violated)",
-                input.missing
-            ));
+            failures.push(input.undelivered_failure());
         }
     }
     if c.bad_status > 0 {
@@ -378,7 +415,7 @@ pub(crate) fn evaluate(input: &EvalInput<'_>) -> Verdict {
         offered: c.offered,
         accepted: c.accepted,
         receipted: c.receipted,
-        missing: input.missing,
+        missing: input.undelivered(),
         unlanded: input.unlanded,
         bad_status: c.bad_status,
         bad_receipt: c.bad_receipt,

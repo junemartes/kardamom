@@ -149,6 +149,12 @@ pub struct LoadConfig {
     pub drain_timeout: Duration,
     /// The number of per-submit retry attempts on a transient failure.
     pub retry_submit: u32,
+    /// How long one submit waits out the refusals of a paused ingress,
+    /// from the first one, before it counts as a failed attempt. A
+    /// paused ingress refuses a submit before it forwards it, so the
+    /// retry resubmits the same nonce and no nonce hole forms. Zero
+    /// turns the wait off.
+    pub pause_wait: Duration,
     /// The ramp increment for each step, in tx/s. Non-zero: it is a
     /// divisor at `per_sender_estimate`, and a step count of 0 would
     /// never advance the ramp.
@@ -243,6 +249,7 @@ impl Default for LoadConfig {
             max_gap: 5,
             drain_timeout: Duration::from_secs(90),
             retry_submit: 2,
+            pause_wait: Duration::ZERO,
             ramp_step_tps: NonZeroU32::MIN,
             ramp_step_secs: DEFAULT_RAMP_STEP_SECS,
             soak_fraction: 0.8,

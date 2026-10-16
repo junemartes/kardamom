@@ -9,6 +9,7 @@ fn raft_faults_cannot_hide_bad_receipts_or_replica_failures() {
     let mut verdict = Verdict {
         pass: false,
         missing: 0,
+        unlanded: 0,
         failures: vec!["receipt had non-0x1 status".into()],
         offered: 10,
         accepted: 10,
@@ -37,6 +38,7 @@ fn spec() -> LoadSpec {
         duration: PROBE_WINDOW,
         tps: NonZeroU32::MIN,
         retry_submit: 0,
+        pause_wait: PROBE_PAUSE_WAIT,
         max_gap: 0,
         drain_timeout: Duration::ZERO,
         report_path: PathBuf::new(),
@@ -59,6 +61,7 @@ fn a_probe_leg_needs_every_receipt_and_a_rate_and_names_its_meaning() {
     let mut verdict = Verdict {
         pass: true,
         missing: 0,
+        unlanded: 0,
         failures: Vec::new(),
         offered: 3000,
         accepted: 3000,
@@ -74,6 +77,19 @@ fn a_probe_leg_needs_every_receipt_and_a_rate_and_names_its_meaning() {
     );
     verdict.accepted = 3000;
     verdict.missing = 1;
+    verdict.unlanded = 1;
     verdict.pass = false;
-    assert!(leg.judge(case, &verdict).is_err());
+    let err = leg.judge(case, &verdict).unwrap_err().to_string();
+    assert!(
+        err.contains("missing=1 of 3000 offered") && err.contains("unlanded=1"),
+        "{err}"
+    );
+}
+
+/// The probe waits out a sealer halt that clears by itself: longer
+/// than the 10 s silence budget that starts it.
+#[test]
+fn the_probe_waits_out_a_paused_ingress_past_the_sealer_silence() {
+    assert!(PROBE_PAUSE_WAIT > Duration::from_secs(10));
+    assert_eq!(spec().pause_wait, PROBE_PAUSE_WAIT);
 }

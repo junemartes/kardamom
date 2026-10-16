@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use alloy_primitives::Address;
-use kardamom_cluster_adapter::wire::encode_record_lag_reject;
+use kardamom_cluster_adapter::wire::{
+    encode_egress_boundary, encode_record_lag_reject, encode_status,
+};
 use kardamom_sequencer::resync::{SealerRefusal, SharedWatermark};
-use kardamom_types::TxErrorReason;
 use kardamom_types::cluster_status::RecordLagStatus;
+use kardamom_types::{ClusterStatus, TxErrorReason};
 
 use super::EgressWatermarkFeed;
 
@@ -43,4 +47,38 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
         }
     );
     assert!(reject_rx.try_recv().is_err(), "a refusal is not a rewind");
+}
+
+/// A status with the snapshot notice holds the lag flag through the
+/// snapshot stall, the boundary after the stall included. The next
+/// boundary gap flags again.
+#[test]
+fn a_snapshot_notice_holds_the_lag_flag_until_the_next_boundary() {
+    let (deadline_tx, _deadline_rx) = crossbeam_channel::bounded(4);
+    let (reject_tx, _reject_rx) = crossbeam_channel::bounded(4);
+    let (origins, _origins_rx) = crossbeam_channel::unbounded();
+    let watermark = SharedWatermark::new();
+    let mut feed =
+        EgressWatermarkFeed::new(1, 0, watermark.clone(), reject_tx, deadline_tx, origins);
+    let notice = encode_status(&ClusterStatus {
+        snapshot_follows: true,
+        ..ClusterStatus::default()
+    });
+
+    feed.on_frame(&notice);
+    std::thread::sleep(Duration::from_millis(5));
+    feed.on_idle();
+    feed.on_frame(&encode_egress_boundary(9, 100, 0, 0));
+    assert_eq!(
+        watermark.take_lag(),
+        None,
+        "a stall that the notice announced is no lag"
+    );
+
+    std::thread::sleep(Duration::from_millis(5));
+    feed.on_idle();
+    assert!(
+        watermark.take_lag().is_some(),
+        "the boundary after the snapshot ends the stall"
+    );
 }

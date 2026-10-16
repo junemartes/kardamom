@@ -23,7 +23,13 @@ pub struct Verdict {
     pub pass: bool,
     #[serde(default)]
     pub failures: Vec<String>,
+    /// The undelivered transactions: the accepted ones with no receipt,
+    /// plus the unlanded ones when the completeness counts them.
     pub missing: u64,
+    /// The offered transactions that the ingress refused through all
+    /// retries, so they never got an ack.
+    #[serde(default)]
+    pub unlanded: u64,
     #[serde(default)]
     pub offered: u64,
     #[serde(default)]
@@ -58,6 +64,9 @@ pub struct LoadSpec {
     pub duration: Duration,
     pub tps: NonZeroU32,
     pub retry_submit: u32,
+    /// How long one submit waits out the refusals of a paused ingress,
+    /// from the first one. Zero turns the wait off.
+    pub pause_wait: Duration,
     pub max_gap: u64,
     pub drain_timeout: Duration,
     pub report_path: PathBuf,
@@ -88,6 +97,7 @@ impl LoadSpec {
             max_gap: self.max_gap,
             drain_timeout: self.drain_timeout,
             retry_submit: self.retry_submit,
+            pause_wait: self.pause_wait,
             ramp_step_tps,
             ramp_step_secs: NonZeroU64::new(15).context("ramp step secs")?,
             soak_fraction: 0.8,

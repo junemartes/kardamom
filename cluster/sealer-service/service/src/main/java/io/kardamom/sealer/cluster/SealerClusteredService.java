@@ -96,6 +96,10 @@ public final class SealerClusteredService implements ClusteredService {
     private CanonicalSealerState state;
     private SealerEgress egress;
     private SeedRecord seedRecord;
+    private SnapshotRequests snapshots;
+
+    /** The periodic snapshot. Empty leaves the snapshots to an operator and to the seed. */
+    private Optional<SnapshotSchedule> snapshotSchedule = Optional.empty();
 
     /**
      * The log position of the last entry this service applied. The admin
@@ -286,10 +290,17 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /** Ask for a snapshot on each boundary tick that {@code schedule} makes due. */
+    SealerClusteredService snapshotEvery(final SnapshotSchedule schedule) {
+        this.snapshotSchedule = Optional.of(schedule);
+        return this;
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
         this.seedRecord = new SeedRecord(cluster, memberId);
+        this.snapshots = new SnapshotRequests(cluster, memberId);
         if (snapshotImage != null) {
             // Restore canonical state from the cluster snapshot. An unreadable
             // or empty snapshot image is fatal. Restarting silently at genesis
@@ -958,7 +969,8 @@ public final class SealerClusteredService implements ClusteredService {
         }
         System.out.println("sealer seed CONFIRMED memberId=" + memberId + " block=" + state.blockNumber()
             + " canonicalCount=" + state.canonicalCount());
-        seedRecord.requestSnapshot();
+        requestSnapshot().ifPresent(requested -> System.out.println(
+            "sealer seed SNAPSHOT memberId=" + memberId + " requested=" + requested));
     }
 
     /**
@@ -1081,6 +1093,7 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
         recordServicePosition();
+        snapshots.onTimer(cluster.time(), state.blockNumber());
         egress.drainBacklogs();
         if (correlationId == WINDOW_TIMER_CORRELATION_ID) {
             flushWindow();
@@ -1095,7 +1108,7 @@ public final class SealerClusteredService implements ClusteredService {
         egress.offerBoundary(boundary);
         // The status rides every tick, so an observer sees the guard flip
         // and the retention stretch without waiting for a cursor record.
-        egress.offerStatus(status());
+        offerTickStatus();
         boundaryTicks++;
         if (boundaryTicks % BOUNDARY_TICK_LOG_EVERY == 0) {
             // The proof that the boundary clock runs. A stall with a leader
@@ -1109,8 +1122,36 @@ public final class SealerClusteredService implements ClusteredService {
         scheduleBoundaryTimer();
     }
 
+    /**
+     * Offer the status of a boundary tick. On a tick that the schedule
+     * makes due, the status carries the snapshot notice, and the leader
+     * asks for the snapshot.
+     */
+    private void offerTickStatus() {
+        if (snapshotSchedule.filter(schedule -> schedule.due(state.blockNumber())).isEmpty()) {
+            egress.offerStatus(status());
+            return;
+        }
+        requestSnapshot().ifPresent(requested -> System.out.println(
+            (requested ? "cluster SNAPSHOT requested" : "cluster SNAPSHOT attempt failed")
+                + " memberId=" + memberId + " block=" + state.blockNumber()));
+    }
+
+    /**
+     * Send the status with the snapshot notice to every session, then ask
+     * for a snapshot. The notice leaves before the consensus module stops,
+     * so a client waits for the snapshot and does not call the sealer lost.
+     * The value is the answer of the leader's toggle; empty on a follower.
+     */
+    private Optional<Boolean> requestSnapshot() {
+        egress.offerSnapshotNotice(status());
+        return snapshots.request();
+    }
+
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        System.out.println("sealer snapshot START memberId=" + memberId + " block=" + state.blockNumber());
+        snapshots.onSnapshot(lastBoundaryClockMs);
         // The snapshot action is a log event, so every member closes the
         // window here, and the snapshot never has to carry held records.
         flushWindow();
