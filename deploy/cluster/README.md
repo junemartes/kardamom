@@ -304,7 +304,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
 | Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary and compares the format registries. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
-| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. |
+| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
 | Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
 | Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
