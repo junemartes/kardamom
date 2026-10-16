@@ -172,10 +172,8 @@
          item.value | regex_replace('^.*@', '') }}
     method: HEAD
     headers:
-      Accept: >-
-        application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json,
-        application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
-    status_code: [200, 404]
+      Accept: "{{ workloads_gate_manifest_types }}"
+    status_code: [200, 401, 404]
   loop: "{{ workloads_image_refs | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
@@ -183,13 +181,53 @@
   check_mode: false
   when: workloads_registry_url != 'off'
 
+# A registry such as ghcr.io answers 401 without a token, also for a
+# public image. The challenge names the token service and the scope; an
+# anonymous token reads a public image.
+- name: Get a pull token for each image that the registry refuses without one
+  ansible.builtin.uri:
+    url: >-
+      {{ challenge | regex_findall('realm="([^"]+)"') | first }}?service={{
+         challenge | regex_findall('service="([^"]+)"') | first | urlencode }}&scope={{
+         challenge | regex_findall('scope="([^"]+)"') | first | urlencode }}
+    return_content: true
+  vars:
+    challenge: "{{ item.www_authenticate | default('') }}"
+  loop: "{{ workloads_gate_images.results | selectattr('status', 'defined') | selectattr('status', 'equalto', 401) | list }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  register: workloads_gate_tokens
+  check_mode: false
+  no_log: true
+  when: workloads_registry_url != 'off'
+
+- name: Check with the pull token each image that the registry refused without one
+  ansible.builtin.uri:
+    url: "{{ item.item.url }}"
+    method: HEAD
+    headers:
+      Accept: "{{ workloads_gate_manifest_types }}"
+      Authorization: "Bearer {{ item.json.token | default(item.json.access_token) }}"
+    status_code: [200, 404]
+  loop: "{{ workloads_gate_tokens.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.key }}"
+  register: workloads_gate_token_images
+  check_mode: false
+  no_log: true
+  when: workloads_registry_url != 'off'
+
 - name: Refuse a release whose image is not in the registry
   ansible.builtin.assert:
-    that: workloads_gate_images.results | selectattr('status', 'equalto', 404) | list | length == 0
+    that: missing | length == 0
     fail_msg: >-
-      Refused: the registry {{ workloads_registry_url }} does not hold the image of
-      {{ workloads_gate_images.results | selectattr('status', 'equalto', 404) | map(attribute='item.key') | join(', ') }}.
+      Refused: the registry {{ workloads_registry_url }} does not hold the image of {{ missing | join(', ') }}.
       Push the images (`just images`) or fix the manifest.
+  vars:
+    missing: >-
+      {{ (workloads_gate_images.results | selectattr('status', 'equalto', 404) | map(attribute='item.key') | list)
+         + (workloads_gate_token_images.results | selectattr('status', 'equalto', 404)
+            | map(attribute='item.item.item.key') | list) }}
   when: workloads_registry_url != 'off'
 
 # 4. The formats, against the accepted release (docs/formats.md). Without
