@@ -580,6 +580,18 @@ impl ResyncController {
         }
     }
 
+    /// Drain the terminal refusals the sealer answered this shard with.
+    /// Each one is a transaction no republish can order now.
+    pub fn drain_deadline_rejects(&mut self) -> Vec<SealerRefusal> {
+        drain_bounded(
+            &self.deadline_rx,
+            &mut self.deadline_rx_dead,
+            FLOOR_DRAIN_PER_ITER,
+            self.partition,
+            "past-deadline producer disconnected",
+        )
+    }
+
     /// Drain pending contiguity rejects into `(committed_drops,
     /// gap_rewinds)`:
     ///
@@ -603,19 +615,10 @@ impl ResyncController {
     ///   the lowest covers them all). Refs for `expected..nonce`
     ///   vanished, so rewind the unconfirmed ledger and republish.
     ///
+    /// The expected nonce of each reject is first raised to the receipt
+    /// floor. See [`Self::current_expected`].
+    ///
     /// Bounded per iteration, like the floor drain.
-    /// Drain the terminal refusals the sealer answered this shard with.
-    /// Each one is a transaction no republish can order now.
-    pub fn drain_deadline_rejects(&mut self) -> Vec<SealerRefusal> {
-        drain_bounded(
-            &self.deadline_rx,
-            &mut self.deadline_rx_dead,
-            FLOOR_DRAIN_PER_ITER,
-            self.partition,
-            "past-deadline producer disconnected",
-        )
-    }
-
     pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
         let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
@@ -627,9 +630,26 @@ impl ResyncController {
             "contiguity-reject producer disconnected",
         );
         for (sender, nonce, expected) in rejects {
-            fold_contiguity_reject(sender, nonce, expected, &mut drops, &mut lowest);
+            fold_contiguity_reject(
+                sender,
+                nonce,
+                self.current_expected(sender, expected),
+                &mut drops,
+                &mut lowest,
+            );
         }
         (drops, lowest.into_iter().collect())
+    }
+
+    /// The expected nonce of a contiguity reject, raised to the receipt
+    /// floor of `sender`. A receipt proves that every nonce below the
+    /// floor executed, so the sealer expects the floor or a later nonce.
+    /// A reject that names a lower nonce is stale: the sealer ordered that
+    /// nonce after it sent the reject. A floor rewind to the stale nonce
+    /// puts the sender below the chain for good. No later receipt raises
+    /// the floor again, because no ref of the sender publishes.
+    fn current_expected(&self, sender: Address, expected: u64) -> u64 {
+        self.floor(sender).map_or(expected, |f| f.max(expected))
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.

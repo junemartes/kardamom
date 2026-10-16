@@ -6,7 +6,7 @@
 //! ref it ordered long ago, so a refusal alone says nothing about the
 //! nonce. The sequencer moves its floor back only to the expected nonce
 //! that a contiguity reject names, and only when it holds no ref at that
-//! nonce. A resubmit at a refused nonce below the floor is offered again,
+//! nonce. The floor never goes back below the receipt floor. A resubmit at a refused nonce below the floor is offered again,
 //! and the sealer decides.
 
 use std::num::NonZeroU64;
@@ -17,7 +17,7 @@ use alloy_signer_local::PrivateKeySigner;
 use kardamom_types::{TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::resync::{ResyncChannel, ResyncConfig, SealerRefusal};
+use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig, SealerRefusal};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
@@ -33,6 +33,7 @@ const LATE: TxErrorReason = TxErrorReason::PastDeadline {
 struct Sealed {
     seq: Sequencer,
     rig: Rig,
+    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
     reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     /// The next free `tx_data` offset.
@@ -44,6 +45,7 @@ impl Sealed {
         let mut seq = Sequencer::new(cfg).unwrap();
         let ResyncChannel {
             controller,
+            floor_tx,
             reject_tx,
             deadline_tx,
             ..
@@ -52,6 +54,7 @@ impl Sealed {
         Self {
             seq,
             rig: Rig::default(),
+            floor_tx,
             reject_tx,
             deadline_tx,
             offset: 0,
@@ -125,6 +128,11 @@ impl Sealed {
         for nonce in nonces {
             self.reject_tx.send((s, *nonce, expected)).unwrap();
         }
+    }
+
+    /// The receipt of the executed tx of `s` at `nonce` arrives.
+    fn execute(&self, s: Address, nonce: u64) {
+        self.floor_tx.send(FloorUpdate::executed(s, nonce)).unwrap();
     }
 
     fn errors_of(&self, nonce: u64) -> Vec<TxErrorReason> {
@@ -367,4 +375,52 @@ fn a_late_refusal_spares_the_resubmit_that_replaced_its_copy() {
         1_000,
         "nonce 2 publishes the resubmit"
     );
+}
+
+/// The sealer refuses nonce 1, and the resubmit of 1 executes. The
+/// contiguity rejects of 2 and 3 with `expected=1` wait in the channel
+/// backlog, so the sequencer reads them after the receipt of 1. The
+/// chain is at nonce 2, so the rejects are stale: the floor does not go
+/// back to 1. Nonces 2 and 3 republish at once, and the sender goes on.
+#[test]
+fn a_reject_read_after_the_receipt_keeps_the_floor() {
+    let s = signer(29);
+    let mut sealed = Sealed::short_ttl();
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    sealed.refuse(s.address(), &[1]);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(4), vec![1], "the resubmit");
+
+    sealed.execute(s.address(), 1);
+    sealed.reject(s.address(), &[2, 3], 1);
+    sealed.step();
+    assert_eq!(
+        sealed.offered_nonces(5),
+        vec![2, 3],
+        "the rewind starts at the receipt floor"
+    );
+    sealed.submit(&s, 4);
+    assert_eq!(sealed.offered_nonces(7), vec![4]);
+    sealed.step_after_ttl();
+    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+}
+
+/// A window-full answer names the nonce of the refused copy as the
+/// expected nonce. The sequencer reads the answer to an older copy of
+/// nonce 2 after the receipt of 2. The receipt proves nonce 2, so the
+/// floor stays at 3, and nonce 3 publishes.
+#[test]
+fn a_window_full_answer_read_after_the_receipt_keeps_the_floor() {
+    let s = signer(30);
+    let mut sealed = Sealed::short_ttl();
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.execute(s.address(), 2);
+    sealed.reject(s.address(), &[2], 2);
+    sealed.step();
+
+    sealed.submit(&s, 3);
+    assert_eq!(sealed.offered_nonces(3), vec![3], "no stall");
+    sealed.step_after_ttl();
+    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
 }
