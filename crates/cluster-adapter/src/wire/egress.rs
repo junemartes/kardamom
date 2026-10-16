@@ -22,8 +22,8 @@ use super::{
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX,
     RT_TX_OFFER, RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN,
-    STATUS_WITH_RECORD_LAG_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8,
-    rd_u64, too_short,
+    STATUS_WITH_RECORD_LAG_LEN, STATUS_WITH_RETAINED_BYTES_LEN, WireError, encode_kind_2u64,
+    rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -227,9 +227,11 @@ impl EgressItem {
     }
 
     /// The byte tail after the record-lag tail of a status frame. A frame
-    /// with no byte tail reads as no retained bytes.
+    /// shorter than [`STATUS_WITH_RETAINED_BYTES_LEN`] has no byte tail and
+    /// reads as no retained bytes. Its bytes after the record-lag tail are
+    /// unknown, so the reader ignores them.
     fn decode_retained_bytes_tail(buf: &[u8]) -> Result<Option<u64>, WireError> {
-        if buf.len() <= STATUS_WITH_RECORD_LAG_LEN {
+        if buf.len() < STATUS_WITH_RETAINED_BYTES_LEN {
             return Ok(None);
         }
         rd_u64(buf, STATUS_WITH_RECORD_LAG_LEN).map(Some)
