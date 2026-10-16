@@ -19,11 +19,11 @@ use super::{
     sealers, unchecked_target, wipe_node,
 };
 use crate::cases::cache::freeze_and_flush;
-use crate::cases::component::{executor_containers, wipe_dirs};
+use crate::cases::component::wipe_dirs;
 use crate::evidence::CountWait;
 use crate::harness::Harness;
 use crate::l1::L1;
-use crate::nomad::{SavedJob, Streams};
+use crate::nomad::{Nodes, SavedJob, Streams};
 use crate::poll::{self, Budget};
 use crate::probes::CLUSTER_TASK;
 use crate::stages::rebuild::{Output, Rebuild, Rebuilt};
@@ -145,7 +145,7 @@ struct FleetWipe<'a> {
     h: &'a Harness,
     jobs: Jobs,
     l1: L1,
-    executors: Vec<String>,
+    executors: Executors,
     sealers: Vec<String>,
     aux: String,
 }
@@ -155,7 +155,7 @@ impl<'a> FleetWipe<'a> {
         Ok(Self {
             jobs: Jobs::capture(h).await?,
             l1: L1::new(h).await?,
-            executors: executor_containers(h),
+            executors: Executors::of(h)?,
             sealers: sealers(h)?,
             aux: h.probes.validator.container.clone(),
             h,
@@ -170,21 +170,6 @@ impl<'a> FleetWipe<'a> {
         self.resume_executors(&seeded).await?;
         self.resume_the_rest(&seeded).await?;
         self.assert_the_record_continues(seeded.head.block).await
-    }
-
-    /// The executor that keeps the state of the old chain.
-    fn stale(&self) -> anyhow::Result<&str> {
-        self.executors
-            .last()
-            .map(String::as_str)
-            .ok_or_else(|| crate::chaos_fail!("{CTX}: no executor node"))
-    }
-
-    /// The executors that resume on the rebuilt image at once.
-    fn fresh(&self) -> &[String] {
-        self.executors
-            .split_last()
-            .map_or(&[][..], |(_, fresh)| fresh)
     }
 
     /// Stop the ingress and let the blocks in flight land and post. Then
@@ -318,7 +303,7 @@ impl<'a> FleetWipe<'a> {
             sealer_seed: None,
         };
         let (image, validator) = tokio::join!(
-            install_rebuilt_image(self.h, CTX, self.fresh(), head, Some(seed.clone())),
+            install_rebuilt_image(self.h, CTX, &self.executors.fresh, head, Some(seed.clone())),
             validator.run()
         );
         let seeded = Seeded {
@@ -344,7 +329,7 @@ impl<'a> FleetWipe<'a> {
             self.seed_node(node, seeded).await?;
         }
         let checkpoints = format!("find {} -mindepth 1 -delete", StateOwner::CHECKPOINTS);
-        wipe_dirs(self.h, self.stale()?, CTX, &checkpoints).await?;
+        wipe_dirs(self.h, &self.executors.stale, CTX, &checkpoints).await?;
         let owner = StateOwner::read(self.h, CTX, &self.aux, VALIDATOR_STATE).await?;
         wipe_dirs(self.h, &self.aux, CTX, &owner.wipe_script()).await?;
         install_image(self.h, CTX, &self.aux, &owner, &seeded.validator).await?;
@@ -426,24 +411,32 @@ impl<'a> FleetWipe<'a> {
     /// Start the executors. The fresh ones resume at `(E_H, H + 1)`; the
     /// stale one asks for a cursor past the head and gets `REPLAY_AHEAD`.
     /// Then the stale one gets the image too, and all of them resume.
+    ///
+    /// The stale executor exits at each start, and Nomad holds it in a
+    /// restart delay for most of the time. So the first start waits for
+    /// the fresh executors' allocations only.
     async fn resume_executors(&self, seeded: &Seeded) -> anyhow::Result<()> {
         let base = ResumeCounts::read(self.h, &seeded.head).await?;
-        self.jobs.executor.restore().await?;
-        base.await_resumed(self.h, &seeded.head, self.fresh().len())
+        self.jobs
+            .executor
+            .restore_on(&self.executors.fresh_nodes)
             .await?;
-        base.await_ahead(self.h).await?;
+        base.await_resumed(self.h, &seeded.head, self.executors.fresh.len())
+            .await?;
+        base.await_ahead(self.h, &seeded.head).await?;
+        base.assert_stale_not_served(self.h, &seeded.head).await?;
         base.assert_no_checkpoint(self.h).await?;
         self.jobs.executor.stop().await?;
-        let stale = self.stale()?;
+        let stale = &self.executors.stale;
         let owner = wipe_node(self.h, CTX, stale).await?;
         install_image(self.h, CTX, stale, &owner, &seeded.image).await?;
         let resumed = self.count(RESUMED, "executor").await?;
         self.jobs.executor.restore().await?;
-        self.wait_count("executor", RESUMED, resumed, self.executors.len())
+        self.wait_count("executor", RESUMED, resumed, self.executors.count)
             .await?;
         crate::log(format!(
             "{CTX}: all {} executors resume on the new chain",
-            self.executors.len()
+            self.executors.count
         ));
         Ok(())
     }
@@ -583,6 +576,40 @@ impl<'a> FleetWipe<'a> {
         if let Err(e) = job.restore().await {
             crate::log(format!("{CTX}: could not start a job again: {e:#}"));
         }
+    }
+}
+
+/// The executor nodes of the case. The stale one keeps the state of the
+/// old chain. The fresh ones resume on the rebuilt image at once.
+struct Executors {
+    /// The container of the stale executor.
+    stale: String,
+    /// The containers of the fresh executors.
+    fresh: Vec<String>,
+    /// The Nomad names of the fresh executor nodes.
+    fresh_nodes: Nodes,
+    /// The count of executor nodes: the fresh ones and the stale one.
+    count: usize,
+}
+
+impl Executors {
+    /// The executor nodes of the contract, by index. The last one is the
+    /// stale one.
+    fn of(h: &Harness) -> anyhow::Result<Self> {
+        let all = h.contract.of_role("executor");
+        let (stale, fresh) = all
+            .split_last()
+            .ok_or_else(|| crate::chaos_fail!("{CTX}: no executor node"))?;
+        let fresh_nodes =
+            Nodes::new(fresh.iter().map(|node| node.name.clone())).ok_or_else(|| {
+                crate::chaos_fail!("{CTX}: the case needs two executor nodes or more")
+            })?;
+        Ok(Self {
+            stale: stale.container.clone(),
+            fresh: fresh.iter().map(|node| node.container.clone()).collect(),
+            fresh_nodes,
+            count: all.len(),
+        })
     }
 }
 
