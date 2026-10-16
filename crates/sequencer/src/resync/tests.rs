@@ -233,20 +233,35 @@ fn contiguity_rejects_split_drops_from_rewinds() {
     // Gap rejects (nonce >= expected): a rejected batch produces one
     // reject per entry. The drain collapses them into one rewind per
     // sender, at the lowest expected value.
-    reject_tx.send((s(1), 9, 7)).unwrap();
-    reject_tx.send((s(1), 8, 5)).unwrap();
-    reject_tx.send((s(1), 12, 9)).unwrap();
-    reject_tx.send((s(2), 3, 3)).unwrap();
+    let reject = |sender, nonce, expected| SealerAnswer::ContiguityReject {
+        sender,
+        nonce,
+        expected,
+    };
+    reject_tx.send(reject(s(1), 9, 7)).unwrap();
+    reject_tx.send(reject(s(1), 8, 5)).unwrap();
+    reject_tx.send(reject(s(1), 12, 9)).unwrap();
+    reject_tx.send(reject(s(2), 4, 3)).unwrap();
     // Committed-proof reject (nonce < expected): the ref sealed long ago,
     // and its dedup entry aged out. This confirms by reject, so drop the
     // entry.
-    reject_tx.send((s(3), 0, 1)).unwrap();
-    let (drops, mut rewinds) = c.drain_contiguity_rejects();
-    rewinds.sort();
-    assert_eq!(rewinds, vec![(s(1), 5), (s(2), 3)]);
-    assert_eq!(drops, vec![(s(3), 0)]);
-    let (drops, rewinds) = c.drain_contiguity_rejects();
-    assert!(drops.is_empty() && rewinds.is_empty());
+    reject_tx.send(reject(s(3), 0, 1)).unwrap();
+    // A window-full answer names no expected nonce. It is neither a drop
+    // nor a gap.
+    reject_tx
+        .send(SealerAnswer::WindowFull {
+            sender: s(4),
+            nonce: 6,
+        })
+        .unwrap();
+    let drain = c.drain_answers();
+    let mut gaps: Vec<_> = drain.gaps.into_iter().collect();
+    gaps.sort();
+    assert_eq!(gaps, vec![(s(1), 5), (s(2), 3)]);
+    assert_eq!(drain.drops, vec![(s(3), 0)]);
+    assert_eq!(drain.window_full, vec![(s(4), 6)]);
+    let drain = c.drain_answers();
+    assert!(drain.drops.is_empty() && drain.gaps.is_empty() && drain.window_full.is_empty());
 }
 
 #[test]
@@ -295,10 +310,14 @@ fn channels_are_bounded_to_dedup_capacity() {
         Err(crossbeam_channel::TrySendError::Full(_))
     ));
 
-    assert!(reject_tx.try_send((s(1), 0, 0)).is_ok());
-    assert!(reject_tx.try_send((s(1), 0, 0)).is_ok());
+    let full = SealerAnswer::WindowFull {
+        sender: s(1),
+        nonce: 0,
+    };
+    assert!(reject_tx.try_send(full).is_ok());
+    assert!(reject_tx.try_send(full).is_ok());
     assert!(matches!(
-        reject_tx.try_send((s(1), 0, 0)),
+        reject_tx.try_send(full),
         Err(crossbeam_channel::TrySendError::Full(_))
     ));
 }

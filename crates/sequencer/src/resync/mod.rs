@@ -40,6 +40,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
+mod answers;
+
+pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
+
 /// Milliseconds since `since`, saturated to `u64::MAX`. An elapsed time
 /// this large never happens in practice, and saturating keeps a
 /// threshold comparison (`elapsed_ms >= cfg.some_ms`) correct even in
@@ -358,14 +362,9 @@ pub struct ResyncController {
     /// The drain sets this when it sees `Disconnected`. It logs the event
     /// once. It does not treat the channel as "empty forever".
     floor_rx_dead: bool,
-    /// `(sender, nonce, expected)` contiguity rejects, forwarded by the
-    /// egress-watermark thread. The sealer refused a ref whose nonce was
-    /// not the sender's expected next one. `nonce >= expected` means a
-    /// gap: rewind the unconfirmed ledger from `expected` and republish.
-    /// `nonce < expected` means the ref already committed (the guard's
-    /// expected nonce advanced past it), and its dedup entry aged out.
-    /// This confirms by reject, dropping the ledger entry.
-    reject_rx: Receiver<(Address, u64, u64)>,
+    /// The contiguity rejects and the window-full answers, forwarded by
+    /// the egress-watermark thread. See [`Self::drain_answers`].
+    reject_rx: Receiver<SealerAnswer>,
     reject_rx_dead: bool,
     /// The sealer's terminal refusals, forwarded by the egress-watermark
     /// thread: a ref whose inclusion deadline the open block had passed,
@@ -412,28 +411,6 @@ fn drain_bounded<T>(
     out
 }
 
-/// Fold one contiguity reject into `drops`/`lowest`, for
-/// [`ResyncController::drain_contiguity_rejects`]'s loop. `nonce <
-/// expected` proves the ref already committed (see that method's doc
-/// comment), so it drops; otherwise it is a gap rewind, deduplicated per
-/// sender to the lowest `expected`.
-fn fold_contiguity_reject(
-    sender: Address,
-    nonce: u64,
-    expected: u64,
-    drops: &mut Vec<(Address, u64)>,
-    lowest: &mut HashMap<Address, u64>,
-) {
-    if nonce < expected {
-        drops.push((sender, nonce));
-    } else {
-        lowest
-            .entry(sender)
-            .and_modify(|e| *e = (*e).min(expected))
-            .or_insert(expected);
-    }
-}
-
 /// One [`drain_bounded`] step: `Continue` carries the next item; `Break`
 /// means the channel is empty, or disconnected (latching `*dead` and
 /// warning once on the first disconnect this sees).
@@ -468,11 +445,6 @@ fn warn_once_dead(dead: &mut bool, partition: u32, on_dead: &str) {
 /// [`ResyncController::drain_floor_updates`].
 pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 
-/// One drain of the contiguity-reject channel:
-/// `(committed_drops, gap_rewinds)`. See
-/// [`ResyncController::drain_contiguity_rejects`].
-pub type RejectDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
-
 impl ResyncController {
     /// # Errors
     ///
@@ -482,7 +454,7 @@ impl ResyncController {
         cfg: ResyncConfig,
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
-        reject_rx: Receiver<(Address, u64, u64)>,
+        reject_rx: Receiver<SealerAnswer>,
         deadline_rx: Receiver<SealerRefusal>,
         watermark: SharedWatermark,
     ) -> Result<Self, ResyncConfigError> {
@@ -578,78 +550,6 @@ impl ResyncController {
             *e = floor;
             raised.push((u.sender, floor));
         }
-    }
-
-    /// Drain the terminal refusals the sealer answered this shard with.
-    /// Each one is a transaction no republish can order now.
-    pub fn drain_deadline_rejects(&mut self) -> Vec<SealerRefusal> {
-        drain_bounded(
-            &self.deadline_rx,
-            &mut self.deadline_rx_dead,
-            FLOOR_DRAIN_PER_ITER,
-            self.partition,
-            "past-deadline producer disconnected",
-        )
-    }
-
-    /// Drain pending contiguity rejects into `(committed_drops,
-    /// gap_rewinds)`:
-    ///
-    /// - `committed_drops`: `(sender, nonce)` rejects with `nonce <
-    ///   expected`. The guard's expected nonce is already past this ref,
-    ///   which proves it committed (per-sender contiguity means the guard
-    ///   accepted it on the way up). Its dedup entry merely aged out. The
-    ///   ledger entry is dropped, like a receipt confirmation would drop
-    ///   it. Not dropping it would re-offer the ref every confirm timeout
-    ///   forever (the nonce-0 case has no confirming receipt at all,
-    ///   since nonce-0 receipts cannot be told apart from deposits and
-    ///   never confirm). Caveat: if the sealer evicted and re-seeded this
-    ///   sender above a genuinely voided ref, this drops a ref that never
-    ///   sealed. But republishing can never seal it either, since the
-    ///   guard rejects it forever. So the drop only trades an infinite
-    ///   reject loop for an honest, bounded degradation, in the same
-    ///   eviction-floor class the guard itself documents.
-    /// - `gap_rewinds`: `(sender, expected)` rejects with `nonce >=
-    ///   expected`, deduplicated per sender to the lowest expected (a
-    ///   rejected batch produces one reject per entry, and one rewind to
-    ///   the lowest covers them all). Refs for `expected..nonce`
-    ///   vanished, so rewind the unconfirmed ledger and republish.
-    ///
-    /// The expected nonce of each reject is first raised to the receipt
-    /// floor. See [`Self::current_expected`].
-    ///
-    /// Bounded per iteration, like the floor drain.
-    pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
-        let mut drops: Vec<(Address, u64)> = Vec::new();
-        let mut lowest: HashMap<Address, u64> = HashMap::new();
-        let rejects = drain_bounded(
-            &self.reject_rx,
-            &mut self.reject_rx_dead,
-            FLOOR_DRAIN_PER_ITER,
-            self.partition,
-            "contiguity-reject producer disconnected",
-        );
-        for (sender, nonce, expected) in rejects {
-            fold_contiguity_reject(
-                sender,
-                nonce,
-                self.current_expected(sender, expected),
-                &mut drops,
-                &mut lowest,
-            );
-        }
-        (drops, lowest.into_iter().collect())
-    }
-
-    /// The expected nonce of a contiguity reject, raised to the receipt
-    /// floor of `sender`. A receipt proves that every nonce below the
-    /// floor executed, so the sealer expects the floor or a later nonce.
-    /// A reject that names a lower nonce is stale: the sealer ordered that
-    /// nonce after it sent the reject. A floor rewind to the stale nonce
-    /// puts the sender below the chain for good. No later receipt raises
-    /// the floor again, because no ref of the sender publishes.
-    fn current_expected(&self, sender: Address, expected: u64) -> u64 {
-        self.floor(sender).map_or(expected, |f| f.max(expected))
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
@@ -770,18 +670,6 @@ impl ResyncController {
     }
 }
 
-/// One terminal refusal from the sealer: the ref of `sender` at `nonce`
-/// is not ordered, and `reason` is what the client is told. The past
-/// deadline, the DA lag and the record lag share this path, because the
-/// remedy is the same: drop the ledger entry, free the nonce, and tell the
-/// client, who resubmits.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealerRefusal {
-    pub sender: Address,
-    pub nonce: u64,
-    pub reason: kardamom_types::TxErrorReason,
-}
-
 /// What [`ResyncChannel::open`] hands back: the controller (publish
 /// loop), the floor-update sender (receipts thread), the `(sender,
 /// nonce, expected)` contiguity-reject sender (egress-watermark thread),
@@ -792,7 +680,7 @@ pub struct SealerRefusal {
 pub struct ResyncChannel {
     pub controller: ResyncController,
     pub floor_tx: Sender<FloorUpdate>,
-    pub reject_tx: Sender<(Address, u64, u64)>,
+    pub reject_tx: Sender<SealerAnswer>,
     /// The sealer's terminal refusals: late refs, and refs the DA-lag
     /// guard or the record-lag guard refused. No republish can order them
     /// now.

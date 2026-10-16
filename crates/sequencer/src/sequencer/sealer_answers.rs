@@ -10,25 +10,44 @@ use tracing::{trace, warn};
 
 use super::{RefMetadata, Sequencer, SequencerPorts};
 use crate::metrics;
-use crate::resync::SealerRefusal;
+use crate::resync::{AnswerDrain, SealerRefusal};
 use crate::state::FreedNonce;
 
 impl Sequencer {
-    /// The sealer rejected this sequencer's ref because its nonce was not
-    /// the sender's expected next one. Two cases, split in the drain:
+    /// The sealer did not take refs of this sequencer. Three cases, split
+    /// in the drain (see `ResyncController::drain_answers`):
     ///
     /// - Committed-proof (nonce < expected): drop the ledger entry
     ///   exactly like a receipt confirmation. See
     ///   `UnconfirmedLedger::drop_committed` for the full story.
     /// - Gap (nonce >= expected): the sealer did not order `expected`.
     ///   See [`Self::apply_gap`].
+    /// - Window full: see [`Self::republish_held`].
     pub(super) fn apply_contiguity_rejects(&mut self, r: &mut crate::resync::ResyncController) {
-        let (drops, rewinds) = r.drain_contiguity_rejects();
+        let AnswerDrain {
+            drops,
+            gaps,
+            window_full,
+        } = r.drain_answers();
         for (sender, n) in drops {
             self.drop_committed_and_trace(sender, n);
         }
-        for (sender, expected) in rewinds {
+        for (sender, expected) in gaps {
             self.apply_gap(sender, expected);
+        }
+        for (sender, nonce) in window_full {
+            self.republish_held(sender, nonce);
+        }
+    }
+
+    /// One window-full answer: the window had no room for the ref of
+    /// `sender` at `nonce`. The answer names no expected nonce, so it
+    /// never frees a nonce. If the ledger still holds the ref, it and the
+    /// later refs republish. Otherwise a receipt, a reject or a refusal
+    /// already settled the ref, and nothing happens.
+    fn republish_held(&mut self, sender: Address, nonce: u64) {
+        if self.unconfirmed.contains(sender, nonce) {
+            self.rewind_one_gap(sender, nonce);
         }
     }
 

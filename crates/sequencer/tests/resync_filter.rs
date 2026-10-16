@@ -6,7 +6,7 @@
 
 use kardamom_types::TxDataLoc;
 
-use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig};
+use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{
     Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
@@ -18,7 +18,7 @@ use kardamom_sequencer::testkit::{
 type ResyncTestRig = (
     Sequencer,
     crossbeam_channel::Sender<FloorUpdate>,
-    crossbeam_channel::Sender<(alloy_primitives::Address, u64, u64)>,
+    crossbeam_channel::Sender<SealerAnswer>,
 );
 
 fn resync_sequencer_with_rejects() -> ResyncTestRig {
@@ -194,7 +194,13 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
 
     // The sealer answers a republish with a committed-proof reject
     // (nonce 0 below expected 1). The entry retires permanently.
-    reject_tx.send((s.address(), 0, 1)).unwrap();
+    reject_tx
+        .send(SealerAnswer::ContiguityReject {
+            sender: s.address(),
+            nonce: 0,
+            expected: 1,
+        })
+        .unwrap();
     rig.step(&mut seq).unwrap();
     let stable = rig.refs().len();
     rig.step(&mut seq).unwrap();

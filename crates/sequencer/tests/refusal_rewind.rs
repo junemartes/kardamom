@@ -6,8 +6,9 @@
 //! ref it ordered long ago, so a refusal alone says nothing about the
 //! nonce. The sequencer moves its floor back only to the expected nonce
 //! that a contiguity reject names, and only when it holds no ref at that
-//! nonce. The floor never goes back below the receipt floor. A resubmit at a refused nonce below the floor is offered again,
-//! and the sealer decides.
+//! nonce. The floor never goes back below the receipt floor, and a
+//! window-full answer never frees a nonce. A resubmit at a refused nonce
+//! below the floor is offered again, and the sealer decides.
 
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -17,7 +18,9 @@ use alloy_signer_local::PrivateKeySigner;
 use kardamom_types::{TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig, SealerRefusal};
+use kardamom_sequencer::resync::{
+    FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal,
+};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
 
@@ -34,7 +37,7 @@ struct Sealed {
     seq: Sequencer,
     rig: Rig,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+    reject_tx: crossbeam_channel::Sender<SealerAnswer>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     /// The next free `tx_data` offset.
     offset: i32,
@@ -126,8 +129,26 @@ impl Sealed {
     /// names `expected`.
     fn reject(&self, s: Address, nonces: &[u64], expected: u64) {
         for nonce in nonces {
-            self.reject_tx.send((s, *nonce, expected)).unwrap();
+            self.answer(SealerAnswer::ContiguityReject {
+                sender: s,
+                nonce: *nonce,
+                expected,
+            });
         }
+    }
+
+    /// The sealer answers each of `nonces` with a full window.
+    fn window_full(&self, s: Address, nonces: &[u64]) {
+        for nonce in nonces {
+            self.answer(SealerAnswer::WindowFull {
+                sender: s,
+                nonce: *nonce,
+            });
+        }
+    }
+
+    fn answer(&self, answer: SealerAnswer) {
+        self.reject_tx.send(answer).unwrap();
     }
 
     /// The receipt of the executed tx of `s` at `nonce` arrives.
@@ -423,4 +444,36 @@ fn a_window_full_answer_read_after_the_receipt_keeps_the_floor() {
     assert_eq!(sealed.offered_nonces(3), vec![3], "no stall");
     sealed.step_after_ttl();
     assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+}
+
+/// The executors are down, so no receipt comes. The sealer ordered 0 to
+/// 3 and rejects a late copy of 2 with `expected=4`, so the ledger entry
+/// of 2 drops. Then a window-full answer for an older copy of 2 comes.
+/// The answer names no expected nonce, so it frees nothing: 4 publishes,
+/// and nothing expires.
+#[test]
+fn a_window_full_answer_never_frees_a_nonce() {
+    let s = signer(31);
+    let mut sealed = Sealed::short_ttl();
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    sealed.reject(s.address(), &[2], 4);
+    sealed.window_full(s.address(), &[2]);
+    sealed.step();
+
+    sealed.submit(&s, 4);
+    assert_eq!(sealed.offered_nonces(4), vec![4], "no stall");
+    sealed.step_after_ttl();
+    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+}
+
+/// The window has no room for 1 and 2. The ledger holds both, so they
+/// republish at once, without a wait for the confirm timeout.
+#[test]
+fn a_window_full_answer_republishes_a_held_ref() {
+    let s = signer(32);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.window_full(s.address(), &[1, 2]);
+    sealed.step();
+    assert_eq!(sealed.offered_nonces(3), vec![1, 2]);
 }

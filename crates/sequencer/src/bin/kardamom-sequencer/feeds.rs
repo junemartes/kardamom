@@ -49,7 +49,8 @@ use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncController, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
+    FloorUpdate, ResyncController, SealerAnswer, SealerRefusal, SharedWatermark,
+    elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::shard_map::{VslotSet, vslot_for};
@@ -125,7 +126,7 @@ pub(crate) struct EgressWatermarkFeed {
     /// DA-lag guard or the record-lag guard refused. The publish loop
     /// drops each one and tells the client.
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
-    reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+    reject_tx: crossbeam_channel::Sender<SealerAnswer>,
     /// The epoch pump's signals: each growth of the boundaries' L1
     /// origin, and each origin-gap reject.
     origins: OriginSignalTx,
@@ -149,7 +150,7 @@ impl EgressWatermarkFeed {
         silence_ms: u64,
         partition: u32,
         watermark: SharedWatermark,
-        reject_tx: crossbeam_channel::Sender<(Address, u64, u64)>,
+        reject_tx: crossbeam_channel::Sender<SealerAnswer>,
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
     ) -> Self {
@@ -263,7 +264,11 @@ impl EgressWatermarkFeed {
             expected,
             "sealer contiguity reject received"
         );
-        self.forward_contiguity_reject(sender, nonce, expected);
+        self.forward_answer(SealerAnswer::ContiguityReject {
+            sender,
+            nonce,
+            expected,
+        });
         true
     }
 
@@ -274,8 +279,9 @@ impl EgressWatermarkFeed {
     /// The two go to different places, because their remedies differ.
     ///
     /// - A window-full reject asks for the same ref again once the window
-    ///   prunes. It takes the contiguity-reject channel, the publish
-    ///   loop's rewind path, rewinding from its own nonce.
+    ///   prunes. It takes the rewind channel. The publish loop
+    ///   republishes the ref if it still holds it. It never frees the
+    ///   nonce, because the answer names no expected nonce.
     /// - A past-deadline reject can never be accepted, whoever offers it.
     ///   It takes its own channel, so the publish loop drops the ledger
     ///   entry and tells the client to sign again.
@@ -316,7 +322,7 @@ impl EgressWatermarkFeed {
                         nonce,
                         "sealer window-full reject received; republishing the ref"
                     );
-                    self.forward_contiguity_reject(sender, nonce, nonce);
+                    self.forward_answer(SealerAnswer::WindowFull { sender, nonce });
                 }
                 true
             }
