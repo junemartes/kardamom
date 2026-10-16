@@ -11,6 +11,11 @@
 //! the state. A record with no heartbeat for [`EXPIRY`] is gone: the
 //! process died or froze.
 //!
+//! More than one [`Publisher`] can write one `(service, instance)`: each
+//! ingress publishes the sealer as it observes it, with its own `seq`. So
+//! the board keeps the last `seq` per publisher. [`Board::observe`] states
+//! the restart rule.
+//!
 //! The transport is the caller's: the beacon hands each record to a
 //! publish function, and the [`BoardFeed`] reads records from a channel.
 //!
@@ -137,41 +142,137 @@ impl Beacon {
     }
 }
 
-/// One record as the board last saw it.
+/// The transport's id of the publication that carries a record. A
+/// restarted process opens a new publication, so it has a new id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Publisher(pub i32);
+
+impl Publisher {
+    const FIRST: Self = Self(i32::MIN);
+    const LAST: Self = Self(i32::MAX);
+}
+
+/// One record and the publisher that sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub publisher: Publisher,
+    pub event: ServiceEvent,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Delivery {
+    /// `event` from one fixed publisher, for a test with one publisher
+    /// per `(service, instance)`.
+    #[must_use]
+    pub fn of_one_publisher(event: ServiceEvent) -> Self {
+        Self {
+            publisher: Publisher(1),
+            event,
+        }
+    }
+}
+
+/// One value as the board last saw it.
 #[derive(Debug, Clone)]
-struct Seen {
-    event: ServiceEvent,
+struct Seen<T> {
+    value: T,
     at: Instant,
 }
 
-/// The latest record of every `(service, instance)`.
+impl<T> Seen<T> {
+    fn new(value: T, at: Instant) -> Self {
+        Self { value, at }
+    }
+
+    /// Whether the board still keeps the value at `now`.
+    fn kept(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < FORGET
+    }
+}
+
+/// The latest record of every `(service, instance)`, and the last `seq`
+/// of every publisher of it.
 #[derive(Debug, Default)]
 pub struct Board {
-    entries: BTreeMap<(String, String), Seen>,
+    entries: BTreeMap<(String, String), Seen<ServiceEvent>>,
+    seqs: BTreeMap<(String, String, Publisher), Seen<u64>>,
 }
 
 impl Board {
-    /// Take `event` as the latest state of its process.
-    pub fn observe(&mut self, event: ServiceEvent, now: Instant) {
-        let key = (event.service.clone(), event.instance.clone());
-        let restarted = self
-            .entries
-            .get(&key)
-            .is_some_and(|seen| event.seq < seen.event.seq);
-        if restarted {
+    /// Take the delivered record as the latest state of its process, and
+    /// log a restart.
+    ///
+    /// A record shows a restart in two cases:
+    ///
+    /// - Its `seq` is lower than the last `seq` of the same publisher.
+    /// - Its publisher is new, the key had exactly one publisher within
+    ///   [`FORGET`], and its `seq` is lower than the last `seq` of that
+    ///   publisher. A restarted process opens a new publication, so a
+    ///   self-reporting service restarts as a new publisher of its key.
+    ///
+    /// A key with two live publishers, such as `sealer/cluster` from two
+    /// ingresses, logs no restart for a new publisher. So a restarted
+    /// ingress logs no sealer restart, and two `seq` counters that drift
+    /// apart log nothing. The limit: a service that restarts twice within
+    /// [`FORGET`] logs only the first restart, because the old publisher
+    /// still counts. An ingress that joins after the other ingress ran
+    /// alone for [`FORGET`] logs one sealer restart.
+    pub fn observe(&mut self, delivery: Delivery, now: Instant) {
+        let Delivery { publisher, event } = delivery;
+        if self.restarted(publisher, &event, now) {
             tracing::info!(
                 service = %event.service,
                 instance = %event.instance,
                 "service events: the process restarted"
             );
         }
-        self.entries.insert(key, Seen { event, at: now });
+        self.seqs.insert(
+            (event.service.clone(), event.instance.clone(), publisher),
+            Seen::new(event.seq, now),
+        );
+        self.entries.insert(
+            (event.service.clone(), event.instance.clone()),
+            Seen::new(event, now),
+        );
+    }
+
+    /// Whether `event` from `publisher` shows a restart. See
+    /// [`Self::observe`] for the rule.
+    fn restarted(&self, publisher: Publisher, event: &ServiceEvent, now: Instant) -> bool {
+        self.seqs
+            .get(&(event.service.clone(), event.instance.clone(), publisher))
+            .or_else(|| self.only_publisher(event, now))
+            .is_some_and(|last| event.seq < last.value)
+    }
+
+    /// The last `seq` of the one publisher of `event`'s key within
+    /// [`FORGET`]. `None` when the key has no publisher or more than one.
+    fn only_publisher(&self, event: &ServiceEvent, now: Instant) -> Option<&Seen<u64>> {
+        let first = (
+            event.service.clone(),
+            event.instance.clone(),
+            Publisher::FIRST,
+        );
+        let last = (
+            event.service.clone(),
+            event.instance.clone(),
+            Publisher::LAST,
+        );
+        let mut kept = self
+            .seqs
+            .range(first..=last)
+            .map(|(_, seen)| seen)
+            .filter(|seen| seen.kept(now));
+        match (kept.next(), kept.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
     }
 
     /// Drop the records gone for longer than the board keeps them.
     pub fn forget(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, seen| now.saturating_duration_since(seen.at) < FORGET);
+        self.entries.retain(|_, seen| seen.kept(now));
+        self.seqs.retain(|_, seen| seen.kept(now));
     }
 
     /// The board at `now`.
@@ -184,7 +285,7 @@ impl Board {
                 .map(|seen| {
                     let age = now.saturating_duration_since(seen.at);
                     ServiceView {
-                        event: seen.event.clone(),
+                        event: seen.value.clone(),
                         live: age < EXPIRY,
                         age,
                     }
@@ -291,7 +392,7 @@ impl BoardView {
 /// channel, and publishes the view on every record and every second.
 pub struct BoardFeed {
     board: Board,
-    rx: mpsc::Receiver<ServiceEvent>,
+    rx: mpsc::Receiver<Delivery>,
     view: watch::Sender<BoardView>,
 }
 
@@ -302,7 +403,7 @@ impl BoardFeed {
     /// A feed, the sender its transport writes the records to, and the
     /// receiver of the view.
     #[must_use]
-    pub fn new() -> (Self, mpsc::Sender<ServiceEvent>, watch::Receiver<BoardView>) {
+    pub fn new() -> (Self, mpsc::Sender<Delivery>, watch::Receiver<BoardView>) {
         let (tx, rx) = mpsc::channel(FEED_DEPTH);
         let (view, view_rx) = watch::channel(BoardView::default());
         (
@@ -324,8 +425,8 @@ impl BoardFeed {
     /// Take one record or one refresh, then publish the view.
     async fn step(&mut self) -> ControlFlow<()> {
         tokio::select! {
-            event = self.rx.recv() => match event {
-                Some(event) => self.board.observe(event, Instant::now()),
+            delivery = self.rx.recv() => match delivery {
+                Some(delivery) => self.board.observe(delivery, Instant::now()),
                 None => return ControlFlow::Break(()),
             },
             () = tokio::time::sleep(REFRESH) => {}
