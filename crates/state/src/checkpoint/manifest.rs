@@ -99,7 +99,8 @@ impl ImageSchema {
 pub(crate) struct CheckpointManifest {
     /// The committed block the image was taken at. This matches the file name.
     pub block: u64,
-    /// keccak256 of the mdbx image bytes.
+    /// keccak256 of every byte of the mdbx image file. A reader hashes
+    /// the whole file, so a writer can choose the file length.
     pub image_keccak: B256,
     /// `KEY_GENESIS_DIGEST` from the image. This binds the image to a
     /// chain identity.

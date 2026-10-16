@@ -471,3 +471,61 @@ fn format_versions_match_the_registry() {
     Registry::assert_exact("state-db", crate::meta::SCHEMA_VERSION);
     Registry::assert_exact("checkpoint-manifest", super::manifest::MANIFEST_VERSION);
 }
+
+/// A new checkpoint image holds only its used pages, not the trailing
+/// hole of the growth step. The manifest hash and a peer transfer then
+/// read about as many bytes as the state holds. The image still opens
+/// in place, read-only, and still restores.
+#[test]
+fn create_cuts_the_image_to_its_used_pages() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x28; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 3);
+    let c = create_checkpoint(&env, ckpt.path()).unwrap();
+
+    let len = std::fs::metadata(checkpoint_data_file(&c.path).unwrap())
+        .unwrap()
+        .len();
+    assert_eq!(len % (64 * 1024), 0, "the cut length is 64 KiB aligned");
+    assert!(len <= 1024 * 1024, "the image keeps no hole: {len} bytes");
+
+    let in_place = StateEnvBuilder::new(&c.path)
+        .read_only(true)
+        .open()
+        .unwrap();
+    assert_eq!(
+        stored_genesis_digest(&in_place).unwrap(),
+        stored_genesis_digest(&env).unwrap()
+    );
+    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 3);
+}
+
+/// An image that is longer than its used pages still verifies and
+/// restores. A release that does not cut its images writes this shape,
+/// with the hash of the whole file in the manifest.
+#[test]
+fn restore_reads_an_image_with_a_trailing_hole() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x29; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let c = create_checkpoint(&env, ckpt.path()).unwrap();
+
+    let data = checkpoint_data_file(&c.path).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data)
+        .unwrap()
+        .set_len(4 * 1024 * 1024)
+        .unwrap();
+    let manifest = CheckpointManifest {
+        image_keccak: file_keccak(&data).unwrap(),
+        ..read_manifest(&c.path).unwrap()
+    };
+    std::fs::write(manifest_path(&c.path), manifest.encode()).unwrap();
+
+    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 2);
+}

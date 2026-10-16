@@ -137,6 +137,9 @@ code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
 # schema it does not read. A manifest without the key passes, and the
 # image says its schema when it opens. The image inside the checkpoint is
 # a state database, so the state-db entry also applies to a checkpoint.
+# `image_keccak` is the hash of every byte of the image file. The writer
+# cuts the file to its used pages, and a reader hashes the whole file, so
+# an image of either length verifies in every release.
 [format.checkpoint-manifest]
 writes = 1
 reads_min = 1
