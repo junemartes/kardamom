@@ -1,0 +1,23 @@
+# The genesis fragment of the local canary: Anvil accounts #34..#37, the
+# transaction canary's ring (nomad/canary.nomad.hcl, --ring-offset 34).
+# The canary owns their nonce chains; no load stage, chaos case or perf
+# soak uses them.
+#
+# The executor and validator jobs append this file to dev.toml only when
+# the local canary runs (CANARY_LOCAL=1 in the local profile, no
+# CANARY_MNEMONIC). A live chain keeps the genesis it started from: an
+# executor refuses a genesis that differs from the one in its state. So
+# do not add an account to dev.toml for a new feature; add a fragment
+# that only a new chain takes.
+[[alloc]]
+address = "0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x2f4f06d218E426344CFE1A83D53dAd806994D325"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x1003ff39d25F2Ab16dBCc18EcE05a9B6154f65F4"
+balance = "1000000000000000000000"
+[[alloc]]
+address = "0x9eAF5590f2c84912A08de97FA28d0529361Deb9E"
+balance = "1000000000000000000000"

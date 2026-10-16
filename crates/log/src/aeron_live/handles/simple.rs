@@ -321,6 +321,14 @@ declare_channel_handles! {
     open(ch) = (ch.events_channel, ch.events_stream_id);
 }
 
+impl ServiceEventsSubscriberHandle {
+    /// The next record, with the Aeron session id of the publication
+    /// that sent it.
+    pub(super) async fn recv_from(&mut self) -> Option<(i32, ServiceEvent)> {
+        self.rx.recv_from().await
+    }
+}
+
 declare_channel_handles! {
     /// `exec_txs` publisher (executor → validator, batcher, executor archive).
     publisher ExecTxsPublisherHandle {

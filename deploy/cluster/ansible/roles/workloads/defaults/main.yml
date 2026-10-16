@@ -44,6 +44,9 @@ workloads_common_vars:
   # the executor's and validator's fee schedule: "on" or "off". Empty
   # leaves every job at its "off" default.
   priority_fees: "{{ workloads_priority_fees }}"
+  # The local canary's genesis fragment (config/genesis/canary.toml), for
+  # the executor and the validator: "on" only when the local canary runs.
+  canary_genesis: "{{ 'on' if workloads_canary_mnemonic | length == 0 and workloads_canary_deployed | bool else 'off' }}"
   # One value for every Aeron party: each client's driver timeout and
   # each media driver's client liveness timeout. The jobs derive the
   # rest from it.
@@ -94,8 +97,9 @@ workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # 0). The mnemonic reaches the task only through the job's Nomad Variable
 # (tasks/secrets.yml). Without a mnemonic, CANARY_LOCAL=1 runs the canary
 # of the local profile on the public anvil mnemonic from index 34, the
-# four accounts the dev genesis funds for it. Otherwise no canary runs:
-# the CI shards count transactions, and the canary's would add to them.
+# four accounts that config/genesis/canary.toml funds for it. Otherwise
+# no canary runs: the CI shards count transactions, and the canary's
+# would add to them.
 workloads_canary_mnemonic: "{{ lookup('env', 'CANARY_MNEMONIC') }}"
 workloads_canary_ring_offset: "{{ lookup('env', 'CANARY_RING_OFFSET') | default('0', true) }}"
 workloads_canary_dev_mnemonic: "test test test test test test test test test test test junk"

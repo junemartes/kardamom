@@ -71,25 +71,36 @@ impl<'a> StackLaunch<'a> {
 
     /// Materialise the genesis for `cfg.chain_id`: the canonical TOML
     /// as-is at the default id with fees off, or a patched copy in the
-    /// stack root (the `chain_id` line rewritten, the fee schedule
-    /// fragment appended with priority fees on — alloc + predeploy
+    /// stack root (the `chain_id` line rewritten, the canary's accounts
+    /// and the fee schedule fragment appended when on — alloc + predeploy
     /// bytecode ride along byte-identical, so the deployer's drift guard
     /// keeps watching the ONE canonical copy).
     fn materialise_genesis(&self, canonical: &Path) -> Result<PathBuf> {
         let chain_id = self.cfg.chain_id;
-        if chain_id == DEV_CHAIN_ID && !self.cfg.priority_fees {
+        if chain_id == DEV_CHAIN_ID && !self.cfg.priority_fees && !self.cfg.canary_genesis {
             return Ok(canonical.to_path_buf());
         }
-        let mut src = std::fs::read_to_string(canonical)
+        let src = std::fs::read_to_string(canonical)
             .with_context(|| format!("read genesis {}", canonical.display()))?;
-        if self.cfg.priority_fees {
-            let fragment = super::config::Genesis::fees_fragment(&services::repo_root());
-            src.push('\n');
-            src.push_str(
-                &std::fs::read_to_string(&fragment)
-                    .with_context(|| format!("read fee fragment {}", fragment.display()))?,
-            );
-        }
+        // The order of the deploy: the canary's accounts, then the fees.
+        let repo = services::repo_root();
+        let fragments = [
+            (
+                self.cfg.canary_genesis,
+                super::config::Genesis::canary_fragment(&repo),
+            ),
+            (
+                self.cfg.priority_fees,
+                super::config::Genesis::fees_fragment(&repo),
+            ),
+        ];
+        let src = std::iter::once(Ok(src))
+            .chain(fragments.iter().filter(|(on, _)| *on).map(|(_, fragment)| {
+                std::fs::read_to_string(fragment)
+                    .with_context(|| format!("read genesis fragment {}", fragment.display()))
+            }))
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
         let i = src
             .lines()
             .position(|l| l.trim_start().starts_with("chain_id"))
