@@ -102,15 +102,29 @@ impl ColdAccounts {
     /// The fresh committed state of `sender`, from the map or from one
     /// query pair. `None` admits: no client, an unknown outcome, or a
     /// stale answer.
+    ///
+    /// The query future is boxed. Every submit of a sender with no cache
+    /// row awaits this future inside its own task, so an inline query
+    /// future would grow every submit task by the size of two HTTP
+    /// requests. The box costs one allocation only for a query that goes
+    /// out.
     pub(crate) async fn fresh_state(&self, sender: Address) -> Option<AccountView> {
-        if let Some(slot) = self.get(sender) {
-            cache_metrics::record_lookup("cold", "hit");
-            return match slot {
-                Slot::Known(view) => Some(view),
-                Slot::Unknown => None,
-            };
+        let slot = match self.get(sender) {
+            Some(slot) => {
+                cache_metrics::record_lookup("cold", "hit");
+                slot
+            }
+            None => Box::pin(self.ask(self.query.as_ref()?, sender)).await,
+        };
+        match slot {
+            Slot::Known(view) => Some(view),
+            Slot::Unknown => None,
         }
-        let query = self.query.as_ref()?;
+    }
+
+    /// Ask the executor for the nonce and the balance of `sender`, and
+    /// keep the slot the answer gives.
+    async fn ask(&self, query: &ExecutorQuery, sender: Address) -> Slot {
         let (nonce, balance) = tokio::join!(query.nonce(sender), query.balance(sender));
         let slot = if let (Ok(nonce), Ok(balance)) = (nonce, balance) {
             self.judge(&nonce, &balance)
@@ -119,10 +133,7 @@ impl ColdAccounts {
             Slot::Unknown
         };
         self.insert(sender, slot.clone());
-        match slot {
-            Slot::Known(view) => Some(view),
-            Slot::Unknown => None,
-        }
+        slot
     }
 
     /// The slot for one answer pair. The older snapshot of the two
