@@ -12,7 +12,9 @@
 //! funds) with a status-0 receipt and leave the committed nonce. Its
 //! nonce is free, and the next send takes the committed nonce. So the
 //! next nonce goes above the committed nonce only for a transaction the
-//! chain applied.
+//! chain applied. The chain drops a hash it saw again, so each skip
+//! raises the fee cap of the account's next sends by one wei: the
+//! transaction at the freed nonce never has the hash of a skipped one.
 //!
 //! The leases are per-account async mutexes taken with `try_lock`: the
 //! probe tasks run on several threads and contend for the same
@@ -110,6 +112,9 @@ pub enum Settled {
 struct Account {
     address: Address,
     next_nonce: Option<u64>,
+    /// The skips since the last applied transaction: the fee cap's
+    /// raise in wei.
+    skips: u128,
     in_flight: Option<InFlight>,
     journal: Journal,
 }
@@ -210,6 +215,7 @@ impl Ring {
             account: Arc::new(Mutex::new(Account {
                 address: signer.address,
                 next_nonce: None,
+                skips: 0,
                 in_flight,
                 journal,
             })),
@@ -413,7 +419,8 @@ impl Lease {
             max_fee_per_gas: price
                 .saturating_mul(2)
                 .max(MIN_FEE_CAP)
-                .saturating_add(call.tip),
+                .saturating_add(call.tip)
+                .saturating_add(self.account.skips),
             max_priority_fee_per_gas: call.tip,
             to: call.to,
             value: call.value,
@@ -497,10 +504,14 @@ impl Lease {
         let applied =
             receipt.is_some_and(Receipt::succeeded) || committed.is_some_and(|c| c > nonce);
         if applied {
+            self.account.skips = 0;
             self.release(nonce.checked_add(1)).await;
             return Settled::Applied;
         }
         tracing::warn!(account = %self.address(), nonce, "the chain skipped the transaction");
+        // Saturation only stops the raise: a skip count past `u128` does
+        // not occur.
+        self.account.skips = self.account.skips.saturating_add(1);
         self.release(None).await;
         Settled::Skipped
     }

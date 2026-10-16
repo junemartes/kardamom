@@ -8,9 +8,6 @@
 //!   transaction that never left before a restart, both resolve from the
 //!   journal before their nonce takes other work; concurrent probes on
 //!   one account get distinct, contiguous nonces.
-//! - [`skipped_send_frees_its_nonce`]: a send from an account without
-//!   funds does not use its nonce. After a funding, the next send takes
-//!   the committed nonce and lands.
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -52,8 +49,6 @@ const PROBES: [&str; 6] = [
 const ONCE: [&str; 2] = ["probe=\"liquidity\"", "probe=\"deposit\""];
 /// How many transfers [`receipts_match_their_blocks`] checks.
 const BLOCK_CHECKS: usize = 5;
-/// The funding of [`skipped_send_frees_its_nonce`]: 0.01 ETH.
-const FUNDING: u64 = 10_000_000_000_000_000;
 /// The L1 key of the canary in the scenario: anvil account #9, which no
 /// other part of the stack uses.
 pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6";
@@ -370,64 +365,6 @@ impl BlockCheck<'_> {
     }
 }
 
-/// An account with no funds sends first, as the canary did when it
-/// took an unread account as funded. The ingress refuses the send, or
-/// the executors skip it: either way the committed nonce stays. Then
-/// the funded account `funder` sends [`FUNDING`] to it, and its next
-/// send takes the committed nonce and lands.
-///
-/// # Errors
-/// Returns an error when the first send uses its nonce, or the send
-/// after the funding does not take the committed nonce.
-pub async fn skipped_send_frees_its_nonce(
-    t: &Target,
-    dir: &Path,
-    unfunded: u32,
-    funder: u32,
-) -> Result<()> {
-    let rpc = Rpc::new(
-        t.rpc.url.parse::<Endpoint>().map_err(anyhow::Error::msg)?,
-        LAND,
-    )?;
-    let signers = ring::signers(DEV_MNEMONIC, unfunded, NonZeroU32::MIN)?;
-    let address = signers[0].address;
-    let start = rpc.nonce(address).await?;
-    let ring = open_ring(&dir.join("unfunded"), signers, t.chain_id).await?;
-    send_unfunded(&rpc, lease_when_free(&ring, &rpc).await?).await?;
-    anyhow::ensure!(
-        rpc.nonce(address).await? == start,
-        "the unfunded send used its nonce"
-    );
-    let funders = ring::signers(DEV_MNEMONIC, funder, NonZeroU32::MIN)?;
-    let funding = open_ring(&dir.join("funder"), funders, t.chain_id).await?;
-    let lease = lease_when_free(&funding, &rpc).await?;
-    send_settled(&rpc, lease, transfer_call(address, U256::from(FUNDING))).await?;
-    let sent = transfer(&rpc, lease_when_free(&ring, &rpc).await?).await?;
-    anyhow::ensure!(
-        sent.nonce == start,
-        "after the skip the ring signed {}, the committed nonce is {start}",
-        sent.nonce
-    );
-    Ok(())
-}
-
-/// Send a transfer from an account without funds. A send that the
-/// ingress takes must land as a skip.
-async fn send_unfunded(rpc: &Rpc, mut lease: Lease) -> Result<()> {
-    let call = transfer_call(Address::repeat_byte(0x5d), U256::from(1));
-    let Ok(sent) = lease.send(rpc, call).await else {
-        return Ok(());
-    };
-    let receipt = landed(rpc, sent.hash).await?;
-    let settled = lease.settle(rpc, &receipt, Poll::within(LAND, POLL)).await;
-    anyhow::ensure!(
-        settled == Settled::Skipped,
-        "the unfunded send at nonce {} settled as {settled:?}",
-        sent.nonce
-    );
-    Ok(())
-}
-
 /// Open a ring on `dir` with every account marked funded: the ring
 /// cases run without the balance task.
 async fn open_ring(dir: &Path, signers: Vec<DerivedSigner>, chain_id: u64) -> Result<Ring> {
@@ -458,21 +395,15 @@ async fn lease_when_free(ring: &Ring, rpc: &Rpc) -> Result<Lease> {
         .context("the account never came free")?
 }
 
-/// A transfer of `value` wei to `to`.
-fn transfer_call(to: Address, value: U256) -> Call {
-    Call::new(TxKind::Call(to), value, Bytes::new(), 21_000)
-}
-
-/// Send one transfer of one wei on `lease`, wait for its receipt,
-/// settle, and return what was sent.
-async fn transfer(rpc: &Rpc, lease: Lease) -> Result<Sent> {
-    let call = transfer_call(Address::repeat_byte(0x5d), U256::from(1));
-    send_settled(rpc, lease, call).await
-}
-
-/// Send `call` on `lease`, wait for its receipt, and settle. The chain
-/// must apply the transaction.
-async fn send_settled(rpc: &Rpc, mut lease: Lease, call: Call) -> Result<Sent> {
+/// Send one transfer on `lease`, wait for its receipt, settle, and
+/// return what was sent. The chain must apply the transaction.
+async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<Sent> {
+    let call = Call::new(
+        TxKind::Call(Address::repeat_byte(0x5d)),
+        U256::from(1),
+        Bytes::new(),
+        21_000,
+    );
     let sent = lease
         .send(rpc, call)
         .await

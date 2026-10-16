@@ -2,7 +2,9 @@
 //! nonce and balance, and it lands each transaction at once. It applies
 //! a transaction when the account has funds and the transaction's nonce
 //! is the committed nonce. Otherwise it skips the transaction, as the
-//! executors do: the receipt has status 0 and the nonce stays.
+//! executors do: the receipt has status 0 and the nonce stays. A
+//! transaction whose hash the chain saw before does not run again: its
+//! old receipt stays.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -44,11 +46,14 @@ pub(crate) struct Chain {
 impl Chain {
     fn take(&mut self, raw: &Bytes) -> B256 {
         let tx = TxEnvelope::decode_2718(&mut raw.as_ref()).expect("a signed transaction");
+        let hash = *tx.tx_hash();
+        self.sends += 1;
+        if self.receipts.contains_key(&hash) {
+            return hash;
+        }
         let applied = !self.balance.is_zero() && tx.nonce() == self.nonce;
         self.nonce += u64::from(applied);
-        self.sends += 1;
         let status = U64::from(u64::from(applied && !self.revert));
-        let hash = *tx.tx_hash();
         self.receipts
             .insert(hash, json!({ "status": status, "blockNumber": "0x1" }));
         hash
