@@ -145,7 +145,7 @@ public final class ClusterNode {
         final Optional<CarryBytes> carryBytes = new CarryBytes.Inputs(
             System.getProperty(RetainedFile.Config.SETTING),
             System.getProperty(RetainedFile.Config.SEGMENT_SETTING),
-            System.getProperty(RetainedEndpoint.TOKEN_SETTING, System.getenv("KARDAMOM_RETAINED_TOKEN")),
+            System.getenv(RetainedToken.ENV),
             Path.of(clusterDir), adminPort, snapshotIntervalS).parse();
         System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
             .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())

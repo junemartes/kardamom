@@ -6,6 +6,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -38,7 +39,7 @@ import org.agrona.IoUtil;
  * @param token    the shared token of the job
  * @param memberId this member's id, for the log lines
  */
-record RetainedCopy(List<URI> peers, SegmentDir into, String token, int memberId) {
+record RetainedCopy(List<URI> peers, SegmentDir into, RetainedToken token, int memberId) {
 
     /** The longest wait for a connection or for one answer. */
     private static final Duration TIMEOUT = Duration.ofSeconds(60);
@@ -57,7 +58,15 @@ record RetainedCopy(List<URI> peers, SegmentDir into, String token, int memberId
                 + " — the backed-up snapshot holds no retained file");
             return false;
         }
-        final RetainedSection section = RetainedSection.ofSnapshot(snapshot);
+        final RetainedSection section;
+        try {
+            section = RetainedSection.ofSnapshot(snapshot);
+        } catch (final IllegalStateException | IllegalArgumentException | IndexOutOfBoundsException
+                | BufferUnderflowException e) {
+            System.out.println("cluster SEED retained-copy FAILED memberId=" + memberId
+                + " — the backed-up snapshot holds no readable retained section: " + e.getMessage());
+            return false;
+        }
         final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
         return peers.stream().anyMatch(peer -> copyFrom(http, peer, section));
     }
@@ -128,7 +137,7 @@ record RetainedCopy(List<URI> peers, SegmentDir into, String token, int memberId
 
     private HttpRequest request(final URI uri) {
         return HttpRequest.newBuilder().uri(uri).timeout(TIMEOUT)
-            .header("Authorization", RetainedEndpoint.authorization(token))
+            .header("Authorization", token.authorization())
             .GET().build();
     }
 

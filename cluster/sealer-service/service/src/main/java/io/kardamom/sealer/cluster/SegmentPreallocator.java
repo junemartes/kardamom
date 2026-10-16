@@ -44,6 +44,8 @@ final class SegmentPreallocator {
     record Failed(IOException cause) implements Prepared {
     }
 
+    /** The longest wait of {@link #close()} for the helper thread. */
+    private static final long CLOSE_WAIT_MS = 5_000;
     /** The size of one write of the zero fill. */
     private static final int ZERO_CHUNK = 1 << 20;
 
@@ -79,14 +81,24 @@ final class SegmentPreallocator {
     }
 
     /**
-     * Stop the helper thread, wait for it, and unmap a segment that waits in
-     * the queue. The file of that segment stays on disk, and the next helper
-     * writes over it. A second call does nothing more.
+     * Ask the helper thread to stop, and do not wait. A helper inside a sync
+     * of a failed disk does not wake on the interrupt, so a fatal stop must
+     * not wait for it. The thread is a daemon, so it never keeps the JVM
+     * alive.
+     */
+    void stop() {
+        thread.interrupt();
+    }
+
+    /**
+     * Stop the helper thread, wait for it up to {@link #CLOSE_WAIT_MS}, and
+     * unmap a segment that waits in the queue. The file of that segment
+     * stays on disk, and the next helper writes over it.
      */
     void close() {
-        thread.interrupt();
+        stop();
         try {
-            thread.join();
+            thread.join(CLOSE_WAIT_MS);
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
         }

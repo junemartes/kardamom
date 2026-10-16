@@ -13,6 +13,13 @@ import java.util.Optional;
  * its segment, each boundary matches the index, the last record ends
  * exactly at the head, and the frame count and the boundary count match.
  *
+ * <p>The walk also checks the record indexes, because the eviction copies
+ * them into the floor. An index is at least the floor index, and above the
+ * index before it. The first record after a boundary has the end index of
+ * that boundary, and every record before a boundary is below its end
+ * index. An index can step up by more than one: an origin record takes one
+ * index for each of its slots.</p>
+ *
  * <p>A preallocated segment holds zeros, and zeros never pass: a record of
  * length 0 is not a frame. So a file that ends below the head of the
  * snapshot, or a segment with a gap, fails the walk. After a passed walk,
@@ -37,10 +44,15 @@ final class RetainedWalk {
     private final RetainedSection section;
     private long frames;
     private long marks;
+    /** The lowest index that the next record can have. */
+    private long nextIndex;
+    /** Whether the next record must have exactly {@link #nextIndex}: it is the first after a boundary. */
+    private boolean afterBoundary;
 
     RetainedWalk(final NavigableMap<Long, ? extends ByteBuffer> segments, final RetainedSection section) {
         this.segments = segments;
         this.section = section;
+        this.nextIndex = section.floors().index();
     }
 
     /** Empty when the file holds exactly the frames of the section; else the first mismatch. */
@@ -90,7 +102,7 @@ final class RetainedWalk {
         final byte kind = buffer.get(at);
         frames++;
         if (kind == SealerWire.EGRESS_KIND_RELAYED && length >= SealerWire.RELAYED_HEADER_LEN) {
-            return new Step(after, Optional.empty());
+            return record(pos, buffer.getLong(at + FrameKey.KEY_OFFSET), after);
         }
         if (kind != SealerWire.EGRESS_KIND_BOUNDARY || length != BOUNDARY_LEN) {
             return fail(pos, "the frame kind " + kind + " with length " + length + " is not retained");
@@ -101,7 +113,25 @@ final class RetainedWalk {
         if (!expected.equals(section.marks().get(block))) {
             return fail(pos, "the boundary of block " + block + " " + expected + " is not in the index");
         }
+        if (nextIndex > expected.endTxIdx()) {
+            return fail(pos, "the boundary of block " + block + " ends at index " + expected.endTxIdx()
+                + ", below the records before it");
+        }
         marks++;
+        nextIndex = expected.endTxIdx();
+        afterBoundary = true;
+        return new Step(after, Optional.empty());
+    }
+
+    /** Check the index of one relayed record against the records and the boundary before it. */
+    private Step record(final long pos, final long index, final long after) {
+        final boolean fits = afterBoundary ? index == nextIndex : index >= nextIndex;
+        if (!fits) {
+            return fail(pos, "the record index " + index + " does not follow: the next index is "
+                + (afterBoundary ? "" : "at least ") + nextIndex);
+        }
+        nextIndex = Math.addExact(index, 1);
+        afterBoundary = false;
         return new Step(after, Optional.empty());
     }
 

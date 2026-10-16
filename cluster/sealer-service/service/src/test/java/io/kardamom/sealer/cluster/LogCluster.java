@@ -42,7 +42,7 @@ final class LogCluster implements AutoCloseable {
     /** A small retained-file segment, so the frames of a short log span several segments. */
     static final int RETAINED_SEGMENT_BYTES = 64 * 1024;
     private static final long ADMIN_LAG_BYTES = 0;
-    private static final String RETAINED_TOKEN = "log-cluster";
+    private static final RetainedToken RETAINED_TOKEN = RetainedToken.of("log-cluster").orElseThrow();
     private static final long TICK_MS = 200L;
     private static final String LOG_CHANNEL = "aeron:udp?term-length=64k|alias=raft";
 

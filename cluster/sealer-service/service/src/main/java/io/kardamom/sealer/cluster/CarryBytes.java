@@ -15,14 +15,14 @@ import java.util.function.LongSupplier;
  * @param file  the retained-file settings
  * @param token the shared token of the job
  */
-record CarryBytes(RetainedFile.Config file, String token) {
+record CarryBytes(RetainedFile.Config file, RetainedToken token) {
 
     /**
      * The raw values of the settings, as the node reads them at the start.
      *
      * @param carryBytes        {@code kardamom.cluster.carryBytes}
      * @param segmentBytes      {@code kardamom.cluster.retainedSegmentBytes}
-     * @param token             {@code kardamom.cluster.retainedToken}, or the env var
+     * @param token             the env var {@code KARDAMOM_RETAINED_TOKEN}
      * @param clusterDir        the consensus module directory
      * @param adminPort         the admin port; 0 is off
      * @param snapshotIntervalS the snapshot interval; 0 is off
@@ -52,15 +52,14 @@ record CarryBytes(RetainedFile.Config file, String token) {
                 throw new IllegalArgumentException(RetainedFile.Config.SETTING + "=true needs"
                     + " kardamom.cluster.adminPort: a member that a peer seeds copies the retained file from it");
             }
-            if (token == null || token.isBlank()) {
-                throw new IllegalArgumentException(RetainedFile.Config.SETTING + "=true needs "
-                    + RetainedEndpoint.TOKEN_SETTING + " or KARDAMOM_RETAINED_TOKEN: it guards the retained file");
-            }
+            final RetainedToken parsed = RetainedToken.of(token).orElseThrow(() -> new IllegalArgumentException(
+                RetainedFile.Config.SETTING + "=true needs the env var " + RetainedToken.ENV
+                    + ": it guards the retained file"));
             if (snapshotIntervalS <= 0) {
                 throw new IllegalArgumentException(RetainedFile.Config.SETTING + "=true needs"
                     + " kardamom.cluster.snapshotIntervalS above 0: the purge of the retained file runs at each snapshot");
             }
-            return new CarryBytes(file, token.trim());
+            return new CarryBytes(file, parsed);
         }
     }
 

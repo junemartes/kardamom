@@ -304,7 +304,7 @@ A blank member without the bootstrap copies state from a running peer before it 
 - With `carryBytes`, the round then copies the segment files of the retained file from the admin endpoint of a peer (`GET /retained`).
   - The round reads the sealer snapshot that the backup copied. It walks the copy from the front to the head of that snapshot, as a restore does. See [Retained file](#retained-file).
   - The line `cluster SEED retained-copy` shows the peer and the segment count. A copy that fails the walk prints `cluster SEED retained-copy FAILED` with the reason, and the round tries the next peer.
-  - A round in which no peer serves a copy that passes ends with no result, and prints `cluster SEED retained-copy MISMATCH`. After 5 such rounds the seed prints `cluster SEED retained-copy GAVE-UP` and stops the start.
+  - A round in which no peer serves a copy that passes ends with no result, and prints `cluster SEED retained-copy MISMATCH`. After 5 such rounds the seed prints `cluster SEED retained-copy GAVE-UP` and stops the start. See [Recover a member that stops on its retained file](#recover-a-member-that-stops-on-its-retained-file).
   - A cluster with no snapshot needs no copy: the member replays the whole log.
 
 ## Seeded start
@@ -365,8 +365,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
-| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It needs `adminPort`, `retainedToken` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
-| `kardamom.cluster.retainedToken` | none (env `KARDAMOM_RETAINED_TOKEN`) | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The property wins over the env var. |
+| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
@@ -443,6 +443,18 @@ With `carryBytes=true`, the member keeps its retained frames in an append-only f
 - Any I/O error on the file stops the member with `sealer RETAINED-FILE FATAL`. A full disk fails the preallocation of the helper thread. The member stops at the next boundary tick, or at the next segment change. A file error never changes the replicated state or the egress.
 - The admin endpoint serves the segments to a member that a peer seeds, only below the head that the member published at its last boundary tick, snapshot or restore. See [Admin server](#admin-server).
 
+### Recover a member that stops on its retained file
+
+A member stops with `sealer RETAINED-FILE FATAL` when its file does not match its snapshot, and its peer seed stops with `cluster SEED retained-copy GAVE-UP` when no peer serves a matching copy. The member keeps its recording log, so the next start resumes from the same snapshot and stops again. Seed it again:
+
+1. Make sure that a quorum of the other members runs, and that they took a snapshot after the failure.
+2. Stop the member: `nomad alloc stop <alloc>`, or stop its job.
+3. Wipe its state on the host: the cluster directory (with `retained/` in it) and the archive directory. Keep the directories themselves.
+4. Start the member. It finds no recording log, so it seeds from a peer and copies the retained file (`cluster START mode=SEED_FROM_PEER`).
+5. Check the log for `cluster SEED retained-copy` with no `FAILED`, then `sealer snapshot RESTORED`.
+
+- If the seed gives up again, the peers purged the segments during the copy. Wait for the next snapshot of the peers, and start the member again.
+
 ### Member names
 
 The member list names each member by its Consul node name, for example `sealer-0.node.dc1.consul`. Every node resolves these names through its own Consul agent.
@@ -494,7 +506,8 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
 - The server answers `/status`, `/ready` and `/metrics` on one thread. The paths under `/retained` run on two threads of their own, so a segment copy does not hold up `/ready`.
-- The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <retainedToken>`. The job passes the same token to every member.
+- The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
+  - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
 - The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `diskFreeBytes` and `ready`.
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.

@@ -26,18 +26,18 @@ final class AdminServerTest {
         new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, OptionalLong.of(4096));
     private static final MemberStatus BEHIND =
         new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT, OptionalLong.of(4096));
-    private static final String TOKEN = "s3cret";
+    private static final RetainedToken TOKEN = RetainedToken.of("s3cret").orElseThrow();
 
     private static HttpResponse<String> get(final AdminServer admin, final String path)
             throws IOException, InterruptedException {
-        return get(admin, path, "none");
+        return get(admin, path, RetainedToken.of("none").orElseThrow());
     }
 
-    private static HttpResponse<String> get(final AdminServer admin, final String path, final String token)
+    private static HttpResponse<String> get(final AdminServer admin, final String path, final RetainedToken token)
             throws IOException, InterruptedException {
         final HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create("http://127.0.0.1:" + admin.port() + path))
-            .header("Authorization", RetainedEndpoint.authorization(token))
+            .header("Authorization", token.authorization())
             .GET()
             .build();
         return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());

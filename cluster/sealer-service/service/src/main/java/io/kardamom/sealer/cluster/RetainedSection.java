@@ -48,15 +48,27 @@ record RetainedSection(RetainedFrames.Floors floors, long count, long front, lon
         return buf.array();
     }
 
-    /** Read a section at the position of {@code buf}, and its length after it. */
+    /**
+     * Read a section at the position of {@code buf}, and its length after
+     * it. The section must end the buffer, and the length must equal the
+     * bytes of the section.
+     *
+     * @throws IllegalStateException when the length does not match, or bytes follow it
+     */
     static RetainedSection read(final ByteBuffer buf) {
+        final int start = buf.position();
         final RetainedFrames.Floors floors = new RetainedFrames.Floors(buf.getLong(), buf.getLong());
         final long count = buf.getLong();
         final long front = buf.getLong();
         final long head = buf.getLong();
         final TreeMap<Long, Mark> marks = new TreeMap<>();
         IntStream.range(0, buf.getInt()).forEach(i -> marks.put(buf.getLong(), new Mark(buf.getLong(), buf.getLong())));
-        buf.getInt();
+        final int read = buf.position() - start;
+        final int length = buf.getInt();
+        if (length != read || buf.hasRemaining()) {
+            throw new IllegalStateException("the retained section has " + read + " bytes and the length " + length
+                + ", with " + buf.remaining() + " bytes after it");
+        }
         return new RetainedSection(floors, count, front, head, marks);
     }
 

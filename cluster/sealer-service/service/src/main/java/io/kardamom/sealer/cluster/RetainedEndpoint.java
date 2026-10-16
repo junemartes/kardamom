@@ -8,7 +8,6 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.NoSuchFileException;
-import java.security.MessageDigest;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
@@ -29,7 +28,8 @@ import java.util.stream.Collectors;
  * <p>The file holds the bytes of every transaction above the posted head,
  * and the admin server listens on all addresses. So every request must
  * carry the shared token of the job in {@code Authorization: Bearer
- * <token>}; any other request answers 403. The requests run on their own
+ * <token>}; any other request answers 403. The token and the bytes travel
+ * in cleartext HTTP on the node network. The requests run on their own
  * threads, so a slow copy does not hold up {@code /ready}.</p>
  *
  * @param dir     the directory of the retained file
@@ -37,29 +37,22 @@ import java.util.stream.Collectors;
  * @param token   the shared token of the job
  * @param workers the threads of the segment requests
  */
-record RetainedEndpoint(SegmentDir dir, LongSupplier head, String token, ExecutorService workers) {
+record RetainedEndpoint(SegmentDir dir, LongSupplier head, RetainedToken token, ExecutorService workers) {
 
     /** The path of the segment list. A segment is under it. */
     static final String PATH = "/retained";
-    /** The setting of the shared token. The env var {@code KARDAMOM_RETAINED_TOKEN} also sets it. */
-    static final String TOKEN_SETTING = "kardamom.cluster.retainedToken";
     private static final int THREADS = 2;
     private static final int OK = 200;
     private static final int FORBIDDEN = 403;
     private static final int NOT_FOUND = 404;
 
     /** An endpoint with its own daemon threads. */
-    static RetainedEndpoint start(final SegmentDir dir, final LongSupplier head, final String token) {
+    static RetainedEndpoint start(final SegmentDir dir, final LongSupplier head, final RetainedToken token) {
         return new RetainedEndpoint(dir, head, token, Executors.newFixedThreadPool(THREADS, task -> {
             final Thread t = new Thread(task, "kardamom-admin-retained");
             t.setDaemon(true);
             return t;
         }));
-    }
-
-    /** The request header that carries the token. */
-    static String authorization(final String token) {
-        return "Bearer " + token;
     }
 
     /** Hand the request to the threads of the endpoint. */
@@ -88,9 +81,7 @@ record RetainedEndpoint(SegmentDir dir, LongSupplier head, String token, Executo
     }
 
     private boolean authorized(final HttpExchange exchange) {
-        final String sent = exchange.getRequestHeaders().getFirst("Authorization");
-        return sent != null && MessageDigest.isEqual(
-            sent.getBytes(StandardCharsets.UTF_8), authorization(token).getBytes(StandardCharsets.UTF_8));
+        return token.authorizes(exchange.getRequestHeaders().getFirst("Authorization"));
     }
 
     /** The served segments by start position, each with the bytes it serves. */

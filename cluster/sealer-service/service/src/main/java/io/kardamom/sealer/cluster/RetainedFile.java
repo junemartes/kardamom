@@ -3,6 +3,7 @@ package io.kardamom.sealer.cluster;
 import io.kardamom.sealer.ClusterStatus;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
@@ -364,7 +365,7 @@ final class RetainedFile implements RetainedFrames {
      */
     @Override
     public Floors restore(final ByteBuffer buf, final Floors restorePoint) {
-        final RetainedSection section = RetainedSection.read(buf);
+        final RetainedSection section = readSection(buf);
         count = section.count();
         frontPos = section.front();
         headPos = section.head();
@@ -386,6 +387,15 @@ final class RetainedFile implements RetainedFrames {
         publishedHead = headPos;
         askSpare();
         return section.floors();
+    }
+
+    /** The section in {@code buf}. A section that does not parse stops the member. */
+    private RetainedSection readSection(final ByteBuffer buf) {
+        try {
+            return RetainedSection.read(buf);
+        } catch (final IllegalStateException | BufferUnderflowException e) {
+            throw fatal("read the snapshot section", e);
+        }
     }
 
     private TreeMap<Long, ByteBuffer> buffers() {
@@ -445,9 +455,13 @@ final class RetainedFile implements RetainedFrames {
         preallocator.close();
     }
 
-    /** Stop the helper, log the fatal error, and return the exception that stops the service agent. */
+    /**
+     * Ask the helper to stop, log the fatal error, and return the exception
+     * that stops the service agent. It does not wait for the helper: a
+     * helper inside a sync of a failed disk could hold up the stop.
+     */
     private AgentTerminationException fatal(final String what, final Exception cause) {
-        preallocator.close();
+        preallocator.stop();
         System.out.println("sealer RETAINED-FILE FATAL memberId=" + memberId + " " + what + ": " + cause);
         System.out.flush();
         return new AgentTerminationException(cause);

@@ -49,7 +49,7 @@ class RetainedFileTest {
     private static final int SECTION_HEAD_OFFSET = 4 * Long.BYTES;
     /** The floors at the restore point; a retained-file section brings its own. */
     private static final RetainedFrames.Floors RESTORE_POINT = new RetainedFrames.Floors(99, 99);
-    private static final String TOKEN = "t";
+    private static final RetainedToken TOKEN = RetainedToken.of("t").orElseThrow();
 
     @TempDir
     Path dir;
@@ -335,13 +335,48 @@ class RetainedFileTest {
     void the_carried_bytes_need_the_admin_port_the_token_and_the_snapshots() {
         final Path clusterDir = Path.of("/opt/kardamom/cluster");
         assertTrue(new CarryBytes.Inputs(null, null, null, clusterDir, 0, 0).parse().isEmpty());
-        assertEquals("t", new CarryBytes.Inputs("true", null, " t ", clusterDir, 40205, 300).parse()
-            .orElseThrow().token());
+        final RetainedToken token = new CarryBytes.Inputs("true", null, " t ", clusterDir, 40205, 300).parse()
+            .orElseThrow().token();
+        assertTrue(token.authorizes("Bearer t"), "the token is trimmed");
+        assertEquals("RetainedToken[hidden]", token.toString(), "a log line never prints the token");
+        assertFalse(token.authorizes("Bearer u"));
+        assertFalse(token.authorizes(null));
         assertThrows(IllegalArgumentException.class,
             () -> new CarryBytes.Inputs("true", null, "t", clusterDir, 0, 300).parse());
         assertThrows(IllegalArgumentException.class,
             () -> new CarryBytes.Inputs("true", null, " ", clusterDir, 40205, 300).parse());
         assertThrows(IllegalArgumentException.class,
             () -> new CarryBytes.Inputs("true", null, "t", clusterDir, 40205, 0).parse());
+    }
+
+    @Test
+    void a_restore_stops_the_member_when_a_record_index_does_not_follow() throws IOException {
+        final RetainedFile before = openFresh();
+        blocks(before, 1, BLOCKS + 1);
+        final byte[] section = before.writeSnapshot(0, 1);
+        before.close();
+        // The first record has index 0. A damaged index 5 would move the floor of this member only.
+        try (FileChannel channel = FileChannel.open(segmentFiles().get(0), StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.allocate(Long.BYTES).order(ByteOrder.LITTLE_ENDIAN).putLong(0, 5L),
+                RetainedFile.LENGTH_PREFIX + FrameKey.KEY_OFFSET);
+        }
+
+        final RetainedFile restored = open(dir, SEGMENT_BYTES);
+        assertThrows(AgentTerminationException.class, () -> restore(restored, section));
+    }
+
+    @Test
+    void a_section_must_end_with_its_own_length() {
+        final RetainedFile file = openFresh();
+        blocks(file, 1, 3);
+        final byte[] section = file.writeSnapshot(0, 1);
+        assertEquals(file.count(), RetainedSection.read(ByteBuffer.wrap(section)).count());
+
+        final byte[] longer = Arrays.copyOf(section, section.length + 1);
+        assertThrows(IllegalStateException.class, () -> RetainedSection.read(ByteBuffer.wrap(longer)));
+        final byte[] badLength = section.clone();
+        ByteBuffer.wrap(badLength).putInt(badLength.length - Integer.BYTES, 1);
+        assertThrows(IllegalStateException.class, () -> RetainedSection.read(ByteBuffer.wrap(badLength)));
+        assertThrows(AgentTerminationException.class, () -> restore(open(dir.resolve("other"), SEGMENT_BYTES), longer));
     }
 }
