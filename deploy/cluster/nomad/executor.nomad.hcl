@@ -77,6 +77,17 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The genesis fragment of the local canary, "on" or "off"
+# (config/genesis/canary.toml). The deploy sets it on only for the local
+# canary. A live chain keeps "off": its executors refuse a changed genesis.
+variable "canary_genesis" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.canary_genesis)
+    error_message = "The canary_genesis value must be on or off."
+  }
+}
 # The recorded cursor, "on" or "off" (--exec-cursor). On, each executor
 # sends the recorded cursor of its stream to the sealer, the floor of the
 # record-lag guard. Switch it on only after every sealer member reads the
@@ -301,11 +312,16 @@ job "executor" {
 
       # The chain genesis comes from one source, config/genesis/dev.toml.
       # It prefunds Anvil accounts #0 through #15 with 1000 ETH each,
-      # plus the ERC-7955 factory predeploy. With priority fees on, the
-      # fee schedule fragment follows it; the validator renders the same.
+      # plus the ERC-7955 factory predeploy. The local canary's accounts
+      # and, with priority fees on, the fee schedule fragment follow it;
+      # the validator renders the same.
       template {
         destination = "local/genesis.toml"
-        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
+        data = join("\n", concat(
+          [file("config/genesis/dev.toml")],
+          var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
+          var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],
+        ))
       }
 
       service {

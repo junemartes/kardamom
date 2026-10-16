@@ -21,8 +21,8 @@
 # (KARDAMOM_L1_RPC) come from the Nomad Variable nomad/jobs/canary, which
 # the workloads role writes: a key never appears in the job. Without a
 # real mnemonic, and with CANARY_LOCAL=1, the role writes the public
-# anvil mnemonic with ring_offset 34, the accounts the dev genesis funds
-# for the canary.
+# anvil mnemonic with ring_offset 34, the accounts that the genesis
+# fragment config/genesis/canary.toml funds for the local canary only.
 #
 # Placement: the node whose role set holds monitoring (the aux node by
 # default), outside the chaos suite's blast radius, beside the

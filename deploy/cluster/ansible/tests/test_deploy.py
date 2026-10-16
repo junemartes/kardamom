@@ -27,6 +27,11 @@ MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 # The Nomad Variable a job's template renders into the task environment.
 SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 # A secret no rendered job, job variable or play output may hold.
+# The genesis of a deployment without the local canary, and the first
+# account of the canary's fragment (config/genesis/canary.toml).
+DEV_GENESIS = ANSIBLE.parent / 'config/genesis/dev.toml'
+CANARY_RING_ACCOUNT = '0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D'
+
 SENTINEL = 'SECRET-SENTINEL'
 # The chain status of a chain that stands on nothing.
 HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
@@ -452,6 +457,9 @@ class DeployTest(Deploys):
             'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
+        # The local canary's ring is funded by its own genesis fragment.
+        for name in ('executor', 'validator'):
+            self.assertIn(CANARY_RING_ACCOUNT, self.genesis_template(self.api.state['jobs'][name]), name)
         self.assertEqual(sorted(self.api.state['variable_writes']),
                          ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/l1-indexer'])
         self.run_deploy(environ=local_canary)
@@ -792,6 +800,9 @@ class DeployTest(Deploys):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+            # A deployment without the local canary keeps dev.toml as it
+            # is: a live chain refuses a changed genesis.
+            self.assertEqual(self.genesis_template(plans[name]), DEV_GENESIS.read_text(), name)
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):
