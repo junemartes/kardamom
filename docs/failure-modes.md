@@ -1153,7 +1153,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - Proof: the chaos case `canary-da-lag` freezes the batcher past the DA-lag budget. The canary reports `rpc_error{code="-32010"}`, and Alertmanager holds its page as inhibited. The case runs by name with `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, as `da-lag-halt` does, on a cluster deployed with `CANARY_LOCAL=1`.
 - **Known limits.**
   - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
-  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
+  - The genesis fragment `deploy/cluster/config/genesis/canary.toml` funds anvil accounts #34 to #37 for the canary ring of the local profile. The executor and validator jobs append it only with `CANARY_LOCAL=1`, so a live chain keeps its genesis. The local canary runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
 
 ## Redis account cache
 

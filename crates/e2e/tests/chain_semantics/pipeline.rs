@@ -170,6 +170,8 @@ async fn s19_canary_probes_succeed_and_the_ring_resolves_in_flight() {
         notifier: true,
         l1: true,
         priority_fees: true,
+        // The ring's accounts, #34 to #37.
+        canary_genesis: true,
         ..StackConfig::default()
     });
     let t = target(&stack);
