@@ -467,6 +467,7 @@ class DeployTest(Deploys):
         # deploy workflow sets.
         l1 = f'https://l1.example/v3/{SENTINEL}-L1'
         followers = f'https://a.example/v2/{SENTINEL}-A,https://b.example/v3/{SENTINEL}-B'
+        batcher = f'https://primary.example/v2/{SENTINEL}-P,https://fallback.example/v3/{SENTINEL}-F'
         key = f'0x{SENTINEL}-KEY'
         # An Alertmanager configuration with a receiver token, and its own
         # Go templates, which must arrive as data.
@@ -476,7 +477,7 @@ class DeployTest(Deploys):
             f'      - bot_token: "{SENTINEL}-BOT"\n        chat_id: 1\n'
             '        message: \'{{ .CommonLabels.alertname }} {{ range .Alerts }}{{ .Annotations.runbook }}{{ end }}\'\n')
         output = self.run_deploy(environ={
-            'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
+            'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_L1_RPC': batcher, 'BATCHER_KEY': key,
             'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
             'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC', 'CANARY_L1_KEY': f'0x{SENTINEL}-CANARY',
             'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
@@ -489,7 +490,7 @@ class DeployTest(Deploys):
         self.assertTrue(monitoring['alertmanager'].startswith(alertmanager.read_text()), monitoring['alertmanager'].replace(SENTINEL, '<S>'))
         self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
         self.assertEqual(state['variables'], {
-            'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
+            'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': batcher, 'KARDAMOM_L1_KEY': key},
             'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
                                   'KARDAMOM_CANARY_L1_KEY': f'0x{SENTINEL}-CANARY', 'KARDAMOM_L1_RPC': l1},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,

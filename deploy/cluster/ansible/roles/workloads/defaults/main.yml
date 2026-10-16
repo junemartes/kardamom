@@ -55,6 +55,9 @@ workloads_common_vars:
 # real L1 (the batcher, the da-watcher) read the given one.
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
 workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
+# The batcher starts with this endpoint order and ranks failing ones last.
+# The settlement bootstrap and DA proxy keep the single L1_RPC endpoint.
+workloads_batcher_rpc: "{{ lookup('env', 'BATCHER_L1_RPC') | default(workloads_l1_rpc, true) }}"
 # The batcher's L1 key: the batcher's KARDAMOM_L1_KEY and the DA proxy's
 # signer. Empty: the batcher signs with workloads_batcher_dev_key, and
 # the proxy is read-only. Like every keyed L1 URL, it reaches a task
