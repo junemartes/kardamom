@@ -15,13 +15,15 @@ use rkyv::Archive;
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
 
+use super::entry::{CanonicalTx, RelayedRef};
 use super::{
     CANONICAL_ID_LEN, EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT,
     EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED,
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
-    EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH,
-    RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, WireError,
-    encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX,
+    RT_TX_OFFER, RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN,
+    STATUS_WITH_RECORD_LAG_LEN, WireError, encode_kind_2u64, rd_i32, rd_len, rd_slice, rd_u8,
+    rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -31,6 +33,13 @@ use super::{
 pub enum EgressItem {
     /// A relayed canonical record with its assigned 0-based index.
     Record { index: u64, msg: TxOrderingMessage },
+    /// A relayed canonical entry with its bytes: record type 6.
+    Tx { index: u64, tx: CanonicalTx },
+    /// The index and the id of a canonical entry, without its bytes.
+    RelayedRef(RelayedRef),
+    /// The member feed dropped frames from this record index and block on.
+    /// Ask for a replay from the cursor.
+    FeedGap { next_index: u64, next_block: u64 },
     /// A generated block boundary.
     Boundary(BlockBoundaryStart),
     /// Replay refused: the requested range predates the service's retention.
@@ -143,6 +152,11 @@ impl EgressItem {
                 expected_origin: rd_u64(buf, 9)?,
             }),
             super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
+            super::EGRESS_KIND_RELAYED_REF => RelayedRef::parse(buf).map(Self::RelayedRef),
+            super::EGRESS_KIND_FEED_GAP => Ok(Self::FeedGap {
+                next_index: rd_u64(buf, 1)?,
+                next_block: rd_u64(buf, 9)?,
+            }),
             other => Err(WireError::BadEgressKind(other)),
         }
     }
@@ -155,10 +169,7 @@ impl EgressItem {
             declared: payload_len,
             remaining: buf.len().saturating_sub(start),
         })?;
-        Ok(Self::Record {
-            index,
-            msg: RelayedPayload::parse(payload)?.decode()?,
-        })
+        RelayedPayload::parse(payload)?.into_item(index)
     }
 
     fn decode_boundary(buf: &[u8]) -> Result<Self, WireError> {
@@ -211,7 +222,17 @@ impl EgressItem {
             floor_index: rd_u64(buf, 34)?,
             floor_block: rd_u64(buf, 42)?,
             record_lag: Self::decode_record_lag_tail(buf)?,
+            retained_bytes: Self::decode_retained_bytes_tail(buf)?,
         }))
+    }
+
+    /// The byte tail after the record-lag tail of a status frame. A frame
+    /// with no byte tail reads as no retained bytes.
+    fn decode_retained_bytes_tail(buf: &[u8]) -> Result<Option<u64>, WireError> {
+        if buf.len() <= STATUS_WITH_RECORD_LAG_LEN {
+            return Ok(None);
+        }
+        rd_u64(buf, STATUS_WITH_RECORD_LAG_LEN).map(Some)
     }
 
     /// The record-lag tail after the first [`STATUS_LEN`] bytes of a status
@@ -287,6 +308,23 @@ impl<'a> RelayedPayload<'a> {
             record_type,
             fields: &p[CANONICAL_ID_LEN + 1..],
         })
+    }
+
+    /// The egress item of this payload at canonical `index`. A canonical
+    /// entry has its own item. A full entry is an ingress type, so a
+    /// relayed one is refused.
+    fn into_item(self, index: u64) -> Result<EgressItem, WireError> {
+        match self.record_type {
+            RT_TX => Ok(EgressItem::Tx {
+                index,
+                tx: CanonicalTx::parse(self.id, self.fields)?,
+            }),
+            RT_TX_OFFER => Err(WireError::UnrelayedRecordType(RT_TX_OFFER)),
+            _ => Ok(EgressItem::Record {
+                index,
+                msg: self.decode()?,
+            }),
+        }
     }
 
     /// Decode `self.fields` into a [`TxOrderingMessage`]. This recovers
@@ -392,7 +430,7 @@ impl<'a> RelayedPayload<'a> {
 /// per L1 (or origin) block, so the copy cost is small. The alternative,
 /// padding the frame to realign it, would have to survive the Java relay
 /// byte-for-byte.
-fn decode_rkyv_body<T>(fields: &[u8]) -> Result<T, rancor::Error>
+pub(super) fn decode_rkyv_body<T>(fields: &[u8]) -> Result<T, rancor::Error>
 where
     T: Archive,
     T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
@@ -516,11 +554,12 @@ pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
 }
 
 /// Frame the chain's status exactly as the Java service does. The real
-/// encoder is the Java service; this is a test and mock-server helper.
+/// encoder is the Java service; this is a test and mock-server helper. A
+/// status with no retained bytes gets no byte tail.
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
-    let mut b = Vec::with_capacity(super::STATUS_WITH_RECORD_LAG_LEN);
+    let mut b = Vec::with_capacity(super::STATUS_WITH_RETAINED_BYTES_LEN);
     b.push(EGRESS_KIND_STATUS);
     b.extend_from_slice(&status.posted_head.to_le_bytes());
     b.extend_from_slice(&status.sealed_head.to_le_bytes());
@@ -533,6 +572,9 @@ pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
     b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
     b.extend_from_slice(&lag.budget.to_le_bytes());
     b.push(u8::from(lag.halted));
+    if let Some(retained_bytes) = status.retained_bytes {
+        b.extend_from_slice(&retained_bytes.to_le_bytes());
+    }
     b
 }
 

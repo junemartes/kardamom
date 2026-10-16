@@ -293,7 +293,10 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             // Every reject is offered only to the offering sequencer
             // session. An executor session cannot receive one. Ignore them
             // defensively. The status is broadcast to every session; the
-            // ingress reads it, a consumer of the ordering does not.
+            // ingress reads it, a consumer of the ordering does not. A
+            // relayed reference repeats an entry without its bytes, and a
+            // feed gap comes only on the member feed: both carry nothing
+            // for this reader.
             EgressItem::ContiguityReject { .. }
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::PastDeadline { .. }
@@ -301,7 +304,14 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             | EgressItem::DaLagReject { .. }
             | EgressItem::RecordLagReject { .. }
             | EgressItem::OriginGap { .. }
-            | EgressItem::Status(_) => {}
+            | EgressItem::Status(_)
+            | EgressItem::RelayedRef(_)
+            | EgressItem::FeedGap { .. } => {}
+            // This reader orders references. It drops a canonical entry
+            // and logs it, as it drops a frame of an unknown record type.
+            EgressItem::Tx { index, .. } => {
+                tracing::warn!(index, "dropping a canonical entry on the reference path");
+            }
             EgressItem::ReplayUnavailable {
                 oldest_index,
                 oldest_block,

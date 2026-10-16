@@ -64,36 +64,45 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
-# only when recordLagBudget is above 0.
+# only when recordLagBudget is above 0. This release reads kind 15 (the
+# relayed reference) and kind 16 (the feed gap, on the member feed only),
+# and sends neither. No frame uses kind 14: a reader drops it as unknown.
 #
-# The status frame (kind 9) is 50 bytes, or 67 bytes with the record-lag
-# fields at the tail. A reader of either release reads either size: an old
-# reader ignores the tail, and a new reader reads a frame with no tail as
-# the guard off.
+# The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
+# fields at the tail, or 75 bytes with the retained bytes after them. This
+# release sends 67 bytes. A reader of either release reads every size: an
+# old reader ignores a tail it does not know, and a new reader reads a
+# frame with no tail as the guard off and no retained bytes.
 [format.sealer-egress-kinds]
 writes = 12
 reads_min = 1
-reads_max = 13
+reads_max = 16
 shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_RECORD_LAG_REJECT",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_FEED_GAP",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_RECORD_LAG_REJECT",
-    "crates/cluster-adapter/src/wire/mod.rs#STATUS_WITH_RECORD_LAG_LEN",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_FEED_GAP",
+    "crates/cluster-adapter/src/wire/mod.rs#STATUS_WITH_RETAINED_BYTES_LEN",
 ]
 activation = { flag = "recordLagBudget", writes = 13 }
 
-# The record type inside a relayed egress frame. The Rust writers send
-# types 0 to 3, and the sealer writes type 4 (void). The Rust reader drops
-# a frame with an unknown type, so an old executor misses a canonical
-# record.
+# The record type inside an ingress record and a relayed egress frame. The
+# Rust writers send types 0 to 3, and the sealer writes type 4 (void). This
+# release has the codecs of type 5 (the full entry, on ingress only) and
+# type 6 (the canonical entry, on egress only), and writes neither. The
+# Rust reader refuses a relayed type 5, and drops a frame with an unknown
+# type, so an old executor misses a canonical record.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0
-reads_max = 4
+reads_max = 6
 shared = true
 code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
+    "crates/cluster-adapter/src/wire/mod.rs#RT_TX",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/TxOffer.java#RT_TX",
 ]
 
 # The seed file that kardamom-reconstruct writes and an empty sealer

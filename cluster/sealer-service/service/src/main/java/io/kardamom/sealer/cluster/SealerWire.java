@@ -206,6 +206,18 @@ public final class SealerWire {
      * {@code index} from the chain. Matches Rust {@code RT_VOID}.
      */
     public static final byte RT_VOID = io.kardamom.sealer.VoidLedger.RT_VOID;
+    /**
+     * Record type of a full entry inside a kind-0 record:
+     * {@code [canonical_id:32][record_type:5][lane:u8][envelope]}. See
+     * {@link io.kardamom.sealer.TxOffer}. Matches Rust {@code RT_TX_OFFER}.
+     */
+    public static final byte RT_TX_OFFER = io.kardamom.sealer.TxOffer.RT_TX_OFFER;
+    /**
+     * Record type of a canonical entry inside a relayed payload:
+     * {@code [canonical_id:32][record_type:6][lane:u8][envelope]}. Matches
+     * Rust {@code RT_TX}.
+     */
+    public static final byte RT_TX = io.kardamom.sealer.TxOffer.RT_TX;
 
     /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
     static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
@@ -294,9 +306,10 @@ public final class SealerWire {
      * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}
      * (50 bytes), then the record-lag tail
      * {@code [best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]}
-     * (17 bytes). {@code best_recorded} is {@code u64::MAX} before the
-     * first recorded cursor. A reader that knows only the first 50 bytes
-     * ignores the tail. The ingress serves {@code safe} from the posted
+     * (17 bytes), then the byte tail {@code [retained_bytes:u64]} (8 bytes).
+     * The service sends the first two parts. {@code best_recorded} is
+     * {@code u64::MAX} before the first recorded cursor. A reader ignores
+     * the tails it does not know. The ingress serves {@code safe} from the posted
      * head and raises its {@code da_lag} halt from the flag. Not retained:
      * a session learns the current status when it announces itself.
      */
@@ -327,6 +340,44 @@ public final class SealerWire {
      * ordered. Matches Rust {@code EGRESS_KIND_RECORD_LAG_REJECT}.
      */
     public static final byte EGRESS_KIND_RECORD_LAG_REJECT = 13;
+    /**
+     * A relayed reference:
+     * {@code [kind:15][index:u64 LE][canonical_id:32][record_type:u8]}
+     * ({@link #RELAYED_REF_LEN} bytes). It goes to every egress subscriber
+     * for each {@link #RT_TX} entry, in place of the kind-1 frame: the
+     * subscriber learns the index and the id, not the bytes. Matches Rust
+     * {@code EGRESS_KIND_RELAYED_REF}.
+     */
+    public static final byte EGRESS_KIND_RELAYED_REF = 15;
+    /** Length of an {@link #EGRESS_KIND_RELAYED_REF} frame. */
+    static final int RELAYED_REF_LEN =
+        Byte.BYTES + Long.BYTES + CanonicalSealerState.CANONICAL_ID_LEN + Byte.BYTES;
+    /**
+     * A feed gap, on the member feed only:
+     * {@code [kind:16][next_index:u64 LE][next_block:u64 LE]}: the first
+     * record index and the first block that the feed did not carry. The
+     * cluster egress never sends it. No frame uses kind 14. Matches Rust
+     * {@code EGRESS_KIND_FEED_GAP}.
+     */
+    public static final byte EGRESS_KIND_FEED_GAP = 16;
+
+    /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
+    static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;
+    /** Length of a status frame without its tails. */
+    static final int STATUS_LEN = 50;
+    /** Length of a status frame with the record-lag tail. */
+    static final int STATUS_WITH_RECORD_LAG_LEN = STATUS_LEN + Long.BYTES + Long.BYTES + Byte.BYTES;
+    /** Length of a status frame with the record-lag tail and the byte tail. */
+    static final int STATUS_WITH_RETAINED_BYTES_LEN = STATUS_WITH_RECORD_LAG_LEN + Long.BYTES;
+
+    /**
+     * The longest session message that the cluster log takes, header
+     * included: the 8 MiB log term divided by 8. Matches Rust
+     * {@code MAX_SESSION_MESSAGE_LEN}.
+     */
+    static final int MAX_SESSION_MESSAGE_LEN = 1 << 20;
+    /** The session header in front of the payload of each session message. */
+    static final int SESSION_HEADER_LEN = 32;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     static final int DEFAULT_RETENTION = 65536;

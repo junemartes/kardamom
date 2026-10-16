@@ -1,5 +1,6 @@
 package io.kardamom.sealer.cluster;
 
+import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.kardamom.sealer.Boundary;
@@ -109,6 +110,8 @@ final class SealerEgress {
     // Staging buffer for egress framing. Reuse it to avoid a per-message
     // allocation on the single cluster service thread.
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer();
+    /** The frame codec over {@link #egressBuffer}. */
+    private final EgressFrames frames = new EgressFrames(egressBuffer);
 
     SealerEgress(
             final Cluster cluster,
@@ -168,9 +171,16 @@ final class SealerEgress {
         backlogs.drain();
     }
 
-    /** Drop the backlog of a closed session. */
-    void dropBacklog(final long sessionId) {
-        backlogs.drop(sessionId);
+    /**
+     * Drop the backlog of a closed session. A close that the service did not
+     * ask for ends the session for good, so its response channel loses its
+     * count of too-long closes too.
+     */
+    void dropBacklog(final ClientSession session, final CloseReason closeReason) {
+        backlogs.drop(session.id());
+        if (closeReason != CloseReason.SERVICE_ACTION) {
+            backlogs.forgetChannel(session.responseChannel());
+        }
     }
 
     /** Drop every backlog, because this member's role changed. */
@@ -306,15 +316,7 @@ final class SealerEgress {
 
     /** Frame and offer a control message {@code kind(1) | a(8) | b(8)}. */
     private void offerControl(final ClientSession session, final byte kind, final long a, final long b) {
-        final MutableDirectBuffer buf = egressBuffer;
-        int pos = 0;
-        buf.putByte(pos, kind);
-        pos += Byte.BYTES;
-        buf.putLong(pos, a, ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, b, ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        offerToSession(session, pos);
+        offerToSession(session, frames.control(kind, a, b));
     }
 
     /**
@@ -418,9 +420,7 @@ final class SealerEgress {
      * window and its block is posted.
      */
     private void retain(final int length, final boolean boundary, final long key) {
-        final byte[] copy = new byte[length];
-        egressBuffer.getBytes(0, copy);
-        retained.addLast(new RetainedFrame(copy, boundary, key));
+        retained.addLast(new RetainedFrame(frames.copy(length), boundary, key));
         prune();
     }
 
@@ -449,13 +449,12 @@ final class SealerEgress {
 
     /**
      * Frame and broadcast the chain's status to every session, or offer it
-     * to one session: {@code kind(1) | posted_head(8) | sealed_head(8) |
-     * budget(8) | halted(1) | retained(8) | floor_index(8) | floor_block(8)
-     * | best_recorded(8) | record_lag_budget(8) | record_lag_halted(1)}.
-     * Not retained: a session that announces itself gets the current one.
+     * to one session. The frame carries the record-lag tail
+     * ({@link EgressFrames#status(ClusterStatus)}). Not retained: a session
+     * that announces itself gets the current one.
      */
     void offerStatus(final ClusterStatus status) {
-        final int len = frameStatus(status);
+        final int len = frames.status(status);
         for (final ClientSession session : cluster.clientSessions()) {
             offerToSession(session, len);
         }
@@ -463,35 +462,7 @@ final class SealerEgress {
 
     /** {@link #offerStatus(ClusterStatus)} to one session. */
     void offerStatus(final ClientSession session, final ClusterStatus status) {
-        offerToSession(session, frameStatus(status));
-    }
-
-    private int frameStatus(final ClusterStatus status) {
-        final MutableDirectBuffer buf = egressBuffer;
-        int pos = 0;
-        buf.putByte(pos, SealerWire.EGRESS_KIND_STATUS);
-        pos += Byte.BYTES;
-        buf.putLong(pos, status.postedHead(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.sealedHead(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.budgetBlocks(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putByte(pos, status.halted() ? (byte) 1 : (byte) 0);
-        pos += Byte.BYTES;
-        buf.putLong(pos, status.retainedFrames(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.floorIndex(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.floorBlock(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.bestRecorded(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putLong(pos, status.recordLagBudget(), ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putByte(pos, status.recordLagHalted() ? (byte) 1 : (byte) 0);
-        pos += Byte.BYTES;
-        return pos;
+        offerToSession(session, frames.status(status));
     }
 
     /**
@@ -610,7 +581,7 @@ final class SealerEgress {
     }
 
     void offerRelayed(final Relayed relayed) {
-        final int len = frameRelayed(relayed);
+        final int len = frames.relayed(relayed);
         retain(len, false, relayed.index);
         offerToConsumers(lastRetained());
     }
@@ -642,27 +613,6 @@ final class SealerEgress {
         cluster.clientSessions().stream()
             .filter(session -> consumerSessions.isEmpty() || consumerSessions.contains(session.id()))
             .forEach(session -> backlogs.offer(session, frame));
-    }
-
-    /**
-     * Frame a {@link Relayed} into {@link #egressBuffer}:
-     * {@code kind(1) | index(8) | payloadLen(4) | payload[]}. The payload is
-     * copied through as is.
-     */
-    private int frameRelayed(final Relayed relayed) {
-        final MutableDirectBuffer buf = egressBuffer;
-        int pos = 0;
-        buf.putByte(pos, SealerWire.EGRESS_KIND_RELAYED);
-        pos += Byte.BYTES;
-        buf.putLong(pos, relayed.index, ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putInt(pos, relayed.payload.length, ByteOrder.LITTLE_ENDIAN);
-        pos += Integer.BYTES;
-        if (relayed.payload.length > 0) {
-            buf.putBytes(pos, relayed.payload);
-            pos += relayed.payload.length;
-        }
-        return pos;
     }
 
     void offerBoundary(final Boundary boundary) {
@@ -703,13 +653,6 @@ final class SealerEgress {
      * and the next frame reuses the staging buffer.
      */
     private void offerToSession(final ClientSession session, final int length) {
-        backlogs.offer(session, staged(length));
-    }
-
-    /** A copy of the first {@code length} bytes of {@link #egressBuffer}. */
-    private byte[] staged(final int length) {
-        final byte[] frame = new byte[length];
-        egressBuffer.getBytes(0, frame);
-        return frame;
+        backlogs.offer(session, frames.copy(length));
     }
 }
