@@ -362,7 +362,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
 | `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
-| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. `0` turns the join watchdog off, and with it the exit on a closed component. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
+| `kardamom.cluster.catchupStallS` | `300` | no | A member that tried a catch-up, and makes no progress for this long while a peer has a closed election, drops its recording log and exits with code 4. The relaunch seeds the member from a peer. `0` turns the seed off: the member then never drops its log. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
@@ -466,6 +467,32 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 - If the status cannot be read, `/ready` and `/status` answer 503 with an `error` field.
 - The Nomad job registers a Consul check of the path `/ready`. A rolling deploy waits for it before it stops the next member.
 
+## Election stalls
+
+Aeron 1.44 has three election waits with no bound. The join watchdog turns each into an exit. The relaunch then starts from the member's own state.
+
+- `LEADER_READY` has no timeout. The leader waits until each member that voted, or after the leader heartbeat timeout a quorum, appends at its position in its term. A member that voted, but can never join the term, keeps the leader there.
+- A follower whose service applied a log tail that the new leader does not hold fails each join at once. The join check finds the leader's join position below the member's log position, and each new election takes the position from the commit counter again. Only a relaunch replays the log again, up to the leader's log.
+- `FOLLOWER_LOG_REPLICATION` checks its deadline only after the archive signals both the end of the replication and the stop of the recording. A replication that fails before its recording starts sends no stop, and the election waits for ever.
+
+The rules:
+
+- **Progress.** A new highest commit position of the member, a new highest position of its log recording in `FOLLOWER_LOG_REPLICATION`, a new highest commit position of a peer while the member waits in `LEADER_READY`, or a closed election. A leader reads the commit positions of its peers from their admin servers each 5 s. A replay of the member's own log from a lower position is no progress.
+- **Leader stall.** The member waits in `LEADER_READY` with no progress for longer than the stall limit. It logs `cluster LEADER STALL` and exits with code 7.
+- **Follower stall.** The member reached a follower state, so it found a leader, and it then makes no progress for the stall limit. It logs `cluster FOLLOWER STALL` and exits with code 8. The relaunch keeps the recording log.
+- **Catch-up stall.** A member in the follower stall that tried a catch-up (`FOLLOWER_LOG_REPLICATION` or a `FOLLOWER_CATCHUP` state) first asks its peers for their admin status.
+  - No peer has a closed election: the leader that the member found is not live, so its log tail is not the cause. The member exits with code 8 and keeps its log.
+  - A peer has a closed election: the member waits until `catchupStallS`, asks again, and then drops its recording log and exits with code 4. The relaunch seeds from that peer.
+
+The stall limit comes from the member's Aeron timeouts: two join attempts of a follower, each with two leader heartbeat timeouts, one archive message timeout and one driver timeout. That is 2 x (2 x 10 + 10 + 10) = 80 s at the defaults, and 2 x (2 x 10 + 30 + 30) = 160 s at the CI stall tolerance of 30 s. A healthy election in CI closes `LEADER_READY` within 10 s.
+
+None of the rules fires on a healthy cluster:
+
+- A slow follower that replays or catches up moves its commit position. The follower counts it as progress, and a waiting leader reads it from the follower's admin server.
+- A lone member with quorum lost, and a coordinated restart, wait in `CANVASS`. They reach no follower state until a leader exists.
+- A snapshot runs with a closed election. A closed election is progress.
+- With `adminPort` 0, the members serve no status. A leader then reads no peer progress, and a follower never drops its log.
+
 ## Log lines
 
 The service prints on stdout. Each line starts with a UTC instant, then the text in the table.
@@ -507,7 +534,12 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
 | `cluster LEADER WEDGE` | The completion of the member's leader election failed, so the leader has no ingress subscription: its control toggle is active, but its election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. The process halts with exit code 6, and the members elect again. |
-| `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`). A short state can pass with no line. |
+| `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`, `candidateTermId`, `logLeadershipTermId`). A short state can pass with no line. `candidateTermId` is the highest term that the member voted in or stood for (from the node state file). `logLeadershipTermId` is the term of the last term entry of the recording log: a leader writes it when it starts its term, and a follower when it joins the leader's log. It reads `unknown` when the member has no term entry, or when the read meets an entry that the consensus module writes at that moment. |
+| `cluster REPLICATION` | The member is in `FOLLOWER_LOG_REPLICATION`, and the position of its active log recording changed (`recordingId`, `position`, `commitPosition`). `(no active recording)` means that the replication ended, or never started, with no recording. |
+| `cluster LEADER STALL` | The member waited in `LEADER_READY` with no progress on itself or its peers for the stall limit. The process halts with exit code 7, and the members elect again. See [Election stalls](#election-stalls). |
+| `cluster FOLLOWER STALL` | The member found a leader and then made no progress for the stall limit. The process halts with exit code 8, and the relaunch keeps the recording log. A line with `deferred` shows that a peer has a closed election: the `CATCHUP STALL` rule then decides at `catchupStallS`. |
+| `cluster CATCHUP STALL` | The member tried a catch-up and made no progress for `catchupStallS`, and a peer has a closed election. The member drops its recording log, and the process halts with exit code 4. The relaunch seeds from that peer. |
+| `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |

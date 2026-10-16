@@ -93,18 +93,28 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "cluster CATCHUP STALL",
     "cluster COMPONENT CLOSED",
     "cluster LEADER WEDGE",
+    "cluster LEADER STALL",
+    "cluster FOLLOWER STALL",
+    "cluster ERROR LOG",
     "cluster ELECTION",
+    "cluster REPLICATION",
     "cluster DNS",
     "cluster LOG PURGE",
     "cluster SEED",
 ];
 const CONSENSUS_EVENTS: usize = 120;
-const AERON_ERRORS: &str = "for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do [ -f \"$f\" ] && { echo \"--- $f ---\"; cat \"$f\"; }; done";
+/// The error logs that a start saved from the mark files of the previous
+/// run. A missing file is no failure: the loop must end with status 0.
+const AERON_ERRORS: &str = "for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do if [ -f \"$f\" ]; then echo \"--- $f ---\"; cat \"$f\"; fi; done";
+/// The live error logs of the running member: the consensus module, the
+/// media driver and the service container. Each tool run has its own
+/// bound below the bound of the docker command: the tool waits for a mark
+/// file that a member in its peer seed does not have yet.
 const CLUSTER_TOOL: &str = r#"inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
 [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
-docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster errors 2>&1 | tail -40
+timeout 12 docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster errors 2>&1 | tail -60
 echo "--- list-members ---"
-docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3"#;
+timeout 5 docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3"#;
 
 /// The dump of one cluster.
 pub struct Diagnostics {
@@ -338,21 +348,56 @@ impl Diagnostics {
 
     async fn sealer_section(&self, node: &Node) {
         section(format!("{}: Aeron cluster error logs", node.name));
-        println!(
-            "{}",
-            self.nodes
-                .exec(&node.container, AERON_ERRORS)
-                .await
-                .unwrap_or_default()
-        );
+        println!("{}", self.node_script(node, AERON_ERRORS).await);
         section(format!("{}: ClusterTool errors + members", node.name));
-        println!(
-            "{}",
-            self.nodes
-                .exec(&node.container, CLUSTER_TOOL)
-                .await
-                .unwrap_or_default()
-        );
+        println!("{}", self.node_script(node, CLUSTER_TOOL).await);
+    }
+
+    /// The output of a script in a node container. A failed or a timed
+    /// out exec names its cause, so an empty section never hides it.
+    async fn node_script(&self, node: &Node, script: &str) -> String {
+        let run = self
+            .nodes
+            .docker(&["exec", &node.container, "bash", "-lc", script])
+            .await;
+        ScriptReport::from(run).to_string()
+    }
+}
+
+/// What a node script printed, and why it ended when it did not end well.
+struct ScriptReport {
+    stdout: String,
+    failure: Option<String>,
+}
+
+impl From<anyhow::Result<std::process::Output>> for ScriptReport {
+    fn from(run: anyhow::Result<std::process::Output>) -> Self {
+        match run {
+            Ok(out) => Self {
+                stdout: String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+                failure: (!out.status.success()).then(|| {
+                    format!(
+                        "{}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )
+                }),
+            },
+            Err(e) => Self {
+                stdout: String::new(),
+                failure: Some(format!("{e:#}")),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ScriptReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.stdout)?;
+        match &self.failure {
+            Some(why) => write!(f, "\n(the script failed: {why})"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -504,6 +549,45 @@ mod tests {
         assert_eq!(timeline.lines().count(), 4);
         assert!(!timeline.contains("SESSION"));
         assert!(!timeline.contains("CONTIGUITY"));
+    }
+
+    #[test]
+    fn the_consensus_timeline_keeps_the_stall_exits_and_the_error_log() {
+        let logs = "2026-10-16T13:05:54Z cluster REPLICATION memberId=2 recordingId=0 position=-1 commitPosition=15027712 (no active recording)\n\
+            2026-10-16T13:08:31Z cluster LEADER STALL memberId=1 commitPosition=15027008\n\
+            2026-10-16T13:08:32Z cluster FOLLOWER STALL memberId=0 commitPosition=15027712\n\
+            2026-10-16T13:08:32Z cluster ERROR LOG memberId=0 | followerLogAwait - joinPosition=15027008 less than logPosition=15027712\n\
+            2026-10-16T13:08:33Z cluster SESSION open memberId=1 session=41\n";
+        let timeline = matching_lines(logs, CONSENSUS_MARKERS, CONSENSUS_EVENTS);
+        assert_eq!(timeline.lines().count(), 4);
+        assert!(timeline.contains("joinPosition=15027008"));
+    }
+
+    #[test]
+    fn the_saved_error_log_script_ends_well_with_no_file() {
+        let out = std::process::Command::new("bash")
+            .args(["-c", AERON_ERRORS])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    #[test]
+    fn a_failed_script_names_its_cause() {
+        let report = ScriptReport::from(Err(anyhow::anyhow!("docker exec sealer-2 timed out")));
+        assert_eq!(
+            report.to_string(),
+            "\n(the script failed: docker exec sealer-2 timed out)"
+        );
+        let ok = std::process::Command::new("bash")
+            .args(["-c", "echo partial; exit 3"])
+            .output()
+            .unwrap();
+        let report = ScriptReport::from(Ok(ok)).to_string();
+        assert!(
+            report.starts_with("partial\n(the script failed: exit status: 3"),
+            "{report}"
+        );
     }
 
     #[test]

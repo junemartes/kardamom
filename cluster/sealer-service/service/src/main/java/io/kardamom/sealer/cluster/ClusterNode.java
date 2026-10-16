@@ -234,8 +234,8 @@ public final class ClusterNode {
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
             // not read that close as a failed component.
-            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop),
-                contexts.clusterState());
+            startJoinWatchdog(new JoinWatchdogThread.Member(memberId, consensus, container.context(), stop,
+                PeerProbe.forMembers(clusterMembers, memberId, adminPort())), contexts.clusterState());
             stop.await();
         }
     }
@@ -274,7 +274,7 @@ public final class ClusterNode {
             final ConsensusModule.Context consensus,
             final SealerClusteredService service,
             final int memberId) {
-        final int port = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
+        final int port = adminPort();
         if (port == 0) {
             System.out.println("cluster admin endpoint DISABLED memberId=" + memberId);
             return null;
@@ -294,6 +294,11 @@ public final class ClusterNode {
         }
         System.out.println("cluster admin endpoint up memberId=" + memberId + " port=" + admin.port());
         return admin;
+    }
+
+    /** The port of the admin endpoint of every member; 0 turns it off. */
+    static int adminPort() {
+        return Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
     }
 
     /**
@@ -377,19 +382,22 @@ public final class ClusterNode {
     /**
      * Exits the process when the member never joins the cluster
      * ({@code -Dkardamom.cluster.joinWatchdogS}, default 60, 0 disables it),
-     * when a component closes with no stop request, or when its catch-up stalls
+     * when a component closes with no stop request, when an election stalls,
+     * or when its catch-up stalls and a peer can seed it
      * ({@code -Dkardamom.cluster.catchupStallS}, default 300, 0 disables
-     * that rule only).
+     * the seed only).
      *
      * <p>A member can wedge inside its first election, after a successful
      * launch, with no error and no exit. Aeron 1.44's
      * {@code awaitLocalSocketsClosed} has no timeout, so the consensus
      * module spins in {@code Election.init} forever while the container
-     * reports healthy to Nomad. A follower whose log ends below the
+     * reports healthy to Nomad. A leader can wait in LEADER_READY forever
+     * for a member that cannot join its term, and a follower can cycle or
+     * wait in log replication forever. A follower whose log ends below the
      * leader's purge point cycles through its catch-up forever, also while
      * the container runs. A consensus module or a service container that
      * fails in its start closes, while the process runs on. See
-     * {@link JoinWatchdog} for the two rules, and {@link JoinWatchdogThread}
+     * {@link JoinWatchdog} for the rules, and {@link JoinWatchdogThread}
      * for the exits.</p>
      */
     private static void startJoinWatchdog(final JoinWatchdogThread.Member member, final StateDir clusterDir) {
@@ -759,11 +767,19 @@ public final class ClusterNode {
      * comma separated: the peers that a blank member seeds from.
      */
     static String peerConsensusEndpoints(final String clusterMembers, final int memberId) {
-        return java.util.Arrays.stream(clusterMembers.split("\\|"))
-            .map(member -> member.split(","))
-            .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
+        return peerEntries(clusterMembers, memberId)
             .map(f -> f[2].trim())
             .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    /**
+     * The entries of every member except {@code memberId}, each split into
+     * its fields {@code id,ingress,consensus,log,catchup,archive}.
+     */
+    static java.util.stream.Stream<String[]> peerEntries(final String clusterMembers, final int memberId) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","))
+            .filter(f -> Integer.parseInt(f[0].trim()) != memberId);
     }
 
     /**

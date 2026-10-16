@@ -156,12 +156,23 @@ class ClusterLogPurgeTest {
      * stall. Return the member's commit position at the stall.
      */
     private static long awaitStall(final TestNode member) {
-        final JoinWatchdog watchdog = new JoinWatchdog(STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4);
-        final long inactive = ClusterControl.ToggleState.INACTIVE.code();
-        while (watchdog.observe(member.electionState(), member.commitPosition(), System.currentTimeMillis(), inactive)
-                != JoinWatchdog.Verdict.CATCHUP_STALL) {
+        final JoinWatchdog watchdog = new JoinWatchdog(new JoinWatchdog.Limits(
+                STALL_WINDOW_MS * 4, STALL_WINDOW_MS, STALL_WINDOW_MS * 4, STALL_WINDOW_MS));
+        while (verdict(watchdog, member) != JoinWatchdog.Verdict.CATCHUP_STALL) {
             Tests.sleep(100);
         }
         return member.commitPosition();
+    }
+
+    /**
+     * One sample of {@code member}. The cluster runs a live leader, so a peer
+     * check finds a peer with a closed election.
+     */
+    private static JoinWatchdog.Verdict verdict(final JoinWatchdog watchdog, final TestNode member) {
+        final long nowMs = System.currentTimeMillis();
+        final JoinWatchdog.Verdict verdict = watchdog.observe(new JoinWatchdog.Sample(
+                member.electionState(), member.commitPosition(), -1L, 0L,
+                ClusterControl.ToggleState.INACTIVE.code(), nowMs));
+        return verdict == JoinWatchdog.Verdict.PEER_CHECK ? watchdog.afterPeerCheck(true, nowMs) : verdict;
     }
 }
