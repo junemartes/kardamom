@@ -76,8 +76,9 @@ const DISCOVERY_MARKERS: &[&str] = &[
     "aeron: image",
 ];
 const DISCOVERY_EVENTS: usize = 80;
-/// The sealer's consensus history: roles, leadership terms, snapshots,
-/// the boundary clock's heartbeat and its revivals. Session and
+/// The sealer's consensus history: roles, leadership terms, election
+/// states, failed member name lookups, snapshots, the boundary clock's
+/// heartbeat and its revivals. Session and
 /// contiguity lines flood a sealer's head and tail, and these few lines
 /// are the ones that tell which member led when and whether its clock
 /// ran. Each line carries its own time.
@@ -91,6 +92,9 @@ const CONSENSUS_MARKERS: &[&str] = &[
     "cluster JOIN WEDGE",
     "cluster CATCHUP STALL",
     "cluster COMPONENT CLOSED",
+    "cluster LEADER WEDGE",
+    "cluster ELECTION",
+    "cluster DNS",
     "cluster LOG PURGE",
     "cluster SEED",
 ];

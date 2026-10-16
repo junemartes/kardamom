@@ -3,10 +3,13 @@ package io.kardamom.sealer.cluster;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.driver.NameResolver;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.regex.Matcher;
@@ -182,5 +185,29 @@ final class ClusterNodeTest {
         assertTrue(setting.find(), "the sealer job passes the decision version");
         assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, Integer.parseInt(setting.group(1)));
         assertFalse(setting.find(), "the sealer job passes the decision version once");
+    }
+
+    /** Member names under the reserved .invalid domain: no lookup can resolve them. */
+    private static final String NAMED_MEMBERS =
+        "0,sealer-0.invalid:40200,sealer-0.invalid:40201,sealer-0.invalid:40202,sealer-0.invalid:40203,"
+            + "sealer-0.invalid:40204|1,sealer-1.invalid:40200,sealer-1.invalid:40201,sealer-1.invalid:40202,"
+            + "sealer-1.invalid:40203,sealer-1.invalid:40204";
+
+    private static MemberContexts namedContexts() {
+        return new MemberContexts("aeron", "cluster", "archive", ClusterNode.memberEndpoints(NAMED_MEMBERS, 0));
+    }
+
+    @Test
+    void theNameResolverMapsTheOwnNameToTheNodeAddress() throws Exception {
+        final NameResolver resolver = namedContexts().withPeerNames(0, "192.168.56.17").driver().nameResolver();
+        assertEquals(InetAddress.getByName("192.168.56.17"),
+            resolver.resolve("sealer-0.invalid", "endpoint", false));
+        assertNull(resolver.resolve("sealer-1.invalid", "endpoint", false), "a peer name still needs a lookup");
+    }
+
+    @Test
+    void theNameResolverWithNoNodeAddressKnowsNoName() {
+        final NameResolver resolver = namedContexts().withPeerNames(0, null).driver().nameResolver();
+        assertNull(resolver.resolve("sealer-0.invalid", "endpoint", false));
     }
 }

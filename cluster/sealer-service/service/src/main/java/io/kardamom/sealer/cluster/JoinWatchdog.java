@@ -1,5 +1,6 @@
 package io.kardamom.sealer.cluster;
 
+import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.ElectionState;
 import java.util.EnumSet;
 import java.util.Set;
@@ -10,7 +11,7 @@ import java.util.Set;
  * <p>A member that never becomes active is invisible to the rest of the
  * system. Nomad sees a live container. The other members do not need it
  * while quorum holds. It stays INACTIVE forever, and the danger is the
- * next failure. This class turns two such states into an exit.</p>
+ * next failure. This class turns three such states into an exit.</p>
  *
  * <p>The INIT wedge. The election stays in {@link ElectionState#INIT} for
  * longer than the window. INIT normally lasts milliseconds. The known
@@ -30,6 +31,27 @@ import java.util.Set;
  * does not count the failed catch-ups: the states between two of them can
  * last less than one sample interval.</p>
  *
+ * <p>The leader wedge. The completion of an election throws. Aeron 1.44
+ * completes a leader's election in this order: it activates the control
+ * toggle (INACTIVE to NEUTRAL), makes the recovery plan (archive requests,
+ * each up to the archive message timeout), clears the election, and adds
+ * the ingress subscription (up to the driver timeout). When the add fails,
+ * for example on a name lookup that fails, the member runs as the leader
+ * with no ingress, and the state counter keeps the last election state for
+ * ever. No client can open a session, and the pipeline stalls.</p>
+ *
+ * <p>The rule fires when the toggle is active and the election is not
+ * CLOSED for longer than the half-elected limit. The limit is longer than
+ * the two blocking waits of a completion that succeeds, so a slow archive
+ * or a slow driver never fires it. A new election first sets the state
+ * counter to INIT, and its first step then sets the toggle to INACTIVE.
+ * The first election after a start does not set the toggle, but a new
+ * consensus module starts with an INACTIVE toggle. These moments last one
+ * duty cycle, far below the limit. The rule uses no time in a wait state:
+ * a healthy leader can wait for minutes for a follower that loads an old
+ * snapshot and replays its log, with its toggle INACTIVE. A restart
+ * replays the member's own log, and the members elect again.</p>
+ *
  * <p>Every other long election state has a good reason. A lone member
  * with quorum lost sits in CANVASS, and never reaches a catch-up state
  * without a leader. A catch-up that receives log moves the commit position
@@ -48,7 +70,9 @@ final class JoinWatchdog {
         /** The election stays in INIT past the window. */
         INIT_WEDGE,
         /** The catch-ups bring no commit progress for the stall window. */
-        CATCHUP_STALL
+        CATCHUP_STALL,
+        /** The election of a leader did not complete, but its control toggle is active. */
+        LEADER_WEDGE
     }
 
     /** The stall window when none is given: 5 minutes, longer than any catch-up of the purge margin. */
@@ -74,7 +98,10 @@ final class JoinWatchdog {
     private final long windowMs;
     /** The stall window; 0 turns the stall rule off. */
     private final long stallWindowMs;
-    private long initSinceMs = -1L;
+    /** How long an open election with an active control toggle may last. */
+    private final long halfElectedLimitMs;
+    private final Persistence init = new Persistence();
+    private final Persistence halfElected = new Persistence();
     private long highestCommit = Long.MIN_VALUE;
     /** The time of the last commit progress or closed election; -1 before the first observation. */
     private long progressAtMs = -1L;
@@ -86,52 +113,59 @@ final class JoinWatchdog {
      *     reports a wedge.
      * @param stallWindowMs how long failed catch-ups may go on without
      *     commit progress before {@link #observe} reports a stall; 0 for never.
+     * @param halfElectedLimitMs how long an open election with an active
+     *     control toggle may last before {@link #observe} reports a leader
+     *     wedge: longer than the blocking waits of a completion.
      */
-    JoinWatchdog(final long windowMs, final long stallWindowMs) {
+    JoinWatchdog(final long windowMs, final long stallWindowMs, final long halfElectedLimitMs) {
         if (windowMs <= 0) {
             throw new IllegalArgumentException("windowMs must be positive: " + windowMs);
         }
         this.windowMs = windowMs;
         this.stallWindowMs = stallWindowMs;
+        this.halfElectedLimitMs = halfElectedLimitMs;
     }
 
     /**
      * Records one observation of the member.
      *
-     * @param state the election state, or null when the counter is not
-     *     allocated yet (the module has not started its first election).
+     * @param state the election state.
      * @param commitPosition the member's commit position.
      * @param nowMs the observation time.
+     * @param toggleCode the value of the control toggle counter of the
+     *     consensus module. Any value but INACTIVE means that a leader's
+     *     election completed: NEUTRAL, or an action such as SNAPSHOT.
      */
-    Verdict observe(final ElectionState state, final long commitPosition, final long nowMs) {
-        final boolean wedged = initWedged(state, nowMs);
+    Verdict observe(
+            final ElectionState state, final long commitPosition, final long nowMs, final long toggleCode) {
+        final boolean wedged = init.exceeds(state == ElectionState.INIT, nowMs, windowMs);
         final boolean stalled = catchupStalled(state, commitPosition, nowMs);
+        final boolean leaderWedged = halfElected.exceeds(
+            toggleCode != ClusterControl.ToggleState.INACTIVE.code() && state != ElectionState.CLOSED,
+            nowMs,
+            halfElectedLimitMs);
         if (wedged) {
             return Verdict.INIT_WEDGE;
+        }
+        if (leaderWedged) {
+            return Verdict.LEADER_WEDGE;
         }
         return stalled ? Verdict.CATCHUP_STALL : Verdict.NONE;
     }
 
     /** How long the election has been in INIT, in ms, or 0 when it is not. */
     long initForMs(final long nowMs) {
-        return initSinceMs < 0 ? 0L : nowMs - initSinceMs;
+        return init.forMs(nowMs);
+    }
+
+    /** How long the election has stayed open with an active toggle, in ms, or 0 when it has not. */
+    long halfElectedForMs(final long nowMs) {
+        return halfElected.forMs(nowMs);
     }
 
     /** How long the member has gone without commit progress, in ms, or 0 before it reaches a catch-up state. */
     long stallForMs(final long nowMs) {
         return triedCatchup ? nowMs - progressAtMs : 0L;
-    }
-
-    private boolean initWedged(final ElectionState state, final long nowMs) {
-        if (state != ElectionState.INIT) {
-            initSinceMs = -1L;
-            return false;
-        }
-        if (initSinceMs < 0) {
-            initSinceMs = nowMs;
-            return false;
-        }
-        return nowMs - initSinceMs > windowMs;
     }
 
     private boolean catchupStalled(final ElectionState state, final long commitPosition, final long nowMs) {
