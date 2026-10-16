@@ -227,7 +227,7 @@ fn nonce_zero_skip_confirms_without_raising() {
 fn contiguity_rejects_split_drops_from_rewinds() {
     let ResyncChannel {
         controller: mut c,
-        reject_tx,
+        answer_tx,
         ..
     } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
     // Gap rejects (nonce >= expected): a rejected batch produces one
@@ -238,17 +238,17 @@ fn contiguity_rejects_split_drops_from_rewinds() {
         nonce,
         expected,
     };
-    reject_tx.send(reject(s(1), 9, 7)).unwrap();
-    reject_tx.send(reject(s(1), 8, 5)).unwrap();
-    reject_tx.send(reject(s(1), 12, 9)).unwrap();
-    reject_tx.send(reject(s(2), 4, 3)).unwrap();
+    answer_tx.send(reject(s(1), 9, 7)).unwrap();
+    answer_tx.send(reject(s(1), 8, 5)).unwrap();
+    answer_tx.send(reject(s(1), 12, 9)).unwrap();
+    answer_tx.send(reject(s(2), 4, 3)).unwrap();
     // Committed-proof reject (nonce < expected): the ref sealed long ago,
     // and its dedup entry aged out. This confirms by reject, so drop the
     // entry.
-    reject_tx.send(reject(s(3), 0, 1)).unwrap();
+    answer_tx.send(reject(s(3), 0, 1)).unwrap();
     // A window-full answer names no expected nonce. It is neither a drop
     // nor a gap.
-    reject_tx
+    answer_tx
         .send(SealerAnswer::WindowFull {
             sender: s(4),
             nonce: 6,
@@ -296,7 +296,7 @@ fn channels_are_bounded_to_dedup_capacity() {
     let ResyncChannel {
         controller: _controller,
         floor_tx: tx,
-        reject_tx,
+        answer_tx,
         ..
     } = ResyncChannel::open(cfg, 0).unwrap();
 
@@ -314,10 +314,10 @@ fn channels_are_bounded_to_dedup_capacity() {
         sender: s(1),
         nonce: 0,
     };
-    assert!(reject_tx.try_send(full).is_ok());
-    assert!(reject_tx.try_send(full).is_ok());
+    assert!(answer_tx.try_send(full).is_ok());
+    assert!(answer_tx.try_send(full).is_ok());
     assert!(matches!(
-        reject_tx.try_send(full),
+        answer_tx.try_send(full),
         Err(crossbeam_channel::TrySendError::Full(_))
     ));
 }

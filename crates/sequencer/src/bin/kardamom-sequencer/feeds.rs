@@ -126,7 +126,7 @@ pub(crate) struct EgressWatermarkFeed {
     /// DA-lag guard or the record-lag guard refused. The publish loop
     /// drops each one and tells the client.
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
-    reject_tx: crossbeam_channel::Sender<SealerAnswer>,
+    answer_tx: crossbeam_channel::Sender<SealerAnswer>,
     /// The epoch pump's signals: each growth of the boundaries' L1
     /// origin, and each origin-gap reject.
     origins: OriginSignalTx,
@@ -150,7 +150,7 @@ impl EgressWatermarkFeed {
         silence_ms: u64,
         partition: u32,
         watermark: SharedWatermark,
-        reject_tx: crossbeam_channel::Sender<SealerAnswer>,
+        answer_tx: crossbeam_channel::Sender<SealerAnswer>,
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
     ) -> Self {
@@ -159,7 +159,7 @@ impl EgressWatermarkFeed {
             partition,
             watermark,
             deadline_tx,
-            reject_tx,
+            answer_tx,
             origins,
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
@@ -169,7 +169,7 @@ impl EgressWatermarkFeed {
 
     /// Spawn on a blocking thread. `LiveEgress` holds nothing `!Send`,
     /// but its only wait primitive is a blocking crossbeam
-    /// `recv_timeout`. `reject_tx` stays a std channel, because its
+    /// `recv_timeout`. `answer_tx` stays a std channel, because its
     /// consumer is the sync `ResyncController` in the publish loop.
     pub(crate) fn spawn(
         self,
@@ -237,7 +237,7 @@ impl EgressWatermarkFeed {
     }
 
     /// Handle one contiguity-reject frame. Returns `true` when `frame`
-    /// was a contiguity reject (already forwarded to `reject_tx`), so
+    /// was a contiguity reject (already forwarded to `answer_tx`), so
     /// the caller does not also check it for a boundary.
     ///
     /// The sealer rejected one of this sequencer's refs because a known

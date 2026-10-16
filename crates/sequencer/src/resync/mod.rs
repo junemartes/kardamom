@@ -364,8 +364,8 @@ pub struct ResyncController {
     floor_rx_dead: bool,
     /// The contiguity rejects and the window-full answers, forwarded by
     /// the egress-watermark thread. See [`Self::drain_answers`].
-    reject_rx: Receiver<SealerAnswer>,
-    reject_rx_dead: bool,
+    answer_rx: Receiver<SealerAnswer>,
+    answer_rx_dead: bool,
     /// The sealer's terminal refusals, forwarded by the egress-watermark
     /// thread: a ref whose inclusion deadline the open block had passed,
     /// or one the DA-lag guard or the record-lag guard refused. No
@@ -454,7 +454,7 @@ impl ResyncController {
         cfg: ResyncConfig,
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
-        reject_rx: Receiver<SealerAnswer>,
+        answer_rx: Receiver<SealerAnswer>,
         deadline_rx: Receiver<SealerRefusal>,
         watermark: SharedWatermark,
     ) -> Result<Self, ResyncConfigError> {
@@ -467,8 +467,8 @@ impl ResyncController {
             floors: HashMap::new(),
             floor_rx,
             floor_rx_dead: false,
-            reject_rx,
-            reject_rx_dead: false,
+            answer_rx,
+            answer_rx_dead: false,
             deadline_rx,
             deadline_rx_dead: false,
             watermark,
@@ -671,8 +671,8 @@ impl ResyncController {
 }
 
 /// What [`ResyncChannel::open`] hands back: the controller (publish
-/// loop), the floor-update sender (receipts thread), the `(sender,
-/// nonce, expected)` contiguity-reject sender (egress-watermark thread),
+/// loop), the floor-update sender (receipts thread), the rewind-channel
+/// sender of [`SealerAnswer`]s (egress-watermark thread),
 /// and the shared watermark (egress-watermark thread). A named struct,
 /// not a positional tuple: the four fields have four different owners on
 /// the sequencer binary side, so a `.0`/`.1`/`.2`/`.3` call site would
@@ -680,7 +680,7 @@ impl ResyncController {
 pub struct ResyncChannel {
     pub controller: ResyncController,
     pub floor_tx: Sender<FloorUpdate>,
-    pub reject_tx: Sender<SealerAnswer>,
+    pub answer_tx: Sender<SealerAnswer>,
     /// The sealer's terminal refusals: late refs, and refs the DA-lag
     /// guard or the record-lag guard refused. No republish can order them
     /// now.
@@ -690,8 +690,8 @@ pub struct ResyncChannel {
 
 impl ResyncChannel {
     /// Build the controller, plus the sender halves of the floor-update
-    /// channel (handed to the receipts thread) and the contiguity-reject
-    /// channel (handed to the egress-watermark thread, alongside the
+    /// channel (handed to the receipts thread) and the rewind channel
+    /// (handed to the egress-watermark thread, alongside the
     /// shared watermark).
     ///
     /// Both channels are bounded to `cfg.dedup_capacity`: the cluster's
@@ -721,7 +721,7 @@ impl ResyncChannel {
             }
         })?;
         let (floor_tx, floor_rx) = crossbeam_channel::bounded(cap);
-        let (reject_tx, reject_rx) = crossbeam_channel::bounded(cap);
+        let (answer_tx, answer_rx) = crossbeam_channel::bounded(cap);
         // A past-deadline reject is rare next to a contiguity reject: it
         // needs a replica to stall past the whole horizon. A small bound
         // is enough, and it keeps the up-front allocation where it was.
@@ -731,14 +731,14 @@ impl ResyncChannel {
             cfg,
             partition,
             floor_rx,
-            reject_rx,
+            answer_rx,
             deadline_rx,
             watermark.clone(),
         )?;
         Ok(Self {
             controller,
             floor_tx,
-            reject_tx,
+            answer_tx,
             deadline_tx,
             watermark,
         })

@@ -354,7 +354,7 @@ impl ResyncWiring {
         let kardamom_sequencer::resync::ResyncChannel {
             controller,
             floor_tx,
-            reject_tx,
+            answer_tx,
             deadline_tx,
             watermark,
         } = kardamom_sequencer::resync::ResyncChannel::open(
@@ -370,7 +370,7 @@ impl ResyncWiring {
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,
             watermark,
-            reject_tx,
+            answer_tx,
             deadline_tx,
             origins,
         )

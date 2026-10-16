@@ -127,7 +127,7 @@ impl EgressWatermarkFeed {
     /// channel is full: the confirm-timeout sweep still recovers a
     /// dropped answer, later.
     pub(super) fn forward_answer(&self, answer: SealerAnswer) {
-        match self.reject_tx.try_send(answer) {
+        match self.answer_tx.try_send(answer) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 // The publish loop is stalled past the resync window

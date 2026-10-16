@@ -95,11 +95,11 @@ impl ResyncController {
     ///   nonce.
     pub fn drain_answers(&mut self) -> AnswerDrain {
         drain_bounded(
-            &self.reject_rx,
-            &mut self.reject_rx_dead,
+            &self.answer_rx,
+            &mut self.answer_rx_dead,
             FLOOR_DRAIN_PER_ITER,
             self.partition,
-            "contiguity-reject producer disconnected",
+            "rewind-channel producer disconnected",
         )
         .into_iter()
         .fold(AnswerDrain::default(), |drain, answer| {

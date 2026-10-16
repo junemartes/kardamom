@@ -23,7 +23,7 @@ impl Sequencer {
     /// - Gap (nonce >= expected): the sealer did not order `expected`.
     ///   See [`Self::apply_gap`].
     /// - Window full: see [`Self::republish_held`].
-    pub(super) fn apply_contiguity_rejects(&mut self, r: &mut crate::resync::ResyncController) {
+    pub(super) fn apply_sealer_answers(&mut self, r: &mut crate::resync::ResyncController) {
         let AnswerDrain {
             drops,
             gaps,
@@ -165,7 +165,7 @@ impl Sequencer {
     }
 
     /// One committed-proof contiguity reject, for
-    /// [`Self::apply_contiguity_rejects`]'s first loop.
+    /// [`Self::apply_sealer_answers`]'s first loop.
     fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
         if self.unconfirmed.drop_committed(sender, n).is_some() {
             trace!(
@@ -177,7 +177,7 @@ impl Sequencer {
     }
 
     /// One gap contiguity reject, for
-    /// [`Self::apply_contiguity_rejects`]'s second loop: rewind every
+    /// [`Self::apply_sealer_answers`]'s second loop: rewind every
     /// unconfirmed ref the ledger holds for `sender` at or after
     /// `expected`, if any.
     fn rewind_one_gap(&mut self, sender: Address, expected: u64) {

@@ -26,15 +26,15 @@ fn resync_sequencer_with_rejects() -> ResyncTestRig {
     let ResyncChannel {
         controller,
         floor_tx,
-        reject_tx,
+        answer_tx,
         ..
     } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
     seq.enable_resync(controller);
-    (seq, floor_tx, reject_tx)
+    (seq, floor_tx, answer_tx)
 }
 
 fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
-    let (seq, floor_tx, _reject_tx) = resync_sequencer_with_rejects();
+    let (seq, floor_tx, _answer_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
 
@@ -180,7 +180,7 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
     let s = signer(5);
     let mut rig = Rig::default();
     rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 60));
-    let (mut seq, _floor_tx, reject_tx) = resync_sequencer_with_rejects();
+    let (mut seq, _floor_tx, answer_tx) = resync_sequencer_with_rejects();
 
     // Publish the sender's only transaction (nonce 0). No receipt will
     // ever confirm it, since nonce-0 receipts are excluded. So with
@@ -194,7 +194,7 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
 
     // The sealer answers a republish with a committed-proof reject
     // (nonce 0 below expected 1). The entry retires permanently.
-    reject_tx
+    answer_tx
         .send(SealerAnswer::ContiguityReject {
             sender: s.address(),
             nonce: 0,

@@ -37,7 +37,7 @@ struct Sealed {
     seq: Sequencer,
     rig: Rig,
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    reject_tx: crossbeam_channel::Sender<SealerAnswer>,
+    answer_tx: crossbeam_channel::Sender<SealerAnswer>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     /// The next free `tx_data` offset.
     offset: i32,
@@ -49,7 +49,7 @@ impl Sealed {
         let ResyncChannel {
             controller,
             floor_tx,
-            reject_tx,
+            answer_tx,
             deadline_tx,
             ..
         } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
@@ -58,7 +58,7 @@ impl Sealed {
             seq,
             rig: Rig::default(),
             floor_tx,
-            reject_tx,
+            answer_tx,
             deadline_tx,
             offset: 0,
         }
@@ -148,7 +148,7 @@ impl Sealed {
     }
 
     fn answer(&self, answer: SealerAnswer) {
-        self.reject_tx.send(answer).unwrap();
+        self.answer_tx.send(answer).unwrap();
     }
 
     /// The receipt of the executed tx of `s` at `nonce` arrives.
@@ -427,17 +427,17 @@ fn a_reject_read_after_the_receipt_keeps_the_floor() {
     assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
 }
 
-/// A window-full answer names the nonce of the refused copy as the
-/// expected nonce. The sequencer reads the answer to an older copy of
-/// nonce 2 after the receipt of 2. The receipt proves nonce 2, so the
-/// floor stays at 3, and nonce 3 publishes.
+/// The sequencer reads a reject of 2 with `expected=1` after the receipt
+/// of 2. The receipt floor is 3, so the expected nonce rises to 3, and
+/// the reject of 2 only drops its ledger entry. The floor stays at 3, and
+/// nonce 3 publishes.
 #[test]
-fn a_window_full_answer_read_after_the_receipt_keeps_the_floor() {
+fn a_reject_below_the_receipt_floor_keeps_the_floor() {
     let s = signer(30);
     let mut sealed = Sealed::short_ttl();
     (0..3).for_each(|n| sealed.submit(&s, n));
     sealed.execute(s.address(), 2);
-    sealed.reject(s.address(), &[2], 2);
+    sealed.reject(s.address(), &[2], 1);
     sealed.step();
 
     sealed.submit(&s, 3);
