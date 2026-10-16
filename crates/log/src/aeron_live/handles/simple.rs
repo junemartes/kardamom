@@ -142,6 +142,12 @@ macro_rules! declare_channel_handles {
             pub fn try_recv(&mut self) -> Option<(BPosition, $msg)> {
                 self.rx.try_recv()
             }
+
+            /// The next record, with the Aeron session id of the
+            /// publication that sent it.
+            pub async fn recv_from(&mut self) -> Option<(i32, $msg)> {
+                self.rx.recv_from().await
+            }
         }
     };
 

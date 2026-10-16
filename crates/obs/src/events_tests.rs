@@ -1,10 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 use kardamom_types::service::{Halt, HaltCause, HaltRef, PauseReason, ServiceEvent, ServiceState};
 
-use super::{Beacon, Board, BoardFeed, EXPIRY, FORGET, HEARTBEAT, Identity};
+use super::{Beacon, Board, BoardFeed, Delivery, EXPIRY, FORGET, HEARTBEAT, Identity, Publisher};
 use crate::lifecycle::Lifecycle;
 
 fn identity() -> Identity {
@@ -14,12 +18,55 @@ fn identity() -> Identity {
     }
 }
 
-fn event(service: &str, instance: &str, seq: u64, state: ServiceState) -> ServiceEvent {
-    ServiceEvent {
-        service: service.into(),
-        instance: instance.into(),
-        seq,
-        state,
+fn event(service: &str, instance: &str, seq: u64, state: ServiceState) -> Delivery {
+    Delivery {
+        publisher: Publisher(1),
+        event: ServiceEvent {
+            service: service.into(),
+            instance: instance.into(),
+            seq,
+            state,
+        },
+    }
+}
+
+/// A `sealer/cluster` record of `publisher`, as an ingress sends it.
+fn sealer_from(publisher: i32, seq: u64) -> Delivery {
+    Delivery {
+        publisher: Publisher(publisher),
+        ..event("sealer", "cluster", seq, ServiceState::Running)
+    }
+}
+
+/// A layer that counts the restart logs.
+#[derive(Clone, Default)]
+struct Restarts(Arc<AtomicUsize>);
+
+impl Restarts {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for Restarts {
+    fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+        let mut message = Message::default();
+        event.record(&mut message);
+        if message.0 == "service events: the process restarted" {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The `message` field of one log.
+#[derive(Default)]
+struct Message(String);
+
+impl Visit for Message {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
     }
 }
 
@@ -102,6 +149,25 @@ fn the_latest_record_wins_and_a_restart_is_taken() {
     assert_eq!(view.services[0].event.state, ServiceState::Running);
     board.observe(event("executor", "e1", 2, ServiceState::Resumed), now);
     assert_eq!(board.view(now).services[0].state_id(), "running");
+}
+
+#[test]
+fn two_publishers_of_one_key_restart_only_when_one_seq_goes_down() {
+    let restarts = Restarts::default();
+    let subscriber = tracing_subscriber::registry().with(restarts.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        let now = Instant::now();
+        let mut board = Board::default();
+        (8..=10).zip(498..=500).for_each(|(low, high)| {
+            board.observe(sealer_from(1, low), now);
+            board.observe(sealer_from(2, high), now);
+        });
+        assert_eq!(restarts.count(), 0, "two counters interleave");
+        assert_eq!(board.view(now).services.len(), 1, "one sealer/cluster row");
+        board.observe(sealer_from(1, 0), now);
+        board.observe(sealer_from(2, 501), now);
+        assert_eq!(restarts.count(), 1, "one publisher's seq went down");
+    });
 }
 
 #[test]

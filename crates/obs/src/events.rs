@@ -11,6 +11,11 @@
 //! the state. A record with no heartbeat for [`EXPIRY`] is gone: the
 //! process died or froze.
 //!
+//! More than one [`Publisher`] can write one `(service, instance)`: each
+//! ingress publishes the sealer as it observes it, with its own `seq`. So
+//! the board compares `seq` per publisher. A restart is a `seq` that goes
+//! down in the records of one publisher.
+//!
 //! The transport is the caller's: the beacon hands each record to a
 //! publish function, and the [`BoardFeed`] reads records from a channel.
 //!
@@ -137,41 +142,72 @@ impl Beacon {
     }
 }
 
-/// One record as the board last saw it.
+/// The transport's id of the publication that carries a record. Two
+/// publishers of one `(service, instance)` on two hosts have two ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Publisher(pub i32);
+
+/// One record and the publisher that sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub publisher: Publisher,
+    pub event: ServiceEvent,
+}
+
+/// One value as the board last saw it.
 #[derive(Debug, Clone)]
-struct Seen {
-    event: ServiceEvent,
+struct Seen<T> {
+    value: T,
     at: Instant,
 }
 
-/// The latest record of every `(service, instance)`.
+impl<T> Seen<T> {
+    /// Whether the board still keeps the value at `now`.
+    fn kept(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < FORGET
+    }
+}
+
+/// The latest record of every `(service, instance)`, and the last `seq`
+/// of every publisher of it.
 #[derive(Debug, Default)]
 pub struct Board {
-    entries: BTreeMap<(String, String), Seen>,
+    entries: BTreeMap<(String, String), Seen<ServiceEvent>>,
+    seqs: BTreeMap<(String, String, Publisher), Seen<u64>>,
 }
 
 impl Board {
-    /// Take `event` as the latest state of its process.
-    pub fn observe(&mut self, event: ServiceEvent, now: Instant) {
-        let key = (event.service.clone(), event.instance.clone());
-        let restarted = self
-            .entries
-            .get(&key)
-            .is_some_and(|seen| event.seq < seen.event.seq);
-        if restarted {
+    /// Take the delivered record as the latest state of its process.
+    pub fn observe(&mut self, delivery: Delivery, now: Instant) {
+        let Delivery { publisher, event } = delivery;
+        let seq = Seen {
+            value: event.seq,
+            at: now,
+        };
+        let last = self.seqs.insert(
+            (event.service.clone(), event.instance.clone(), publisher),
+            seq,
+        );
+        if last.is_some_and(|last| event.seq < last.value) {
             tracing::info!(
                 service = %event.service,
                 instance = %event.instance,
                 "service events: the process restarted"
             );
         }
-        self.entries.insert(key, Seen { event, at: now });
+        self.entries.insert(
+            (event.service.clone(), event.instance.clone()),
+            Seen {
+                value: event,
+                at: now,
+            },
+        );
     }
 
     /// Drop the records gone for longer than the board keeps them.
     pub fn forget(&mut self, now: Instant) {
-        self.entries
-            .retain(|_, seen| now.saturating_duration_since(seen.at) < FORGET);
+        self.entries.retain(|_, seen| seen.kept(now));
+        self.seqs.retain(|_, seen| seen.kept(now));
     }
 
     /// The board at `now`.
@@ -184,7 +220,7 @@ impl Board {
                 .map(|seen| {
                     let age = now.saturating_duration_since(seen.at);
                     ServiceView {
-                        event: seen.event.clone(),
+                        event: seen.value.clone(),
                         live: age < EXPIRY,
                         age,
                     }
@@ -291,7 +327,7 @@ impl BoardView {
 /// channel, and publishes the view on every record and every second.
 pub struct BoardFeed {
     board: Board,
-    rx: mpsc::Receiver<ServiceEvent>,
+    rx: mpsc::Receiver<Delivery>,
     view: watch::Sender<BoardView>,
 }
 
@@ -302,7 +338,7 @@ impl BoardFeed {
     /// A feed, the sender its transport writes the records to, and the
     /// receiver of the view.
     #[must_use]
-    pub fn new() -> (Self, mpsc::Sender<ServiceEvent>, watch::Receiver<BoardView>) {
+    pub fn new() -> (Self, mpsc::Sender<Delivery>, watch::Receiver<BoardView>) {
         let (tx, rx) = mpsc::channel(FEED_DEPTH);
         let (view, view_rx) = watch::channel(BoardView::default());
         (
@@ -324,8 +360,8 @@ impl BoardFeed {
     /// Take one record or one refresh, then publish the view.
     async fn step(&mut self) -> ControlFlow<()> {
         tokio::select! {
-            event = self.rx.recv() => match event {
-                Some(event) => self.board.observe(event, Instant::now()),
+            delivery = self.rx.recv() => match delivery {
+                Some(delivery) => self.board.observe(delivery, Instant::now()),
                 None => return ControlFlow::Break(()),
             },
             () = tokio::time::sleep(REFRESH) => {}

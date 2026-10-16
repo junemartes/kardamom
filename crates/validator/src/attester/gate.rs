@@ -85,7 +85,7 @@ impl Default for AttesterGate {
 
 #[cfg(test)]
 mod tests {
-    use kardamom_obs::events::Board;
+    use kardamom_obs::events::{Board, Delivery, Publisher};
     use kardamom_obs::halt::{Halt, ServiceEvent, ServiceState};
     use tokio::time::Instant;
 
@@ -95,11 +95,14 @@ mod tests {
         let now = Instant::now();
         let mut board = Board::default();
         board.observe(
-            ServiceEvent {
-                service: AttesterGate::VALIDATOR.into(),
-                instance: "v2".into(),
-                seq: 1,
-                state,
+            Delivery {
+                publisher: Publisher(1),
+                event: ServiceEvent {
+                    service: AttesterGate::VALIDATOR.into(),
+                    instance: "v2".into(),
+                    seq: 1,
+                    state,
+                },
             },
             now,
         );
