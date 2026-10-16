@@ -36,3 +36,7 @@ deploy/cluster/deployed/
 
 # dhat heap profiles written by crates/bench alloc_profile tests
 crates/bench/dhat-heap*.json
+
+# The Aeron jar that CI puts into the Aeron image build context
+# (.github/actions/aeron-jar).
+crates/log/docker/aeron/aeron-all.jar
