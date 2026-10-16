@@ -91,22 +91,31 @@ fn executors() -> (Job, Vec<Alloc>) {
     (job, allocs)
 }
 
+fn nodes<const N: usize>(names: [&str; N]) -> Nodes {
+    Nodes::new(names.map(String::from)).unwrap()
+}
+
+#[test]
+fn a_node_set_holds_at_least_one_node() {
+    assert!(Nodes::new(Vec::new()).is_none());
+}
+
 #[test]
 fn a_replica_that_restarts_by_design_does_not_hold_back_the_named_nodes() {
     let (job, allocs) = executors();
     assert!(job.running(&allocs).is_none());
-    assert!(job.runs_on(&allocs, &["executor-0", "executor-1"]));
-    assert!(!job.runs_on(&allocs, &["executor-0", "executor-2"]));
+    assert!(job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-2"])));
 }
 
 #[test]
 fn a_named_node_needs_a_current_running_allocation() {
     let (job, mut allocs) = executors();
     allocs[1].client_status = "pending".into();
-    assert!(!job.runs_on(&allocs, &["executor-0", "executor-1"]));
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
     allocs[1] = Alloc {
         node_name: "executor-1".into(),
         ..alloc("old", "executor", 5, "run", "running")
     };
-    assert!(!job.runs_on(&allocs, &["executor-0", "executor-1"]));
+    assert!(!job.runs_on(&allocs, &nodes(["executor-0", "executor-1"])));
 }

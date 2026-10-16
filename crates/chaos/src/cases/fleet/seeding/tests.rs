@@ -130,3 +130,39 @@ fn the_da_watcher_resumes_after_the_seed_origin() {
     let no_args = json!({ "TaskGroups": [{ "Tasks": [{ "Config": {} }] }] });
     assert!(JobDefinition(&no_args).resumed_after(1).is_err());
 }
+
+/// The seed of a failed run: H = 1672 and `E_H` = 302495.
+fn wiped_head() -> SeedHead {
+    SeedHead {
+        block: 1672,
+        end_tx_idx: 302_495,
+        l1_origin: 459,
+    }
+}
+
+/// Sealer lines of that run: a fresh resume at the seed's cursor, an
+/// old-chain resume, and the refusal of the stale cursor.
+const FRESH_SERVED: &str =
+    "cluster REPLAY memberId=2 session=1 from=(302495,1673) served=1 queued=0 dropped=0 retained=1";
+const OLD_SERVED: &str = "cluster REPLAY memberId=1 session=50 from=(284422,1581) served=4 queued=0 dropped=0 retained=65536";
+const STALE_AHEAD: &str =
+    "cluster REPLAY memberId=2 session=3 from=(302498,1684) AHEAD head=(302495,1674)";
+
+#[test]
+fn the_refusal_needle_names_the_seeded_head() {
+    let needle = wiped_head().ahead_needle();
+    assert!(STALE_AHEAD.contains(&needle));
+    assert!(
+        !"cluster REPLAY memberId=2 session=3 from=(302498,1684) AHEAD head=(302497,1683)"
+            .contains(&needle)
+    );
+}
+
+#[test]
+fn only_a_served_cursor_past_the_seed_counts_as_stale() {
+    let head = wiped_head();
+    let logs = [FRESH_SERVED, OLD_SERVED, STALE_AHEAD].join("\n");
+    assert_eq!(head.served_past(&logs), 0);
+    let served = STALE_AHEAD.replace("AHEAD head=(302495,1674)", "served=0");
+    assert_eq!(head.served_past(&format!("{logs}\n{served}")), 1);
+}

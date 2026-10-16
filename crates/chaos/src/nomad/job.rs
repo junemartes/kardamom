@@ -35,11 +35,11 @@ impl Job {
     /// `nodes`. An allocation on another node does not count, so a
     /// replica that stops by design on its own node does not hold back
     /// the others.
-    pub(crate) fn runs_on(&self, allocs: &[Alloc], nodes: &[&str]) -> bool {
+    pub(crate) fn runs_on(&self, allocs: &[Alloc], nodes: &Nodes) -> bool {
         nodes.iter().all(|node| {
             allocs
                 .iter()
-                .any(|a| a.node_name == *node && self.current(a))
+                .any(|a| a.node_name == node && self.current(a))
         })
     }
 
@@ -51,6 +51,32 @@ impl Job {
 
     pub(crate) fn has_group(&self, name: &str) -> bool {
         self.groups.iter().any(|g| g.name == name && g.count > 0)
+    }
+}
+
+/// The Nomad names of one or more nodes. The type holds at least one
+/// name, so a wait on the set always waits for a node.
+#[derive(Debug)]
+pub(crate) struct Nodes {
+    first: String,
+    rest: Vec<String>,
+}
+
+impl Nodes {
+    /// The set of `names`, or `None` when `names` is empty.
+    pub(crate) fn new(names: impl IntoIterator<Item = String>) -> Option<Self> {
+        let mut names = names.into_iter();
+        let first = names.next()?;
+        Some(Self {
+            first,
+            rest: names.collect(),
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(&self.first)
+            .chain(&self.rest)
+            .map(String::as_str)
     }
 }
 

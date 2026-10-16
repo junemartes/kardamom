@@ -3,7 +3,7 @@
 use anyhow::Context;
 use serde_json::Value;
 
-use super::{Alloc, Job, Nomad};
+use super::{Alloc, Job, Nodes, Nomad};
 use crate::poll::{self, Budget};
 
 pub(crate) struct SavedJob {
@@ -82,7 +82,7 @@ impl SavedJob {
     /// Register the saved definition again, and wait until its allocation
     /// runs on each node of `nodes`. The allocations on the other nodes
     /// can stop and restart: the caller expects them to.
-    pub(crate) async fn restore_on(&self, nodes: &[&str]) -> anyhow::Result<()> {
+    pub(crate) async fn restore_on(&self, nodes: &Nodes) -> anyhow::Result<()> {
         let desired = self.post(&self.definition).await?;
         self.await_allocs(&desired, |allocs| desired.runs_on(allocs, nodes))
             .await
