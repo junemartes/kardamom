@@ -7,10 +7,10 @@
 //! the file, and a peer sends every byte of it, so the copy is cut to
 //! its used pages before the hash.
 //!
-//! The cut keeps the image valid. libmdbx accepts a data file that is
+//! The cut keeps the image valid. libmdbx reads no page at or past the
+//! first unallocated page of the meta, so it accepts a data file that is
 //! shorter than its geometry and not shorter than its used pages. A
-//! read-write open grows the file back to the geometry, and a read-only
-//! open maps only the file.
+//! read-write open grows the file back to the geometry.
 
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -21,10 +21,8 @@ use crate::compaction::MdbxPath;
 use crate::error::StateError;
 
 /// The cut length is a multiple of 64 KiB. A read-only open refuses a
-/// file whose length is not a multiple of the allocation granularity of
-/// the host. 64 KiB is the largest granularity of a supported host:
-/// Linux pages are 4, 16 or 64 KiB, and the Windows granularity is
-/// 64 KiB. So the cut image opens on every host.
+/// file whose length is not a multiple of the allocation granularity.
+/// libmdbx sets that granularity to 64 KiB on every 64-bit POSIX host.
 const CUT_ALIGN: u64 = 64 * 1024;
 
 /// A compacted mdbx data file that no process has open.
