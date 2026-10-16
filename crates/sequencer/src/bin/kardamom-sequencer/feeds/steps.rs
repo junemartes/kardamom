@@ -10,7 +10,7 @@ use kardamom_cache::QueryError;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_sequencer::epoch::OriginSignal;
 use kardamom_sequencer::metrics as seq_metrics;
-use kardamom_sequencer::resync::SealerRefusal;
+use kardamom_sequencer::resync::{SealerAnswer, SealerRefusal};
 
 use super::{EgressWatermarkFeed, NonceLookupFeed};
 
@@ -106,9 +106,6 @@ impl EgressWatermarkFeed {
         let _ = self.origins.send(signal);
     }
 
-    /// Forward one contiguity reject to the publish loop's reject
-    /// channel. Drops it, with a warning, only when the channel is full:
-    /// the confirm-timeout sweep still recovers a dropped reject, later.
     /// Forward one terminal refusal to the publish loop. A full channel
     /// means the loop has stalled far past the horizon already, and
     /// every ref in flight is refused: dropping is safe, because the
@@ -125,8 +122,12 @@ impl EgressWatermarkFeed {
         }
     }
 
-    pub(super) fn forward_contiguity_reject(&self, sender: Address, nonce: u64, expected: u64) {
-        match self.reject_tx.try_send((sender, nonce, expected)) {
+    /// Forward one contiguity reject or window-full answer to the publish
+    /// loop's rewind channel. Drops it, with a warning, only when the
+    /// channel is full: the confirm-timeout sweep still recovers a
+    /// dropped answer, later.
+    pub(super) fn forward_answer(&self, answer: SealerAnswer) {
+        match self.answer_tx.try_send(answer) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 // The publish loop is stalled past the resync window

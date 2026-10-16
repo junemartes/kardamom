@@ -11,13 +11,13 @@ use super::EgressWatermarkFeed;
 #[test]
 fn a_record_lag_reject_is_a_terminal_refusal() {
     let (deadline_tx, deadline_rx) = crossbeam_channel::bounded(4);
-    let (reject_tx, reject_rx) = crossbeam_channel::bounded(4);
+    let (answer_tx, answer_rx) = crossbeam_channel::bounded(4);
     let (origins, _origins_rx) = crossbeam_channel::unbounded();
     let mut feed = EgressWatermarkFeed::new(
         1_000,
         0,
         SharedWatermark::new(),
-        reject_tx,
+        answer_tx,
         deadline_tx,
         origins,
     );
@@ -42,5 +42,5 @@ fn a_record_lag_reject_is_a_terminal_refusal() {
             },
         }
     );
-    assert!(reject_rx.try_recv().is_err(), "a refusal is not a rewind");
+    assert!(answer_rx.try_recv().is_err(), "a refusal is not a rewind");
 }
