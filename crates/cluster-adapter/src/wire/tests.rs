@@ -135,7 +135,7 @@ fn ingress_layout_is_kind_sender_nonce_deadline_tip_id_then_fields() {
     assert_eq!(&relayed[0..32], r.tx_hash.as_slice());
 }
 
-fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
+pub(super) fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
     use kardamom_types::xchain::{NonEmptyVec, RemoteEpochRecord, XChainMessage};
     RemoteEpochRecord {
         origin_chain_id: 412_346,
@@ -303,6 +303,7 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
         floor_index: 90_000,
         floor_block: 95,
         record_lag: RecordLagStatus::default(),
+        retained_bytes: None,
     };
     let b = encode_status(&status);
     assert_eq!(b.len(), STATUS_WITH_RECORD_LAG_LEN);

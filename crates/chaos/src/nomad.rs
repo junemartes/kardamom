@@ -13,7 +13,7 @@ use crate::poll::Budget;
 mod job;
 mod log;
 mod saved_job;
-pub(crate) use job::Job;
+pub(crate) use job::{Job, Nodes};
 pub(crate) use saved_job::SavedJob;
 
 /// The log streams to read.

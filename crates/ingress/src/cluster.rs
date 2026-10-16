@@ -127,6 +127,12 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 | EgressItem::RecordLagReject { .. }
                 | EgressItem::OriginGap { .. },
             ) => return ControlFlow::Continue(()),
+            // The watermark moves on relayed records and boundaries. A
+            // canonical entry, a relayed reference and a feed gap do not
+            // move it.
+            Ok(EgressItem::Tx { .. } | EgressItem::RelayedRef(_) | EgressItem::FeedGap { .. }) => {
+                return ControlFlow::Continue(());
+            }
             Err(e) => {
                 // The cluster stream is authoritative, so this should
                 // not happen in practice. This code drops the frame

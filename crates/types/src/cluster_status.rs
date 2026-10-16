@@ -26,6 +26,9 @@ pub struct ClusterStatus {
     /// The record-lag guard. A status frame from a sealer that does not
     /// send the guard reads as the default: no cursor, the guard off.
     pub record_lag: RecordLagStatus,
+    /// The bytes of the retained frames above the posted head. `None` when
+    /// the sealer does not send them.
+    pub retained_bytes: Option<u64>,
 }
 
 /// The sealer's record-lag guard: the best recorded cursor of the

@@ -97,6 +97,17 @@ variable "priority_fees" {
     error_message = "The priority_fees value must be on or off."
   }
 }
+# The genesis fragment of the local canary, "on" or "off"
+# (config/genesis/canary.toml). The deploy sets it on only for the local
+# canary. A live chain keeps "off": its executors refuse a changed genesis.
+variable "canary_genesis" {
+  type    = string
+  default = "off"
+  validation {
+    condition     = contains(["on", "off"], var.canary_genesis)
+    error_message = "The canary_genesis value must be on or off."
+  }
+}
 variable "executor_count" {
   type        = number
   description = "The executor node count (node_classes.executor.count). The checkpoint peers are executor-<i>.node.<datacenter>.consul."
@@ -327,11 +338,16 @@ job "validator" {
       }
 
       # The chain genesis comes from one source: config/genesis/dev.toml.
-      # With priority fees on, the fee schedule fragment follows it, as
-      # on the executor: both roles compute the same roots.
+      # The local canary's accounts and, with priority fees on, the fee
+      # schedule fragment follow it, as on the executor: both roles
+      # compute the same roots.
       template {
         destination = "local/genesis.toml"
-        data        = var.priority_fees == "on" ? join("\n", [file("config/genesis/dev.toml"), file("config/genesis/fees.toml")]) : file("config/genesis/dev.toml")
+        data = join("\n", concat(
+          [file("config/genesis/dev.toml")],
+          var.canary_genesis == "on" ? [file("config/genesis/canary.toml")] : [],
+          var.priority_fees == "on" ? [file("config/genesis/fees.toml")] : [],
+        ))
       }
 
       service {

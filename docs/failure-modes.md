@@ -229,12 +229,29 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Follower below the purge point**
   - Trigger: a follower stops for longer than the purge margin. It restarts with a log that ends below the purge point of the leader.
   - Effect: the archive of the leader refuses the catch-up of the follower. The election of the follower cycles, while Nomad sees a live container.
-  - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off).
-    - It logs `cluster CATCHUP STALL`.
+  - Recovery: the join watchdog acts after 300 s with no commit progress (`kardamom.cluster.catchupStallS`, 0 turns this rule off), and only when a peer has a closed election.
+    - At the stall limit (see the next entry) the member asks its peers for their admin status. When every peer answers with an open election, it relaunches and keeps its log (exit code 8).
+    - Otherwise it waits until 300 s and logs `cluster CATCHUP STALL`. A peer with a closed election, a peer that does not answer, and a member with no admin port (`adminPort` 0) all lead here.
     - It deletes the recording log of the member and exits with code 4.
     - The relaunch finds no recording log. So the member seeds from a peer and rejoins.
-    - The member holds no committed entry that the leader does not have, because it was behind the leader.
-  - Proof: the in-JVM tests `ClusterLogPurgeTest` and `JoinWatchdogTest`.
+    - The member holds no committed entry that the leader does not have, because it was behind the live leader.
+  - Proof: the in-JVM tests `ClusterLogPurgeTest`, `JoinWatchdogTest` and `PeerProbeTest`.
+- **Election stall after a full restart**
+  - Trigger: all members restart together with different log tails. Two members win two different terms. Aeron 1.44 lets a member vote in a higher term, then accept the leader of the lower term in `CANVASS`. So one member can give a quorum to both leaders. The leader of the lower term replays its longer log into its service before it learns of the higher term.
+  - Effect: the cluster stays without a closed election, while Nomad sees three live containers.
+    - The leader of the higher term waits in `LEADER_READY` for ever: Aeron 1.44 gives that state no timeout, and a member that voted must join.
+    - The old leader cannot join: its service is ahead of the new leader's log. Each join fails at once (`followerLogAwait - joinPosition=... less than logPosition=...`), and each new election takes the position from the commit counter again.
+    - A third member can wait in `FOLLOWER_LOG_REPLICATION` for ever: Aeron 1.44 checks that deadline only after the archive signals both the end of the replication and the stop of the recording, and a replication that fails before its recording starts sends no stop.
+  - Recovery: the join watchdog acts after the stall limit with no progress. The limit is two join attempts of a follower: 2 x (2 x leader heartbeat timeout + archive message timeout + driver timeout). That is 80 s at the defaults and 160 s at the CI stall tolerance of 30 s.
+    - A leader in `LEADER_READY` with no progress on itself or its peers logs `cluster LEADER STALL` and exits with code 7.
+    - A member that found a leader and makes no progress logs `cluster FOLLOWER STALL` and exits with code 8. It keeps its recording log.
+    - Each relaunch starts from the member's own state. A member replays its log after the new leader truncates its log tail, so it joins at the leader's position.
+    - Data: the truncated tail can be committed in the lower term. In #620, member 2 closed term T0 at 15027712 with member 0, and the leader of T1 holds the log only to 15027008. The members then keep the log of T1, and the entries from 15027008 to 15027712 go. This is the behavior of Aeron 1.44 after the double vote, not of the watchdog.
+    - With `adminPort` 0 the leader reads no peer progress. Then the leader stall can also fire while a slow follower replays for longer than the stall limit. The relaunch costs one more election.
+    - Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44, and no rule acts on it.
+    - Before each exit, the member prints its Aeron error logs (`cluster ERROR LOG`).
+  - Not a stall (with the admin port set): a slow follower that replays or catches up moves its commit position. A waiting leader reads the commit positions of its peers from their admin servers every 5 s, and counts a new highest one as progress. A coordinated restart and a lone member wait in `CANVASS`, which is no follower state. A snapshot runs with a closed election.
+  - Proof: the in-JVM tests `JoinWatchdogTest`, `PeerProbeTest` and `ComponentCloseTest` (the limits follow the member's configured timeouts).
 - **Component fails in its start**
   - Trigger: the consensus module or the service container throws while it starts. The usual cause is a slow host at a full restart: the snapshot load waits for the archive past an Aeron timeout.
   - Effect: the component records the error in its error log and closes. Aeron calls no termination hook, and the media driver and the archive keep the process alive. The member never joins and takes no snapshot. At the next restart it restores an old snapshot, and its log can end below the purge point of the leader.
@@ -254,7 +271,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
   - Recovery: the join watchdog acts when the control toggle is active and the election state is not `CLOSED` for longer than the two blocking waits of a completion: the archive message timeout plus the driver timeout (20 s at the defaults, 60 s at the CI stall tolerance of 30 s). A completion that succeeds moves the state to `CLOSED` within those waits. A new election sets the state to `INIT` first, and its first step then sets the toggle to `INACTIVE`; the first election after a start does not set the toggle, but a new consensus module starts with an `INACTIVE` toggle. So only a failed completion keeps that combination past the limit.
     - It logs `cluster LEADER WEDGE`.
     - It exits with code 6. The relaunch starts from the member's own state, and the members elect again.
-  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, and the watchdog does not act.
+  - Not a wedge: a leader in `LEADER_READY` that waits for a slow follower. After a total loss on a slow host, a follower can load an old snapshot and replay minutes of log. The toggle of the leader stays `INACTIVE` while it waits, so this rule does not act. The leader stall rule (see "Election stall after a full restart") counts the follower's replay as progress.
   - Proof: the in-JVM test `JoinWatchdogTest`.
 - **Quorum loss**
   - Trigger: two members die.
@@ -538,8 +555,10 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A resubmit at a marked nonce is offered again, and the floor stays. The sealer decides: it orders the resubmit if it did not order the nonce, and it rejects it as a past nonce if it did. A mark ends when a ref at the nonce publishes, or when a receipt floor passes it.
   - The floor moves back only on a contiguity reject that names an expected nonce `E` at which the sequencer holds no ref. Then the floor goes back to `E`, and the later refs of the sender leave the ledger and park above it. The resubmit of `E` publishes, and the parked refs drain behind it. A parked ref waits for at most `tx_ttl`. With no resubmit, it expires, and its client gets `Expired`.
   - If the sequencer holds the ref at `E`, the offer vanished, and the sequencer republishes from `E` as before.
+  - The floor never goes back below the receipt floor of the sender. A receipt proves that every nonce below the receipt floor executed, so the sealer cannot expect such a nonce now. A contiguity reject can wait in the channel backlog until after that receipt, for example under overload. So the sequencer first raises `E` to the receipt floor. A reject at a nonce below the raised `E` drops the ledger entry like a receipt. Without this, the floor goes below the chain nonce. The later refs park and expire, and no receipt comes to raise the floor again.
+  - A window-full answer never frees a nonce. The window check runs before the contiguity guard, so the answer names no expected nonce. If the sequencer still holds the ref in its ledger, the ref and the later refs republish. Otherwise a receipt, a reject or a refusal already settled the ref, and nothing happens.
   - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
-  - Proof: `crates/sequencer/tests/refusal_rewind.rs`, `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs` (the stale reject: `a_reject_read_after_the_receipt_keeps_the_floor`, `a_reject_below_the_receipt_floor_keeps_the_floor`, `a_window_full_answer_never_frees_a_nonce`), `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
@@ -1151,7 +1170,7 @@ The canary (`kardamom-canary`, `nomad/canary.nomad.hcl`) is an observer. It uses
   - Proof: the chaos case `canary-da-lag` freezes the batcher past the DA-lag budget. The canary reports `rpc_error{code="-32010"}`, and Alertmanager holds its page as inhibited. The case runs by name with `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, as `da-lag-halt` does, on a cluster deployed with `CANARY_LOCAL=1`.
 - **Known limits.**
   - A transaction that the chain refuses for ever (for example a fee cap under a base fee that stays high) blocks its account. `kardamom_canary_account_stalled` shows it. Clear the account's journal file after you make sure that its nonce is free.
-  - The dev genesis funds anvil accounts #34 to #37 for the canary ring of the local profile, which runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
+  - The genesis fragment `deploy/cluster/config/genesis/canary.toml` funds anvil accounts #34 to #37 for the canary ring of the local profile. The executor and validator jobs append it only with `CANARY_LOCAL=1`, so a live chain keeps its genesis. The local canary runs only with `CANARY_LOCAL=1`: the CI shards count transactions, so their clusters run no canary. A real chain gets its ring from `CANARY_MNEMONIC`.
 
 ## Redis account cache
 

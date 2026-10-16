@@ -5,6 +5,8 @@
 use anyhow::Context;
 use serde_json::Value;
 
+use crate::evidence::number_after;
+
 /// Where the cluster job mounts the seed directory on a sealer node.
 pub(super) const SEED_DIR: &str = "/opt/kardamom/seed";
 
@@ -55,6 +57,25 @@ impl SeedHead {
     /// sealer logs it: `(E_H,H+1)`.
     pub(super) fn resume_cursor(self) -> String {
         format!("({},{})", self.end_tx_idx, self.block.saturating_add(1))
+    }
+
+    /// The sealer's refusal of a cursor past this head, as it logs it:
+    /// `AHEAD head=(E_H,`. Only a sealer seeded at this head has `E_H` as
+    /// its head index, so no line of the old chain matches.
+    pub(super) fn ahead_needle(self) -> String {
+        format!(" AHEAD head=({},", self.end_tx_idx)
+    }
+
+    /// The count of replay lines in `logs` that serve a cursor past
+    /// `E_H`. Only a consumer of the old chain holds such a cursor, and a
+    /// sealer seeded at this head refuses it.
+    pub(super) fn served_past(self, logs: &str) -> usize {
+        logs.lines()
+            .filter(|line| line.contains(" served="))
+            .filter(|line| {
+                number_after(line, "from=(").is_some_and(|index| index > self.end_tx_idx)
+            })
+            .count()
     }
 }
 

@@ -144,18 +144,35 @@ final class SessionBacklogs {
     }
 
     /**
-     * The relayed index that last closed a session of a response channel as
-     * too long, and how many closes in a row it caused after the first.
+     * The frame that closes a session as too long: its kind, and its
+     * canonical index, or -1 for a kind that carries no index.
      */
-    private record TooLong(long index, long repeats) {
+    private record FrameKey(byte kind, long index) {
+        static FrameKey of(final byte[] frame) {
+            final boolean indexed = frame[0] == SealerWire.EGRESS_KIND_RELAYED
+                || frame[0] == SealerWire.EGRESS_KIND_RELAYED_REF;
+            return new FrameKey(frame[0], indexed
+                ? new UnsafeBuffer(frame).getLong(Byte.BYTES, ByteOrder.LITTLE_ENDIAN)
+                : -1L);
+        }
+    }
+
+    /**
+     * The frame that last closed a session of a response channel as too
+     * long, and how many closes in a row it caused after the first.
+     */
+    private record TooLong(FrameKey frame, long repeats) {
     }
 
     /**
      * The last {@link TooLong} close of each response channel. A client
      * keeps its response channel across reconnects, so a client whose
      * egress term cannot take a frame shows here as a run of repeats on one
-     * index. This is member-local IO state, like the backlogs. Only the
-     * leader closes sessions, so a follower keeps no entry.
+     * frame. This is member-local IO state, like the backlogs. Only the
+     * leader closes sessions, so a follower keeps no entry: a role change
+     * clears the map. A session close that the service did not ask for
+     * removes the entry of its channel ({@link #forgetChannel}), so the map
+     * holds only the channels of sessions that the service closed.
      */
     private final Map<String, TooLong> tooLongByChannel = new HashMap<>();
 
@@ -212,9 +229,15 @@ final class SessionBacklogs {
         bySession.remove(sessionId);
     }
 
-    /** Drop every backlog, because this member's role changed. */
+    /** Drop every backlog and every close count, because this member's role changed. */
     void dropAll() {
         bySession.clear();
+        tooLongByChannel.clear();
+    }
+
+    /** Forget the close count of a response channel whose session ended for good. */
+    void forgetChannel(final String responseChannel) {
+        tooLongByChannel.remove(responseChannel);
     }
 
     private Backlog open(final ClientSession session) {
@@ -295,26 +318,23 @@ final class SessionBacklogs {
      * response channel, so the loop is visible.
      */
     private void closeTooLong(final ClientSession session, final byte[] frame) {
-        final long index = relayedIndex(frame);
+        final FrameKey key = FrameKey.of(frame);
         final TooLong last = tooLongByChannel.get(session.responseChannel());
-        final long repeats = last != null && last.index() == index ? last.repeats() + 1 : 0;
-        tooLongByChannel.put(session.responseChannel(), new TooLong(index, repeats));
+        final long repeats = last != null && last.frame().equals(key) ? last.repeats() + 1 : 0;
+        tooLongByChannel.put(session.responseChannel(), new TooLong(key, repeats));
         closeLoudly(session, "frame above the max message length of the egress publication"
-            + " index=" + index + " length=" + frame.length + " repeats=" + repeats
-            + " channel=" + session.responseChannel());
+            + " kind=" + key.kind() + " index=" + key.index() + " length=" + frame.length
+            + " repeats=" + repeats + " channel=" + session.responseChannel());
     }
 
-    /** The canonical index of a relayed frame, or -1 for any other frame. */
-    private static long relayedIndex(final byte[] frame) {
-        return frame[0] == SealerWire.EGRESS_KIND_RELAYED
-            ? new UnsafeBuffer(frame).getLong(Byte.BYTES, ByteOrder.LITTLE_ENDIAN)
-            : -1L;
-    }
-
-    /** How many closes in a row the frame at {@code index} caused for {@code channel}, after the first. */
-    long tooLongRepeats(final String channel, final long index) {
+    /**
+     * How many closes in a row the frame of {@code kind} at {@code index}
+     * caused for {@code channel}, after the first, or -1 when it is not the
+     * last such frame.
+     */
+    long tooLongRepeats(final String channel, final byte kind, final long index) {
         final TooLong last = tooLongByChannel.get(channel);
-        return last != null && last.index() == index ? last.repeats() : -1L;
+        return last != null && last.frame().equals(new FrameKey(kind, index)) ? last.repeats() : -1L;
     }
 
     /**

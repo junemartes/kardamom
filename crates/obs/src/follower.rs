@@ -83,22 +83,26 @@ mod tests {
     use tokio::time::Instant;
 
     use super::FollowerWatch;
-    use crate::events::Board;
+    use crate::events::{Board, Delivery};
 
-    fn halted(instance: &str) -> ServiceEvent {
-        ServiceEvent {
+    fn record(instance: &str, state: ServiceState) -> Delivery {
+        Delivery::of_one_publisher(ServiceEvent {
             service: HaltRef::L1_FOLLOWER.into(),
             instance: instance.into(),
             seq: 1,
-            state: ServiceState::Halted(Halt::new(HaltCause::L1ChainBreak, "block 7")),
-        }
+            state,
+        })
     }
 
-    fn running(instance: &str) -> ServiceEvent {
-        ServiceEvent {
-            state: ServiceState::Running,
-            ..halted(instance)
-        }
+    fn halted(instance: &str) -> Delivery {
+        record(
+            instance,
+            ServiceState::Halted(Halt::new(HaltCause::L1ChainBreak, "block 7")),
+        )
+    }
+
+    fn running(instance: &str) -> Delivery {
+        record(instance, ServiceState::Running)
     }
 
     /// One halted instance is not a root while the other serves; both
