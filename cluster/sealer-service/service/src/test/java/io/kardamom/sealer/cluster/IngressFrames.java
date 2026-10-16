@@ -40,6 +40,11 @@ final class IngressFrames {
      * with a yield, not a sleep, so the offer stays deterministic.
      */
     static void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
+        offerRecord(client, canonicalId32, canonicalId32);
+    }
+
+    /** {@link #offerIngress} with an opaque {@code payload} of any length. */
+    static void offerRecord(final AeronCluster client, final byte[] canonicalId32, final byte[] payload) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
         buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
@@ -54,8 +59,8 @@ final class IngressFrames {
         pos += SealerWire.TIP_LEN;
         buf.putBytes(pos, canonicalId32);
         pos += canonicalId32.length;
-        buf.putBytes(pos, canonicalId32); // opaque payload, relayed verbatim
-        pos += canonicalId32.length;
+        buf.putBytes(pos, payload); // opaque payload, relayed verbatim
+        pos += payload.length;
         offerFully(client, buf, pos);
     }
 

@@ -37,6 +37,8 @@ final class ClusterStubs {
         boolean backPressured;
         /** How many more offers this session takes before it reports back-pressure. */
         long credit = Long.MAX_VALUE;
+        /** An offer above this length throws, as Aeron's offer above the max message length does. */
+        int maxMessageLength = Integer.MAX_VALUE;
 
         StubSession(final long id) {
             this.id = id;
@@ -68,6 +70,9 @@ final class ClusterStubs {
         }
 
         public long offer(final DirectBuffer buffer, final int offset, final int length) {
+            if (length > maxMessageLength) {
+                throw new IllegalArgumentException("message exceeds maxMessageLength of " + maxMessageLength);
+            }
             if (backPressured || credit == 0) {
                 return Publication.BACK_PRESSURED;
             }

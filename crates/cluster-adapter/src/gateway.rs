@@ -14,6 +14,11 @@ pub enum OfferOutcome {
     Accepted,
     BackPressured,
     NotConnected,
+    /// The payload does not fit one cluster session message. A retry
+    /// cannot succeed.
+    TooLarge {
+        len: usize,
+    },
 }
 
 /// Offer app messages to cluster ingress (used by the ref publisher).
