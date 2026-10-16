@@ -346,3 +346,37 @@ async fn a_lie_that_arrived_before_the_clear_does_not_halt_the_watcher_again() {
         "got {err}"
     );
 }
+
+/// The clear also drops a true live record past the archives' end. The
+/// history after the clear stops at the archives' end. The next live
+/// record is ahead of the head, so the watcher seeks the dropped block in
+/// the archives and publishes it: no block is lost.
+#[tokio::test]
+async fn a_true_record_dropped_by_the_clear_comes_back_by_a_seek() {
+    let stream = ScriptedStream::default();
+    stream.tips(&[100, 101]);
+    let (mut w, tap) = watcher(&stream, None);
+    w.process_once().await.unwrap();
+    w.process_once().await.unwrap();
+    let mut lie = stream.record(101);
+    lie.hash = B256::repeat_byte(0xAB);
+    stream.inject(lie);
+    assert!(w.process_once().await.is_err());
+    stream.inject(stream.record(105));
+    assert_eq!(w.process_once().await.unwrap(), 0, "held until the clear");
+    stream.archive_up_to(104);
+    w.on_halt_cleared();
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 3);
+    assert_eq!(w.cursor(), Some(104), "the live 105 was dropped");
+
+    // The archives now hold 105 and 106. The watcher wants no block, so
+    // only the seek on the live 106 reads them.
+    stream.archive_up_to(106);
+    stream.inject(stream.record(106));
+    assert_eq!(w.process_once().await.unwrap(), 0, "106 is ahead: a seek");
+    assert_eq!(w.cursor(), Some(104));
+    tokio::time::sleep(TICK * 2).await;
+    assert_eq!(w.process_once().await.unwrap(), 2);
+    assert_eq!(numbers(&tap), (101..=106).collect::<Vec<_>>());
+}

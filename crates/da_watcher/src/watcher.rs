@@ -458,8 +458,12 @@ impl<F: BlockFeed, P: EpochPublisher> L1Watcher<F, P> {
     /// The clear covers every record that arrived before it. A record of
     /// the lying instance can wait in the inbox through the halt; judged
     /// after the clear, against the true record the history gives for its
-    /// block, it raises the halt again. The history after the head gives
-    /// every block again, by the parent chain.
+    /// block, it raises the halt again. The history read after the head
+    /// gives the dropped blocks that the archives hold, by the parent
+    /// chain. A dropped block past the archives' end comes back on the
+    /// next live record: that record is ahead of the head
+    /// (`Admit::Ahead`), so the watcher seeks the missing block in the
+    /// archives.
     pub fn on_halt_cleared(&mut self) {
         let dropped = self.drop_arrived();
         info!(
