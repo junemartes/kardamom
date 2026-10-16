@@ -14,13 +14,11 @@ import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumSet;
-import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
 
@@ -139,8 +137,19 @@ public final class ClusterNode {
                 + " digest=" + s.digestHex())
             .orElse(" <none: a cluster with no snapshot starts at genesis>"));
 
+        // The retained frames: on the heap, or in an append-only file in the
+        // cluster directory. Replicated configuration: the choice decides the
+        // snapshot version, so every member must run the same value.
         final int adminPort = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
-        final Optional<RetainedFile.Config> retainedFile = retainedFile(clusterDir, memberId, adminPort);
+        final long snapshotIntervalS = Long.getLong("kardamom.cluster.snapshotIntervalS", 300L);
+        final Optional<CarryBytes> carryBytes = new CarryBytes.Inputs(
+            System.getProperty(RetainedFile.Config.SETTING),
+            System.getProperty(RetainedFile.Config.SEGMENT_SETTING),
+            System.getProperty(RetainedEndpoint.TOKEN_SETTING, System.getenv("KARDAMOM_RETAINED_TOKEN")),
+            Path.of(clusterDir), adminPort, snapshotIntervalS).parse();
+        System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
+            .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())
+            .orElse(" <off: retained frames on the heap>"));
 
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
@@ -163,8 +172,8 @@ public final class ClusterNode {
         // The member's own name resolves to the node address with no lookup.
         final MemberContexts contexts =
             new MemberContexts(aeronDir, clusterDir, archiveDir, me).withPeerNames(memberId, nodeIp);
-        prepareState(contexts, memberId, peerConsensusEndpoints(clusterMembers, memberId), retainedFile
-            .map(c -> new RetainedCopy(peerAdminEndpoints(clusterMembers, memberId, adminPort), c.dir(), memberId)));
+        prepareState(contexts, memberId, peerConsensusEndpoints(clusterMembers, memberId), carryBytes
+            .map(c -> c.copy(new CarryBytes.Members(clusterMembers).peerAdminEndpoints(memberId, adminPort), memberId)));
 
         // Launch with a retry past the mark-file liveness window. A member
         // that was hard-killed (kill -9 or docker kill) cannot clear its
@@ -205,7 +214,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
-                retainedFile.ifPresent(service::carryingBytes);
+                carryBytes.map(CarryBytes::file).ifPresent(service::carryingBytes);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop));
                 break;
@@ -234,12 +243,13 @@ public final class ClusterNode {
         }
 
         final ConsensusModule.Context consensus = driver.consensusModule().context();
+        final SealerClusteredService launched = service;
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container;
-             AdminServer ignored3 = startAdminServer(
-                 consensus, service, memberId, Path.of(clusterDir), retainedFile.map(RetainedFile.Config::dir))) {
+             AdminServer ignored3 = startAdminServer(consensus, service, memberId, Path.of(clusterDir),
+                 carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
-            startSnapshotScheduler(clusterDir, memberId);
+            startSnapshotScheduler(clusterDir, memberId, snapshotIntervalS);
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
@@ -248,29 +258,6 @@ public final class ClusterNode {
                 contexts.clusterState());
             stop.await();
         }
-    }
-
-    /**
-     * The retained-file settings: empty keeps the retained frames on the
-     * heap. Replicated configuration: the choice decides the retention
-     * section of the snapshot, so every member must run the same value. A
-     * member that a peer seeds copies the file from the admin endpoint of a
-     * peer, so the file needs the admin port.
-     */
-    private static Optional<RetainedFile.Config> retainedFile(
-            final String clusterDir, final int memberId, final int adminPort) {
-        final Optional<RetainedFile.Config> config = RetainedFile.Config.parse(
-            System.getProperty(RetainedFile.Config.SETTING),
-            System.getProperty(RetainedFile.Config.SEGMENT_SETTING),
-            Path.of(clusterDir));
-        if (config.isPresent() && adminPort == 0) {
-            throw new IllegalArgumentException(RetainedFile.Config.SETTING + "=true needs"
-                + " kardamom.cluster.adminPort: a member that a peer seeds copies the retained file from it");
-        }
-        System.out.println("cluster carry bytes memberId=" + memberId + config
-            .map(c -> " dir=" + c.dir() + " segmentBytes=" + c.segmentBytes())
-            .orElse(" <off: retained frames on the heap>"));
-        return config;
     }
 
     /**
@@ -306,15 +293,15 @@ public final class ClusterNode {
      * accepts a null resource.</p>
      *
      * <p>{@code stateDir} is the directory whose disk the free-space gauge
-     * reads. {@code retainedDir} is the retained file that the endpoint
-     * serves to a member that a peer seeds.</p>
+     * reads. {@code retained} serves the retained file to a member that a
+     * peer seeds.</p>
      */
     private static AdminServer startAdminServer(
             final ConsensusModule.Context consensus,
             final SealerClusteredService service,
             final int memberId,
             final Path stateDir,
-            final Optional<Path> retainedDir) {
+            final Optional<RetainedEndpoint> retained) {
         final int port = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
         if (port == 0) {
             System.out.println("cluster admin endpoint DISABLED memberId=" + memberId);
@@ -330,7 +317,7 @@ public final class ClusterNode {
             stateDir);
         final AdminServer admin;
         try {
-            admin = AdminServer.start(port, source::sample, lagBytes, retainedDir);
+            admin = AdminServer.start(port, source::sample, lagBytes, retained);
         } catch (final java.io.IOException e) {
             throw new IllegalStateException("cluster admin endpoint bind failed on port " + port, e);
         }
@@ -376,12 +363,16 @@ public final class ClusterNode {
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()), diskFreeBytes());
         }
 
-        /** The bytes that the member can still write to the disk of its state. */
-        private long diskFreeBytes() {
+        /**
+         * The bytes that the member can still write to the disk of its
+         * state, or empty when the disk cannot be read. A failed read does
+         * not make the member unready.
+         */
+        private OptionalLong diskFreeBytes() {
             try {
-                return Files.getFileStore(stateDir).getUsableSpace();
+                return OptionalLong.of(Files.getFileStore(stateDir).getUsableSpace());
             } catch (final IOException e) {
-                throw new UncheckedIOException(e);
+                return OptionalLong.empty();
             }
         }
     }
@@ -399,8 +390,7 @@ public final class ClusterNode {
      * next tick retries. A snapshot trigger must never take a member
      * down.</p>
      */
-    private static void startSnapshotScheduler(final String clusterDir, final int memberId) {
-        final long intervalS = Long.getLong("kardamom.cluster.snapshotIntervalS", 300L);
+    private static void startSnapshotScheduler(final String clusterDir, final int memberId, final long intervalS) {
         if (intervalS <= 0) {
             System.out.println("cluster snapshot scheduler DISABLED memberId=" + memberId);
             return;
@@ -819,18 +809,6 @@ public final class ClusterNode {
             .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
             .map(f -> f[2].trim())
             .collect(java.util.stream.Collectors.joining(","));
-    }
-
-    /**
-     * The admin endpoints of every member except {@code memberId}: the host
-     * of each ingress endpoint, with the admin port that every member uses.
-     */
-    static List<URI> peerAdminEndpoints(final String clusterMembers, final int memberId, final int adminPort) {
-        return java.util.Arrays.stream(clusterMembers.split("\\|"))
-            .map(member -> member.split(","))
-            .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
-            .map(f -> URI.create("http://" + f[1].trim().split(":")[0] + ":" + adminPort))
-            .toList();
     }
 
     /**

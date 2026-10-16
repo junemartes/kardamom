@@ -244,4 +244,22 @@ class SealerRetentionFloorTest {
         assertThrows(AgentTerminationException.class,
             () -> deliver(service, publisher, IngressFrames.recordFrame(0, sender, 0)));
     }
+
+    @Test
+    void a_member_stops_on_a_snapshot_of_the_other_retention_layout() {
+        start(Store.HEAP);
+        fourBlocks();
+        final byte[] heapSnapshot = service.snapshot();
+        final SealerClusteredService file = startService(Store.FILE, "d", Optional.empty());
+        block(file, 0, 2);
+        final byte[] fileSnapshot = file.snapshot();
+
+        assertThrows(AgentTerminationException.class, () -> startService(Store.FILE, "e", Optional.of(heapSnapshot)),
+            "the switch never turns on with a heap section");
+        assertThrows(AgentTerminationException.class, () -> startService(Store.HEAP, "f", Optional.of(fileSnapshot)),
+            "a heap member cannot read a retained file");
+        assertEquals(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION,
+            ByteBuffer.wrap(fileSnapshot).getInt(Integer.BYTES), "the file writes snapshot version 12");
+        assertEquals(CanonicalSealerState.snapshotWriteVersion(), ByteBuffer.wrap(heapSnapshot).getInt(Integer.BYTES));
+    }
 }

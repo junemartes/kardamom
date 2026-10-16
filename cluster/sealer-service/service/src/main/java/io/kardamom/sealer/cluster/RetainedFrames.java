@@ -56,10 +56,11 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     byte[] writeSnapshot(long floorIndex, long floorBlock);
 
     /**
-     * Restore a retention section that {@link RetainedFile} wrote, after its
-     * marker. Return the floors that the section holds.
+     * Restore the retention section of a snapshot that this store wrote, at
+     * the position of {@code section}. Return the floors. The floors start
+     * at {@code restorePoint}, the next record and block to emit.
      */
-    Floors restore(ByteBuffer section);
+    Floors restore(ByteBuffer section, Floors restorePoint);
 
     /** Drop every retained frame: the start of an empty retention. */
     void clear();
@@ -72,6 +73,12 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
      * of the store for readers on other threads. Call it at each boundary tick.
      */
     void checkHealth();
+
+    /**
+     * The position below which every byte of the retained file is a whole
+     * record, for the admin thread that serves the file. 0 for the heap.
+     */
+    long publishedHead();
 
     /** Release the files and the threads of the store. */
     void close();

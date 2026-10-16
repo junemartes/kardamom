@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import java.util.OptionalLong;
 
 /**
  * One sample of a member's health: its Raft role, the election state, the
@@ -44,8 +45,11 @@ final class MemberStatus {
     final long commitPosition;
     final long servicePosition;
     final SnapshotVersions snapshot;
-    /** The bytes that the member can still write to the disk of its retained file and its log. */
-    final long diskFreeBytes;
+    /**
+     * The bytes that the member can still write to the disk of its retained
+     * file and its log, or empty when the disk cannot be read.
+     */
+    final OptionalLong diskFreeBytes;
 
     MemberStatus(
             final int memberId,
@@ -54,7 +58,7 @@ final class MemberStatus {
             final long commitPosition,
             final long servicePosition,
             final SnapshotVersions snapshot,
-            final long diskFreeBytes) {
+            final OptionalLong diskFreeBytes) {
         this.memberId = memberId;
         this.role = role;
         this.election = election;
@@ -87,15 +91,21 @@ final class MemberStatus {
             + ",\"snapshotReadsMin\":" + snapshot.readsMin()
             + ",\"snapshotReadsMax\":" + snapshot.readsMax()
             + ",\"snapshotLatest\":" + snapshot.latest()
-            + ",\"diskFreeBytes\":" + diskFreeBytes
+            + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"ready\":" + isReady(lagBytes)
             + "}";
     }
 
-    /** The Prometheus text of the gauges. */
+    /** The Prometheus text of the gauges. An unknown value is {@code NaN}. */
     String toMetrics() {
         return "# HELP kardamom_sealer_disk_free_bytes The free bytes of the disk of the member state.\n"
             + "# TYPE kardamom_sealer_disk_free_bytes gauge\n"
-            + "kardamom_sealer_disk_free_bytes{member_id=\"" + memberId + "\"} " + diskFreeBytes + "\n";
+            + "kardamom_sealer_disk_free_bytes{member_id=\"" + memberId + "\"} "
+            + diskFree("NaN") + "\n";
+    }
+
+    /** The free bytes as text, or {@code unknown} when the disk cannot be read. */
+    private String diskFree(final String unknown) {
+        return diskFreeBytes.isPresent() ? Long.toString(diskFreeBytes.getAsLong()) : unknown;
     }
 }

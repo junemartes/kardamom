@@ -301,7 +301,11 @@ A blank member without the bootstrap copies state from a running peer before it 
 - A round ends with no result when no peer answers for 20 s. The next round starts after a backoff of 1 s that doubles up to 30 s.
 - A blank member never falls back to position 0. It waits and prints `cluster SEED waiting-for-peer`.
 - If the cluster has no snapshot yet, the member holds the whole log. The line `cluster SEED from-peer` shows `snapshotPosition=-1`.
-- With `carryBytes`, the round then copies the segment files of the retained file from the admin endpoint of a peer (`GET /retained`). The line `cluster SEED retained-copy` shows the peer and the segment count. A round in which no peer serves the files ends with no result.
+- With `carryBytes`, the round then copies the segment files of the retained file from the admin endpoint of a peer (`GET /retained`).
+  - The round reads the sealer snapshot that the backup copied. It walks the copy from the front to the head of that snapshot, as a restore does. See [Retained file](#retained-file).
+  - The line `cluster SEED retained-copy` shows the peer and the segment count. A copy that fails the walk prints `cluster SEED retained-copy FAILED` with the reason, and the round tries the next peer.
+  - A round in which no peer serves a copy that passes ends with no result, and prints `cluster SEED retained-copy MISMATCH`. After 5 such rounds the seed prints `cluster SEED retained-copy GAVE-UP` and stops the start.
+  - A cluster with no snapshot needs no copy: the member replays the whole log.
 
 ## Seeded start
 
@@ -361,7 +365,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
-| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap. It needs `adminPort`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It needs `adminPort`, `retainedToken` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.retainedToken` | none (env `KARDAMOM_RETAINED_TOKEN`) | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The property wins over the env var. |
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
@@ -386,6 +391,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
   - With no budget (`0`), nothing bounds the stretch.
   - Use the same value on every member, so the replay range does not change after a failover.
 - `carryBytes`: the deploy does not pass it yet, so the retained frames stay on the heap.
+  - Switch it only with a new chain or a coordinated cut-over, never on a live chain. A member with the file stops on a snapshot before version 12, and a member without the file stops on a version-12 snapshot. Both print `sealer RETAINED-FILE FATAL`.
+  - `snapshotIntervalS=0` with `carryBytes` stops the start: the purge of the file runs at each snapshot, so the file would never shrink.
 - `daLagBudgetBlocks`: the start-up line `cluster da-lag budget` shows the value. See [DA-lag guard](#da-lag-guard).
 - `recordLagBudget`: the start-up line `cluster record-lag budget` shows the value. See [Record-lag guard](#record-lag-guard).
   - The deploy does not pass it yet, so the guard is off.
@@ -417,22 +424,24 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 With `carryBytes=true`, the member keeps its retained frames in an append-only file in `<kardamom.cluster.dir>/retained`.
 
 - The file is a sequence of segment files, `retained-<start>.seg`. `<start>` is the position of the first byte, with 20 digits. A position counts the bytes of all frames from the start of the file.
-- Each frame is a record `[len:u32 LE][frame]`. A record never crosses a segment. A segment ends where the next segment starts.
+- Each frame is a record `[len:u32 LE][frame]`. A record never crosses a segment. The records of a segment end where the next segment starts. A segment file can be longer: the rest holds the zeros of the preallocation.
 - The service thread appends each frame through the memory-mapped buffer of the last segment. The common path needs no system call.
-- A helper thread prepares the next segment: it writes zeros into all of it, syncs it and maps it. The file `segment.next` is the prepared segment. The service thread names it by its start position when it takes it.
+- A helper thread prepares the next segment: it writes zeros into all of it, syncs it and maps it. The file `segment.next` is the prepared segment. The service thread names it by its start position when it takes it, and syncs the directory.
 - The heap keeps only an index: the end index and the file position of each retained boundary.
 - The floors and the eviction rule are the same as on the heap. The file serves the same replay bytes.
 - The snapshot carries the floors, the frame count, the front and head positions, and the index. It does not carry the frames. See [Snapshot](#snapshot).
   - Before the member writes the snapshot, it forces the mapped segments to disk up to the head.
   - Then it deletes each segment that ends at or below the front position of the snapshot before. So a peer seed from the latest snapshot finds every segment that it needs.
+  - The purge lags the front: a segment leaves the disk one to two snapshot intervals after the front passes it. Plan for the disk of two snapshot intervals and two segments above the floor.
 - A restore makes the file match the snapshot:
   1. It deletes the segments at or above the head position, and the segments below the front position.
-  2. It writes zeros into the last segment from the head position on.
-  3. It checks that the segments hold every byte from the front to the head, with no gap. A file that does not stops the member with `sealer RETAINED-FILE FATAL`.
+  2. It walks the records from the front to the head. Each record must be a whole relayed frame or boundary frame inside its segment, and each boundary must match the index. The walk must end exactly at the head, with the frame count and the boundary count of the snapshot. Any other byte, such as the zeros of a preallocated segment, stops the member with `sealer RETAINED-FILE FATAL`.
+  3. It writes zeros into the last segment from the head position on.
   4. The log replay appends the frames after the snapshot.
+- The eviction and the replay read the records of the file. Every record from the front to the head is one that the member wrote, or that the walk checked, so the reads act alike on every member.
 - A member that starts with no snapshot deletes every segment. The log replay writes the file again from position 0.
 - Any I/O error on the file stops the member with `sealer RETAINED-FILE FATAL`. A full disk fails the preallocation of the helper thread. The member stops at the next boundary tick, or at the next segment change. A file error never changes the replicated state or the egress.
-- The admin endpoint serves the segments to a member that a peer seeds. See [Admin server](#admin-server).
+- The admin endpoint serves the segments to a member that a peer seeds, only below the head that the member published at its last boundary tick, snapshot or restore. See [Admin server](#admin-server).
 
 ### Member names
 
@@ -479,12 +488,14 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 | `GET /status` | Always 200 with the status JSON. |
 | `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
 | `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}` in the Prometheus text format. |
-| `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment file. Else 404. |
-| `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment. 404 for a name that is not a segment, or a segment that the purge deleted. |
+| `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment below the published head. `size` counts only the bytes below that head. 403 without the token. Else 404. |
+| `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment below the published head. 403 without the token. 404 for a name that is not a served segment, or a segment that the purge deleted. |
 | any other path | 404 |
 
 - The server listens on `0.0.0.0`. Two members on one host cannot share the port, so the port is off by default.
-- The server runs two threads, so a segment copy does not hold up `/ready`.
+- The server answers `/status`, `/ready` and `/metrics` on one thread. The paths under `/retained` run on two threads of their own, so a segment copy does not hold up `/ready`.
+- The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <retainedToken>`. The job passes the same token to every member.
+- `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
 - The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `diskFreeBytes` and `ready`.
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
@@ -529,13 +540,15 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `sealer seed CONFIRMED` | The first seed record is in the log (`block`, `canonicalCount`). |
 | `sealer seed SNAPSHOT` | The seeded leader asked for a snapshot (`requested=true` or `false`). A refused request leaves the periodic snapshot to take one. |
 | `sealer SEED-EPOCH FATAL` | The log holds a seed record, but this member started at genesis or from another seed. The member stops. |
-| `sealer RETAINED-FILE FATAL` | An I/O step of the retained file failed: the preallocation, a force, a delete, or a restore that finds a gap. The line names the step. The member stops. |
+| `sealer RETAINED-FILE FATAL` | An I/O step of the retained file failed: the preallocation, a force, a rename, a delete, or a restore whose walk fails. Or the snapshot holds the other retention layout. The line names the step. The member stops. |
 | `sealer SEED-EPOCH offer FAILED` | The offer of the seed record failed. The next leadership term offers it again. |
 | `cluster START mode=` | The start mode of the member (`RESUME`, `GENESIS` or `SEED_FROM_PEER`). |
 | `cluster SEED start` / `cluster SEED from-peer` | A blank member starts to copy a snapshot from a peer, and then ends the copy (`snapshotPosition`, `round`). |
 | `cluster SEED waiting-for-peer` | A round of the peer seed ended with no result (`outcome`, `backupState`, `retryInMs`). The member waits and does not start at genesis. |
 | `cluster SEED backup error` | The ClusterBackup of the peer seed reported an error. |
-| `cluster SEED retained-copy` / `cluster SEED retained-copy FAILED` | The peer seed copied the retained file from a peer (`peer`, `segments`), or the copy from that peer failed. |
+| `cluster SEED retained-copy` / `cluster SEED retained-copy FAILED` | The peer seed copied the retained file from a peer (`peer`, `segments`), or the copy from that peer failed, with the reason. |
+| `cluster SEED retained-copy MISMATCH` / `cluster SEED retained-copy GAVE-UP` | No peer served a copy that matches the backed-up snapshot in this round (`failures`), or the seed stopped the start after 5 such rounds. |
+| `cluster admin retained request FAILED` | A request under `/retained` failed while the server answered it. |
 | `cluster SNAPSHOT triggered` / `cluster SNAPSHOT attempt failed` | The scheduler asked for a cluster snapshot, or the attempt failed. The next tick tries again. |
 | `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
@@ -552,7 +565,8 @@ The chaos suite and operators read these lines. The admin server also exports on
 
 ## Snapshot
 
-- The member reads snapshot versions 1 to 11. It writes version 10.
+- The member reads snapshot versions 1 to 12. It writes version 10, or version 12 with `carryBytes`.
+  - Version 12 is the state section of version 11, then the retention section of the retained file. It is not frozen yet: the record path with bytes adds its fields to version 12 before any release writes it.
   - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
   - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
@@ -568,11 +582,10 @@ The chaos suite and operators read these lines. The admin server also exports on
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head
   - from version 11 only, the recorded cursors, after the seed digest: `[count:u8]`, then `[executor_id:u8][recorded_through:u64]` for each executor, in executor-id order
     - A restore drops the cursor of an executor that is not a configured voter.
-- The retention section follows the state section. It has one of two layouts. Both are big-endian.
-  - On the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
-  - With `carryBytes`: `[marker:i32 = -1][floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary. See [Retained file](#retained-file).
-  - A member with `carryBytes` that restores a heap section writes its frames into a new file. A member without `carryBytes` that finds a file section stops: it cannot read the frames.
-  - The snapshot version does not change with the layout. `carryBytes` is a setting that every member must match.
+- The retention section follows the state section. Its layout depends on the version. Both layouts are big-endian.
+  - Versions 8 to 11, on the heap: `[count:i32]`, then `[boundary:u8][key:u64][len:u32][frame]` for each retained frame.
+  - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
+  - A member with `carryBytes` stops on a snapshot before version 12. A member without it stops on version 12.
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The leader triggers it. The action is a log entry, so all members snapshot at the same position.
 

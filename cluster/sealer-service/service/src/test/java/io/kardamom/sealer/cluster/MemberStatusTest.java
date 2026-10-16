@@ -15,7 +15,7 @@ final class MemberStatusTest {
 
     private static MemberStatus sample(
             final String role, final String election, final long commit, final long applied) {
-        return new MemberStatus(1, role, election, commit, applied, SNAPSHOT, 0);
+        return new MemberStatus(1, role, election, commit, applied, SNAPSHOT, java.util.OptionalLong.of(0));
     }
 
     @Test

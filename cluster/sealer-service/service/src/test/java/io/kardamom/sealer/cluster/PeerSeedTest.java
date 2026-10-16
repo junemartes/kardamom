@@ -42,7 +42,8 @@ final class PeerSeedTest {
                 dir.resolve("archive").toString(),
                 ClusterNode.memberEndpoints(MEMBERS, MEMBER_ID));
         final PeerSeed seed = new PeerSeed(
-                MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID), contexts, FAST);
+                MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID), contexts, FAST,
+                java.util.Optional.empty());
         final Thread seeding = new Thread(seed::run, "peer-seed-test");
         seeding.start();
 

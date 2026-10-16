@@ -10,16 +10,11 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
-import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
 import org.agrona.IoUtil;
@@ -31,41 +26,44 @@ import org.agrona.concurrent.UnsafeBuffer;
  * The heap keeps only an index: the end index and the file position of each
  * retained boundary.
  *
- * <p>The file is a sequence of segment files in one directory. A segment is
- * named by the position of its first byte: {@code retained-<start>.seg},
- * with 20 digits. A position counts the bytes of all frames from the start
- * of the file, so the positions do not depend on the segment size. Each
- * frame is a record {@code [len:u32 LE][frame]}, and a record never crosses
- * a segment. A segment ends where the next segment starts. The last segment
- * ends at the head position.</p>
+ * <p>The file is a sequence of segment files in one directory
+ * ({@link SegmentDir}). A position counts the bytes of all records from the
+ * start of the file, so the positions do not depend on the segment size.
+ * Each frame is a record {@code [len:u32 LE][frame]}, and a record never
+ * crosses a segment. The records of a segment end where the next segment
+ * starts. A segment file can be longer than its records: the rest of it
+ * holds the zeros of the preallocation.</p>
  *
  * <p>The service thread appends each frame through the mapped buffer of the
  * last segment, with no system call. When a frame does not fit, it takes the
  * next segment from {@link SegmentPreallocator} and asks for one more. When
  * the helper has not finished that segment, the service thread waits for
- * it. The helper thread owns only the preparation. The service thread owns the
- * appends, the index, the purge and the restore.</p>
+ * it. The helper thread owns only the preparation. The service thread owns
+ * the appends, the index, the purge and the restore.</p>
  *
  * <p>Every byte of the file is a function of the log. A file I/O result
  * never changes the replicated state or the egress: an I/O error stops the
  * member with {@code sealer RETAINED-FILE FATAL}.</p>
  *
- * <p>The snapshot section holds the floors, the frame count, the front and
- * head positions, and the index. It does not hold the frames. Before it
- * writes the section, the member forces the mapped segments to disk up to
- * the head position. After a crash, the restore truncates the file at that
- * position, and the log replay appends the rest.</p>
+ * <p>The eviction and the replay read the records of the file. The reads
+ * act alike on every member because every record from the front to the
+ * head is a whole frame that this member wrote, or that a restore checked
+ * with {@link RetainedWalk}: a restore that finds any other byte stops the
+ * member.</p>
+ *
+ * <p>The snapshot section ({@link RetainedSection}) holds the floors, the
+ * frame count, the front and head positions, and the index. It does not
+ * hold the frames. Before it writes the section, the member forces the
+ * mapped segments to disk up to the head position. After a crash, the
+ * restore truncates the file at that position, and the log replay appends
+ * the rest.</p>
  */
 final class RetainedFile implements RetainedFrames {
 
     /** The directory of the retained file in the consensus module directory. */
     static final String DIR_NAME = "retained";
-    /** The first int of the snapshot section. A heap section starts with its frame count, which is never negative. */
-    static final int SECTION_MARKER = -1;
     /** The length prefix of each record in a segment. */
     static final int LENGTH_PREFIX = Integer.BYTES;
-    /** The name of a segment file. Group 1 is the start position. */
-    static final Pattern SEGMENT_NAME = Pattern.compile("retained-(\\d{20})\\.seg");
 
     /**
      * The retained-file settings, parsed once at the start.
@@ -119,22 +117,20 @@ final class RetainedFile implements RetainedFrames {
             return Math.toIntExact(pos - start);
         }
 
+        /** Whether a record of {@code recordBytes} at {@code pos}, at or after the start, fits. */
         boolean fits(final long pos, final int recordBytes) {
-            return start <= pos && Math.addExact(pos, recordBytes) <= end();
+            return Math.addExact(pos, recordBytes) <= end();
         }
     }
 
-    /** One retained boundary: its end index, and the position after its record. */
-    private record Mark(long endTxIdx, long endPos) {
-    }
-
     private final Config config;
+    private final SegmentDir dir;
     private final int memberId;
     private final SegmentPreallocator preallocator;
     /** The live segments by start position. The last one takes the appends. */
     private final TreeMap<Long, Segment> segments = new TreeMap<>();
     /** The retained boundaries by block number. */
-    private final TreeMap<Long, Mark> boundaries = new TreeMap<>();
+    private final TreeMap<Long, RetainedSection.Mark> boundaries = new TreeMap<>();
     /** Whether a request to the helper is open. At most one is. */
     private boolean spareAsked;
     /** The position of the oldest retained frame. */
@@ -146,14 +142,19 @@ final class RetainedFile implements RetainedFrames {
     private long forcedPos;
     /** The purge deletes each segment that ends at or below this position: the front of the last snapshot. */
     private long purgeBelow;
-    /** The head position at the last boundary tick, for readers on other threads. */
+    /**
+     * The head position at the last boundary tick, snapshot or restore. The
+     * admin thread serves the file only below it: every byte below it is a
+     * whole record.
+     */
     private volatile long publishedHead;
 
     RetainedFile(final Config config, final int memberId) {
         this.config = config;
+        this.dir = new SegmentDir(config.dir());
         this.memberId = memberId;
-        io("create " + config.dir(), () -> Files.createDirectories(config.dir()));
         this.preallocator = new SegmentPreallocator(config.dir(), config.segmentBytes(), memberId);
+        io("create " + config.dir(), () -> Files.createDirectories(config.dir()));
     }
 
     @Override
@@ -178,16 +179,24 @@ final class RetainedFile implements RetainedFrames {
     private void markBoundary(final DirectBuffer staged) {
         final FrameKey key = FrameKey.of(staged);
         if (key.boundary()) {
-            boundaries.put(key.key(), new Mark(
+            boundaries.put(key.key(), new RetainedSection.Mark(
                 staged.getLong(FrameKey.BOUNDARY_END_OFFSET, ByteOrder.LITTLE_ENDIAN), headPos));
         }
     }
 
-    /** Take the prepared segment at the head position, and ask for the next one. */
+    /**
+     * Take the prepared segment at the head position, name it, sync the
+     * directory, and ask for the next one. The sync keeps the name of a
+     * segment that a later snapshot counts on.
+     */
     private Segment roll() {
         final SegmentPreallocator.Ready ready = takePrepared();
-        final Path path = config.dir().resolve(segmentName(headPos));
+        final Path path = dir.segment(headPos);
         io("name the segment " + path, () -> Files.move(ready.path(), path, StandardCopyOption.ATOMIC_MOVE));
+        io("sync " + config.dir(), () -> {
+            dir.sync();
+            return null;
+        });
         final Segment segment = new Segment(headPos, path, ready.buffer());
         segments.put(headPos, segment);
         askSpare();
@@ -238,7 +247,7 @@ final class RetainedFile implements RetainedFrames {
 
     @Override
     public long boundaryEnd(final long block) {
-        return Optional.ofNullable(boundaries.get(block)).map(Mark::endTxIdx).orElse(-1L);
+        return Optional.ofNullable(boundaries.get(block)).map(RetainedSection.Mark::endTxIdx).orElse(-1L);
     }
 
     /**
@@ -249,7 +258,9 @@ final class RetainedFile implements RetainedFrames {
      */
     @Override
     public Stream<byte[]> wanted(final long fromIndex, final long fromBlock) {
-        final long start = Optional.ofNullable(boundaries.get(fromBlock - 1)).map(Mark::endPos).orElse(frontPos);
+        final long start = Optional.ofNullable(boundaries.get(fromBlock - 1))
+            .map(RetainedSection.Mark::endPos)
+            .orElse(frontPos);
         return Stream.iterate(start, pos -> pos < headPos, this::next)
             .filter(pos -> keyAt(pos).wanted(fromIndex, fromBlock))
             .map(this::frameAt);
@@ -293,27 +304,20 @@ final class RetainedFile implements RetainedFrames {
 
     /**
      * Force the segments to disk up to the head, purge the segments below
-     * the front of the last snapshot, and write the section:
-     * {@code marker(4) | floor_index(8) | floor_block(8) | count(8) |
-     * front(8) | head(8) | n(4) | n * (block(8) | end_tx_idx(8) | end_pos(8))},
-     * big-endian like the state.
+     * the front of the last snapshot, and write the section.
      *
      * <p>The purge keeps the segments of the last snapshot. So a peer seed
      * that copies the latest snapshot finds every segment that it needs,
-     * unless the peer takes two more snapshots during the copy.</p>
+     * unless the peer takes two more snapshots during the copy. A segment
+     * leaves the disk one to two snapshot intervals after the front passes
+     * it.</p>
      */
     @Override
     public byte[] writeSnapshot(final long floorIndex, final long floorBlock) {
         force();
         purge();
-        final int markBytes = Math.multiplyExact(3 * Long.BYTES, boundaries.size());
-        final ByteBuffer buf = ByteBuffer
-            .allocate(Math.addExact(2 * Integer.BYTES + 5 * Long.BYTES, markBytes))
-            .order(ByteOrder.BIG_ENDIAN);
-        buf.putInt(SECTION_MARKER).putLong(floorIndex).putLong(floorBlock)
-            .putLong(count).putLong(frontPos).putLong(headPos).putInt(boundaries.size());
-        boundaries.forEach((block, mark) -> buf.putLong(block).putLong(mark.endTxIdx()).putLong(mark.endPos()));
-        return buf.array();
+        publishedHead = headPos;
+        return new RetainedSection(new Floors(floorIndex, floorBlock), count, frontPos, headPos, boundaries).write();
     }
 
     private void force() {
@@ -345,53 +349,48 @@ final class RetainedFile implements RetainedFrames {
      * Unmap the segments of {@code old} and remove them from the map. A
      * deleted file frees its disk blocks only when no mapping holds it.
      */
-    private static void forget(final NavigableMap<Long, Segment> old) {
+    private void forget(final NavigableMap<Long, Segment> old) {
         old.values().forEach(s -> IoUtil.unmap(s.buffer()));
         old.clear();
     }
 
     /**
-     * Restore the section after its marker, and make the file match it:
-     * delete the segments at or above the head, zero the last segment from
-     * the head on, and delete the segments below the front. The kept
-     * segments must hold every byte from the front to the head. A file that
-     * does not stops the member: it would serve a partial retention.
+     * Restore a section, and make the file match it: delete the segments at
+     * or above the head and below the front, check the records from the
+     * front to the head with {@link RetainedWalk}, and zero the last segment
+     * from the head on. A file that fails the walk stops the member: it
+     * would serve a partial retention, or evict on other bytes than its
+     * peers.
      */
     @Override
-    public Floors restore(final ByteBuffer section) {
-        final Floors floors = new Floors(section.getLong(), section.getLong());
-        count = section.getLong();
-        frontPos = section.getLong();
-        headPos = section.getLong();
-        final int marks = section.getInt();
+    public Floors restore(final ByteBuffer buf, final Floors restorePoint) {
+        final RetainedSection section = RetainedSection.read(buf);
+        count = section.count();
+        frontPos = section.front();
+        headPos = section.head();
         boundaries.clear();
-        IntStream.range(0, marks).forEach(i -> boundaries.put(section.getLong(),
-            new Mark(section.getLong(), section.getLong())));
+        boundaries.putAll(section.marks());
         forget(segments);
-        final TreeMap<Long, Path> files = listSegments();
+        final TreeMap<Long, Path> files = io("list " + config.dir(), dir::list);
         final long first = Optional.ofNullable(files.floorKey(frontPos)).orElse(frontPos);
         files.tailMap(headPos, true).values().forEach(this::delete);
         files.headMap(first, false).values().forEach(this::delete);
-        files.subMap(first, true, headPos, false).forEach(this::map);
-        if (!covers()) {
-            throw fatal("restore", new IllegalStateException("the retained file in " + config.dir()
-                + " does not hold the positions [" + frontPos + ", " + headPos + ") of the snapshot"));
-        }
+        files.subMap(first, true, headPos, false).keySet().forEach(this::map);
+        new RetainedWalk(buffers(), section).problem().ifPresent(problem -> {
+            throw fatal("restore", new IllegalStateException(
+                "the retained file in " + config.dir() + " does not match the snapshot: " + problem));
+        });
         truncateAtHead();
-        forcedPos = frontPos;
+        forcedPos = headPos;
         purgeBelow = frontPos;
         publishedHead = headPos;
         askSpare();
-        return floors;
+        return section.floors();
     }
 
-    /** Whether the mapped segments hold every byte from the front to the head, with no gap. */
-    private boolean covers() {
-        final List<Segment> live = List.copyOf(segments.values());
-        return frontPos == headPos || !live.isEmpty()
-            && live.get(0).start() <= frontPos
-            && IntStream.range(1, live.size()).allMatch(i -> live.get(i - 1).end() >= live.get(i).start())
-            && live.get(live.size() - 1).end() >= headPos;
+    private TreeMap<Long, ByteBuffer> buffers() {
+        return segments.values().stream().collect(Collectors.toMap(
+            Segment::start, Segment::buffer, (a, b) -> a, TreeMap::new));
     }
 
     /** Zero the bytes of the last segment from the head on: the file ends at the head. */
@@ -405,7 +404,7 @@ final class RetainedFile implements RetainedFrames {
     @Override
     public void clear() {
         drop(segments);
-        listSegments().values().forEach(this::delete);
+        io("list " + config.dir(), dir::list).values().forEach(this::delete);
         boundaries.clear();
         count = 0;
         frontPos = 0;
@@ -416,31 +415,14 @@ final class RetainedFile implements RetainedFrames {
         askSpare();
     }
 
-    /** The segment files in the directory, by start position. */
-    private TreeMap<Long, Path> listSegments() {
-        return io("list " + config.dir(), () -> {
-            try (Stream<Path> paths = Files.list(config.dir())) {
-                return paths
-                    .map(p -> SEGMENT_NAME.matcher(p.getFileName().toString()))
-                    .filter(Matcher::matches)
-                    .collect(Collectors.toMap(m -> Long.parseLong(m.group(1)),
-                        m -> config.dir().resolve(m.group()), (a, b) -> a, TreeMap::new));
-            }
-        });
-    }
-
     private void delete(final Path path) {
         io("delete " + path, () -> Files.deleteIfExists(path));
     }
 
-    private void map(final long start, final Path path) {
-        final MappedByteBuffer buffer = io("map " + path, () -> {
-            try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-                return channel.map(FileChannel.MapMode.READ_WRITE, 0, channel.size());
-            }
-        });
-        buffer.order(ByteOrder.LITTLE_ENDIAN);
-        segments.put(start, new Segment(start, path, buffer));
+    private void map(final long start) {
+        final MappedByteBuffer buffer = io("map " + dir.segment(start),
+            () -> dir.map(start, FileChannel.MapMode.READ_WRITE));
+        segments.put(start, new Segment(start, dir.segment(start), buffer));
     }
 
     /** Stop the member when the helper failed to prepare a segment, and publish the head position. */
@@ -452,24 +434,20 @@ final class RetainedFile implements RetainedFrames {
         publishedHead = headPos;
     }
 
-    /** The head position at the last boundary tick. Every byte below it is in the file. */
-    long publishedHead() {
+    @Override
+    public long publishedHead() {
         return publishedHead;
     }
 
-    /** Stop the helper. The mappings stay until the collector frees them, so no late read can fault. */
+    /** Stop the helper and wait for it. The mappings stay until the collector frees them, so no late read can fault. */
     @Override
     public void close() {
         preallocator.close();
     }
 
-    /** The name of the segment that starts at {@code start}. */
-    static String segmentName(final long start) {
-        return String.format("retained-%020d.seg", start);
-    }
-
-    /** Log the fatal error and return the exception that stops the service agent. */
+    /** Stop the helper, log the fatal error, and return the exception that stops the service agent. */
     private AgentTerminationException fatal(final String what, final Exception cause) {
+        preallocator.close();
         System.out.println("sealer RETAINED-FILE FATAL memberId=" + memberId + " " + what + ": " + cause);
         System.out.flush();
         return new AgentTerminationException(cause);

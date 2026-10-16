@@ -3,7 +3,6 @@ package io.kardamom.sealer.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 import java.io.IOException;
 import java.net.URI;
@@ -12,10 +11,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.Supplier;
-import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -24,14 +22,22 @@ final class AdminServerTest {
     private static final long LAG = 1024;
 
     private static final MemberStatus.SnapshotVersions SNAPSHOT = MemberStatus.SnapshotVersions.of(0);
-    private static final MemberStatus READY = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, 4096);
+    private static final MemberStatus READY =
+        new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, OptionalLong.of(4096));
     private static final MemberStatus BEHIND =
-        new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT, 4096);
+        new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT, OptionalLong.of(4096));
+    private static final String TOKEN = "s3cret";
 
     private static HttpResponse<String> get(final AdminServer admin, final String path)
             throws IOException, InterruptedException {
+        return get(admin, path, "none");
+    }
+
+    private static HttpResponse<String> get(final AdminServer admin, final String path, final String token)
+            throws IOException, InterruptedException {
         final HttpRequest request = HttpRequest.newBuilder()
             .uri(URI.create("http://127.0.0.1:" + admin.port() + path))
+            .header("Authorization", RetainedEndpoint.authorization(token))
             .GET()
             .build();
         return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
@@ -39,7 +45,7 @@ final class AdminServerTest {
 
     private static HttpResponse<String> serve(final Supplier<MemberStatus> status, final String path)
             throws IOException, InterruptedException {
-        try (AdminServer admin = AdminServer.start(0, status, LAG)) {
+        try (AdminServer admin = AdminServer.start(0, status, LAG, Optional.empty())) {
             return get(admin, path);
         }
     }
@@ -90,27 +96,28 @@ final class AdminServerTest {
     }
 
     @Test
-    void theRetainedFileServesItsSegmentsToACopy(@TempDir final Path dir) throws Exception {
-        final Path from = Files.createDirectories(dir.resolve("from"));
-        final String first = RetainedFile.segmentName(0);
-        final String second = RetainedFile.segmentName(5);
-        Files.write(from.resolve(first), new byte[] {1, 2, 3, 4, 5});
-        Files.write(from.resolve(second), new byte[] {6, 7});
-        Files.write(from.resolve(SegmentPreallocator.PREPARED_NAME), new byte[] {9});
-        try (AdminServer admin = AdminServer.start(0, () -> READY, LAG, Optional.of(from))) {
-            assertEquals(first + " 5\n" + second + " 2\n", get(admin, "/retained").body());
-            assertEquals(404, get(admin, "/retained/" + SegmentPreallocator.PREPARED_NAME).statusCode());
-            assertEquals(404, get(admin, "/retained/" + RetainedFile.segmentName(7)).statusCode());
+    void anUnreadableDiskReadsAsUnknownAndKeepsTheMemberReady() throws Exception {
+        final MemberStatus unknown = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, OptionalLong.empty());
+        assertEquals(200, serve(() -> unknown, "/ready").statusCode());
+        assertTrue(serve(() -> unknown, "/status").body().contains("\"diskFreeBytes\":null"));
+        assertTrue(serve(() -> unknown, "/metrics").body().endsWith("} NaN\n"));
+    }
 
-            final Path into = dir.resolve("into");
-            final URI peer = URI.create("http://127.0.0.1:" + admin.port());
-            final URI deadPeer = URI.create("http://127.0.0.1:1");
-            assertTrue(new RetainedCopy(List.of(deadPeer, peer), into, 1).run(), "the second peer serves");
-            assertArrayEquals(Files.readAllBytes(from.resolve(first)), Files.readAllBytes(into.resolve(first)));
-            assertArrayEquals(Files.readAllBytes(from.resolve(second)), Files.readAllBytes(into.resolve(second)));
-            try (Stream<Path> copied = Files.list(into)) {
-                assertEquals(2, copied.count(), "the copy takes only the segments");
-            }
+    @Test
+    void theRetainedFileServesItsSegmentsBelowThePublishedHead(@TempDir final Path dir) throws Exception {
+        final SegmentDir from = new SegmentDir(Files.createDirectories(dir.resolve("from")));
+        Files.write(from.segment(0), new byte[] {1, 2, 3, 4, 5});
+        Files.write(from.segment(5), new byte[] {6, 7, 0, 0});
+        Files.write(from.segment(9), new byte[] {8});
+        Files.write(from.dir().resolve(SegmentPreallocator.PREPARED_NAME), new byte[] {9});
+        final RetainedEndpoint endpoint = RetainedEndpoint.start(from, () -> 7, TOKEN);
+        try (AdminServer admin = AdminServer.start(0, () -> READY, LAG, Optional.of(endpoint))) {
+            assertEquals(403, get(admin, "/retained").statusCode(), "a request without the token");
+            assertEquals(SegmentDir.name(0) + " 5\n" + SegmentDir.name(5) + " 2\n",
+                get(admin, "/retained", TOKEN).body(), "only the bytes below the head");
+            assertEquals(2, get(admin, "/retained/" + SegmentDir.name(5), TOKEN).body().length());
+            assertEquals(404, get(admin, "/retained/" + SegmentDir.name(9), TOKEN).statusCode());
+            assertEquals(404, get(admin, "/retained/" + SegmentPreallocator.PREPARED_NAME, TOKEN).statusCode());
         }
     }
 }

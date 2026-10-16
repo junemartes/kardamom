@@ -4,12 +4,14 @@ import static io.kardamom.sealer.cluster.RetainedFiles.assertEqualFiles;
 import static io.kardamom.sealer.cluster.RetainedFiles.awaitHeads;
 import static io.kardamom.sealer.cluster.RetainedFiles.nextPublishedHead;
 import static io.kardamom.sealer.cluster.RetainedFiles.segments;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
 import io.aeron.test.SystemTestWatcher;
 import io.aeron.test.cluster.TestNode;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -49,6 +51,21 @@ class RetainedFileSeedTest {
             final List<TestNode> compared = List.of(run.leader, member);
             awaitHeads(compared, head);
             assertEqualFiles(compared, run::retainedDir, head);
+        }
+    }
+
+    @Test
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
+    void a_seed_stops_after_its_copies_fail_a_bounded_number_of_rounds() {
+        try (LogCluster run = new LogCluster(systemTestWatcher, baseDir, true)) {
+            run.appendLog(LogCluster.LOG_BYTES_TAIL);
+            run.snapshotRunning();
+            final int memberId = run.stopFollower();
+            final URI deadPeer = URI.create("http://127.0.0.1:1");
+
+            final IllegalStateException stop =
+                assertThrows(IllegalStateException.class, () -> run.seedOnly(memberId, List.of(deadPeer)));
+            assertTrue(stop.getMessage().contains(PeerSeed.MAX_COPY_FAILURES + " rounds"), stop.getMessage());
         }
     }
 }

@@ -2,19 +2,26 @@ package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.Relayed;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -38,8 +45,11 @@ class RetainedFileTest {
     private static final int PAYLOAD_BYTES = 4 * 1024;
     private static final int BLOCKS = 12;
     private static final int RECORDS_PER_BLOCK = 4;
-    /** The offset of the head position in a section: marker, two floors, the count and the front. */
-    private static final int SECTION_HEAD_OFFSET = Integer.BYTES + 4 * Long.BYTES;
+    /** The offset of the head position in a section: two floors, the count and the front. */
+    private static final int SECTION_HEAD_OFFSET = 4 * Long.BYTES;
+    /** The floors at the restore point; a retained-file section brings its own. */
+    private static final RetainedFrames.Floors RESTORE_POINT = new RetainedFrames.Floors(99, 99);
+    private static final String TOKEN = "t";
 
     @TempDir
     Path dir;
@@ -100,7 +110,7 @@ class RetainedFileTest {
 
     private List<Path> segmentFiles() throws IOException {
         try (Stream<Path> paths = Files.list(dir)) {
-            return paths.filter(p -> RetainedFile.SEGMENT_NAME.matcher(p.getFileName().toString()).matches())
+            return paths.filter(p -> SegmentDir.SEGMENT_NAME.matcher(p.getFileName().toString()).matches())
                 .sorted().toList();
         }
     }
@@ -109,9 +119,8 @@ class RetainedFileTest {
         return ByteBuffer.wrap(section).getLong(SECTION_HEAD_OFFSET);
     }
 
-    /** The section after its marker, as {@link SealerEgress#readSnapshot} hands it over. */
-    private static ByteBuffer afterMarker(final byte[] section) {
-        return ByteBuffer.wrap(section).position(Integer.BYTES);
+    private static RetainedFrames.Floors restore(final RetainedFile file, final byte[] section) {
+        return file.restore(ByteBuffer.wrap(section), RESTORE_POINT);
     }
 
     @Test
@@ -150,10 +159,10 @@ class RetainedFileTest {
         before.close();
 
         final RetainedFile restored = open(dir, SEGMENT_BYTES);
-        assertEquals(new RetainedFrames.Floors(0, 1), restored.restore(afterMarker(section)));
+        assertEquals(new RetainedFrames.Floors(0, 1), restore(restored, section));
         final long snapshotHead = head(section);
         final Path last = segmentFiles().get(segmentFiles().size() - 1);
-        final long lastStart = Long.parseLong(RetainedFile.SEGMENT_NAME.matcher(last.getFileName().toString())
+        final long lastStart = Long.parseLong(SegmentDir.SEGMENT_NAME.matcher(last.getFileName().toString())
             .results().findFirst().orElseThrow().group(1));
         assertTrue(lastStart < snapshotHead, "no segment starts at or above the head");
         final byte[] tail = Files.readAllBytes(last);
@@ -179,7 +188,7 @@ class RetainedFileTest {
         Files.delete(segmentFiles().get(1));
 
         final RetainedFile restored = open(dir, SEGMENT_BYTES);
-        assertThrows(AgentTerminationException.class, () -> restored.restore(afterMarker(section)));
+        assertThrows(AgentTerminationException.class, () -> restore(restored, section));
     }
 
     @Test
@@ -267,5 +276,72 @@ class RetainedFileTest {
         assertThrows(IllegalArgumentException.class, () -> RetainedFile.Config.parse(
             "true", Integer.toString(RetainedFile.Config.MIN_SEGMENT_BYTES - 1), clusterDir));
         assertThrows(IllegalArgumentException.class, () -> RetainedFile.Config.parse("true", "64m", clusterDir));
+    }
+
+    @Test
+    void a_restore_stops_the_member_when_the_file_ends_below_the_head() throws IOException {
+        final RetainedFile before = openFresh();
+        blocks(before, 1, BLOCKS + 1);
+        final byte[] section = before.writeSnapshot(0, 1);
+        before.close();
+        // A copy from a peer behind the snapshot holds the zeros of the preallocation below the head.
+        final Path last = segmentFiles().get(segmentFiles().size() - 1);
+        final long lastStart = Long.parseLong(SegmentDir.SEGMENT_NAME.matcher(last.getFileName().toString())
+            .results().findFirst().orElseThrow().group(1));
+        try (FileChannel channel = FileChannel.open(last, StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.allocate(PAYLOAD_BYTES), head(section) - lastStart - PAYLOAD_BYTES);
+        }
+
+        final RetainedFile restored = open(dir, SEGMENT_BYTES);
+        assertThrows(AgentTerminationException.class, () -> restore(restored, section));
+    }
+
+    /** A sealer snapshot payload of {@code version}: the magic and the version, then the retained section. */
+    private static byte[] snapshotOf(final int version, final byte[] section) {
+        return ByteBuffer.allocate(2 * Integer.BYTES + section.length)
+            .putInt(0x4B53_4541).putInt(version).put(section).array();
+    }
+
+    @Test
+    void a_seed_copy_passes_only_when_it_holds_the_snapshot() throws IOException {
+        final Path source = dir.resolve("source");
+        final RetainedFile peer = open(source, SEGMENT_BYTES);
+        peer.clear();
+        blocks(peer, 1, BLOCKS + 1);
+        final byte[] snapshot = snapshotOf(CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION,
+            peer.writeSnapshot(0, 1));
+        final long head = peer.publishedHead();
+        final RetainedCopy copy = new RetainedCopy(List.of(), new SegmentDir(dir.resolve("into")), TOKEN, 1);
+
+        assertTrue(copyFrom(source, head, copy, snapshot), "a peer at the snapshot head serves a whole copy");
+        assertFalse(copyFrom(source, head - 1, copy, snapshot), "a peer behind the snapshot fails the walk");
+        assertFalse(copyFrom(source, head, copy, snapshotOf(10, new byte[Integer.BYTES])),
+            "a snapshot without a retained file fails");
+    }
+
+    /** Serve the file in {@code source} below {@code head}, and run {@code copy} against it. */
+    private static boolean copyFrom(final Path source, final long head, final RetainedCopy copy, final byte[] snapshot)
+            throws IOException {
+        final RetainedEndpoint endpoint = RetainedEndpoint.start(new SegmentDir(source), () -> head, TOKEN);
+        final MemberStatus status = new MemberStatus(0, MemberStatus.ROLE_LEADER, MemberStatus.ELECTION_CLOSED,
+            0, 0, MemberStatus.SnapshotVersions.of(0), OptionalLong.empty());
+        try (AdminServer admin = AdminServer.start(0, () -> status, 0, Optional.of(endpoint))) {
+            final URI peer = URI.create("http://127.0.0.1:" + admin.port());
+            return new RetainedCopy(List.of(peer), copy.into(), TOKEN, 1).run(snapshot);
+        }
+    }
+
+    @Test
+    void the_carried_bytes_need_the_admin_port_the_token_and_the_snapshots() {
+        final Path clusterDir = Path.of("/opt/kardamom/cluster");
+        assertTrue(new CarryBytes.Inputs(null, null, null, clusterDir, 0, 0).parse().isEmpty());
+        assertEquals("t", new CarryBytes.Inputs("true", null, " t ", clusterDir, 40205, 300).parse()
+            .orElseThrow().token());
+        assertThrows(IllegalArgumentException.class,
+            () -> new CarryBytes.Inputs("true", null, "t", clusterDir, 0, 300).parse());
+        assertThrows(IllegalArgumentException.class,
+            () -> new CarryBytes.Inputs("true", null, " ", clusterDir, 40205, 300).parse());
+        assertThrows(IllegalArgumentException.class,
+            () -> new CarryBytes.Inputs("true", null, "t", clusterDir, 40205, 0).parse());
     }
 }

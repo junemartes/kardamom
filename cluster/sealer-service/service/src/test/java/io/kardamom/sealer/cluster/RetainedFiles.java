@@ -57,7 +57,7 @@ final class RetainedFiles {
     /** The segment files of {@code dir}, by start position. */
     static TreeMap<Long, Path> segments(final Path dir) {
         try (Stream<Path> paths = Files.list(dir)) {
-            return paths.map(p -> RetainedFile.SEGMENT_NAME.matcher(p.getFileName().toString()))
+            return paths.map(p -> SegmentDir.SEGMENT_NAME.matcher(p.getFileName().toString()))
                 .filter(Matcher::matches)
                 .collect(Collectors.toMap(m -> Long.parseLong(m.group(1)), m -> dir.resolve(m.group()),
                     (a, b) -> a, TreeMap::new));

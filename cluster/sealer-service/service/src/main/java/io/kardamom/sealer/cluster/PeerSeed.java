@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.ChannelUri;
 import io.aeron.CommonContext;
+import io.aeron.Image;
+import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ClusterBackup;
 import io.aeron.cluster.ClusterBackup.Configuration.ReplayStart;
@@ -9,6 +11,7 @@ import io.aeron.cluster.ClusterBackupMediaDriver;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
+import org.agrona.concurrent.YieldingIdleStrategy;
 import org.agrona.concurrent.status.AtomicCounter;
 
 /**
@@ -32,8 +35,10 @@ import org.agrona.concurrent.status.AtomicCounter;
  * catches up from there. A longer copy only shortens that catch-up.</p>
  *
  * <p>A member with a retained file also copies the segment files from a
- * peer ({@link RetainedCopy}). A round in which no peer serves them ends
- * with no result, like a round with no backup.</p>
+ * peer ({@link RetainedCopy}), and checks the copy against the backed-up
+ * snapshot with {@link RetainedWalk}. A round in which no peer serves a
+ * copy that passes ends with no result, like a round with no backup. After
+ * {@link #MAX_COPY_FAILURES} such rounds, the seed stops the start.</p>
  *
  * <p>A round in which no peer answers ends after the peer timeout, and the
  * next round starts after a backoff. The seed has no other exit: a blank
@@ -43,6 +48,10 @@ final class PeerSeed {
 
     /** How often a round samples the backup state. */
     private static final long POLL_MS = 100;
+    /** The rounds whose retained-file copy fails before the seed stops the start. */
+    static final int MAX_COPY_FAILURES = 5;
+    private static final String REPLAY_CHANNEL = "aeron:ipc";
+    private static final int REPLAY_STREAM_ID = 1_956;
     /** The wait of the backup after a peer refuses it, before it asks the next peer. */
     private static final long COOL_DOWN_NS = TimeUnit.SECONDS.toNanos(1);
 
@@ -70,10 +79,8 @@ final class PeerSeed {
     private final Timing timing;
     /** The copy of the retained file, or empty when the member keeps the frames on the heap. */
     private final Optional<RetainedCopy> retainedCopy;
-
-    PeerSeed(final int memberId, final String peers, final MemberContexts contexts, final Timing timing) {
-        this(memberId, peers, contexts, timing, Optional.empty());
-    }
+    /** The rounds whose retained-file copy failed. */
+    private int copyFailures;
 
     PeerSeed(
             final int memberId,
@@ -110,7 +117,7 @@ final class PeerSeed {
         clusterDir.clear();
         archiveDir.clear();
         final Round result = backUp();
-        if (result.outcome() == SeedWatch.Outcome.SEEDED && retainedCopy.map(RetainedCopy::run).orElse(true)) {
+        if (result.outcome() == SeedWatch.Outcome.SEEDED && copiedRetained(result)) {
             clusterDir.dropMarkFiles();
             archiveDir.dropMarkFiles();
             return true;
@@ -124,15 +131,72 @@ final class PeerSeed {
         return false;
     }
 
-    /** The end of one round: its outcome and the last backup state it sampled. */
-    private record Round(SeedWatch.Outcome outcome, ClusterBackup.State lastState) {
+    /**
+     * Whether the retained file is in place: the member keeps no file, the
+     * cluster has no snapshot yet, or a peer served a copy that matches the
+     * backed-up snapshot. Stop the start after {@link #MAX_COPY_FAILURES}
+     * failed copies.
+     */
+    private boolean copiedRetained(final Round result) {
+        final boolean copied = retainedCopy
+            .map(copy -> result.snapshot().map(copy::run).orElse(true))
+            .orElse(true);
+        if (!copied) {
+            copyFailures++;
+            System.out.println("cluster SEED retained-copy MISMATCH memberId=" + memberId
+                + " failures=" + copyFailures + "/" + MAX_COPY_FAILURES
+                + " — no peer served a retained file that matches the backed-up snapshot");
+            if (copyFailures >= MAX_COPY_FAILURES) {
+                final String why = "no peer serves a retained file that matches its snapshot after "
+                    + copyFailures + " rounds";
+                System.out.println("cluster SEED retained-copy GAVE-UP memberId=" + memberId + " — " + why);
+                throw new IllegalStateException(why);
+            }
+        }
+        return copied;
+    }
+
+    /**
+     * The end of one round: its outcome, the last backup state it sampled,
+     * and the payload of the backed-up sealer snapshot when the member
+     * needs it for the retained-file check.
+     */
+    private record Round(SeedWatch.Outcome outcome, ClusterBackup.State lastState, Optional<byte[]> snapshot) {
     }
 
     private Round backUp() {
         try (ClusterBackupMediaDriver backup = ClusterBackupMediaDriver.launch(
                 contexts.driver(), contexts.archive(), backupContext())) {
-            return await(backup.clusterBackup().context().stateCounter());
+            final Round round = await(backup.clusterBackup().context().stateCounter());
+            final boolean wanted = round.outcome() == SeedWatch.Outcome.SEEDED && retainedCopy.isPresent();
+            return new Round(round.outcome(), round.lastState(),
+                wanted ? clusterDir.latestServiceSnapshotRecording().map(this::readSnapshot) : Optional.empty());
         }
+    }
+
+    /** The payload of the sealer snapshot in {@code recordingId}, replayed from the archive of the backup. */
+    private byte[] readSnapshot(final long recordingId) {
+        try (AeronArchive archive = AeronArchive.connect(contexts.localArchiveClient())) {
+            final int sessionId = (int) archive.startReplay(
+                recordingId, 0L, AeronArchive.NULL_LENGTH, REPLAY_CHANNEL, REPLAY_STREAM_ID);
+            try (Subscription subscription = archive.context().aeron().addSubscription(
+                    ChannelUri.addSessionId(REPLAY_CHANNEL, sessionId), REPLAY_STREAM_ID)) {
+                return SnapshotIo.readServicePayload(awaitImage(subscription, sessionId), YieldingIdleStrategy.INSTANCE);
+            }
+        }
+    }
+
+    private static Image awaitImage(final Subscription subscription, final int sessionId) {
+        Image image = subscription.imageBySessionId(sessionId);
+        while (image == null) {
+            image = nextImage(subscription, sessionId);
+        }
+        return image;
+    }
+
+    private static Image nextImage(final Subscription subscription, final int sessionId) {
+        Thread.onSpinWait();
+        return subscription.imageBySessionId(sessionId);
     }
 
     private Round await(final AtomicCounter stateCounter) {
@@ -146,7 +210,7 @@ final class PeerSeed {
 
     private static Round sample(final SeedWatch watch, final AtomicCounter stateCounter) {
         final ClusterBackup.State state = ClusterBackup.State.get(stateCounter);
-        return new Round(watch.observe(state, System.currentTimeMillis()), state);
+        return new Round(watch.observe(state, System.currentTimeMillis()), state, Optional.empty());
     }
 
     private ClusterBackup.Context backupContext() {

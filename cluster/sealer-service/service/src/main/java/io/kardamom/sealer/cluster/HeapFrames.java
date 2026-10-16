@@ -4,6 +4,7 @@ import io.kardamom.sealer.ClusterStatus;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -75,14 +76,37 @@ final class HeapFrames implements RetainedFrames {
     }
 
     /**
-     * The heap cannot hold a retained file: its frames are on the disk of
-     * the member that wrote the snapshot. The member stops, so it never
-     * serves a partial retention.
+     * Read the frames of a heap section, and move the floors down to the
+     * oldest of them. A section-less snapshot (a version before 8) keeps
+     * the floors at the restore point.
      */
     @Override
-    public Floors restore(final ByteBuffer section) {
-        throw new IllegalStateException("the snapshot holds a retained file, and this member keeps the retained"
-            + " frames on the heap; start every member with kardamom.cluster.carryBytes=true");
+    public Floors restore(final ByteBuffer section, final Floors restorePoint) {
+        final int count = section.hasRemaining() ? section.getInt() : 0;
+        return IntStream.range(0, count)
+            .mapToObj(i -> restoreFrame(section))
+            .reduce(restorePoint, HeapFrames::lower, HeapFrames::lowerBoth);
+    }
+
+    /** Read one frame, {@code boundary(1) | key(8) | len(4) | frame}, retain it, and return its key. */
+    private FrameKey restoreFrame(final ByteBuffer section) {
+        section.position(section.position() + Byte.BYTES + Long.BYTES);
+        final byte[] bytes = new byte[section.getInt()];
+        section.get(bytes);
+        final FrameKey key = FrameKey.of(new UnsafeBuffer(bytes));
+        frames.addLast(new Frame(bytes, key));
+        return key;
+    }
+
+    /** The floors moved down to {@code key}, on its axis. */
+    private static Floors lower(final Floors floors, final FrameKey key) {
+        return key.boundary()
+            ? new Floors(floors.index(), Math.min(floors.block(), key.key()))
+            : new Floors(Math.min(floors.index(), key.key()), floors.block());
+    }
+
+    private static Floors lowerBoth(final Floors a, final Floors b) {
+        return new Floors(Math.min(a.index(), b.index()), Math.min(a.block(), b.block()));
     }
 
     @Override
@@ -93,6 +117,11 @@ final class HeapFrames implements RetainedFrames {
     @Override
     public int status(final EgressFrames codec, final ClusterStatus status, final long postedHead) {
         return codec.status(status);
+    }
+
+    @Override
+    public long publishedHead() {
+        return 0;
     }
 
     @Override

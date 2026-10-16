@@ -131,7 +131,7 @@ class RetainedFileClusterTest {
         // Overwrite every byte above the snapshot head, and add a segment far above it.
         final TreeMap<Long, Path> files = segments(retainedDir(followerId));
         files.forEach((start, path) -> garble(path, Math.max(0, aboveSnapshot - start)));
-        final Path stray = retainedDir(followerId).resolve(RetainedFile.segmentName(1L << 40));
+        final Path stray = retainedDir(followerId).resolve(SegmentDir.name(1L << 40));
         Files.write(stray, new byte[SEGMENT_BYTES]);
 
         final TestNode restarted = cluster.startStaticNode(followerId, false);

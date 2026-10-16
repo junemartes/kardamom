@@ -10,6 +10,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import org.agrona.IoUtil;
 
 /**
  * The helper thread of the retained file. It creates the next segment file,
@@ -77,9 +78,21 @@ final class SegmentPreallocator {
             .map(p -> ((Failed) p).cause());
     }
 
-    /** Stop the helper thread. A file that it prepared stays on disk, and the next helper writes over it. */
+    /**
+     * Stop the helper thread, wait for it, and unmap a segment that waits in
+     * the queue. The file of that segment stays on disk, and the next helper
+     * writes over it. A second call does nothing more.
+     */
     void close() {
         thread.interrupt();
+        try {
+            thread.join();
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        Optional.ofNullable(ready.poll())
+            .filter(Ready.class::isInstance)
+            .ifPresent(p -> IoUtil.unmap(((Ready) p).buffer()));
     }
 
     private void run() {

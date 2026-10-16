@@ -13,11 +13,9 @@ import java.util.EnumMap;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.collections.LongHashSet;
-import org.agrona.concurrent.UnsafeBuffer;
 
 /**
  * The egress layer of {@link SealerClusteredService}.
@@ -503,42 +501,20 @@ final class SealerEgress {
     }
 
     /**
-     * Open the retention from the section a snapshot carries, and set the
-     * floors. A retained-file section holds its floors. A heap section
-     * holds its frames: the floors move down to the oldest of them, and the
-     * frames go into the store, a file too. A snapshot without a retention
-     * section (a version before 8) opens an empty store and leaves the
-     * floors at the restore point, where the constructor put them.
+     * Restore the retention from the section that a snapshot carries, and
+     * set the floors. The floors start at the restore point, where the
+     * constructor put them.
      */
-    void readSnapshot(final ByteBuffer buf) {
-        final int count = buf.hasRemaining() ? buf.getInt() : 0;
-        if (count == RetainedFile.SECTION_MARKER) {
-            final RetainedFrames.Floors floors = retained.restore(buf);
-            firstRetainedIndex = floors.index();
-            firstRetainedBlock = floors.block();
-            return;
-        }
-        retained.clear();
-        IntStream.range(0, count).forEach(i -> retainHeapFrame(buf));
+    void restore(final ByteBuffer section) {
+        final RetainedFrames.Floors floors =
+            retained.restore(section, new RetainedFrames.Floors(firstRetainedIndex, firstRetainedBlock));
+        firstRetainedIndex = floors.index();
+        firstRetainedBlock = floors.block();
     }
 
-    /**
-     * Read one frame of a heap section, {@code boundary(1) | key(8) |
-     * len(4) | frame}, retain it, and move the floor of its axis down to it.
-     * The frame bytes carry the boundary flag and the key too.
-     */
-    private void retainHeapFrame(final ByteBuffer buf) {
-        buf.position(buf.position() + Byte.BYTES + Long.BYTES);
-        final byte[] frame = new byte[buf.getInt()];
-        buf.get(frame);
-        final UnsafeBuffer staged = new UnsafeBuffer(frame);
-        retained.append(staged, frame.length);
-        final FrameKey key = FrameKey.of(staged);
-        if (key.boundary()) {
-            firstRetainedBlock = Math.min(firstRetainedBlock, key.key());
-        } else {
-            firstRetainedIndex = Math.min(firstRetainedIndex, key.key());
-        }
+    /** Open an empty retention: a start at genesis or from a seed. */
+    void openEmpty() {
+        retained.clear();
     }
 
     void offerRelayed(final Relayed relayed) {

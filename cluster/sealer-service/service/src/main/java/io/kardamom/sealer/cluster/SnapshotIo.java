@@ -2,8 +2,15 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
+import io.aeron.ImageControlledFragmentAssembler;
 import io.aeron.ImageFragmentAssembler;
 import io.aeron.Publication;
+import io.aeron.cluster.codecs.MessageHeaderDecoder;
+import io.aeron.cluster.codecs.SnapshotMark;
+import io.aeron.cluster.codecs.SnapshotMarkerDecoder;
+import io.aeron.logbuffer.ControlledFragmentHandler;
+import io.aeron.logbuffer.Header;
+import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -53,6 +60,49 @@ final class SnapshotIo {
         final byte[] snapshot = new byte[size[0]];
         assembled.getBytes(0, snapshot);
         return snapshot;
+    }
+
+    /**
+     * The payload of a sealer snapshot replayed from the archive. The
+     * service container writes its begin marker, the client sessions and its
+     * end marker before the payload of the service, so this method skips
+     * every message up to the end marker, as the container does on a
+     * restore, and then reads the payload to the end of the stream.
+     */
+    static byte[] readServicePayload(final Image snapshotImage, final IdleStrategy idleStrategy) {
+        final ContainerMessages container = new ContainerMessages();
+        final ImageControlledFragmentAssembler assembler = new ImageControlledFragmentAssembler(container::onFragment);
+        while (!container.ended) {
+            pollContainer(snapshotImage, assembler, idleStrategy);
+        }
+        return readSnapshot(snapshotImage, idleStrategy);
+    }
+
+    private static void pollContainer(
+            final Image snapshotImage, final ImageControlledFragmentAssembler assembler, final IdleStrategy idleStrategy) {
+        if (snapshotImage.controlledPoll(assembler, 1) == 0) {
+            if (snapshotImage.isClosed() || snapshotImage.isEndOfStream()) {
+                throw new IllegalStateException("snapshot image ended before the end marker of the container");
+            }
+            idleStrategy.idle();
+        }
+    }
+
+    /** The messages of the service container in front of the payload of the service. */
+    private static final class ContainerMessages {
+        private final MessageHeaderDecoder header = new MessageHeaderDecoder();
+        private final SnapshotMarkerDecoder marker = new SnapshotMarkerDecoder();
+        private boolean ended;
+
+        ControlledFragmentHandler.Action onFragment(
+                final DirectBuffer buffer, final int offset, final int length, final Header fragmentHeader) {
+            header.wrap(buffer, offset);
+            ended = header.schemaId() == MessageHeaderDecoder.SCHEMA_ID
+                && header.templateId() == SnapshotMarkerDecoder.TEMPLATE_ID
+                && marker.wrap(buffer, offset + MessageHeaderDecoder.ENCODED_LENGTH, header.blockLength(),
+                    header.version()).mark() == SnapshotMark.END;
+            return ended ? ControlledFragmentHandler.Action.BREAK : ControlledFragmentHandler.Action.CONTINUE;
+        }
     }
 
     /**
