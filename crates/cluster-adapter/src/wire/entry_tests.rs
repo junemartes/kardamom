@@ -237,12 +237,12 @@ fn the_frames_of_today_still_decode() {
 }
 
 #[test]
-fn a_partial_byte_tail_or_a_short_reference_is_too_short() {
+fn a_partial_byte_tail_is_ignored_and_a_short_reference_is_too_short() {
     let status = golden_frame("status_75");
-    assert!(matches!(
-        EgressItem::decode(&status[..STATUS_WITH_RECORD_LAG_LEN + 3]),
-        Err(WireError::TooShort { .. })
-    ));
+    assert_eq!(
+        EgressItem::decode(&status[..STATUS_WITH_RECORD_LAG_LEN + 3]).unwrap(),
+        EgressItem::Status(Fixture::status(None))
+    );
     let relayed_ref = golden_frame("relayed_ref");
     assert!(matches!(
         EgressItem::decode(&relayed_ref[..RELAYED_REF_LEN - 1]),
