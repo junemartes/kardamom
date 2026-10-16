@@ -44,8 +44,7 @@ class SealerSnapshotStallClusterTest {
     private static final long SNAPSHOT_PAUSE_MS = 3_000L;
     /** A gap between two frames this long is a stall: 15 ticks, half the snapshot pause. */
     private static final long STALL_NS = TimeUnit.MILLISECONDS.toNanos(SNAPSHOT_PAUSE_MS / 2);
-    /** The offset of the {@code snapshot_follows} byte in a status frame. */
-    private static final int SNAPSHOT_FOLLOWS_OFFSET = 67;
+    private static final int SNAPSHOT_FOLLOWS_OFFSET = SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET;
 
     @RegisterExtension
     final SystemTestWatcher systemTestWatcher = new SystemTestWatcher();

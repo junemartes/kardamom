@@ -39,8 +39,13 @@ impl Refusal {
         }
     }
 
-    /// Whether a paused ingress refused the submit. The ingress refuses
-    /// before it forwards, so the same transaction can go again.
+    /// Whether the ingress refused the submit as chain halted. A paused
+    /// ingress refuses before it forwards. The ingress also answers this
+    /// code after a forward, when the sealer refuses the record on its
+    /// `da_lag` or `record_lag` guard. A refused record is not ordered,
+    /// so its nonce stays open in both cases. The retry sends the same
+    /// signed transaction: it has the same hash, so a copy that did land
+    /// is a duplicate that the dedup drops, not a second transaction.
     pub(super) fn is_paused(&self) -> bool {
         self.code == Some(CHAIN_HALTED_CODE)
     }

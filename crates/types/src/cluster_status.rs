@@ -1,7 +1,7 @@
 //! The chain's data-availability status, as the sealer fans it out to every
 //! cluster session.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a cluster session may see no frame before its holder calls
 /// the sealer halted on a lost quorum. The sealer sends a boundary and a
@@ -66,16 +66,68 @@ impl ClusterStatus {
     pub fn lag(&self) -> u64 {
         self.sealed_head.saturating_sub(self.posted_head)
     }
+}
 
-    /// How long the session may see no frame after this status:
-    /// [`SNAPSHOT_SILENCE`] when a snapshot follows, else
-    /// [`SEALER_SILENCE`].
+/// The silence check of one cluster session: how long the session may see
+/// no frame, and since when it sees none.
+///
+/// A status or a boundary restarts the silence. A status with the
+/// snapshot notice starts a snapshot: the budget is [`SNAPSHOT_SILENCE`]
+/// until the next boundary or the next status without the notice. Other
+/// frames do not change the check: the leader can send a relayed record
+/// after the notice, before the snapshot stops it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SilenceDeadline {
+    since: Instant,
+    snapshot: bool,
+}
+
+impl SilenceDeadline {
+    /// A check whose silence starts at `now`, with the normal budget.
     #[must_use]
-    pub fn silence_budget(&self) -> Duration {
-        if self.snapshot_follows {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            snapshot: false,
+        }
+    }
+
+    /// A status frame arrived at `now`.
+    pub fn on_status(&mut self, status: &ClusterStatus, now: Instant) {
+        self.since = now;
+        self.snapshot = status.snapshot_follows;
+    }
+
+    /// A boundary frame arrived at `now`. A snapshot is complete.
+    pub fn on_boundary(&mut self, now: Instant) {
+        self.since = now;
+        self.snapshot = false;
+    }
+
+    /// How long the session may see no frame: [`SNAPSHOT_SILENCE`] in a
+    /// snapshot, else [`SEALER_SILENCE`].
+    #[must_use]
+    pub fn budget(&self) -> Duration {
+        if self.snapshot {
             SNAPSHOT_SILENCE
         } else {
             SEALER_SILENCE
         }
     }
+
+    /// The silence at `now` when it reached the budget, else `None`.
+    #[must_use]
+    pub fn expired(&self, now: Instant) -> Option<Duration> {
+        Some(now.saturating_duration_since(self.since)).filter(|silent| *silent >= self.budget())
+    }
+
+    /// Whether a snapshot that a notice announced covers `now`.
+    #[must_use]
+    pub fn in_snapshot(&self, now: Instant) -> bool {
+        self.snapshot && self.expired(now).is_none()
+    }
 }
+
+#[cfg(test)]
+#[path = "cluster_status_tests.rs"]
+mod tests;

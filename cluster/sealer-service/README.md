@@ -545,6 +545,16 @@ The chaos suite and operators read these lines. The sealer has no other observab
   - After the notice, the ingress, the sequencer and the session watchdog of each client wait 60 s (`SNAPSHOT_SILENCE`), not 10 s, for the next frame. A stall past 60 s is still a lost quorum.
   - A snapshot that an operator asks for with `ClusterTool` carries no notice.
 
+### Manual snapshot
+
+A manual snapshot (`ClusterTool <cluster dir> snapshot` on the leader) sends no snapshot notice. The clients keep the 10 s budget. On a loaded disk the stall can pass 10 s, and then:
+
+- each ingress halts with `sealer_no_quorum` and pauses submits,
+- each sequencer pauses,
+- each session watchdog forces a reconnect.
+
+The halt clears by itself at the next status frame. To avoid it, do not ask for a manual snapshot while the disk is loaded. Let the periodic snapshot take it, or set `snapshotIntervalS` lower for a while. Before a manual snapshot, tell the operators of the clients that a short `sealer_no_quorum` halt can come.
+
 ## Build and test
 
 Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on first run.

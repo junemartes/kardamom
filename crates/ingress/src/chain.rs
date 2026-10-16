@@ -22,6 +22,7 @@ use kardamom_obs::halt::{Halt, HaltCause, HaltRef, Record};
 use kardamom_obs::lifecycle::{Lifecycle, Slots, process};
 use kardamom_types::ClusterStatus;
 use kardamom_types::cluster_status::RecordLagStatus;
+use kardamom_types::cluster_status::SilenceDeadline;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -56,10 +57,10 @@ pub(crate) struct ChainWatch {
     status: watch::Receiver<ClusterStatus>,
     board: watch::Receiver<BoardView>,
     sealer: SealerLifecycle,
-    /// When the last status frame arrived, and how long the next one may
-    /// take. `None` until the first one: an ingress without a cluster
-    /// session never calls the sealer silent.
-    last_status: Option<(Instant, Duration)>,
+    /// The silence since the last status frame. `None` until the first
+    /// one: an ingress without a cluster session never calls the sealer
+    /// silent.
+    silence: Option<SilenceDeadline>,
 }
 
 impl ChainWatch {
@@ -72,7 +73,7 @@ impl ChainWatch {
             status,
             board,
             sealer,
-            last_status: None,
+            silence: None,
         }
     }
 
@@ -106,7 +107,10 @@ impl ChainWatch {
     /// `record_lag` or `da_lag` halt. Any status frame proves the quorum,
     /// so it also ends a `sealer_no_quorum` halt.
     fn on_status(&mut self, status: &ClusterStatus, now: Instant) {
-        self.last_status = Some((now, status.silence_budget()));
+        let now = now.into_std();
+        self.silence
+            .get_or_insert(SilenceDeadline::new(now))
+            .on_status(status, now);
         crate::metrics::record_cluster_status(status);
         match Self::status_halt(status) {
             Some(halt) => self.sealer.raise(halt),
@@ -159,10 +163,8 @@ impl ChainWatch {
     /// arrived for the budget of the last one.
     fn check_silence(&self, now: Instant) {
         let Some(silent) = self
-            .last_status
-            .map(|(at, budget)| (now.saturating_duration_since(at), budget))
-            .filter(|(silent, budget)| silent >= budget)
-            .map(|(silent, _)| silent)
+            .silence
+            .and_then(|silence| silence.expired(now.into_std()))
         else {
             return;
         };

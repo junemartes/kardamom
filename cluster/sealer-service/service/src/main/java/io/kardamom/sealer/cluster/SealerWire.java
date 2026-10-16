@@ -305,6 +305,10 @@ public final class SealerWire {
      * itself.
      */
     public static final byte EGRESS_KIND_STATUS = 9;
+    /** Offset of the {@code snapshot_follows} byte in an {@link #EGRESS_KIND_STATUS} frame. */
+    public static final int STATUS_SNAPSHOT_FLAG_OFFSET = 67;
+    /** Length of an {@link #EGRESS_KIND_STATUS} frame with the snapshot tail. */
+    public static final int STATUS_WITH_SNAPSHOT_FLAG_LEN = STATUS_SNAPSHOT_FLAG_OFFSET + 1;
     /**
      * The DA-lag guard refused a user record:
      * {@code [kind:10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]}.

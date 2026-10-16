@@ -2,17 +2,15 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.service.Cluster;
-import java.util.Optional;
-import org.agrona.concurrent.status.AtomicCounter;
 
 /**
  * The snapshot requests of the service, and the stall that each snapshot
  * causes.
  *
- * <p>Only the consensus module of the leader reads its control toggle. A
- * follower never sets its toggle: the toggle stays set, and the module
- * takes it when the member leads later. The snapshot action then goes
- * through the log to every member.</p>
+ * <p>Only the consensus module of the leader reads its control toggle, so
+ * only the leader sets it. A follower's toggle does nothing: its module
+ * does not read the toggle, and an election clears it. The snapshot action
+ * goes through the log to every member.</p>
  *
  * <p>The consensus module fires no timer while it takes a snapshot. So the
  * first timer after a snapshot ends the stall, and the stall starts at the
@@ -33,18 +31,24 @@ final class SnapshotRequests {
         this.memberId = memberId;
     }
 
-    /**
-     * Ask the consensus module of this member for a snapshot when this
-     * member leads. The value tells whether the toggle took the request; a
-     * toggle that holds another request refuses it. Empty on a follower.
-     */
-    Optional<Boolean> request() {
+    /** The answer to a snapshot request. */
+    enum Answer {
+        /** The leader's toggle took the request. */
+        REQUESTED,
+        /** The leader's toggle holds another request, so it refused this one. */
+        REFUSED,
+        /** This member does not lead, so it asks for nothing. */
+        FOLLOWER
+    }
+
+    /** Ask the consensus module of this member for a snapshot when this member leads. */
+    Answer request() {
         if (cluster.role() != Cluster.Role.LEADER) {
-            return Optional.empty();
+            return Answer.FOLLOWER;
         }
-        final AtomicCounter toggle = ClusterControl.findControlToggle(
-            cluster.aeron().countersReader(), cluster.context().clusterId());
-        return Optional.of(toggle != null && ClusterControl.ToggleState.SNAPSHOT.toggle(toggle));
+        final boolean taken = ClusterControl.ToggleState.SNAPSHOT.toggle(ClusterControl.findControlToggle(
+            cluster.aeron().countersReader(), cluster.context().clusterId()));
+        return taken ? Answer.REQUESTED : Answer.REFUSED;
     }
 
     /** A snapshot starts. The stall runs from {@code lastTickMs}, the cluster time of the last boundary tick. */

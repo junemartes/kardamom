@@ -4,7 +4,7 @@
 //! property that must hold.
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_types::cluster_status::{RecordLagStatus, SEALER_SILENCE, SNAPSHOT_SILENCE};
+use kardamom_types::cluster_status::RecordLagStatus;
 use kardamom_types::epoch::EpochRecord;
 use kardamom_types::xchain::{Callback, RemoteEpochRecord};
 use kardamom_types::{
@@ -306,7 +306,7 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
         snapshot_follows: false,
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), STATUS_WITH_SNAPSHOT_LEN);
+    assert_eq!(b.len(), STATUS_WITH_SNAPSHOT_FLAG_LEN);
     assert_eq!(b[0], 9, "kind 9 is the Java EGRESS_KIND_STATUS");
     assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 100);
     assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 160);
@@ -356,35 +356,47 @@ fn recorded_cursor_and_status_tail_layouts_are_pinned_byte_for_byte() {
     assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
 }
 
-/// The status before a snapshot carries the snapshot flag at offset 67.
-/// A frame of a sealer with no snapshot tail reads as no snapshot, and a
-/// tail that a later sealer adds after the flag is ignored.
+/// The status before a snapshot carries the snapshot flag at byte 67, so
+/// the frame is 68 bytes. A frame of a sealer with no snapshot tail (67
+/// bytes) reads as no snapshot. A later sealer adds `retained_bytes:u64` at
+/// bytes 68..76, and the 76-byte frame still reads the flag at byte 67.
 #[test]
-fn the_snapshot_flag_follows_the_record_lag_tail() {
+fn the_snapshot_flag_sits_at_byte_67() {
+    assert_eq!(STATUS_SNAPSHOT_FLAG_OFFSET, 67);
+    assert_eq!(STATUS_WITH_SNAPSHOT_FLAG_LEN, 68);
     let status = kardamom_types::ClusterStatus {
         sealed_head: 160,
         snapshot_follows: true,
         ..Default::default()
     };
     let b = encode_status(&status);
-    assert_eq!(b[67], 1, "the snapshot flag at offset 67");
+    assert_eq!(b.len(), 68);
+    assert_eq!(b[67], 1, "the snapshot flag at byte 67");
     assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
-    assert_eq!(status.silence_budget(), SNAPSHOT_SILENCE);
 
-    let EgressItem::Status(old) = EgressItem::decode(&b[..STATUS_WITH_RECORD_LAG_LEN]).unwrap()
-    else {
+    let EgressItem::Status(old) = EgressItem::decode(&b[..67]).unwrap() else {
         panic!("a status frame decodes as a status");
     };
     assert!(
         !old.snapshot_follows,
         "no snapshot tail reads as no snapshot"
     );
-    assert_eq!(old.silence_budget(), SEALER_SILENCE);
 
-    let longer = [b.as_slice(), &[0xAA; 8]].concat();
+    let retained_bytes = 0x0102_0304_0506_0708_u64.to_le_bytes();
+    let wide = [b.as_slice(), &retained_bytes].concat();
+    assert_eq!(wide.len(), 76);
     assert_eq!(
-        EgressItem::decode(&longer).unwrap(),
-        EgressItem::Status(status)
+        EgressItem::decode(&wide).unwrap(),
+        EgressItem::Status(status),
+        "the 76-byte frame reads the flag at byte 67 and ignores bytes 68..76"
+    );
+    let plain = [&b[..67], &[0], &retained_bytes].concat();
+    let EgressItem::Status(plain) = EgressItem::decode(&plain).unwrap() else {
+        panic!("a status frame decodes as a status");
+    };
+    assert!(
+        !plain.snapshot_follows,
+        "a 76-byte frame with byte 67 at 0 is no snapshot"
     );
 }
 

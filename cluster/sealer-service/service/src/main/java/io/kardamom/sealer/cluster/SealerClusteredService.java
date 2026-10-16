@@ -13,6 +13,7 @@ import io.kardamom.sealer.ClusterStatus;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.OrderingWindow;
 import io.kardamom.sealer.OriginOutcome;
+import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
@@ -678,8 +679,7 @@ public final class SealerClusteredService implements ClusteredService {
         if (outcome.advance.isEmpty()) {
             return; // Duplicate epoch from a racing sequencer.
         }
-        outcome.advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
-        egress.offerRelayed(outcome.advance.get().relayed());
+        offerAdvance(outcome.advance.get().forcedBoundary(), outcome.advance.get().relayed());
     }
 
     /**
@@ -761,8 +761,7 @@ public final class SealerClusteredService implements ClusteredService {
         if (outcome.advance.isEmpty()) {
             return; // duplicate batch from a racing watcher
         }
-        outcome.advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
-        egress.offerRelayed(outcome.advance.get().relayed());
+        offerAdvance(outcome.advance.get().forcedBoundary(), outcome.advance.get().relayed());
     }
 
     /**
@@ -969,8 +968,11 @@ public final class SealerClusteredService implements ClusteredService {
         }
         System.out.println("sealer seed CONFIRMED memberId=" + memberId + " block=" + state.blockNumber()
             + " canonicalCount=" + state.canonicalCount());
-        requestSnapshot().ifPresent(requested -> System.out.println(
-            "sealer seed SNAPSHOT memberId=" + memberId + " requested=" + requested));
+        final SnapshotRequests.Answer answer = requestSnapshot();
+        if (answer != SnapshotRequests.Answer.FOLLOWER) {
+            System.out.println("sealer seed SNAPSHOT memberId=" + memberId
+                + " requested=" + (answer == SnapshotRequests.Answer.REQUESTED));
+        }
     }
 
     /**
@@ -1108,7 +1110,8 @@ public final class SealerClusteredService implements ClusteredService {
         egress.offerBoundary(boundary);
         // The status rides every tick, so an observer sees the guard flip
         // and the retention stretch without waiting for a cursor record.
-        offerTickStatus();
+        egress.offerStatus(status());
+        requestSnapshotIfDue();
         boundaryTicks++;
         if (boundaryTicks % BOUNDARY_TICK_LOG_EVERY == 0) {
             // The proof that the boundary clock runs. A stall with a leader
@@ -1123,27 +1126,39 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Offer the status of a boundary tick. On a tick that the schedule
-     * makes due, the status carries the snapshot notice, and the leader
-     * asks for the snapshot.
+     * Offer the boundary that an origin record forces, if any, then the
+     * record. A forced boundary opens a block as a tick does, so it counts
+     * for the snapshot schedule. The request comes after the record, so the
+     * notice is the last status before the stall.
      */
-    private void offerTickStatus() {
+    private void offerAdvance(final Optional<Boundary> forcedBoundary, final Relayed relayed) {
+        forcedBoundary.ifPresent(egress::offerBoundary);
+        egress.offerRelayed(relayed);
+        forcedBoundary.ifPresent(boundary -> requestSnapshotIfDue());
+    }
+
+    /**
+     * Ask for a snapshot when the block that the last boundary opened is
+     * due. Call this after each boundary, of the timer or forced.
+     */
+    private void requestSnapshotIfDue() {
         if (snapshotSchedule.filter(schedule -> schedule.due(state.blockNumber())).isEmpty()) {
-            egress.offerStatus(status());
             return;
         }
-        requestSnapshot().ifPresent(requested -> System.out.println(
-            (requested ? "cluster SNAPSHOT requested" : "cluster SNAPSHOT attempt failed")
-                + " memberId=" + memberId + " block=" + state.blockNumber()));
+        final SnapshotRequests.Answer answer = requestSnapshot();
+        if (answer != SnapshotRequests.Answer.FOLLOWER) {
+            System.out.println((answer == SnapshotRequests.Answer.REQUESTED
+                    ? "cluster SNAPSHOT requested" : "cluster SNAPSHOT attempt failed")
+                + " memberId=" + memberId + " block=" + state.blockNumber());
+        }
     }
 
     /**
      * Send the status with the snapshot notice to every session, then ask
      * for a snapshot. The notice leaves before the consensus module stops,
      * so a client waits for the snapshot and does not call the sealer lost.
-     * The value is the answer of the leader's toggle; empty on a follower.
      */
-    private Optional<Boolean> requestSnapshot() {
+    private SnapshotRequests.Answer requestSnapshot() {
         egress.offerSnapshotNotice(status());
         return snapshots.request();
     }

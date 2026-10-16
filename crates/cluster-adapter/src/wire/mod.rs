@@ -247,7 +247,8 @@ pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
 /// ([`STATUS_LEN`] bytes), then the record-lag tail
 /// `[best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]`
 /// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the snapshot tail
-/// `[snapshot_follows:u8]` ([`STATUS_WITH_SNAPSHOT_LEN`] bytes in all).
+/// `[snapshot_follows:u8]` at [`STATUS_SNAPSHOT_FLAG_OFFSET`]
+/// ([`STATUS_WITH_SNAPSHOT_FLAG_LEN`] bytes in all).
 /// `best_recorded` is `u64::MAX` before the first recorded cursor. A frame
 /// with no record-lag tail decodes as no cursor and the guard off, and a
 /// frame with no snapshot tail as no snapshot. A reader ignores a tail it
@@ -259,8 +260,10 @@ pub const EGRESS_KIND_STATUS: u8 = 9;
 pub const STATUS_LEN: usize = 50;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the record-lag tail.
 pub const STATUS_WITH_RECORD_LAG_LEN: usize = STATUS_LEN + 8 + 8 + 1;
+/// Offset of the `snapshot_follows` byte in an [`EGRESS_KIND_STATUS`] frame.
+pub const STATUS_SNAPSHOT_FLAG_OFFSET: usize = STATUS_WITH_RECORD_LAG_LEN;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the snapshot tail.
-pub const STATUS_WITH_SNAPSHOT_LEN: usize = STATUS_WITH_RECORD_LAG_LEN + 1;
+pub const STATUS_WITH_SNAPSHOT_FLAG_LEN: usize = STATUS_SNAPSHOT_FLAG_OFFSET + 1;
 
 /// Egress kind: the DA-lag guard refused a record:
 /// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.
