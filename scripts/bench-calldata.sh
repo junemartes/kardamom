@@ -118,8 +118,12 @@ settle() {
     echo ">> the chain did not settle in 10 minutes" >&2
 }
 
+# A load with a value of 1 to 10^9 wei from the clock. Two loads then never sign
+# the same transaction, so a transaction of a cell that failed never
+# makes the sealer drop a transaction of a later cell as a duplicate.
 load() {
-    "$LOAD_BIN" --rpc "$rpc" --fixed-rate --target-tps "$1" --workload calldata \
+    local value=$((10#$(date +%N) + 1))
+    "$LOAD_BIN" --rpc "$rpc" --fixed-rate --target-tps "$1" --workload calldata --value "$value" \
         --calldata-bytes "$2" --senders "$SENDERS" --sender-offset 1 --nonce-start chain \
         --duration "$3" --scrape executor,ingress,sequencer --subscribe \
         --max-in-flight "$MAX_IN_FLIGHT" "${@:4}"
