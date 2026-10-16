@@ -69,8 +69,9 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # and sends neither. No frame uses kind 14: a reader drops it as unknown.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
-# fields at the tail, or 75 bytes with the retained bytes after them. This
-# release sends 67 bytes. A reader of either release reads every size: an
+# fields at the tail, 68 bytes with the snapshot flag after them, or 76
+# bytes with the retained bytes after the flag. This release sends 67
+# bytes. A reader of either release reads every size: an
 # old reader ignores a tail it does not know, and a new reader reads a
 # frame with no tail as the guard off and no retained bytes.
 [format.sealer-egress-kinds]

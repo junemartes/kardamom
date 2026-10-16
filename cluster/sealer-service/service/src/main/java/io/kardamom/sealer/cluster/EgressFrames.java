@@ -107,11 +107,16 @@ final class EgressFrames {
         return pos;
     }
 
-    /** {@link #status(ClusterStatus)}, then the byte tail {@code [retained_bytes:u64]}. */
+    /**
+     * {@link #status(ClusterStatus)}, then the flag byte
+     * {@code [snapshot_follows:u8]} as 0, then the byte tail
+     * {@code [retained_bytes:u64]}.
+     */
     int status(final ClusterStatus status, final long retainedBytes) {
         final int pos = status(status);
-        buf.putLong(pos, retainedBytes, ByteOrder.LITTLE_ENDIAN);
-        return pos + Long.BYTES;
+        buf.putByte(pos, (byte) 0);
+        buf.putLong(SealerWire.STATUS_RETAINED_BYTES_OFFSET, retainedBytes, ByteOrder.LITTLE_ENDIAN);
+        return SealerWire.STATUS_WITH_RETAINED_BYTES_LEN;
     }
 
     /** A copy of the first {@code length} bytes of the staging buffer. */

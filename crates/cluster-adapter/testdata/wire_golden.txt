@@ -8,7 +8,8 @@
 # tx_egress         egress kind 1, index 5, record type 6 (canonical entry)
 # relayed_ref       egress kind 15 for the entry at index 5
 # feed_gap          egress kind 16, next index 9, next block 4
-# status_75         egress kind 9 with the record-lag and the byte tails
+# status_76         egress kind 9 with the record-lag tail, the flag byte
+#                   (snapshot_follows, 0) and the byte tail
 # status_67         egress kind 9 with the record-lag tail only
 # txref_ingress     ingress kind 0, record type 0 (reference)
 # txref_egress      egress kind 1, index 5, record type 0
@@ -16,7 +17,7 @@ tx_offer_ingress 001111111111111111111111111111111111111111070000000000000092100
 tx_egress 0105000000000000007a000000abababababababababababababababababababababababababababababababab060302f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
 relayed_ref 0f0500000000000000abababababababababababababababababababababababababababababababab06
 feed_gap 1009000000000000000400000000000000
-status_75 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff0000000000000000000700100000000000
+status_76 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff000000000000000000000700100000000000
 status_67 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff000000000000000000
 txref_ingress 0011111111111111111111111111111111111111110700000000000000921000000000000002010000000000000000000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0003070000000f27000005000000
 txref_egress 0105000000000000002e000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0003070000000f27000005000000

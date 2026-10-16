@@ -8,6 +8,7 @@ import io.kardamom.sealer.RecordedCursors;
 import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.TxOffer;
 import java.io.IOException;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HexFormat;
@@ -73,8 +74,18 @@ final class WireGoldenTest {
     void theStatusFramesMatchWithAndWithoutTheByteTail() {
         assertArrayEquals(golden.get("status_67"), frames.copy(frames.status(status())));
         assertEquals(SealerWire.STATUS_WITH_RECORD_LAG_LEN, golden.get("status_67").length);
-        assertArrayEquals(golden.get("status_75"), frames.copy(frames.status(status(), RETAINED_BYTES)));
-        assertEquals(SealerWire.STATUS_WITH_RETAINED_BYTES_LEN, golden.get("status_75").length);
+        assertArrayEquals(golden.get("status_76"), frames.copy(frames.status(status(), RETAINED_BYTES)));
+        assertEquals(SealerWire.STATUS_WITH_RETAINED_BYTES_LEN, golden.get("status_76").length);
+    }
+
+    @Test
+    void theFlagByteSitsBetweenTheRecordLagTailAndTheByteTail() {
+        final UnsafeBuffer status = new UnsafeBuffer(golden.get("status_76"));
+        assertEquals(0, status.getByte(SealerWire.STATUS_WITH_RECORD_LAG_LEN));
+        assertEquals(RETAINED_BYTES,
+            status.getLong(SealerWire.STATUS_RETAINED_BYTES_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertEquals(68, SealerWire.STATUS_RETAINED_BYTES_OFFSET);
+        assertEquals(76, SealerWire.STATUS_WITH_RETAINED_BYTES_LEN);
     }
 
     @Test

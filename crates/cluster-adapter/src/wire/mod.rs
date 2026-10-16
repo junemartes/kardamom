@@ -254,8 +254,9 @@ pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
 /// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`
 /// ([`STATUS_LEN`] bytes), then the record-lag tail
 /// `[best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]`
-/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the byte tail
-/// `[retained_bytes:u64]` ([`STATUS_WITH_RETAINED_BYTES_LEN`] bytes in
+/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the flag byte
+/// `[snapshot_follows:u8]`, then the byte tail `[retained_bytes:u64]` at
+/// [`STATUS_RETAINED_BYTES_OFFSET`] ([`STATUS_WITH_RETAINED_BYTES_LEN`] bytes in
 /// all). `best_recorded` is `u64::MAX` before the first recorded cursor. A
 /// frame with no record-lag tail decodes as no cursor and the guard off. A
 /// frame with no byte tail decodes as no retained bytes. A reader ignores
@@ -268,7 +269,10 @@ pub const STATUS_LEN: usize = 50;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the record-lag tail.
 pub const STATUS_WITH_RECORD_LAG_LEN: usize = STATUS_LEN + 8 + 8 + 1;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the byte tail.
-pub const STATUS_WITH_RETAINED_BYTES_LEN: usize = STATUS_WITH_RECORD_LAG_LEN + 8;
+pub const STATUS_WITH_RETAINED_BYTES_LEN: usize = STATUS_RETAINED_BYTES_OFFSET + 8;
+/// Offset of the byte tail of an [`EGRESS_KIND_STATUS`] frame: after the
+/// record-lag tail and the flag byte.
+pub const STATUS_RETAINED_BYTES_OFFSET: usize = STATUS_WITH_RECORD_LAG_LEN + 1;
 
 /// Egress kind: the DA-lag guard refused a record:
 /// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.

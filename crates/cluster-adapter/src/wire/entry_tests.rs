@@ -123,7 +123,7 @@ impl Fixture {
             ),
             ("relayed_ref", Self::relayed_ref().encode()),
             ("feed_gap", encode_feed_gap(9, 4)),
-            ("status_75", encode_status(&Self::status(Some(1_048_583)))),
+            ("status_76", encode_status(&Self::status(Some(1_048_583)))),
             ("status_67", encode_status(&Self::status(None))),
             ("txref_ingress", txref_ingress),
             ("txref_egress", txref_egress),
@@ -205,11 +205,27 @@ fn the_golden_egress_frames_decode() {
             next_block: 4
         }
     );
-    let status = golden_frame("status_75");
+    let status = golden_frame("status_76");
     assert_eq!(status.len(), STATUS_WITH_RETAINED_BYTES_LEN);
     assert_eq!(
         EgressItem::decode(&status).unwrap(),
         EgressItem::Status(Fixture::status(Some(1_048_583)))
+    );
+}
+
+/// The flag byte sits at byte 67, between the record-lag tail and the
+/// byte tail at bytes 68 to 75.
+#[test]
+fn the_flag_byte_sits_between_the_record_lag_tail_and_the_byte_tail() {
+    let status = golden_frame("status_76");
+    assert_eq!(
+        (STATUS_RETAINED_BYTES_OFFSET, STATUS_WITH_RETAINED_BYTES_LEN),
+        (68, 76)
+    );
+    assert_eq!(status[STATUS_WITH_RECORD_LAG_LEN], 0);
+    assert_eq!(
+        status[STATUS_RETAINED_BYTES_OFFSET..],
+        1_048_583_u64.to_le_bytes()
     );
 }
 
@@ -238,11 +254,16 @@ fn the_frames_of_today_still_decode() {
 
 #[test]
 fn a_partial_byte_tail_is_ignored_and_a_short_reference_is_too_short() {
-    let status = golden_frame("status_75");
-    assert_eq!(
-        EgressItem::decode(&status[..STATUS_WITH_RECORD_LAG_LEN + 3]).unwrap(),
-        EgressItem::Status(Fixture::status(None))
-    );
+    let status = golden_frame("status_76");
+    for len in [
+        STATUS_WITH_RECORD_LAG_LEN + 1,
+        STATUS_WITH_RETAINED_BYTES_LEN - 1,
+    ] {
+        assert_eq!(
+            EgressItem::decode(&status[..len]).unwrap(),
+            EgressItem::Status(Fixture::status(None))
+        );
+    }
     let relayed_ref = golden_frame("relayed_ref");
     assert!(matches!(
         EgressItem::decode(&relayed_ref[..RELAYED_REF_LEN - 1]),

@@ -306,7 +306,8 @@ public final class SealerWire {
      * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}
      * (50 bytes), then the record-lag tail
      * {@code [best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]}
-     * (17 bytes), then the byte tail {@code [retained_bytes:u64]} (8 bytes).
+     * (17 bytes), then the flag byte {@code [snapshot_follows:u8]}, then the
+     * byte tail {@code [retained_bytes:u64]} (8 bytes).
      * The service sends the first two parts. {@code best_recorded} is
      * {@code u64::MAX} before the first recorded cursor. A reader ignores
      * the tails it does not know. The ingress serves {@code safe} from the posted
@@ -367,8 +368,10 @@ public final class SealerWire {
     static final int STATUS_LEN = 50;
     /** Length of a status frame with the record-lag tail. */
     static final int STATUS_WITH_RECORD_LAG_LEN = STATUS_LEN + Long.BYTES + Long.BYTES + Byte.BYTES;
-    /** Length of a status frame with the record-lag tail and the byte tail. */
-    static final int STATUS_WITH_RETAINED_BYTES_LEN = STATUS_WITH_RECORD_LAG_LEN + Long.BYTES;
+    /** Offset of the byte tail: after the record-lag tail and the flag byte. */
+    static final int STATUS_RETAINED_BYTES_OFFSET = STATUS_WITH_RECORD_LAG_LEN + Byte.BYTES;
+    /** Length of a status frame with the record-lag tail, the flag byte and the byte tail. */
+    static final int STATUS_WITH_RETAINED_BYTES_LEN = STATUS_RETAINED_BYTES_OFFSET + Long.BYTES;
 
     /**
      * The longest session message that the cluster log takes, header
