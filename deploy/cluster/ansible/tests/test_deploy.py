@@ -3,6 +3,7 @@
 Run with: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
 Requires ansible-playbook and nomad on PATH; never connects to a real cluster.
 """
+import hashlib
 import json
 import os
 import re
@@ -27,12 +28,13 @@ MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 # The Nomad Variable a job's template renders into the task environment.
 SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 # A secret no rendered job, job variable or play output may hold.
-# The genesis of a deployment without the local canary, and the first
-# account of the canary's fragment (config/genesis/canary.toml).
-DEV_GENESIS = ANSIBLE.parent / 'config/genesis/dev.toml'
-CANARY_RING_ACCOUNT = '0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D'
-
 SENTINEL = 'SECRET-SENTINEL'
+# The SHA-256 of the genesis that staging started from. A live chain
+# refuses a changed genesis, so a deployment without the local canary
+# renders exactly this file.
+STAGING_GENESIS_SHA256 = '1f9b08a455960c3bb26469765baf0dd46cfd68843eda9ee735fb9291aaaad1fa'
+# The first account of the canary's fragment (config/genesis/canary.toml).
+CANARY_RING_ACCOUNT = '0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D'
 # The chain status of a chain that stands on nothing.
 HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
 # The chain status while no sealer member runs: the ingress halts the
@@ -802,7 +804,8 @@ class DeployTest(Deploys):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
             # A deployment without the local canary keeps dev.toml as it
             # is: a live chain refuses a changed genesis.
-            self.assertEqual(self.genesis_template(plans[name]), DEV_GENESIS.read_text(), name)
+            template = self.genesis_template(plans[name]).encode()
+            self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):

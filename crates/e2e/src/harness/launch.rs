@@ -80,7 +80,7 @@ impl<'a> StackLaunch<'a> {
         if chain_id == DEV_CHAIN_ID && !self.cfg.priority_fees && !self.cfg.canary_genesis {
             return Ok(canonical.to_path_buf());
         }
-        let mut src = std::fs::read_to_string(canonical)
+        let src = std::fs::read_to_string(canonical)
             .with_context(|| format!("read genesis {}", canonical.display()))?;
         // The order of the deploy: the canary's accounts, then the fees.
         let repo = services::repo_root();
@@ -94,13 +94,13 @@ impl<'a> StackLaunch<'a> {
                 super::config::Genesis::fees_fragment(&repo),
             ),
         ];
-        for (_, fragment) in fragments.iter().filter(|(on, _)| *on) {
-            src.push('\n');
-            src.push_str(
-                &std::fs::read_to_string(fragment)
-                    .with_context(|| format!("read genesis fragment {}", fragment.display()))?,
-            );
-        }
+        let src = std::iter::once(Ok(src))
+            .chain(fragments.iter().filter(|(on, _)| *on).map(|(_, fragment)| {
+                std::fs::read_to_string(fragment)
+                    .with_context(|| format!("read genesis fragment {}", fragment.display()))
+            }))
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
         let i = src
             .lines()
             .position(|l| l.trim_start().starts_with("chain_id"))
