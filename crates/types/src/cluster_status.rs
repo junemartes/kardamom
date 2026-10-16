@@ -47,6 +47,9 @@ pub struct ClusterStatus {
     /// A snapshot follows this status, and no frame comes until it is
     /// complete. A status frame without the snapshot tail reads as false.
     pub snapshot_follows: bool,
+    /// The bytes of the retained frames above the posted head. `None` when
+    /// the sealer does not send them.
+    pub retained_bytes: Option<u64>,
 }
 
 /// The sealer's record-lag guard: the best recorded cursor of the

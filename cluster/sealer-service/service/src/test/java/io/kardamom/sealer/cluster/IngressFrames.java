@@ -45,6 +45,21 @@ final class IngressFrames {
 
     /** {@link #offerIngress} with an opaque {@code payload} of any length. */
     static void offerRecord(final AeronCluster client, final byte[] canonicalId32, final byte[] payload) {
+        offerFrame(client, exemptRecordFrame(canonicalId32, payload));
+    }
+
+    /** Offer a complete ingress {@code frame} until the cluster takes it. */
+    static void offerFrame(final AeronCluster client, final byte[] frame) {
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(frame.length);
+        buf.putBytes(0, frame);
+        offerFully(client, buf, frame.length);
+    }
+
+    /**
+     * A kind-0 frame that the guard exempts: a zero sender, nonce 0, no
+     * deadline and no tip, then the canonical id and the opaque payload.
+     */
+    static byte[] exemptRecordFrame(final byte[] canonicalId32, final byte[] payload) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
         buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
@@ -61,7 +76,9 @@ final class IngressFrames {
         pos += canonicalId32.length;
         buf.putBytes(pos, payload); // opaque payload, relayed verbatim
         pos += payload.length;
-        offerFully(client, buf, pos);
+        final byte[] out = new byte[pos];
+        buf.getBytes(0, out);
+        return out;
     }
 
     /** Offer a {@code REPLAY_FROM(from_index, from_block)} request to the cluster. */

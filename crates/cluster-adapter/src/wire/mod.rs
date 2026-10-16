@@ -44,9 +44,13 @@ use kardamom_types::epoch::EpochRecord;
 use thiserror::Error;
 
 mod egress;
+mod entry;
+#[cfg(test)]
+mod entry_tests;
 #[cfg(test)]
 mod format_tests;
 mod ingress;
+mod relay;
 #[cfg(test)]
 mod tests;
 
@@ -59,6 +63,9 @@ pub use egress::{
     encode_contiguity_reject, encode_da_lag_reject, encode_origin_gap, encode_past_deadline,
     encode_record_lag_reject, encode_status, encode_window_full,
 };
+pub use entry::{CanonicalTx, RelayedRef};
+#[cfg(any(test, feature = "testing"))]
+pub use entry::{TxOffer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
@@ -67,6 +74,7 @@ pub use ingress::{
     encode_replay_request, encode_subscribe, encode_void_request, ingress_deadline,
     ingress_sender_nonce, ingress_tip, split_ingress,
 };
+pub(crate) use relay::MAX_INGRESS_PAYLOAD_LEN;
 
 /// A `TxRef` fixture for wire and publish tests: distinct-enough bytes to
 /// prove `tag` round-trips, not a value with consensus meaning. Shared by
@@ -246,13 +254,17 @@ pub const EGRESS_KIND_WINDOW_FULL: u8 = 8;
 /// `[kind:u8 = 9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]`
 /// ([`STATUS_LEN`] bytes), then the record-lag tail
 /// `[best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]`
-/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the snapshot tail
+/// ([`STATUS_WITH_RECORD_LAG_LEN`] bytes in all), then the flag byte
 /// `[snapshot_follows:u8]` at [`STATUS_SNAPSHOT_FLAG_OFFSET`]
-/// ([`STATUS_WITH_SNAPSHOT_FLAG_LEN`] bytes in all).
-/// `best_recorded` is `u64::MAX` before the first recorded cursor. A frame
-/// with no record-lag tail decodes as no cursor and the guard off, and a
-/// frame with no snapshot tail as no snapshot. A reader ignores a tail it
-/// does not know. The ingress serves `safe` from the posted head and
+/// ([`STATUS_WITH_SNAPSHOT_FLAG_LEN`] bytes in all), then the byte tail
+/// `[retained_bytes:u64]` at [`STATUS_RETAINED_BYTES_OFFSET`]
+/// ([`STATUS_WITH_RETAINED_BYTES_LEN`] bytes in all). `best_recorded` is
+/// `u64::MAX` before the first recorded cursor. `snapshot_follows` is 1 on
+/// the status before a snapshot: no frame comes until the snapshot is
+/// complete. A frame with no record-lag tail decodes as no cursor and the
+/// guard off, a frame with no flag byte as no snapshot, and a frame with
+/// no byte tail as no retained bytes. A reader ignores bytes after the
+/// tails it knows. The ingress serves `safe` from the posted head and
 /// raises its `da_lag` halt from the flag. Not retained. Matches Java
 /// `EGRESS_KIND_STATUS`.
 pub const EGRESS_KIND_STATUS: u8 = 9;
@@ -264,6 +276,11 @@ pub const STATUS_WITH_RECORD_LAG_LEN: usize = STATUS_LEN + 8 + 8 + 1;
 pub const STATUS_SNAPSHOT_FLAG_OFFSET: usize = STATUS_WITH_RECORD_LAG_LEN;
 /// Length of an [`EGRESS_KIND_STATUS`] frame with the snapshot tail.
 pub const STATUS_WITH_SNAPSHOT_FLAG_LEN: usize = STATUS_SNAPSHOT_FLAG_OFFSET + 1;
+/// Offset of the byte tail of an [`EGRESS_KIND_STATUS`] frame: after the
+/// record-lag tail and the flag byte.
+pub const STATUS_RETAINED_BYTES_OFFSET: usize = STATUS_WITH_SNAPSHOT_FLAG_LEN;
+/// Length of an [`EGRESS_KIND_STATUS`] frame with the byte tail.
+pub const STATUS_WITH_RETAINED_BYTES_LEN: usize = STATUS_RETAINED_BYTES_OFFSET + 8;
 
 /// Egress kind: the DA-lag guard refused a record:
 /// `[kind:u8 = 10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]`.
@@ -287,6 +304,24 @@ pub const EGRESS_KIND_ORIGIN_GAP: u8 = 12;
 /// session, and only while the guard is on. The record is not ordered.
 /// Matches Java `EGRESS_KIND_RECORD_LAG_REJECT`.
 pub const EGRESS_KIND_RECORD_LAG_REJECT: u8 = 13;
+
+/// Egress kind: a relayed reference
+/// `[kind:u8 = 15][index:u64][canonical_id:32][record_type:u8]`
+/// ([`RELAYED_REF_LEN`] bytes). The sealer sends it to every egress
+/// subscriber for each [`RT_TX`] entry, in place of the kind-1 frame: the
+/// subscriber learns the index and the id, not the bytes. Every other
+/// record type stays kind 1. Matches Java `EGRESS_KIND_RELAYED_REF`.
+pub const EGRESS_KIND_RELAYED_REF: u8 = 15;
+/// Length of an [`EGRESS_KIND_RELAYED_REF`] frame.
+pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
+
+/// Egress kind, on the member feed only: the feed dropped frames because
+/// its ring was full: `[kind:u8 = 16][next_index:u64][next_block:u64]`.
+/// `next_index` and `next_block` are the first record index and the first
+/// block that the feed did not carry. The reader asks for a replay from its
+/// cursor. The cluster egress never sends it. No frame uses kind 14.
+/// Matches Java `EGRESS_KIND_FEED_GAP`.
+pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
@@ -370,6 +405,14 @@ pub const RT_REMOTE_EPOCH: u8 = 3;
 /// removed transaction. The service generates this record itself and never
 /// relays it from a session. Matches Java `RT_VOID`.
 pub const RT_VOID: u8 = 4;
+/// A full entry, on ingress only: `[lane:u8][envelope]` after the record
+/// type. The sealer orders it and relays it as [`RT_TX`]. No egress frame
+/// carries this type. Matches Java `RT_TX_OFFER`.
+pub const RT_TX_OFFER: u8 = 5;
+/// A canonical entry: `[lane:u8][envelope]` after the record type, where
+/// the envelope is the archived `TxEnvelope`. See [`CanonicalTx`]. Matches
+/// Java `RT_TX`.
+pub const RT_TX: u8 = 6;
 
 /// How many canonical slots an epoch occupies. This is one slot for the
 /// epoch marker itself, plus one slot per deposit.
@@ -449,6 +492,10 @@ pub enum WireError {
     EntryTooLarge { len: usize },
     #[error("declared length {declared} does not fit in this platform's usize")]
     LenOverflow { declared: u32 },
+    #[error("bad canonical entry: {0}")]
+    BadTx(String),
+    #[error("record type {0} is an ingress type that the sealer never relays")]
+    UnrelayedRecordType(u8),
 }
 
 // ── shared helpers (both directions) ────────────────────────────────────────

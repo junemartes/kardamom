@@ -40,6 +40,10 @@ tasks.named('test') {
     def formats = rootProject.file('../../formats.toml')
     inputs.file(formats)
     systemProperty 'kardamom.formats', formats.canonicalPath
+    // WireGoldenTest reads the golden frames that the Rust wire tests also read.
+    def wireGolden = rootProject.file('../../crates/cluster-adapter/testdata/wire_golden.txt')
+    inputs.file(wireGolden)
+    systemProperty 'kardamom.wireGolden', wireGolden.canonicalPath
     // ClusterNodeTest reads the decision version that the sealer job passes.
     def sealerJob = rootProject.file('../../deploy/cluster/nomad/cluster.nomad.hcl')
     inputs.file(sealerJob)

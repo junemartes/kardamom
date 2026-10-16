@@ -158,7 +158,7 @@ An offer to a session never waits. The service thread also runs the boundary tic
 | No frame leaves the backlog | 1 second. The clock restarts each time a frame leaves. | `offer deadline exhausted (back-pressure)` |
 | The backlog holds more bytes | 64 MiB. A replay of the default retention fits well below it. | `egress backlog over <n> bytes` |
 | A terminal offer result (not `CLOSED`) | at once | `terminal offer result <n>` |
-| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication index=<i> length=<n> repeats=<r> channel=<c>`. `repeats` counts the closes in a row on the same index for the response channel. A value above 0 means the client reconnects with an egress term that is too small. |
+| A frame above the maximum message length of the session's egress publication (its term divided by 8) | at once | `frame above the max message length of the egress publication kind=<k> index=<i> length=<n> repeats=<r> channel=<c>`. `index` is the canonical index of a relayed frame, or `-1` for a kind with no index. `repeats` counts the closes in a row on the same frame (the same kind and index) for the response channel. A value above 0 means the client reconnects with an egress term that is too small. A session close that the service did not ask for clears the count of its channel, and so does a role change. |
 
 - A session that is closing gets no more frames. The client reconnects, replays and recovers.
 - A role change drops all backlogs. The clients of a leader that steps down reconnect to the new leader and replay.
@@ -492,7 +492,7 @@ The chaos suite and operators read these lines. The sealer has no other observab
 | `cluster REPLAY` | A replay request. A served replay ends with `served=`, `queued=` and `dropped=`. A refusal ends with `AHEAD head=(index,block)`, `SKEWED` or `UNAVAILABLE`. `AHEAD` means that the cursor is past the head. `SKEWED` means that `from_index` is outside the block that `from_block` names. |
 | `cluster EGRESS-CLOSE` | The service closed a client session because it could not take its frames. The line has the reason. See [Egress back-pressure](#egress-back-pressure). |
 | `sealer snapshot START` | The service starts its snapshot (`block`). The archive recording of the snapshot is open. |
-| `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`). A member that replays old log entries also prints it. |
+| `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`, and `ms`, the wall time of the snapshot in milliseconds). A member that replays old log entries also prints it. |
 | `sealer snapshot RESTORED` | The member started from a snapshot. The line shows `block`, `canonicalCount`, `retained` and `postedHead`. |
 | `sealer state FRESH at genesis` | The member started with no snapshot and no seed. |
 | `sealer state SEEDED` | The member started from a seed (`block`, `endTx`, `senders`, `stateRoot`, `digest`). |

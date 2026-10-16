@@ -51,7 +51,7 @@ impl GuardHeader {
         tip: 0,
     };
 
-    fn write(&self, b: &mut Vec<u8>) {
+    pub(super) fn write(&self, b: &mut Vec<u8>) {
         b.extend_from_slice(self.sender.as_slice()); // sender (20)
         b.extend_from_slice(&self.nonce.to_le_bytes());
         b.extend_from_slice(&self.max_inclusion_block.to_le_bytes());

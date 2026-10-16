@@ -10,7 +10,9 @@ use std::time::Duration;
 use alloy_primitives::{Address, U256, address};
 use anyhow::Context;
 use kardamom_bench::ANVIL_MNEMONIC;
-use kardamom_bench::load::{self, Completeness, LoadConfig, MetricsTargets, SenderRange, Workload};
+use kardamom_bench::load::{
+    self, CalldataMix, Completeness, LoadConfig, MetricsTargets, NonceStart, SenderRange, Workload,
+};
 use serde::Deserialize;
 
 /// The burn address of every load transfer.
@@ -82,13 +84,14 @@ impl LoadSpec {
             NonZeroU32::new(self.tps.get().checked_div(8).unwrap_or(1)).context("ramp step")?;
         Ok(LoadConfig {
             workload: Workload::Transfers,
+            calldata: CalldataMix::default(),
             rpc: self.rpc_url.clone(),
             receipt_rpcs: self.receipt_rpcs.clone(),
             chain_id: Some(self.chain_id),
             duration: self.duration,
             target_tps: self.tps,
             sender_range,
-            nonce_start: self.nonce_start,
+            nonce_start: NonceStart::Fixed(self.nonce_start),
             mnemonic: ANVIL_MNEMONIC.to_string(),
             to: SINK,
             value: U256::from(1),

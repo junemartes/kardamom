@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use alloy_primitives::U256;
 use kardamom_bench::ANVIL_MNEMONIC;
-use kardamom_bench::load::{Completeness, LoadConfig, SenderRange, Workload};
+use kardamom_bench::load::{
+    CalldataMix, Completeness, LoadConfig, NonceStart, SenderRange, Workload,
+};
 
 use crate::harness::Harness;
 use crate::knobs::SoakRun;
@@ -37,10 +39,7 @@ struct Run<'a> {
 
 impl Run<'_> {
     fn name(&self) -> &'static str {
-        match self.workload {
-            Workload::Transfers => "transfers",
-            Workload::Defi => "defi",
-        }
+        self.workload.as_str()
     }
 }
 
@@ -104,13 +103,14 @@ impl Harness {
             .unwrap_or(NonZeroU32::MIN);
         Ok(LoadConfig {
             workload: run.workload,
+            calldata: CalldataMix::default(),
             rpc: self.rpc_url.clone(),
             receipt_rpcs: self.receipt_rpcs(),
             chain_id: Some(self.knobs.chain_id),
             duration: run.values.duration,
             target_tps: run.values.tps,
             sender_range: SenderRange::new(run.first_sender, run.values.senders)?,
-            nonce_start: 0,
+            nonce_start: NonceStart::Fixed(0),
             mnemonic: ANVIL_MNEMONIC.to_string(),
             to: SINK,
             value: U256::from(1),
