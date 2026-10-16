@@ -41,9 +41,9 @@ pub enum SealerAnswer {
 #[derive(Debug, Default)]
 pub struct AnswerDrain {
     /// `(sender, nonce, expected)` of each reject below the expected
-    /// nonce. Either the sealer ordered the ref, so its ledger entry
-    /// drops like on a receipt, or a skip left the sealer's guard above
-    /// the chain. See `Sequencer::apply_past_reject`.
+    /// nonce: another transaction at a nonce the sealer already holds, or
+    /// a guard that a skip left above the chain. See
+    /// `Sequencer::apply_past_reject`.
     pub drops: Vec<(Address, u64, u64)>,
     /// The lowest expected nonce of each sender with a reject at or above
     /// it. The sealer did not order that nonce.
@@ -84,12 +84,11 @@ impl ResyncController {
     /// Drain the contiguity rejects and the window-full answers. Bounded
     /// per iteration, like the floor drain.
     ///
-    /// - A reject below the expected nonce is a past nonce. Mostly the
-    ///   sealer ordered the ref: the guard accepted it on the way up, and
-    ///   its window entry aged out. The ledger entry drops. Without the
-    ///   drop, a ref with no confirming receipt republishes on every
-    ///   confirm timeout. The sequencer tells this case from a guard that
-    ///   is ahead of the chain.
+    /// - A reject below the expected nonce is a past nonce. A copy of an
+    ///   ordered ref gets a duplicate or past-deadline answer first, so
+    ///   the rejected ref is another transaction at a nonce in flight, or
+    ///   the guard is ahead of the chain. The ref leaves the ledger, and
+    ///   its client hears of it.
     /// - A reject at or above the expected nonce is a gap: the sealer did
     ///   not order the expected nonce. A rejected batch gives one reject
     ///   per entry, so the gaps collapse to the lowest expected nonce of

@@ -7,7 +7,7 @@ use std::time::Instant;
 use alloy_primitives::Address;
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::{TxError, TxErrorReason};
-use tracing::{trace, warn};
+use tracing::warn;
 
 use super::{RefMetadata, Sequencer, SequencerPorts};
 use crate::metrics;
@@ -175,25 +175,31 @@ impl Sequencer {
     }
 
     /// One contiguity reject below the expected nonce, for
-    /// [`Self::apply_sealer_answers`]'s first loop. Three cases:
+    /// [`Self::apply_sealer_answers`]'s first loop. A copy or a republish
+    /// of an ordered ref has the same id, so the sealer answers it as a
+    /// duplicate or past its deadline before the guard. So a ref that
+    /// reaches the guard below the expected nonce is another transaction
+    /// at a nonce the sealer already holds, or the sealer counted a
+    /// skipped transaction. Four cases:
     ///
-    /// - The sealer ordered the ref: the guard accepted it on the way up,
-    ///   and its window entry aged out. Then every nonce below `expected`
-    ///   is on the chain, or is in this replica's ledger on its way there:
-    ///   `expected` is at most the receipt floor plus the refs in flight.
-    ///   Drop the ledger entry like on a receipt. See
-    ///   `UnconfirmedLedger::drop_committed`.
-    /// - `expected` is above that bound, and it stays so for the settle
-    ///   time: an executor skipped a transaction that the guard counted,
-    ///   and the guard refuses every lower nonce of the sender. Refuse the
-    ///   ref like a sealer refusal, with a reason that names both nonces.
+    /// - The ledger no longer holds the ref: a receipt or an earlier answer
+    ///   settled it. Nothing to tell.
+    /// - `expected` is at most the receipt floor plus the refs in flight:
+    ///   another transaction at the nonce is in flight, for example the
+    ///   one a speed-up replaces. Refuse the ref with the retryable
+    ///   `NonceInFlight`, so its client does not wait for a receipt that
+    ///   never comes.
     /// - `expected` is above that bound, but the settle time has not
     ///   passed: the sealer can still hold an ordered ref that this
     ///   replica does not know, for example after a restart. Refuse the
-    ///   ref with a retryable reason.
+    ///   ref with `NonceInFlight` too.
+    /// - `expected` stays above that bound for the settle time: an
+    ///   executor skipped a transaction that the guard counted, and the
+    ///   guard refuses every lower nonce of the sender. Refuse the ref
+    ///   with `SealerNonceAhead`, which names both nonces.
     ///
     /// Each refusal takes the ref out of the ledger and marks the nonce,
-    /// so the resubmit is offered again.
+    /// so a resubmit is offered again.
     fn apply_past_reject<P: SequencerPorts>(&mut self, ports: &mut P, past: PastReject) {
         let PastReject {
             sender,
@@ -201,12 +207,16 @@ impl Sequencer {
             expected,
             chain,
         } = past;
-        let in_flight = usize_to_u64(self.unconfirmed.count_from(sender, chain));
-        if expected <= chain.saturating_add(in_flight) {
-            self.drop_committed_and_trace(sender, nonce);
+        if !self.unconfirmed.contains(sender, nonce) {
             return;
         }
-        let reason = match self.nonce_ahead.observe(sender, chain, Instant::now()) {
+        let in_flight = usize_to_u64(self.unconfirmed.count_from(sender, chain));
+        let verdict = if expected <= chain.saturating_add(in_flight) {
+            Verdict::InFlight
+        } else {
+            self.nonce_ahead.observe(sender, chain, Instant::now())
+        };
+        let reason = match verdict {
             Verdict::Stuck => {
                 metrics::record_sealer_nonce_ahead(self.cfg.partition_index);
                 TxErrorReason::SealerNonceAhead {
@@ -224,17 +234,6 @@ impl Sequencer {
                 reason,
             },
         );
-    }
-
-    /// A committed-proof contiguity reject: drop the ledger entry.
-    fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
-        if self.unconfirmed.drop_committed(sender, n).is_some() {
-            trace!(
-                sender = ?sender,
-                nonce = n,
-                "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
-            );
-        }
     }
 
     /// One gap contiguity reject, for

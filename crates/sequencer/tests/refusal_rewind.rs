@@ -460,10 +460,10 @@ fn a_reject_below_the_receipt_floor_keeps_the_floor() {
 }
 
 /// The executors are down, so no receipt comes. The sealer ordered 0 to
-/// 3 and rejects a late copy of 2 with `expected=4`, so the ledger entry
-/// of 2 drops. Then a window-full answer for an older copy of 2 comes.
-/// The answer names no expected nonce, so it frees nothing: 4 publishes,
-/// and nothing expires.
+/// 3 and rejects another transaction at 2 with `expected=4`, so the
+/// ledger entry of 2 drops and its client hears `NonceInFlight`. Then a
+/// window-full answer for an older copy of 2 comes. The answer names no
+/// expected nonce, so it frees nothing: 4 publishes, and nothing expires.
 #[test]
 fn a_window_full_answer_never_frees_a_nonce() {
     let s = signer(31);
@@ -476,7 +476,11 @@ fn a_window_full_answer_never_frees_a_nonce() {
     sealed.submit(&s, 4);
     assert_eq!(sealed.offered_nonces(4), vec![4], "no stall");
     sealed.step_after_ttl();
-    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+    assert_eq!(
+        sealed.errors_but_refusals(),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }],
+        "nothing expires"
+    );
 }
 
 /// The window has no room for 1 and 2. The ledger holds both, so they
@@ -554,24 +558,48 @@ fn a_guard_ahead_of_the_chain_answers_the_client() {
     );
 }
 
-/// A reject below the expected nonce, while the ledger holds the refs
-/// between, is a stale answer for an ordered ref: it drops the ref and
-/// tells the client nothing.
+/// The ledger holds nonces 0 to 2, and the guard rejects a ref at 0 with
+/// `expected=3`. A copy of an ordered ref gets a duplicate answer before
+/// the guard, so this ref is another transaction at a nonce in flight,
+/// for example a speed-up. Its client hears `NonceInFlight` and does not
+/// wait for a receipt that never comes. That is the chain nonce plus the
+/// refs in flight, so it is never `SealerNonceAhead`.
 #[test]
-fn a_reject_with_refs_in_flight_is_an_ordered_ref() {
+fn another_tx_at_a_nonce_in_flight_hears_of_it() {
     let s = signer(43);
     let mut sealed = short_settle();
     (0..3).for_each(|n| sealed.submit(&s, n));
+    std::thread::sleep(Duration::from_millis(40));
     sealed.reject(s.address(), &[0], 3);
     sealed.step();
-    assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
+    assert_eq!(
+        sealed.errors_of(0),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }]
+    );
+}
+
+/// A receipt settled this replica's own refs at 0 and 1, and then a stale
+/// reject of its copy at 1 arrives. The ledger no longer holds the ref, so
+/// nobody waits on it, and the client hears nothing.
+#[test]
+fn a_stale_reject_of_a_settled_copy_is_silent() {
+    let s = signer(45);
+    let mut sealed = short_settle();
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    sealed.execute(s.address(), 1);
+    sealed.step();
+    sealed.reject(s.address(), &[1], 3);
+    sealed.step();
+    assert_eq!(sealed.errors_but_refusals(), Vec::<TxErrorReason>::new());
+    sealed.submit(&s, 4);
+    assert_eq!(sealed.offered_nonces(4), vec![4], "the floor stays");
 }
 
 /// A replica that restarted holds no ledger entry for the ordered ref at
 /// 1, which has not executed. The client sends a new transaction at 1,
 /// and the guard rejects it with `expected=2`. That is the chain nonce
-/// plus the one ref in flight, so the replica does not call the sender
-/// stuck, after the settle time too.
+/// plus the one ref in flight, so the client hears `NonceInFlight`, after
+/// the settle time too, and never `SealerNonceAhead`.
 #[test]
 fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
     let s = signer(44);
@@ -583,5 +611,8 @@ fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
     std::thread::sleep(Duration::from_millis(40));
     sealed.reject(s.address(), &[1], 2);
     sealed.step();
-    assert_eq!(sealed.errors_of(1), Vec::<TxErrorReason>::new());
+    assert_eq!(
+        sealed.errors_of(1),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 1 }]
+    );
 }
