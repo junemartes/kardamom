@@ -10,8 +10,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.aeron.driver.NameResolver;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
@@ -55,6 +57,13 @@ final class ClusterNodeTest {
     void peerConsensusEndpointsListsEveryOtherMember() {
         assertEquals("192.168.56.52:40201,192.168.56.53:40201", ClusterNode.peerConsensusEndpoints(MEMBERS, 0));
         assertEquals("192.168.56.51:40201,192.168.56.53:40201", ClusterNode.peerConsensusEndpoints(MEMBERS, 1));
+    }
+
+    @Test
+    void peerAdminEndpointsUseTheIngressHostOfEveryOtherMember() {
+        assertEquals(
+            List.of(URI.create("http://192.168.56.51:40205"), URI.create("http://192.168.56.53:40205")),
+            ClusterNode.peerAdminEndpoints(MEMBERS, 1, 40205));
     }
 
     @Test

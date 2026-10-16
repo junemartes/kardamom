@@ -163,6 +163,20 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
   - The retained frames are in the snapshot. A restored member keeps the floor at the posted head.
+- **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
+  - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
+  - The file is a function of the log. Every member holds the same bytes at the same position.
+  - The snapshot holds the floors, the front and head positions, and the index. It does not hold the frames. The member syncs the file to disk up to the head before it writes the snapshot.
+  - A restore truncates the file at the head position of the snapshot. The log replay appends the rest.
+  - A restore stops the member when the file does not hold every byte from the front to the head of the snapshot. The member never serves a partial file. Wipe the member: the peer seed copies the file.
+  - A member that a peer seeds copies the segment files from the admin endpoint of a peer, after the snapshot. So the file needs `kardamom.cluster.adminPort`.
+  - The status frame gets the tail `retained_bytes`: the bytes of the file above the posted head.
+- **Disk full.** A helper thread writes zeros into each new segment before the member writes to it. A full disk fails that preallocation.
+  - The member logs `sealer RETAINED-FILE FATAL` and stops at its next boundary tick or segment change. Any other I/O error on the file does the same.
+  - The member never takes a different branch than the other members. It stops.
+  - All members retain the same bytes, so disks of one size fill at about the same time. When a quorum stops, the chain stops.
+  - The admin endpoint exports `kardamom_sealer_disk_free_bytes` (`GET /metrics`) and `diskFreeBytes` (`GET /status`).
+  - Recovery: free the disk or add disk. The member restarts, truncates its file at its snapshot, and replays its log.
 - The wire layouts are in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
 - Proof: `da-lag-halt` and `prune-floor`. Both run by name with `KARDAMOM_CHAOS_CASES`. They are in no shard.
   - `da-lag-halt` freezes the batcher and lets the sealed head pass the budget. It needs `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, set to the small budget that the cluster runs with.

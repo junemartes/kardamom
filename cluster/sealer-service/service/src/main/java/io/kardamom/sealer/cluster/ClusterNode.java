@@ -14,8 +14,12 @@ import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Optional;
 import org.agrona.SemanticVersion;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -135,6 +139,9 @@ public final class ClusterNode {
                 + " digest=" + s.digestHex())
             .orElse(" <none: a cluster with no snapshot starts at genesis>"));
 
+        final int adminPort = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
+        final Optional<RetainedFile.Config> retainedFile = retainedFile(clusterDir, memberId, adminPort);
+
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
         // batcher). Unset or empty refuses every void request. Every member
@@ -156,7 +163,8 @@ public final class ClusterNode {
         // The member's own name resolves to the node address with no lookup.
         final MemberContexts contexts =
             new MemberContexts(aeronDir, clusterDir, archiveDir, me).withPeerNames(memberId, nodeIp);
-        prepareState(contexts, clusterMembers, memberId);
+        prepareState(contexts, memberId, peerConsensusEndpoints(clusterMembers, memberId), retainedFile
+            .map(c -> new RetainedCopy(peerAdminEndpoints(clusterMembers, memberId, adminPort), c.dir(), memberId)));
 
         // Launch with a retry past the mark-file liveness window. A member
         // that was hard-killed (kill -9 or docker kill) cannot clear its
@@ -197,6 +205,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                retainedFile.ifPresent(service::carryingBytes);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop));
                 break;
@@ -227,7 +236,8 @@ public final class ClusterNode {
         final ConsensusModule.Context consensus = driver.consensusModule().context();
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container;
-             AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
+             AdminServer ignored3 = startAdminServer(
+                 consensus, service, memberId, Path.of(clusterDir), retainedFile.map(RetainedFile.Config::dir))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
             startSnapshotScheduler(clusterDir, memberId);
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
@@ -241,17 +251,42 @@ public final class ClusterNode {
     }
 
     /**
+     * The retained-file settings: empty keeps the retained frames on the
+     * heap. Replicated configuration: the choice decides the retention
+     * section of the snapshot, so every member must run the same value. A
+     * member that a peer seeds copies the file from the admin endpoint of a
+     * peer, so the file needs the admin port.
+     */
+    private static Optional<RetainedFile.Config> retainedFile(
+            final String clusterDir, final int memberId, final int adminPort) {
+        final Optional<RetainedFile.Config> config = RetainedFile.Config.parse(
+            System.getProperty(RetainedFile.Config.SETTING),
+            System.getProperty(RetainedFile.Config.SEGMENT_SETTING),
+            Path.of(clusterDir));
+        if (config.isPresent() && adminPort == 0) {
+            throw new IllegalArgumentException(RetainedFile.Config.SETTING + "=true needs"
+                + " kardamom.cluster.adminPort: a member that a peer seeds copies the retained file from it");
+        }
+        System.out.println("cluster carry bytes memberId=" + memberId + config
+            .map(c -> " dir=" + c.dir() + " segmentBytes=" + c.segmentBytes())
+            .orElse(" <off: retained frames on the heap>"));
+        return config;
+    }
+
+    /**
      * Decide how the member starts, and seed a blank member from a peer
      * unless this start is the bootstrap of a new cluster. See
      * {@link StartMode} and {@link PeerSeed}.
      */
     private static void prepareState(
-            final MemberContexts contexts, final String clusterMembers, final int memberId) {
+            final MemberContexts contexts,
+            final int memberId,
+            final String peers,
+            final Optional<RetainedCopy> retainedCopy) {
         final StartMode mode = StartMode.decide(contexts.clusterState());
         System.out.println("cluster START mode=" + mode + " memberId=" + memberId + " — " + mode.note);
         if (mode == StartMode.SEED_FROM_PEER) {
-            new PeerSeed(memberId, peerConsensusEndpoints(clusterMembers, memberId), contexts,
-                PeerSeed.Timing.DEFAULT).run();
+            new PeerSeed(memberId, peers, contexts, PeerSeed.Timing.DEFAULT, retainedCopy).run();
         }
     }
 
@@ -269,11 +304,17 @@ public final class ClusterNode {
      * not ready, so a rolling deploy waits for it before it stops the next
      * member. Returns {@code null} when the port is 0; try-with-resources
      * accepts a null resource.</p>
+     *
+     * <p>{@code stateDir} is the directory whose disk the free-space gauge
+     * reads. {@code retainedDir} is the retained file that the endpoint
+     * serves to a member that a peer seeds.</p>
      */
     private static AdminServer startAdminServer(
             final ConsensusModule.Context consensus,
             final SealerClusteredService service,
-            final int memberId) {
+            final int memberId,
+            final Path stateDir,
+            final Optional<Path> retainedDir) {
         final int port = Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
         if (port == 0) {
             System.out.println("cluster admin endpoint DISABLED memberId=" + memberId);
@@ -285,10 +326,11 @@ public final class ClusterNode {
             consensus.clusterNodeRoleCounter(),
             consensus.electionStateCounter(),
             consensus.commitPositionCounter(),
-            service);
+            service,
+            stateDir);
         final AdminServer admin;
         try {
-            admin = AdminServer.start(port, source::sample, lagBytes);
+            admin = AdminServer.start(port, source::sample, lagBytes, retainedDir);
         } catch (final java.io.IOException e) {
             throw new IllegalStateException("cluster admin endpoint bind failed on port " + port, e);
         }
@@ -306,18 +348,22 @@ public final class ClusterNode {
         private final AtomicCounter election;
         private final AtomicCounter commitPosition;
         private final SealerClusteredService service;
+        /** A directory on the disk of the member state: the log and the retained file. */
+        private final Path stateDir;
 
         MemberStatusSource(
                 final int memberId,
                 final AtomicCounter role,
                 final AtomicCounter election,
                 final AtomicCounter commitPosition,
-                final SealerClusteredService service) {
+                final SealerClusteredService service,
+                final Path stateDir) {
             this.memberId = memberId;
             this.role = role;
             this.election = election;
             this.commitPosition = commitPosition;
             this.service = service;
+            this.stateDir = stateDir;
         }
 
         MemberStatus sample() {
@@ -327,7 +373,16 @@ public final class ClusterNode {
                 ? MemberStatus.ELECTION_CLOSED : String.valueOf(ElectionState.get(election));
             final long commit = commitPosition.isClosed() ? 0L : commitPosition.get();
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
-                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()));
+                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()), diskFreeBytes());
+        }
+
+        /** The bytes that the member can still write to the disk of its state. */
+        private long diskFreeBytes() {
+            try {
+                return Files.getFileStore(stateDir).getUsableSpace();
+            } catch (final IOException e) {
+                throw new UncheckedIOException(e);
+            }
         }
     }
 
@@ -764,6 +819,18 @@ public final class ClusterNode {
             .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
             .map(f -> f[2].trim())
             .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    /**
+     * The admin endpoints of every member except {@code memberId}: the host
+     * of each ingress endpoint, with the admin port that every member uses.
+     */
+    static List<URI> peerAdminEndpoints(final String clusterMembers, final int memberId, final int adminPort) {
+        return java.util.Arrays.stream(clusterMembers.split("\\|"))
+            .map(member -> member.split(","))
+            .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
+            .map(f -> URI.create("http://" + f[1].trim().split(":")[0] + ":" + adminPort))
+            .toList();
     }
 
     /**

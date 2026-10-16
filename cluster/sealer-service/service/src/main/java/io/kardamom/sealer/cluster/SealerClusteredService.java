@@ -92,8 +92,20 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private Optional<SealerSeed> seed = Optional.empty();
 
+    /**
+     * The retained-file settings, or empty to keep the retained frames on
+     * the heap. Replicated configuration: the choice decides the layout of
+     * the retention section of the snapshot, so every member runs the same.
+     */
+    private Optional<RetainedFile.Config> retainedFile = Optional.empty();
+
     private Cluster cluster;
     private CanonicalSealerState state;
+    /**
+     * The store of the retained frames. The service thread opens it in
+     * {@code onStart}. The tests read it from another thread.
+     */
+    private volatile RetainedFrames retained;
     private SealerEgress egress;
     private SeedRecord seedRecord;
 
@@ -286,16 +298,33 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /**
+     * Keep the retained frames in an append-only file, not on the heap.
+     * Every member must run the same choice.
+     */
+    SealerClusteredService carryingBytes(final RetainedFile.Config config) {
+        this.retainedFile = Optional.of(config);
+        return this;
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
+        // An unreadable or empty snapshot image is fatal. Restarting silently
+        // at genesis would diverge from the rest of the cluster, which assumes
+        // the snapshotted state (and the log replayed after it) is correct.
+        start(cluster, Optional.ofNullable(snapshotImage)
+            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy())));
+    }
+
+    /** Start from {@code snapshot} when there is one, else from the seed or at genesis. */
+    void start(final Cluster cluster, final Optional<byte[]> snapshot) {
         this.cluster = cluster;
         this.seedRecord = new SeedRecord(cluster, memberId);
-        if (snapshotImage != null) {
-            // Restore canonical state from the cluster snapshot. An unreadable
-            // or empty snapshot image is fatal. Restarting silently at genesis
-            // would diverge from the rest of the cluster, which assumes the
-            // snapshotted state (and the log replayed after it) is correct.
-            restore(SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy()));
+        this.retained = retainedFile
+            .<RetainedFrames>map(config -> new RetainedFile(config, memberId))
+            .orElseGet(HeapFrames::new);
+        if (snapshot.isPresent()) {
+            restore(snapshot.get());
             // The log position of a start from a snapshot is the snapshot's position.
             purgeView = PurgeView.EMPTY
                 .withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()))
@@ -312,8 +341,7 @@ public final class SealerClusteredService implements ClusteredService {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
                 inclusionHorizonBlocks, window.capacity(), budgets);
-            this.egress = new SealerEgress(
-                cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+            openEgress(ByteBuffer.allocate(0));
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
         }
         // Do not call scheduleTimer here: Aeron rejects timer scheduling from
@@ -378,7 +406,7 @@ public final class SealerClusteredService implements ClusteredService {
      * head.
      */
     private void openEgress(final ByteBuffer retention) {
-        this.egress = new SealerEgress(cluster, memberId, state.canonicalCount(), state.blockNumber());
+        this.egress = new SealerEgress(cluster, memberId, retained, state.canonicalCount(), state.blockNumber());
         egress.readSnapshot(retention);
         egress.setPostedHead(state.postedHead());
     }
@@ -1063,6 +1091,7 @@ public final class SealerClusteredService implements ClusteredService {
         flushWindow();
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
+        retained.checkHealth();
         // The status rides every tick, so an observer sees the guard flip
         // and the retention stretch without waiting for a cursor record.
         egress.offerStatus(status());
@@ -1118,7 +1147,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTerminate(Cluster cluster) {
-        // No external resources to release.
+        retained.close();
     }
 
     /** The log position of the last applied entry; 0 before the first. */
@@ -1134,6 +1163,11 @@ public final class SealerClusteredService implements ClusteredService {
     /** Ingress frames of an unknown kind this member dropped. */
     long droppedUnknownKindCount() {
         return unknownKindCount;
+    }
+
+    /** The store of the retained frames. */
+    RetainedFrames retained() {
+        return retained;
     }
 
     /** The snapshot marks and the posted head that the log purge plans with. */

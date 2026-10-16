@@ -6,6 +6,7 @@ import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ClusterBackup;
 import io.aeron.cluster.ClusterBackup.Configuration.ReplayStart;
 import io.aeron.cluster.ClusterBackupMediaDriver;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.agrona.concurrent.status.AtomicCounter;
@@ -29,6 +30,10 @@ import org.agrona.concurrent.status.AtomicCounter;
  * is written. The log after the snapshot needs no copy: the leader keeps
  * its log from the snapshot position on, and the member's election
  * catches up from there. A longer copy only shortens that catch-up.</p>
+ *
+ * <p>A member with a retained file also copies the segment files from a
+ * peer ({@link RetainedCopy}). A round in which no peer serves them ends
+ * with no result, like a round with no backup.</p>
  *
  * <p>A round in which no peer answers ends after the peer timeout, and the
  * next round starts after a backoff. The seed has no other exit: a blank
@@ -63,14 +68,26 @@ final class PeerSeed {
     private final StateDir clusterDir;
     private final StateDir archiveDir;
     private final Timing timing;
+    /** The copy of the retained file, or empty when the member keeps the frames on the heap. */
+    private final Optional<RetainedCopy> retainedCopy;
 
     PeerSeed(final int memberId, final String peers, final MemberContexts contexts, final Timing timing) {
+        this(memberId, peers, contexts, timing, Optional.empty());
+    }
+
+    PeerSeed(
+            final int memberId,
+            final String peers,
+            final MemberContexts contexts,
+            final Timing timing,
+            final Optional<RetainedCopy> retainedCopy) {
         this.memberId = memberId;
         this.peers = peers;
         this.contexts = contexts;
         this.clusterDir = contexts.clusterState();
         this.archiveDir = contexts.archiveState();
         this.timing = timing;
+        this.retainedCopy = retainedCopy;
     }
 
     /**
@@ -93,7 +110,7 @@ final class PeerSeed {
         clusterDir.clear();
         archiveDir.clear();
         final Round result = backUp();
-        if (result.outcome() == SeedWatch.Outcome.SEEDED) {
+        if (result.outcome() == SeedWatch.Outcome.SEEDED && retainedCopy.map(RetainedCopy::run).orElse(true)) {
             clusterDir.dropMarkFiles();
             archiveDir.dropMarkFiles();
             return true;

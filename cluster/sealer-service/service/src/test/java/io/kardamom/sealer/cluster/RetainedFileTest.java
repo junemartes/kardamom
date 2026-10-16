@@ -1,0 +1,271 @@
+package io.kardamom.sealer.cluster;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.kardamom.sealer.Relayed;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+import org.agrona.ExpandableArrayBuffer;
+import org.agrona.concurrent.AgentTerminationException;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * The retained file on its own: it serves the frames that the heap store
+ * serves, a restore truncates it at the snapshot head, a missing segment or
+ * a failed preallocation stops the member, the purge keeps the segments of
+ * the last snapshot, and the heap does not grow with the retained bytes.
+ */
+@Timeout(value = 120, unit = TimeUnit.SECONDS)
+class RetainedFileTest {
+
+    private static final int SEGMENT_BYTES = 64 * 1024;
+    private static final int PAYLOAD_BYTES = 4 * 1024;
+    private static final int BLOCKS = 12;
+    private static final int RECORDS_PER_BLOCK = 4;
+    /** The offset of the head position in a section: marker, two floors, the count and the front. */
+    private static final int SECTION_HEAD_OFFSET = Integer.BYTES + 4 * Long.BYTES;
+
+    @TempDir
+    Path dir;
+
+    private final ExpandableArrayBuffer staging = new ExpandableArrayBuffer();
+    private final EgressFrames frames = new EgressFrames(staging);
+    private final List<RetainedFrames> opened = new ArrayList<>();
+
+    @AfterEach
+    void closeStores() {
+        opened.forEach(RetainedFrames::close);
+    }
+
+    private RetainedFile open(final Path in, final int segmentBytes) {
+        final RetainedFile file = new RetainedFile(new RetainedFile.Config(in, segmentBytes), 0);
+        opened.add(file);
+        return file;
+    }
+
+    private RetainedFile openFresh() {
+        final RetainedFile file = open(dir, SEGMENT_BYTES);
+        file.clear();
+        return file;
+    }
+
+    private void record(final RetainedFrames store, final long index, final int payloadBytes) {
+        final byte[] payload = new byte[payloadBytes];
+        Arrays.fill(payload, (byte) index);
+        store.append(staging, frames.relayed(new Relayed(index, payload)));
+    }
+
+    private void boundary(final RetainedFrames store, final long block, final long endTxIdx) {
+        staging.putByte(0, SealerWire.EGRESS_KIND_BOUNDARY);
+        staging.putLong(FrameKey.KEY_OFFSET, block, ByteOrder.LITTLE_ENDIAN);
+        staging.putLong(FrameKey.BOUNDARY_END_OFFSET, endTxIdx, ByteOrder.LITTLE_ENDIAN);
+        staging.putLong(FrameKey.BOUNDARY_END_OFFSET + Long.BYTES, 0L, ByteOrder.LITTLE_ENDIAN);
+        staging.putLong(FrameKey.BOUNDARY_END_OFFSET + 2 * Long.BYTES, 0L, ByteOrder.LITTLE_ENDIAN);
+        store.append(staging, FrameKey.BOUNDARY_END_OFFSET + 3 * Long.BYTES);
+    }
+
+    /** Blocks {@code from..to - 1}, each with its records, then its boundary. */
+    private void blocks(final RetainedFrames store, final int from, final int to) {
+        IntStream.range(from, to).forEach(block -> {
+            final long first = (long) (block - 1) * RECORDS_PER_BLOCK;
+            IntStream.range(0, RECORDS_PER_BLOCK).forEach(i -> record(store, first + i, PAYLOAD_BYTES));
+            boundary(store, block, first + RECORDS_PER_BLOCK);
+        });
+    }
+
+    private static List<byte[]> replay(final RetainedFrames store, final long fromIndex, final long fromBlock) {
+        return store.wanted(fromIndex, fromBlock).toList();
+    }
+
+    private static void assertSameFrames(final List<byte[]> expected, final List<byte[]> actual) {
+        assertEquals(expected.size(), actual.size());
+        IntStream.range(0, expected.size()).forEach(i -> assertArrayEquals(expected.get(i), actual.get(i), "frame " + i));
+    }
+
+    private List<Path> segmentFiles() throws IOException {
+        try (Stream<Path> paths = Files.list(dir)) {
+            return paths.filter(p -> RetainedFile.SEGMENT_NAME.matcher(p.getFileName().toString()).matches())
+                .sorted().toList();
+        }
+    }
+
+    private static long head(final byte[] section) {
+        return ByteBuffer.wrap(section).getLong(SECTION_HEAD_OFFSET);
+    }
+
+    /** The section after its marker, as {@link SealerEgress#readSnapshot} hands it over. */
+    private static ByteBuffer afterMarker(final byte[] section) {
+        return ByteBuffer.wrap(section).position(Integer.BYTES);
+    }
+
+    @Test
+    void the_file_serves_the_frames_that_the_heap_serves() throws IOException {
+        final HeapFrames heap = new HeapFrames();
+        final RetainedFile file = openFresh();
+        blocks(heap, 1, BLOCKS + 1);
+        blocks(file, 1, BLOCKS + 1);
+        assertTrue(segmentFiles().size() > 2, "the frames span several segments: " + segmentFiles());
+
+        assertEquals(heap.count(), file.count());
+        assertSameFrames(replay(heap, 0, 1), replay(file, 0, 1));
+        assertSameFrames(replay(heap, 18, 5), replay(file, 18, 5));
+        IntStream.rangeClosed(0, BLOCKS + 1).forEach(block ->
+            assertEquals(heap.boundaryEnd(block), file.boundaryEnd(block), "block " + block));
+
+        IntStream.range(0, 2 * RECORDS_PER_BLOCK + 3).forEach(i -> {
+            assertEquals(heap.front(), file.front());
+            heap.evictFront();
+            file.evictFront();
+        });
+        assertEquals(heap.count(), file.count());
+        assertSameFrames(replay(heap, 10, 3), replay(file, 10, 3));
+        assertEquals(-1L, file.boundaryEnd(2), "an evicted boundary leaves the index");
+    }
+
+    @Test
+    void a_restore_truncates_the_file_at_the_snapshot_head() throws IOException {
+        final RetainedFile before = openFresh();
+        blocks(before, 1, 6);
+        final byte[] section = before.writeSnapshot(0, 1);
+        final List<byte[]> atSnapshot = replay(before, 0, 1);
+        final int segmentsAtSnapshot = segmentFiles().size();
+        blocks(before, 6, BLOCKS + 1);
+        assertTrue(segmentFiles().size() > segmentsAtSnapshot, "the appends after the snapshot open a segment");
+        before.close();
+
+        final RetainedFile restored = open(dir, SEGMENT_BYTES);
+        assertEquals(new RetainedFrames.Floors(0, 1), restored.restore(afterMarker(section)));
+        final long snapshotHead = head(section);
+        final Path last = segmentFiles().get(segmentFiles().size() - 1);
+        final long lastStart = Long.parseLong(RetainedFile.SEGMENT_NAME.matcher(last.getFileName().toString())
+            .results().findFirst().orElseThrow().group(1));
+        assertTrue(lastStart < snapshotHead, "no segment starts at or above the head");
+        final byte[] tail = Files.readAllBytes(last);
+        final int headOffset = Math.toIntExact(snapshotHead - lastStart);
+        assertTrue(IntStream.range(headOffset, tail.length).allMatch(i -> tail[i] == 0), "the file ends at the head");
+        assertSameFrames(atSnapshot, replay(restored, 0, 1));
+
+        // The log replay appends the same frames again, at the same positions.
+        blocks(restored, 6, BLOCKS + 1);
+        final RetainedFile fresh = open(dir.resolve("fresh"), SEGMENT_BYTES);
+        fresh.clear();
+        blocks(fresh, 1, BLOCKS + 1);
+        assertSameFrames(replay(fresh, 0, 1), replay(restored, 0, 1));
+        assertEquals(head(fresh.writeSnapshot(0, 1)), head(restored.writeSnapshot(0, 1)));
+    }
+
+    @Test
+    void a_restore_stops_the_member_when_the_file_misses_a_segment() throws IOException {
+        final RetainedFile before = openFresh();
+        blocks(before, 1, BLOCKS + 1);
+        final byte[] section = before.writeSnapshot(0, 1);
+        before.close();
+        Files.delete(segmentFiles().get(1));
+
+        final RetainedFile restored = open(dir, SEGMENT_BYTES);
+        assertThrows(AgentTerminationException.class, () -> restored.restore(afterMarker(section)));
+    }
+
+    @Test
+    void a_failed_preallocation_stops_the_member() throws IOException {
+        final RetainedFile file = open(dir, SEGMENT_BYTES);
+        // A directory at the name of the prepared file makes the helper fail, as a full disk does.
+        Files.createDirectory(dir.resolve(SegmentPreallocator.PREPARED_NAME));
+        file.clear();
+        assertThrows(AgentTerminationException.class, () -> record(file, 0, PAYLOAD_BYTES));
+    }
+
+    @Test
+    void the_boundary_tick_stops_the_member_after_a_failed_preallocation() throws IOException {
+        final RetainedFile file = open(dir, SEGMENT_BYTES);
+        Files.createDirectory(dir.resolve(SegmentPreallocator.PREPARED_NAME));
+        file.clear();
+        assertThrows(AgentTerminationException.class, () -> {
+            while (true) {
+                file.checkHealth();
+                Thread.onSpinWait();
+            }
+        });
+    }
+
+    @Test
+    void the_purge_keeps_the_segments_of_the_last_snapshot() throws IOException {
+        final RetainedFile file = openFresh();
+        blocks(file, 1, BLOCKS + 1);
+        final List<Path> all = segmentFiles();
+        // Evict the first half of the frames: the front moves into a later segment.
+        IntStream.range(0, Math.toIntExact(file.count() / 2)).forEach(i -> file.evictFront());
+        final List<byte[]> served = replay(file, file.front().key(), BLOCKS / 2 + 1);
+
+        file.writeSnapshot(0, 1);
+        assertEquals(all, segmentFiles(), "the first snapshot keeps the segments below its own front");
+        file.writeSnapshot(0, 1);
+        final List<Path> kept = segmentFiles();
+        assertTrue(kept.size() < all.size(), "the next snapshot deletes them: " + kept);
+        assertEquals(all.get(all.size() - 1), kept.get(kept.size() - 1));
+        assertSameFrames(served, replay(file, file.front().key(), BLOCKS / 2 + 1));
+    }
+
+    @Test
+    void the_heap_does_not_grow_with_the_retained_bytes() {
+        final int frameBytes = 64 * 1024;
+        final int frameCount = 1024;
+        final long retainedBytes = (long) frameBytes * frameCount;
+
+        final RetainedFile file = open(dir, 8 << 20);
+        file.clear();
+        final long fileGrowth = heapGrowth(file, frameBytes, frameCount);
+        final long heapGrowth = heapGrowth(new HeapFrames(), frameBytes, frameCount);
+
+        assertTrue(heapGrowth > retainedBytes / 2, "the measure sees the heap store: " + heapGrowth);
+        assertTrue(fileGrowth < retainedBytes / 8,
+            "the file store keeps " + retainedBytes + " bytes off the heap, and the heap grew " + fileGrowth);
+    }
+
+    /** The bytes that the heap holds after {@code count} frames of {@code bytes} go into {@code store}. */
+    private long heapGrowth(final RetainedFrames store, final int bytes, final int count) {
+        final long before = usedHeap();
+        IntStream.range(0, count).forEach(i -> record(store, i, bytes - SealerWire.RELAYED_HEADER_LEN));
+        final long growth = usedHeap() - before;
+        assertEquals(count, store.count());
+        return growth;
+    }
+
+    private static long usedHeap() {
+        IntStream.range(0, 3).forEach(i -> System.gc());
+        return ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+    }
+
+    @Test
+    void the_settings_parse_once_at_the_start() {
+        final Path clusterDir = Path.of("/opt/kardamom/cluster");
+        assertTrue(RetainedFile.Config.parse(null, null, clusterDir).isEmpty());
+        assertTrue(RetainedFile.Config.parse(" ", "1", clusterDir).isEmpty());
+        assertTrue(RetainedFile.Config.parse("false", null, clusterDir).isEmpty());
+        assertEquals(new RetainedFile.Config(clusterDir.resolve("retained"), RetainedFile.Config.DEFAULT_SEGMENT_BYTES),
+            RetainedFile.Config.parse("true", "", clusterDir).orElseThrow());
+        assertEquals(RetainedFile.Config.MIN_SEGMENT_BYTES,
+            RetainedFile.Config.parse("true", Integer.toString(RetainedFile.Config.MIN_SEGMENT_BYTES), clusterDir)
+                .orElseThrow().segmentBytes());
+        assertThrows(IllegalArgumentException.class, () -> RetainedFile.Config.parse("yes", null, clusterDir));
+        assertThrows(IllegalArgumentException.class, () -> RetainedFile.Config.parse(
+            "true", Integer.toString(RetainedFile.Config.MIN_SEGMENT_BYTES - 1), clusterDir));
+        assertThrows(IllegalArgumentException.class, () -> RetainedFile.Config.parse("true", "64m", clusterDir));
+    }
+}

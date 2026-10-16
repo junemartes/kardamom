@@ -5,8 +5,8 @@ import io.kardamom.sealer.CanonicalSealerState;
 /**
  * One sample of a member's health: its Raft role, the election state, the
  * commit position the consensus module knows, the position the service
- * has applied, and the snapshot versions the member writes, reads and
- * holds.
+ * has applied, the snapshot versions the member writes, reads and
+ * holds, and the free bytes of the disk that holds its state.
  *
  * <p>The sample is a plain value. The admin endpoint renders it as JSON, and
  * the readiness rule reads it. A member is ready when it holds a settled
@@ -44,6 +44,8 @@ final class MemberStatus {
     final long commitPosition;
     final long servicePosition;
     final SnapshotVersions snapshot;
+    /** The bytes that the member can still write to the disk of its retained file and its log. */
+    final long diskFreeBytes;
 
     MemberStatus(
             final int memberId,
@@ -51,13 +53,15 @@ final class MemberStatus {
             final String election,
             final long commitPosition,
             final long servicePosition,
-            final SnapshotVersions snapshot) {
+            final SnapshotVersions snapshot,
+            final long diskFreeBytes) {
         this.memberId = memberId;
         this.role = role;
         this.election = election;
         this.commitPosition = commitPosition;
         this.servicePosition = servicePosition;
         this.snapshot = snapshot;
+        this.diskFreeBytes = diskFreeBytes;
     }
 
     /**
@@ -83,7 +87,15 @@ final class MemberStatus {
             + ",\"snapshotReadsMin\":" + snapshot.readsMin()
             + ",\"snapshotReadsMax\":" + snapshot.readsMax()
             + ",\"snapshotLatest\":" + snapshot.latest()
+            + ",\"diskFreeBytes\":" + diskFreeBytes
             + ",\"ready\":" + isReady(lagBytes)
             + "}";
+    }
+
+    /** The Prometheus text of the gauges. */
+    String toMetrics() {
+        return "# HELP kardamom_sealer_disk_free_bytes The free bytes of the disk of the member state.\n"
+            + "# TYPE kardamom_sealer_disk_free_bytes gauge\n"
+            + "kardamom_sealer_disk_free_bytes{member_id=\"" + memberId + "\"} " + diskFreeBytes + "\n";
     }
 }
