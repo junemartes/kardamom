@@ -3,11 +3,9 @@
 //! validate, cache-answer, admission-check, and publish stages.
 //!
 //! The admission checks read the local account layer, then Redis on a
-//! miss when `[cache]` is on, then the executor query for a cold sender.
-//! The query answer stays for a TTL, so each cold sender costs one query.
-//! The query client sheds a query over its in-flight bound at once, and
-//! a shed or failed query admits: a flood of cold senders costs the
-//! executors at most that bound. A past nonce answers from a receipt:
+//! miss when `[cache]` is on, then the executor answer for a cold sender
+//! (see `crate::cold_accounts`). Only a fresh answer refuses: a stale,
+//! failed or shed query admits. A past nonce answers from a receipt:
 //! the local receipt cache, then the Redis receipt index. The same tx
 //! gets its receipt, across an ingress restart when Redis holds it;
 //! another tx at a nonce that a receipt proves used is `Duplicate`. A
@@ -24,7 +22,7 @@ use alloy_consensus::transaction::Transaction;
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256};
 use alloy_rlp::Decodable;
 
-use kardamom_cache::{AccountView, metrics as cache_metrics};
+use kardamom_cache::metrics as cache_metrics;
 use kardamom_types::{Receipt, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
@@ -275,33 +273,7 @@ where
                 fresh: redis.fresh(),
             });
         }
-        self.cold_state(sender).await
-    }
-
-    /// The state of a sender that no cache layer holds. A sender that
-    /// never sent and never received value has no row anywhere, and an
-    /// unknown sender would pass both the ingress and the sequencer. So
-    /// the executor query answers once, and the answer stays for a TTL.
-    /// The answer is committed state, so it is fresh. No query configured,
-    /// a shed query, or a failed query admits.
-    async fn cold_state(&self, sender: Address) -> Option<AccountState> {
-        if let Some(view) = self.cold.get(sender) {
-            cache_metrics::record_lookup("cold", "hit");
-            return Some(AccountState { view, fresh: true });
-        }
-        let query = self.query.as_ref()?;
-        let (nonce, balance) = tokio::join!(query.nonce(sender), query.balance(sender));
-        let (Ok(nonce), Ok(balance)) = (nonce, balance) else {
-            cache_metrics::record_lookup("cold", "error");
-            return None;
-        };
-        cache_metrics::record_lookup("cold", "miss");
-        let view = AccountView {
-            nonce: u64::try_from(nonce.value).ok()?,
-            balance: balance.value,
-            tx_idx: nonce.tx_idx.min(balance.tx_idx),
-        };
-        self.cold.insert(sender, view.clone());
+        let view = self.cold.fresh_state(sender).await?;
         Some(AccountState { view, fresh: true })
     }
 

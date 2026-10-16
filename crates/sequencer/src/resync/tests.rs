@@ -15,6 +15,19 @@ fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWaterm
     (controller, floor_tx, watermark)
 }
 
+/// `(sender, nonce-or-floor)` pairs.
+type Pairs = Vec<(Address, u64)>;
+
+/// The raised floors and the confirmations of one receipt drain.
+fn raised_and_confirmed(c: &mut ResyncController) -> (Pairs, Pairs) {
+    let ReceiptDrain {
+        raised,
+        confirmations,
+        ..
+    } = c.drain_floor_updates();
+    (raised, confirmations)
+}
+
 fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
     // Boundaries flow (the count advances). No lag flag, no stall.
     // The exit hold elapses across a few observe calls.
@@ -109,21 +122,13 @@ fn publish_stall_enters() {
 fn floor_updates_raise_and_report() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
     tx.send(FloorUpdate::executed(s(1), 4)).unwrap();
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(raised, vec![(s(1), 5)]);
     assert_eq!(confirmations, vec![(s(1), 4)], "every receipt confirms");
     assert_eq!(c.floor(s(1)), Some(5), "nonces 0..=4 proven executed");
     assert_eq!(c.floor(s(2)), None, "unknown sender has no proof");
     // Re-draining with nothing pending raises nothing.
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty() && confirmations.is_empty());
 }
 
@@ -139,11 +144,7 @@ fn skip_receipts_confirm_but_never_raise_floors() {
         kardamom_types::SkipReason::NonceTooLow,
     ))
     .unwrap();
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty(), "skip is not floor evidence");
     assert_eq!(c.floor(s(1)), None);
     assert_eq!(confirmations, vec![(s(1), 7)], "skip IS a confirmation");
@@ -152,7 +153,8 @@ fn skip_receipts_confirm_but_never_raise_floors() {
 /// A skip uses no nonce, so each skip names the nonce the chain expects
 /// next. An insufficient-funds skip names its own nonce. A
 /// nonce-too-high skip names the receipt floor, 0 for a sender with no
-/// executed receipt. A nonce-too-low skip names nothing.
+/// executed receipt. A nonce-too-low skip names nothing, and so does a
+/// late skip below the receipt floor.
 #[test]
 fn skip_receipts_release_to_the_chain_nonce() {
     use kardamom_types::SkipReason;
@@ -168,6 +170,8 @@ fn skip_receipts_release_to_the_chain_nonce() {
         .unwrap();
     tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow))
         .unwrap();
+    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds))
+        .unwrap();
     let ReceiptDrain {
         raised, released, ..
     } = c.drain_floor_updates();
@@ -175,7 +179,7 @@ fn skip_receipts_release_to_the_chain_nonce() {
     assert_eq!(
         released,
         vec![(s(1), 0), (s(1), 0), (s(2), 5), (s(2), 7)],
-        "each skip names the chain nonce; a too-low skip names none"
+        "each skip names the chain nonce; a too-low or late skip names none"
     );
 }
 
@@ -187,11 +191,7 @@ fn deposit_receipts_neither_confirm_nor_raise() {
     // nonce.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
     tx.send(FloorUpdate::deposit(s(1))).unwrap();
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty() && confirmations.is_empty());
 }
 
@@ -244,11 +244,7 @@ fn a_receipt_maps_to_its_outcome() {
 fn genuine_nonce_zero_tx_confirms_and_raises() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
     tx.send(FloorUpdate::executed(s(1), 0)).unwrap();
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(
         confirmations,
         vec![(s(1), 0)],
@@ -268,11 +264,7 @@ fn nonce_zero_skip_confirms_without_raising() {
         kardamom_types::SkipReason::NonceTooLow,
     ))
     .unwrap();
-    let ReceiptDrain {
-        raised,
-        confirmations,
-        ..
-    } = c.drain_floor_updates();
+    let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(confirmations, vec![(s(1), 0)]);
     assert!(raised.is_empty(), "a skip consumed no nonce");
 }
@@ -325,7 +317,7 @@ fn floors_are_monotonic() {
     // A lower receipt arriving later (a late multicast frame) must not
     // regress the floor.
     tx.send(FloorUpdate::executed(s(1), 3)).unwrap();
-    let ReceiptDrain { raised, .. } = c.drain_floor_updates();
+    let (raised, _) = raised_and_confirmed(&mut c);
     assert_eq!(raised, vec![(s(1), 10)]);
     assert_eq!(c.floor(s(1)), Some(10));
 }

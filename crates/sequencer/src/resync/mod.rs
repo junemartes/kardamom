@@ -41,8 +41,10 @@ use serde::{Deserialize, Serialize};
 use crate::metrics;
 
 mod answers;
+mod floor;
 
 pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
+pub use floor::{FloorUpdate, Outcome};
 
 /// Milliseconds since `since`, saturated to `u64::MAX`. An elapsed time
 /// this large never happens in practice, and saturating keeps a
@@ -51,139 +53,6 @@ pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
 #[must_use]
 pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
     kardamom_types::time::duration_to_ms_saturating(now.duration_since(since))
-}
-
-/// One executed-truth observation. Two sources produce it:
-///
-/// - The `tx_receipts` stream: one update per receipt of this replica's
-///   senders. See [`FloorUpdate::of_receipt`].
-/// - The nonce lookup (`crate::lookup`): an executor reports the committed
-///   account nonce `c`, so every nonce below `c` executed. The task sends
-///   [`Outcome::Executed`] at `c - 1`, and nothing for `c == 0`. The
-///   controller treats both sources the same: the floor rises to `c`, and
-///   published refs at or below `c - 1` count as confirmed, because the
-///   committed state proves them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FloorUpdate {
-    pub sender: Address,
-    pub outcome: Outcome,
-}
-
-/// What one [`FloorUpdate`] proves about its sender.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// The tx at `nonce` executed. It confirms the publish, and it is
-    /// floor evidence: the floor rises to `nonce + 1`.
-    Executed { nonce: u64 },
-    /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
-    /// nonce. Ordering in the canonical log confirms the publish. The
-    /// floor does not rise. The floor logic does not read `reason`.
-    Skipped {
-        nonce: u64,
-        reason: kardamom_types::SkipReason,
-    },
-    /// An L1-originated deposit. It has no L2 nonce, so it is neither a
-    /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
-    /// it, so a genuine nonce-0 tx is never taken for a deposit.
-    Deposit,
-}
-
-impl Outcome {
-    /// The nonce whose publish this confirms. `None` for a deposit.
-    #[must_use]
-    pub(crate) fn confirmed(self) -> Option<u64> {
-        match self {
-            Self::Executed { nonce } | Self::Skipped { nonce, .. } => Some(nonce),
-            Self::Deposit => None,
-        }
-    }
-
-    /// The floor this proves. `Some` only for an executed tx.
-    #[must_use]
-    pub(crate) fn floor(self) -> Option<u64> {
-        match self {
-            Self::Executed { nonce } => Some(nonce.saturating_add(1)),
-            Self::Skipped { .. } | Self::Deposit => None,
-        }
-    }
-
-    /// The nonce the chain expects next after a skip, as far as the
-    /// receipt floor `floor` of the sender shows it. A skip uses no
-    /// nonce, so a nonce floor above this value is above the chain.
-    ///
-    /// - A nonce-too-low skip proves nothing new: the chain is past its
-    ///   nonce. `None`.
-    /// - A nonce-too-high skip proves only that the chain is below its
-    ///   nonce. The receipt floor is the best bound.
-    /// - Every other skip leaves the chain at its nonce, or at the
-    ///   receipt floor when that is higher.
-    ///
-    /// `None` for an executed tx and for a deposit.
-    #[must_use]
-    pub(crate) fn released(self, floor: u64) -> Option<u64> {
-        use kardamom_types::SkipReason;
-        match self {
-            Self::Skipped {
-                reason: SkipReason::NonceTooLow,
-                ..
-            }
-            | Self::Executed { .. }
-            | Self::Deposit => None,
-            Self::Skipped {
-                reason: SkipReason::NonceTooHigh,
-                ..
-            } => Some(floor),
-            Self::Skipped { nonce, .. } => Some(nonce.max(floor)),
-        }
-    }
-}
-
-impl FloorUpdate {
-    /// The update for one receipt. A deposit wins over a skip reason.
-    #[must_use]
-    pub fn of_receipt(receipt: &kardamom_types::Receipt) -> Self {
-        let outcome = match (receipt.is_deposit(), receipt.skip_reason) {
-            (true, _) => Outcome::Deposit,
-            (false, Some(reason)) => Outcome::Skipped {
-                nonce: receipt.nonce,
-                reason,
-            },
-            (false, None) => Outcome::Executed {
-                nonce: receipt.nonce,
-            },
-        };
-        Self {
-            sender: receipt.from,
-            outcome,
-        }
-    }
-
-    /// An executed tx of `sender` at `nonce`.
-    #[must_use]
-    pub fn executed(sender: Address, nonce: u64) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Executed { nonce },
-        }
-    }
-
-    /// A skipped tx of `sender` at `nonce`.
-    #[must_use]
-    pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Skipped { nonce, reason },
-        }
-    }
-
-    /// A deposit to `sender`.
-    #[must_use]
-    pub fn deposit(sender: Address) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Deposit,
-        }
-    }
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -267,6 +136,11 @@ pub struct ResyncConfig {
     /// Republishing early is harmless, since dedup absorbs it. Republishing
     /// late leaves voided refs unrecovered longer.
     pub confirm_timeout_ms: u64,
+    /// How long a sender must stay behind the sealer's nonce guard before
+    /// the sequencer calls it stuck. Within this time an ordered ref can
+    /// still execute and raise the receipt floor. Sized as the confirm
+    /// timeout: past it, the receipts of every ordered ref have arrived.
+    pub nonce_ahead_settle_ms: u64,
 }
 
 /// [`ResyncConfig::default`]'s dedup ring capacity: `2^17` entries.
@@ -284,6 +158,7 @@ impl Default for ResyncConfig {
             publish_stall_ms: 10_000,
             exit_hold_ms: 2_000,
             confirm_timeout_ms: 15_000,
+            nonce_ahead_settle_ms: 15_000,
         }
     }
 }

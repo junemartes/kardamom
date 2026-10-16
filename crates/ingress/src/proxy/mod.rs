@@ -153,16 +153,16 @@ where
     /// The local account layer the subscription feeds. The admission
     /// checks and the account RPCs read it. See `kardamom_cache::live`.
     pub(crate) live: Arc<LiveAccounts>,
-    /// The executor query behind the account RPCs, and behind the
-    /// admission checks of a cold sender. `None` when the config names no
-    /// endpoint: a local miss is then an error for an RPC, and an admit
-    /// for a submit, never a stall.
+    /// The executor query behind the account RPCs. `None` when the
+    /// config names no endpoint: a local miss is then an error, never a
+    /// stall. The admission path never calls it: it has its own client
+    /// in `cold`.
     pub(crate) query: Option<ExecutorQuery>,
     /// The Redis layer. `None` with `[cache]` off: no Redis call exists
     /// on any path. See `kardamom_cache::reader`.
     pub(crate) redis: Option<Arc<CacheReader>>,
-    /// The executor answers for the senders no cache layer holds. The
-    /// admission path fills it, so a cold sender costs one query per TTL.
+    /// The executor answers for the senders no cache layer holds, over
+    /// the admission's own query client. See `crate::cold_accounts`.
     pub(crate) cold: Arc<ColdAccounts>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
@@ -262,6 +262,11 @@ where
             ))
         });
         let cluster_status = subscription.cluster_status();
+        let cold = Arc::new(ColdAccounts::new(
+            &cfg.executor_query,
+            cfg.cache.max_stale_txs,
+            live.clone(),
+        ));
         let me = Self {
             cfg,
             partition_count_m,
@@ -276,7 +281,7 @@ where
             live,
             query,
             redis,
-            cold: Arc::default(),
+            cold,
             latest_block_number: Arc::new(AtomicU64::new(0)),
             fee_history: Arc::new(crate::fee_history::FeeHistory::default()),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,

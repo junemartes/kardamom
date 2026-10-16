@@ -71,15 +71,11 @@ impl<T> UnconfirmedLedger<T> {
         self.entries.contains_key(&(sender, nonce))
     }
 
-    /// Whether the ledger holds a ref of `sender` at a nonce in
-    /// `nonces`. An empty range holds none.
-    pub(crate) fn holds_in(&self, sender: Address, nonces: std::ops::Range<u64>) -> bool {
-        nonces.start < nonces.end
-            && self
-                .entries
-                .range((sender, nonces.start)..(sender, nonces.end))
-                .next()
-                .is_some()
+    /// The refs of `sender` the ledger holds at `from` or a later nonce.
+    pub(crate) fn count_from(&self, sender: Address, from: u64) -> usize {
+        self.entries
+            .range((sender, from)..=(sender, u64::MAX))
+            .count()
     }
 
     /// Retain a just-published ref until a receipt proves canonical

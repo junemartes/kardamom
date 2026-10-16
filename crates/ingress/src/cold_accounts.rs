@@ -2,59 +2,162 @@
 //!
 //! A sender with no row in the local layer or in Redis is cold: it never
 //! sent a transaction and never received value, or its rows aged out.
-//! The admission path asks the executor query once for such a sender and
-//! keeps the answer here. So each cold sender costs one query per TTL,
-//! not one query per submit. A row in the local layer always wins: the
-//! admission path reads this map only after the local layer and Redis
-//! missed.
+//! The admission path asks an executor once for such a sender and keeps
+//! the answer here, so each cold sender costs one query pair per TTL, not
+//! one per submit. A row in the local layer always wins: the admission
+//! path reads this map only after the local layer and Redis missed.
+//!
+//! Only a fresh answer can refuse a submit. An answer is fresh when the
+//! executor's snapshot is within `max_stale_txs` positions of the newest
+//! position this ingress has seen, the same rule as for Redis. A stale
+//! answer, a failed query, and a query shed over the in-flight bound
+//! admit, and the map keeps that outcome for a short time, so a hung or
+//! lagging executor costs one wait per sender, not one per submit.
+//!
+//! The admission path has its own query client, with its own in-flight
+//! bound. A flood of cold submits can only make the admission fail open.
+//! It cannot shed the account RPCs or the receipt lookups.
 //!
 //! The map is bounded, oldest first, like the receipt cache: the insert
 //! that fills the ring retires the oldest address.
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
-use kardamom_cache::AccountView;
+use kardamom_cache::{
+    AccountView, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, QueryAnswer,
+    metrics as cache_metrics,
+};
 
 /// The bound on cold senders the map holds.
 const CAPACITY: NonZeroUsize = NonZeroUsize::new(64 * 1024).unwrap();
 
-/// How long an answer stays. A cold sender that gets funds or lands a
-/// transaction gets a row in the local layer, which wins. So the TTL
+/// The bound on admission queries in flight, for each ingress. Each cold
+/// sender takes two: the nonce and the balance.
+const IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
+/// How long a fresh answer stays. A cold sender that gets funds or lands
+/// a transaction gets a row in the local layer, which wins. So the TTL
 /// bounds only a missed receipt frame, and it matches the local layer's
 /// default TTL.
-const TTL: Duration = Duration::from_secs(30);
+const KNOWN_TTL: Duration = Duration::from_secs(30);
 
-/// The executor answers, by address, with the time each one came.
-pub(crate) struct ColdAccounts {
-    map: DashMap<Address, (AccountView, Instant)>,
-    order: ArrayQueue<Address>,
+/// How long an unknown outcome stays: a stale answer, a failed query, or
+/// a shed query. A submit in this time admits at once.
+const UNKNOWN_TTL: Duration = Duration::from_secs(3);
+
+/// What the admission path learned of one cold sender.
+#[derive(Clone)]
+enum Slot {
+    /// A fresh answer: the committed state of the sender.
+    Known(AccountView),
+    /// No answer that can refuse a submit.
+    Unknown,
 }
 
-impl Default for ColdAccounts {
-    fn default() -> Self {
-        Self {
-            map: DashMap::new(),
-            order: ArrayQueue::new(CAPACITY.get()),
+impl Slot {
+    fn ttl(&self) -> Duration {
+        match self {
+            Self::Known(_) => KNOWN_TTL,
+            Self::Unknown => UNKNOWN_TTL,
         }
     }
 }
 
+/// The admission query client, its answers by address, and the staleness
+/// rule that decides which answers can refuse.
+pub(crate) struct ColdAccounts {
+    query: Option<ExecutorQuery>,
+    live: Arc<LiveAccounts>,
+    max_stale: u64,
+    map: DashMap<Address, (Slot, Instant)>,
+    order: ArrayQueue<Address>,
+}
+
 impl ColdAccounts {
-    /// The answer for `address`, when one came within the TTL.
-    pub(crate) fn get(&self, address: Address) -> Option<AccountView> {
-        let entry = self.map.get(&address)?;
-        (entry.1.elapsed() <= TTL).then(|| entry.0.clone())
+    /// The map over its own query client to the endpoints of `cfg`. No
+    /// endpoint means no client: every cold sender admits.
+    pub(crate) fn new(
+        cfg: &ExecutorQueryConfig,
+        max_stale: NonZeroU64,
+        live: Arc<LiveAccounts>,
+    ) -> Self {
+        let query = ExecutorQuery::new(&ExecutorQueryConfig {
+            max_in_flight: IN_FLIGHT,
+            ..cfg.clone()
+        });
+        Self {
+            query,
+            live,
+            max_stale: max_stale.get(),
+            map: DashMap::new(),
+            order: ArrayQueue::new(CAPACITY.get()),
+        }
     }
 
-    /// Keep the answer for `address`. A full ring retires the oldest
+    /// The fresh committed state of `sender`, from the map or from one
+    /// query pair. `None` admits: no client, an unknown outcome, or a
+    /// stale answer.
+    pub(crate) async fn fresh_state(&self, sender: Address) -> Option<AccountView> {
+        if let Some(slot) = self.get(sender) {
+            cache_metrics::record_lookup("cold", "hit");
+            return match slot {
+                Slot::Known(view) => Some(view),
+                Slot::Unknown => None,
+            };
+        }
+        let query = self.query.as_ref()?;
+        let (nonce, balance) = tokio::join!(query.nonce(sender), query.balance(sender));
+        let slot = if let (Ok(nonce), Ok(balance)) = (nonce, balance) {
+            self.judge(&nonce, &balance)
+        } else {
+            cache_metrics::record_lookup("cold", "error");
+            Slot::Unknown
+        };
+        self.insert(sender, slot.clone());
+        match slot {
+            Slot::Known(view) => Some(view),
+            Slot::Unknown => None,
+        }
+    }
+
+    /// The slot for one answer pair. The older snapshot of the two
+    /// decides the staleness. A snapshot with no position header is
+    /// stale.
+    fn judge(&self, nonce: &QueryAnswer, balance: &QueryAnswer) -> Slot {
+        let tx_idx = nonce.tx_idx.min(balance.tx_idx);
+        let lag = self.live.head().saturating_sub(tx_idx);
+        let (Ok(nonce), true) = (
+            u64::try_from(nonce.value),
+            tx_idx > 0 && lag <= self.max_stale,
+        ) else {
+            cache_metrics::record_lookup("cold", "stale");
+            return Slot::Unknown;
+        };
+        cache_metrics::record_lookup("cold", "miss");
+        Slot::Known(AccountView {
+            nonce,
+            balance: balance.value,
+            tx_idx,
+        })
+    }
+
+    /// The slot of `address`, when it is within its TTL.
+    fn get(&self, address: Address) -> Option<Slot> {
+        let entry = self.map.get(&address)?;
+        let (slot, at) = entry.value();
+        (at.elapsed() <= slot.ttl()).then(|| slot.clone())
+    }
+
+    /// Keep the slot of `address`. A full ring retires the oldest
     /// address. A retired address that came again since then loses its
-    /// newer answer too, which costs one more query and nothing else.
-    pub(crate) fn insert(&self, address: Address, view: AccountView) {
-        self.map.insert(address, (view, Instant::now()));
+    /// newer slot too, which costs one more query and nothing else.
+    fn insert(&self, address: Address, slot: Slot) {
+        self.map.insert(address, (slot, Instant::now()));
         if let Some(oldest) = self.order.force_push(address) {
             self.map.remove(&oldest);
         }
@@ -64,6 +167,7 @@ impl ColdAccounts {
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
+    use kardamom_cache::LiveAccountsConfig;
 
     use super::*;
 
@@ -71,22 +175,52 @@ mod tests {
         AccountView {
             nonce,
             balance: U256::ZERO,
-            tx_idx: 0,
+            tx_idx: 1,
+        }
+    }
+
+    fn cold() -> ColdAccounts {
+        let (live, _writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        ColdAccounts::new(
+            &ExecutorQueryConfig::default(),
+            NonZeroU64::new(8).unwrap(),
+            live,
+        )
+    }
+
+    fn known_nonce(cold: &ColdAccounts, address: Address) -> Option<u64> {
+        match cold.get(address)? {
+            Slot::Known(view) => Some(view.nonce),
+            Slot::Unknown => None,
         }
     }
 
     #[test]
-    fn an_answer_is_kept_and_the_ring_retires_the_oldest() {
-        let cold = ColdAccounts::default();
+    fn a_slot_is_kept_and_the_ring_retires_the_oldest() {
+        let cold = cold();
         let first = Address::repeat_byte(0x01);
-        cold.insert(first, view(3));
-        assert_eq!(cold.get(first).map(|v| v.nonce), Some(3));
+        cold.insert(first, Slot::Known(view(3)));
+        assert_eq!(known_nonce(&cold, first), Some(3));
         (0..CAPACITY.get()).for_each(|i| {
             let mut bytes = [0xffu8; 20];
             bytes[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
-            cold.insert(Address::from(bytes), view(0));
+            cold.insert(Address::from(bytes), Slot::Unknown);
         });
         assert!(cold.get(first).is_none(), "the oldest address retires");
         assert_eq!(cold.map.len(), CAPACITY.get());
+    }
+
+    /// An answer with no position header, or one far behind the head,
+    /// cannot refuse a submit.
+    #[test]
+    fn a_stale_answer_is_unknown() {
+        let cold = cold();
+        let answer = |tx_idx| QueryAnswer {
+            value: U256::ZERO,
+            block: 0,
+            tx_idx,
+        };
+        assert!(matches!(cold.judge(&answer(0), &answer(0)), Slot::Unknown));
+        assert!(matches!(cold.judge(&answer(5), &answer(5)), Slot::Known(_)));
     }
 }

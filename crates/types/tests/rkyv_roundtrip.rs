@@ -203,8 +203,8 @@ fn record_lag_tx_error_roundtrip() {
     assert_eq!(back.reason.expected_nonce(), None);
 }
 
-/// The nonce-ahead refusal keeps both nonces and its reason word through
-/// the wire.
+/// The two nonce-guard refusals keep their nonces and their reason words
+/// through the wire, and name no nonce to sign.
 #[test]
 fn sealer_nonce_ahead_tx_error_roundtrip() {
     let e = TxError {
@@ -218,7 +218,15 @@ fn sealer_nonce_ahead_tx_error_roundtrip() {
     let back = roundtrip(&e);
     assert_eq!(back, e);
     assert_eq!(back.reason.word(), "sealer-nonce-ahead");
-    assert_eq!(back.reason.expected_nonce(), Some(25));
+    assert_eq!(back.reason.expected_nonce(), None, "no nonce to sign");
+    let e = TxError {
+        reason: TxErrorReason::NonceInFlight { chain_nonce: 4 },
+        ..e
+    };
+    let back = roundtrip(&e);
+    assert_eq!(back, e);
+    assert_eq!(back.reason.word(), "nonce-in-flight");
+    assert_eq!(back.reason.expected_nonce(), None);
 }
 
 #[test]

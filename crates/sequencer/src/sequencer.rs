@@ -63,6 +63,7 @@ use crate::fees::FeeGate;
 use crate::inbound::{Inbound, TxDataSubscriber};
 use crate::lookup::LookupRequester;
 use crate::metrics;
+use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
@@ -230,6 +231,8 @@ pub struct Sequencer {
     /// [`crate::unconfirmed`] for the ledger semantics and the
     /// expiry-queue mechanics.
     unconfirmed: UnconfirmedLedger<RefMetadata>,
+    /// The senders that the sealer's nonce guard rejects above the chain.
+    nonce_ahead: NonceAheadWatch,
     /// The nonce lookup seam. `None` when the binary has no executor
     /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
     lookup: Option<LookupRequester>,
@@ -269,12 +272,15 @@ impl Sequencer {
         });
         metrics::record_shadow_vslots(cfg.partition_index, cfg.shadow_vslots.len());
         let depth = DepthReport::new(now, cfg.partition_index);
+        let nonce_ahead =
+            NonceAheadWatch::new(Duration::from_millis(cfg.resync.nonce_ahead_settle_ms));
         Ok(Self {
             state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
             hot,
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
+            nonce_ahead,
             lookup: None,
             vslots,
             shadow,

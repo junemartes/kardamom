@@ -244,7 +244,9 @@ fn a_refused_tail_is_offered_again_on_resubmit() {
 /// to 3 long ago, and no receipt came. The confirm sweep republishes
 /// them, and the sealer refuses each late copy. The floor stays, a new
 /// nonce publishes at once, and nothing expires. A resubmit of a refused
-/// nonce is offered, and the sealer answers it as a past nonce.
+/// nonce is offered, and the sealer answers it as a past nonce. The
+/// replica holds no ref of the ordered nonces now, and no receipt came,
+/// so the client hears that a nonce is in flight.
 #[test]
 fn a_late_copy_of_an_ordered_ref_keeps_the_floor() {
     let s = signer(23);
@@ -266,7 +268,11 @@ fn a_late_copy_of_an_ordered_ref_keeps_the_floor() {
     sealed.step_after_ttl();
     sealed.submit(&s, 5);
     assert_eq!(sealed.offered_nonces(10), vec![5], "the floor stays at 5");
-    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+    assert_eq!(
+        sealed.errors_but_refusals(),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }],
+        "nothing expires"
+    );
 }
 
 /// The twins of a shard get the same sealer answers in a different
@@ -487,9 +493,8 @@ fn a_window_full_answer_republishes_a_held_ref() {
 
 /// The executors skip nonce 0 for lack of funds. The skip uses no nonce,
 /// so the floor goes back to 0: nonce 1 waits on the gap and does not
-/// publish, and the resubmit at 0 publishes, with 1 behind it. Before
-/// the release, nonce 1 published at once into the nonce gap of the
-/// chain, and the resubmit at 0 was a past nonce.
+/// publish into a nonce gap of the chain, and the resubmit at 0
+/// publishes, with 1 behind it.
 #[test]
 fn a_skip_receipt_reopens_the_skipped_nonce() {
     let s = signer(41);
@@ -504,15 +509,23 @@ fn a_skip_receipt_reopens_the_skipped_nonce() {
     assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
 }
 
+/// A sequencer whose nonce-guard settle time is 20 ms.
+fn short_settle() -> Sealed {
+    let mut cfg = one_partition_cfg();
+    cfg.resync.nonce_ahead_settle_ms = 20;
+    Sealed::new(cfg)
+}
+
 /// The sealer's guard counted nonces 0 to 2, and the executors skipped
 /// all three. The resubmit at 0 publishes, and the guard rejects it with
-/// `expected=3`. The client hears that the guard is ahead of the chain,
-/// and the next resubmit is offered again. Before, the reject dropped
-/// the ref as ordered, and the client heard nothing.
+/// `expected=3`. Within the settle time, the client gets the retryable
+/// `NonceInFlight`. The next resubmit is offered again, and after the
+/// settle time its reject tells the client that the guard is ahead of
+/// the chain.
 #[test]
 fn a_guard_ahead_of_the_chain_answers_the_client() {
     let s = signer(42);
-    let mut sealed = Sealed::new(one_partition_cfg());
+    let mut sealed = short_settle();
     (0..3).for_each(|n| sealed.submit(&s, n));
     sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
     sealed.skip(s.address(), 1, SkipReason::NonceTooHigh);
@@ -522,15 +535,23 @@ fn a_guard_ahead_of_the_chain_answers_the_client() {
     assert_eq!(sealed.offered_nonces(3), vec![0]);
     sealed.reject(s.address(), &[0], 3);
     sealed.step();
-    assert_eq!(
-        sealed.errors_of(0),
-        vec![TxErrorReason::SealerNonceAhead {
-            expected_nonce: 3,
-            chain_nonce: 0,
-        }]
-    );
+    let in_flight = TxErrorReason::NonceInFlight { chain_nonce: 0 };
+    assert_eq!(sealed.errors_of(0), vec![in_flight.clone()]);
+    std::thread::sleep(Duration::from_millis(40));
     sealed.submit(&s, 0);
     assert_eq!(sealed.offered_nonces(3), vec![0, 0], "offered again");
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    assert_eq!(
+        sealed.errors_of(0),
+        vec![
+            in_flight,
+            TxErrorReason::SealerNonceAhead {
+                expected_nonce: 3,
+                chain_nonce: 0,
+            }
+        ]
+    );
 }
 
 /// A reject below the expected nonce, while the ledger holds the refs
@@ -539,9 +560,28 @@ fn a_guard_ahead_of_the_chain_answers_the_client() {
 #[test]
 fn a_reject_with_refs_in_flight_is_an_ordered_ref() {
     let s = signer(43);
-    let mut sealed = Sealed::new(one_partition_cfg());
+    let mut sealed = short_settle();
     (0..3).for_each(|n| sealed.submit(&s, n));
     sealed.reject(s.address(), &[0], 3);
     sealed.step();
     assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
+}
+
+/// A replica that restarted holds no ledger entry for the ordered ref at
+/// 1, which has not executed. The client sends a new transaction at 1,
+/// and the guard rejects it with `expected=2`. That is the chain nonce
+/// plus the one ref in flight, so the replica does not call the sender
+/// stuck, after the settle time too.
+#[test]
+fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
+    let s = signer(44);
+    let mut sealed = short_settle();
+    sealed.execute(s.address(), 0);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(0), vec![1]);
+    std::thread::sleep(Duration::from_millis(40));
+    sealed.reject(s.address(), &[1], 2);
+    sealed.step();
+    assert_eq!(sealed.errors_of(1), Vec::<TxErrorReason>::new());
 }

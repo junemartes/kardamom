@@ -457,6 +457,10 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             expected_nonce: *expected_nonce,
             chain_nonce: *chain_nonce,
         },
+        TxErrorReason::NonceInFlight { chain_nonce } => IngressError::NonceInFlight {
+            sender_nonce: (sender, nonce),
+            chain_nonce: *chain_nonce,
+        },
     }
 }
 

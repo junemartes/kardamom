@@ -57,10 +57,12 @@ pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_water
 /// Skip receipts that moved a sender's nonce floor back down. A skip uses
 /// no nonce, so the floor goes back to the nonce the chain expects.
 pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
-/// Contiguity rejects whose expected nonce is above every nonce this
-/// replica can prove: the sealer's nonce guard is ahead of the chain
-/// after a skip. The sender is stuck until an operator resets the guard.
-/// Alert on any increase.
+/// Contiguity rejects whose expected nonce stays above the chain nonce
+/// plus the refs in flight for the settle time: the sealer's nonce guard
+/// is ahead of the chain after a skip. The sender is stuck until an
+/// operator acts. A client that keeps resubmitting counts once per try,
+/// so alert on a rate that stays above zero over some minutes, not on
+/// one increase.
 pub(crate) const SEALER_NONCE_AHEAD: &str = "kardamom_sequencer_sealer_nonce_ahead_total";
 /// The unix time of the last boundary frame the cluster egress delivered.
 /// The readiness rule requires one within the boundary-silence window:

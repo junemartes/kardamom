@@ -62,6 +62,7 @@ impl Sequencer {
     /// loop: advance the state machine's floor, and record the drops it
     /// proves, if the floor actually moved.
     fn apply_one_floor_update(&mut self, sender: Address, floor: u64) {
+        self.nonce_ahead.forget(sender);
         let Some((from, dropped)) = self.state.advance_floor(sender, floor) else {
             return;
         };

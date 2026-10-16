@@ -5,11 +5,13 @@
 use std::time::Instant;
 
 use alloy_primitives::Address;
+use kardamom_types::num::usize_to_u64;
 use kardamom_types::{TxError, TxErrorReason};
 use tracing::{trace, warn};
 
 use super::{RefMetadata, Sequencer, SequencerPorts};
 use crate::metrics;
+use crate::nonce_ahead::Verdict;
 use crate::resync::{AnswerDrain, SealerRefusal};
 use crate::state::FreedNonce;
 
@@ -173,19 +175,25 @@ impl Sequencer {
     }
 
     /// One contiguity reject below the expected nonce, for
-    /// [`Self::apply_sealer_answers`]'s first loop. Two cases:
+    /// [`Self::apply_sealer_answers`]'s first loop. Three cases:
     ///
     /// - The sealer ordered the ref: the guard accepted it on the way up,
     ///   and its window entry aged out. Then every nonce below `expected`
-    ///   is on the chain, or is in this replica's ledger on its way there.
+    ///   is on the chain, or is in this replica's ledger on its way there:
+    ///   `expected` is at most the receipt floor plus the refs in flight.
     ///   Drop the ledger entry like on a receipt. See
     ///   `UnconfirmedLedger::drop_committed`.
-    /// - The guard is ahead of the chain: `expected` is above the receipt
-    ///   floor, and the ledger holds no ref between the rejected nonce and
-    ///   `expected`. An executor skipped a transaction that the guard
-    ///   counted, and the guard refuses every lower nonce of the sender.
-    ///   No republish can order the ref. Refuse it like a sealer refusal,
-    ///   with a reason that names both nonces, so the client hears of it.
+    /// - `expected` is above that bound, and it stays so for the settle
+    ///   time: an executor skipped a transaction that the guard counted,
+    ///   and the guard refuses every lower nonce of the sender. Refuse the
+    ///   ref like a sealer refusal, with a reason that names both nonces.
+    /// - `expected` is above that bound, but the settle time has not
+    ///   passed: the sealer can still hold an ordered ref that this
+    ///   replica does not know, for example after a restart. Refuse the
+    ///   ref with a retryable reason.
+    ///
+    /// Each refusal takes the ref out of the ledger and marks the nonce,
+    /// so the resubmit is offered again.
     fn apply_past_reject<P: SequencerPorts>(&mut self, ports: &mut P, past: PastReject) {
         let PastReject {
             sender,
@@ -193,23 +201,27 @@ impl Sequencer {
             expected,
             chain,
         } = past;
-        let in_flight = self
-            .unconfirmed
-            .holds_in(sender, nonce.saturating_add(1)..expected);
-        if expected <= chain || in_flight {
+        let in_flight = usize_to_u64(self.unconfirmed.count_from(sender, chain));
+        if expected <= chain.saturating_add(in_flight) {
             self.drop_committed_and_trace(sender, nonce);
             return;
         }
-        metrics::record_sealer_nonce_ahead(self.cfg.partition_index);
+        let reason = match self.nonce_ahead.observe(sender, chain, Instant::now()) {
+            Verdict::Stuck => {
+                metrics::record_sealer_nonce_ahead(self.cfg.partition_index);
+                TxErrorReason::SealerNonceAhead {
+                    expected_nonce: expected,
+                    chain_nonce: chain,
+                }
+            }
+            Verdict::InFlight => TxErrorReason::NonceInFlight { chain_nonce: chain },
+        };
         self.report_refusal(
             ports,
             SealerRefusal {
                 sender,
                 nonce,
-                reason: TxErrorReason::SealerNonceAhead {
-                    expected_nonce: expected,
-                    chain_nonce: chain,
-                },
+                reason,
             },
         );
     }

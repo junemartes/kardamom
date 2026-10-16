@@ -106,6 +106,14 @@ pub enum TxErrorReason {
         expected_nonce: u64,
         chain_nonce: u64,
     },
+    /// The sealer's nonce guard expects a nonce of the sender above
+    /// `chain_nonce` and above the transactions the sequencer knows are
+    /// in flight. The sealer can hold an ordered transaction that is not
+    /// executed yet, so the sequencer does not call the sender stuck
+    /// before the receipts settle. The transaction is not ordered. The
+    /// client waits for the receipts of its earlier transactions, then
+    /// resubmits.
+    NonceInFlight { chain_nonce: u64 },
 }
 
 impl TxErrorReason {
@@ -124,26 +132,30 @@ impl TxErrorReason {
             Self::DaLag { .. } => "da-lag",
             Self::RecordLag { .. } => "record-lag",
             Self::SealerNonceAhead { .. } => "sealer-nonce-ahead",
+            Self::NonceInFlight { .. } => "nonce-in-flight",
         }
     }
 
     /// The next nonce the sequencer expects from the sender, for the
     /// reasons that name one. A deadline names a block, a fee reason
     /// names amounts, and a halt names the chain's state, so these
-    /// reasons name no nonce.
+    /// reasons name no nonce. A nonce-guard reason names no nonce either:
+    /// the sealer refuses the chain nonce, and the nonce of the guard is
+    /// above the chain, so neither nonce is one the client can sign.
     #[must_use]
     pub fn expected_nonce(&self) -> Option<u64> {
         match self {
             Self::DuplicatedTx { expected_nonce }
             | Self::Evicted { expected_nonce }
-            | Self::Expired { expected_nonce }
-            | Self::SealerNonceAhead { expected_nonce, .. } => Some(*expected_nonce),
+            | Self::Expired { expected_nonce } => Some(*expected_nonce),
             Self::PastDeadline { .. }
             | Self::FeeInvalid { .. }
             | Self::FeeTooLow { .. }
             | Self::InsufficientFunds { .. }
             | Self::DaLag { .. }
-            | Self::RecordLag { .. } => None,
+            | Self::RecordLag { .. }
+            | Self::SealerNonceAhead { .. }
+            | Self::NonceInFlight { .. } => None,
         }
     }
 }
