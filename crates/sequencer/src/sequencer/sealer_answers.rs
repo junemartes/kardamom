@@ -17,20 +17,28 @@ impl Sequencer {
     /// The sealer did not take refs of this sequencer. Three cases, split
     /// in the drain (see `ResyncController::drain_answers`):
     ///
-    /// - Committed-proof (nonce < expected): drop the ledger entry
-    ///   exactly like a receipt confirmation. See
-    ///   `UnconfirmedLedger::drop_committed` for the full story.
+    /// - Past nonce (nonce < expected): see [`Self::apply_past_reject`].
     /// - Gap (nonce >= expected): the sealer did not order `expected`.
     ///   See [`Self::apply_gap`].
     /// - Window full: see [`Self::republish_held`].
-    pub(super) fn apply_sealer_answers(&mut self, r: &mut crate::resync::ResyncController) {
+    pub(super) fn apply_sealer_answers<P: SequencerPorts>(
+        &mut self,
+        r: &mut crate::resync::ResyncController,
+        ports: &mut P,
+    ) {
         let AnswerDrain {
             drops,
             gaps,
             window_full,
         } = r.drain_answers();
-        for (sender, n) in drops {
-            self.drop_committed_and_trace(sender, n);
+        for (sender, nonce, expected) in drops {
+            let past = PastReject {
+                sender,
+                nonce,
+                expected,
+                chain: r.floor(sender).unwrap_or(0),
+            };
+            self.apply_past_reject(ports, past);
         }
         for (sender, expected) in gaps {
             self.apply_gap(sender, expected);
@@ -164,8 +172,49 @@ impl Sequencer {
         Some(refused)
     }
 
-    /// One committed-proof contiguity reject, for
-    /// [`Self::apply_sealer_answers`]'s first loop.
+    /// One contiguity reject below the expected nonce, for
+    /// [`Self::apply_sealer_answers`]'s first loop. Two cases:
+    ///
+    /// - The sealer ordered the ref: the guard accepted it on the way up,
+    ///   and its window entry aged out. Then every nonce below `expected`
+    ///   is on the chain, or is in this replica's ledger on its way there.
+    ///   Drop the ledger entry like on a receipt. See
+    ///   `UnconfirmedLedger::drop_committed`.
+    /// - The guard is ahead of the chain: `expected` is above the receipt
+    ///   floor, and the ledger holds no ref between the rejected nonce and
+    ///   `expected`. An executor skipped a transaction that the guard
+    ///   counted, and the guard refuses every lower nonce of the sender.
+    ///   No republish can order the ref. Refuse it like a sealer refusal,
+    ///   with a reason that names both nonces, so the client hears of it.
+    fn apply_past_reject<P: SequencerPorts>(&mut self, ports: &mut P, past: PastReject) {
+        let PastReject {
+            sender,
+            nonce,
+            expected,
+            chain,
+        } = past;
+        let in_flight = self
+            .unconfirmed
+            .holds_in(sender, nonce.saturating_add(1)..expected);
+        if expected <= chain || in_flight {
+            self.drop_committed_and_trace(sender, nonce);
+            return;
+        }
+        metrics::record_sealer_nonce_ahead(self.cfg.partition_index);
+        self.report_refusal(
+            ports,
+            SealerRefusal {
+                sender,
+                nonce,
+                reason: TxErrorReason::SealerNonceAhead {
+                    expected_nonce: expected,
+                    chain_nonce: chain,
+                },
+            },
+        );
+    }
+
+    /// A committed-proof contiguity reject: drop the ledger entry.
     fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
         if self.unconfirmed.drop_committed(sender, n).is_some() {
             trace!(
@@ -194,6 +243,20 @@ impl Sequencer {
         );
         self.rewind_for_republish(taken);
     }
+}
+
+/// One contiguity reject below the expected nonce, with the receipt
+/// floor of its sender. See [`Sequencer::apply_past_reject`].
+#[derive(Clone, Copy)]
+struct PastReject {
+    sender: Address,
+    nonce: u64,
+    /// The expected nonce of the reject, raised to the receipt floor.
+    expected: u64,
+    /// The receipt floor of the sender: the next nonce on the chain, as
+    /// far as the receipts prove it. 0 for a sender with no executed
+    /// receipt.
+    chain: u64,
 }
 
 impl RefMetadata {

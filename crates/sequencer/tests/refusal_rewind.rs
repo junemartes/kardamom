@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_types::{TxDataLoc, TxErrorReason};
+use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::resync::{
@@ -154,6 +154,13 @@ impl Sealed {
     /// The receipt of the executed tx of `s` at `nonce` arrives.
     fn execute(&self, s: Address, nonce: u64) {
         self.floor_tx.send(FloorUpdate::executed(s, nonce)).unwrap();
+    }
+
+    /// The skip receipt of the tx of `s` at `nonce` arrives.
+    fn skip(&self, s: Address, nonce: u64, reason: SkipReason) {
+        self.floor_tx
+            .send(FloorUpdate::skip(s, nonce, reason))
+            .unwrap();
     }
 
     fn errors_of(&self, nonce: u64) -> Vec<TxErrorReason> {
@@ -476,4 +483,65 @@ fn a_window_full_answer_republishes_a_held_ref() {
     sealed.window_full(s.address(), &[1, 2]);
     sealed.step();
     assert_eq!(sealed.offered_nonces(3), vec![1, 2]);
+}
+
+/// The executors skip nonce 0 for lack of funds. The skip uses no nonce,
+/// so the floor goes back to 0: nonce 1 waits on the gap and does not
+/// publish, and the resubmit at 0 publishes, with 1 behind it. Before
+/// the release, nonce 1 published at once into the nonce gap of the
+/// chain, and the resubmit at 0 was a past nonce.
+#[test]
+fn a_skip_receipt_reopens_the_skipped_nonce() {
+    let s = signer(41);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.submit(&s, 0);
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(1), Vec::<u64>::new(), "1 waits");
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(1), vec![0, 1]);
+    assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
+}
+
+/// The sealer's guard counted nonces 0 to 2, and the executors skipped
+/// all three. The resubmit at 0 publishes, and the guard rejects it with
+/// `expected=3`. The client hears that the guard is ahead of the chain,
+/// and the next resubmit is offered again. Before, the reject dropped
+/// the ref as ordered, and the client heard nothing.
+#[test]
+fn a_guard_ahead_of_the_chain_answers_the_client() {
+    let s = signer(42);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.skip(s.address(), 1, SkipReason::NonceTooHigh);
+    sealed.skip(s.address(), 2, SkipReason::NonceTooHigh);
+    sealed.step();
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(3), vec![0]);
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    assert_eq!(
+        sealed.errors_of(0),
+        vec![TxErrorReason::SealerNonceAhead {
+            expected_nonce: 3,
+            chain_nonce: 0,
+        }]
+    );
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(3), vec![0, 0], "offered again");
+}
+
+/// A reject below the expected nonce, while the ledger holds the refs
+/// between, is a stale answer for an ordered ref: it drops the ref and
+/// tells the client nothing.
+#[test]
+fn a_reject_with_refs_in_flight_is_an_ordered_ref() {
+    let s = signer(43);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
 }

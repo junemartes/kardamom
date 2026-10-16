@@ -40,10 +40,11 @@ pub enum SealerAnswer {
 /// One drain of the rewind channel. See [`ResyncController::drain_answers`].
 #[derive(Debug, Default)]
 pub struct AnswerDrain {
-    /// `(sender, nonce)` of each reject below the expected nonce. The
-    /// sealer ordered the ref, so its ledger entry drops like on a
-    /// receipt.
-    pub drops: Vec<(Address, u64)>,
+    /// `(sender, nonce, expected)` of each reject below the expected
+    /// nonce. Either the sealer ordered the ref, so its ledger entry
+    /// drops like on a receipt, or a skip left the sealer's guard above
+    /// the chain. See `Sequencer::apply_past_reject`.
+    pub drops: Vec<(Address, u64, u64)>,
     /// The lowest expected nonce of each sender with a reject at or above
     /// it. The sealer did not order that nonce.
     pub gaps: HashMap<Address, u64>,
@@ -57,7 +58,7 @@ impl AnswerDrain {
     /// to the receipt floor.
     fn add_reject(&mut self, sender: Address, nonce: u64, expected: u64) {
         if nonce < expected {
-            self.drops.push((sender, nonce));
+            self.drops.push((sender, nonce, expected));
             return;
         }
         self.gaps
@@ -83,10 +84,12 @@ impl ResyncController {
     /// Drain the contiguity rejects and the window-full answers. Bounded
     /// per iteration, like the floor drain.
     ///
-    /// - A reject below the expected nonce proves that the sealer ordered
-    ///   the ref: the guard accepted it on the way up, and its window
-    ///   entry aged out. The ledger entry drops. Without the drop, a ref
-    ///   with no confirming receipt republishes on every confirm timeout.
+    /// - A reject below the expected nonce is a past nonce. Mostly the
+    ///   sealer ordered the ref: the guard accepted it on the way up, and
+    ///   its window entry aged out. The ledger entry drops. Without the
+    ///   drop, a ref with no confirming receipt republishes on every
+    ///   confirm timeout. The sequencer tells this case from a guard that
+    ///   is ahead of the chain.
     /// - A reject at or above the expected nonce is a gap: the sealer did
     ///   not order the expected nonce. A rejected batch gives one reject
     ///   per entry, so the gaps collapse to the lowest expected nonce of

@@ -482,6 +482,14 @@ The ingress replicas are shared-nothing. There is no leader and no sticky sessio
   - The lookup is bounded by the token bucket of the client, the in-flight bound of the query client and its timeout. A shed or failed query answers `null`. This is the same answer as "not committed yet".
   - The counter is `kardamom_cache_lookups_total{layer="receipt", outcome}`. The outcomes are `hit`, `state_hit`, `miss`, `shed` and `state_error`.
   - Proof: `ingress-pair-loss-recover` kills both ingresses under load. It requires the receipt of every accepted transaction afterwards.
+- **Admission of a cold sender**
+  - The admission checks read the local account layer, then Redis. A sender that never sent and never received value has no row in either layer.
+  - For such a cold sender, the ingress asks the executor query for the nonce and the balance (two queries), and keeps the answer for 30 s in a map of at most 65,536 senders. So a cold sender costs one pair of queries for each 30 s, not one pair for each submit. A row in the local layer always wins.
+  - The query client takes at most `max_in_flight` queries at once (default 64) and sheds the next one at once. A shed, failed or timed-out query admits. The executors then skip an unpayable transaction, as before.
+  - A cold sender that cannot pay the fee cap gets `InsufficientFunds` (JSON-RPC `-32000`).
+  - The counter is `kardamom_cache_lookups_total{layer="cold", outcome}`, with the outcomes `hit`, `miss` and `error` (a shed or failed query).
+  - Each admission refusal counts `kardamom_ingress_tx_rejected_total{reason}` and logs `submit refused` at debug level, with the sender, the nonce and the reason.
+  - Proof: `crates/ingress/tests/account_cache_test.rs` (`a_cold_unfunded_sender_is_refused_with_one_query`, `a_cold_funded_sender_or_a_failed_query_admits`).
 - The JSON-RPC surface is in [`json-rpc.md`](json-rpc.md).
 
 ## Sequencer (2 shards x 2 racing replicas)
@@ -542,6 +550,23 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A window-full answer never frees a nonce. The window check runs before the contiguity guard, so the answer names no expected nonce. If the sequencer still holds the ref in its ledger, the ref and the later refs republish. Otherwise a receipt, a reject or a refusal already settled the ref, and nothing happens.
   - Both twins of a shard get the answers to their own offers. The decision uses only the expected nonce from the sealer and the refs that the twin holds, so both twins end in the same state. The refusals and the contiguity rejects arrive on two channels. The end state does not depend on their order: a gap rewind that runs first republishes the refused ref, the sealer refuses that copy again, and the next contiguity reject frees the nonce.
   - Proof: `crates/sequencer/tests/refusal_rewind.rs` (the stale reject: `a_reject_read_after_the_receipt_keeps_the_floor`, `a_reject_below_the_receipt_floor_keeps_the_floor`, `a_window_full_answer_never_frees_a_nonce`), `ContiguityGuardTest.guard_keeps_the_nonce_of_a_refusal_past_the_deadline`, and `crates/ingress/tests/inclusion_deadline_test.rs`.
+- **A skipped transaction leaves its nonce open**
+  - An executor skips a canonical transaction that it cannot run, for example `insufficient_funds` or `nonce_too_high`. The skip receipt has `status=false` and `gas_used=0`. The skip uses no nonce on the chain.
+  - On a skip receipt, the sequencer moves the nonce floor of the sender back to the nonce that the chain expects:
+    - a `nonce_too_low` skip moves nothing;
+    - a `nonce_too_high` skip moves the floor back to the receipt floor of the sender (0 for a sender with no executed receipt);
+    - any other skip moves the floor back to its own nonce, or to the receipt floor if that is higher.
+  - The floor only goes down. The parked refs stay. The next nonce of the sender then waits on the gap and expires after `tx_ttl` (`Expired`). It does not publish into the gap and skip too. The counter is `kardamom_sequencer_skip_releases_total{partition}`.
+  - On the ingress, a skip receipt does not prove a used nonce. Another transaction at that nonce publishes. It does not get `Duplicate`. The same transaction gets its skip receipt.
+  - **The sealer guard stays ahead.** The contiguity guard of the sealer counts every ordered record, skipped or not. It has no input from the executors. After a skip, it expects a nonce above the chain, and it rejects every lower nonce of the sender with `CONTIGUITY-REJECT`.
+    - The sequencer tells this case from a stale reject: the expected nonce `E` is above the receipt floor of the sender, and the publish ledger holds no ref between the rejected nonce and `E`.
+    - The sequencer then refuses the ref like a sealer refusal. The client gets `TxErrorReason::SealerNonceAhead` (`expected_nonce`, `chain_nonce`). The ingress answers JSON-RPC `-32000` with the message `sender nonce stuck: the sealer expects nonce E ... but the chain expects nonce C`.
+    - The counter is `kardamom_sequencer_sealer_nonce_ahead_total{partition}`. Alert on any increase. The sequencer logs `the sealer refused the ref; reporting it to the client` with `reason=SealerNonceAhead`.
+    - The sender stays stuck until the guard forgets it. The sealer has no command that resets the expected nonce of one sender. Until the sealer gets a release record for a skip, the operator fix is one of these:
+      1. Move the account to a new key. For the transaction canary, give it a new key and fund the key. This is the normal fix.
+      2. Wait until the guard evicts the sender. The guard is an LRU map with `kardamom.cluster.dedupCapacity` entries (default 131,072). After that many other senders, the sender seeds again at the nonce that it sends.
+      3. Rebuild the sealer fleet from a seed (`docs/runbooks/sealer-fleet-rebuild.md`). The seed takes the next nonce of each sender from the chain. Use this only when other reasons also need a rebuild.
+  - Proof: `crates/sequencer/tests/refusal_rewind.rs` (`a_skip_receipt_reopens_the_skipped_nonce`, `a_guard_ahead_of_the_chain_answers_the_client`, `a_reject_with_refs_in_flight_is_an_ordered_ref`), and `crates/ingress/tests/account_cache_test.rs` (`a_skip_receipt_leaves_its_nonce_open`).
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.

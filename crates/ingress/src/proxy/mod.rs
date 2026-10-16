@@ -30,6 +30,7 @@ use kardamom_types::{ClusterStatus, Receipt, TxError};
 use crate::chain::SealerLifecycle;
 
 use crate::channels::{IngressPublication, IngressSubscription};
+use crate::cold_accounts::ColdAccounts;
 use crate::config::IngressConfig;
 use crate::error::IngressError;
 use crate::pending::PendingReceipts;
@@ -152,13 +153,17 @@ where
     /// The local account layer the subscription feeds. The admission
     /// checks and the account RPCs read it. See `kardamom_cache::live`.
     pub(crate) live: Arc<LiveAccounts>,
-    /// The executor query behind the account RPCs. `None` when the
-    /// config names no endpoint: a local miss is then an error, never a
-    /// stall. The admission path never calls it.
+    /// The executor query behind the account RPCs, and behind the
+    /// admission checks of a cold sender. `None` when the config names no
+    /// endpoint: a local miss is then an error for an RPC, and an admit
+    /// for a submit, never a stall.
     pub(crate) query: Option<ExecutorQuery>,
     /// The Redis layer. `None` with `[cache]` off: no Redis call exists
     /// on any path. See `kardamom_cache::reader`.
     pub(crate) redis: Option<Arc<CacheReader>>,
+    /// The executor answers for the senders no cache layer holds. The
+    /// admission path fills it, so a cold sender costs one query per TTL.
+    pub(crate) cold: Arc<ColdAccounts>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
     /// value only increases, one writer, the `BlockBoundary` watcher, sets
@@ -217,6 +222,7 @@ where
             live: self.live.clone(),
             query: self.query.clone(),
             redis: self.redis.clone(),
+            cold: self.cold.clone(),
             latest_block_number: self.latest_block_number.clone(),
             fee_history: self.fee_history.clone(),
             receipt_feed: self.receipt_feed.clone(),
@@ -270,6 +276,7 @@ where
             live,
             query,
             redis,
+            cold: Arc::default(),
             latest_block_number: Arc::new(AtomicU64::new(0)),
             fee_history: Arc::new(crate::fee_history::FeeHistory::default()),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,

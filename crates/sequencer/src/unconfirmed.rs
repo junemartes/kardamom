@@ -71,6 +71,17 @@ impl<T> UnconfirmedLedger<T> {
         self.entries.contains_key(&(sender, nonce))
     }
 
+    /// Whether the ledger holds a ref of `sender` at a nonce in
+    /// `nonces`. An empty range holds none.
+    pub(crate) fn holds_in(&self, sender: Address, nonces: std::ops::Range<u64>) -> bool {
+        nonces.start < nonces.end
+            && self
+                .entries
+                .range((sender, nonces.start)..(sender, nonces.end))
+                .next()
+                .is_some()
+    }
+
     /// Retain a just-published ref until a receipt proves canonical
     /// commitment, and queue it for the confirm-timeout sweep.
     pub(crate) fn record_published(&mut self, sender: Address, nonce: u64, meta: T) {

@@ -96,6 +96,16 @@ pub enum TxErrorReason {
         recorded_index: u64,
         budget: u64,
     },
+    /// The sealer's nonce guard expects `expected_nonce` of the sender.
+    /// That is above `chain_nonce`, the next nonce on the chain as the
+    /// receipts prove it. An executor skipped a transaction of the
+    /// sender: the skip used no nonce on the chain, but the guard counted
+    /// it. The sealer refuses every lower nonce of the sender until an
+    /// operator resets the guard. The transaction is not ordered.
+    SealerNonceAhead {
+        expected_nonce: u64,
+        chain_nonce: u64,
+    },
 }
 
 impl TxErrorReason {
@@ -113,6 +123,7 @@ impl TxErrorReason {
             Self::InsufficientFunds { .. } => "insufficient-funds",
             Self::DaLag { .. } => "da-lag",
             Self::RecordLag { .. } => "record-lag",
+            Self::SealerNonceAhead { .. } => "sealer-nonce-ahead",
         }
     }
 
@@ -125,7 +136,8 @@ impl TxErrorReason {
         match self {
             Self::DuplicatedTx { expected_nonce }
             | Self::Evicted { expected_nonce }
-            | Self::Expired { expected_nonce } => Some(*expected_nonce),
+            | Self::Expired { expected_nonce }
+            | Self::SealerNonceAhead { expected_nonce, .. } => Some(*expected_nonce),
             Self::PastDeadline { .. }
             | Self::FeeInvalid { .. }
             | Self::FeeTooLow { .. }

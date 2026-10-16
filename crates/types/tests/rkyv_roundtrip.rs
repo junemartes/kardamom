@@ -203,6 +203,24 @@ fn record_lag_tx_error_roundtrip() {
     assert_eq!(back.reason.expected_nonce(), None);
 }
 
+/// The nonce-ahead refusal keeps both nonces and its reason word through
+/// the wire.
+#[test]
+fn sealer_nonce_ahead_tx_error_roundtrip() {
+    let e = TxError {
+        sender: Address::repeat_byte(0x57),
+        nonce: 0,
+        reason: TxErrorReason::SealerNonceAhead {
+            expected_nonce: 25,
+            chain_nonce: 0,
+        },
+    };
+    let back = roundtrip(&e);
+    assert_eq!(back, e);
+    assert_eq!(back.reason.word(), "sealer-nonce-ahead");
+    assert_eq!(back.reason.expected_nonce(), Some(25));
+}
+
 #[test]
 fn tx_status_roundtrip_every_stage() {
     let hash = B256::repeat_byte(0x33);

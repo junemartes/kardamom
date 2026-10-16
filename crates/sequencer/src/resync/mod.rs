@@ -106,6 +106,36 @@ impl Outcome {
             Self::Skipped { .. } | Self::Deposit => None,
         }
     }
+
+    /// The nonce the chain expects next after a skip, as far as the
+    /// receipt floor `floor` of the sender shows it. A skip uses no
+    /// nonce, so a nonce floor above this value is above the chain.
+    ///
+    /// - A nonce-too-low skip proves nothing new: the chain is past its
+    ///   nonce. `None`.
+    /// - A nonce-too-high skip proves only that the chain is below its
+    ///   nonce. The receipt floor is the best bound.
+    /// - Every other skip leaves the chain at its nonce, or at the
+    ///   receipt floor when that is higher.
+    ///
+    /// `None` for an executed tx and for a deposit.
+    #[must_use]
+    pub(crate) fn released(self, floor: u64) -> Option<u64> {
+        use kardamom_types::SkipReason;
+        match self {
+            Self::Skipped {
+                reason: SkipReason::NonceTooLow,
+                ..
+            }
+            | Self::Executed { .. }
+            | Self::Deposit => None,
+            Self::Skipped {
+                reason: SkipReason::NonceTooHigh,
+                ..
+            } => Some(floor),
+            Self::Skipped { nonce, .. } => Some(nonce.max(floor)),
+        }
+    }
 }
 
 impl FloorUpdate {
@@ -440,10 +470,20 @@ fn warn_once_dead(dead: &mut bool, partition: u32, on_dead: &str) {
     tracing::warn!(partition, "{}", on_dead);
 }
 
-/// One drain of the receipts channel: `(raised_floors, confirmations)`.
-/// Both are `(sender, nonce-or-floor)` lists. See
+/// One drain of the receipts channel. Each list holds
+/// `(sender, nonce-or-floor)` pairs. See
 /// [`ResyncController::drain_floor_updates`].
-pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReceiptDrain {
+    /// The senders whose executed-truth floor rose, with the new floor.
+    pub raised: Vec<(Address, u64)>,
+    /// `(sender, nonce)` for each receipt that confirms a publish.
+    pub confirmations: Vec<(Address, u64)>,
+    /// `(sender, nonce)` for each skip receipt that proves the chain
+    /// expects `nonce` or a lower nonce of the sender next. See
+    /// [`Outcome::released`].
+    pub released: Vec<(Address, u64)>,
+}
 
 impl ResyncController {
     /// # Errors
@@ -494,9 +534,9 @@ impl ResyncController {
     }
 
     /// Drain pending receipt updates (bounded per iteration). Returns
-    /// `(raised_floors, confirmations)`:
+    /// three lists:
     ///
-    /// - `raised_floors`: senders whose executed-truth floor rose, for
+    /// - `raised`: senders whose executed-truth floor rose, for
     ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts
     ///   and deposit receipts are not floor evidence: a skip consumed no
     ///   nonce, and a deposit has no L2 nonce at all.
@@ -510,9 +550,12 @@ impl ResyncController {
     ///   transaction. `Receipt::tx_type` tells the two apart at
     ///   the source, so the exclusion is exactly "is this a deposit?",
     ///   not "is the nonce 0?".
+    /// - `released`: the nonce the chain expects after each skip receipt,
+    ///   for [`crate::state::PartitionState::release_floor`]. Each value
+    ///   is at or above the receipt floor at the time of its skip. So a
+    ///   caller that applies `released` before `raised` ends at the
+    ///   newest proof: a raise that comes after a skip in the stream wins.
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
-        let mut raised = Vec::new();
-        let mut confirmations = Vec::new();
         let updates = drain_bounded(
             &self.floor_rx,
             &mut self.floor_rx_dead,
@@ -520,36 +563,38 @@ impl ResyncController {
             self.partition,
             "floor-update producer disconnected; resync floors are frozen",
         );
-        for u in updates {
-            self.fold_floor_update(u, &mut raised, &mut confirmations);
-        }
-        if !raised.is_empty() {
+        let drain = updates
+            .into_iter()
+            .fold(ReceiptDrain::default(), |drain, u| {
+                self.fold_floor_update(drain, u)
+            });
+        if !drain.raised.is_empty() {
             metrics::record_floor_senders(self.partition, self.floors.len());
         }
-        (raised, confirmations)
+        drain
     }
 
-    /// Fold one floor update into `raised`/`confirmations`, for
-    /// [`Self::drain_floor_updates`]'s loop. See [`Outcome`] for what each
-    /// case proves.
-    fn fold_floor_update(
-        &mut self,
-        u: FloorUpdate,
-        raised: &mut Vec<(Address, u64)>,
-        confirmations: &mut Vec<(Address, u64)>,
-    ) {
+    /// Fold one floor update into `drain`, for
+    /// [`Self::drain_floor_updates`]. See [`Outcome`] for what each case
+    /// proves.
+    fn fold_floor_update(&mut self, mut drain: ReceiptDrain, u: FloorUpdate) -> ReceiptDrain {
         let Some(nonce) = u.outcome.confirmed() else {
-            return;
+            return drain;
         };
-        confirmations.push((u.sender, nonce));
+        drain.confirmations.push((u.sender, nonce));
+        let floor = self.floor(u.sender).unwrap_or(0);
+        if let Some(chain) = u.outcome.released(floor) {
+            drain.released.push((u.sender, chain));
+        }
         let Some(floor) = u.outcome.floor() else {
-            return;
+            return drain;
         };
         let e = self.floors.entry(u.sender).or_insert(0);
         if floor > *e {
             *e = floor;
-            raised.push((u.sender, floor));
+            drain.raised.push((u.sender, floor));
         }
+        drain
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
