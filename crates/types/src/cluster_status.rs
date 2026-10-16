@@ -1,7 +1,9 @@
 //! The chain's data-availability status, as the sealer fans it out to every
 //! cluster session.
 
-use std::time::{Duration, Instant};
+use core::time::Duration;
+#[cfg(feature = "std")]
+use std::time::Instant;
 
 /// How long a cluster session may see no frame before its holder calls
 /// the sealer halted on a lost quorum. The sealer sends a boundary and a
@@ -76,12 +78,16 @@ impl ClusterStatus {
 /// until the next boundary or the next status without the notice. Other
 /// frames do not change the check: the leader can send a relayed record
 /// after the notice, before the snapshot stops it.
+///
+/// It reads the clock of the host, so it needs the `std` feature.
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SilenceDeadline {
     since: Instant,
     snapshot: bool,
 }
 
+#[cfg(feature = "std")]
 impl SilenceDeadline {
     /// A check whose silence starts at `now`, with the normal budget.
     #[must_use]
@@ -128,6 +134,6 @@ impl SilenceDeadline {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 #[path = "cluster_status_tests.rs"]
 mod tests;
