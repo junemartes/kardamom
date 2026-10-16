@@ -2,7 +2,6 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.ArchiveTool;
 import io.aeron.archive.ArchiveTool.VerifyOption;
-import io.aeron.cluster.ClusterTool;
 import io.aeron.cluster.ElectionState;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
@@ -150,6 +149,15 @@ public final class ClusterNode {
         final Optional<PurgePlanner> purgePlanner =
             PurgePlanner.fromSetting(System.getProperty(PurgePlanner.SETTING));
 
+        // The periodic snapshot. The leader's service asks for it on a due
+        // boundary tick, after the status notice (see SnapshotSchedule).
+        final Optional<SnapshotSchedule> snapshotSchedule = SnapshotSchedule.fromSetting(
+            Long.getLong(SnapshotSchedule.SETTING, SnapshotSchedule.DEFAULT_INTERVAL_S), tickMs);
+        System.out.println(snapshotSchedule
+            .map(schedule -> "cluster snapshot scheduler up memberId=" + memberId
+                + " intervalBlocks=" + schedule.intervalBlocks())
+            .orElse("cluster snapshot scheduler DISABLED memberId=" + memberId));
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
         // The driver keeps the last address of each member name, so a short
         // outage of the node's DNS agent does not fail an add in an election.
@@ -197,6 +205,7 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
+                snapshotSchedule.ifPresent(service::snapshotEvery);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop));
                 break;
@@ -229,7 +238,6 @@ public final class ClusterNode {
              ClusteredServiceContainer ignored2 = container;
              AdminServer ignored3 = startAdminServer(consensus, service, memberId)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
-            startSnapshotScheduler(clusterDir, memberId);
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
@@ -334,49 +342,6 @@ public final class ClusterNode {
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
                 MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()));
         }
-    }
-
-    /**
-     * Periodic cluster-wide snapshot trigger
-     * ({@code -Dkardamom.cluster.snapshotIntervalS}, 0 disables it).
-     *
-     * <p>This runs the same way on every member. Only the leader's control
-     * toggle accepts SNAPSHOT. The action is appended to the replicated log,
-     * so all members then snapshot at the same log position. On a follower,
-     * {@link ClusterTool#snapshot} is a no-op that returns false. So the
-     * current leader snapshots on schedule, with no cross-member
-     * coordination and no special deploy case. Failures are logged, and the
-     * next tick retries. A snapshot trigger must never take a member
-     * down.</p>
-     */
-    private static void startSnapshotScheduler(final String clusterDir, final int memberId) {
-        final long intervalS = Long.getLong("kardamom.cluster.snapshotIntervalS", 300L);
-        if (intervalS <= 0) {
-            System.out.println("cluster snapshot scheduler DISABLED memberId=" + memberId);
-            return;
-        }
-        final Thread t = new Thread(() -> {
-            while (true) {
-                try {
-                    Thread.sleep(intervalS * 1000L);
-                } catch (final InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-                try {
-                    if (ClusterTool.snapshot(new File(clusterDir), System.out)) {
-                        System.out.println("cluster SNAPSHOT triggered memberId=" + memberId);
-                    }
-                } catch (final Exception e) {
-                    System.out.println("cluster SNAPSHOT attempt failed memberId=" + memberId
-                        + " (leader may be mid-election; next tick retries): " + e);
-                }
-            }
-        }, "kardamom-snapshot-scheduler");
-        t.setDaemon(true);
-        t.start();
-        System.out.println("cluster snapshot scheduler up memberId=" + memberId
-            + " intervalS=" + intervalS);
     }
 
     /**

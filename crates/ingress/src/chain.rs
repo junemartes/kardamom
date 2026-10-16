@@ -6,7 +6,8 @@
 //! `record_lag` while the status frame says the record-lag guard refuses,
 //! on `da_lag` while it says the DA-lag guard refuses, and on
 //! `sealer_no_quorum` while no status frame arrives for
-//! [`SEALER_SILENCE`]. The binary publishes that lifecycle on the stream.
+//! [`SEALER_SILENCE`], or for [`SNAPSHOT_SILENCE`] after a status with
+//! the snapshot notice. The binary publishes that lifecycle on the stream.
 //!
 //! The ingress pauses submits on a root: the sealer's halt first, then
 //! every live executor halted (no receipt can come). One executor halted
@@ -21,6 +22,7 @@ use kardamom_obs::halt::{Halt, HaltCause, HaltRef, Record};
 use kardamom_obs::lifecycle::{Lifecycle, Slots, process};
 use kardamom_types::ClusterStatus;
 use kardamom_types::cluster_status::RecordLagStatus;
+use kardamom_types::cluster_status::SilenceDeadline;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -37,8 +39,9 @@ pub const BATCHER: &str = "batcher";
 
 /// How long the cluster may send no status frame before the ingress
 /// calls the sealer halted on a lost quorum. The sealer sends one on
-/// every boundary tick.
-pub use kardamom_obs::events::SEALER_SILENCE;
+/// every boundary tick. After a status with the snapshot notice, the
+/// budget is the snapshot's.
+pub use kardamom_obs::events::{SEALER_SILENCE, SNAPSHOT_SILENCE};
 
 /// How often the watch checks the silence and the board when nothing
 /// arrives.
@@ -54,10 +57,10 @@ pub(crate) struct ChainWatch {
     status: watch::Receiver<ClusterStatus>,
     board: watch::Receiver<BoardView>,
     sealer: SealerLifecycle,
-    /// When the last status frame arrived. `None` until the first one:
-    /// an ingress without a cluster session never calls the sealer
+    /// The silence since the last status frame. `None` until the first
+    /// one: an ingress without a cluster session never calls the sealer
     /// silent.
-    last_status: Option<Instant>,
+    silence: Option<SilenceDeadline>,
 }
 
 impl ChainWatch {
@@ -70,7 +73,7 @@ impl ChainWatch {
             status,
             board,
             sealer,
-            last_status: None,
+            silence: None,
         }
     }
 
@@ -104,7 +107,10 @@ impl ChainWatch {
     /// `record_lag` or `da_lag` halt. Any status frame proves the quorum,
     /// so it also ends a `sealer_no_quorum` halt.
     fn on_status(&mut self, status: &ClusterStatus, now: Instant) {
-        self.last_status = Some(now);
+        let now = now.into_std();
+        self.silence
+            .get_or_insert(SilenceDeadline::new(now))
+            .on_status(status, now);
         crate::metrics::record_cluster_status(status);
         match Self::status_halt(status) {
             Some(halt) => self.sealer.raise(halt),
@@ -154,12 +160,11 @@ impl ChainWatch {
     }
 
     /// Call the sealer halted on a lost quorum once no status frame
-    /// arrived for [`SEALER_SILENCE`].
+    /// arrived for the budget of the last one.
     fn check_silence(&self, now: Instant) {
         let Some(silent) = self
-            .last_status
-            .map(|at| now.saturating_duration_since(at))
-            .filter(|silent| *silent >= SEALER_SILENCE)
+            .silence
+            .and_then(|silence| silence.expired(now.into_std()))
         else {
             return;
         };

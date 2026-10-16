@@ -78,7 +78,7 @@ impl Fixture {
         }
     }
 
-    fn status(retained_bytes: Option<u64>) -> ClusterStatus {
+    fn status(retained_bytes: Option<u64>, snapshot_follows: bool) -> ClusterStatus {
         ClusterStatus {
             posted_head: 100,
             sealed_head: 160,
@@ -89,6 +89,7 @@ impl Fixture {
             floor_block: 95,
             record_lag: RecordLagStatus::default(),
             retained_bytes,
+            snapshot_follows,
         }
     }
 
@@ -123,8 +124,19 @@ impl Fixture {
             ),
             ("relayed_ref", Self::relayed_ref().encode()),
             ("feed_gap", encode_feed_gap(9, 4)),
-            ("status_76", encode_status(&Self::status(Some(1_048_583)))),
-            ("status_67", encode_status(&Self::status(None))),
+            (
+                "status_76",
+                encode_status(&Self::status(Some(1_048_583), false)),
+            ),
+            (
+                "status_76_snapshot",
+                encode_status(&Self::status(Some(1_048_583), true)),
+            ),
+            ("status_68", encode_status(&Self::status(None, false))),
+            (
+                "status_67",
+                encode_status(&Self::status(None, false))[..STATUS_WITH_RECORD_LAG_LEN].to_vec(),
+            ),
             ("txref_ingress", txref_ingress),
             ("txref_egress", txref_egress),
         ]
@@ -209,7 +221,15 @@ fn the_golden_egress_frames_decode() {
     assert_eq!(status.len(), STATUS_WITH_RETAINED_BYTES_LEN);
     assert_eq!(
         EgressItem::decode(&status).unwrap(),
-        EgressItem::Status(Fixture::status(Some(1_048_583)))
+        EgressItem::Status(Fixture::status(Some(1_048_583), false))
+    );
+    assert_eq!(
+        EgressItem::decode(&golden_frame("status_76_snapshot")).unwrap(),
+        EgressItem::Status(Fixture::status(Some(1_048_583), true))
+    );
+    assert_eq!(
+        EgressItem::decode(&golden_frame("status_68")).unwrap(),
+        EgressItem::Status(Fixture::status(None, false))
     );
 }
 
@@ -222,7 +242,16 @@ fn the_flag_byte_sits_between_the_record_lag_tail_and_the_byte_tail() {
         (STATUS_RETAINED_BYTES_OFFSET, STATUS_WITH_RETAINED_BYTES_LEN),
         (68, 76)
     );
-    assert_eq!(status[STATUS_WITH_RECORD_LAG_LEN], 0);
+    assert_eq!(
+        (STATUS_SNAPSHOT_FLAG_OFFSET, STATUS_WITH_SNAPSHOT_FLAG_LEN),
+        (67, 68)
+    );
+    assert_eq!(status[STATUS_SNAPSHOT_FLAG_OFFSET], 0);
+    assert_eq!(
+        golden_frame("status_76_snapshot")[STATUS_SNAPSHOT_FLAG_OFFSET],
+        1,
+        "the snapshot notice"
+    );
     assert_eq!(
         status[STATUS_RETAINED_BYTES_OFFSET..],
         1_048_583_u64.to_le_bytes()
@@ -237,7 +266,7 @@ fn the_frames_of_today_still_decode() {
     assert_eq!(status.len(), STATUS_WITH_RECORD_LAG_LEN);
     assert_eq!(
         EgressItem::decode(&status).unwrap(),
-        EgressItem::Status(Fixture::status(None))
+        EgressItem::Status(Fixture::status(None, false))
     );
     let EgressItem::Status(short) = EgressItem::decode(&status[..STATUS_LEN]).unwrap() else {
         panic!("a status frame decodes as a status");
@@ -261,7 +290,7 @@ fn a_partial_byte_tail_is_ignored_and_a_short_reference_is_too_short() {
     ] {
         assert_eq!(
             EgressItem::decode(&status[..len]).unwrap(),
-            EgressItem::Status(Fixture::status(None))
+            EgressItem::Status(Fixture::status(None, false))
         );
     }
     let relayed_ref = golden_frame("relayed_ref");

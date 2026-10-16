@@ -119,6 +119,7 @@ impl Harness {
             max_gap: self.knobs.load_max_gap,
             drain_timeout: DRAIN_TIMEOUT,
             retry_submit: RETRY_SUBMIT,
+            pause_wait: Duration::ZERO,
             ramp_step_tps,
             ramp_step_secs: RAMP_STEP_SECS,
             soak_fraction: SOAK_FRACTION,

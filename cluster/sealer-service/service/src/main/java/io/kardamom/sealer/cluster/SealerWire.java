@@ -306,13 +306,16 @@ public final class SealerWire {
      * {@code [kind:9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64]}
      * (50 bytes), then the record-lag tail
      * {@code [best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]}
-     * (17 bytes), then the flag byte {@code [snapshot_follows:u8]}, then the
-     * byte tail {@code [retained_bytes:u64]} (8 bytes).
-     * The service sends the first two parts. {@code best_recorded} is
-     * {@code u64::MAX} before the first recorded cursor. A reader ignores
-     * the tails it does not know. The ingress serves {@code safe} from the posted
-     * head and raises its {@code da_lag} halt from the flag. Not retained:
-     * a session learns the current status when it announces itself.
+     * (17 bytes), then the flag byte {@code [snapshot_follows:u8]} at byte 67
+     * (68 bytes in all), then the byte tail {@code [retained_bytes:u64]}
+     * (8 bytes, 76 in all). The service sends the first three parts.
+     * {@code best_recorded} is {@code u64::MAX} before the first recorded
+     * cursor. {@code snapshot_follows} is 1 on the status before a
+     * snapshot: no frame comes until the snapshot is complete, so a client
+     * waits longer for the next one. A reader ignores the tails it does not
+     * know. The ingress serves {@code safe} from the posted head and raises
+     * its {@code da_lag} halt from the flag. Not retained: a session learns
+     * the current status when it announces itself.
      */
     public static final byte EGRESS_KIND_STATUS = 9;
     /**
@@ -368,8 +371,12 @@ public final class SealerWire {
     static final int STATUS_LEN = 50;
     /** Length of a status frame with the record-lag tail. */
     static final int STATUS_WITH_RECORD_LAG_LEN = STATUS_LEN + Long.BYTES + Long.BYTES + Byte.BYTES;
+    /** Offset of the {@code snapshot_follows} byte: after the record-lag tail. */
+    static final int STATUS_SNAPSHOT_FLAG_OFFSET = STATUS_WITH_RECORD_LAG_LEN;
+    /** Length of a status frame with the record-lag tail and the flag byte. */
+    static final int STATUS_WITH_SNAPSHOT_FLAG_LEN = STATUS_SNAPSHOT_FLAG_OFFSET + Byte.BYTES;
     /** Offset of the byte tail: after the record-lag tail and the flag byte. */
-    static final int STATUS_RETAINED_BYTES_OFFSET = STATUS_WITH_RECORD_LAG_LEN + Byte.BYTES;
+    static final int STATUS_RETAINED_BYTES_OFFSET = STATUS_WITH_SNAPSHOT_FLAG_LEN;
     /** Length of a status frame with the record-lag tail, the flag byte and the byte tail. */
     static final int STATUS_WITH_RETAINED_BYTES_LEN = STATUS_RETAINED_BYTES_OFFSET + Long.BYTES;
 

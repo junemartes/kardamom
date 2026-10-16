@@ -124,6 +124,10 @@ struct Args {
     /// The number of per-submit retry attempts on a transient failure.
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
+    /// How long one submit waits out the refusals of a paused ingress, in
+    /// seconds. 0 turns the wait off.
+    #[arg(long = "pause-wait-secs", default_value_t = 0)]
+    pause_wait_secs: u64,
 
     /// The ramp increment for each step, in tx/s. Unset means auto:
     /// `target_tps` / 8.
@@ -248,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         max_gap: args.max_gap,
         drain_timeout: args.drain_timeout,
         retry_submit: args.retry_submit,
+        pause_wait: std::time::Duration::from_secs(args.pause_wait_secs),
         ramp_step_tps,
         ramp_step_secs: args.ramp_step_secs,
         soak_fraction: args.soak_fraction,

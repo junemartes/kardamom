@@ -9,7 +9,7 @@ use kardamom_types::cluster_status::RecordLagStatus;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::{ChainStatus, ChainWatch, EXECUTOR, SEALER, SEALER_SILENCE};
+use super::{ChainStatus, ChainWatch, EXECUTOR, SEALER, SEALER_SILENCE, SNAPSHOT_SILENCE};
 
 fn event(service: &str, instance: &str, state: ServiceState) -> ServiceEvent {
     ServiceEvent {
@@ -154,6 +154,44 @@ fn a_silent_cluster_halts_the_sealer_on_a_lost_quorum_and_a_status_ends_it() {
 
     chain.on_status(&ClusterStatus::default(), start + SEALER_SILENCE * 2);
     assert_eq!(sealer.slots().halt, None, "a status proves the quorum");
+}
+
+/// The snapshot stalled the status frames for 11 s on a loaded CI disk,
+/// longer than [`SEALER_SILENCE`]. After a status with the snapshot
+/// notice, the ingress waits [`SNAPSHOT_SILENCE`]. The next status sets
+/// the normal budget back.
+#[test]
+fn a_snapshot_notice_holds_the_silence_halt_for_the_snapshot_budget() {
+    let sealer = Arc::new(Lifecycle::new(Some(SEALER)));
+    let mut chain = watch_over(&sealer);
+    let start = Instant::now();
+    let notice = ClusterStatus {
+        snapshot_follows: true,
+        ..ClusterStatus::default()
+    };
+    chain.on_status(&notice, start);
+    chain.check_silence(start + Duration::from_secs(14));
+    assert_eq!(
+        sealer.slots().halt,
+        None,
+        "a 14 s snapshot stall is no lost quorum"
+    );
+    chain.check_silence(start + SNAPSHOT_SILENCE);
+    assert_eq!(
+        sealer.slots().halt.unwrap().cause,
+        HaltCause::SealerNoQuorum,
+        "a stall past the snapshot budget is a lost quorum"
+    );
+
+    let after = start + SNAPSHOT_SILENCE;
+    chain.on_status(&ClusterStatus::default(), after);
+    assert_eq!(sealer.slots().halt, None);
+    chain.check_silence(after + SEALER_SILENCE);
+    assert_eq!(
+        sealer.slots().halt.unwrap().cause,
+        HaltCause::SealerNoQuorum,
+        "the status after the snapshot sets the normal budget back"
+    );
 }
 
 #[test]
