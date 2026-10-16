@@ -33,6 +33,10 @@ pub const CLUSTER_FRAME_DROPPED_TOTAL: &str = "kardamom_ingress_cluster_frames_d
 pub const CLUSTER_POSTED_HEAD: &str = "kardamom_ingress_cluster_posted_head";
 /// The last sealed block, from the same status frame.
 pub const CLUSTER_SEALED_HEAD: &str = "kardamom_ingress_cluster_sealed_head";
+/// The DA-lag budget from the same status frame: the sealer refuses new
+/// transactions when the sealed head runs this many blocks past the posted
+/// head. Exported so an alert can warn before the guard halts the chain.
+pub const CLUSTER_DA_LAG_BUDGET: &str = "kardamom_ingress_cluster_da_lag_budget_blocks";
 /// The egress frames the sealer retains for replay. Above the retention
 /// window while unposted blocks hold it there; back inside it once the
 /// batcher posts.
@@ -94,6 +98,10 @@ pub fn describe() {
     metrics::describe_gauge!(
         CLUSTER_SEALED_HEAD,
         "the last sealed block, from the cluster's status frame"
+    );
+    metrics::describe_gauge!(
+        CLUSTER_DA_LAG_BUDGET,
+        "the DA-lag budget in blocks, from the cluster's status frame; 0 turns the guard off"
     );
     metrics::describe_gauge!(
         CLUSTER_RETAINED_FRAMES,
@@ -160,6 +168,7 @@ pub(crate) fn record_cluster_status(status: &kardamom_types::ClusterStatus) {
     {
         metrics::gauge!(CLUSTER_POSTED_HEAD).set(status.posted_head as f64);
         metrics::gauge!(CLUSTER_SEALED_HEAD).set(status.sealed_head as f64);
+        metrics::gauge!(CLUSTER_DA_LAG_BUDGET).set(status.budget_blocks as f64);
         metrics::gauge!(CLUSTER_RETAINED_FRAMES).set(status.retained_frames as f64);
         metrics::gauge!(CLUSTER_FLOOR_BLOCK).set(status.floor_block as f64);
     }
@@ -185,6 +194,7 @@ mod tests {
             QUEUE_DEPTH,
             CLUSTER_POSTED_HEAD,
             CLUSTER_SEALED_HEAD,
+            CLUSTER_DA_LAG_BUDGET,
             CLUSTER_RETAINED_FRAMES,
             CLUSTER_FLOOR_BLOCK,
             CLUSTER_RECORDED_HEAD,
