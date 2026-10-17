@@ -6,7 +6,7 @@ use kardamom_types::{BlockFees, FeeSchedule};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
-use kardamom_types::BlockBoundary;
+use kardamom_types::{BlockBoundary, ReceiptRollback};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -127,6 +127,10 @@ pub struct ExecutorConfig {
     /// commit thread derives its thresholds from it. The default is the
     /// floor of that budget.
     pub stall_budget: Duration,
+    /// The rollback record that the commit thread publishes before its
+    /// first receipt: this run restored a state below a divergence of the
+    /// canonical stream. `None` in every other run.
+    pub rollback: Option<ReceiptRollback>,
 }
 
 /// Default [`ExecutorConfig::stall_budget`]: the floor of the Aeron
@@ -147,6 +151,7 @@ impl Default for ExecutorConfig {
             reader: ReaderConfig::default(),
             fees: None,
             stall_budget: DEFAULT_STALL_BUDGET,
+            rollback: None,
         }
     }
 }

@@ -135,6 +135,14 @@ impl<P: TxReceiptsPublication> ExtractingReceiptSink<P> {
 }
 
 impl<P: TxReceiptsPublication> TxReceiptsPublication for ExtractingReceiptSink<P> {
+    /// The rollback record carries no receipt to extract: pass it on.
+    fn publish_rollback(
+        &mut self,
+        rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        self.inner.publish_rollback(rollback)
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         // Buffer BEFORE forwarding (the message moves into the inner sink),
         // but FLUSH only after the inner chain accepted the boundary — a
@@ -171,6 +179,13 @@ mod tests {
 
     struct OkSink;
     impl TxReceiptsPublication for OkSink {
+        fn publish_rollback(
+            &mut self,
+            _rollback: kardamom_types::ReceiptRollback,
+        ) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+
         fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
             Ok(())
         }

@@ -101,7 +101,7 @@ impl FakeExec {
     /// re-publish yields none).
     fn observe_and_forward(
         &self,
-        receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+        receipt_bus: &tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
         shard: usize,
         env: &kardamom_types::TxEnvelope,
         term: i32,
@@ -111,7 +111,7 @@ impl FakeExec {
             term_offset: term,
         };
         if let Some(receipt) = self.observe(shard, env, pos) {
-            let _ = receipt_bus.send(receipt);
+            let _ = receipt_bus.send(receipt.into());
         }
     }
 
@@ -122,7 +122,7 @@ impl FakeExec {
         self,
         shard: usize,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
-        receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+        receipt_bus: tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
     ) {
         let mut term: i32 = 0;
         while let Some(env) = rx.recv().await {

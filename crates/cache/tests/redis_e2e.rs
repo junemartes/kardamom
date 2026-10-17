@@ -136,6 +136,43 @@ async fn receipts_index_by_sender_and_nonce_and_expire() {
     );
 }
 
+/// A clear deletes every account and receipt key over several scan
+/// pages, and keeps the heads and the pending floors.
+#[tokio::test]
+#[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
+async fn a_clear_deletes_the_projection_and_keeps_the_heads() {
+    let (_c, cache) = redis().await;
+    let rows: Vec<AccountRow> = (0..=255u8).map(|byte| row(byte, 1, 1)).collect();
+    cache
+        .write_rows(BPosition::from_index(50), &rows)
+        .await
+        .unwrap();
+    let sender = Address::repeat_byte(0x11);
+    let receipts: Vec<Receipt> = (0..1_500u64)
+        .map(|nonce| Receipt {
+            from: sender,
+            nonce,
+            ..Receipt::default()
+        })
+        .collect();
+    cache.write_receipts(&receipts).await.unwrap();
+    cache.set_head(0, BPosition::from_index(50)).await.unwrap();
+    let pending = Address::repeat_byte(0x22);
+    cache.set_pending(pending, 8).await.unwrap();
+
+    assert_eq!(cache.clear_projection().await.unwrap(), 256 + 1_500);
+
+    assert_eq!(cache.account(Address::repeat_byte(7)).await.unwrap(), None);
+    assert_eq!(cache.receipt(sender, 1_499).await.unwrap(), None);
+    assert_eq!(cache.heads(&[0]).await.unwrap(), vec![Some(50)]);
+    assert_eq!(cache.pending(pending).await.unwrap(), Some(8));
+    let lower = cache
+        .write_rows(BPosition::from_index(10), &[row(7, 3, 3)])
+        .await
+        .unwrap();
+    assert_eq!(lower.applied, 1, "a lower position applies after a clear");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
 async fn heads_and_pending_round_trip() {

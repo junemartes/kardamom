@@ -45,6 +45,7 @@ pub(crate) fn adopt_checkpoint_if_fresh(
         ckpt_dir,
         state_dir,
         checkpoint_peers,
+        kardamom_state::BlockRange::ANY,
         expected_genesis,
     )?;
     if let Some((block, ckpt_path)) = restored {

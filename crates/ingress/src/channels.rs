@@ -20,10 +20,33 @@ use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
     AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxError,
+    ReceiptRollback, TxEnvelope, TxError,
 };
 
 use crate::error::IngressError;
+use crate::rollback_log::RollbackLog;
+
+/// One item of the ordered `tx_receipts` bus. The bus keeps the order of
+/// the stream, so a rollback applies after every receipt before it and
+/// before every receipt after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "almost every item is a receipt: a box adds one allocation per receipt and saves nothing"
+)]
+pub enum ReceiptItem {
+    /// An executed transaction's receipt.
+    Receipt(Receipt),
+    /// An executor rolled its state back: the receipts above `to_block`
+    /// are void.
+    Rollback(ReceiptRollback),
+}
+
+impl From<Receipt> for ReceiptItem {
+    fn from(receipt: Receipt) -> Self {
+        Self::Receipt(receipt)
+    }
+}
 
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
 /// sender-sharded `tx_data` streams. `partition_for(envelope.sender, K)`
@@ -45,11 +68,15 @@ pub trait IngressPublication: Send + Sync + 'static {
 /// and client release; the quorum-watermark stream, for ack gating; and
 /// the `tx_receipts` `BlockBoundary` stream, for `eth_blockNumber`.
 pub trait IngressSubscription: Send + Sync + 'static {
-    /// Stream of enriched `Receipt`s observed on `tx_receipts`. Drives the
-    /// in-memory `tx_hash -> Receipt` and `(sender, nonce) -> Receipt`
-    /// indexes, and releases parked client submissions in
-    /// `PendingReceipts`.
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
+    /// Stream of enriched `Receipt`s observed on `tx_receipts`, with the
+    /// rollbacks in stream order. Drives the in-memory `tx_hash ->
+    /// Receipt` and `(sender, nonce) -> Receipt` indexes, and releases
+    /// parked client submissions in `PendingReceipts`.
+    fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem>;
+    /// The recent rollbacks of [`Self::subscribe_receipts`]. A reader that
+    /// lags on the receipt bus loses items: it reads the rollbacks that it
+    /// missed here.
+    fn rollbacks(&self) -> watch::Receiver<RollbackLog>;
     /// Stream of `QuorumWatermark` snapshots.
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
     /// Stream of `FsyncWatermark` snapshots from the local recorder: the
@@ -111,7 +138,10 @@ pub(crate) const BUS_CAPACITY: usize = 1024;
 pub struct MockChannels {
     /// One sender per `tx_data` shard.
     pub(crate) tx_data_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
-    pub receipt_bus: broadcast::Sender<Receipt>,
+    pub receipt_bus: broadcast::Sender<ReceiptItem>,
+    /// The rollback log a test drives, as the receipt pump would next to
+    /// each rollback on `receipt_bus`.
+    pub rollback_log: watch::Sender<RollbackLog>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub(crate) local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub(crate) block_boundary_bus: broadcast::Sender<BlockBoundary>,
@@ -147,6 +177,7 @@ impl MockChannels {
         let (tx_vec, rx_vec): (Vec<_>, Vec<_>) =
             (0..shards.get()).map(|_| mpsc::unbounded_channel()).unzip();
         let (receipt_bus, _) = broadcast::channel(BUS_CAPACITY);
+        let (rollback_log, _) = watch::channel(RollbackLog::default());
         let (watermark_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (local_fsync_bus, _) = broadcast::channel(BUS_CAPACITY);
         let (block_boundary_bus, _) = broadcast::channel(BUS_CAPACITY);
@@ -158,6 +189,7 @@ impl MockChannels {
             Self {
                 tx_data_tx: tx_vec,
                 receipt_bus,
+                rollback_log,
                 watermark_bus,
                 local_fsync_bus,
                 block_boundary_bus,
@@ -209,8 +241,11 @@ impl IngressPublication for MockChannels {
 }
 
 impl IngressSubscription for MockChannels {
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt> {
+    fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem> {
         self.receipt_bus.subscribe()
+    }
+    fn rollbacks(&self) -> watch::Receiver<RollbackLog> {
+        self.rollback_log.subscribe()
     }
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {
         self.watermark_bus.subscribe()

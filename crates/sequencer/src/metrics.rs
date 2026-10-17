@@ -57,6 +57,10 @@ pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_water
 /// Skip receipts that moved a sender's nonce floor back down. A skip uses
 /// no nonce, so the floor goes back to the nonce the chain expects.
 pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
+/// Nonce floors that an executor rollback voided. The sender's floor is
+/// unknown again until a lookup or a new receipt sets it.
+pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
+    "kardamom_sequencer_receipt_floors_forgotten_total";
 /// The decision version that the sealer reported for the current session,
 /// 0 before its report. The sequencer sends a nonce release only at 3 or
 /// above.
@@ -241,6 +245,10 @@ pub(crate) fn record_floor_advance(partition: u32) {
 
 pub(crate) fn record_skip_release(partition: u32) {
     bump(SKIP_RELEASES, partition, 1);
+}
+
+pub(crate) fn record_floor_forgotten(partition: u32) {
+    bump(RECEIPT_FLOORS_FORGOTTEN, partition, 1);
 }
 
 pub(crate) fn record_sealer_version(partition: u32, version: u8) {

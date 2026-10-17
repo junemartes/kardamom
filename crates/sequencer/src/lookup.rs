@@ -17,13 +17,27 @@
 //! The task delivers the answer as a `FloorUpdate`. The floor rises through
 //! `advance_floor`, with a max merge. It never seeds the state machine.
 //!
+//! A request carries the rollback generation of the controller. The answer
+//! carries it back, so an answer to a request from before the latest
+//! rollback counts for nothing, and every later rollback voids the floor
+//! of an answer. A source can still answer from a voided state after a
+//! rollback: Redis before the state mirror clears it, and an executor
+//! before its own rollback. Such a floor stays until the next rollback
+//! event. Each executor that rolls back sends one, so the floor of a stale
+//! executor answer goes when that executor rolls back. A stale Redis
+//! answer stays at most until the next rollback event, or until a receipt
+//! of the sender gives the chain floor again.
+//!
 //! Every answer is a lower bound. A layer at any height gives a valid
 //! answer: a floor that lags the truth only parks a transaction a little
 //! longer. So a Redis miss or outage only sends the lookup to an executor.
 //!
 //! The core does not own the in-flight set or the timeout. The task does.
 //! The core sends one request per park, and the task drops the duplicates.
-//! A timed-out lookup therefore retries on the sender's next park.
+//! A timed-out lookup therefore retries on the sender's next park. The core
+//! also asks again when it drops an answer to a request from before a
+//! rollback. The task does not count a request of a newer generation as a
+//! duplicate, so the new request goes out at once.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
@@ -36,22 +50,30 @@ use serde::{Deserialize, Serialize};
 /// sender with no known floor. The lookup task in the binary owns the
 /// receiver.
 pub struct LookupRequester {
-    tx: tokio::sync::mpsc::UnboundedSender<Address>,
+    tx: tokio::sync::mpsc::UnboundedSender<LookupRequest>,
+}
+
+/// One lookup request: the sender, and the rollback generation of the
+/// controller when the core asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupRequest {
+    pub sender: Address,
+    pub generation: u64,
 }
 
 impl LookupRequester {
     /// A requester and the receiver its task drains.
     #[must_use]
-    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Address>) {
+    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<LookupRequest>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (Self { tx }, rx)
     }
 
-    /// Ask the task for `sender`'s committed nonce.
-    pub fn request(&mut self, sender: Address) {
+    /// Ask the task for the committed nonce of the sender of `request`.
+    pub fn request(&mut self, request: LookupRequest) {
         // A closed receiver means the task is gone. The park then waits
         // for a receipt or expires, as before the lookup existed.
-        let _ = self.tx.send(sender);
+        let _ = self.tx.send(request);
     }
 }
 
@@ -104,9 +126,12 @@ mod tests {
     #[test]
     fn requester_delivers_to_the_task_side() {
         let (mut req, mut rx) = LookupRequester::channel();
-        let a = Address::repeat_byte(0x33);
-        req.request(a);
-        assert_eq!(rx.try_recv().ok(), Some(a));
+        let request = LookupRequest {
+            sender: Address::repeat_byte(0x33),
+            generation: 2,
+        };
+        req.request(request);
+        assert_eq!(rx.try_recv().ok(), Some(request));
     }
 
     #[test]

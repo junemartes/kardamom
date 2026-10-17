@@ -18,6 +18,11 @@ use kardamom_types::BPosition;
 /// The width of a position tag. `u64::MAX` has 20 digits.
 const TAG_WIDTH: usize = 20;
 
+/// The `SCAN` pattern of every account hash.
+pub const ACCOUNT_PATTERN: &str = "acct:*";
+/// The `SCAN` pattern of every receipt index entry.
+pub const RECEIPT_PATTERN: &str = "rcpt:*";
+
 /// The account hash of `address`.
 #[must_use]
 pub fn account(address: Address) -> String {
@@ -76,6 +81,16 @@ mod tests {
         check(id, "head", &head(3));
         check(id, "pending", &pending(Address::ZERO));
         check(id, "index_tag", &index_tag(7));
+    }
+
+    /// The scan patterns match the keys that the writers make.
+    #[test]
+    fn the_scan_patterns_match_the_keys() {
+        let prefix = |pattern: &str| pattern.trim_end_matches('*').to_string();
+        assert!(account(Address::ZERO).starts_with(&prefix(ACCOUNT_PATTERN)));
+        assert!(receipt(Address::ZERO, 5).starts_with(&prefix(RECEIPT_PATTERN)));
+        assert!(!head(3).starts_with(&prefix(ACCOUNT_PATTERN)));
+        assert!(!pending(Address::ZERO).starts_with(&prefix(RECEIPT_PATTERN)));
     }
 
     #[test]
