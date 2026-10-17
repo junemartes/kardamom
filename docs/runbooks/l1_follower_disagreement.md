@@ -36,12 +36,15 @@ its two-source check did not catch, for example two endpoints of one provider.
 
 ## Clear
 
-This halt waits for an operator (`operator`). After the steps, clear it on the
-consumer's node:
+This halt waits for an operator (`operator`). Clear only after the lying
+instance is stopped or redeployed. After the steps, clear it on the consumer's
+node:
 
 ```sh
 curl -s -X POST http://127.0.0.1:<port>/halt/clear
 ```
 
-The consumer takes records again from its cursor. A second disagreement raises
-the halt again.
+The consumer takes records again from its cursor. The da-watcher drops the live
+records that arrived before the clear, and reads the records after its cursor
+again from the archives. A second disagreement after the clear raises the halt
+again.

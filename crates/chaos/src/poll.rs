@@ -74,6 +74,28 @@ where
     }
 }
 
+/// Sample a condition that must hold: call `step` with the elapsed time
+/// every `interval` for `timeout`, the first call immediate. A step
+/// yields `Some` with the evidence of a break. Returns the first break and
+/// when it came, or `None` when the condition held through the window.
+///
+/// # Errors
+///
+/// Returns the step's error.
+pub async fn first_break<T, F, Fut>(
+    budget: Budget,
+    step: F,
+) -> anyhow::Result<Option<(T, Duration)>>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<T>>>,
+{
+    Ok(match until(budget, step).await? {
+        Outcome::Ready { value, elapsed } => Some((value, elapsed)),
+        Outcome::TimedOut { .. } => None,
+    })
+}
+
 /// Wait `timeout` after the first sleep, so a wait that must sleep
 /// before its first observation (a freeze, a window) starts late.
 ///
@@ -117,5 +139,24 @@ mod tests {
         assert!(
             matches!(outcome, Outcome::TimedOut { elapsed } if elapsed == Duration::from_secs(10))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_reports_its_first_break_or_none() {
+        let budget = Budget::secs(10, 2);
+        let mut calls = 0;
+        let broken = first_break(budget, |_| {
+            calls += 1;
+            let value = (calls >= 2).then_some(calls);
+            async move { Ok(value) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(broken, Some((2, Duration::from_secs(2))));
+
+        let held: Option<((), Duration)> = first_break(budget, |_| async move { Ok(None) })
+            .await
+            .unwrap();
+        assert_eq!(held, None);
     }
 }
