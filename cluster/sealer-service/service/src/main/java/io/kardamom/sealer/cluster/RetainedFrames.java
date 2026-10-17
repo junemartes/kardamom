@@ -84,6 +84,13 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
      */
     long publishedHead();
 
+    /**
+     * A retained frame as an egress session gets it. The heap store gives
+     * the frame as is. The file store gives a canonical entry as its
+     * relayed reference: no egress session gets the envelope.
+     */
+    byte[] forSession(byte[] frame);
+
     /** Release the files and the threads of the store. */
     void close();
 }

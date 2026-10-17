@@ -126,3 +126,18 @@ fn replay_ask_resends_until_the_leader_answers() {
     ask.on_payload(EGRESS_KIND_REPLAY_AHEAD);
     assert!(!ask.due(1_000 + 30 * REPLAY_RESEND_MS));
 }
+
+/// The rules frame that the sealer sends when a session opens comes
+/// before the sealer can have read the subscribe announcement, so it does
+/// not stop the resends. Every other frame of the sealer does.
+#[test]
+fn the_sealer_rules_do_not_confirm_a_subscribe() {
+    assert!(!SessionLoop::confirms_subscribe(
+        crate::wire::EGRESS_KIND_SEALER_INFO
+    ));
+    assert!(SessionLoop::confirms_subscribe(EGRESS_KIND_BOUNDARY));
+    assert!(SessionLoop::confirms_subscribe(EGRESS_KIND_RELAYED));
+    assert!(SessionLoop::confirms_subscribe(
+        crate::wire::EGRESS_KIND_STATUS
+    ));
+}
