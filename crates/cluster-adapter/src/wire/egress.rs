@@ -56,6 +56,9 @@ pub enum EgressItem {
     ReplayDone { up_to_index: u64, up_to_block: u64 },
     /// Replay refused: the requested cursor is past the sealer's head.
     ReplayAhead { head_index: u64, head_block: u64 },
+    /// A new session starts. Every later frame belongs to the new session.
+    /// The session thread makes this item; the sealer never sends it.
+    SessionStart,
     /// Contiguity reject. The service refused to seal `sender`'s ref at
     /// `nonce`, because it expected `expected`. Republish from `expected`:
     /// the unconfirmed ledger holds the missing refs.
@@ -158,6 +161,7 @@ impl EgressItem {
             }),
             super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
             super::EGRESS_KIND_RELAYED_REF => RelayedRef::parse(buf).map(Self::RelayedRef),
+            super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart),
             super::EGRESS_KIND_FEED_GAP => Ok(Self::FeedGap {
                 next_index: rd_u64(buf, 1)?,
                 next_block: rd_u64(buf, 9)?,
@@ -499,6 +503,13 @@ pub fn encode_replay_unavailable(oldest_index: u64, oldest_block: u64) -> Vec<u8
 #[must_use]
 pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_DONE, up_to_index, up_to_block)
+}
+
+/// Frame the client-local session-start marker. Only the session thread
+/// sends it, on the consumer channel.
+#[must_use]
+pub fn encode_session_start() -> Vec<u8> {
+    vec![super::EGRESS_KIND_SESSION_START]
 }
 
 /// Frame a replay-ahead refusal exactly as the Java service does.

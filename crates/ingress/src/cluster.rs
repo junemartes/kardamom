@@ -113,10 +113,12 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
             // Replay control frames are per-session responses to a
             // REPLAY_FROM request. The ingress never sends one; it
             // derives a watermark only from live progress. Every reject
-            // goes only to the offering sequencer session. None can
-            // arrive here, so this arm ignores them as a safeguard.
+            // goes only to the offering sequencer session. The
+            // session-start marker goes only to a replay consumer. None
+            // can arrive here, so this arm ignores them as a safeguard.
             Ok(
                 EgressItem::ReplayDone { .. }
+                | EgressItem::SessionStart
                 | EgressItem::ReplayAhead { .. }
                 | EgressItem::ReplayUnavailable { .. }
                 | EgressItem::ContiguityReject { .. }

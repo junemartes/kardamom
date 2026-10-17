@@ -75,6 +75,8 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # It sends no kind 15. It sends kind 16 only on the member feed, which is off
 # unless kardamom.cluster.feedAeronDir is set. No frame uses kind 14: a
 # reader drops it as unknown.
+# Kind 255 is local to the Rust client: the session thread puts it on the
+# consumer channel when a session opens. It is never on the wire.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads

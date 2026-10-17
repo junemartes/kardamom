@@ -86,8 +86,11 @@ pub(super) struct ExecObservers<W: ExecPorts> {
 ///
 /// Durability semantics do not change. A boundary reaches `tx_receipts`
 /// only after its block is durable. Receipts stream out before
-/// durability, at least once: a crash replay re-publishes them, and
-/// they are byte-identical.
+/// durability, at least once: a crash replay re-publishes them. The
+/// copies are identical only when the records arrive in canonical order,
+/// because a receipt takes its block number from [`Cursor::block`]. The
+/// reader guarantees that order per cluster session, from the session's
+/// start marker on.
 pub(super) struct CommitPipeline<W: ExecPorts> {
     /// The snapshot source returns owned snapshots keyed by block number:
     /// the block just committed. This is the [`ResumePoint`]'s `block` field

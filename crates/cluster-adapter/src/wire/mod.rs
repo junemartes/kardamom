@@ -56,7 +56,7 @@ mod tests;
 
 pub use egress::{
     EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
-    encode_replay_ahead, encode_replay_done, encode_replay_unavailable,
+    encode_replay_ahead, encode_replay_done, encode_replay_unavailable, encode_session_start,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use egress::{
@@ -330,6 +330,13 @@ pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
 /// `[request_id:u64]` at offset 17. [`EgressItem::decode`] reads the fields
 /// that it knows and ignores the tail.
 pub const EGRESS_KIND_FEED_GAP: u8 = 16;
+
+/// Client-local kind: a new session starts: `[kind:u8 = 255]`. The
+/// session thread puts this frame on the consumer channel when a session
+/// opens, before any frame of that session. The channel is FIFO, so every
+/// frame of an earlier session comes before the marker. The sealer never
+/// sends this kind, and no frame on the wire uses it.
+pub const EGRESS_KIND_SESSION_START: u8 = 255;
 
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
