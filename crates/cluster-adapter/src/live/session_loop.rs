@@ -446,6 +446,17 @@ impl SessionLoop {
         }
     }
 
+    /// Whether an egress frame of `kind` proves that the sealer saw the
+    /// subscribe announcement of this session. The sealer sends its rules
+    /// (kind 17) to every session when the session opens, before it can
+    /// have read the announcement, so that frame proves nothing: a
+    /// session that took it as the proof would never resend a lost
+    /// announcement, and the sealer would leave it out of the record
+    /// fan-out.
+    fn confirms_subscribe(kind: u8) -> bool {
+        kind != crate::wire::EGRESS_KIND_SEALER_INFO
+    }
+
     /// Tell a replay consumer, or a consumer of the sealer's rules, that a
     /// new session starts. The marker goes on the consumer channel before
     /// any frame of the new session, and after every frame of the old one.
@@ -477,7 +488,10 @@ impl SessionLoop {
     /// consumer sees the payload. A closed consumer channel ends the egress
     /// direction.
     fn on_app_message(&mut self, payload: Vec<u8>) {
-        self.subscribe_confirmed = true;
+        self.subscribe_confirmed |= payload
+            .first()
+            .copied()
+            .is_some_and(Self::confirms_subscribe);
         // The replay gate reads the kind byte before the egress filter: a
         // replay answer (REPLAY_DONE, REPLAY_AHEAD or REPLAY_UNAVAILABLE)
         // ends the resends even when the consumer does not want the frame.
