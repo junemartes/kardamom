@@ -136,13 +136,26 @@ finding at deploy time, because the waiver was given against a pull
 request base, not against the release that runs. The gate rules are in
 "The release gate" of `deploy/cluster/README.md`.
 
-Each finding carries the `shared` flag of the format. The gate treats a
-`rollback` finding as one-way. It treats a `rolling` or `mixed_fleet`
-finding, and a `retired` finding of a shared format, as coordinated. A
-retired format that is not shared passes the rolling deploy: only the
-service that wrote it reads it, so a mixed fleet and a rollback each read
-their own file. The pull request check still needs the `[retired.<id>]`
-waiver.
+Each finding carries the `shared` and `permanent` flags of the format.
+The gate treats a `rollback` finding as one-way, and a `rolling`,
+`mixed_fleet` or `retired` finding as coordinated. One exception applies
+to a retired format:
+
+- The operator names it in `KARDAMOM_ALLOW_RETIRED`, and the format is
+  neither shared nor permanent. The rolling deploy then carries the
+  change, with no rollback floor. The deploy record keeps the list.
+- Give the allowance only when the release removes the service that
+  owned the format, as the removal of the notifier did for
+  `notifier-outbox`. A rollback then starts the old service on its own
+  file, which no release changed in the meantime.
+- Do not give it for a format that a running service renames, for
+  example a new layout of a frozen format under a new id (rule 6). The
+  new release stops updating the old file, and a rollback starts the old
+  service on stale data. Take the coordinated path, or keep the new
+  release writing the old file through one release.
+- The gate refuses an allowance that covers no such finding.
+
+The pull request check still needs the `[retired.<id>]` waiver.
 
 ## Rules for a format change
 

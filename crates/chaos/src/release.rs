@@ -21,7 +21,8 @@ pub struct FormatGate {
 impl FormatGate {
     /// Every rule that the target breaks against the accepted release, as
     /// a JSON array. Each finding has `rule` (`rollback`, `rolling`,
-    /// `mixed_fleet` or `retired`), `id`, `head`, `base` and `shared`.
+    /// `mixed_fleet` or `retired`), `id`, `head`, `base`, `shared` and
+    /// `permanent`.
     ///
     /// # Errors
     ///

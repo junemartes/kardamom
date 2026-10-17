@@ -25,7 +25,7 @@ fn a_one_way_release_prints_a_rollback_finding() {
     let findings: serde_json::Value = serde_json::from_str(&gate.findings_json().unwrap()).unwrap();
     assert_eq!(
         findings,
-        serde_json::json!([{"rule": "rollback", "id": "spool", "head": 2, "base": 1, "shared": false}])
+        serde_json::json!([{"rule": "rollback", "id": "spool", "head": 2, "base": 1, "shared": false, "permanent": false}])
     );
 }
 
@@ -49,23 +49,27 @@ fn a_shared_one_way_release_is_also_a_mixed_fleet_finding() {
 }
 
 #[test]
-fn a_retired_format_carries_its_shared_flag() {
+fn a_retired_format_carries_its_shared_and_permanent_flags() {
     let dir = tempfile::tempdir().unwrap();
-    let findings = |shared: bool| {
+    let findings = |shared: bool, permanent: bool| {
         let base = registry(dir.path(), "accepted.toml", [1, 1, 1], shared);
-        let head = std::fs::read_to_string(&base)
-            .unwrap()
-            .replace("spool", "other");
-        std::fs::write(dir.path().join("formats.toml"), head).unwrap();
+        let text = std::fs::read_to_string(&base).unwrap();
+        std::fs::write(&base, format!("{text}permanent = {permanent}\n")).unwrap();
+        std::fs::write(
+            dir.path().join("formats.toml"),
+            text.replace("spool", "other"),
+        )
+        .unwrap();
         let gate = FormatGate {
             base,
             root: dir.path().to_path_buf(),
         };
         serde_json::from_str::<serde_json::Value>(&gate.findings_json().unwrap()).unwrap()
     };
-    let retired = |shared: bool| serde_json::json!([{"rule": "retired", "id": "spool", "head": 1, "base": 1, "shared": shared}]);
-    assert_eq!(findings(false), retired(false));
-    assert_eq!(findings(true), retired(true));
+    let retired = |shared: bool, permanent: bool| serde_json::json!([{"rule": "retired", "id": "spool", "head": 1, "base": 1, "shared": shared, "permanent": permanent}]);
+    for (shared, permanent) in [(false, false), (true, false), (false, true)] {
+        assert_eq!(findings(shared, permanent), retired(shared, permanent));
+    }
 }
 
 #[test]

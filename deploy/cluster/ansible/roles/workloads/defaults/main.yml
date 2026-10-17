@@ -304,6 +304,11 @@ workloads_operator: >-
 # (KARDAMOM_ALLOW_ONE_WAY, comma-separated). The record then carries a
 # rollback floor. A one-way change that the list does not name is refused.
 workloads_allow_one_way: "{{ lookup('env', 'KARDAMOM_ALLOW_ONE_WAY') | split(',') | map('trim') | reject('equalto', '') | list }}"
+# The retired format ids that the operator accepts in the rolling path
+# (KARDAMOM_ALLOW_RETIRED, comma-separated): formats that are neither
+# shared nor permanent, of a service that the release removes. The record
+# keeps the list. A retired format that the list does not name is refused.
+workloads_allow_retired: "{{ lookup('env', 'KARDAMOM_ALLOW_RETIRED') | split(',') | map('trim') | reject('equalto', '') | list }}"
 # The sealer settings of workloads_sealer_must_match that a documented
 # procedure changes in the rolling path (KARDAMOM_ALLOW_MUST_MATCH,
 # comma-separated): the return from a seeded start changes seedSnapshot
