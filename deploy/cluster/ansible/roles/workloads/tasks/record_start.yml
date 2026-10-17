@@ -1,8 +1,8 @@
 ---
 # The attempt record, before the first registration. It holds the target
 # (the manifest, the formats, the revision), the version of every job
-# Nomad knows (the release that runs), and the rollback floor of the
-# gate. Each registration adds the job to `changed`; the acceptance
+# Nomad knows (the release that runs), the rollback floor of the gate,
+# and the retired formats that KARDAMOM_ALLOW_RETIRED accepted. Each registration adds the job to `changed`; the acceptance
 # copies the attempt to `accepted`; a rollback fills `rolled_back`.
 # README.md documents the schema.
 # The job list gives only stubs, without the version. Each job's own
@@ -50,6 +50,7 @@
       changed: []
       rolled_back: []
       floor: "{{ workloads_floor }}"
+      retired: "{{ workloads_retired_allowed | map(attribute='id') | list }}"
     # The registrations of this play record themselves; a rollback's do not.
     workloads_recording: true
 
