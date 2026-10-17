@@ -678,6 +678,10 @@ deploy:
 rollback env:
     @just --justfile deploy/cluster/justfile rollback {{ env }}
 
+# Check the sealer before a change of its decision version (cluster/sealer-service/README.md).
+sealer-quiesce-check env:
+    @just --justfile deploy/cluster/justfile sealer-quiesce-check {{ env }}
+
 # Re-render the release before the last one when Nomad dropped its job versions.
 rollback-rerender env:
     @just --justfile deploy/cluster/justfile rollback-rerender {{ env }}

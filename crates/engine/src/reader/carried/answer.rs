@@ -244,8 +244,11 @@ impl Answer {
                 })
             }),
             EgressItem::FeedGap { request_id, .. } => self.answer(Some(request_id), || Step::Ask),
+            // The sealer's rules go to a cluster session, never to the
+            // member feed; a frame of them here drops like a reject.
             EgressItem::RelayedRef(_)
-            | EgressItem::SessionStart
+            | EgressItem::SessionStart { .. }
+            | EgressItem::SealerInfo { .. }
             | EgressItem::Status(_)
             | EgressItem::ContiguityReject { .. }
             | EgressItem::PastDeadline { .. }

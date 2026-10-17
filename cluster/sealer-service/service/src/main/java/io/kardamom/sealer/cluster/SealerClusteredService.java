@@ -16,6 +16,7 @@ import io.kardamom.sealer.OriginOutcome;
 import io.kardamom.sealer.Relayed;
 import io.kardamom.sealer.RemoteOriginAdvance;
 import io.kardamom.sealer.SealerSeed;
+import io.kardamom.sealer.TxOffer;
 import io.kardamom.sealer.VoidLedger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -178,6 +179,17 @@ public final class SealerClusteredService implements ClusteredService {
     private long pastDeadlineCount = 0;
     private long windowFullCount = 0;
 
+    /** Nonce releases applied (logged at power-of-two counts). */
+    private long releaseCount = 0;
+
+    /**
+     * The nonce-release frames that this member applied from the log since
+     * its last snapshot, taken or restored. The admin thread reads it: a
+     * change of the decision version needs 0 on every member, so that no
+     * release replays under the other rules.
+     */
+    private volatile long releasesSinceSnapshot = 0;
+
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
 
@@ -212,7 +224,8 @@ public final class SealerClusteredService implements ClusteredService {
     private final OrderingWindow<HeldRecord> window;
 
     /**
-     * Scratch buffer for the id of an origin, remote-origin, or void frame.
+     * Scratch buffer for the id of an origin, remote-origin, void, or
+     * release frame.
      * Reused to avoid a per-message allocation on the single cluster
      * service thread. A held record copies its id instead.
      */
@@ -324,6 +337,14 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /**
+     * The void configuration of the state. A member with the retained file
+     * takes no void request, and its snapshot holds no void ledger.
+     */
+    private VoidLedger.Config voids() {
+        return retainedFile.isPresent() ? VoidLedger.Config.DISABLED : voidConfig;
+    }
+
     /** Ask for a snapshot on each boundary tick that {@code schedule} makes due. */
     SealerClusteredService snapshotEvery(final SnapshotSchedule schedule) {
         this.snapshotSchedule = Optional.of(schedule);
@@ -363,7 +384,7 @@ public final class SealerClusteredService implements ClusteredService {
             startSeeded(seed.get());
         } else {
             this.state = new CanonicalSealerState(
-                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
+                dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voids(),
                 inclusionHorizonBlocks, window.capacity(), budgets);
             openEgress(Optional.empty());
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
@@ -402,7 +423,7 @@ public final class SealerClusteredService implements ClusteredService {
     void restore(final byte[] snapshot) {
         final ByteBuffer buf = ByteBuffer.wrap(snapshot).order(ByteOrder.BIG_ENDIAN);
         this.state = CanonicalSealerState.load(
-            buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
+            buf, dedupCapacity, remoteOrigins, voids(), inclusionHorizonBlocks, window.capacity(),
             budgets);
         latestSnapshotVersion = state.restoredSnapshotVersion();
         requireRetentionLayout(latestSnapshotVersion);
@@ -439,7 +460,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void startSeeded(final SealerSeed seed) {
         this.state = CanonicalSealerState.seeded(
-            seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), budgets);
+            seed, dedupCapacity, voids(), inclusionHorizonBlocks, window.capacity(), budgets);
         openEgress(Optional.empty());
         // The seed head is on L1, so the purge floor starts there. The first
         // snapshot after the seed confirmation is the first purge mark.
@@ -527,6 +548,7 @@ public final class SealerClusteredService implements ClusteredService {
         // session opening is a log-driven moment where timer scheduling is
         // allowed, so use it to revive a dead boundary clock (see helper).
         maybeReviveBoundaryClock();
+        egress.offerSealerInfo(session);
     }
 
     @Override
@@ -576,7 +598,11 @@ public final class SealerClusteredService implements ClusteredService {
                 onPostedCursor(buffer, offset, length);
                 return;
             case SealerWire.KIND_RECORDED_CURSOR:
-                onRecordedCursor(buffer, offset, length);
+                retainedFile.ifPresentOrElse(
+                    file -> onUnknownKind(kind, length), () -> onRecordedCursor(buffer, offset, length));
+                return;
+            case SealerWire.KIND_NONCE_RELEASE:
+                onNonceRelease(buffer, offset, length);
                 return;
             case SealerWire.KIND_SEED_EPOCH:
                 onSeedEpoch(session, buffer, offset, length);
@@ -603,7 +629,8 @@ public final class SealerClusteredService implements ClusteredService {
                 return;
             }
             case SealerWire.KIND_VOID_REQUEST:
-                onVoidRequest(buffer, offset, length);
+                retainedFile.ifPresentOrElse(
+                    file -> onUnknownKind(kind, length), () -> onVoidRequest(buffer, offset, length));
                 return;
             case SealerWire.KIND_ORIGIN_RECORD:
                 onOriginRecord(session, buffer, offset, length);
@@ -636,9 +663,9 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onIngressRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < SealerWire.MIN_INGRESS_LEN) {
-            // Malformed or too-short envelope: it cannot hold kind
-            // plus a 32-byte id.
+        if (length < RelayShape.INGRESS_RECORD.minLength()) {
+            // Malformed or too-short envelope: it cannot hold the guard
+            // header, the id and the record type.
             onMalformedFrame("ingress-envelope", length);
             return;
         }
@@ -673,7 +700,7 @@ public final class SealerClusteredService implements ClusteredService {
             }
             final int entryLen = buffer.getInt(pos, ByteOrder.LITTLE_ENDIAN);
             pos += 4;
-            if (entryLen < SealerWire.MIN_INGRESS_LEN || pos + entryLen > limit) {
+            if (entryLen < RelayShape.INGRESS_RECORD.minLength() || pos + entryLen > limit) {
                 onMalformedFrame("batch-entry", entryLen);
                 return;
             }
@@ -696,7 +723,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < SealerWire.MIN_ORIGIN_RECORD_LEN) {
+        if (length < RelayShape.ORIGIN_RECORD.minLength()) {
             onMalformedFrame("origin-record", length);
             return;
         }
@@ -770,7 +797,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onRemoteOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN) {
+        if (length < RelayShape.REMOTE_ORIGIN_RECORD.minLength()) {
             onMalformedFrame("remote-origin-record", length);
             return;
         }
@@ -852,7 +879,12 @@ public final class SealerClusteredService implements ClusteredService {
         final long tipLo = buffer.getLong(offset + SealerWire.TIP_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final long tipHi =
             buffer.getLong(offset + SealerWire.TIP_OFFSET + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
-        final byte[] payload = RelayShape.INGRESS_RECORD.payload(buffer, offset, length);
+        final Optional<byte[]> relay = relayOf(RelayShape.INGRESS_RECORD.payload(buffer, offset, length));
+        if (relay.isEmpty()) {
+            onMalformedFrame("canonical-entry-on-ingress", length);
+            return;
+        }
+        final byte[] payload = relay.get();
         final boolean opened = window.isEmpty();
         final boolean full = window.add(
             sender, tipHi, tipLo, new HeldRecord(session, canonicalId, sender, nonce, deadline, payload));
@@ -863,6 +895,23 @@ public final class SealerClusteredService implements ClusteredService {
         if (opened) {
             scheduleWindowTimer();
         }
+    }
+
+    /**
+     * The relayed payload of a kind-0 record. A member with the retained
+     * file relays a full entry as a canonical entry
+     * ({@link SealerWire#RT_TX}), and takes no canonical entry from a
+     * session: only a full entry becomes one, so each canonical entry in
+     * the file holds a whole envelope. Every other payload relays as is.
+     */
+    private Optional<byte[]> relayOf(final byte[] payload) {
+        if (retainedFile.isEmpty()) {
+            return Optional.of(payload);
+        }
+        if (TxOffer.isCanonical(payload)) {
+            return Optional.empty();
+        }
+        return Optional.of(TxOffer.parse(payload).map(TxOffer::canonicalPayload).orElse(payload));
     }
 
     /**
@@ -970,6 +1019,32 @@ public final class SealerClusteredService implements ClusteredService {
                 + " totalAdvances=" + recordedAdvanceCount);
         }
         egress.offerStatus(status());
+    }
+
+    /**
+     * Handle a {@link SealerWire#KIND_NONCE_RELEASE} frame: a sequencer saw
+     * a skip receipt, and the guard goes back to the nonce that the chain
+     * expects. A frame of another length drops as malformed. A release
+     * that does not apply prints nothing: both twins send each release.
+     */
+    private void onNonceRelease(final DirectBuffer buffer, final int offset, final int length) {
+        releasesSinceSnapshot++;
+        if (length != SealerWire.NONCE_RELEASE_LEN) {
+            onMalformedFrame("nonce-release", length);
+            return;
+        }
+        final byte[] sender = new byte[CanonicalSealerState.SENDER_LEN];
+        buffer.getBytes(offset + SealerWire.RELEASE_SENDER_OFFSET, sender);
+        final long nonce = buffer.getLong(offset + SealerWire.RELEASE_NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        buffer.getBytes(offset + SealerWire.RELEASE_ID_OFFSET, canonicalIdScratch);
+        if (!state.onRelease(sender, nonce, canonicalIdScratch)) {
+            return;
+        }
+        releaseCount++;
+        if (Long.bitCount(releaseCount) == 1) {
+            System.out.println("cluster NONCE-RELEASE memberId=" + memberId
+                + " nonce=" + nonce + " totalReleased=" + releaseCount);
+        }
     }
 
     /**
@@ -1210,6 +1285,7 @@ public final class SealerClusteredService implements ClusteredService {
         // window here, and the snapshot never has to carry held records.
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
+        releasesSinceSnapshot = 0;
         latestSnapshotVersion = retainedFile.isPresent()
             ? CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION
             : CanonicalSealerState.snapshotWriteVersion();
@@ -1267,6 +1343,11 @@ public final class SealerClusteredService implements ClusteredService {
     /** The version of the newest snapshot this member restored or took; 0 before either. */
     int latestSnapshotVersion() {
         return latestSnapshotVersion;
+    }
+
+    /** The nonce-release frames since the last snapshot, taken or restored. */
+    long releasesSinceSnapshot() {
+        return releasesSinceSnapshot;
     }
 
     /** Ingress frames of an unknown kind this member dropped. */

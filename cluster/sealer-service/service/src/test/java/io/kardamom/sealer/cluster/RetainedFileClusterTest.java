@@ -85,6 +85,8 @@ class RetainedFileClusterTest {
         IntStream.range(from, to).forEach(i -> {
             final byte[] payload = new byte[PAYLOAD_BYTES];
             Arrays.fill(payload, (byte) i);
+            // Record type 0: a canonical entry (type 6) goes to an egress session as its reference.
+            payload[0] = 0;
             offerRecord(client, canonicalId(i), payload);
         });
         awaitCondition(client, () -> egress.relayedIndexes.size() >= to);

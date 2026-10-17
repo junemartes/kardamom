@@ -189,6 +189,25 @@ public final class SealerWire {
     /** Exact length of a {@link #KIND_RECORDED_CURSOR} frame. */
     static final int RECORDED_CURSOR_LEN = RECORDED_THROUGH_OFFSET + Long.BYTES;
 
+    /**
+     * Nonce release, a sequencer's system record:
+     * {@code [kind:10][sender:20][nonce:u64 LE][canonical_id:32]}
+     * ({@link #NONCE_RELEASE_LEN} bytes). An executor skipped the ordered
+     * entry {@code canonical_id} of {@code sender}, and the chain expects
+     * {@code nonce} of the sender next. See
+     * {@link CanonicalSealerState#onRelease}. A member that does not know
+     * the kind drops the frame. Matches Rust {@code KIND_NONCE_RELEASE}.
+     */
+    public static final byte KIND_NONCE_RELEASE = 10;
+    /** Offset of the 20-byte sender within a {@link #KIND_NONCE_RELEASE} frame. */
+    static final int RELEASE_SENDER_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE nonce within a {@link #KIND_NONCE_RELEASE} frame. */
+    static final int RELEASE_NONCE_OFFSET = RELEASE_SENDER_OFFSET + CanonicalSealerState.SENDER_LEN;
+    /** Offset of the 32-byte canonical id within a {@link #KIND_NONCE_RELEASE} frame. */
+    static final int RELEASE_ID_OFFSET = RELEASE_NONCE_OFFSET + Long.BYTES;
+    /** Exact length of a {@link #KIND_NONCE_RELEASE} frame. */
+    static final int NONCE_RELEASE_LEN = RELEASE_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
     /** Offset of the u64 LE canonical index within a {@link #KIND_VOID_REQUEST} frame. */
@@ -382,6 +401,21 @@ public final class SealerWire {
     static final int FEED_STREAM_ID = 1006;
     /** The stream id of the feed control, executor to member, over IPC. */
     static final int FEED_CONTROL_STREAM_ID = 1007;
+
+    /**
+     * The sealer's rules:
+     * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
+     * when the session opens, with the id of that session, so a client ties
+     * it to its session whatever the order of its own session events. A member sends it again after a restart into
+     * another decision version, because every session opens again. A
+     * sequencer sends a nonce release only after it got version 3 or above
+     * on its current session. A reader that does not know the kind drops
+     * it. Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
+     */
+    public static final byte EGRESS_KIND_SEALER_INFO = 17;
+    /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
+    static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES + Long.BYTES;
 
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;
