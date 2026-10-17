@@ -414,6 +414,24 @@ Each executor exports these metrics for its executor stream (`exec_txs`). See "T
 - The live publication counts its dropped records in `kardamom_log_best_effort_dropped_total{stream_id="1005"}`. A drop is normal while no consumer subscribes.
 - With `--exec-cursor` on (`KARDAMOM_EXEC_CURSOR`), the publisher sends the recorded cursor to the sealer. It sends a cursor that moved when 100 ms passed, or at once when it moved by 1024 records. A sent cursor never moves down. The ingress shows the best cursor of the executors in `kardamom_ingress_cluster_recorded_head`.
 
+### Executor input source
+
+With `--carry-bytes` (`KARDAMOM_CARRY_BYTES`, off by default), the executor reads the canonical entries with their bytes from the feed of its paired sealer member, on `aeron:ipc` of the media driver at `--aeron-dir`.
+
+- The executor opens no `tx_data` lane, joins nothing and votes no void.
+- It opens no cluster session and sends no recorded cursor. It refuses to start with `--exec-cursor`.
+- Switch it on only with sealer members that carry the bytes and run the member feed.
+- Off: the executor joins the references of the cluster egress with `tx_data`.
+
+| Metric | Meaning |
+| --- | --- |
+| `kardamom_executor_input_source{source}` | 1 for the source that the executor reads, 0 for the other. `source` is `feed` (the member feed) or `service` (the serving service). |
+| `kardamom_executor_source_mismatch_total{source}` | Canonical entries whose `keccak256(raw_tx)` is not the canonical id, by the source that sent them. The executor does not execute such an entry and does not stop: it leaves the source and reads the same index from the other source. |
+
+- The executor leaves the feed when no frame comes for 6 s, when the feed loses its image, or on a mismatch. It goes back to the feed after the feed has one image for 30 s and a replay of the feed from its cursor reaches `REPLAY_DONE`.
+- Any increment of `kardamom_executor_source_mismatch_total` needs an operator: a member or a service sends bytes that do not match the ordered id. The log line is `the raw transaction does not hash to its canonical id; replaying from the other source`, with the source and the index.
+- A switch logs `switching the input source` with the old and the new source and the cursor.
+
 ### L1 follower (inbox indexer)
 
 | Metric | Meaning |
