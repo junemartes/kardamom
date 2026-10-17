@@ -345,12 +345,18 @@ class Deploys(unittest.TestCase):
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
-        # The operator binary: the smoke, and the format findings of the
-        # release gate, which a test scripts in `smoke.sh.findings`.
+        # One stub for each operator binary. The cluster binary smokes a
+        # canary and fails a `formats` call. The deploy binary prints the
+        # format findings of the release gate, which a test scripts in
+        # `deploy.sh.findings`. Each stub logs its calls in `<stub>.calls`.
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
         self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                              'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+                              'if [ "$1" = formats ]; then exit 1; fi\n')
         self.smoke.chmod(0o755)
+        self.deploy_bin = Path(self.tmp.name) / 'deploy.sh'
+        self.deploy_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
+                                   'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+        self.deploy_bin.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.api.server_close)
@@ -370,6 +376,7 @@ class Deploys(unittest.TestCase):
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
+            'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
@@ -411,7 +418,7 @@ class Deploys(unittest.TestCase):
         self.run_deploy()
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
-        Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
+        Path(str(self.deploy_bin) + '.findings').write_text(json.dumps(findings))
         self.repin('b')
 
 
@@ -1066,7 +1073,7 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('does not hold the image of executor', output)
         self.assertEqual(self.api.state['writes'], [])
-        self.assertFalse(Path(str(self.smoke) + '.calls').exists(), 'the gate reads the registry before the formats')
+        self.assertFalse(Path(str(self.deploy_bin) + '.calls').exists(), 'the gate reads the registry before the formats')
         # Only the local profile skips the check.
         output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
         self.assertIn('the production profile does not allow that', output)
@@ -1089,9 +1096,11 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('coordinated format change: sealer-snapshot', output)
         self.assertEqual(self.api.state['writes'], [])
-        # The comparison ran the library against the accepted registry and this tree.
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
+        # The deploy binary ran the comparison against the accepted registry
+        # and this tree. The cluster binary did not run.
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
         self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+        self.assertFalse(Path(str(self.smoke) + '.calls').exists())
 
     def test_a_retired_format_needs_the_allowance(self):
         self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1,

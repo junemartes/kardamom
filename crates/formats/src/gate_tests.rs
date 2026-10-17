@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
+
 use super::*;
 
-fn registry(dir: &std::path::Path, name: &str, versions: [u32; 3], shared: bool) -> PathBuf {
+fn registry(dir: &Path, name: &str, versions: [u32; 3], shared: bool) -> PathBuf {
     let [writes, reads_min, reads_max] = versions;
     let path = dir.join(name);
     std::fs::write(
@@ -13,32 +15,29 @@ fn registry(dir: &std::path::Path, name: &str, versions: [u32; 3], shared: bool)
     path
 }
 
-#[test]
-fn a_one_way_release_prints_a_rollback_finding() {
+/// The findings of a target with `head` versions against an accepted
+/// release with `base` versions, as the JSON that the deploy role reads.
+fn findings_json(base: [u32; 3], head: [u32; 3], shared: bool) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
-    let base = registry(dir.path(), "accepted.toml", [1, 1, 1], false);
-    registry(dir.path(), "formats.toml", [2, 1, 2], false);
     let gate = FormatGate {
-        base,
+        base: registry(dir.path(), "accepted.toml", base, shared),
         root: dir.path().to_path_buf(),
     };
-    let findings: serde_json::Value = serde_json::from_str(&gate.findings_json().unwrap()).unwrap();
+    registry(dir.path(), "formats.toml", head, shared);
+    serde_json::to_value(gate.findings().unwrap()).unwrap()
+}
+
+#[test]
+fn a_one_way_release_has_a_rollback_finding() {
     assert_eq!(
-        findings,
+        findings_json([1, 1, 1], [2, 1, 2], false),
         serde_json::json!([{"rule": "rollback", "id": "spool", "head": 2, "base": 1, "shared": false, "permanent": false}])
     );
 }
 
 #[test]
 fn a_shared_one_way_release_is_also_a_mixed_fleet_finding() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = registry(dir.path(), "accepted.toml", [1, 1, 1], true);
-    registry(dir.path(), "formats.toml", [2, 1, 2], true);
-    let gate = FormatGate {
-        base,
-        root: dir.path().to_path_buf(),
-    };
-    let findings: serde_json::Value = serde_json::from_str(&gate.findings_json().unwrap()).unwrap();
+    let findings = findings_json([1, 1, 1], [2, 1, 2], true);
     let rules: Vec<&str> = findings
         .as_array()
         .unwrap()
@@ -64,7 +63,7 @@ fn a_retired_format_carries_its_shared_and_permanent_flags() {
             base,
             root: dir.path().to_path_buf(),
         };
-        serde_json::from_str::<serde_json::Value>(&gate.findings_json().unwrap()).unwrap()
+        serde_json::to_value(gate.findings().unwrap()).unwrap()
     };
     let retired = |shared: bool, permanent: bool| serde_json::json!([{"rule": "retired", "id": "spool", "head": 1, "base": 1, "shared": shared, "permanent": permanent}]);
     for (shared, permanent) in [(false, false), (true, false), (false, true)] {
@@ -73,15 +72,11 @@ fn a_retired_format_carries_its_shared_and_permanent_flags() {
 }
 
 #[test]
-fn a_compatible_release_prints_an_empty_array() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = registry(dir.path(), "accepted.toml", [1, 1, 2], false);
-    registry(dir.path(), "formats.toml", [2, 1, 2], false);
-    let gate = FormatGate {
-        base,
-        root: dir.path().to_path_buf(),
-    };
-    assert_eq!(gate.findings_json().unwrap(), "[]");
+fn a_compatible_release_has_no_finding() {
+    assert_eq!(
+        findings_json([1, 1, 2], [2, 1, 2], false),
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -91,6 +86,6 @@ fn a_missing_registry_is_an_error_that_names_the_file() {
         base: dir.path().join("absent.toml"),
         root: dir.path().to_path_buf(),
     };
-    let error = gate.findings_json().unwrap_err().to_string();
+    let error = gate.findings().unwrap_err().to_string();
     assert!(error.contains("absent.toml"), "{error}");
 }
