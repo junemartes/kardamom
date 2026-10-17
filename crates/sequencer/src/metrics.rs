@@ -61,10 +61,19 @@ pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
 /// unknown again until a lookup or a new receipt sets it.
 pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
     "kardamom_sequencer_receipt_floors_forgotten_total";
+/// The decision version that the sealer reported for the current session,
+/// 0 before its report. The sequencer sends a nonce release only at 3 or
+/// above.
+pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
+/// The nonce releases for the sealer, by outcome: `sent` to the sealer,
+/// `duplicate` for a skipped entry that already has a release, `dropped`
+/// when the bounded queue was full or the transport refused the frame.
+pub(crate) const NONCE_RELEASES: &str = "kardamom_sequencer_nonce_releases_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce
 /// plus the refs in flight for the settle time: the sealer's nonce guard
-/// is ahead of the chain after a skip. The sender is stuck until an
-/// operator acts. A client that keeps resubmitting counts once per try,
+/// is ahead of the chain after a skip. The nonce release of the skip
+/// brings the guard back; a sender that stays stuck had no release reach
+/// the sealer. A client that keeps resubmitting counts once per try,
 /// so alert on a rate that stays above zero over some minutes, not on
 /// one increase.
 pub(crate) const SEALER_NONCE_AHEAD: &str = "kardamom_sequencer_sealer_nonce_ahead_total";
@@ -240,6 +249,15 @@ pub(crate) fn record_skip_release(partition: u32) {
 
 pub(crate) fn record_floor_forgotten(partition: u32) {
     bump(RECEIPT_FLOORS_FORGOTTEN, partition, 1);
+}
+
+pub(crate) fn record_sealer_version(partition: u32, version: u8) {
+    set(SEALER_VERSION, partition, f64::from(version));
+}
+
+pub(crate) fn record_nonce_release(partition: u32, outcome: &'static str) {
+    counter!(NONCE_RELEASES, "partition" => partition.to_string(), "outcome" => outcome)
+        .increment(1);
 }
 
 pub(crate) fn record_sealer_nonce_ahead(partition: u32) {

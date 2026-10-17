@@ -66,11 +66,21 @@ pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     encode_kind_2u64(EGRESS_KIND_REPLAY_DONE, up_to_index, up_to_block)
 }
 
-/// Frame the client-local session-start marker. Only the session thread
-/// sends it, on the consumer channel.
+/// Frame the sealer's rules exactly as the Java service does.
 #[must_use]
-pub fn encode_session_start() -> Vec<u8> {
-    vec![super::EGRESS_KIND_SESSION_START]
+pub fn encode_sealer_info(decision_version: u8, session_id: i64) -> Vec<u8> {
+    let mut b = vec![super::EGRESS_KIND_SEALER_INFO, decision_version];
+    b.extend_from_slice(&session_id.to_le_bytes());
+    b
+}
+
+/// Frame the client-local session-start marker of the session
+/// `session_id`. Only the session thread sends it, on the consumer channel.
+#[must_use]
+pub fn encode_session_start(session_id: i64) -> Vec<u8> {
+    let mut b = vec![super::EGRESS_KIND_SESSION_START];
+    b.extend_from_slice(&session_id.to_le_bytes());
+    b
 }
 
 /// Frame a replay-ahead refusal exactly as the Java service does.

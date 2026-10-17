@@ -28,14 +28,23 @@ final class MemberStatus {
      * a release whose read maximum is below {@code latest}: that member
      * could not restore its own snapshot after the roll.
      */
-    record SnapshotVersions(int writes, int readsMin, int readsMax, int latest) {
-        /** This release's constants, with the member's {@code latest}. */
+    record SnapshotVersions(int writes, int readsMin, int readsMax, int latest, long releasesSince) {
+        /** This release's constants, with the member's {@code latest} and no release since it. */
         static SnapshotVersions of(final int latest) {
+            return of(latest, 0L);
+        }
+
+        /**
+         * This release's constants, with the member's {@code latest}, and the
+         * nonce-release frames it applied since its last snapshot.
+         */
+        static SnapshotVersions of(final int latest, final long releasesSince) {
             return new SnapshotVersions(
                 CanonicalSealerState.snapshotWriteVersion(),
                 CanonicalSealerState.SNAPSHOT_READ_MIN_VERSION,
                 CanonicalSealerState.snapshotReadMaxVersion(),
-                latest);
+                latest,
+                releasesSince);
         }
     }
 
@@ -91,6 +100,8 @@ final class MemberStatus {
             + ",\"snapshotReadsMin\":" + snapshot.readsMin()
             + ",\"snapshotReadsMax\":" + snapshot.readsMax()
             + ",\"snapshotLatest\":" + snapshot.latest()
+            + ",\"releasesSinceSnapshot\":" + snapshot.releasesSince()
+            + ",\"decisionVersion\":" + CanonicalSealerState.DECISION_VERSION
             + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"ready\":" + isReady(lagBytes)
             + "}";

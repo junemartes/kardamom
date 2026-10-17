@@ -131,11 +131,13 @@ let report = Comparison::new(&base, &head).report();
 The deploy preflight is the release gate of the workloads role
 (`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`). It reads the
 registry of the accepted release from the deploy record, runs
-`kardamom-cluster formats --base <that registry>` for the findings, and
-decides by the findings alone: a waiver in `formats.toml` does not cover a
-finding at deploy time, because the waiver was given against a pull
+`kardamom-deploy formats --base <that registry> --root <target tree>` for
+the findings, and decides by the findings alone: a waiver in `formats.toml`
+does not cover a finding at deploy time, because the waiver was given against a pull
 request base, not against the release that runs. The gate rules are in
-"The release gate" of `deploy/cluster/README.md`.
+"The release gate" of `deploy/cluster/README.md`. Every release ships
+`kardamom-deploy`, signed, so the gate runs the binary of the release that
+it deploys.
 
 ## Rules for a format change
 
@@ -182,8 +184,9 @@ proves each one.
 
 | Reader | Rule | What it makes safe |
 |---|---|---|
-| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
+| Sealer ingress dispatch | Every member drops a frame of a kind it does not know, counts it (`cluster DROPPED unknown-kind`), and never orders it. Kind 0 carries one user record, and kind 3 carries a batch of them; every other known kind is a control message. Kind 10, the nonce release, is a control message of the sequencer. The sequencer sends it only after the sealer reported decision version 3 on the session (egress kind 17), so a sealer of an older version gets none. The release before this one orders an unknown kind of 85 bytes or more as a user record, so during the first roll to this release no client may send an unknown kind. | A mixed fleet does not fork on a new kind: a member of the old release drops the frame, and a member of the new release sends a state-changing kind only after every member reads it. |
 | Sealer `/status` | The admin endpoint reports `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, and `snapshotLatest`, the version of the newest snapshot the member restored or took. | A deploy preflight refuses a target whose `reads_max` is below `snapshotLatest` of any member. That member could not restore its own snapshot after the roll. |
+| Rust egress reader | A frame of a kind the reader does not know drops with a warning. Kind 17 (the sealer's rules) is new: an older reader drops it, and only the sequencer reads it. | A sealer can send a new egress kind to the clients of the release before. |
 | Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |
 | Checkpoint manifest and peer fetch | The manifest states `schema_version`, and the peer header `x-checkpoint-schema` carries it. An adopter skips an image of a schema it does not read, before the copy, with a log line and `kardamom_checkpoint_unreadable_schema_skips_total`. An image without a stated schema passes, and says its schema when it opens. | After a schema bump, an executor or a validator of the old release does not adopt a checkpoint of the new release, from its own disk or from a peer. It takes the next checkpoint that it reads. |
 | da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |

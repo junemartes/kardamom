@@ -16,6 +16,10 @@ import org.agrona.MutableDirectBuffer;
  * the staging buffer.</p>
  */
 final class EgressFrames {
+    /** The offset of the record type in a relayed frame: after the header and the canonical id. */
+    private static final int ENTRY_RECORD_TYPE_OFFSET =
+        SealerWire.RELAYED_HEADER_LEN + CanonicalSealerState.CANONICAL_ID_LEN;
+
     private final MutableDirectBuffer buf;
 
     EgressFrames(final MutableDirectBuffer buf) {
@@ -57,6 +61,28 @@ final class EgressFrames {
         return pos;
     }
 
+    /**
+     * A retained frame as an egress session gets it: a relayed canonical
+     * entry becomes its relayed reference, and every other frame stays as
+     * is. A retained frame is one that this member framed: a relayed frame
+     * always holds the record type, because the service takes no ingress
+     * record without one ({@link RelayShape#minLength()}).
+     */
+    static byte[] forSession(final byte[] retained) {
+        final boolean entry = retained[0] == SealerWire.EGRESS_KIND_RELAYED
+            && retained[ENTRY_RECORD_TYPE_OFFSET] == SealerWire.RT_TX;
+        if (!entry) {
+            return retained;
+        }
+        final byte[] ref = new byte[SealerWire.RELAYED_REF_LEN];
+        ref[0] = SealerWire.EGRESS_KIND_RELAYED_REF;
+        System.arraycopy(retained, Byte.BYTES, ref, Byte.BYTES, Long.BYTES);
+        System.arraycopy(retained, SealerWire.RELAYED_HEADER_LEN, ref, Byte.BYTES + Long.BYTES,
+            CanonicalSealerState.CANONICAL_ID_LEN);
+        ref[SealerWire.RELAYED_REF_LEN - 1] = SealerWire.RT_TX;
+        return ref;
+    }
+
     /** A control message {@code [kind][a:u64][b:u64]}: the replay answers and the origin gap. */
     int control(final byte kind, final long a, final long b) {
         int pos = 0;
@@ -67,6 +93,14 @@ final class EgressFrames {
         buf.putLong(pos, b, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         return pos;
+    }
+
+    /** The sealer's rules: {@code [kind:17][decision_version:u8][cluster_session_id:i64]}. */
+    int sealerInfo(final int decisionVersion, final long sessionId) {
+        buf.putByte(0, SealerWire.EGRESS_KIND_SEALER_INFO);
+        buf.putByte(Byte.BYTES, (byte) decisionVersion);
+        buf.putLong(Byte.BYTES + Byte.BYTES, sessionId, ByteOrder.LITTLE_ENDIAN);
+        return SealerWire.SEALER_INFO_LEN;
     }
 
     /**

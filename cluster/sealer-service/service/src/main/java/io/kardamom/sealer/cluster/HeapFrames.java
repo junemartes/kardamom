@@ -126,6 +126,11 @@ final class HeapFrames implements RetainedFrames {
     }
 
     @Override
+    public byte[] forSession(final byte[] frame) {
+        return frame;
+    }
+
+    @Override
     public void checkHealth() {
         // The heap store has no helper thread and no file.
     }

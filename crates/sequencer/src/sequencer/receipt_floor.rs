@@ -1,7 +1,8 @@
 //! The receipts of this shard's senders, as the publish loop drains them:
 //! the publish confirmations, the skip releases, and the executed-truth
 //! floors, and the floors that a rollback voids. Each one moves the
-//! publish ledger or the nonce floor of one sender.
+//! publish ledger or the nonce floor of one sender. A skip that proves the
+//! chain nonce also queues a nonce release for the sealer's guard.
 
 use std::time::Instant;
 
@@ -27,6 +28,7 @@ impl Sequencer {
             confirmations,
             released,
             forgotten,
+            sealer,
         } = r.drain_floor_updates();
         // A receipt proves that every one of this sequencer's published
         // refs for that sender, at or below its nonce, committed. Drop
@@ -36,6 +38,9 @@ impl Sequencer {
         }
         for (sender, chain) in released {
             self.apply_one_release(sender, chain);
+        }
+        for release in sealer {
+            self.releases.push(release);
         }
         for (sender, floor) in raised {
             self.apply_one_floor_update(sender, floor);

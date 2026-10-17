@@ -14,8 +14,11 @@
 //!
 //! [`Comparison::report`] compares any two registries: a pull request
 //! against its base, or a deploy target against the deployed release.
+//! [`FormatGate`] gives the findings of a deploy target against the
+//! accepted release.
 
 mod check;
+mod gate;
 mod support;
 
 use std::collections::BTreeMap;
@@ -24,6 +27,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use check::{Comparison, Finding, Report, Rule};
+pub use gate::FormatGate;
 
 /// The versions of one format that a release writes and reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

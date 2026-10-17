@@ -1,8 +1,14 @@
 use super::*;
+use alloy_primitives::B256;
 use std::time::Duration;
 
 fn s(byte: u8) -> Address {
     Address::repeat_byte(byte)
+}
+
+/// The hash of a skipped test entry.
+fn h(byte: u8) -> B256 {
+    B256::repeat_byte(byte)
 }
 
 fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorEvent>, SharedWatermark) {
@@ -138,7 +144,7 @@ fn skip_receipts_confirm_but_never_raise_floors() {
     // confirmation), while it proves no nonce was consumed. It is not
     // floor evidence.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(s(1), 7, kardamom_types::SkipReason::NonceTooLow).into())
+    tx.send(FloorUpdate::skip(s(1), 7, kardamom_types::SkipReason::NonceTooLow, h(7)).into())
         .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty(), "skip is not floor evidence");
@@ -155,27 +161,35 @@ fn skip_receipts_confirm_but_never_raise_floors() {
 fn skip_receipts_release_to_the_chain_nonce() {
     use kardamom_types::SkipReason;
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds).into())
+    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds, h(10)).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh).into())
+    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh, h(11)).into())
         .unwrap();
     tx.send(FloorUpdate::executed(s(2), 4).into()).unwrap();
-    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh).into())
+    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh, h(29)).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 7, SkipReason::InsufficientFunds).into())
+    tx.send(FloorUpdate::skip(s(2), 7, SkipReason::InsufficientFunds, h(27)).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow).into())
+    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow, h(22)).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds).into())
+    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds, h(23)).into())
         .unwrap();
     let ReceiptDrain {
-        raised, released, ..
+        raised,
+        released,
+        sealer,
+        ..
     } = c.drain_floor_updates();
     assert_eq!(raised, vec![(s(2), 5)]);
     assert_eq!(
         released,
         vec![(s(1), 0), (s(1), 0), (s(2), 5), (s(2), 7)],
         "each skip names the chain nonce; a too-low or late skip names none"
+    );
+    assert_eq!(
+        sealer,
+        vec![release(1, 0, 10), release(2, 7, 27)],
+        "only an insufficient-funds skip at or above the floor releases the sealer's guard"
     );
 }
 
@@ -211,6 +225,7 @@ fn a_receipt_maps_to_its_outcome() {
             Outcome::Skipped {
                 nonce: 3,
                 reason: SkipReason::NonceTooLow,
+                tx_hash: B256::ZERO,
             },
         ),
         (TX_TYPE_DEPOSIT, None, Outcome::Deposit),
@@ -255,7 +270,7 @@ fn genuine_nonce_zero_tx_confirms_and_raises() {
 #[test]
 fn nonce_zero_skip_confirms_without_raising() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(s(1), 0, kardamom_types::SkipReason::NonceTooLow).into())
+    tx.send(FloorUpdate::skip(s(1), 0, kardamom_types::SkipReason::NonceTooLow, h(0)).into())
         .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(confirmations, vec![(s(1), 0)]);
@@ -425,4 +440,76 @@ fn a_raised_floor_carries_the_block_of_the_receipt_that_raised_it() {
     let drain = c.drain_floor_updates();
     assert_eq!(drain.forgotten, vec![s(1)]);
     assert_eq!(c.floor(s(1)), None);
+}
+
+fn release(who: u8, nonce: u64, hash: u8) -> NonceRelease {
+    NonceRelease {
+        sender: s(who),
+        nonce,
+        tx_hash: h(hash),
+    }
+}
+
+/// An insufficient-funds skip proves the chain nonce, so it releases the
+/// sealer's guard with no receipt floor: the first transaction of a new
+/// key. A skip from a check before the nonce check proves nothing about
+/// the nonce: with no floor it sends no release, and with a floor it
+/// releases only at the floor. A nonce skip never releases.
+#[test]
+fn a_release_to_the_sealer_needs_a_proof_of_the_chain_nonce() {
+    use kardamom_types::SkipReason;
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds, h(1)).into())
+        .unwrap();
+    tx.send(FloorUpdate::skip(s(2), 0, SkipReason::GasLimit, h(2)).into())
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(3), 2).into()).unwrap();
+    tx.send(FloorUpdate::skip(s(3), 3, SkipReason::Fee, h(3)).into())
+        .unwrap();
+    tx.send(FloorUpdate::skip(s(3), 1, SkipReason::Fee, h(4)).into())
+        .unwrap();
+    tx.send(FloorUpdate::skip(s(3), 4, SkipReason::NonceTooHigh, h(5)).into())
+        .unwrap();
+    tx.send(FloorUpdate::skip(s(3), 2, SkipReason::NonceTooLow, h(6)).into())
+        .unwrap();
+    let ReceiptDrain { sealer, .. } = c.drain_floor_updates();
+    assert_eq!(
+        sealer,
+        vec![release(1, 0, 1), release(3, 3, 3)],
+        "a fee skip at the floor releases; below it, or with no floor, none"
+    );
+}
+
+/// Floor f. Entry f skips for insufficient funds, and f + 1 skips for a fee
+/// check that runs before the nonce check. Only f releases: the guard
+/// reopens at f, and a late release of f + 1 cannot set it below the chain
+/// after f' and f+1' are ordered. A fee skip at the floor itself releases.
+#[test]
+fn a_skip_before_the_nonce_check_releases_only_at_the_floor() {
+    use kardamom_types::SkipReason;
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(FloorUpdate::executed(s(1), 4).into()).unwrap();
+    tx.send(FloorUpdate::skip(s(1), 5, SkipReason::InsufficientFunds, h(5)).into())
+        .unwrap();
+    tx.send(FloorUpdate::skip(s(1), 6, SkipReason::Fee, h(6)).into())
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(2), 1).into()).unwrap();
+    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::Fee, h(7)).into())
+        .unwrap();
+    let ReceiptDrain { sealer, .. } = c.drain_floor_updates();
+    assert_eq!(sealer, vec![release(1, 5, 5), release(2, 2, 7)]);
+}
+
+/// A sealer that has not reported decision version 3 on the current
+/// session gets no release, and a new session forgets the report.
+#[test]
+fn the_sealer_takes_releases_only_after_it_reported_version_three() {
+    let (c, _tx, w) = mk(ResyncConfig::default());
+    assert!(!c.sealer_takes_releases());
+    w.set_sealer_version(2);
+    assert!(!c.sealer_takes_releases());
+    w.set_sealer_version(3);
+    assert!(c.sealer_takes_releases());
+    w.set_sealer_version(0);
+    assert!(!c.sealer_takes_releases());
 }
