@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use alloy_primitives::Address;
+use kardamom_cluster_adapter::wire::NonceRelease;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -354,10 +355,10 @@ pub struct ReceiptDrain {
     pub raised: Vec<(Address, u64)>,
     /// `(sender, nonce)` for each receipt that confirms a publish.
     pub confirmations: Vec<(Address, u64)>,
-    /// `(sender, nonce)` for each skip receipt that proves the chain
-    /// expects `nonce` or a lower nonce of the sender next. See
-    /// [`Outcome::released`].
-    pub released: Vec<(Address, u64)>,
+    /// One nonce release for each skip receipt that proves the chain
+    /// expects `nonce` or a lower nonce of the sender next, with the hash
+    /// of the skipped entry. See [`Outcome::released`].
+    pub released: Vec<NonceRelease>,
 }
 
 impl ResyncController {
@@ -458,8 +459,8 @@ impl ResyncController {
         };
         drain.confirmations.push((u.sender, nonce));
         let floor = self.floor(u.sender).unwrap_or(0);
-        if let Some(chain) = u.outcome.released(floor) {
-            drain.released.push((u.sender, chain));
+        if let Some(release) = u.released(floor) {
+            drain.released.push(release);
         }
         let Some(floor) = u.outcome.floor() else {
             return drain;

@@ -107,8 +107,13 @@ public final class CanonicalSealerState {
      * version. The deploy passes it in {@code kardamom.cluster.decisionVersion},
      * a setting that every member must match, so a new version needs a
      * coordinated restart of the sealer.
+     *
+     * <p>Version 3 adds the nonce release ({@link #onRelease}). A member that
+     * keeps its retained frames in a file also orders full entries and takes
+     * no void request; that choice is a setting that every member must
+     * match, and the snapshot version carries it.</p>
      */
-    public static final int DECISION_VERSION = 2;
+    public static final int DECISION_VERSION = 3;
 
     /**
      * Default ordering window: off. The deploy sets {@code 20} together with
@@ -157,10 +162,11 @@ public final class CanonicalSealerState {
      * Version 11 adds the recorded cursors after the seed digest; an older
      * snapshot restores no cursor, and the record-lag guard refuses
      * nothing until the first cursor. Version 12 has the state section of
-     * version 11, and the retention section of the retained file after it:
-     * the service writes it only when the member keeps its retained frames
-     * in a file. A member that cannot read the file section must not load
-     * the snapshot.
+     * version 10 without the void ledger, and the retention section of the
+     * retained file after it: the service writes it only when the member
+     * keeps its retained frames in a file, and such a member takes no void
+     * request and no recorded cursor. A member that cannot read the file
+     * section must not load the snapshot.
      *
      * <p>This is the newest version that {@link #load} reads. The writer
      * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
@@ -169,8 +175,8 @@ public final class CanonicalSealerState {
 
     /**
      * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
-     * state section of version 11, then the retention section of the
-     * retained file.
+     * state section of version 10 without the void ledger, then the
+     * retention section of the retained file.
      */
     public static final int RETAINED_FILE_SNAPSHOT_VERSION = 12;
 
@@ -949,6 +955,60 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * Apply a nonce release: an executor skipped the ordered entry
+     * {@code canonicalId32} of {@code sender20}, and the chain expects
+     * {@code nonce} of the sender next. A skip uses no nonce on the chain,
+     * so the expected nonce of the sender becomes the lower of the expected
+     * nonce and {@code nonce}. An evicted sender re-seeds on its next
+     * record, so it needs no change.
+     *
+     * <p>The skipped id stays in the window, so the same signed bytes stay
+     * a duplicate until their deadline, and one hash never has two
+     * canonical entries. The sender signs a new transaction at the released
+     * nonce. The release applies only while the id is in the window, and
+     * only once:</p>
+     * <ul>
+     *   <li>It adds a release mark to the window: the id with its first byte
+     *       inverted ({@link #releaseMark}), held to the deadline of the id.
+     *       Both twins of a lane send a release for each skip, so the
+     *       second copy finds the mark and changes nothing.</li>
+     *   <li>A release whose id the window no longer holds is stale and
+     *       changes nothing.</li>
+     *   <li>The mark cannot stand for a real id. A real id is a keccak hash,
+     *       and the mark is a fixed transform of an id that the window
+     *       holds, so a real id equal to a mark is a hash collision.</li>
+     *   <li>The mark skips the capacity check, as an epoch marker does. The
+     *       window holds at most one mark for each ordered entry, and the
+     *       mark leaves with the entry at its deadline.</li>
+     * </ul>
+     *
+     * <p>The decision reads only replicated state, so every member decides
+     * alike, and the snapshot carries the mark with the window.</p>
+     *
+     * @return whether the release applied
+     */
+    public boolean onRelease(byte[] sender20, long nonce, byte[] canonicalId32) {
+        ByteBuffer key = idKey(canonicalId32);
+        Long held = dedup.get(key);
+        ByteBuffer mark = releaseMark(canonicalId32);
+        if (held == null || dedup.containsKey(mark)) {
+            return false;
+        }
+        insertFresh(mark, held);
+        expectedNonce.computeIfPresent(
+            ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer(),
+            (sender, expected) -> Math.min(expected, nonce));
+        return true;
+    }
+
+    /** The release mark of an id: the id with its first byte inverted. */
+    private static ByteBuffer releaseMark(byte[] canonicalId32) {
+        byte[] mark = canonicalId32.clone();
+        mark[0] = (byte) (mark[0] ^ 0xFF);
+        return ByteBuffer.wrap(mark).asReadOnlyBuffer();
+    }
+
+    /**
      * Process a record without the contiguity guard (no sender identity)
      * and without a deadline. This is the pre-guard contract, kept for
      * deposit-only callers and existing tests. It is equivalent to
@@ -1467,7 +1527,8 @@ public final class CanonicalSealerState {
      * the void ledger. Version 10 adds the seed status (1, the
      * {@link SeedStatus} ordinal) and the seed digest (32) after it.
      * Version 11 adds the recorded cursors after the seed digest: see
-     * {@link RecordedCursors#writeTo}.</p>
+     * {@link RecordedCursors#writeTo}. Version 12 is version 10 without the
+     * void ledger.</p>
      *
      * <p>The writer writes {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
@@ -1484,14 +1545,16 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * {@link #takeSnapshot()} in the layout of {@code version}: 10 has no
-     * recorded-cursor section, 11 and 12 have it. A version-10 snapshot is
-     * the same bytes that the previous release writes for the same state.
+     * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
+     * void ledger, 11 has the void ledger and the recorded cursors, 12 has
+     * neither. A version-10 snapshot is the same bytes that the previous
+     * release writes for the same state.
      *
      * @param version 10, 11 or 12
      */
     byte[] takeSnapshot(int version) {
-        boolean withCursors = version >= 11;
+        boolean withVoids = version < RETAINED_FILE_SNAPSHOT_VERSION;
+        boolean withCursors = version == 11;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1499,7 +1562,7 @@ public final class CanonicalSealerState {
                 + 4 + senderCount * (SENDER_LEN + 8)
                 + 8 + 8 + 8
                 + 4 + remoteCount * REMOTE_ENTRY_LEN_V5
-                + voids.snapshotLen(canonicalCount)
+                + (withVoids ? voids.snapshotLen(canonicalCount) : 0)
                 + 4
                 + 8
                 + 1 + SealerSeed.HASH_LEN
@@ -1542,8 +1605,10 @@ public final class CanonicalSealerState {
             buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
             buf.putLong(e.getValue().nextSeq);
         }
-        // v6 tail: the void window, then the open votes.
-        voids.writeTo(buf, canonicalCount);
+        // v6 to v11: the void window, then the open votes.
+        if (withVoids) {
+            voids.writeTo(buf, canonicalCount);
+        }
         // v8 tail: the ordering window the cluster runs.
         buf.putInt(orderingWindow);
         // v9 tail: the posted head.
@@ -1551,7 +1616,7 @@ public final class CanonicalSealerState {
         // v10 tail: the seed status and the seed digest.
         buf.put((byte) seedStatus.ordinal());
         buf.put(seedDigest);
-        // v11 tail: the recorded cursors, in executor-id order.
+        // v11 only: the recorded cursors, in executor-id order.
         if (withCursors) {
             recorded.writeTo(buf);
         }
@@ -1666,15 +1731,16 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
-        if (idCount < 0 || idCount > (long) dedupCapacity + MARKER_SLACK) {
+        if (idCount < 0 || idCount > 2L * dedupCapacity + MARKER_SLACK) {
             // A snapshot taken with a larger configured window than this
             // member's would rebuild an oversized window, and members that
             // disagree on the capacity would decide differently. Fail
             // loudly. Markers do not meet the cap, so a window can hold
-            // MARKER_SLACK ids above it. Shrinking the window across a
-            // restart needs an explicit migration.
+            // MARKER_SLACK epoch ids above it, and one release mark for
+            // each ordered id. Shrinking the window across a restart needs
+            // an explicit migration.
             throw new IllegalArgumentException(
-                    "snapshot idCount " + idCount + " outside [0, dedupCapacity="
+                    "snapshot idCount " + idCount + " outside [0, 2 * dedupCapacity="
                             + dedupCapacity + " + " + MARKER_SLACK
                             + "] — members must agree on the configured window");
         }
@@ -1750,7 +1816,7 @@ public final class CanonicalSealerState {
                 state.remoteOrigins.put(originChainId, new RemotePeer(anchorNumber, nextSeqKnown, nextSeq));
             }
         }
-        if (version >= 6) {
+        if (version >= 6 && version < RETAINED_FILE_SNAPSHOT_VERSION) {
             state.voids = VoidLedger.readFrom(buf, voidConfig);
         }
         if (version >= 8) {
@@ -1768,7 +1834,7 @@ public final class CanonicalSealerState {
             state.seedStatus = seedStatusOf(buf.get());
             buf.get(state.seedDigest);
         }
-        if (version >= 11) {
+        if (version == 11) {
             state.recorded = RecordedCursors.readFrom(
                 buf, budgets.recordLagRecords(), state.voids::isVoter);
         }

@@ -29,9 +29,10 @@
 # snapshot. A member that joins late can get a snapshot of another member,
 # so the format is shared. This release reads v12 and still writes v10.
 # With kardamom.cluster.carryBytes=true, the members write v12: the state
-# of v11, then the index of the retained file in place of the retained
-# frames. A release that reads only up to v11 refuses v12 and stops, so
-# switch the flag on only on a new chain or at a coordinated cut-over.
+# of v10 without the void ledger, then the index of the retained file in
+# place of the retained frames. A release that reads only up to v11
+# refuses v12 and stops, so switch the flag on only on a new chain or at a
+# coordinated cut-over. No release wrote v12 before this layout.
 [format.sealer-snapshot]
 writes = 10
 reads_min = 1
@@ -45,36 +46,37 @@ code = [
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
-# to 7. The sealer itself writes kind 8 into its log. The executor sends
-# kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
-# (--exec-cursor); the default is off. Every member drops a frame of a
-# kind it does not know, counts it, and never orders it. A new kind that
-# changes the replicated state is sent only after every member reads it:
-# members of two releases decide alike until then. So switch the flag on
-# only after every member reads kind 9. The release before this one orders
-# an unknown kind of 85 bytes or more as a user record. So during the first
-# roll to this release, no client may send an unknown kind: an old member
-# orders such a frame and a new member drops it. No client sends one today
-# (the Rust writers send kinds 0 to 7).
+# to 7, and the sequencer sends kind 10 (the nonce release) for each skip
+# receipt of its senders. The sealer itself writes kind 8 into its log.
+# The executor sends kind 9 (the recorded cursor) only with
+# KARDAMOM_EXEC_CURSOR on (--exec-cursor); the default is off. Every
+# member drops a frame of a kind it does not know, counts it, and never
+# orders it. So a sealer of the release before this one drops kind 10,
+# and the sequencer can deploy first. Kind 10 changes the replicated
+# state of a member that reads it: decision version 3, which every member
+# reaches in one coordinated restart.
 [format.sealer-ingress-kinds]
-writes = 8
+writes = 10
 reads_min = 0
-reads_max = 9
+reads_max = 10
 shared = true
 code = [
-    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_RECORDED_CURSOR",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_NONCE_RELEASE",
+    "crates/cluster-adapter/src/wire/mod.rs#KIND_NONCE_RELEASE",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
     "crates/executor/src/bin/kardamom-executor/args.rs#KARDAMOM_EXEC_CURSOR",
 ]
-activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
 # only when recordLagBudget is above 0. This release reads kind 15 (the
-# relayed reference) and kind 16 (the feed gap, on the member feed only),
-# and sends neither. No frame uses kind 14: a reader drops it as unknown.
-# Kind 255 is local to the Rust client: the session thread puts it on the
-# consumer channel when a session opens. It is never on the wire.
+# relayed reference) and kind 16 (the feed gap, on the member feed only).
+# With kardamom.cluster.carryBytes=true, the sealer sends kind 15 to each
+# egress session in place of the kind-1 frame of a canonical entry. It
+# never sends kind 16 on the egress. No frame uses kind 14: a reader drops
+# it as unknown. Kind 255 is local to the Rust client: the session thread
+# puts it on the consumer channel when a session opens. It is never on the
+# wire.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76
@@ -99,14 +101,17 @@ activation = { flag = "recordLagBudget", writes = 13 }
 # The record type inside an ingress record and a relayed egress frame. The
 # Rust writers send types 0 to 3, and the sealer writes type 4 (void). This
 # release has the codecs of type 5 (the full entry, on ingress only) and
-# type 6 (the canonical entry, on egress only), and writes neither. The
-# Rust reader refuses a relayed type 5, and drops a frame with an unknown
-# type, so an old executor misses a canonical record.
+# type 6 (the canonical entry, on egress only). With
+# kardamom.cluster.carryBytes=true, the sealer relays a type 5 as a type 6
+# into its retained file, and takes no void request. The Rust reader
+# refuses a relayed type 5, and drops a frame with an unknown type, so an
+# old executor misses a canonical record.
 [format.sealer-record-types]
 writes = 4
 reads_min = 0
 reads_max = 6
 shared = true
+activation = { flag = "kardamom.cluster.carryBytes", writes = 6 }
 code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_VOID",
     "crates/cluster-adapter/src/wire/mod.rs#RT_TX",
@@ -294,7 +299,15 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 # reason = "The members write snapshot v11. A member of the base release cannot load it."
 [one_way]
 
+[one_way.sealer-ingress-kinds]
+version = 10
+reason = "The sequencer sends the nonce release (kind 10). A sealer of the base release drops it as an unknown kind, so a rollback loses only the release, and the sender waits for the operator fix of the base release."
+
 [coordinated]
+
+[coordinated.sealer-ingress-kinds]
+version = 10
+reason = "Kind 10 changes the guard of a member that reads it. Decision version 3 brings it, and the sealer moves to version 3 in one coordinated restart, so no mixed fleet of sealers runs."
 
 [retired]
 

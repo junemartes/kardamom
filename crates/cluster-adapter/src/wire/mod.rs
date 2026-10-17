@@ -69,10 +69,10 @@ pub use entry::{TxOffer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
-    encode_ingress_recorded_cursor, encode_ingress_remote_epoch, encode_ingress_txref,
-    encode_replay_request, encode_subscribe, encode_void_request, ingress_deadline,
-    ingress_sender_nonce, ingress_tip, split_ingress,
+    GuardHeader, NonceRelease, encode_ingress_batch, encode_ingress_epoch,
+    encode_ingress_posted_cursor, encode_ingress_recorded_cursor, encode_ingress_remote_epoch,
+    encode_ingress_txref, encode_replay_request, encode_subscribe, encode_void_request,
+    ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
 };
 pub(crate) use relay::MAX_INGRESS_PAYLOAD_LEN;
 
@@ -184,6 +184,14 @@ pub const KIND_POSTED_CURSOR: u8 = 7;
 /// sealer's own seed record, which no Rust producer sends. Matches Java
 /// `KIND_RECORDED_CURSOR`.
 pub const KIND_RECORDED_CURSOR: u8 = 9;
+/// Ingress kind: a sequencer's nonce release, a system record:
+/// `[kind:u8 = 10][sender:20][nonce:u64][tx_hash:32]`, 61 bytes. An executor
+/// skipped the ordered entry `tx_hash` of `sender`, and the chain expects
+/// `nonce` of the sender next. The sealer lowers the expected nonce of its
+/// contiguity guard to `nonce`, once for each skipped entry. A sealer that
+/// does not know the kind drops the frame. Matches Java
+/// `KIND_NONCE_RELEASE`.
+pub const KIND_NONCE_RELEASE: u8 = 10;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the

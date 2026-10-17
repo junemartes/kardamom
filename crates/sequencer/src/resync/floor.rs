@@ -1,7 +1,8 @@
 //! The executed-truth observations the receipts stream gives the
 //! sequencer, and what each one proves about the nonce of its sender.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
+use kardamom_cluster_adapter::wire::NonceRelease;
 
 /// One executed-truth observation. Two sources produce it:
 ///
@@ -28,9 +29,12 @@ pub enum Outcome {
     /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
     /// nonce. Ordering in the canonical log confirms the publish. The
     /// floor does not rise. The floor logic does not read `reason`.
+    /// `tx_hash` names the skipped entry in the nonce release to the
+    /// sealer.
     Skipped {
         nonce: u64,
         reason: kardamom_types::SkipReason,
+        tx_hash: B256,
     },
     /// An L1-originated deposit. It has no L2 nonce, so it is neither a
     /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
@@ -101,6 +105,7 @@ impl FloorUpdate {
             (false, Some(reason)) => Outcome::Skipped {
                 nonce: receipt.nonce,
                 reason,
+                tx_hash: receipt.tx_hash,
             },
             (false, None) => Outcome::Executed {
                 nonce: receipt.nonce,
@@ -121,13 +126,36 @@ impl FloorUpdate {
         }
     }
 
-    /// A skipped tx of `sender` at `nonce`.
+    /// The skipped tx `tx_hash` of `sender` at `nonce`.
     #[must_use]
-    pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
+    pub fn skip(
+        sender: Address,
+        nonce: u64,
+        reason: kardamom_types::SkipReason,
+        tx_hash: B256,
+    ) -> Self {
         Self {
             sender,
-            outcome: Outcome::Skipped { nonce, reason },
+            outcome: Outcome::Skipped {
+                nonce,
+                reason,
+                tx_hash,
+            },
         }
+    }
+
+    /// The nonce release that this update proves, for a sender whose
+    /// receipt floor is `floor`. See [`Outcome::released`].
+    #[must_use]
+    pub(crate) fn released(self, floor: u64) -> Option<NonceRelease> {
+        let Outcome::Skipped { tx_hash, .. } = self.outcome else {
+            return None;
+        };
+        self.outcome.released(floor).map(|nonce| NonceRelease {
+            sender: self.sender,
+            nonce,
+            tx_hash,
+        })
     }
 
     /// A deposit to `sender`.

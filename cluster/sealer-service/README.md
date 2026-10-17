@@ -41,6 +41,7 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 | 7 | Posted cursor | `[kind=7][posted_head:u64]` |
 | 8 | Seed record | `[kind=8][digest:32]` |
 | 9 | Recorded cursor | `[kind=9][executor_id:u8][recorded_through:u64]` (10 bytes) |
+| 10 | Nonce release | `[kind=10][sender:20][nonce:u64][canonical_id:32]` (61 bytes) |
 
 - Kind 0: the guard header is `sender`, `nonce`, `deadline` and `tip`.
   - The service reads the header for the contiguity guard, the deadline check and the ordering window.
@@ -86,6 +87,19 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - A frame that is not 10 bytes, an `executor_id` that is not a configured voter, or a cursor at or above the canonical count is malformed. The service drops it.
   - When the best cursor moves up, the sealer sends an egress kind 9 to every session. It prints `cluster RECORDED-CURSOR` at power-of-two counts of these moves.
   - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
+- With `carryBytes`, a member drops kinds 6 and 9 as unknown kinds. Its snapshot holds no void ledger and no recorded cursor.
+- Kind 10: the nonce release is a system record of a sequencer. It has no guard header. Decision version 3 brings it.
+  - An executor skipped the ordered entry `canonical_id` of `sender`, and the chain expects `nonce` of the sender next. A skip uses no nonce on the chain.
+  - The sequencer sends one release for each skip receipt of its senders. Both twins of a lane send it.
+  - The sealer applies it only while `canonical_id` is in the dedup window, and only once:
+    - It sets the expected nonce of the sender to the lower of the expected nonce and `nonce`. An unknown or evicted sender needs no change.
+    - It adds a release mark to the dedup window: the id with its first byte inverted, held to the deadline of the id. The second copy of the release finds the mark and changes nothing.
+    - A release whose id has left the window changes nothing.
+  - The id stays in the window, so the same signed bytes stay a duplicate until their deadline. One hash never has two canonical entries. The sender signs a new transaction at the released nonce.
+  - The mark cannot stand for a real id: a real id is a keccak hash, and the mark is a fixed transform of an id in the window.
+  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark for each ordered entry, and the mark leaves with its entry. So a snapshot can hold up to `2 * dedupCapacity` ids, plus the epoch slack.
+  - A frame that is not 61 bytes is malformed. A release that applies prints `cluster NONCE-RELEASE` at power-of-two counts.
+  - A sealer that does not know kind 10 drops it as an unknown kind. So the sequencer can deploy before the sealer.
 
 ### Relayed record types
 
@@ -98,11 +112,15 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 2 | Epoch | an rkyv `EpochRecord` |
 | 3 | Remote epoch | an rkyv `RemoteEpochRecord` |
 | 4 | Void record | `[index:u64]` |
+| 5 | Full entry, on ingress only | `[lane:u8][envelope]` |
+| 6 | Canonical entry, in the retained file only | `[lane:u8][envelope]` |
 
 - The void record is the payload `[tx_hash:32][record_type=4][index:u64]`.
   - The service generates it. It never relays one from a session.
   - It takes one canonical slot.
   - Every consumer drops the `TxRef` at `index`. The service removes the hash from the dedup window and sets the sender nonce back.
+- With `carryBytes`, the service relays a full entry (type 5) as a canonical entry (type 6): the same payload with the record type 6. The retained file keeps the kind-1 frame with the envelope. Each egress session gets the relayed reference (egress kind 15) in its place, live and in a replay. No egress session gets the envelope.
+- Without `carryBytes`, the service relays a type 5 as is, like every other payload.
 
 ### Egress kinds (cluster to client)
 
@@ -366,7 +384,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.daLagBudgetBlocks` | `10000` (env `DA_LAG_BUDGET_BLOCKS`) | yes | The DA-lag budget in blocks. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. |
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
-| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
 | env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
@@ -492,6 +510,10 @@ A new version needs the coordinated restart of the sealer, not a rolling deploy:
 |---|---|
 | 1 | The first rules. |
 | 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
+| 3 | A nonce release (ingress kind 10) sets the expected nonce of the sender to the lower of the expected nonce and the released nonce, once for each skipped entry. With `carryBytes`, a member orders full entries, relays them as canonical entries, and takes no void request. |
+
+- `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot before version 12, and a member without it stops on version 12.
+- The move to version 3 is the coordinated restart above. The members of version 2 write snapshot version 10, and a member of version 3 without `carryBytes` restores it.
 
 ## Admin server
 
@@ -575,6 +597,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster DA-LAG-REJECT` | The DA-lag guard refused a record (`nonce`, `sealedHead`, `postedHead`, `budget`, `totalDaLagRejected`). |
 | `cluster RECORD-LAG-REJECT` | The record-lag guard refused a record (`nonce`, `sealedIndex`, `bestRecorded`, `budget`, `totalRecordLagRejected`). |
 | `cluster POSTED-CURSOR` | The posted head moved up (`postedHead`, `sealedHead`, `retained`, `halted`). |
+| `cluster NONCE-RELEASE` | A nonce release applied (`nonce`, `totalReleased`). It prints at power-of-two counts. A twin copy or a stale release prints nothing. |
 | `cluster RECORDED-CURSOR` | The best recorded cursor moved up (`executorId`, `through`, `best`, `halted`, `totalAdvances`). It prints at power-of-two counts of the moves, because the best cursor moves at the cadence of the executors. `halted` is the record-lag flag. |
 | `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
 | `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
@@ -616,13 +639,14 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
-- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
+- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT`, `NONCE-RELEASE` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.
 
 ## Snapshot
 
 - The member reads snapshot versions 1 to 12. It writes version 10, or version 12 with `carryBytes`.
-  - Version 12 is the state section of version 11, then the retention section of the retained file. It is not frozen yet: the record path with bytes adds its fields to version 12 before any release writes it.
+  - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
+  - Each snapshot version carries the release marks of the nonce release in the dedup window, as ids.
   - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
   - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.
@@ -632,7 +656,7 @@ The chaos suite and operators read these lines. The admin server also exports on
   - the dedup window with the deadline of each id
   - the per-sender nonces
   - the remote-origin state
-  - the void ledger
+  - the void ledger, in versions 6 to 11 only
   - the ordering window size
   - the posted head, after the ordering window size
   - the seed status (1 byte) and the seed digest (32 bytes), after the posted head

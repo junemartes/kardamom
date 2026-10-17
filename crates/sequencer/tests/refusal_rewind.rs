@@ -13,8 +13,9 @@
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
+use kardamom_cluster_adapter::wire::NonceRelease;
 use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
@@ -23,6 +24,14 @@ use kardamom_sequencer::resync::{
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
+
+/// The hash of the skipped tx of `s` at `nonce` in these tests.
+fn skipped_hash(s: Address, nonce: u64) -> B256 {
+    let mut hash = [0_u8; 32];
+    hash[..20].copy_from_slice(s.as_slice());
+    hash[24..].copy_from_slice(&nonce.to_le_bytes());
+    B256::from(hash)
+}
 
 /// The reason every refusal in these tests carries. It names the
 /// deadline of the test envelopes, so it names their copies.
@@ -159,7 +168,7 @@ impl Sealed {
     /// The skip receipt of the tx of `s` at `nonce` arrives.
     fn skip(&self, s: Address, nonce: u64, reason: SkipReason) {
         self.floor_tx
-            .send(FloorUpdate::skip(s, nonce, reason))
+            .send(FloorUpdate::skip(s, nonce, reason, skipped_hash(s, nonce)))
             .unwrap();
     }
 
@@ -615,4 +624,61 @@ fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
         sealed.errors_of(1),
         vec![TxErrorReason::NonceInFlight { chain_nonce: 1 }]
     );
+}
+
+/// A skip receipt sends one nonce release to the sealer: the chain
+/// expects the skipped nonce again. A second copy of the receipt, for
+/// example after a resubscribe, sends nothing.
+#[test]
+fn a_skip_receipt_sends_one_nonce_release() {
+    let s = signer(51);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.submit(&s, 0);
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.step();
+    assert_eq!(
+        sealed.rig.releases(),
+        vec![NonceRelease {
+            sender: s.address(),
+            nonce: 0,
+            tx_hash: skipped_hash(s.address(), 0),
+        }]
+    );
+}
+
+/// A nonce-too-low skip proves nothing new, so it sends no release. A
+/// nonce-too-high skip releases to the receipt floor.
+#[test]
+fn a_release_names_the_nonce_that_the_chain_expects() {
+    let s = signer(52);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.execute(s.address(), 0);
+    sealed.skip(s.address(), 1, SkipReason::NonceTooLow);
+    sealed.skip(s.address(), 2, SkipReason::NonceTooHigh);
+    sealed.step();
+    assert_eq!(
+        sealed.rig.releases(),
+        vec![NonceRelease {
+            sender: s.address(),
+            nonce: 1,
+            tx_hash: skipped_hash(s.address(), 2),
+        }]
+    );
+}
+
+/// A blocked transport keeps the release, and the next step sends it.
+#[test]
+fn a_release_waits_out_a_blocked_transport() {
+    let s = signer(53);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.submit(&s, 0);
+    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = true;
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.step();
+    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
+    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = false;
+    sealed.step();
+    assert_eq!(sealed.rig.releases().len(), 1);
 }

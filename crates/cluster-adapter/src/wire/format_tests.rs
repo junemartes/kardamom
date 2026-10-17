@@ -45,6 +45,7 @@ fn the_ingress_kinds_stay_within_the_sealer_reader() {
         KIND_VOID_REQUEST,
         KIND_POSTED_CURSOR,
         KIND_RECORDED_CURSOR,
+        KIND_NONCE_RELEASE,
     ];
     assert!(kinds.into_iter().all(|kind| u32::from(kind) <= reads_max));
 }

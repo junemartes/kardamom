@@ -65,6 +65,7 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::release::ReleaseSender;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
@@ -233,6 +234,8 @@ pub struct Sequencer {
     unconfirmed: UnconfirmedLedger<RefMetadata>,
     /// The senders that the sealer's nonce guard rejects above the chain.
     nonce_ahead: NonceAheadWatch,
+    /// The nonce releases for the sealer, one for each skip receipt.
+    releases: ReleaseSender,
     /// The nonce lookup seam. `None` when the binary has no executor
     /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
     lookup: Option<LookupRequester>,
@@ -274,6 +277,7 @@ impl Sequencer {
         let depth = DepthReport::new(now, cfg.partition_index);
         let nonce_ahead =
             NonceAheadWatch::new(Duration::from_millis(cfg.resync.nonce_ahead_settle_ms));
+        let cfg_partition = cfg.partition_index;
         Ok(Self {
             state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
@@ -281,6 +285,7 @@ impl Sequencer {
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
             nonce_ahead,
+            releases: ReleaseSender::new(cfg_partition),
             lookup: None,
             vslots,
             shadow,
@@ -598,6 +603,8 @@ impl Sequencer {
         self.apply_deadline_rejects(&mut r, ports);
         self.apply_sealer_answers(&mut r, ports);
         self.resync = Some(r);
+        let (_, refs, _) = ports.split();
+        self.releases.flush(refs);
         self.sweep_confirm_timeouts();
     }
 

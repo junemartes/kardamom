@@ -47,6 +47,7 @@ pub mod partition;
 mod pause_gate;
 pub(crate) mod pending;
 pub mod pump;
+mod release;
 pub mod remote_epoch;
 pub mod resync;
 pub(crate) mod sender;

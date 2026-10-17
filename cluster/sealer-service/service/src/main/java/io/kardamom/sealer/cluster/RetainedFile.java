@@ -450,6 +450,11 @@ final class RetainedFile implements RetainedFrames {
         return publishedHead;
     }
 
+    @Override
+    public byte[] forSession(final byte[] frame) {
+        return EgressFrames.forSession(frame);
+    }
+
     /** Stop the helper and wait for it. The mappings stay until the collector frees them, so no late read can fault. */
     @Override
     public void close() {

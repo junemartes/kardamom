@@ -1,8 +1,14 @@
 use super::*;
+use alloy_primitives::B256;
 use std::time::Duration;
 
 fn s(byte: u8) -> Address {
     Address::repeat_byte(byte)
+}
+
+/// The hash of a skipped test entry.
+fn h(byte: u8) -> B256 {
+    B256::repeat_byte(byte)
 }
 
 fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWatermark) {
@@ -142,6 +148,7 @@ fn skip_receipts_confirm_but_never_raise_floors() {
         s(1),
         7,
         kardamom_types::SkipReason::NonceTooLow,
+        h(7),
     ))
     .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
@@ -159,27 +166,52 @@ fn skip_receipts_confirm_but_never_raise_floors() {
 fn skip_receipts_release_to_the_chain_nonce() {
     use kardamom_types::SkipReason;
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds))
-        .unwrap();
-    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh))
+    tx.send(FloorUpdate::skip(
+        s(1),
+        0,
+        SkipReason::InsufficientFunds,
+        h(10),
+    ))
+    .unwrap();
+    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh, h(11)))
         .unwrap();
     tx.send(FloorUpdate::executed(s(2), 4)).unwrap();
-    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh))
+    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh, h(29)))
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 7, SkipReason::InsufficientFunds))
+    tx.send(FloorUpdate::skip(
+        s(2),
+        7,
+        SkipReason::InsufficientFunds,
+        h(27),
+    ))
+    .unwrap();
+    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow, h(22)))
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow))
-        .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds))
-        .unwrap();
+    tx.send(FloorUpdate::skip(
+        s(2),
+        3,
+        SkipReason::InsufficientFunds,
+        h(23),
+    ))
+    .unwrap();
     let ReceiptDrain {
         raised, released, ..
     } = c.drain_floor_updates();
     assert_eq!(raised, vec![(s(2), 5)]);
+    let release = |who: u8, nonce, hash: u8| NonceRelease {
+        sender: s(who),
+        nonce,
+        tx_hash: h(hash),
+    };
     assert_eq!(
         released,
-        vec![(s(1), 0), (s(1), 0), (s(2), 5), (s(2), 7)],
-        "each skip names the chain nonce; a too-low or late skip names none"
+        vec![
+            release(1, 0, 10),
+            release(1, 0, 11),
+            release(2, 5, 29),
+            release(2, 7, 27)
+        ],
+        "each skip names the chain nonce and its entry; a too-low or late skip names none"
     );
 }
 
@@ -215,6 +247,7 @@ fn a_receipt_maps_to_its_outcome() {
             Outcome::Skipped {
                 nonce: 3,
                 reason: SkipReason::NonceTooLow,
+                tx_hash: B256::ZERO,
             },
         ),
         (TX_TYPE_DEPOSIT, None, Outcome::Deposit),
@@ -262,6 +295,7 @@ fn nonce_zero_skip_confirms_without_raising() {
         s(1),
         0,
         kardamom_types::SkipReason::NonceTooLow,
+        h(0),
     ))
     .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);

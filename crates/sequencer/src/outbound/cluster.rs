@@ -117,6 +117,10 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         // origin block that carried messages, each forcing a boundary.
         self.offer_encoded(wire::encode_ingress_remote_epoch(r), "remote epoch")
     }
+
+    fn try_publish_release(&mut self, r: &wire::NonceRelease) -> Result<(), SequencerError> {
+        self.offer(&r.encode())
+    }
 }
 
 /// The egress kinds a publisher session reads: the boundaries, the

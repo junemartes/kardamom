@@ -1125,9 +1125,19 @@ class RecordTest(Deploys):
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
-            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=2', '')
+            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=3', '')
         output = self.run_deploy(success=False)
         self.assertIn('every member must match: decisionVersion.', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_carry_bytes_flip_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] += ' -Dkardamom.cluster.carryBytes=true'
+        output = self.run_deploy(success=False)
+        self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
