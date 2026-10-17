@@ -1185,6 +1185,17 @@ class RecordTest(Deploys):
         output = self.coordinated_restart(success=False)
         self.assertIn('within the last 600 s', output)
 
+    def test_the_age_of_a_quiesce_check_is_capped_at_an_hour(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.run_deploy(playbook='quiesce.yml')
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        check['checked_unix'] = str(int(check['checked_unix']) - 3700)
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        output = self.run_deploy(success=False, environ={'KARDAMOM_QUIESCE_MAX_AGE_S': '86400'})
+        self.assertIn('within the last 3600 s', output)
+
     def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
         self.to_version_two()
         del self.api.state['jobs']['sequencer']
