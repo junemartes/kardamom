@@ -115,40 +115,36 @@ fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) 
     let round = CheckpointRound {
         env: env.clone(),
         dir: ckpt_dir,
-        keep: args.checkpoint_keep.get(),
+        keep: args.checkpoint_keep,
     };
     let interval = std::time::Duration::from_secs(interval_secs.get());
     Checkpointer::new(round, interval, shutdown).spawn();
 }
 
 /// One checkpoint round's fixed inputs: the state env, the checkpoint
-/// directory, and how many past checkpoints to retain. Cloned into each
+/// directory, and how many of the newest checkpoints to keep. Cloned into each
 /// round's blocking task, so the mdbx transaction stays on one thread for
 /// the whole call.
 #[derive(Clone)]
 struct CheckpointRound {
     env: StateEnv,
     dir: std::path::PathBuf,
-    keep: u64,
+    keep: std::num::NonZeroUsize,
 }
 
 impl CheckpointRound {
     /// One checkpoint + prune round; failures are logged, never fatal.
     fn once(&self) {
         match create_checkpoint(&self.env, &self.dir) {
-            Ok(info) => self.prune_stale(info.block),
+            Ok(_) => self.prune_stale(),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
     }
 
-    /// Prunes checkpoints that fall outside the retention window behind
-    /// `block`. Does nothing until the chain has produced more than
-    /// `self.keep` checkpoints. Failures are logged, never fatal.
-    fn prune_stale(&self, block: u64) {
-        if block <= self.keep {
-            return;
-        }
-        if let Err(e) = prune_checkpoints(&self.dir, block - self.keep + 1) {
+    /// Prunes all checkpoints except the newest `self.keep`, whatever
+    /// their block spacing. Failures are logged, never fatal.
+    fn prune_stale(&self) {
+        if let Err(e) = prune_checkpoints(&self.dir, self.keep) {
             tracing::warn!(error = %e, "checkpoint prune failed");
         }
     }
