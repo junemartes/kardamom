@@ -44,6 +44,9 @@ workloads_common_vars:
   # the executor's and validator's fee schedule: "on" or "off". Empty
   # leaves every job at its "off" default.
   priority_fees: "{{ workloads_priority_fees }}"
+  # The local canary's genesis fragment (config/genesis/canary.toml), for
+  # the executor and the validator: "on" only when the local canary runs.
+  canary_genesis: "{{ 'on' if workloads_canary_mnemonic | length == 0 and workloads_canary_deployed | bool else 'off' }}"
   # One value for every Aeron party: each client's driver timeout and
   # each media driver's client liveness timeout. The jobs derive the
   # rest from it.
@@ -55,6 +58,9 @@ workloads_common_vars:
 # real L1 (the batcher, the da-watcher) read the given one.
 workloads_l1_rpc: "{{ lookup('env', 'L1_RPC') }}"
 workloads_l1_rpc_given: "{{ lookup('env', 'L1_RPC') }}"
+# The batcher starts with this endpoint order and ranks failing ones last.
+# The settlement bootstrap and DA proxy keep the single L1_RPC endpoint.
+workloads_batcher_rpc: "{{ lookup('env', 'BATCHER_L1_RPC') | default(workloads_l1_rpc, true) }}"
 # The batcher's L1 key: the batcher's KARDAMOM_L1_KEY and the DA proxy's
 # signer. Empty: the batcher signs with workloads_batcher_dev_key, and
 # the proxy is read-only. Like every keyed L1 URL, it reaches a task
@@ -91,8 +97,9 @@ workloads_settlement_address: "{{ lookup('env', 'SETTLEMENT_ADDRESS') }}"
 # 0). The mnemonic reaches the task only through the job's Nomad Variable
 # (tasks/secrets.yml). Without a mnemonic, CANARY_LOCAL=1 runs the canary
 # of the local profile on the public anvil mnemonic from index 34, the
-# four accounts the dev genesis funds for it. Otherwise no canary runs:
-# the CI shards count transactions, and the canary's would add to them.
+# four accounts that config/genesis/canary.toml funds for it. Otherwise
+# no canary runs: the CI shards count transactions, and the canary's
+# would add to them.
 workloads_canary_mnemonic: "{{ lookup('env', 'CANARY_MNEMONIC') }}"
 workloads_canary_ring_offset: "{{ lookup('env', 'CANARY_RING_OFFSET') | default('0', true) }}"
 workloads_canary_dev_mnemonic: "test test test test test test test test test test test junk"
@@ -322,3 +329,7 @@ workloads_ingress_rpc_port: "{{ ports.ingress_rpc }}"
 workloads_registry_url: >-
   {{ lookup('env', 'KARDAMOM_REGISTRY_URL')
      | default(workloads_nomad_addr | regex_replace(':[0-9]+$', '') ~ ':' ~ ports.registry, true) }}
+# The manifest media types the image check accepts from the registry.
+workloads_gate_manifest_types: >-
+  application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json,
+  application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json

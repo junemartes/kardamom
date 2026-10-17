@@ -2,7 +2,6 @@ package io.kardamom.sealer.cluster;
 
 import java.net.URI;
 import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.LongSupplier;
@@ -60,27 +59,6 @@ record CarryBytes(RetainedFile.Config file, RetainedToken token) {
                     + " kardamom.cluster.snapshotIntervalS above 0: the purge of the retained file runs at each snapshot");
             }
             return new CarryBytes(file, parsed);
-        }
-    }
-
-    /**
-     * The members of the cluster, {@code id,ingress,consensus,log,catchup,archive}
-     * each, separated by {@code |}.
-     *
-     * @param spec the member list
-     */
-    record Members(String spec) {
-        /**
-         * The admin endpoints of every member except {@code memberId}: the
-         * host of each ingress endpoint, with the admin port that every
-         * member uses.
-         */
-        List<URI> peerAdminEndpoints(final int memberId, final int adminPort) {
-            return Arrays.stream(spec.split("\\|"))
-                .map(member -> member.split(","))
-                .filter(f -> Integer.parseInt(f[0].trim()) != memberId)
-                .map(f -> URI.create("http://" + f[1].trim().split(":")[0] + ":" + adminPort))
-                .toList();
         }
     }
 

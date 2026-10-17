@@ -304,7 +304,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
 | Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary and compares the format registries. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
-| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. |
+| Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
 | Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
 | Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
@@ -335,6 +335,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Light client | `L1_LIGHT_CLIENT_HOST`, `L1_LIGHT_CLIENT_PORT` | `kardamom-l1-light-client.service.<datacenter>.consul`, `8548` | Where the validator and the followers reach the light client. |
 | Monitoring | `ALERTMANAGER_CONFIG_FILE` | empty | A file with the Alertmanager routes and receivers of the environment. Set: the role writes it, with the inhibit rules of `deploy/alertmanager-inhibit.yml` added, to the item `alertmanager` of `nomad/jobs/monitoring`. The file must not hold `inhibit_rules`. Empty: the role leaves the variable as it is. |
 | Monitoring | `PROMETHEUS_RULES_FILE` | empty (`groups: []`) | The extra Prometheus rule file of the environment, the item `rules`. The role writes it only with `ALERTMANAGER_CONFIG_FILE`. Prometheus loads `deploy/alerts.yml` in all cases. |
+| Batcher L1 | `BATCHER_L1_RPC` | `L1_RPC` | Comma-separated endpoints, best first. The batcher falls back on errors and ranks failing endpoints last. The DA proxy and settlement bootstrap keep the single `L1_RPC` endpoint. |
 | Followers | `L1_FOLLOWERS_RPC` | the fault proxy if deployed, else the light client if deployed, else `L1_RPC` | The L1 that the indexer (the L1 follower) reads. A comma-separated list. With two or more entries, a block counts only when two agree. The da-watcher reads the follower's stream, not L1. |
 | da-watcher, batcher | `L1_SILENCE_S` | empty (`1152` in the binaries) | Seconds with no `l1_blocks` record before the da-watcher and the batcher pause with the follower as their root. |
 | Indexer | `L1_INDEXER_START_BLOCK` | empty (`1` with the fault proxy) | The first L1 block to index on an empty archive. Empty: the finalized block at the first start. |
@@ -382,7 +383,7 @@ The gate reads only, so it also runs in check mode. A cluster without an accepte
 
 A secret is a keyed L1 URL, a private key, or a receiver token. No job definition holds one.
 
-- `L1_RPC`, `L1_FOLLOWERS_RPC`, `L1_LIGHT_CLIENT_EXECUTION_RPC`, `L1_LIGHT_CLIENT_CONSENSUS_RPC`, `BATCHER_KEY` and `ALERTMANAGER_CONFIG_FILE` reach the role as environment variables.
+- `L1_RPC`, `BATCHER_L1_RPC`, `L1_FOLLOWERS_RPC`, `L1_LIGHT_CLIENT_EXECUTION_RPC`, `L1_LIGHT_CLIENT_CONSENSUS_RPC`, `BATCHER_KEY` and `ALERTMANAGER_CONFIG_FILE` reach the role as environment variables.
   - In CI, they come from GitHub environment secrets. They are never plain GitHub variables.
 - The role writes the secrets of a job to the Nomad Variable `nomad/jobs/<job>` (`roles/workloads/tasks/secrets.yml`).
   - It writes the variable before it registers the job, and only on a change.
@@ -396,7 +397,7 @@ A secret is a keyed L1 URL, a private key, or a receiver token. No job definitio
 
 | Job | Variable item | The task reads it as |
 |-----|---------------|----------------------|
-| `batcher` | `KARDAMOM_L1_RPC` | The L1 endpoints: the fault proxy, else `L1_RPC`, else the in-cluster anvil. |
+| `batcher` | `KARDAMOM_L1_RPC` | The L1 endpoints: the fault proxy, else `BATCHER_L1_RPC` (default `L1_RPC`), else the in-cluster anvil. |
 | `batcher` | `KARDAMOM_L1_KEY` | The L1 key: `BATCHER_KEY`, else the anvil dev key. |
 | `da-watcher`, `l1-indexer` | `KARDAMOM_L1_RPC` | The followers' L1 (`L1_FOLLOWERS_RPC` and its defaults). |
 | `da-proxy` | `EIGENDA_PROXY_EIGENDA_V2_ETH_RPC` | `L1_RPC`. |

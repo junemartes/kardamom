@@ -115,8 +115,9 @@ final class HeapFrames implements RetainedFrames {
     }
 
     @Override
-    public int status(final EgressFrames codec, final ClusterStatus status, final long postedHead) {
-        return codec.status(status);
+    public int status(
+            final EgressFrames codec, final ClusterStatus status, final boolean snapshotFollows, final long postedHead) {
+        return codec.status(status, snapshotFollows);
     }
 
     @Override

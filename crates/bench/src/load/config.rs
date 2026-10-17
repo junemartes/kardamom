@@ -124,8 +124,9 @@ pub struct LoadConfig {
     pub target_tps: NonZeroU32,
     /// The sender accounts this run uses.
     pub sender_range: SenderRange,
-    /// The starting nonce for each sender.
-    pub nonce_start: u64,
+    /// The first nonce of each sender: one fixed value, or each sender's
+    /// nonce on the chain.
+    pub nonce_start: NonceStart,
     /// The BIP-39 mnemonic the senders derive from.
     pub mnemonic: String,
     /// The transfer sink address.
@@ -137,6 +138,9 @@ pub struct LoadConfig {
     /// deploys its contracts from the first sender before the ramp, and
     /// reports gas-centric throughput.
     pub workload: Workload,
+    /// The calldata sizes of the calldata workload, with their weights.
+    /// The other workloads do not read it.
+    pub calldata: CalldataMix,
     /// The legacy gas price, in wei.
     pub gas_price: u128,
     /// The limit on outstanding submits. This bounds open-loop back
@@ -149,6 +153,12 @@ pub struct LoadConfig {
     pub drain_timeout: Duration,
     /// The number of per-submit retry attempts on a transient failure.
     pub retry_submit: u32,
+    /// How long one submit waits out the refusals of a paused ingress,
+    /// from the first one, before it counts as a failed attempt. A
+    /// paused ingress refuses a submit before it forwards it, so the
+    /// retry resubmits the same nonce and no nonce hole forms. Zero
+    /// turns the wait off.
+    pub pause_wait: Duration,
     /// The ramp increment for each step, in tx/s. Non-zero: it is a
     /// divisor at `per_sender_estimate`, and a step count of 0 would
     /// never advance the ramp.
@@ -233,16 +243,18 @@ impl Default for LoadConfig {
             target_tps: DEFAULT_TARGET_TPS,
             sender_range: SenderRange::new(0, DEFAULT_SENDER_RANGE_WIDTH)
                 .expect("0 + 16 never overflows"),
-            nonce_start: 0,
+            nonce_start: NonceStart::Fixed(0),
             mnemonic: ANVIL_MNEMONIC.to_string(),
             to: DEFAULT_TO,
             value: U256::from(1u64),
             workload: Workload::default(),
+            calldata: CalldataMix::default(),
             gas_price: 1_000_000_000,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             max_gap: 5,
             drain_timeout: Duration::from_secs(90),
             retry_submit: 2,
+            pause_wait: Duration::ZERO,
             ramp_step_tps: NonZeroU32::MIN,
             ramp_step_secs: DEFAULT_RAMP_STEP_SECS,
             soak_fraction: 0.8,
@@ -276,6 +288,10 @@ pub enum Workload {
     #[default]
     Transfers,
     Defi,
+    /// Transfers to an externally owned account with the calldata sizes
+    /// of [`LoadConfig::calldata`]. The size is the only value that
+    /// differs from a plain transfer.
+    Calldata,
 }
 
 impl Workload {
@@ -285,6 +301,7 @@ impl Workload {
         match self {
             Self::Transfers => "transfers",
             Self::Defi => "defi",
+            Self::Calldata => "calldata",
         }
     }
 }
@@ -301,8 +318,110 @@ impl std::str::FromStr for Workload {
         match s {
             "transfers" => Ok(Self::Transfers),
             "defi" => Ok(Self::Defi),
-            other => anyhow::bail!("unknown workload {other:?} (transfers|defi)"),
+            "calldata" => Ok(Self::Calldata),
+            other => anyhow::bail!("unknown workload {other:?} (transfers|defi|calldata)"),
         }
+    }
+}
+
+/// The first nonce of each sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceStart {
+    /// Every sender starts at this nonce.
+    Fixed(u64),
+    /// Each sender starts at its nonce on the chain. Runs one after the
+    /// other on one chain then need no nonce bookkeeping.
+    Chain,
+}
+
+impl std::str::FromStr for NonceStart {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "chain" {
+            return Ok(Self::Chain);
+        }
+        s.parse()
+            .map(Self::Fixed)
+            .map_err(|e| anyhow::anyhow!("nonce start {s:?} is not `chain` or a u64: {e}"))
+    }
+}
+
+/// The calldata sizes of the calldata workload, with their weights. The
+/// type holds the first part apart, so a mix always has one part or more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalldataMix {
+    first: CalldataPart,
+    rest: Vec<CalldataPart>,
+}
+
+/// One calldata size of a [`CalldataMix`], and its share of the cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalldataPart {
+    pub bytes: usize,
+    pub weight: NonZeroU32,
+}
+
+impl CalldataMix {
+    /// The first part.
+    #[must_use]
+    pub fn first(&self) -> CalldataPart {
+        self.first
+    }
+
+    /// The parts after the first, in the order of the flag.
+    #[must_use]
+    pub fn rest(&self) -> &[CalldataPart] {
+        &self.rest
+    }
+
+    /// All parts, in the order of the flag.
+    pub fn parts(&self) -> impl Iterator<Item = CalldataPart> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+}
+
+impl Default for CalldataMix {
+    /// One part: no calldata.
+    fn default() -> Self {
+        Self {
+            first: CalldataPart {
+                bytes: 0,
+                weight: NonZeroU32::MIN,
+            },
+            rest: Vec::new(),
+        }
+    }
+}
+
+impl std::str::FromStr for CalldataPart {
+    type Err = anyhow::Error;
+    /// `N` is `N` bytes with weight 1. `N:W` is `N` bytes with weight `W`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (bytes, weight) = s.split_once(':').unwrap_or((s, "1"));
+        Ok(Self {
+            bytes: bytes
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("calldata size {bytes:?}: {e}"))?,
+            weight: weight
+                .trim()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("calldata weight {weight:?}: {e}"))?,
+        })
+    }
+}
+
+impl std::str::FromStr for CalldataMix {
+    type Err = anyhow::Error;
+    /// A comma-separated list of [`CalldataPart`]: `8082`, or
+    /// `0:16,1938:3,8082:1`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(',').map(str::parse::<CalldataPart>);
+        let first = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the calldata mix is empty"))??;
+        let rest = parts.collect::<anyhow::Result<Vec<CalldataPart>>>()?;
+        Ok(Self { first, rest })
     }
 }
 
@@ -371,4 +490,38 @@ pub struct LoadReport {
     pub scrape_fallbacks: u64,
     /// The completeness, drop accounting, and keep-pace verdict.
     pub verdict: Verdict,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calldata_mix_parses_one_size_and_a_weighted_list() {
+        let one: CalldataMix = "8082".parse().unwrap();
+        assert_eq!(
+            one.parts().collect::<Vec<_>>(),
+            [CalldataPart {
+                bytes: 8082,
+                weight: NonZeroU32::MIN,
+            }]
+        );
+        let mix: CalldataMix = "0:16, 1938:3,8082:1".parse().unwrap();
+        let sizes: Vec<(usize, u32)> = mix.parts().map(|p| (p.bytes, p.weight.get())).collect();
+        assert_eq!(sizes, vec![(0, 16), (1938, 3), (8082, 1)]);
+    }
+
+    #[test]
+    fn calldata_mix_rejects_a_zero_weight_and_an_empty_part() {
+        assert!("10:0".parse::<CalldataMix>().is_err());
+        assert!("".parse::<CalldataMix>().is_err());
+        assert!("10,,20".parse::<CalldataMix>().is_err());
+    }
+
+    #[test]
+    fn nonce_start_parses_a_number_or_chain() {
+        assert_eq!("7".parse::<NonceStart>().unwrap(), NonceStart::Fixed(7));
+        assert_eq!("chain".parse::<NonceStart>().unwrap(), NonceStart::Chain);
+        assert!("latest".parse::<NonceStart>().is_err());
+    }
 }

@@ -65,8 +65,12 @@ sealed interface RetainedFrames permits HeapFrames, RetainedFile {
     /** Drop every retained frame: the start of an empty retention. */
     void clear();
 
-    /** Frame the status into {@code frames} and return the length. */
-    int status(EgressFrames frames, ClusterStatus status, long postedHead);
+    /**
+     * Frame the status into {@code frames}, with the snapshot flag, and
+     * return the length: 68 bytes on the heap, 76 bytes with the retained
+     * bytes above {@code postedHead} for the file.
+     */
+    int status(EgressFrames frames, ClusterStatus status, boolean snapshotFollows, long postedHead);
 
     /**
      * Stop the member when the store cannot go on, and publish the progress

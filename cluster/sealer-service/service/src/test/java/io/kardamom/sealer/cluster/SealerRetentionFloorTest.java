@@ -45,8 +45,14 @@ class SealerRetentionFloorTest {
     }
 
     private static final int SEGMENT_BYTES = 64 * 1024;
-    /** The status frame with the retained-bytes tail. */
-    private static final int STATUS_WITH_BYTES_LEN = 75;
+    /** The status frame with the snapshot flag: the heap store sends it. */
+    private static final int STATUS_LEN = 68;
+    /** The offset of the snapshot flag in the status frame. */
+    private static final int SNAPSHOT_FLAG_OFFSET = 67;
+    /** The offset of the retained bytes in the status frame of the file store: after the flag. */
+    private static final int RETAINED_BYTES_OFFSET = 68;
+    /** The status frame with the retained-bytes tail: the file store sends it. */
+    private static final int STATUS_WITH_BYTES_LEN = 76;
 
     @TempDir
     Path dir;
@@ -222,14 +228,26 @@ class SealerRetentionFloorTest {
             .reduce((first, second) -> second)
             .orElseThrow();
         assertEquals(STATUS_WITH_BYTES_LEN, status.length);
+        assertEquals(0, status[SNAPSHOT_FLAG_OFFSET], "no snapshot follows a posted cursor");
         final long retainedBytes = ByteBuffer.wrap(status).order(ByteOrder.LITTLE_ENDIAN)
-            .getLong(STATUS_WITH_BYTES_LEN - Long.BYTES);
+            .getLong(RETAINED_BYTES_OFFSET);
         // Blocks 3 and 4 are above the posted head: four records and two boundaries.
         assertTrue(retainedBytes > 0, "retained bytes " + retainedBytes);
         deliver(service, publisher, IngressFrames.postedCursorFrame(4L));
         final byte[] after = publisher.offered.get(publisher.offered.size() - 1);
         assertEquals(0L, ByteBuffer.wrap(after).order(ByteOrder.LITTLE_ENDIAN)
-            .getLong(STATUS_WITH_BYTES_LEN - Long.BYTES), "nothing is above a posted head at the sealed head");
+            .getLong(RETAINED_BYTES_OFFSET), "nothing is above a posted head at the sealed head");
+    }
+
+    @Test
+    void the_heap_store_sends_the_status_without_the_retained_bytes() {
+        start(Store.HEAP);
+        fourBlocks();
+        deliver(service, publisher, IngressFrames.postedCursorFrame(2L));
+        final byte[] status = publisher.offered.get(publisher.offered.size() - 1);
+        assertEquals(SealerWire.EGRESS_KIND_STATUS, status[0]);
+        assertEquals(STATUS_LEN, status.length);
+        assertEquals(0, status[SNAPSHOT_FLAG_OFFSET]);
     }
 
     @Test

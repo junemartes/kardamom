@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use kardamom_obs::events::{Beacon, BoardFeed, BoardView};
+use kardamom_obs::events::{Beacon, BoardFeed, BoardView, Delivery, Publisher};
 use kardamom_types::service::ServiceEvent;
 use tokio::sync::{mpsc, watch};
 
@@ -47,13 +47,20 @@ impl ServiceEventsSubscriberHandle {
         view
     }
 
-    /// Move one record from the stream to the board. `Break` when the
+    /// Move one record from the stream to the board, with its publisher.
+    /// The Aeron session id names the publisher. A discovered publication
+    /// has its own channel in each process, so each process has its own
+    /// session, and a restarted process has a new one. `Break` when the
     /// stream or the board ends.
-    async fn forward(&mut self, tx: &mpsc::Sender<ServiceEvent>) -> ControlFlow<()> {
-        let Some((_, event)) = self.recv().await else {
+    async fn forward(&mut self, tx: &mpsc::Sender<Delivery>) -> ControlFlow<()> {
+        let Some((session, event)) = self.recv_from().await else {
             return ControlFlow::Break(());
         };
-        match tx.send(event).await {
+        let delivery = Delivery {
+            publisher: Publisher(session),
+            event,
+        };
+        match tx.send(delivery).await {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         }

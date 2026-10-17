@@ -3,6 +3,7 @@
 Run with: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
 Requires ansible-playbook and nomad on PATH; never connects to a real cluster.
 """
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 import shutil
 import socket
 import time
+import urllib.parse
 import urllib.request
 import subprocess
 import tempfile
@@ -27,6 +29,12 @@ MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
 SECRET_PATH = re.compile(r'nomadVar "(nomad/jobs/[\w-]+)"')
 # A secret no rendered job, job variable or play output may hold.
 SENTINEL = 'SECRET-SENTINEL'
+# The SHA-256 of the genesis that staging started from. A live chain
+# refuses a changed genesis, so a deployment without the local canary
+# renders exactly this file.
+STAGING_GENESIS_SHA256 = '1f9b08a455960c3bb26469765baf0dd46cfd68843eda9ee735fb9291aaaad1fa'
+# The first account of the canary's fragment (config/genesis/canary.toml).
+CANARY_RING_ACCOUNT = '0x1aac82773CB722166D7dA0d5b0FA35B0307dD99D'
 # The chain status of a chain that stands on nothing.
 HEALTHY_CHAIN = {'roots': [], 'sealer': {'pause': None}, 'ingress': {'pause': None}, 'services': []}
 # The chain status while no sealer member runs: the ingress halts the
@@ -121,6 +129,15 @@ class NomadAPI(BaseHTTPRequestHandler):
         # The registry: the manifest of an image, by digest.
         assert self.path.startswith('/v2/') and '/manifests/sha256:' in self.path, self.path
         name = self.path.removeprefix('/v2/').split('/manifests/')[0]
+        token = self.server.state.get('registry_token')
+        if token and self.headers.get('Authorization') != f'Bearer {token}':
+            # A registry such as ghcr.io: no manifest without a pull token,
+            # also for a public image.
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', f'Bearer realm="http://127.0.0.1:{self.server.server_port}/token",'
+                                                 f'service="registry.example",scope="repository:{name}:pull"')
+            self.end_headers()
+            return
         self.send_response(404 if name in self.server.state.get('missing_images', ()) else 200)
         self.end_headers()
 
@@ -168,6 +185,14 @@ class NomadAPI(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith('/token?'):
+            # The token service of the registry: an anonymous pull token
+            # for the scope of the challenge.
+            query = urllib.parse.parse_qs(self.path.split('?')[1])
+            assert query['service'] == ['registry.example'] and query['scope'][0].endswith(':pull'), query
+            self.server.state.setdefault('token_scopes', []).append(query['scope'][0])
+            self.respond({'token': self.server.state['registry_token']})
+            return
         parts = self.path.split('?')[0].split('/')
         parts += [''] * (6 - len(parts))
         state = self.server.state
@@ -434,6 +459,9 @@ class DeployTest(Deploys):
             'KARDAMOM_L1_RPC': 'http://anvil.service.consul:8546'})
         canary = self.api.state['jobs']['canary']['TaskGroups'][0]['Tasks'][0]['Config']['args']
         self.assertEqual(str(canary[canary.index('--ring-offset') + 1]), '34')
+        # The local canary's ring is funded by its own genesis fragment.
+        for name in ('executor', 'validator'):
+            self.assertIn(CANARY_RING_ACCOUNT, self.genesis_template(self.api.state['jobs'][name]), name)
         self.assertEqual(sorted(self.api.state['variable_writes']),
                          ['nomad/jobs/batcher', 'nomad/jobs/canary', 'nomad/jobs/l1-indexer'])
         self.run_deploy(environ=local_canary)
@@ -449,6 +477,7 @@ class DeployTest(Deploys):
         # deploy workflow sets.
         l1 = f'https://l1.example/v3/{SENTINEL}-L1'
         followers = f'https://a.example/v2/{SENTINEL}-A,https://b.example/v3/{SENTINEL}-B'
+        batcher = f'https://primary.example/v2/{SENTINEL}-P,https://fallback.example/v3/{SENTINEL}-F'
         key = f'0x{SENTINEL}-KEY'
         # An Alertmanager configuration with a receiver token, and its own
         # Go templates, which must arrive as data.
@@ -458,7 +487,7 @@ class DeployTest(Deploys):
             f'      - bot_token: "{SENTINEL}-BOT"\n        chat_id: 1\n'
             '        message: \'{{ .CommonLabels.alertname }} {{ range .Alerts }}{{ .Annotations.runbook }}{{ end }}\'\n')
         output = self.run_deploy(environ={
-            'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_KEY': key,
+            'L1_RPC': l1, 'L1_FOLLOWERS_RPC': followers, 'BATCHER_L1_RPC': batcher, 'BATCHER_KEY': key,
             'L1_OWNER_KEY': f'0x{SENTINEL}-OWNER', 'EIGENDA_NETWORK': 'sepolia_testnet',
             'CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC', 'CANARY_L1_KEY': f'0x{SENTINEL}-CANARY',
             'ALERTMANAGER_CONFIG_FILE': str(alertmanager)})
@@ -471,7 +500,7 @@ class DeployTest(Deploys):
         self.assertTrue(monitoring['alertmanager'].startswith(alertmanager.read_text()), monitoring['alertmanager'].replace(SENTINEL, '<S>'))
         self.assertIn((ANSIBLE.parents[1] / 'alertmanager-inhibit.yml').read_text(), monitoring['alertmanager'])
         self.assertEqual(state['variables'], {
-            'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': l1, 'KARDAMOM_L1_KEY': key},
+            'nomad/jobs/batcher': {'KARDAMOM_L1_RPC': batcher, 'KARDAMOM_L1_KEY': key},
             'nomad/jobs/canary': {'KARDAMOM_CANARY_MNEMONIC': f'{SENTINEL}-MNEMONIC',
                                   'KARDAMOM_CANARY_L1_KEY': f'0x{SENTINEL}-CANARY', 'KARDAMOM_L1_RPC': l1},
             'nomad/jobs/da-proxy': {'EIGENDA_PROXY_EIGENDA_V2_ETH_RPC': l1,
@@ -774,6 +803,10 @@ class DeployTest(Deploys):
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
+            # A deployment without the local canary keeps dev.toml as it
+            # is: a live chain refuses a changed genesis.
+            template = self.genesis_template(plans[name]).encode()
+            self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):
@@ -1038,6 +1071,17 @@ class RecordTest(Deploys):
         output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
         self.assertIn('the production profile does not allow that', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_the_image_check_reads_a_registry_that_wants_a_pull_token(self):
+        self.api.state['registry_token'] = 'anonymous-pull'
+        self.api.state['missing_images'] = {'kardamom-executor'}
+        output = self.run_deploy(success=False)
+        self.assertIn('does not hold the image of executor', output)
+        self.assertIn('repository:kardamom-executor:pull', self.api.state['token_scopes'])
+        self.assertEqual(self.api.state['writes'], [])
+        self.api.state['missing_images'] = set()
+        self.run_deploy()
+        self.assertIn('cluster', self.api.state['writes'])
 
     def test_a_coordinated_format_change_refuses_the_rolling_path(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'sealer-snapshot', 'head': 11, 'base': 10},

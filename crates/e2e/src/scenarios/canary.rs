@@ -313,7 +313,7 @@ impl BlockCheck<'_> {
             .into_iter()
             .find_map(|(n, h)| (n == number).then_some(h))
             .with_context(|| format!("no header row for block {number}"))?;
-        let history = self.rpc.base_fee(number).await.context("eth_feeHistory")?;
+        let history = self.fee_history_base_fee(number).await?;
         anyhow::ensure!(
             committed.block_number == number,
             "the ingress gives block {number}, the state gives {}",
@@ -326,6 +326,23 @@ impl BlockCheck<'_> {
             header.base_fee
         );
         Ok(())
+    }
+
+    /// The base fee that `eth_feeHistory` gives for block `number`. The
+    /// ingress files a block when its boundary arrives, which can be
+    /// after the receipt (the commit pipeline is four blocks deep). Until
+    /// then it refuses the block as newer than its history.
+    async fn fee_history_base_fee(&self, number: u64) -> Result<U256> {
+        let filed = Poll::within(LAND, POLL)
+            .until(|| async { self.rpc.base_fee(number).await.ok() })
+            .await;
+        match filed {
+            Some(fee) => Ok(fee),
+            // The last answer, for its error.
+            None => Ok(self.rpc.base_fee(number).await.with_context(|| {
+                format!("eth_feeHistory: block {number} never reached the fee history")
+            })?),
+        }
     }
 
     /// The references of block `number`, once the executor commits it.

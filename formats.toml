@@ -75,10 +75,11 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # and sends neither. No frame uses kind 14: a reader drops it as unknown.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
-# fields at the tail, or 75 bytes with the retained bytes after them. This
-# release sends 67 bytes. A reader of either release reads every size: an
-# old reader ignores a tail it does not know, and a new reader reads a
-# frame with no tail as the guard off and no retained bytes.
+# fields at the tail, 68 bytes with the snapshot flag after them, or 76
+# bytes with the retained bytes after the flag. This release sends 68
+# bytes, or 76 bytes with kardamom.cluster.carryBytes=true. A reader of either release reads every size: an old reader
+# ignores a tail it does not know, and a new reader reads a frame with no
+# tail as the guard off, no snapshot and no retained bytes.
 [format.sealer-egress-kinds]
 writes = 12
 reads_min = 1
@@ -152,6 +153,9 @@ code = ["crates/state/src/meta.rs#SCHEMA_VERSION"]
 # schema it does not read. A manifest without the key passes, and the
 # image says its schema when it opens. The image inside the checkpoint is
 # a state database, so the state-db entry also applies to a checkpoint.
+# `image_keccak` is the hash of every byte of the image file. The writer
+# cuts the file to its used pages, and a reader hashes the whole file, so
+# an image of either length verifies in every release.
 [format.checkpoint-manifest]
 writes = 1
 reads_min = 1

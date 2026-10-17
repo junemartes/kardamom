@@ -175,6 +175,8 @@ pub(crate) struct Tracker {
     receipted: AtomicU64,
     bad_status: AtomicU64,
     bad_receipt: AtomicU64,
+    /// The submits the ingress refused, every attempt counted.
+    refused: AtomicU64,
     /// What each planned transaction's receipt must say, by hash.
     /// Filled before the run, so the reads take no lock.
     expected: HashMap<B256, Expected>,
@@ -211,6 +213,7 @@ impl Tracker {
             receipted: AtomicU64::new(0),
             bad_status: AtomicU64::new(0),
             bad_receipt: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
             expected: HashMap::new(),
             placement: Mutex::new(Placement::default()),
             gas_used: AtomicU64::new(0),
@@ -245,6 +248,13 @@ impl Tracker {
     /// Register an attempted submit.
     pub(crate) fn note_offered(&self) {
         self.offered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register a refused submit attempt, and return the count of
+    /// refusals with this one. The count only paces the refusal log, so
+    /// a wrap is harmless.
+    pub(crate) fn note_refused(&self) -> u64 {
+        self.refused.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
     /// Register a submit that ingress accepted.

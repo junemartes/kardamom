@@ -3,9 +3,17 @@ use crate::env::{Durability, StateEnvBuilder};
 use crate::snapshot::StateSnapshot;
 use crate::writer::{StateWriter, WriteBatch};
 use alloy_primitives::{Address, B256, U256};
-use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, StateDatabase};
+use kardamom_types::{
+    AccountChange, BPosition, BlockBoundary, BlockDelta, StateDatabase, StorageChange,
+};
 
 fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
+    commit_blocks_with_slots(env, addr, upto, 0);
+}
+
+/// Commit blocks `1..=upto` for `addr`. Each block also writes `slots`
+/// storage slots of `addr`, with keys that differ from block to block.
+fn commit_blocks_with_slots(env: &StateEnv, addr: Address, upto: u64, slots: u64) {
     let mut handle = StateWriter::spawn(env.clone()).unwrap();
     for b in 1..=upto {
         let boundary = BlockBoundary {
@@ -24,7 +32,13 @@ fn commit_blocks(env: &StateEnv, addr: Address, upto: u64) {
                 balance: U256::from(b * 100),
                 code_hash: B256::ZERO,
             }],
-            storage: Vec::new(),
+            storage: (0..slots)
+                .map(|slot| StorageChange {
+                    address: addr,
+                    key: B256::from(U256::from(b * 1_000_000 + slot)),
+                    value: U256::from(slot + 1),
+                })
+                .collect(),
             code: Vec::new(),
             receipts: Vec::new(),
         };
@@ -58,12 +72,18 @@ fn seed_test_genesis(env: &StateEnv) {
 /// blocks `1..=upto` for `addr`. Every checkpoint test's fixture setup:
 /// open, seed, commit.
 fn seeded_env_with_blocks(dir: &std::path::Path, addr: Address, upto: u64) -> StateEnv {
+    let env = seeded_env(dir);
+    commit_blocks(&env, addr, upto);
+    env
+}
+
+/// Open a fresh tempdir-backed env at `dir`, and seed genesis.
+fn seeded_env(dir: &std::path::Path) -> StateEnv {
     let env = StateEnvBuilder::new(dir)
         .durability(Durability::SafeNoSync)
         .open()
         .unwrap();
     seed_test_genesis(&env);
-    commit_blocks(&env, addr, upto);
     env
 }
 
@@ -470,4 +490,96 @@ fn format_versions_match_the_registry() {
     use kardamom_formats::Registry;
     Registry::assert_exact("state-db", crate::meta::SCHEMA_VERSION);
     Registry::assert_exact("checkpoint-manifest", super::manifest::MANIFEST_VERSION);
+}
+
+/// The rows of each table, as key and value bytes, in cursor order.
+type TableRows = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+/// Every row of every table, in cursor order.
+fn table_rows(env: &StateEnv) -> TableRows {
+    let txn = env.raw().begin_ro_sync().unwrap();
+    crate::schema::ALL_TABLES
+        .iter()
+        .map(|table| {
+            let db = txn.open_db(Some(table)).unwrap();
+            let mut cur = txn.cursor(db).unwrap();
+            let rows = cur
+                .iter_start::<Vec<u8>, Vec<u8>>()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            (*table, rows)
+        })
+        .collect()
+}
+
+/// A new checkpoint image holds only its used pages, not the trailing
+/// hole of the growth step. The manifest hash and a peer transfer then
+/// read about as many bytes as the state holds. The state here fills
+/// many 64 KiB units, so a cut that drops a used page loses rows. The
+/// image keeps every used page, opens in place read-only with every row
+/// of the source, and restores.
+#[test]
+fn create_cuts_the_image_to_its_used_pages() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x28; 20]);
+    let env = seeded_env(src.path());
+    commit_blocks_with_slots(&env, addr, 4, 1_000);
+    let c = create_checkpoint(&env, ckpt.path()).unwrap();
+
+    let len = std::fs::metadata(checkpoint_data_file(&c.path).unwrap())
+        .unwrap()
+        .len();
+    let in_place = StateEnvBuilder::new(&c.path)
+        .read_only(true)
+        .open()
+        .unwrap();
+    let pages = u64::try_from(in_place.raw().info().unwrap().last_pgno()).unwrap() + 1;
+    let used = pages * u64::from(in_place.raw().stat().unwrap().page_size());
+    assert!(
+        used >= 4 * 64 * 1024,
+        "the state fills many units: {used} bytes"
+    );
+    assert!(
+        len >= used,
+        "the image keeps every used page: {len} < {used}"
+    );
+    assert!(
+        len < used + 64 * 1024,
+        "the image keeps no hole: {len} bytes"
+    );
+    assert_eq!(len % (64 * 1024), 0, "the cut length is 64 KiB aligned");
+    assert_eq!(table_rows(&in_place), table_rows(&env));
+    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 4);
+}
+
+/// An image that is longer than its used pages still verifies and
+/// restores, when its manifest has the hash of the whole file. The
+/// reader does not use the file length. A short trailing hole keeps the
+/// hash fast in a debug build.
+#[test]
+fn restore_reads_an_image_with_a_trailing_hole() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x29; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let c = create_checkpoint(&env, ckpt.path()).unwrap();
+
+    let data = checkpoint_data_file(&c.path).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data)
+        .unwrap()
+        .set_len(4 * 1024 * 1024)
+        .unwrap();
+    let manifest = CheckpointManifest {
+        image_keccak: file_keccak(&data).unwrap(),
+        ..read_manifest(&c.path).unwrap()
+    };
+    std::fs::write(manifest_path(&c.path), manifest.encode()).unwrap();
+
+    assert_eq!(restore_checkpoint(&c.path, dst.path(), None).unwrap(), 2);
 }

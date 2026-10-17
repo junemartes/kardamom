@@ -226,7 +226,7 @@
       secrets:
         KARDAMOM_L1_RPC: >-
           {{ workloads_fault_proxy_url if workloads_l1_fault_proxy | bool
-             else workloads_l1_rpc if workloads_l1_rpc_given | length > 0
+             else workloads_batcher_rpc if workloads_l1_rpc_given | length > 0
              else workloads_anvil_service_rpc }}
         KARDAMOM_L1_KEY: "{{ workloads_batcher_key | default(workloads_batcher_dev_key, true) }}"
 

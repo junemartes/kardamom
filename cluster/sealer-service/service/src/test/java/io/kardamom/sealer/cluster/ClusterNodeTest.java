@@ -63,7 +63,7 @@ final class ClusterNodeTest {
     void peerAdminEndpointsUseTheIngressHostOfEveryOtherMember() {
         assertEquals(
             List.of(URI.create("http://192.168.56.51:40205"), URI.create("http://192.168.56.53:40205")),
-            new CarryBytes.Members(MEMBERS).peerAdminEndpoints(1, 40205));
+            new ClusterMembers(MEMBERS).peerAdminEndpoints(1, 40205));
     }
 
     @Test

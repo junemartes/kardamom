@@ -374,13 +374,13 @@ mod tests {
         }
     }
 
-    /// The 67-byte status frame carries the best recorded cursor; the lag
+    /// The 68-byte status frame carries the best recorded cursor; the lag
     /// counts the records past it. The 50-byte frame of a sealer with no
     /// record-lag tail reads as no cursor.
     #[test]
     fn the_record_lag_gauges_follow_the_status_tail() {
         use kardamom_cluster_adapter::wire::{
-            STATUS_LEN, STATUS_WITH_RECORD_LAG_LEN, encode_status,
+            STATUS_LEN, STATUS_WITH_SNAPSHOT_FLAG_LEN, encode_status,
         };
         use kardamom_types::cluster_status::RecordLagStatus;
 
@@ -393,7 +393,7 @@ mod tests {
             ..ClusterStatus::default()
         };
         let full = encode_status(&status);
-        assert_eq!(full.len(), STATUS_WITH_RECORD_LAG_LEN);
+        assert_eq!(full.len(), STATUS_WITH_SNAPSHOT_FLAG_LEN);
         let egress = FakeEgress::new();
         egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250, 0));
         egress.push(full.clone());

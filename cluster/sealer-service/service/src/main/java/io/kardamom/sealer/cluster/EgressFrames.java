@@ -75,12 +75,31 @@ final class EgressFrames {
     }
 
     /**
-     * The chain's status with the record-lag tail: {@code kind(1) |
-     * posted_head(8) | sealed_head(8) | budget(8) | halted(1) | retained(8)
-     * | floor_index(8) | floor_block(8) | best_recorded(8) |
-     * record_lag_budget(8) | record_lag_halted(1)}.
+     * The chain's status with the record-lag tail and the flag byte:
+     * {@code kind(1) | posted_head(8) | sealed_head(8) | budget(8) |
+     * halted(1) | retained(8) | floor_index(8) | floor_block(8) |
+     * best_recorded(8) | record_lag_budget(8) | record_lag_halted(1) |
+     * snapshot_follows(1)}. {@code snapshotFollows} is true on the status
+     * before a snapshot.
      */
-    int status(final ClusterStatus status) {
+    int status(final ClusterStatus status, final boolean snapshotFollows) {
+        final int pos = recordLagStatus(status);
+        buf.putByte(pos, snapshotFollows ? (byte) 1 : (byte) 0);
+        return SealerWire.STATUS_WITH_SNAPSHOT_FLAG_LEN;
+    }
+
+    /**
+     * {@link #status(ClusterStatus, boolean)}, then the byte tail
+     * {@code [retained_bytes:u64]}.
+     */
+    int status(final ClusterStatus status, final boolean snapshotFollows, final long retainedBytes) {
+        status(status, snapshotFollows);
+        buf.putLong(SealerWire.STATUS_RETAINED_BYTES_OFFSET, retainedBytes, ByteOrder.LITTLE_ENDIAN);
+        return SealerWire.STATUS_WITH_RETAINED_BYTES_LEN;
+    }
+
+    /** The status up to the end of the record-lag tail. Returns the next offset. */
+    private int recordLagStatus(final ClusterStatus status) {
         int pos = 0;
         buf.putByte(pos, SealerWire.EGRESS_KIND_STATUS);
         pos += Byte.BYTES;
@@ -105,13 +124,6 @@ final class EgressFrames {
         buf.putByte(pos, status.recordLagHalted() ? (byte) 1 : (byte) 0);
         pos += Byte.BYTES;
         return pos;
-    }
-
-    /** {@link #status(ClusterStatus)}, then the byte tail {@code [retained_bytes:u64]}. */
-    int status(final ClusterStatus status, final long retainedBytes) {
-        final int pos = status(status);
-        buf.putLong(pos, retainedBytes, ByteOrder.LITTLE_ENDIAN);
-        return pos + Long.BYTES;
     }
 
     /** A copy of the first {@code length} bytes of the staging buffer. */

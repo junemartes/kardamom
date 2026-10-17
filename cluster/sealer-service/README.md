@@ -116,7 +116,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 6 | Remote-origin reject | `[kind=6][origin_chain_id:u64][first_seq:u64][expected_next_seq:u64][reason:u8]` | the offering session |
 | 7 | Past deadline | `[kind=7][sender:20][nonce:u64][max_inclusion_block:u64][at_block:u64]` | the offering session |
 | 8 | Window full | `[kind=8][sender:20][nonce:u64]` | the offering session |
-| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64][best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8]` (67 bytes) | all sessions |
+| 9 | Status | `[kind=9][posted_head:u64][sealed_head:u64][budget_blocks:u64][halted:u8][retained_frames:u64][floor_index:u64][floor_block:u64][best_recorded:u64][record_lag_budget:u64][record_lag_halted:u8][snapshot_follows:u8]` (68 bytes) | all sessions |
 | 10 | DA-lag reject | `[kind=10][sender:20][nonce:u64][sealed_head:u64][posted_head:u64][budget_blocks:u64]` | the offering session |
 | 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
@@ -131,7 +131,8 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 - Kind 9: the status of the chain. `halted` is `1` when the DA-lag guard refuses user records.
   - The last 17 bytes are the record-lag guard. `best_recorded` is `u64::MAX` before the first recorded cursor. `record_lag_halted` is `1` when the record-lag guard refuses user records.
   - A reader that knows only the first 50 bytes ignores the last 17. The Rust reader reads a 50-byte frame as no recorded cursor and the guard off.
-  - With `carryBytes`, the frame has the tail `[retained_bytes:u64]` (75 bytes): the bytes of the retained file above the posted head. See [Retained file](#retained-file).
+  - Byte 67 is the snapshot notice. `snapshot_follows` is `1` on the status before a snapshot: the consensus module sends nothing until the snapshot is complete. A client then waits for the next frame for 60 s, not 10 s. See [Snapshot](#snapshot). A reader reads a 67-byte frame as no snapshot.
+  - The frame is 68 bytes. With `carryBytes`, the tail `[retained_bytes:u64]` follows the flag at bytes 68 to 75 (76 bytes): the bytes of the retained file above the posted head. See [Retained file](#retained-file).
   - This egress kind 9 is not the ingress kind 9 (the recorded cursor).
   - The service sends it on each boundary tick, on each posted cursor that moves up, on each recorded cursor that moves the best cursor up, and to a session that announces itself with a kind 1 or a kind 2.
   - It is not retained. A session that announces itself gets the current status.
@@ -370,8 +371,9 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
 | `kardamom.cluster.readyLagBytes` | `4194304` (4 MiB) | no | The most that the service can lag the commit position and still be ready. |
-| `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot. `0` turns it off. |
-| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. `0` turns the join watchdog off, and with it the exit on a closed component. |
+| `kardamom.cluster.snapshotIntervalS` | `300` | no | The interval of the automatic snapshot, in seconds. The leader asks for a snapshot on every boundary tick whose block number is a multiple of `snapshotIntervalS * 1000 / tickMs`. `0` turns it off. An interval shorter than one tick stops the start. |
+| `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
+| `kardamom.cluster.catchupStallS` | `300` | no | A member that tried a catch-up, and makes no progress for this long, drops its recording log and exits with code 4, unless every peer answers with an open election. The relaunch seeds the member from a peer. `0` turns the seed off: the member then never drops its log. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
@@ -522,6 +524,40 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 - If the status cannot be read, `/ready` and `/status` answer 503 with an `error` field.
 - The Nomad job registers a Consul check of the path `/ready`. A rolling deploy waits for it before it stops the next member.
 
+## Election stalls
+
+Aeron 1.44 has three election waits with no bound. The join watchdog turns each into an exit. The relaunch then starts from the member's own state.
+
+- `LEADER_READY` has no timeout. The leader waits until each member that voted, or after the leader heartbeat timeout a quorum, appends at its position in its term. A member that voted, but can never join the term, keeps the leader there.
+- A follower whose service applied a log tail that the new leader does not hold fails each join at once. The join check finds the leader's join position below the member's log position, and each new election takes the position from the commit counter again. Only a relaunch replays the log again, up to the leader's log.
+- `FOLLOWER_LOG_REPLICATION` checks its deadline only after the archive signals both the end of the replication and the stop of the recording. A replication that fails before its recording starts sends no stop, and the election waits for ever.
+
+The rules:
+
+- **Progress.** A new highest commit position of the member, a new highest position of its log recording in `FOLLOWER_LOG_REPLICATION`, a new highest commit position of a peer while the member waits in `LEADER_READY`, or a closed election. A leader reads the commit positions of its peers from their admin servers each 5 s. A replay of the member's own log from a lower position is no progress.
+- **Leader stall.** The member waits in `LEADER_READY` with no progress for longer than the stall limit. It logs `cluster LEADER STALL` and exits with code 7.
+- **Follower stall.** The member reached a follower state, so it found a leader, and it then makes no progress for the stall limit. It logs `cluster FOLLOWER STALL` and exits with code 8. The relaunch keeps the recording log.
+- **Catch-up stall.** A member in the follower stall that tried a catch-up (`FOLLOWER_LOG_REPLICATION` or a `FOLLOWER_CATCHUP` state) first asks its peers for their admin status. Each round asks all peers at once and ends after 2 s, name lookups included.
+  - Every peer answers with an open election: the leader that the member found is not live, so its log tail is not the cause, and no peer can seed the member. The member exits with code 8 and keeps its log.
+  - A peer has a closed election: the member waits until `catchupStallS`, asks again, and then drops its recording log and exits with code 4. The relaunch seeds from that peer.
+  - A peer does not answer, or the member has no admin port (`adminPort` 0, so the probe knows no peer): the answer is unknown. The member asks again at each sample. If no answer ends the wait, it drops its log at `catchupStallS` and seeds, as a member with no probe does.
+- **INIT.** An election that stays in `INIT` gets the INIT wedge (exit code 3) at `joinWatchdogS`. The follower stall does not act on a sample in `INIT`.
+
+The stall limit comes from the member's Aeron timeouts: two join attempts of a follower, each with two leader heartbeat timeouts, one archive message timeout and one driver timeout. That is 2 x (2 x 10 + 10 + 10) = 80 s at the defaults, and 2 x (2 x 10 + 30 + 30) = 160 s at the CI stall tolerance of 30 s. A healthy election in CI closes `LEADER_READY` within 10 s.
+
+With the admin port set, no rule fires on a healthy cluster:
+
+- A slow follower that replays or catches up moves its commit position. The follower counts it as progress, and a waiting leader reads it from the follower's admin server.
+- A lone member with quorum lost, and a coordinated restart, wait in `CANVASS`. They reach no follower state until a leader exists.
+- A snapshot runs with a closed election. A closed election is progress.
+
+With `adminPort` 0 (the code default, and the e2e harness) the members serve no status:
+
+- A leader reads no peer progress. So the leader stall can fire while a slow follower replays for longer than the stall limit. The relaunch costs one more election, and the follower keeps its replay.
+- A follower that tried a catch-up never gets the answer "no closed election". It seeds at `catchupStallS`, as before the probe existed.
+
+Not covered: `LEADER_LOG_REPLICATION` also has no timeout in Aeron 1.44. A leader waits there until a quorum has replicated its log. No rule of the join watchdog acts on that state.
+
 ## Log lines
 
 The service prints on stdout. Each line starts with a UTC instant, then the text in the table.
@@ -546,7 +582,8 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster DROPPED malformed` | The service dropped a malformed frame. The line names the frame type. A non-zero count means that the Java and Rust layouts differ. |
 | `cluster REPLAY` | A replay request. A served replay ends with `served=`, `queued=` and `dropped=`. A refusal ends with `AHEAD head=(index,block)`, `SKEWED` or `UNAVAILABLE`. `AHEAD` means that the cursor is past the head. `SKEWED` means that `from_index` is outside the block that `from_block` names. |
 | `cluster EGRESS-CLOSE` | The service closed a client session because it could not take its frames. The line has the reason. See [Egress back-pressure](#egress-back-pressure). |
-| `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`). A member that replays old log entries also prints it. |
+| `sealer snapshot START` | The service starts its snapshot (`block`). The archive recording of the snapshot is open. |
+| `sealer snapshot TAKEN` | A snapshot was taken (`block`, `canonicalCount`, and `ms`, the wall time of the snapshot in milliseconds). A member that replays old log entries also prints it. |
 | `sealer snapshot RESTORED` | The member started from a snapshot. The line shows `block`, `canonicalCount`, `retained` and `postedHead`. |
 | `sealer state FRESH at genesis` | The member started with no snapshot and no seed. |
 | `sealer state SEEDED` | The member started from a seed (`block`, `endTx`, `senders`, `stateRoot`, `digest`). |
@@ -562,12 +599,18 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster SEED retained-copy` / `cluster SEED retained-copy FAILED` | The peer seed copied the retained file from a peer (`peer`, `segments`), or the copy from that peer failed, with the reason. |
 | `cluster SEED retained-copy MISMATCH` / `cluster SEED retained-copy GAVE-UP` | No peer served a copy that matches the backed-up snapshot in this round (`failures`), or the seed stopped the start after 5 such rounds. |
 | `cluster admin retained request FAILED` | A request under `/retained` failed while the server answered it. |
-| `cluster SNAPSHOT triggered` / `cluster SNAPSHOT attempt failed` | The scheduler asked for a cluster snapshot, or the attempt failed. The next tick tries again. |
+| `cluster SNAPSHOT requested` / `cluster SNAPSHOT attempt failed` | On a due tick (`block`), the leader asked for the periodic snapshot, or its control toggle held another request. The next due tick tries again. |
+| `cluster SNAPSHOT triggered` | The snapshot of the leader is complete: the first timer after it fired. `stallMs` is the time from the boundary tick before the snapshot to that timer. No status frame left the leader in that time. |
 | `cluster LAUNCH RETRY` | The launch found a stale mark file from a killed process. The node waits and retries, up to 6 attempts. |
 | `cluster LAUNCH REPAIR` | The archive had a torn last fragment. The node truncates it and launches again. |
 | `cluster JOIN WEDGE` | The election stayed in `INIT` for longer than `joinWatchdogS`. The process halts with exit code 3. |
 | `cluster LEADER WEDGE` | The completion of the member's leader election failed, so the leader has no ingress subscription: its control toggle is active, but its election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. The process halts with exit code 6, and the members elect again. |
-| `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`). A short state can pass with no line. |
+| `cluster ELECTION` | The election state changed between two samples of the join watchdog, one second apart (`state`, `commitPosition`, `candidateTermId`, `logLeadershipTermId`). A short state can pass with no line. `candidateTermId` is the highest term that the member voted in or stood for (from the node state file). `logLeadershipTermId` is the term of the last term entry of the recording log: a leader writes it when it starts its term, and a follower when it joins the leader's log. It reads `unknown` when the member has no term entry, or when the read meets an entry that the consensus module writes at that moment. |
+| `cluster REPLICATION` | The member is in `FOLLOWER_LOG_REPLICATION`, and the position of its active log recording changed (`recordingId`, `position`, `commitPosition`). `(no active recording)` means that the replication ended, or never started, with no recording. |
+| `cluster LEADER STALL` | The member waited in `LEADER_READY` with no progress on itself or its peers for the stall limit. The process halts with exit code 7, and the members elect again. See [Election stalls](#election-stalls). |
+| `cluster FOLLOWER STALL` | The member found a leader and then made no progress for the stall limit. The process halts with exit code 8, and the relaunch keeps the recording log. After a catch-up, the member exits only when every peer answers with an open election. A line with `deferred` shows that a peer has a closed election: the `CATCHUP STALL` rule then decides at `catchupStallS`. |
+| `cluster CATCHUP STALL` | The member tried a catch-up and made no progress for `catchupStallS`, and not every peer answered with an open election. The member drops its recording log, and the process halts with exit code 4. The relaunch seeds from a peer. |
+| `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
@@ -600,7 +643,21 @@ The chaos suite and operators read these lines. The admin server also exports on
   - Version 12, the retained file: `[floor_index:u64][floor_block:u64][count:u64][front:u64][head:u64][n:i32]`, then `[block:u64][end_tx_idx:u64][end_pos:u64]` for each retained boundary, then `[len:i32]`, the length of the section before it. The section is the end of the snapshot, so a peer seed finds it with no parse of the state. See [Retained file](#retained-file).
   - A member with `carryBytes` stops on a snapshot before version 12. A member without it stops on version 12.
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
-- The Raft snapshot interval is `snapshotIntervalS`. The leader triggers it. The action is a log entry, so all members snapshot at the same position.
+- The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
+- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.
+  - So the status of the due tick carries the snapshot notice (`snapshot_follows`). The notice leaves before the leader sets its toggle.
+  - After the notice, the ingress, the sequencer and the session watchdog of each client wait 60 s (`SNAPSHOT_SILENCE`), not 10 s, for the next frame. A stall past 60 s is still a lost quorum.
+  - A snapshot that an operator asks for with `ClusterTool` carries no notice.
+
+### Manual snapshot
+
+A manual snapshot (`ClusterTool <cluster dir> snapshot` on the leader) sends no snapshot notice. The clients keep the 10 s budget. On a loaded disk the stall can pass 10 s, and then:
+
+- each ingress halts with `sealer_no_quorum` and pauses submits,
+- each sequencer pauses,
+- each session watchdog forces a reconnect.
+
+The halt clears by itself at the next status frame. To avoid it, do not ask for a manual snapshot while the disk is loaded. Let the periodic snapshot take it, or set `snapshotIntervalS` lower for a while. Before a manual snapshot, tell the operators of the clients that a short `sealer_no_quorum` halt can come.
 
 ## Build and test
 

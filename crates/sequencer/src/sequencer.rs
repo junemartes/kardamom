@@ -589,7 +589,7 @@ impl Sequencer {
         // again, the refusal takes it out of the ledger, and the next
         // contiguity reject finds no ref at the expected nonce.
         self.apply_deadline_rejects(&mut r, ports);
-        self.apply_contiguity_rejects(&mut r);
+        self.apply_sealer_answers(&mut r);
         self.resync = Some(r);
         self.sweep_confirm_timeouts();
     }

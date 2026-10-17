@@ -21,8 +21,6 @@ const FRESH: &str = "sealer state FRESH at genesis";
 const CONFIRMED: &str = "sealer seed CONFIRMED";
 const TAKEN: &str = "sealer snapshot TAKEN";
 const SNAPSHOT_RESTORED: &str = "sealer snapshot RESTORED";
-/// The sealer's answer to a resume past its head (`REPLAY_AHEAD`).
-const AHEAD: &str = " AHEAD head=(";
 
 /// The cluster's log counts before the seeded start.
 pub(super) struct SealerCounts {
@@ -121,6 +119,7 @@ impl SealerCounts {
 /// stale cursor, from a checkpoint restore.
 pub(super) struct ResumeCounts {
     served: usize,
+    served_past: usize,
     ahead: usize,
     restored: usize,
     fetched: usize,
@@ -137,7 +136,8 @@ impl ResumeCounts {
             |needle: &'static str| h.evidence.count_lines("executor", needle, Streams::Both);
         Ok(Self {
             served: cluster(format!("from={} served=", head.resume_cursor())).await?,
-            ahead: cluster(AHEAD.to_string()).await?,
+            served_past: head.served_past(&h.evidence.cluster_logs().await?),
+            ahead: cluster(head.ahead_needle()).await?,
             restored: executor(RESTORED).await?,
             fetched: executor(FETCHED).await?,
         })
@@ -171,13 +171,13 @@ impl ResumeCounts {
             .await
     }
 
-    /// The sealer answered the stale executor's cursor with
+    /// The seeded sealer answered the stale executor's cursor with
     /// `REPLAY_AHEAD`.
-    pub(super) async fn await_ahead(&self, h: &Harness) -> anyhow::Result<()> {
+    pub(super) async fn await_ahead(&self, h: &Harness, head: &SeedHead) -> anyhow::Result<()> {
         h.evidence
             .wait_count_gt(&CountWait {
                 job: CLUSTER_TASK,
-                needle: AHEAD,
+                needle: &head.ahead_needle(),
                 baseline: self.ahead,
                 timeout: Duration::from_mins(3),
                 interval: Duration::from_secs(5),
@@ -185,6 +185,25 @@ impl ResumeCounts {
                 fail_msg: "sealer-fleet-total-wipe-recover: the executor that kept the old chain got no REPLAY_AHEAD",
             })
             .await
+    }
+
+    /// The sealer served no cursor past the seed's cursor. A served
+    /// stale cursor plus a fresh executor that resumes twice would also
+    /// reach the count that `await_resumed` waits for.
+    pub(super) async fn assert_stale_not_served(
+        &self,
+        h: &Harness,
+        head: &SeedHead,
+    ) -> anyhow::Result<()> {
+        let served_past = head.served_past(&h.evidence.cluster_logs().await?);
+        anyhow::ensure!(
+            served_past == self.served_past,
+            "{}: {CTX}: the sealer served a cursor past {} ({} -> {served_past} lines)",
+            crate::FAIL_PREFIX,
+            head.resume_cursor(),
+            self.served_past
+        );
+        Ok(())
     }
 
     /// No executor restored or fetched a checkpoint: every checkpoint of

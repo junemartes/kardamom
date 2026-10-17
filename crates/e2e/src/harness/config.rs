@@ -83,6 +83,10 @@ pub struct StackConfig {
     /// (the `[fees]` fragment appended to the genesis), as the deploy's
     /// one `PRIORITY_FEES` value sets them.
     pub priority_fees: bool,
+    /// The local canary's accounts, Anvil #34 to #37
+    /// (`deploy/cluster/config/genesis/canary.toml`, appended to the
+    /// genesis), as the deploy funds them for `CANARY_LOCAL=1`.
+    pub canary_genesis: bool,
     /// Also run `kardamom-notifier`, the transaction status feed. The
     /// feed's WebSocket URL is [`crate::harness::LocalStack::notifier_ws_url`].
     pub notifier: bool,
@@ -118,6 +122,12 @@ impl Genesis {
     pub(super) fn fees_fragment(repo: &std::path::Path) -> PathBuf {
         repo.join("deploy/cluster/config/genesis/fees.toml")
     }
+
+    /// The local canary's fragment: the four accounts of its ring, the
+    /// same file the executor and validator jobs append for it.
+    pub(super) fn canary_fragment(repo: &std::path::Path) -> PathBuf {
+        repo.join("deploy/cluster/config/genesis/canary.toml")
+    }
 }
 
 impl Default for StackConfig {
@@ -138,6 +148,7 @@ impl Default for StackConfig {
             archive_durability: false,
             verified_l1: false,
             priority_fees: false,
+            canary_genesis: false,
             notifier: false,
         }
     }

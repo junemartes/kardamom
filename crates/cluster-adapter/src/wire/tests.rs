@@ -303,10 +303,11 @@ fn posted_cursor_and_status_layouts_are_pinned_byte_for_byte() {
         floor_index: 90_000,
         floor_block: 95,
         record_lag: RecordLagStatus::default(),
+        snapshot_follows: false,
         retained_bytes: None,
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), STATUS_WITH_RECORD_LAG_LEN);
+    assert_eq!(b.len(), STATUS_WITH_SNAPSHOT_FLAG_LEN);
     assert_eq!(b[0], 9, "kind 9 is the Java EGRESS_KIND_STATUS");
     assert_eq!(u64::from_le_bytes(b[1..9].try_into().unwrap()), 100);
     assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), 160);
@@ -348,11 +349,62 @@ fn recorded_cursor_and_status_tail_layouts_are_pinned_byte_for_byte() {
         ..Default::default()
     };
     let b = encode_status(&status);
-    assert_eq!(b.len(), 67);
+    assert_eq!(b.len(), 68);
     assert_eq!(u64::from_le_bytes(b[50..58].try_into().unwrap()), 77);
     assert_eq!(u64::from_le_bytes(b[58..66].try_into().unwrap()), 16_384);
     assert_eq!(b[66], 1, "the record-lag flag at offset 66");
+    assert_eq!(b[67], 0, "the snapshot flag at offset 67");
     assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+}
+
+/// The status before a snapshot carries the snapshot flag at byte 67, so
+/// the frame is 68 bytes. A frame of a sealer with no snapshot tail (67
+/// bytes) reads as no snapshot. A later sealer adds `retained_bytes:u64` at
+/// bytes 68..76, and the 76-byte frame still reads the flag at byte 67.
+#[test]
+fn the_snapshot_flag_sits_at_byte_67() {
+    assert_eq!(STATUS_SNAPSHOT_FLAG_OFFSET, 67);
+    assert_eq!(STATUS_WITH_SNAPSHOT_FLAG_LEN, 68);
+    let status = kardamom_types::ClusterStatus {
+        sealed_head: 160,
+        snapshot_follows: true,
+        ..Default::default()
+    };
+    let b = encode_status(&status);
+    assert_eq!(b.len(), 68);
+    assert_eq!(b[67], 1, "the snapshot flag at byte 67");
+    assert_eq!(EgressItem::decode(&b).unwrap(), EgressItem::Status(status));
+
+    let EgressItem::Status(old) = EgressItem::decode(&b[..67]).unwrap() else {
+        panic!("a status frame decodes as a status");
+    };
+    assert!(
+        !old.snapshot_follows,
+        "no snapshot tail reads as no snapshot"
+    );
+
+    let wide_status = kardamom_types::ClusterStatus {
+        retained_bytes: Some(0x0102_0304_0506_0708),
+        ..status
+    };
+    let wide = encode_status(&wide_status);
+    assert_eq!(wide.len(), 76);
+    assert_eq!(wide[67], 1, "the 76-byte frame keeps the flag at byte 67");
+    assert_eq!(wide[68..], 0x0102_0304_0506_0708_u64.to_le_bytes());
+    assert_eq!(
+        EgressItem::decode(&wide).unwrap(),
+        EgressItem::Status(wide_status)
+    );
+    let plain = kardamom_types::ClusterStatus {
+        snapshot_follows: false,
+        ..wide_status
+    };
+    assert_eq!(encode_status(&plain)[67], 0);
+    assert_eq!(
+        EgressItem::decode(&encode_status(&plain)).unwrap(),
+        EgressItem::Status(plain),
+        "a 76-byte frame with byte 67 at 0 is no snapshot"
+    );
 }
 
 /// A sealer that does not send the record-lag tail sends 50 bytes. The

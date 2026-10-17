@@ -299,8 +299,9 @@ final class RetainedFile implements RetainedFrames {
     }
 
     @Override
-    public int status(final EgressFrames codec, final ClusterStatus status, final long postedHead) {
-        return codec.status(status, bytesAbove(postedHead));
+    public int status(
+            final EgressFrames codec, final ClusterStatus status, final boolean snapshotFollows, final long postedHead) {
+        return codec.status(status, snapshotFollows, bytesAbove(postedHead));
     }
 
     /**

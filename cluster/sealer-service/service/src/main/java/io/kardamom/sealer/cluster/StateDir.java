@@ -2,6 +2,7 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ConsensusModule;
+import io.aeron.cluster.client.ClusterException;
 import io.aeron.cluster.RecordingLog;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -61,6 +62,21 @@ record StateDir(Path root) {
                         && entry.serviceId == ConsensusModule.Configuration.SERVICE_ID)
                 .map(entry -> entry.logPosition)
                 .toList());
+    }
+
+    /**
+     * The leadership term of the last term entry of the recording log, or
+     * empty when the log has none or the read fails. A running consensus
+     * module writes the recording log during an election, so a read can
+     * meet a half-written entry, and the recording log refuses it. The
+     * value serves the election log lines only.
+     */
+    Optional<Long> lastTermId() {
+        try {
+            return withRecordingLog(log -> Optional.ofNullable(log.findLastTerm()).map(entry -> entry.leadershipTermId));
+        } catch (final ClusterException e) {
+            return Optional.empty();
+        }
     }
 
     /** The archive recording id of the Raft log. */

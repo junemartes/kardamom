@@ -1,14 +1,12 @@
 package io.kardamom.sealer.cluster;
 
 import io.aeron.Publication;
-import io.aeron.cluster.ClusterControl;
 import io.aeron.cluster.service.Cluster;
 import org.agrona.concurrent.UnsafeBuffer;
-import org.agrona.concurrent.status.AtomicCounter;
 
 /**
- * The two cluster actions of a seeded member: it offers the seed record to
- * the log, and, once the record confirms the seed, it asks for a snapshot.
+ * The cluster action of a seeded member: it offers the seed record to the
+ * log. Once the record confirms the seed, the service asks for a snapshot.
  */
 final class SeedRecord {
     private final Cluster cluster;
@@ -40,21 +38,5 @@ final class SeedRecord {
             System.out.println("sealer SEED-EPOCH offer FAILED memberId=" + memberId + " result=" + result
                 + " — the next leadership term offers it again");
         }
-    }
-
-    /**
-     * Ask this member's consensus module for a snapshot, when this member
-     * leads. The control toggle takes the request only on the leader, and
-     * the snapshot action then goes through the log to every member. A
-     * refused request leaves the periodic snapshot to take one.
-     */
-    void requestSnapshot() {
-        if (cluster.role() != Cluster.Role.LEADER) {
-            return;
-        }
-        final AtomicCounter toggle = ClusterControl.findControlToggle(
-            cluster.aeron().countersReader(), cluster.context().clusterId());
-        final boolean requested = toggle != null && ClusterControl.ToggleState.SNAPSHOT.toggle(toggle);
-        System.out.println("sealer seed SNAPSHOT memberId=" + memberId + " requested=" + requested);
     }
 }

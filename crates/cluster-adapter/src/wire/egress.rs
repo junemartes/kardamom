@@ -22,7 +22,7 @@ use super::{
     EGRESS_KIND_REMOTE_ORIGIN_REJECT, EGRESS_KIND_REPLAY_DONE, EGRESS_KIND_REPLAY_UNAVAILABLE,
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX,
     RT_TX_OFFER, RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN,
-    STATUS_WITH_RECORD_LAG_LEN, STATUS_WITH_RETAINED_BYTES_LEN, WireError, encode_kind_2u64,
+    STATUS_RETAINED_BYTES_OFFSET, STATUS_WITH_RETAINED_BYTES_LEN, WireError, encode_kind_2u64,
     rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
@@ -222,19 +222,22 @@ impl EgressItem {
             floor_index: rd_u64(buf, 34)?,
             floor_block: rd_u64(buf, 42)?,
             record_lag: Self::decode_record_lag_tail(buf)?,
+            snapshot_follows: buf
+                .get(super::STATUS_SNAPSHOT_FLAG_OFFSET)
+                .is_some_and(|flag| *flag != 0),
             retained_bytes: Self::decode_retained_bytes_tail(buf)?,
         }))
     }
 
     /// The byte tail after the record-lag tail of a status frame. A frame
     /// shorter than [`STATUS_WITH_RETAINED_BYTES_LEN`] has no byte tail and
-    /// reads as no retained bytes. Its bytes after the record-lag tail are
-    /// unknown, so the reader ignores them.
+    /// reads as no retained bytes. This reader does not read the flag byte
+    /// in front of the byte tail, and it ignores a partial byte tail.
     fn decode_retained_bytes_tail(buf: &[u8]) -> Result<Option<u64>, WireError> {
         if buf.len() < STATUS_WITH_RETAINED_BYTES_LEN {
             return Ok(None);
         }
-        rd_u64(buf, STATUS_WITH_RECORD_LAG_LEN).map(Some)
+        rd_u64(buf, STATUS_RETAINED_BYTES_OFFSET).map(Some)
     }
 
     /// The record-lag tail after the first [`STATUS_LEN`] bytes of a status
@@ -557,7 +560,8 @@ pub fn encode_window_full(sender: Address, nonce: u64) -> Vec<u8> {
 
 /// Frame the chain's status exactly as the Java service does. The real
 /// encoder is the Java service; this is a test and mock-server helper. A
-/// status with no retained bytes gets no byte tail.
+/// status with no retained bytes gets no flag byte and no byte tail. A
+/// status with retained bytes gets the flag byte as 0.
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
@@ -574,6 +578,7 @@ pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
     b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
     b.extend_from_slice(&lag.budget.to_le_bytes());
     b.push(u8::from(lag.halted));
+    b.push(u8::from(status.snapshot_follows));
     if let Some(retained_bytes) = status.retained_bytes {
         b.extend_from_slice(&retained_bytes.to_le_bytes());
     }

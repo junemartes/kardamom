@@ -420,20 +420,33 @@ final class SealerEgress {
 
     /**
      * Frame and broadcast the chain's status to every session, or offer it
-     * to one session. The frame carries the record-lag tail
-     * ({@link EgressFrames#status(ClusterStatus)}). Not retained: a session
-     * that announces itself gets the current one.
+     * to one session. The frame carries the record-lag tail and the
+     * snapshot flag; with a retained file, the retained bytes follow
+     * ({@link RetainedFrames#status}). Not retained: a session that
+     * announces itself gets the current one.
      */
     void offerStatus(final ClusterStatus status) {
-        final int len = retained.status(frames, status, postedHead);
-        for (final ClientSession session : cluster.clientSessions()) {
-            offerToSession(session, len);
-        }
+        broadcastStatus(status, false);
+    }
+
+    /**
+     * Broadcast the status with the snapshot notice: a snapshot follows,
+     * and no frame leaves the leader until the snapshot is complete.
+     */
+    void offerSnapshotNotice(final ClusterStatus status) {
+        broadcastStatus(status, true);
     }
 
     /** {@link #offerStatus(ClusterStatus)} to one session. */
     void offerStatus(final ClientSession session, final ClusterStatus status) {
-        offerToSession(session, retained.status(frames, status, postedHead));
+        offerToSession(session, retained.status(frames, status, false, postedHead));
+    }
+
+    private void broadcastStatus(final ClusterStatus status, final boolean snapshotFollows) {
+        final int len = retained.status(frames, status, snapshotFollows, postedHead);
+        for (final ClientSession session : cluster.clientSessions()) {
+            offerToSession(session, len);
+        }
     }
 
     /**

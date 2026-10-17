@@ -5,6 +5,7 @@ import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.logbuffer.Header;
+import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestNode;
 import java.util.concurrent.TimeUnit;
 import org.agrona.DirectBuffer;
@@ -18,11 +19,14 @@ import org.agrona.DirectBuffer;
  * an external {@code ClusteredService} by composition: the harness drives
  * this object, which forwards every call verbatim to the production
  * service. Every callback, the snapshot write included, runs the production
- * code. The only additions are the {@link #restoredFromSnapshot()} probe
- * and the {@link #delegate()} accessor.
+ * code. The only additions are the {@link #restoredFromSnapshot()} probe,
+ * the {@link #delegate()} accessor, and an optional pause at the start of
+ * each snapshot.
  */
 final class SealerTestService extends TestNode.TestService {
     private final SealerClusteredService delegate;
+    /** How long each snapshot waits before it writes, as a slow archive does. */
+    private final long snapshotPauseMs;
     /** Written on the service thread in onStart. The test thread reads it. */
     private volatile boolean restoredFromSnapshot;
 
@@ -32,7 +36,18 @@ final class SealerTestService extends TestNode.TestService {
 
     /** Host {@code delegate}, a service the test configured. */
     SealerTestService(final SealerClusteredService delegate) {
+        this(delegate, 0L);
+    }
+
+    /**
+     * Host {@code delegate}, and hold the service thread for
+     * {@code snapshotPauseMs} at the start of each snapshot. The consensus
+     * module waits for the service, so the cluster stalls as it does on a
+     * disk whose syncs are slow.
+     */
+    SealerTestService(final SealerClusteredService delegate, final long snapshotPauseMs) {
         this.delegate = delegate;
+        this.snapshotPauseMs = snapshotPauseMs;
     }
 
     @Override
@@ -102,6 +117,7 @@ final class SealerTestService extends TestNode.TestService {
 
     @Override
     public void onTakeSnapshot(final io.aeron.ExclusivePublication snapshotPublication) {
+        Tests.sleep(snapshotPauseMs);
         delegate.onTakeSnapshot(snapshotPublication);
     }
 
