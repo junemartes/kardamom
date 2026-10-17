@@ -271,7 +271,7 @@ public final class ClusterNode {
         final DurableSync sync = new DurableSync(
             new DurableSync.Dirs(Path.of(archiveDir), Path.of(clusterDir)),
             DurableSync.memberView(contexts.clusterState(), consensus.aeron().countersReader()),
-            DurableSync.haltMember(memberId));
+            DurableSync.Stops.halting(memberId, contexts.clusterState()));
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container;
              AdminServer ignored3 = startAdminServer(new AdminSources(consensus, service, sync), memberId,

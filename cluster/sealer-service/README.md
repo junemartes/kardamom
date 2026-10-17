@@ -535,7 +535,14 @@ The archive and the consensus module run at `fileSyncLevel` 0, so a commit waits
   - `commitPosition`: the commit position that the member knows.
   - `durablePosition`: the lower of the two, or `-1`. A follower syncs entries that it appended but that are not committed yet, so its synced position can pass its commit position.
   - The median `durablePosition` over the members is the position that a majority holds on disk. A reader that polls each member once for each interval can take the median.
-- A failed force halts the member with exit code 9 (`cluster DISK SYNC FAILED`). Linux marks the pages clean after a failed write-back, so a later force can report success for data that is not on the disk. A file that the purge removed is not a failure.
+- The log segments come after the catalog. So a stop position in the catalog that a round forces points no further than the log bytes that the same round forces. The kernel's own write-back has no order: it can write a newer catalog page first.
+- The rule for a failed round:
+  - A failed force deletes the recording log and halts the member with exit code 9 (`cluster DISK SYNC FAILED`). The relaunch finds no recording log, so it seeds the member from a peer, as after exit code 4. Linux keeps the pages of a failed write-back in the page cache and marks them clean. A relaunch on the same kernel would read them, find the log whole, and publish positions above a hole that the disk does not hold.
+  - If the delete fails too, the line says so. Wipe the cluster and archive directories of the member before it starts.
+  - Any other failure is counted, and the next round tries again: a listing or an open that fails (for example with too many open files), or a read of the recording log while the consensus module writes it. The synced position does not move until a round completes. `cluster DURABLE SYNC round failed` prints at powers of two of the count.
+  - A throwable that escapes the thread halts the member with exit code 10 (`cluster DURABLE SYNC DIED`). The relaunch keeps the log.
+  - A file that the purge removed is not a failure.
+- Prometheus scrapes `/metrics` as the job `kardamom-sealer`. The alerts `KardamomSealerSyncStalled`, `KardamomSealerSyncedPositionStalled` and `KardamomSealerSyncErrors` watch the rounds (`deploy/alerts.yml`).
 - With `durableSyncMs=0` the kernel writes the log back on its own schedule, and the positions stay at `-1`.
 
 ## Admin server
@@ -658,7 +665,9 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster CATCHUP STALL` | The member tried a catch-up and made no progress for `catchupStallS`, and not every peer answered with an open election. The member drops its recording log, and the process halts with exit code 4. The relaunch seeds from a peer. |
 | `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
-| `cluster DISK SYNC FAILED` | A force of the disk sync failed. The Raft log of the member cannot be made durable. The process halts with exit code 9. The relaunch recovers the log from the disk and from the leader. See [Durable sync](#durable-sync). |
+| `cluster DISK SYNC FAILED` | A force of the disk sync failed: the disk lost a write of the Raft log. The member deletes its recording log, and the process halts with exit code 9. The relaunch seeds from a peer. If the line says that the recording log did not go, wipe the member before it starts. See [Durable sync](#durable-sync). |
+| `cluster DURABLE SYNC round failed` | A sync round failed for a cause other than a force, for example too many open files. The next round tries again. It prints at powers of two of the count (`errors`). |
+| `cluster DURABLE SYNC DIED` | A throwable escaped the sync thread. The process halts with exit code 10, and the relaunch keeps the recording log. |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
 | `cluster node up`, `cluster admin endpoint`, `cluster durable sync`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |

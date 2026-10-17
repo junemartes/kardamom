@@ -8,7 +8,6 @@ import io.aeron.test.InterruptingTestCallback;
 import io.aeron.test.SystemTestWatcher;
 import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestNode;
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -48,9 +47,9 @@ class DurableSyncClusterTest {
             final StateDir clusterDir = run.clusterState(memberId);
             final Supplier<Optional<DurableSync.View>> view = DurableSync.memberView(
                 clusterDir, follower.consensusModule().context().aeron().countersReader());
-            final List<IOException> failures = new CopyOnWriteArrayList<>();
-            final DurableSync sync = new DurableSync(
-                new DurableSync.Dirs(run.archiveDir(memberId), clusterDir.root()), view, failures::add);
+            final List<Throwable> failures = new CopyOnWriteArrayList<>();
+            final DurableSync sync = new DurableSync(new DurableSync.Dirs(run.archiveDir(memberId), clusterDir.root()),
+                view, new DurableSync.Stops(memberId, failures::add, failures::add));
             sync.start(new Interval(20));
             final List<Long> synced = new ArrayList<>();
             for (int round = 0; round < ROUNDS; round++) {

@@ -81,6 +81,8 @@ variable "grafana_admin_password" {
 
 locals {
   dc = var.datacenter
+  # The admin endpoint of a sealer member (admin_port in nomad/cluster.nomad.hcl).
+  sealer_admin_port = 40205
   # A sequencer node hosts one replica per active lane; the metrics port
   # forms the lane, 9001 + 10 * lane. Four lanes cover the resize cases;
   # an inactive lane's target reads as down.
@@ -125,6 +127,12 @@ locals {
       - job_name: kardamom-canary
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-canary|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
+      # The admin endpoint of each sealer member: the free disk and the
+      # positions of the durable sync. The member service names the ingress
+      # port; the admin port is the admin_port of nomad/cluster.nomad.hcl.
+      - job_name: kardamom-sealer
+        static_configs:
+          - targets: [{{ range $i, $s := service "kardamom-cluster-member|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:${local.sealer_admin_port}"{{ end }}]
       # The host metrics of every node (nomad/node-exporter.system.nomad.hcl)
       # and the metrics of every Nomad agent, discovered through the local
       # Consul agent. The node label is the Consul node name.

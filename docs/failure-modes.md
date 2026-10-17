@@ -411,7 +411,17 @@ The kill-based cases prove the restart logic. They do not prove durability again
   - `commitPosition` (`kardamom_sealer_commit_position`): the commit position that the member knows.
   - `durablePosition` (`kardamom_sealer_durable_position`): the lower of the two. The median over the members is the position that a majority holds on disk.
   - The rounds, the failed rounds and the round time are `kardamom_sealer_durable_syncs_total`, `kardamom_sealer_durable_sync_errors_total`, `kardamom_sealer_durable_sync_seconds` and `kardamom_sealer_durable_sync_max_seconds`.
-- A failed force stops the member: it logs `cluster DISK SYNC FAILED` and halts with exit code 9. Linux marks the pages clean after a failed write-back, so a later force can report success for data that is not on the disk. A file that the purge removed is not a failure.
+- The rule for a failed round:
+  - A failed force stops the member. The member deletes its recording log, logs `cluster DISK SYNC FAILED`, and halts with exit code 9. The relaunch finds no recording log, so it seeds the member from a peer, as after exit code 4.
+  - Why the seed: after a failed write-back, Linux keeps the pages in the page cache and marks them clean. A relaunch on the same kernel reads them, so the log looks whole, and later rounds would publish positions above a hole that the disk does not hold. The seed replaces the whole log.
+  - If the delete fails too, the line says so. Wipe the cluster and archive directories of the member before it starts.
+  - Any other failure is counted in `kardamom_sealer_durable_sync_errors_total`, and the next round tries again: for example a listing or an open that runs out of file descriptors, or a read of the recording log while the consensus module writes it. The synced position does not move until a round completes. The line `cluster DURABLE SYNC round failed` prints at powers of two of the count.
+  - A throwable that escapes the thread halts the member with exit code 10 (`cluster DURABLE SYNC DIED`). The relaunch keeps the log.
+  - A file that the purge removed is not a failure.
+- Alerts (`deploy/alerts.yml`, group `kardamom-sealer-durability`; Prometheus scrapes the admin endpoint as job `kardamom-sealer`):
+  - `KardamomSealerSyncStalled`: no round completes for two minutes. A force hangs on the disk.
+  - `KardamomSealerSyncedPositionStalled`: the commit position moves, and the synced position does not move for three minutes. The rounds fail, or the log recording is not active.
+  - `KardamomSealerSyncErrors`: a round failed in the last five minutes.
 - The loss window is one interval plus one round: about 1 s.
   - A committed entry is lost only when every member that holds it loses power or its kernel within the window, or is out of the next quorum. With all members in step, that is a power loss or a kernel crash on a majority of members at the same time.
   - An entry below the median `durablePosition` of the members is on the disk of a majority. A majority power loss cannot lose it.
@@ -432,16 +442,30 @@ The kill-based cases prove the restart logic. They do not prove durability again
 
 - Trigger: a majority of members lose power or their kernels within one sync interval.
 - Effect:
-  - The members restart with the log up to their synced position, or more. Committed entries above the median `durablePosition` can be gone. The new leader then commits new entries at those positions.
+  - The members restart with the log up to their synced position, or more. Committed entries above the median `durablePosition` can be gone. The new leader commits new entries at those positions at once: a boundary tick is a new entry.
   - An executor that applied a lost entry holds state that the new log does not have. It does not detect this by itself. So the executor rollback is a precondition of sync level 0.
+  - Until the readers of the stream gate on the median `durablePosition`, the batcher reads committed entries. It can post a block to L1 that the members then lose.
   - A snapshot that completed less than one round before the power loss can be incomplete: the kernel wrote back the recording log entry, but not the snapshot recording. The member then stops at start, because the snapshot does not load.
 - Operator steps:
-  1. From Prometheus, read the last values before the loss: the median of `kardamom_sealer_durable_position` over the members, and the highest `kardamom_sealer_commit_position`. Entries below the median are safe.
-  2. Start the members. Each launch repairs its torn last fragment (`cluster LAUNCH REPAIR`).
-  3. A member that stops at start on its newest snapshot: stop its job, and run `ClusterTool <cluster dir> invalidate-latest-snapshot` on its cluster directory. The command marks the newest snapshot invalid in the recording log. Start the member again. It loads the previous snapshot and replays the log after it. The purge keeps that log.
-  4. When the election closes, read `commitPosition` of the new leader on `/status`. Before new commits, it is the end of the recovered log. If it is below the old commit position from step 1, the members lost the entries between the two positions.
-  5. Roll back each executor, the validator and the batcher to a block below the lost range, and let them replay the new log.
+  1. Read the head of each executor while the sealer has no quorum: `kardamom_executor_block_number` on its `/metrics`. An executor restores its head from its state database at start, and it cannot move without the sealer. Take the highest: `OLD_HEAD`. Then stop the executor, validator and batcher jobs, so that no reader takes the new log before the check.
+  2. Read the posted head `H` from L1: the `l2BlockEnd` of the last batch (`lastBatchIndex` and `batches` on the settlement contract, as in [`runbooks/sealer-fleet-rebuild.md`](runbooks/sealer-fleet-rebuild.md), step 1).
+  3. Start the members. Each launch repairs its torn last fragment (`cluster LAUNCH REPAIR`).
+  4. A member that stops at start on its newest snapshot: stop its job, and run `ClusterTool <cluster dir> invalidate-latest-snapshot` on its cluster directory. The command marks the newest snapshot invalid in the recording log. Start the member again. It loads the previous snapshot and replays the log after it. The purge keeps that log.
+  5. Find the recovered head `R`: the `block=` field of the `cluster TERM` line with the highest `leadershipTermId` after the restart. Every member prints the line when it applies the first entry of the new term, after every entry of the earlier terms. So `R` is the last block of the recovered log, before the new leader commits anything.
+  6. Decide:
+     - `H > R`: L1 holds a block that the members lost. The posted chain and the recovered log disagree. Wipe the cluster and archive directories of every member, and rebuild the fleet from L1: [`runbooks/sealer-fleet-rebuild.md`](runbooks/sealer-fleet-rebuild.md).
+     - `H <= R < OLD_HEAD`: the members lost the blocks `R + 1` to `OLD_HEAD`. Roll back each executor and the validator to block `R`. Then start the executor, validator and batcher jobs. The receipts of the transactions in the lost blocks are void. Tell their senders.
+     - `OLD_HEAD <= R`: no reader applied a lost block. Start the executor, validator and batcher jobs.
 - Proof: none in CI. The chaos suite kills processes, and the page cache survives a kill.
+
+#### A member that kept more log than the new quorum
+
+- Trigger: after a majority power loss, a member comes back with a longer log than the members that elected the new leader. Its disk kept entries that theirs lost, and it was not in the first quorum.
+- Effect:
+  - The election truncates the log of the member to the end of the leader's earlier terms (`Truncating Cluster Log - ... oldPosition=.. newPosition=..` in the error log).
+  - Its service already applied entries above the cut, or its newest snapshot is above the cut. The service container then refuses the log with `Cluster log must be contiguous for joining image` or `... for active log event`. The member logs `cluster COMPONENT CLOSED` and halts with exit code 5. Each relaunch loads the same snapshot and fails the same way.
+- Operator step: stop the member, wipe its cluster and archive directories, and start it. It seeds from a peer. Its executor follows the steps of **Majority power loss**.
+- Proof: none in CI.
 
 ## Executor
 
