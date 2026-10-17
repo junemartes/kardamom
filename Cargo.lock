@@ -4002,6 +4002,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kardamom-deployer",
+ "kardamom-formats",
  "kardamom-types",
  "rand 0.8.6",
  "serde_json",
@@ -4118,6 +4119,8 @@ dependencies = [
  "clap",
  "rkyv",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]

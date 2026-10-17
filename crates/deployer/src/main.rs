@@ -1,6 +1,7 @@
 //! kardamom-deploy: stateless CLI for deploying and upgrading kardamom L1 contracts.
 
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, Bytes};
@@ -13,6 +14,7 @@ use kardamom_deployer::{
     ContractId, Deployer, FactoryStatus, Op, RegistryEntry, VerifyMismatch, encode_address_arg,
     encode_address_pair, encode_oracle_init_args,
 };
+use kardamom_formats::FormatGate;
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-deploy", version)]
@@ -22,14 +24,12 @@ struct Cli {
     rpc_url: String,
 
     /// Canonical owner address (Safe or EOA). The same owner gives the same
-    /// factory address.
+    /// factory address. Each command that reads or writes the contracts
+    /// requires it; `formats` reads no chain.
     ///
-    /// This field is not `global`. Clap forbids a required global argument.
-    /// A debug build panics on the assert; a release build skips the assert
-    /// and parsing breaks, because no pre-subcommand `--owner` ever satisfies
-    /// the requirement. Pass `--owner` before the subcommand.
-    #[arg(long, required = true)]
-    owner: Address,
+    /// This field is not `global`. Pass `--owner` before the subcommand.
+    #[arg(long)]
+    owner: Option<Address>,
 
     #[command(subcommand)]
     command: Command,
@@ -129,16 +129,32 @@ enum Command {
 
     /// Cross-check registry against ERC1967 impl slots.
     Verify,
+
+    /// Compare the format registry of the target tree with the registry
+    /// of the accepted release. Print the findings as a JSON array; the
+    /// deploy role decides by them.
+    Formats {
+        /// The formats.toml of the accepted release.
+        #[arg(long)]
+        base: PathBuf,
+        /// The root of the target tree: the directory that holds its
+        /// formats.toml.
+        #[arg(long)]
+        root: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    let owner = cli
+        .owner
+        .context("this command requires --owner before the subcommand");
 
     match cli.command {
         Command::EnsureFactory { private_key } => {
-            run_ensure_factory(cli.rpc_url, private_key, cli.owner).await
+            run_ensure_factory(cli.rpc_url, private_key, owner?).await
         }
         Command::Deploy {
             private_key,
@@ -161,7 +177,7 @@ async fn main() -> Result<()> {
                     finalization_window,
                 },
             };
-            build_deploy_args(cli.rpc_url, cli.owner, private_key, raw)?
+            build_deploy_args(cli.rpc_url, owner?, private_key, raw)?
                 .run()
                 .await
         }
@@ -175,7 +191,7 @@ async fn main() -> Result<()> {
                 ids: contract_ids,
                 l2_chain_ids,
             }
-            .run(cli.rpc_url, private_key, cli.owner)
+            .run(cli.rpc_url, private_key, owner?)
             .await
         }
         Command::Bootstrap7955Anvil => bootstrap_7955_anvil(cli.rpc_url).await,
@@ -183,8 +199,13 @@ async fn main() -> Result<()> {
             l2_chain_id,
             contract,
             json,
-        } => run_addresses(cli.rpc_url, cli.owner, l2_chain_id, contract, json).await,
-        Command::Verify => run_verify(cli.rpc_url, cli.owner).await,
+        } => run_addresses(cli.rpc_url, owner?, l2_chain_id, contract, json).await,
+        Command::Verify => run_verify(cli.rpc_url, owner?).await,
+        Command::Formats { base, root } => {
+            let findings = FormatGate { base, root }.findings()?;
+            println!("{}", serde_json::to_string(&findings)?);
+            Ok(())
+        }
     }
 }
 
