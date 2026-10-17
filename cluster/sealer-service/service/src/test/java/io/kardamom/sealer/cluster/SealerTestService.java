@@ -128,6 +128,11 @@ final class SealerTestService extends TestNode.TestService {
     }
 
     @Override
+    public int doBackgroundWork(final long nowNs) {
+        return delegate.doBackgroundWork(nowNs);
+    }
+
+    @Override
     public void onTerminate(final Cluster cluster) {
         delegate.onTerminate(cluster);
         super.onTerminate(cluster);

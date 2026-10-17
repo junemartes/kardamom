@@ -71,8 +71,14 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # The egress message kinds of the sealer. The Rust reader drops an unknown
 # kind with a warning. The sealer sends kind 13 (the record-lag reject)
 # only when recordLagBudget is above 0. This release reads kind 15 (the
-# relayed reference) and kind 16 (the feed gap, on the member feed only),
-# and sends neither. No frame uses kind 14: a reader drops it as unknown.
+# relayed reference) and kind 16 (the feed gap, on the member feed only).
+# It sends no kind 15. It sends kind 16 only on the member feed, which is off
+# unless kardamom.cluster.feedAeronDir is set. No frame uses kind 14: a
+# reader drops it as unknown.
+#
+# On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
+# the 17 bytes of the egress layout, then the request id. A reader reads
+# the fields that it knows and ignores the tail.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76

@@ -147,9 +147,19 @@ impl RelayedRef {
     }
 }
 
+/// Frame an answer of the member feed exactly as the Java service does:
+/// `[kind:u8][a:u64][b:u64][request_id:u64]`. The kinds are 3, 4, 11 and 16.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn encode_feed_answer(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
+    let mut frame = encode_kind_2u64(kind, a, b);
+    frame.extend_from_slice(&request_id.to_le_bytes());
+    frame
+}
+
 /// Frame a feed gap exactly as the Java service does.
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
-pub fn encode_feed_gap(next_index: u64, next_block: u64) -> Vec<u8> {
-    encode_kind_2u64(EGRESS_KIND_FEED_GAP, next_index, next_block)
+pub fn encode_feed_gap(next_index: u64, next_block: u64, request_id: u64) -> Vec<u8> {
+    encode_feed_answer(EGRESS_KIND_FEED_GAP, next_index, next_block, request_id)
 }

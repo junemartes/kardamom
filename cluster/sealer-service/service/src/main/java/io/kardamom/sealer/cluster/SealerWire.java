@@ -358,12 +358,28 @@ public final class SealerWire {
         Byte.BYTES + Long.BYTES + CanonicalSealerState.CANONICAL_ID_LEN + Byte.BYTES;
     /**
      * A feed gap, on the member feed only:
-     * {@code [kind:16][next_index:u64 LE][next_block:u64 LE]}: the first
-     * record index and the first block that the feed did not carry. The
-     * cluster egress never sends it. No frame uses kind 14. Matches Rust
-     * {@code EGRESS_KIND_FEED_GAP}.
+     * {@code [kind:16][next_index:u64 LE][next_block:u64 LE][request_id:u64 LE]}.
+     * A replay from {@code (next_index, next_block)} carries every frame
+     * that the feed did not carry. The cluster egress never sends it. No
+     * frame uses kind 14. Matches Rust {@code EGRESS_KIND_FEED_GAP}.
      */
     public static final byte EGRESS_KIND_FEED_GAP = 16;
+    /**
+     * Length of an answer on the member feed: the kinds 3, 4, 11 and 16,
+     * each with the tail {@code [request_id:u64 LE]} of the request it
+     * answers. An egress reader reads the first 17 bytes of kinds 3, 4 and
+     * 11 and ignores the tail.
+     */
+    static final int FEED_ANSWER_LEN = Byte.BYTES + 3 * Long.BYTES;
+    /**
+     * Length of a replay request on the feed control stream:
+     * {@code [kind:1][from_index:u64][from_block:u64][request_id:u64]}.
+     */
+    static final int FEED_REQUEST_LEN = Byte.BYTES + 3 * Long.BYTES;
+    /** The stream id of the member feed, member to executor, over IPC. */
+    static final int FEED_STREAM_ID = 1006;
+    /** The stream id of the feed control, executor to member, over IPC. */
+    static final int FEED_CONTROL_STREAM_ID = 1007;
 
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;

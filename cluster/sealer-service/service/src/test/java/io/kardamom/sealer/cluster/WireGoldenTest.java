@@ -65,9 +65,12 @@ final class WireGoldenTest {
     }
 
     @Test
-    void theRelayedReferenceAndTheFeedGapHaveTheirFixedLengths() {
+    void theRelayedReferenceAndTheFeedAnswersHaveTheirFixedLengths() {
         assertEquals(SealerWire.RELAYED_REF_LEN, golden.get("relayed_ref").length);
-        assertArrayEquals(golden.get("feed_gap"), frames.copy(frames.feedGap(9, 4)));
+        assertArrayEquals(golden.get("feed_gap"), frames.copy(frames.feedGap(9, 4, 7)));
+        assertArrayEquals(golden.get("feed_replay_done"),
+            frames.copy(frames.feedAnswer(SealerWire.EGRESS_KIND_REPLAY_DONE, 9, 4, 7)));
+        assertEquals(SealerWire.FEED_ANSWER_LEN, golden.get("feed_gap").length);
     }
 
     @Test

@@ -259,12 +259,40 @@ final class RetainedFile implements RetainedFrames {
      */
     @Override
     public Stream<byte[]> wanted(final long fromIndex, final long fromBlock) {
-        final long start = Optional.ofNullable(boundaries.get(fromBlock - 1))
-            .map(RetainedSection.Mark::endPos)
-            .orElse(frontPos);
-        return Stream.iterate(start, pos -> pos < headPos, this::next)
+        return Stream.iterate(scanStart(fromBlock), pos -> pos < headPos, this::next)
             .filter(pos -> keyAt(pos).wanted(fromIndex, fromBlock))
             .map(this::frameAt);
+    }
+
+    /**
+     * The position where a replay from {@code fromBlock} starts its scan:
+     * after the retained boundary of the block before it, else the front.
+     */
+    long scanStart(final long fromBlock) {
+        return Optional.ofNullable(boundaries.get(fromBlock - 1))
+            .map(RetainedSection.Mark::endPos)
+            .orElse(frontPos);
+    }
+
+    /** The position of the oldest retained frame. Every record from it to {@link #headPos()} is readable. */
+    long frontPos() {
+        return frontPos;
+    }
+
+    /** The position after the newest frame. */
+    long headPos() {
+        return headPos;
+    }
+
+    /**
+     * Point {@code view} at the frame of the record at {@code pos}, without
+     * a copy. The position is at or above {@link #frontPos()} and below
+     * {@link #headPos()}. The view stays valid until the next purge.
+     */
+    void view(final long pos, final UnsafeBuffer view) {
+        final Segment segment = segmentAt(pos);
+        final int offset = segment.offset(pos);
+        view.wrap(segment.buffer(), offset + LENGTH_PREFIX, segment.buffer().getInt(offset));
     }
 
     private Segment segmentAt(final long pos) {
@@ -277,7 +305,8 @@ final class RetainedFile implements RetainedFrames {
             Byte.BYTES + Long.BYTES));
     }
 
-    private long next(final long pos) {
+    /** The position of the record after the record at {@code pos}. */
+    long next(final long pos) {
         final Segment segment = segmentAt(pos);
         return Math.addExact(pos, LENGTH_PREFIX + segment.buffer().getInt(segment.offset(pos)));
     }

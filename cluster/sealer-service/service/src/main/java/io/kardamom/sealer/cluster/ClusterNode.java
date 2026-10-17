@@ -149,6 +149,13 @@ public final class ClusterNode {
         System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
             .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())
             .orElse(" <off: retained frames on the heap>"));
+        final Optional<FeedConfig> feed = FeedConfig.parse(
+            System.getProperty(FeedConfig.DIR_SETTING),
+            System.getProperty(FeedConfig.RING_SETTING),
+            carryBytes.isPresent());
+        System.out.println("cluster feed memberId=" + memberId + feed
+            .map(f -> " aeronDir=" + f.aeronDir() + " ringBytes=" + f.ringBytes() + " termBytes=" + f.termBytes())
+            .orElse(" <off: no paired executor>"));
 
         // Void voters: the ids of the consumers whose votes remove an entry
         // that no consumer can execute (each executor, the validator, the
@@ -222,6 +229,7 @@ public final class ClusterNode {
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
                 carryBytes.map(CarryBytes::file).ifPresent(service::carryingBytes);
+                feed.ifPresent(service::feeding);
                 snapshotSchedule.ifPresent(service::snapshotEvery);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop));

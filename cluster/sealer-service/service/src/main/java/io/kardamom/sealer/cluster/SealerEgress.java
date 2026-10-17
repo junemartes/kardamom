@@ -94,16 +94,20 @@ final class SealerEgress {
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer();
     /** The frame codec over {@link #egressBuffer}. */
     private final EgressFrames frames = new EgressFrames(egressBuffer);
+    /** The member feed: it carries each retained frame to the paired executor. */
+    private final Feed feed;
 
     SealerEgress(
             final Cluster cluster,
             final int memberId,
             final RetainedFrames retained,
+            final Feed feed,
             final long firstRetainedIndex,
             final long firstRetainedBlock) {
         this.cluster = cluster;
         this.memberId = memberId;
         this.retained = retained;
+        this.feed = feed;
         this.backlogs = new SessionBacklogs(
             memberId, SessionBacklogs.STALL_DEADLINE_NS, SessionBacklogs.BYTE_LIMIT);
         this.firstRetainedIndex = firstRetainedIndex;
@@ -198,35 +202,20 @@ final class SealerEgress {
             final long fromBlock,
             final long upToIndex,
             final long upToBlock) {
-        if (fromIndex > upToIndex || fromBlock > upToBlock) {
-            // A consumer ahead of the head applied records that this member
-            // does not hold, for example after a wipe or a re-seed. A
-            // REPLAY_DONE would let the consumer drop each new record below
-            // its cursor as a duplicate and diverge silently. A repair from
-            // this stream cannot serve it either, so REPLAY_AHEAD carries the
-            // head and stops it.
-            logReplay(session, fromIndex, fromBlock,
-                "AHEAD head=(" + upToIndex + "," + upToBlock + ")");
-            offerControl(session, SealerWire.EGRESS_KIND_REPLAY_AHEAD, upToIndex, upToBlock);
-            return;
-        }
-        final long lowerEnd = retained.boundaryEnd(fromBlock - 1);
-        final long upperEnd = retained.boundaryEnd(fromBlock);
-        if (!cursorInsideBlock(fromIndex, lowerEnd, upperEnd)) {
-            // A consumer resumes at a record index and a block number. The
-            // two select frames on separate axes, so a pair that does not
-            // name one point of the stream skips records, or applies them
-            // twice, and no consumer-side check can see it: the consumer
-            // seeds every counter from the same cursor. This member holds
-            // the boundaries, so it is the one place that can refuse.
-            refuseReplay(session, fromIndex, fromBlock,
-                "SKEWED block " + fromBlock + " spans (" + lowerEnd + "," + upperEnd + ")");
-            return;
-        }
-        if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
-            refuseReplay(session, fromIndex, fromBlock,
-                "UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
-            return;
+        final ReplayVerdict verdict = replayVerdict(fromIndex, fromBlock, upToIndex, upToBlock);
+        switch (verdict.kind()) {
+            case AHEAD -> {
+                logReplay(session, fromIndex, fromBlock, verdict.reason());
+                offerControl(session, SealerWire.EGRESS_KIND_REPLAY_AHEAD, upToIndex, upToBlock);
+                return;
+            }
+            case REFUSED -> {
+                refuseReplay(session, fromIndex, fromBlock, verdict.reason());
+                return;
+            }
+            case SERVE -> {
+                // The retained frames follow.
+            }
         }
         // Count each outcome apart. A dropped replay must not look the same
         // as a served one in these logs.
@@ -243,6 +232,42 @@ final class SealerEgress {
             + " dropped=" + outcomes.getOrDefault(SessionBacklogs.Outcome.DROPPED, 0L)
             + " retained=" + retained.count());
         offerControl(session, SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock);
+    }
+
+    /**
+     * The answer to a replay request from {@code (fromIndex, fromBlock)},
+     * with {@code (upToIndex, upToBlock)} as the head: the canonical count
+     * and the open block.
+     */
+    ReplayVerdict replayVerdict(
+            final long fromIndex, final long fromBlock, final long upToIndex, final long upToBlock) {
+        if (fromIndex > upToIndex || fromBlock > upToBlock) {
+            // A consumer ahead of the head applied records that this member
+            // does not hold, for example after a wipe or a re-seed. A
+            // REPLAY_DONE would let the consumer drop each new record below
+            // its cursor as a duplicate and diverge silently. A repair from
+            // this stream cannot serve it either, so REPLAY_AHEAD carries the
+            // head and stops it.
+            return new ReplayVerdict(ReplayVerdict.Kind.AHEAD,
+                "AHEAD head=(" + upToIndex + "," + upToBlock + ")");
+        }
+        final long lowerEnd = retained.boundaryEnd(fromBlock - 1);
+        final long upperEnd = retained.boundaryEnd(fromBlock);
+        if (!cursorInsideBlock(fromIndex, lowerEnd, upperEnd)) {
+            // A consumer resumes at a record index and a block number. The
+            // two select frames on separate axes, so a pair that does not
+            // name one point of the stream skips records, or applies them
+            // twice, and no consumer-side check can see it: the consumer
+            // seeds every counter from the same cursor. This member holds
+            // the boundaries, so it is the one place that can refuse.
+            return new ReplayVerdict(ReplayVerdict.Kind.REFUSED,
+                "SKEWED block " + fromBlock + " spans (" + lowerEnd + "," + upperEnd + ")");
+        }
+        if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
+            return new ReplayVerdict(ReplayVerdict.Kind.REFUSED,
+                "UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
+        }
+        return ReplayVerdict.SERVE;
     }
 
     /**
@@ -380,12 +405,13 @@ final class SealerEgress {
 
     /**
      * Retain the frame staged in {@link #egressBuffer} for future replays,
-     * and return the array to offer. A retained array never changes. The
-     * window is pruned after the add: a frame leaves only when it is past
-     * the window and its block is posted.
+     * hand it to the member feed, and return the array to offer. A retained
+     * array never changes. The window is pruned after the add: a frame
+     * leaves only when it is past the window and its block is posted.
      */
     private byte[] retain(final int length) {
         final byte[] frame = retained.append(egressBuffer, length);
+        feed.onFrame(egressBuffer, length);
         prune();
         return frame;
     }

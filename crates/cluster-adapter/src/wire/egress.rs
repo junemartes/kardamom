@@ -38,8 +38,13 @@ pub enum EgressItem {
     /// The index and the id of a canonical entry, without its bytes.
     RelayedRef(RelayedRef),
     /// The member feed dropped frames from this record index and block on.
-    /// Ask for a replay from the cursor.
-    FeedGap { next_index: u64, next_block: u64 },
+    /// Ask for a replay from the cursor. `request_id` names the request
+    /// whose answer the gap ends.
+    FeedGap {
+        next_index: u64,
+        next_block: u64,
+        request_id: u64,
+    },
     /// A generated block boundary.
     Boundary(BlockBoundaryStart),
     /// Replay refused: the requested range predates the service's retention.
@@ -156,6 +161,7 @@ impl EgressItem {
             super::EGRESS_KIND_FEED_GAP => Ok(Self::FeedGap {
                 next_index: rd_u64(buf, 1)?,
                 next_block: rd_u64(buf, 9)?,
+                request_id: rd_u64(buf, 17)?,
             }),
             other => Err(WireError::BadEgressKind(other)),
         }
