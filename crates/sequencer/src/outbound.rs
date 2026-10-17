@@ -19,9 +19,7 @@
 //! `tx_errors` channel ([`SideChannelPublisher`]) when an inbound
 //! transaction fails the nonce gate (today: past-nonce or duplicate; more
 //! variants may come later). Ingress reads that channel and releases the
-//! parked client right away with a JSON-RPC error. The same port carries
-//! the `tx_status` stream: an `Offered` status for every ref the
-//! sequencer offers, and a `Rejected` status next to every error.
+//! parked client right away with a JSON-RPC error.
 //!
 //! All surfaces are traits, so unit tests can use the in-memory fakes (no
 //! Aeron media driver needed). Production wiring binds them to the real
@@ -30,9 +28,9 @@
 pub mod cluster;
 
 use kardamom_cluster_adapter::wire::GuardHeader;
-use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
+use kardamom_log::aeron_live::TxErrorsPublisherHandle;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
+use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
@@ -112,36 +110,27 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
-/// The side channels: `tx_errors` and `tx_status`. Both are best effort.
-/// The caller logs a failure and does not propagate it. The canonical
-/// state has already advanced, or the inbound transaction was rejected,
-/// so there is nothing to roll back.
+/// The side channel: `tx_errors`. It is best effort. The caller logs a
+/// failure and does not propagate it. The canonical state has already
+/// advanced, or the inbound transaction was rejected, so there is nothing
+/// to roll back.
 pub trait SideChannelPublisher: Send {
     fn publish_error(&mut self, e: TxError);
-    fn publish_status(&mut self, s: TxStatus);
 }
 
-/// The live side channels. The sequencer publishes rejections on the
+/// The live side channel. The sequencer publishes rejections on the
 /// `tx_errors` Aeron channel, which the ingress reads to release parked
-/// clients early, and statuses on the `tx_status` channel, which the
-/// notifier reads. A publish failure is logged and dropped: the canonical
+/// clients early. A publish failure is logged and dropped: the canonical
 /// state has already advanced, or the transaction was rejected, so there
 /// is nothing to roll back.
 pub struct SideChannels {
     pub errors: TxErrorsPublisherHandle,
-    pub status: TxStatusPublisherHandle,
 }
 
 impl SideChannelPublisher for SideChannels {
     fn publish_error(&mut self, e: TxError) {
         if let Err(err) = self.errors.publish(&e) {
             tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
-        }
-    }
-
-    fn publish_status(&mut self, s: TxStatus) {
-        if let Err(err) = self.status.publish_best_effort(&s) {
-            tracing::warn!(error = %err, "tx_status publish failed (dropped)");
         }
     }
 }
@@ -155,7 +144,7 @@ pub mod fakes {
     use std::sync::{Arc, Mutex};
 
     use kardamom_types::xchain::RemoteEpochRecord;
-    use kardamom_types::{EpochRecord, TxRef, TxStatus};
+    use kardamom_types::{EpochRecord, TxRef};
 
     use super::{RefOffer, SequencerError, SideChannelPublisher, TxError, TxOrderingRefPublisher};
 
@@ -219,21 +208,15 @@ pub mod fakes {
         }
     }
 
-    /// In-memory side channels. Records every error and every status in
-    /// arrival order.
+    /// In-memory side channel. Records every error in arrival order.
     #[derive(Default, Clone)]
     pub struct InMemorySidePublisher {
         pub errors: Arc<Mutex<Vec<TxError>>>,
-        pub statuses: Arc<Mutex<Vec<TxStatus>>>,
     }
 
     impl SideChannelPublisher for InMemorySidePublisher {
         fn publish_error(&mut self, e: TxError) {
             self.errors.lock().unwrap().push(e);
-        }
-
-        fn publish_status(&mut self, s: TxStatus) {
-            self.statuses.lock().unwrap().push(s);
         }
     }
 }
@@ -280,17 +263,14 @@ mod tests {
     }
 
     #[test]
-    fn fake_side_channels_record_errors_and_statuses() {
+    fn fake_side_channel_records_errors() {
         let mut p = InMemorySidePublisher::default();
-        let error = TxError {
+        p.publish_error(TxError {
             sender: Address::repeat_byte(0xAB),
             nonce: 7,
             reason: TxErrorReason::DuplicatedTx { expected_nonce: 10 },
-        };
-        p.publish_status(TxStatus::rejected(B256::repeat_byte(0x01), &error));
-        p.publish_error(error);
+        });
         assert_eq!(p.errors.lock().unwrap().len(), 1);
-        assert_eq!(p.statuses.lock().unwrap().len(), 1);
     }
 
     fn test_epoch(n: u64) -> EpochRecord {

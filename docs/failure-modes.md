@@ -1191,15 +1191,10 @@ A file that exists but does not read or parse raises the `l1_cursor_unreadable` 
 
 ## Notifier
 
-The notifier is off the hot path by construction. It reads `tx_status`, `tx_receipts` and `tx_errors` as one more multi-destination-cast subscriber. A dead or slow notifier costs its own clients and nothing else.
+Kardamom has no notifier service. Issue #640 records the removal of the service, its WebSocket status feed (`kardamom_subscribeTxStatus`) and its webhooks. A separate notification publisher does not fit the 50 ms target from submit to receipt.
 
-- The `tx_status` publishers (sequencer, ingress) offer on a best-effort basis and never block.
-- A back-pressured frame is dropped after a bounded retry. The drop counts in `kardamom_log_best_effort_dropped_total{stream_id="1018"}`.
-- The receipt stream stays the truth. A client that misses a status reads the receipt.
-- A restart loses the in-memory ring. A WebSocket client that reconnects replays what the new ring holds.
-- Webhook subscriptions and their outboxes live on disk. A restart resumes delivery from the persisted cursor, at least once.
-- The two instances shard subscriptions by a rendezvous hash of the id. Both store every registration. The shard of a lost instance moves to the twin when the instance count changes.
-- The `Sealed` stage needs an egress channel on the ingress. See [`tx-status-events.md`](tx-status-events.md) for the API, the settings and the metrics.
+- The `tx_status` stream (id 1018) has no publisher and no reader. The id stays reserved.
+- A client follows a transaction through the ingress. See [Transaction status](json-rpc.md#transaction-status).
 
 ## Transaction canary
 

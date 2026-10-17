@@ -1,6 +1,6 @@
 # Transaction status events for clients
 
-Status: designed, not built.
+Status: built, then removed (issue #640). A separate notification publisher does not fit the 50 ms target from submit to receipt. The design below is a record. For the client API of today, see [Transaction status](../json-rpc.md#transaction-status).
 
 ## 1. Problem
 

@@ -77,7 +77,7 @@ pub fn bin(name: &str) -> Result<ExistingFile> {
         bin_dir()?.join(name),
         "build the service binaries first: `cargo build --bins -p kardamom-ingress \
          -p kardamom-sequencer -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-notifier -p kardamom-canary` (or just \
+         -p kardamom-da-watcher -p kardamom-l1-indexer -p kardamom-reconstruct -p kardamom-canary` (or just \
          `just test-e2e-local`)",
     )
 }

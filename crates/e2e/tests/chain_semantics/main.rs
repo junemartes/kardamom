@@ -29,7 +29,7 @@ use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
     account_layer, bridge, canary, consistency, crash_recovery, da_parity, derivation, divergence,
     fees, nonce_gap, nonce_unordered, resize, rpc_liveness, rpc_vectors, sequencer_restart,
-    tx_status, upgrade,
+    upgrade,
 };
 
 /// The two pending-receipt park bounds every tuned-park test in this

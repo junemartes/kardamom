@@ -124,12 +124,10 @@ impl Sequencer {
     }
 
     /// One sealer refusal (past its deadline, on a DA lag, or on a record
-    /// lag), for [`Self::apply_deadline_rejects`]'s loop. The ledger entry
-    /// carries the transaction's hash, so the `Rejected` status goes out
-    /// with the error. An entry a receipt or a rewind already took gets
-    /// the error only.
+    /// lag), for [`Self::apply_deadline_rejects`]'s loop. The client gets
+    /// the error also when a receipt or a rewind already took the entry.
     fn report_refusal<P: SequencerPorts>(&mut self, ports: &mut P, refusal: SealerRefusal) {
-        let tx_hash = self.take_refused(&refusal).map(|meta| meta.tx_hash);
+        self.take_refused(&refusal);
         warn!(
             sender = ?refusal.sender,
             nonce = refusal.nonce,
@@ -142,36 +140,34 @@ impl Sequencer {
             reason: refusal.reason,
         };
         let (_, _, rc) = ports.split();
-        match tx_hash {
-            Some(tx_hash) => self.publish_rejection(rc, tx_hash, err),
-            None => self.publish_error(rc, err),
-        }
+        self.publish_error(rc, err);
     }
 
     /// Take the refused ref out of the ledger, or out of the buffer when
     /// a freed nonce parked it there, so it never publishes. Mark the
     /// nonce for the resubmit. The floor stays: the sealer also refuses a
     /// late copy of a ref it ordered long ago. See
-    /// [`crate::state::PartitionState::mark_refused`]. Returns the ref's
-    /// metadata.
+    /// [`crate::state::PartitionState::mark_refused`].
     ///
     /// Only the copy the refusal names leaves, so a resubmit that replaced
     /// it survives a late refusal. A rebuffered ref stays too: it waits on
     /// the publisher, the sealer refuses its republish again, and that
     /// refusal finds it in the ledger.
-    fn take_refused(&mut self, refusal: &SealerRefusal) -> Option<RefMetadata> {
+    fn take_refused(&mut self, refusal: &SealerRefusal) {
         let SealerRefusal {
             sender,
             nonce,
             reason,
         } = refusal;
         let named = |meta: &RefMetadata| meta.named_by(reason);
-        let refused = self
+        let taken = self
             .unconfirmed
             .take_named(*sender, *nonce, named)
-            .or_else(|| self.state.take_parked(*sender, *nonce, named))?;
-        self.state.mark_refused(*sender, *nonce);
-        Some(refused)
+            .or_else(|| self.state.take_parked(*sender, *nonce, named))
+            .is_some();
+        if taken {
+            self.state.mark_refused(*sender, *nonce);
+        }
     }
 
     /// One contiguity reject below the expected nonce, for

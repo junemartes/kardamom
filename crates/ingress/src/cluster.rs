@@ -10,15 +10,15 @@
 //! boundary observed is the durable canonical count that the `on-quorum`
 //! gate releases parked submits against.
 //!
-//! The same tap is the `Sealed` publisher of the status stream: every
-//! relayed `TxRef` names the transaction the sealer gave a canonical index.
-//! The ingress decodes these frames already, so it reports the sealed
-//! hash next to the durable position and never touches the sealer.
+//! The same tap times the seal of each transaction: every relayed `TxRef`
+//! names the transaction the sealer gave a canonical index. The ingress
+//! decodes these frames already, so it reports the sealed hash next to
+//! the durable position and never touches the sealer.
 //!
 //! The bin runs [`ClusterWatermarkObserver::next_event`] on a dedicated
 //! OS thread, because egress `recv()` blocks. It forwards each durable
 //! count into the proxy's watermark broadcast bus as a `QuorumWatermark`,
-//! each sealed hash onto `tx_status`, and each cluster status (the posted
+//! each sealed hash into the seal clock, and each cluster status (the posted
 //! head, the DA-lag flag, the retention floors) into the proxy's status
 //! channel. The observer exports the record-lag gauges of each status
 //! itself: the lag needs the durable count that only it holds.

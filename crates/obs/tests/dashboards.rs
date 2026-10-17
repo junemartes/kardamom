@@ -13,7 +13,6 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-executor",
     "kardamom-da-watcher",
     "kardamom-ingress",
-    "kardamom-notifier",
     "kardamom-validator",
     "kardamom-state-mirror",
     "kardamom-l1-follower",

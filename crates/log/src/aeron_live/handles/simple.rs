@@ -1,5 +1,5 @@
 //! The structurally identical single-stream handle pairs: `TxErrors`,
-//! `TxStatus`, `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
+//! `TxDeposits`, `TxRemoteEpochs`, `ServiceEvents`, `ExecTxs`,
 //! `L1Blocks`, `FsyncWatermark`. Each is a publisher
 //! wrapping one [`PubHandle`] plus a subscriber wrapping one typed receiver, differing
 //! only in message type, channel/stream selection, and the publisher's
@@ -15,9 +15,7 @@ use crate::discovery::plane::{DiscoveredPublisher, DiscoveredSubscriber};
 use crate::error::LogError;
 use kardamom_types::service::ServiceEvent;
 use kardamom_types::xchain::RemoteEpochRecord;
-use kardamom_types::{
-    BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, L1Block, TxError, TxStatus,
-};
+use kardamom_types::{BPosition, EpochRecord, ExecTxRecord, FsyncWatermark, L1Block, TxError};
 
 /// Name the discovery topic and stream of one single-stream handle pair,
 /// so [`crate::discovery::StreamPlane`] can open it either way.
@@ -250,26 +248,6 @@ declare_channel_handles! {
 }
 
 declare_channel_handles! {
-    /// `TxStatus` publisher (sequencer and ingress → notifier).
-    publisher TxStatusPublisherHandle {
-        /// Fire-and-forget publish: the Aeron thread retries a
-        /// back-pressured offer for a bounded time, then drops the frame
-        /// and counts it. The hot path never waits for a status reader.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error if `s` fails to encode.
-        pub fn publish_best_effort(&self, s: &TxStatus) -> Result<(), LogError> {
-            self.inner.publish_best_effort(crate::codec::encode(s)?);
-            Ok(())
-        }
-    }
-    /// `TxStatus` subscriber (sequencer and ingress → notifier).
-    subscriber TxStatusSubscriberHandle(TxStatus);
-    open(ch) = (ch.tx_status_channel, ch.tx_status_stream_id);
-}
-
-declare_channel_handles! {
     /// `TxDeposits` publisher (DA watcher → sequencer).
     publisher TxDepositsPublisherHandle {
         /// # Errors
@@ -393,13 +371,6 @@ discoverable!(
     TxError,
     Topic::TxErrors,
     tx_errors_stream_id
-);
-discoverable!(
-    TxStatusPublisherHandle,
-    TxStatusSubscriberHandle,
-    TxStatus,
-    Topic::TxStatus,
-    tx_status_stream_id
 );
 discoverable!(
     TxDepositsPublisherHandle,

@@ -28,7 +28,6 @@ The `[channels]` section of `LogConfig` names the channels. Every default is an 
 | `TxData` (one per sequencer lane) | Ingress | Full `TxEnvelope` bytes. Recorded by the archive of each ingress node. |
 | `TxReceipts` and its boundary stream | Executor | Receipts and block boundaries. RAM only. With `tx_receipts_control_channel` set, the receipts use a multi-destination fan-in: each executor replica has its own UDP endpoint. |
 | `TxErrors` | Sequencer | Rejection signals. RAM only. |
-| `TxStatus` | Sequencer, ingress | One record for each step of a transaction. Best effort. RAM only. |
 | `TxDeposits` | DA watcher | Full `Deposit` envelopes. Recorded by the archive of the DA watcher node. |
 | `TxRemoteEpochs` | Interop watcher | One record for each peer-chain origin block with cross-chain messages. RAM only. |
 | `TxBal` | Executor | The block access list (`BlockDelta`) of each block. RAM only. |

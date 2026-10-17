@@ -16,7 +16,7 @@ use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::{BPosition, TxDataLoc, TxEnvelope, TxError, TxRef, TxStatus};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope, TxError, TxRef};
 
 use crate::config::SequencerConfig;
 use crate::error::SequencerError;
@@ -134,7 +134,7 @@ pub fn pos(offset: i32) -> BPosition {
 
 /// The three fakes a [`Sequencer`] drives against in every test:
 /// scripted `tx_data` in, in-memory `tx_ordering` refs and the side
-/// channels (`tx_errors`, `tx_status`) out. Building one `Rig` and calling [`Self::step`] (or, for the `run`
+/// channel (`tx_errors`) out. Building one `Rig` and calling [`Self::step`] (or, for the `run`
 /// callers, [`Self::ports`]) replaces the `seq.run_once(&mut Ports {
 /// tx_data: &mut a, refs: &mut b, errors: &mut rc })` shape repeated
 /// across this crate's tests and its throughput bench.
@@ -204,16 +204,6 @@ impl Rig {
     #[must_use]
     pub fn errors(&self) -> Vec<TxError> {
         self.errors.errors.lock().unwrap().clone()
-    }
-
-    /// Every status the sequencer published, in arrival order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the statuses mutex is poisoned.
-    #[must_use]
-    pub fn statuses(&self) -> Vec<TxStatus> {
-        self.errors.statuses.lock().unwrap().clone()
     }
 }
 

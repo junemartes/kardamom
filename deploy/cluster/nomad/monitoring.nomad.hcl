@@ -119,9 +119,6 @@ locals {
       - job_name: kardamom-l1-indexer
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-l1-indexer-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
-      - job_name: kardamom-notifier
-        static_configs:
-          - targets: [{{ range $i, $s := service "kardamom-notifier-metrics|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
       - job_name: kardamom-canary
         static_configs:
           - targets: [{{ range $i, $s := service "kardamom-canary|any" }}{{ if $i }}, {{ end }}"{{ $s.Node }}.node.${local.dc}.consul:{{ $s.Port }}"{{ end }}]
@@ -169,7 +166,7 @@ locals {
   dashboards = [
     "kardamom-overview", "kardamom-ingress", "kardamom-sequencer",
     "kardamom-executor", "kardamom-sealer", "kardamom-batcher", "kardamom-da-watcher",
-    "kardamom-validator", "kardamom-state-mirror", "kardamom-notifier",
+    "kardamom-validator", "kardamom-state-mirror",
     "kardamom-chain-status", "kardamom-hosts", "kardamom-nomad", "kardamom-aeron",
     "kardamom-da",
     "kardamom-l1-follower",

@@ -16,7 +16,7 @@ use crate::stages::{head_lines, matching_lines, tail_lines};
 
 mod exits;
 
-const JOBS: [&str; 17] = [
+const JOBS: [&str; 16] = [
     "aeron",
     "anvil",
     "cluster",
@@ -31,7 +31,6 @@ const JOBS: [&str; 17] = [
     "l1-indexer",
     "redis",
     "state-mirror",
-    "notifier",
     "canary",
     "monitoring",
 ];
@@ -59,7 +58,6 @@ const LIFECYCLE_MARKERS: &[&str] = &[
     "cluster egress silent",
     "RESYNC",
     "kardamom-state-mirror starting",
-    "kardamom-notifier starting",
     "rebuild:",
 ];
 const LIFECYCLE_EVENTS: usize = 60;

@@ -81,7 +81,6 @@ pub use shard_map::{ShardMap, ShardMapError, vslot_for};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
-pub use tx_status::{TxStage, TxStageKind, TxStatus};
 pub use txref::TxRef;
 pub use upgrades::{CHAIN_STATE, SYSTEM_UPGRADER, encode_set_feature};
 pub use void::VoidRecord;
