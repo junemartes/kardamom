@@ -365,8 +365,11 @@ fn latest_picks_highest_block_and_prune_trims() {
         7
     );
 
-    // Prune everything before block 7. This removes the block-3 checkpoint.
-    assert_eq!(prune_checkpoints(ckpt_dir.path(), 7).unwrap(), 1);
+    // Keep only the newest checkpoint. This removes the block-3 checkpoint.
+    assert_eq!(
+        prune_checkpoints(ckpt_dir.path(), NonZeroUsize::MIN).unwrap(),
+        1
+    );
     assert_eq!(
         latest_checkpoint(ckpt_dir.path(), BlockRange::ANY)
             .unwrap()
@@ -374,6 +377,63 @@ fn latest_picks_highest_block_and_prune_trims() {
             .block,
         7
     );
+}
+
+/// One prune case: checkpoints at `blocks`, a prune that keeps `keep`,
+/// and the blocks that must stay.
+struct PruneCase {
+    blocks: &'static [u64],
+    keep: usize,
+    stays: &'static [u64],
+}
+
+impl PruneCase {
+    /// Prunes empty checkpoint directories. The prune reads only the
+    /// names, so the images need no mdbx content.
+    fn check(&self) {
+        let dir = tempfile::tempdir().unwrap();
+        self.blocks
+            .iter()
+            .for_each(|b| std::fs::create_dir(dir.path().join(checkpoint_name(*b))).unwrap());
+        let keep = NonZeroUsize::new(self.keep).unwrap();
+        let removed = prune_checkpoints(dir.path(), keep).unwrap();
+        let mut stays: Vec<u64> = checkpoints_newest_first(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.block)
+            .collect();
+        stays.sort_unstable();
+        assert_eq!(stays, self.stays, "keep {}", self.keep);
+        assert_eq!(removed, self.blocks.len() - self.stays.len());
+    }
+}
+
+#[test]
+fn prune_keeps_the_newest_checkpoints_whatever_the_block_spacing() {
+    [
+        PruneCase {
+            blocks: &[10, 20, 30, 40],
+            keep: 3,
+            stays: &[20, 30, 40],
+        },
+        PruneCase {
+            blocks: &[10, 20, 30, 40],
+            keep: 1,
+            stays: &[40],
+        },
+        PruneCase {
+            blocks: &[10, 20],
+            keep: 3,
+            stays: &[10, 20],
+        },
+        PruneCase {
+            blocks: &[],
+            keep: 3,
+            stays: &[],
+        },
+    ]
+    .iter()
+    .for_each(PruneCase::check);
 }
 
 #[test]

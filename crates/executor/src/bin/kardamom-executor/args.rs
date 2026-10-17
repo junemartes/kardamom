@@ -10,7 +10,7 @@ use clap::Parser;
 use kardamom_engine::bin_support::StateDurabilityArg;
 
 /// Default `--checkpoint-keep`.
-const DEFAULT_CHECKPOINT_KEEP: NonZeroU64 = NonZeroU64::new(3).unwrap();
+const DEFAULT_CHECKPOINT_KEEP: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 
 /// Default `--rollback-compare-blocks`: about one minute of 2 s blocks. A
 /// power loss on a majority of the members loses about 1 s of entries.
@@ -172,10 +172,13 @@ pub(crate) struct Args {
     /// checkpoint creation (restore-only). Ignored unless `checkpoint_dir` is set.
     #[arg(long, default_value = "0")]
     pub(crate) checkpoint_interval_secs: CheckpointInterval,
-    /// Number of recent checkpoints to retain (older ones are pruned).
-    /// Non-zero: keeping 0 checkpoints defeats the feature.
+    /// Number of newest checkpoints to keep. Each checkpoint round
+    /// deletes all older checkpoints, whatever their block spacing. The
+    /// oldest kept checkpoint is at least (`--checkpoint-keep` - 1) times
+    /// `--checkpoint-interval-secs` behind the newest one. Non-zero: with
+    /// 0 checkpoints, no restore is possible.
     #[arg(long, default_value_t = DEFAULT_CHECKPOINT_KEEP)]
-    pub(crate) checkpoint_keep: NonZeroU64,
+    pub(crate) checkpoint_keep: NonZeroUsize,
     /// TCP address that serves this node's newest checkpoint to peer
     /// executors (`GET /checkpoint/latest`). Replicas are deterministic
     /// state machines, so any replica's checkpoint is a valid restore

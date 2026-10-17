@@ -44,7 +44,7 @@ use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::B256;
@@ -353,15 +353,20 @@ fn clear_dir(dir: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Delete every checkpoint older than the `keep_from` block, and keep
-/// newer ones. Returns how many were removed. This bounds checkpoint
-/// disk use.
+/// Delete every checkpoint except the newest `keep`, whatever their
+/// block spacing. Returns how many were removed. This bounds checkpoint
+/// disk use, and keeps `keep` restore points for a rollback.
 ///
 /// # Errors
 ///
 /// Returns [`StateError`] if the directory listing or a removal fails.
-pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize, StateError> {
-    BlockRange::below(keep_from).map_or(Ok(0), |old| remove_checkpoints(checkpoints_dir, old))
+pub fn prune_checkpoints(checkpoints_dir: &Path, keep: NonZeroUsize) -> Result<usize, StateError> {
+    checkpoints_newest_first(checkpoints_dir)?
+        .into_iter()
+        .skip(keep.get())
+        .try_fold(0usize, |removed, ckpt| {
+            CheckpointInfo::retire(&ckpt.path).map(|()| removed + 1)
+        })
 }
 
 /// Delete every checkpoint whose block is in `range`. Returns how many were
