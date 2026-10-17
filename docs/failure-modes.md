@@ -459,7 +459,12 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **Wedged executor**
   - Trigger: the block gauge of an executor is flat while the sealer boundaries keep advancing.
   - Effect: this contrast is the FROZEN verdict of the load harness. It tells a wedged replica from a quiescent chain. Absolute progress does not.
-- **Leader failover above the executor** is invisible. The cluster client hides reconnects from the reader thread.
+- **Leader failover above the executor** does not reach the exec thread. The cluster client re-establishes the session and sends `REPLAY_FROM` from the delivery cursor. The reader merges the replay with the live frames.
+- **Live records ahead of the replay after a new session**
+  - Trigger: a session opens again, for example after a quorum loss or a back-pressure close. The client announces the session before it sends `REPLAY_FROM`, so live frames can arrive before the replayed frames. The first live record can have exactly the next index, and the boundary of the open block then arrives only in the replay.
+  - Danger: the exec thread takes a receipt's block number from its own block counter, which moves only at a boundary. A record delivered before a boundary that precedes it executes in the wrong block. The executor streams its receipt before the block is durable, and the ingress keeps the first copy of each receipt. So the wrong block number reaches clients. The state stays correct: the reader fail-stops when the late boundary seals below its delivery cursor, and the restart re-executes from the durable cursor.
+  - Rule: the session thread counts each session start before it forwards a frame of the new session. On a new count, the reader enters catch-up. It delivers a record only after the boundary that closes the block proves the record's place, and it holds the rest until `REPLAY_DONE`. A receipt's block number is correct, and a re-published receipt equals the first copy, only while this rule holds.
+  - Proof: `a_new_session_holds_its_live_records_until_the_replay_is_done` in `crates/engine/src/reader/cluster/tests.rs`. The case `cluster-quorum-loss-recover` gave the order in CI: executor-2 executed 256 records of later blocks as block 1427, and the load check saw one receipt in the wrong block.
 
 ### The executor stream: the executor records what it joins
 

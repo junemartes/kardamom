@@ -271,6 +271,27 @@ fn late_boundary_sealing_below_cursor_is_fatal() {
     ));
 }
 
+/// The order of a reconnect in CI: the new session gets live records
+/// before its replay, and the first one has exactly the next index. The
+/// replayed boundary b1(end=2) precedes them. A new session puts the
+/// subscription into catch-up, so it holds the records until b1 is
+/// delivered and the replay is done. No record reaches the executor in the
+/// wrong block.
+#[test]
+fn a_new_session_holds_its_live_records_until_the_replay_is_done() {
+    let egress = FakeEgress::new();
+    egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
+    egress.push(encode_egress_record(3, &relayed_txref(1, 3)).unwrap());
+    egress.push(encode_egress_boundary(1, 2, 1_000, 0));
+    egress.push(wire::encode_replay_done(4, 2));
+    egress.close();
+    let cursor = ReplayCursor::new(2, 1);
+    cursor.session_starts.fetch_add(1, Ordering::Release);
+    let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, cursor);
+    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
+    assert_eq!(got, vec!["b1", "r2", "r3"]);
+}
+
 #[test]
 fn malformed_frame_is_skipped_not_fatal() {
     let egress = FakeEgress::new();

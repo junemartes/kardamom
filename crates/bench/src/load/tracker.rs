@@ -47,6 +47,13 @@ impl ReceiptStatus {
         })
     }
 
+    /// Whether this is the executor's skip receipt: status 0 and no gas.
+    /// A skip does not spend the nonce, so the nonce can land again in a
+    /// later block. A real execution always charges intrinsic gas.
+    fn is_skip(&self) -> bool {
+        self.status == 0 && self.gas == 0
+    }
+
     /// A successful receipt with no sender or block, for a test that
     /// only counts.
     #[cfg(test)]
@@ -421,7 +428,8 @@ impl Tracker {
     /// Why `receipt` cannot be the receipt of `hash`: it names another
     /// sender, it names no block, or its block is out of order with the
     /// sender's other nonces. `None` for a receipt that fits, or for a
-    /// hash with no expectation.
+    /// hash with no expectation. A skip receipt does not take a place in
+    /// the nonce order, because its nonce stays unspent.
     fn contradiction(&self, hash: B256, receipt: &ReceiptStatus) -> Option<String> {
         let e = *self.expected.get(&hash)?;
         if receipt.from != Some(e.sender) {
@@ -436,6 +444,9 @@ impl Tracker {
                 e.sender, e.nonce
             ));
         };
+        if receipt.is_skip() {
+            return None;
+        }
         let (nonce, other) = lock(&self.placement).place(e, block)?;
         Some(format!(
             "sender {} nonce {} in block {block}, but nonce {nonce} in block {other}",
@@ -532,6 +543,22 @@ mod tests {
             1,
             "one block holds both nonces"
         );
+    }
+
+    #[test]
+    fn a_skip_receipt_takes_no_place_in_the_nonce_order() {
+        let (tracker, signers, hash) = expecting();
+        let latency = Duration::from_millis(1);
+        let me = signers[0].address;
+        let skip = ReceiptStatus {
+            status: 0,
+            gas: 0,
+            ..mined(me, 9)
+        };
+        tracker.confirm(hash(0, 0), &skip, latency);
+        tracker.confirm(hash(0, 1), &mined(me, 7), latency);
+        let c = tracker.counts();
+        assert_eq!((c.bad_status, c.bad_receipt), (1, 0));
     }
 
     #[test]
