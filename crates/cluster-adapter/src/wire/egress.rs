@@ -23,7 +23,8 @@ use super::{
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, FEED_ANSWER_LEN, FEED_REQUEST_ID_OFFSET,
     RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX, RT_TX_OFFER, RT_TXREF, RT_VOID,
     RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN, STATUS_RETAINED_BYTES_OFFSET,
-    STATUS_WITH_RETAINED_BYTES_LEN, WireError, rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    STATUS_WITH_RETAINED_BYTES_LEN, WireError, rd_i32, rd_i64, rd_len, rd_slice, rd_u8, rd_u64,
+    too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -69,9 +70,15 @@ pub enum EgressItem {
         head_block: u64,
         request_id: Option<u64>,
     },
-    /// A new session starts. Every later frame belongs to the new session.
-    /// The session thread makes this item; the sealer never sends it.
-    SessionStart,
+    /// The sealer's rules on the session `session_id`: its decision version.
+    SealerInfo {
+        decision_version: u8,
+        session_id: i64,
+    },
+    /// The session `session_id` starts. Every later frame belongs to the new
+    /// session. The session thread makes this item; the sealer never sends
+    /// it.
+    SessionStart { session_id: i64 },
     /// Contiguity reject. The service refused to seal `sender`'s ref at
     /// `nonce`, because it expected `expected`. Republish from `expected`:
     /// the unconfirmed ledger holds the missing refs.
@@ -177,7 +184,13 @@ impl EgressItem {
             }),
             super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
             super::EGRESS_KIND_RELAYED_REF => RelayedRef::parse(buf).map(Self::RelayedRef),
-            super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart),
+            super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart {
+                session_id: rd_i64(buf, 1)?,
+            }),
+            super::EGRESS_KIND_SEALER_INFO => Ok(Self::SealerInfo {
+                decision_version: rd_u8(buf, 1)?,
+                session_id: rd_i64(buf, 2)?,
+            }),
             super::EGRESS_KIND_FEED_GAP => Ok(Self::FeedGap {
                 next_index: rd_u64(buf, 1)?,
                 next_block: rd_u64(buf, 9)?,

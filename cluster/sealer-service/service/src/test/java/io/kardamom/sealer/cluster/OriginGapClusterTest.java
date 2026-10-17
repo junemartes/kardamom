@@ -89,8 +89,11 @@ class OriginGapClusterTest {
         }
     }
 
+    /** The relayed tail of a test epoch: the epoch record type and no fields. */
+    private static final byte[] EPOCH_TYPE = {2};
+
     private static long offerOnce(final AeronCluster client, final long origin) {
-        final byte[] frame = originRecordFrame(canonicalId((int) origin), origin, 1, new byte[0]);
+        final byte[] frame = originRecordFrame(canonicalId((int) origin), origin, 1, EPOCH_TYPE);
         return client.offer(new UnsafeBuffer(frame), 0, frame.length);
     }
 

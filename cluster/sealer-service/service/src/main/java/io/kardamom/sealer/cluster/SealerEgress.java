@@ -220,6 +220,7 @@ final class SealerEgress {
         // Count each outcome apart. A dropped replay must not look the same
         // as a served one in these logs.
         final Map<SessionBacklogs.Outcome, Long> outcomes = retained.wanted(fromIndex, fromBlock)
+            .map(retained::forSession)
             .map(frame -> backlogs.offer(session, frame))
             .collect(Collectors.groupingBy(
                 Function.identity(),
@@ -551,13 +552,22 @@ final class SealerEgress {
         firstRetainedBlock = floors.block();
     }
 
+    /** Offer the sealer's rules to a session that opened. */
+    void offerSealerInfo(final ClientSession session) {
+        offerToSession(session, frames.sealerInfo(CanonicalSealerState.DECISION_VERSION, session.id()));
+    }
+
     /** Open an empty retention: a start at genesis or from a seed. */
     void openEmpty() {
         retained.clear();
     }
 
+    /**
+     * Retain a relayed record, and offer it to each consumer in the form
+     * that an egress session gets ({@link RetainedFrames#forSession}).
+     */
     void offerRelayed(final Relayed relayed) {
-        offerToConsumers(retain(frames.relayed(relayed)));
+        offerToConsumers(retained.forSession(retain(frames.relayed(relayed))));
     }
 
     /**

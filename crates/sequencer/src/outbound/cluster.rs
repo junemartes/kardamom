@@ -117,12 +117,17 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         // origin block that carried messages, each forcing a boundary.
         self.offer_encoded(wire::encode_ingress_remote_epoch(r), "remote epoch")
     }
+
+    fn try_publish_release(&mut self, r: &wire::NonceRelease) -> Result<(), SequencerError> {
+        self.offer(&r.encode())
+    }
 }
 
 /// The egress kinds a publisher session reads: the boundaries, the
-/// status (for its snapshot notice), and every reject the sealer answers
-/// an offer with.
-pub const PUBLISHER_EGRESS_KINDS: [u8; 9] = [
+/// status (for its snapshot notice), every reject the sealer answers an
+/// offer with, and the sealer's rules (for the nonce release).
+pub const PUBLISHER_EGRESS_KINDS: [u8; 10] = [
+    wire::EGRESS_KIND_SEALER_INFO,
     wire::EGRESS_KIND_BOUNDARY,
     wire::EGRESS_KIND_STATUS,
     wire::EGRESS_KIND_CONTIGUITY_REJECT,

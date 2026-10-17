@@ -46,6 +46,15 @@ enum RelayShape {
         this.afterId = afterId;
     }
 
+    /**
+     * The shortest frame of this kind that the service takes: everything up
+     * to the record type, and the record type. So every relayed frame holds
+     * its record type.
+     */
+    int minLength() {
+        return tailOffset() + Byte.BYTES;
+    }
+
     /** The offset of the record type: the start of the relayed tail. */
     int tailOffset() {
         return idOffset + CanonicalSealerState.CANONICAL_ID_LEN + afterId;

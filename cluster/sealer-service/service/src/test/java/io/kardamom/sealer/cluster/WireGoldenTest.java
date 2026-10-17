@@ -107,6 +107,29 @@ final class WireGoldenTest {
     }
 
     @Test
+    void aRetainedCanonicalEntryGoesToAnEgressSessionAsItsReference() {
+        assertArrayEquals(golden.get("relayed_ref"), EgressFrames.forSession(golden.get("tx_egress")));
+        assertArrayEquals(golden.get("txref_egress"), EgressFrames.forSession(golden.get("txref_egress")));
+    }
+
+    @Test
+    void theSealerInfoNamesTheDecisionVersion() {
+        assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3, 0x0102)));
+        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, 3);
+    }
+
+    @Test
+    void theNonceReleaseHasItsFieldsAtTheServiceOffsets() {
+        final UnsafeBuffer release = new UnsafeBuffer(golden.get("nonce_release"));
+        assertEquals(SealerWire.NONCE_RELEASE_LEN, release.capacity());
+        assertEquals(SealerWire.KIND_NONCE_RELEASE, release.getByte(SealerWire.KIND_OFFSET));
+        assertEquals((byte) 0x11, release.getByte(SealerWire.RELEASE_SENDER_OFFSET + 19));
+        assertEquals(7, release.getLong(SealerWire.RELEASE_NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertEquals((byte) 0xAB, release.getByte(SealerWire.RELEASE_ID_OFFSET));
+        assertEquals((byte) 0xAB, release.getByte(SealerWire.NONCE_RELEASE_LEN - 1));
+    }
+
+    @Test
     void aReferenceRecordRelaysAsToday() {
         assertArrayEquals(golden.get("txref_egress"),
             frames.copy(frames.relayed(new Relayed(INDEX, relayedPayload("txref_ingress")))));
