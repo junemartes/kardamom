@@ -45,9 +45,6 @@ NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
-# The record refers to the formats by the SHA-256 of their text; the text
-# sits in its own variable under the record path.
-FORMATS_REF = 'sha256:' + hashlib.sha256(FORMATS.encode()).hexdigest()
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -151,13 +148,13 @@ class NomadAPI(BaseHTTPRequestHandler):
         path = self.path.split('?')[0].removeprefix('/v1/var/')
         assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
             and body['Path'] == path, (self.path, body)
-        if path.startswith('kardamom/deploys/') and '/formats/' not in path:
+        # Nomad refuses a variable over 64 KiB.
+        assert len(json.dumps(body['Items'])) <= 64 * 1024, (path, len(json.dumps(body['Items'])))
+        if path.startswith('kardamom/deploys/'):
             # The deploy record: two JSON documents in one variable, written
             # with a check-and-set on the modify index. A test clobbers the
-            # record once to stand for another controller. Nomad refuses a
-            # variable over 64 KiB.
+            # record once to stand for another controller.
             assert set(body['Items']) <= {'attempt', 'accepted'}, body
-            assert len(json.dumps(body['Items'])) <= 64 * 1024, len(json.dumps(body['Items']))
             state = self.server.state
             index = state['record_index'].get(path, 0) + int(state.pop('record_clobber', False))
             if int(self.path.split('cas=')[1]) != index:
@@ -169,9 +166,6 @@ class NomadAPI(BaseHTTPRequestHandler):
             state['record_writes'].append(state['records'][path]['attempt']['status'])
             self.respond(body | {'ModifyIndex': index + 1})
             return
-        elif '/formats/' in path:
-            # The registry text of a release, one variable for each text.
-            self.server.state['formats'][path] = body['Items']
         elif path == 'nomad/jobs/cluster':
             assert body['Items'] == {'bootstrap': 'true'}, body
             self.server.state['writes'].append('bootstrap-open')
@@ -210,8 +204,8 @@ class NomadAPI(BaseHTTPRequestHandler):
             if path.startswith('kardamom/deploys/') and path in state['records']:
                 self.respond({'Path': path, 'ModifyIndex': state['record_index'][path],
                               'Items': {k: json.dumps(v) for k, v in state['records'][path].items()}})
-            elif path in state['variables'] | state['formats']:
-                self.respond({'Path': path, 'Items': (state['variables'] | state['formats'])[path]})
+            elif path in state['variables']:
+                self.respond({'Path': path, 'Items': state['variables'][path]})
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -354,9 +348,17 @@ class Deploys(unittest.TestCase):
         # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
-                          'variables': {}, 'variable_writes': [], 'formats': {}, 'records': {}, 'record_index': {},
+                          'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
+        # The target tree: a git checkout with the formats.toml of this
+        # repository. A deploy records its HEAD, and a later gate reads
+        # formats.toml from git at the recorded revision.
+        self.repo = Path(self.tmp.name) / 'repo'
+        self.repo.mkdir()
+        self.git('init', '-q')
+        (self.repo / 'formats.toml').write_text(FORMATS)
+        self.revision = self.commit('the release')
         # One stub for both operator binaries: the smoke of the cluster
         # binary, and the format findings of the deploy binary for the
         # release gate, which a test scripts in `smoke.sh.findings`.
@@ -368,6 +370,16 @@ class Deploys(unittest.TestCase):
         self.thread.start()
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
+
+    def git(self, *args):
+        return subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, message):
+        """Commit the target tree and return the new revision."""
+        self.git('add', '-A')
+        self.git('commit', '-q', '--allow-empty', '-m', message)
+        return self.git('rev-parse', 'HEAD')
 
     def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
         variables = {
@@ -388,7 +400,8 @@ class Deploys(unittest.TestCase):
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
             'workloads_registry_url': f'http://127.0.0.1:{self.api.server_port}',
-            'workloads_revision': 'rev-test',
+            'workloads_repo_root': str(self.repo),
+            'workloads_revision': '',
             'workloads_operator': 'tester',
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
@@ -421,8 +434,11 @@ class Deploys(unittest.TestCase):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
     def gate_formats(self, findings):
-        """Deploy once, then script the format findings of the next deploy."""
+        """Deploy once, give the accepted release the formats text that the
+        gate compares with, then script the format findings of the next
+        deploy."""
         self.run_deploy()
+        self.record()['accepted']['target']['formats'] = FORMATS
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
         Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
@@ -970,9 +986,8 @@ class RecordTest(Deploys):
         attempt = self.record()['attempt']
         self.assertEqual(self.record()['accepted'], attempt)
         self.assertEqual(attempt['status'], 'accepted')
-        self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', 'rev-test'))
-        self.assertEqual(attempt['target']['formats'], FORMATS_REF)
-        self.assertEqual(self.api.state['formats'], {f'kardamom/deploys/local/formats/{FORMATS_REF[7:]}': {'formats': FORMATS}})
+        self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', self.revision))
+        self.assertNotIn('formats', attempt['target'])
         self.assertEqual(attempt['target']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
         self.assertEqual(attempt['changed'], self.api.state['writes'])
         # Every job was new: no version before, version 0 after.
@@ -983,7 +998,8 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['record_writes'], ['started'] * (2 * len(self.api.state['writes']) + 1) + ['accepted'])
         self.assertEqual(json.loads((self.record_dir / 'attempt.json').read_text()), attempt)
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), attempt)
-        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+        # The record holds no formats text, so the mirror writes no registry.
+        self.assertFalse((self.record_dir / 'accepted.formats.toml').exists())
         # A new release records the versions before it, and only the jobs it changed.
         self.repin('b')
         self.api.state['writes'] = []
@@ -1098,23 +1114,6 @@ class RecordTest(Deploys):
         self.run_deploy()
         self.assertIn('cluster', self.api.state['writes'])
 
-    def test_a_record_with_the_formats_text_gates_and_then_refers_to_it(self):
-        # The record holds the registry text itself, and no formats
-        # variable exists.
-        self.run_deploy()
-        for document in self.record().values():
-            document['target']['formats'] = FORMATS
-        self.api.state['formats'] = {}
-        (self.record_dir / 'accepted.formats.toml').unlink()
-        self.repin('b')
-        self.run_deploy()
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
-        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
-        attempt = self.record()['attempt']
-        self.assertEqual((attempt['status'], attempt['target']['formats'], attempt['before']['formats']),
-                         ('accepted', FORMATS_REF, FORMATS))
-        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
-
     def test_a_coordinated_format_change_refuses_the_rolling_path(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'sealer-snapshot', 'head': 11, 'base': 10},
                            {'rule': 'mixed_fleet', 'id': 'sealer-snapshot', 'head': 11, 'base': 10}])
@@ -1123,7 +1122,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
         # The comparison ran the library against the accepted registry and this tree.
         calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
-        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
 
     def test_a_one_way_format_change_needs_the_allowance(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
@@ -1135,7 +1134,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
         self.run_deploy(environ={'KARDAMOM_ALLOW_ONE_WAY': 'state-db'})
         self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
-        self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': 'rev-test'})
+        self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': self.revision})
 
     def test_a_must_match_sealer_setting_refuses_the_rolling_path(self):
         self.run_deploy()
@@ -1245,6 +1244,56 @@ class RecordTest(Deploys):
 
 
 
+class RecordFormatsTest(Deploys):
+    """The revision and the formats text in the deploy record: a deploy
+    records a commit of its checkout and no formats text; the gate compares
+    with the text of an accepted release that holds it."""
+
+    CLUSTER_ROLES = {'node-cluster-0': 'FOLLOWER', 'node-cluster-1': 'LEADER', 'node-cluster-2': 'FOLLOWER'}
+
+    def formats_calls(self):
+        calls = Path(str(self.smoke) + '.calls')
+        return [c for c in calls.read_text().splitlines() if c.startswith('formats')] if calls.exists() else []
+
+    def next_release(self):
+        self.repin('b')
+        self.api.state['roles'] = self.CLUSTER_ROLES
+
+    def test_a_record_with_the_text_gates_and_rolls_back_to_it(self):
+        # The accepted release holds the formats text in target and before,
+        # as the record of staging does.
+        self.run_deploy()
+        for document in self.record().values():
+            document['target']['formats'] = FORMATS
+            document['before']['formats'] = FORMATS
+        self.next_release()
+        self.run_deploy()
+        self.assertEqual(self.formats_calls(),
+                         [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
+        attempt = self.record()['attempt']
+        self.assertNotIn('formats', attempt['target'])
+        self.assertEqual(attempt['before']['formats'], FORMATS)
+        self.api.state['roll_marker'] = 'a' * 64
+        (self.record_dir / 'accepted.formats.toml').unlink()
+        self.run_rollback()
+        self.assertEqual(self.record()['accepted']['target']['formats'], FORMATS)
+        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+
+    def test_a_record_without_the_text_has_no_base(self):
+        self.run_deploy()
+        self.next_release()
+        self.run_deploy()
+        self.assertEqual(self.formats_calls(), [])
+        attempt = self.record()['attempt']
+        self.assertEqual((attempt['status'], attempt['before']['revision']), ('accepted', self.revision))
+        self.assertNotIn('formats', attempt['before'])
+
+    def test_a_target_revision_outside_the_checkout_stops_the_gate(self):
+        output = self.run_deploy({'workloads_revision': 'd' * 40}, success=False)
+        self.assertIn(f'the target revision {"d" * 40} is not a commit of the checkout', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+
 class RollbackTest(Deploys):
     """`just rollback`: the targets, the floor, the re-render, the resume."""
 
@@ -1269,7 +1318,8 @@ class RollbackTest(Deploys):
         self.assertEqual(record['attempt']['status'], 'rolled_back')
         self.assertEqual(record['accepted']['restored_from'], record['attempt']['started_at'])
         self.assertEqual(record['accepted']['target']['manifest'], record['attempt']['before']['manifest'])
-        self.assertEqual(record['accepted']['target']['formats'], FORMATS_REF)
+        self.assertEqual(record['accepted']['target']['revision'], self.revision)
+        self.assertNotIn('formats', record['accepted']['target'])
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
 

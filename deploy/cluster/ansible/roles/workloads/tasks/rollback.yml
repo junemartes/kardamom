@@ -104,11 +104,14 @@
       accepted_at: "{{ workloads_rollback_now }}"
       operator: "{{ workloads_operator }}"
       restored_from: "{{ workloads_last_attempt.started_at }}"
-      target:
-        revision: "{{ workloads_last_attempt.before.revision }}"
-        manifest: "{{ workloads_last_attempt.before.manifest }}"
-        formats: "{{ workloads_last_attempt.before.formats }}"
-        decision_version: "{{ workloads_last_attempt.before.decision_version | default('') }}"
+      # A before written while the accepted release held the formats text
+      # carries the text; the gate reads it in place of the revision.
+      target: >-
+        {{ {'revision': workloads_last_attempt.before.revision,
+            'manifest': workloads_last_attempt.before.manifest,
+            'decision_version': workloads_last_attempt.before.decision_version | default('')}
+           | combine({'formats': workloads_last_attempt.before.formats}
+                     if workloads_last_attempt.before.formats | default('') | length > 0 else {}) }}
       before: {manifest: {}, jobs: {}}
       changed: []
       rolled_back: []

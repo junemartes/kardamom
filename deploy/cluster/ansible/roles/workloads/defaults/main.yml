@@ -283,20 +283,16 @@ workloads_cluster_binary: >-
      | default(workloads_cluster_dir ~ '/../../target/release/kardamom-cluster', true) }}
 # The deploy record, by environment. The Nomad variable
 # kardamom/deploys/<env> holds the current attempt and the last accepted
-# release; deployed/<env>/ mirrors it (attempt.json, accepted.json,
-# accepted.formats.toml) and keeps the manifests: images.digests is the
-# last successful deploy, .previous the one before. README.md documents
+# release; deployed/<env>/ mirrors it (attempt.json, accepted.json), the
+# gate writes accepted.formats.toml there, and the directory keeps the
+# manifests: images.digests is the last successful deploy, .previous the
+# one before. README.md documents
 # the record. An environment name has letters, digits, `-` and `_` only:
 # the Nomad variable path admits no other character.
 workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
 workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"
 workloads_record_path: "kardamom/deploys/{{ workloads_env }}"
 workloads_record_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_record_path }}?namespace={{ workloads_namespace | urlencode }}"
-# The registry text of a release, in one Nomad variable for each text:
-# <record path>/formats/<hex>, with <hex> the SHA-256 of the text. Nomad
-# limits a variable to 64 KiB, so the record holds the reference
-# sha256:<hex>, not the text.
-workloads_formats_path: "{{ workloads_record_path }}/formats"
 # The quiesce check of the sealer before a change of its decision version
 # (`just sealer-quiesce-check <env>`): the variable holds the decision
 # version of the members and the time of the check.
@@ -307,12 +303,12 @@ workloads_quiesce_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_quiesce_p
 # stop; the deploy follows within this window. The gate caps it at
 # 3600 s.
 workloads_quiesce_max_age_s: "{{ lookup('env', 'KARDAMOM_QUIESCE_MAX_AGE_S') | default('600', true) }}"
-# The repository root and its format registry: the formats of the target.
+# The repository root: the git checkout of the target, with its formats.toml.
 workloads_repo_root: "{{ workloads_cluster_dir ~ '/../..' }}"
-workloads_formats_file: "{{ workloads_repo_root }}/formats.toml"
-# The revision of the target tree, for the record. Empty: the gate reads
-# it from git or jj.
-workloads_revision: "{{ lookup('env', 'KARDAMOM_REVISION') | default(lookup('env', 'GITHUB_SHA'), true) }}"
+# The revision of the target tree, for the record (KARDAMOM_REVISION).
+# Empty: the gate reads it from the git checkout, else GITHUB_SHA, else jj.
+# In a git checkout it must be a commit of the checkout.
+workloads_revision: "{{ lookup('env', 'KARDAMOM_REVISION') }}"
 workloads_operator: >-
   {{ lookup('env', 'KARDAMOM_OPERATOR') | default(lookup('env', 'GITHUB_ACTOR'), true)
      | default(lookup('env', 'USER'), true) }}

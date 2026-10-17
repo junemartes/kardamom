@@ -131,9 +131,10 @@ The deploy preflight is the release gate of the workloads role
 (`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`). It reads the
 registry of the accepted release from the deploy record, runs
 `kardamom-deploy formats --base <that registry> --root <target tree>` for
-the findings, and decides by the findings alone: a waiver in `formats.toml`
-does not cover a finding at deploy time, because the waiver was given against a pull
-request base, not against the release that runs. The gate rules are in
+the findings, and decides by the findings alone: a
+waiver in `formats.toml` does not cover a finding at deploy time, because
+the waiver was given against a pull request base, not against the release
+that runs. The gate rules are in
 "The release gate" of `deploy/cluster/README.md`. Every release ships
 `kardamom-deploy`, signed, so the gate runs the binary of the release that
 it deploys.

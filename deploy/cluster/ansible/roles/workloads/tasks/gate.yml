@@ -20,7 +20,6 @@
   failed_when: false
   changed_when: false
   check_mode: false
-  when: workloads_revision | length == 0
 
 - name: Read the revision of the target tree from jj
   ansible.builtin.command:
@@ -31,15 +30,39 @@
   check_mode: false
   when:
     - workloads_revision | length == 0
-    - workloads_gate_git.rc | default(1) != 0
+    - workloads_gate_git.rc != 0
+    - lookup('env', 'GITHUB_SHA') | length == 0
 
 - name: Keep the target revision
   ansible.builtin.set_fact:
     workloads_target_revision: >-
       {{ workloads_revision if workloads_revision | length > 0
-         else workloads_gate_git.stdout if workloads_gate_git.rc | default(1) == 0
+         else workloads_gate_git.stdout if workloads_gate_git.rc == 0
+         else lookup('env', 'GITHUB_SHA') if lookup('env', 'GITHUB_SHA') | length > 0
          else workloads_gate_jj.stdout if workloads_gate_jj.rc | default(1) == 0
          else 'unknown' }}
+
+# The record keeps the revision, and a later gate reads formats.toml from git
+# at it. In a git checkout the revision must be a commit of the checkout, so
+# that a later fetch finds it. GITHUB_SHA of a workflow in another
+# repository is not one.
+- name: Check that the target revision is a commit of the checkout
+  ansible.builtin.command:
+    argv: [git, -C, "{{ workloads_repo_root }}", cat-file, -e, "{{ workloads_target_revision }}^{commit}"]
+  register: workloads_gate_revision_commit
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: workloads_gate_git.rc == 0
+
+- name: Refuse a target revision that the checkout does not hold
+  ansible.builtin.assert:
+    that: workloads_gate_revision_commit.rc == 0
+    fail_msg: >-
+      Refused: the target revision {{ workloads_target_revision }} is not a commit of the checkout
+      {{ workloads_repo_root }}. A later gate reads formats.toml at the revision of the record.
+      Set KARDAMOM_REVISION to the commit of this tree, or leave it empty.
+  when: workloads_gate_git.rc == 0
 
 # 1. The last attempt. One that is still `started` runs, or died. A deploy
 # over a dead attempt records the mixed versions that run, so the operator

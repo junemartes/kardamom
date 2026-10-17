@@ -230,10 +230,10 @@ The deploy record of an environment lives in the Nomad variable `kardamom/deploy
 | `status` | `started` while the attempt runs or after it failed. `accepted` after the deploy succeeded. `rolled_back` after `just rollback`. |
 | `started_at`, `accepted_at`, `rolled_back_at` | UTC times. |
 | `operator` | `KARDAMOM_OPERATOR`, else `GITHUB_ACTOR`, else `USER`. |
-| `target.revision` | The revision of the deployed tree: `KARDAMOM_REVISION`, else `GITHUB_SHA`, else git, else jj. |
+| `target.revision` | The revision of the deployed tree: `KARDAMOM_REVISION`, else `git rev-parse HEAD` of the checkout, else `GITHUB_SHA`, else jj. In a git checkout the gate refuses a revision that is not a commit of the checkout. |
 | `target.manifest` | The image manifest, by service: `{"ingress": "<registry>/kardamom-ingress@sha256:..."}`. |
-| `target.formats` | `sha256:<hex>`: the `formats.toml` of the deployed tree, by the SHA-256 of its text. The text is in the Nomad variable `kardamom/deploys/<env>/formats/<hex>`, one variable for each text, because Nomad limits a variable to 64 KiB. A record can also hold the text itself; the role reads both forms. |
-| `before.revision`, `before.manifest`, `before.formats` | The same three fields of the accepted release at the start of the attempt. |
+| `target.formats` | Optional: the text of `formats.toml`. A deploy does not write it, because Nomad limits the variable to 64 KiB. When the accepted release holds it, the gate compares the formats of the target with it; without it there is no base. |
+| `before.revision`, `before.manifest` | The same fields of the accepted release at the start of the attempt. `before.formats` is there only when the accepted release holds the formats text; a rollback carries it back. |
 | `before.jobs` | The Nomad job version of every job the namespace knows at the start: `{"ingress": {"before": 3}}`. A registration adds `after`, the version the attempt registered. A job that the attempt adds has `before: null`. |
 | `changed` | The jobs the attempt registered, in registration order. A job joins before its registration. The rollback reverts them in reverse order. |
 | `rolled_back` | The jobs a rollback reverted so far, in that order. A rollback that stops resumes after them. |
@@ -372,7 +372,7 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | The last attempt is still started | The record's `attempt.status`. | Let it finish. If it died, `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1`. |
 | The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without the ingress job has no chain to check; an ingress job without a running allocation is refused. When Nomad does not know the sealer job, the gate excuses `sealer_no_quorum` and the upstream pauses on it: the coordinated restart of the sealer purges the job, and the deploy brings it back. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
 | An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. `off` skips it in the local profile only. | Push the images, or fix the manifest. |
-| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. | Stop the writers, or follow the runbook of the format. |
+| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. The comparison needs the formats text in the accepted release. A deploy does not write the text into the record, so after the first deploy of this release there is no base and no comparison, until compatibility fixtures and a mixed-version chaos shard replace the format gate. Do not rely on this check in that window. | Stop the writers, or follow the runbook of the format. |
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
 | A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. `decisionVersion` comes with the sealer image: follow "Decision version" in [`cluster/sealer-service/README.md`](../../cluster/sealer-service/README.md#decision-version). A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
@@ -636,7 +636,7 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in `crates/chaos/tests/shards.rs`.
 - A shard test brings the cluster up itself. `container-test` runs it with `KARDAMOM_CHAOS_REUSE=1` against the cluster that `container-up` made.
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
-- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). The release gate reads the format findings from `kardamom-deploy formats`.
+- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers | formats` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). `formats` prints the format findings of this tree against a `--base` registry as JSON; the release gate reads them.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 
