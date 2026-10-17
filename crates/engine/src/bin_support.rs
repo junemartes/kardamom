@@ -350,6 +350,64 @@ pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscripti
     kardamom_cluster_adapter::LiveIngress,
 >;
 
+/// The live canonical stream with its bytes: the member feed, and no
+/// second source.
+pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
+    crate::reader::carried::AeronFeed,
+    crate::reader::carried::NoSource,
+>;
+
+/// Open the member feed on a dedicated Aeron runtime on `aeron_dir`, the
+/// media driver that the executor shares with its member, and read it from
+/// `cursor`. The feed reads as closed once `stop` is cancelled.
+///
+/// # Errors
+///
+/// Returns `Err` when the runtime fails to spawn, or the feed streams fail
+/// to open.
+pub fn open_member_feed(
+    aeron_dir: Option<&Path>,
+    cursor: crate::reader::cluster::ReplayCursor,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<LiveCarriedSub> {
+    let rt = AeronRuntime::spawn(aeron_dir).context("spawn the member feed AeronRuntime")?;
+    let feed = crate::reader::carried::AeronFeed::open(rt, stop).context("open the member feed")?;
+    Ok(crate::reader::carried::CarriedSubscription::new(
+        feed,
+        crate::reader::carried::NoSource,
+        cursor,
+    ))
+}
+
+/// Connect a publisher-only cluster session: no replay, no egress
+/// subscription, and no egress frame reaches the caller. The executor that
+/// reads the member feed sends its recorded cursor over it.
+///
+/// # Errors
+///
+/// Returns `Err` when the cluster Aeron runtime fails to spawn, or the
+/// cluster session fails to connect.
+pub fn connect_cluster_publisher(
+    aeron_dir: Option<&Path>,
+    cfg: kardamom_cluster_adapter::LiveClusterConfig,
+) -> Result<(
+    kardamom_cluster_adapter::LiveCluster,
+    kardamom_cluster_adapter::LiveIngress,
+)> {
+    let cluster_rt = AeronRuntime::spawn(aeron_dir).context("spawn cluster AeronRuntime")?;
+    let (cluster, ingress, _egress) = kardamom_cluster_adapter::live::connect_with(
+        cluster_rt,
+        cfg,
+        kardamom_cluster_adapter::live::ConnectOptions {
+            replay: None,
+            subscribe: false,
+            egress_kind_filter: Some(Vec::new()),
+        },
+    )
+    .context("connect the publisher-only cluster session")?;
+    Ok((cluster, ingress))
+}
+
 /// The batcher's posted-cursor publisher over the live cluster session,
 /// named here for the same reason as [`LiveTxOrderingSub`].
 pub type LiveCursorPublisher =

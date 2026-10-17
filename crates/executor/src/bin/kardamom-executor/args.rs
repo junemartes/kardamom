@@ -89,6 +89,14 @@ pub(crate) struct Args {
     /// on only after every sealer member reads it.
     #[arg(long, env = "KARDAMOM_EXEC_CURSOR", default_value_t = false)]
     pub(crate) exec_cursor: bool,
+    /// Read the canonical entries with their bytes from the feed of the
+    /// paired sealer member, on `aeron:ipc` of the media driver at
+    /// `--aeron-dir`. The executor then opens no `tx_data` lane, joins
+    /// nothing and votes no void. Switch this on only with a sealer that
+    /// carries the bytes and runs the member feed. Off: the executor joins
+    /// the references of the cluster egress with `tx_data`.
+    #[arg(long, env = "KARDAMOM_CARRY_BYTES", default_value_t = false)]
+    pub(crate) carry_bytes: bool,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,

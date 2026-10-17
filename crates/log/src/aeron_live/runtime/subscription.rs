@@ -115,6 +115,23 @@ impl AeronRuntime {
         Ok((sub_id, rx))
     }
 
+    /// The count of images of the subscription `sub_id`: one for each
+    /// publisher session that it sees. A subscriber that sends a request
+    /// to its publisher waits for an image first, so the publisher has a
+    /// subscriber for its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown or closed, if the client
+    /// cannot read the count, or if the command round trip times out.
+    pub fn image_count(&self, sub_id: u32) -> Result<usize, LogError> {
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubImageCount { sub_id, ack },
+            "image_count",
+        )
+    }
+
     /// Attach a source endpoint to the subscription `sub_id`. The endpoint
     /// gets its own Aeron subscription, which feeds the frame stream of
     /// `sub_id`. No Aeron multi-destination subscription is used: the

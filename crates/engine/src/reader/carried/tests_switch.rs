@@ -1,0 +1,172 @@
+//! The order of the sources and the switch between them: the silence, the
+//! lost connection, the hash mismatch, the floors, and the return to the
+//! feed.
+
+use std::time::Duration;
+
+use super::tests::{Rig, TIMING, boundary, done, entry, forged_at, tx_at, unavailable};
+use super::*;
+
+/// Serve one block on `source` from its newest request: the entry at
+/// `index` and the boundary of `block`, then the replay end.
+fn serve_block(rig: &mut Rig, source: Source, index: u64, block: u64) -> Request {
+    let request = rig.request(source);
+    let remote = rig.remote(source);
+    remote.send(tx_at(index));
+    remote.send(boundary(block, index + 1));
+    remote.send(done(request.request_id, index + 1, block + 1));
+    request
+}
+
+#[test]
+fn a_silent_feed_switches_to_the_service_at_a_frame_boundary() {
+    let mut rig = Rig::new(0, 1);
+    serve_block(&mut rig, Source::Feed, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    rig.feed.send(tx_at(1));
+    let request = rig.request(Source::Service);
+    assert_eq!(rig.sub.source(), Source::Service);
+    assert_eq!(
+        (request.from_index, request.from_block),
+        (1, 2),
+        "the new source replays from the cursor"
+    );
+    rig.service.send(tx_at(1));
+    rig.service.send(boundary(2, 2));
+    rig.service.send(done(request.request_id, 2, 3));
+    assert_eq!(
+        rig.deliver(5),
+        ["t1", "b2"],
+        "the record of the old source waits for its boundary and goes with the switch"
+    );
+}
+
+#[test]
+fn a_lost_feed_switches_at_once() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.set_connected(false);
+    let started = std::time::Instant::now();
+    rig.run_until(|rig| rig.sub.source() == Source::Service);
+    assert!(
+        started.elapsed() < TIMING.silence,
+        "a lost image does not wait for the silence"
+    );
+    assert_eq!(rig.sub.source(), Source::Service);
+}
+
+#[test]
+fn the_reader_comes_back_to_the_feed_after_the_ready_window() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.set_connected(false);
+    serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    rig.feed.set_connected(true);
+    let probe = rig.request(Source::Feed);
+    assert_eq!(
+        rig.sub.source(),
+        Source::Service,
+        "the probe does not switch"
+    );
+    assert_eq!((probe.from_index, probe.from_block), (1, 2));
+    rig.feed.send(tx_at(1));
+    rig.feed.send(done(probe.request_id, 2, 2));
+    let request = rig.request(Source::Feed);
+    assert_ne!(request.request_id, probe.request_id);
+    assert_eq!(rig.sub.source(), Source::Feed);
+    assert_eq!((request.from_index, request.from_block), (1, 2));
+    assert_eq!(
+        rig.deliver(1),
+        [] as [String; 0],
+        "probe frames are dropped"
+    );
+}
+
+#[test]
+fn a_break_in_the_readiness_starts_the_window_again() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.set_connected(false);
+    serve_block(&mut rig, Source::Service, 0, 1);
+    rig.feed.set_connected(true);
+    rig.run_for(TIMING.ready * 2 / 3);
+    rig.feed.set_connected(false);
+    rig.run_for(TIMING.poll * 4);
+    rig.feed.set_connected(true);
+    rig.run_for(TIMING.ready * 2 / 3);
+    assert_eq!(rig.feed.requests(), [], "no probe before a whole window");
+    assert_eq!(rig.sub.source(), Source::Service);
+}
+
+#[test]
+fn a_hash_mismatch_replays_the_index_from_the_other_source() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.send(forged_at(0));
+    let request = serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!((request.from_index, request.from_block), (0, 1));
+    assert_eq!(rig.sub.source(), Source::Service);
+    assert_eq!(
+        rig.next_item(),
+        (
+            kardamom_types::BPosition::from_index(0),
+            Ordered::Tx(entry(0))
+        ),
+        "the reader executes the entry of the other source, not the forged one"
+    );
+}
+
+#[test]
+fn both_sources_below_their_floor_go_to_a_peer_checkpoint() {
+    let mut rig = Rig::new(3, 2);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(unavailable(request.request_id, 10, 5));
+    let request = rig.request(Source::Service);
+    rig.service.send(unavailable(request.request_id, 8, 4));
+    match rig.error() {
+        ExecutorError::ClusterReplayUnavailable {
+            from_index,
+            oldest_index,
+            oldest_block,
+        } => assert_eq!((from_index, oldest_index, oldest_block), (3, 8, 4)),
+        other => panic!("expected the peer-checkpoint error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_feed_below_its_floor_with_no_service_goes_to_a_peer_checkpoint() {
+    let (feed, remote) = MemoryTransport::pair();
+    let mut sub = CarriedSubscription::with_timing(feed, NoSource, ReplayCursor::new(3, 2), TIMING);
+    let request = std::iter::repeat_with(|| {
+        sub.step().unwrap();
+        remote.request(Duration::ZERO)
+    })
+    .find_map(|request| request)
+    .unwrap();
+    remote.send(unavailable(request.request_id, 10, 5));
+    let error = std::iter::repeat_with(|| sub.step())
+        .find_map(Result::err)
+        .unwrap();
+    assert!(matches!(
+        error,
+        ExecutorError::ClusterReplayUnavailable {
+            oldest_block: 5,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_service_that_never_connects_sends_the_reader_back_to_the_feed() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.service.set_connected(false);
+    rig.feed.set_connected(false);
+    rig.run_until(|rig| rig.sub.source() == Source::Service);
+    rig.run_until(|rig| rig.sub.source() == Source::Feed);
+    rig.feed.set_connected(true);
+    let request = rig.request(Source::Feed);
+    assert_eq!((request.from_index, request.from_block), (0, 1));
+    assert_eq!(rig.service.requests(), []);
+}

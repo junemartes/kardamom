@@ -44,7 +44,7 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
-use wiring::ExecutorWiring;
+use wiring::{ExecutorOrdering, ExecutorWiring};
 
 /// The state writer and the adapters built from its handle, plus the
 /// BAL and footprint-shadow capture handoffs.
@@ -224,21 +224,56 @@ async fn connect_cluster(
     file_cfg: &ExecutorFileConfig,
     plane: &StreamPlane,
     start: &kardamom_engine::ResumePoint,
-) -> Result<(
-    kardamom_cluster_adapter::LiveCluster,
-    bin_support::LiveTxOrderingSub,
-)> {
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<(kardamom_cluster_adapter::LiveCluster, ExecutorOrdering)> {
     let mut cluster_cfg = file_cfg.cluster.to_live();
     if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
         cluster_cfg.ingress_endpoints = endpoints;
     }
-    let connected = bin_support::connect_cluster_ordering(
-        args.aeron_dir.as_deref(),
-        cluster_cfg,
-        bin_support::cluster_replay_cursor(start),
-    )?;
+    let cursor = bin_support::cluster_replay_cursor(start);
+    let aeron_dir = args.aeron_dir.as_deref();
+    if args.carry_bytes {
+        let (guard, ingress) = bin_support::connect_cluster_publisher(aeron_dir, cluster_cfg)?;
+        let sub = bin_support::open_member_feed(aeron_dir, cursor, stop.clone())?;
+        tracing::info!("kardamom-executor: canonical entries via the member feed");
+        return Ok((
+            guard,
+            ExecutorOrdering::Carried {
+                sub: Box::new(sub),
+                ingress,
+            },
+        ));
+    }
+    let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-    Ok(connected)
+    Ok((guard, ExecutorOrdering::Refs(sub)))
+}
+
+/// The `tx_data` lanes and their join-miss refetch. The member feed carries
+/// the bytes, so with `--carry-bytes` the executor opens no lane and
+/// refetches nothing.
+fn open_lanes(
+    args: &Args,
+    rt: &AeronRuntime,
+    plane: &mut StreamPlane,
+    aeron_cfg: &kardamom_log::config::AeronConfig,
+) -> Result<(
+    Vec<bin_support::LiveTxDataSub>,
+    Option<kardamom_engine::reader::JoinRecoveryFactory>,
+)> {
+    if args.carry_bytes {
+        return Ok((Vec::new(), None));
+    }
+    Ok((
+        bin_support::open_tx_data_subs(rt, plane)?,
+        bin_support::archive_join_recovery(
+            plane,
+            aeron_cfg,
+            args.aeron_dir.as_deref(),
+            args.archive_control_response_endpoint.as_deref(),
+            args.replay_destination_endpoint.as_deref(),
+        ),
+    ))
 }
 
 /// The streams this replica writes besides the BAL: the receipts, the
@@ -491,14 +526,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // stay live always: the reader's join-miss refetch recovers any
     // down-window or lapse gap in-band, against the remote durability
     // archives.
-    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &mut plane)?;
-    let join_recovery = bin_support::archive_join_recovery(
-        &mut plane,
-        &aeron_cfg,
-        args.aeron_dir.as_deref(),
-        args.archive_control_response_endpoint.as_deref(),
-        args.replay_destination_endpoint.as_deref(),
-    );
+    let (tx_data_subs, join_recovery) = open_lanes(args, &rt, &mut plane, &aeron_cfg)?;
 
     let outputs = Outputs::open(OutputsConfig {
         args,
@@ -510,7 +538,8 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
 
-    let (cluster_guard, tx_ordering_sub) = connect_cluster(args, file_cfg, &plane, &start).await?;
+    let (cluster_guard, tx_ordering_sub) =
+        connect_cluster(args, file_cfg, &plane, &start, &shutdown).await?;
     outputs.exec_stream.cursor.start(
         boot.cursor_id
             .map(|id| tx_ordering_sub.recorded_cursor_publisher(id)),

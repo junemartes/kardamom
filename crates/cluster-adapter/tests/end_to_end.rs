@@ -16,8 +16,8 @@ use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_cluster_adapter::wire::{
     GuardHeader, encode_egress_boundary, encode_egress_record, split_ingress, txref,
 };
-use kardamom_engine::reader::TxOrderingSubscription;
 use kardamom_engine::reader::cluster::ClusterTxOrderingSubscription;
+use kardamom_engine::reader::{Ordered, TxOrderingSubscription};
 use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
 use kardamom_sequencer::outbound::{RefOffer, TxOrderingRefPublisher};
 use kardamom_types::{BPosition, TxOrderingMessage};
@@ -142,8 +142,10 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
     let mut boundary = None;
     loop {
         match sub.next() {
-            Ok((pos, TxOrderingMessage::TxRef(r))) => records.push((pos, r)),
-            Ok((_pos, TxOrderingMessage::BoundaryStart(bnd))) => boundary = Some(bnd),
+            Ok((pos, Ordered::Message(TxOrderingMessage::TxRef(r)))) => records.push((pos, r)),
+            Ok((_pos, Ordered::Message(TxOrderingMessage::BoundaryStart(bnd)))) => {
+                boundary = Some(bnd);
+            }
             Ok((_pos, other)) => panic!("unexpected message {other:?}"),
             Err(_) => break, // TxOrderingClosed means a clean EOF
         }

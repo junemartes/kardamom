@@ -25,6 +25,15 @@ pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_to
 /// compares this head with `validator_committed_block`.
 pub const VALIDATOR_SEALER_BLOCK_NUMBER: &str = "validator_sealer_block_number";
 
+/// The source of the canonical stream with its bytes: 1 for the source that
+/// the executor reads, 0 for the other. The label is `source="feed"` or
+/// `source="service"`.
+pub const INPUT_SOURCE: &str = "kardamom_executor_input_source";
+/// Canonical entries whose raw transaction does not hash to the canonical
+/// id, by the `source` that sent them. The executor does not execute such an
+/// entry: it reads the entry again from the other source.
+pub const SOURCE_MISMATCH_TOTAL: &str = "kardamom_executor_source_mismatch_total";
+
 /// EIP-7928 BAL publication.
 pub const BAL_FRAME_BYTES: &str = "kardamom_executor_bal_frame_bytes";
 pub const BAL_ENCODE_SECONDS: &str = "kardamom_executor_bal_encode_seconds";
@@ -118,6 +127,14 @@ pub fn describe() {
     metrics::describe_counter!(
         INVALID_TX_SKIPPED_TOTAL,
         "deterministically-invalid canonical txs skipped with a marker receipt (#92); any nonzero value means an upstream guard failed"
+    );
+    metrics::describe_gauge!(
+        INPUT_SOURCE,
+        "1 for the source of the canonical stream that the executor reads (feed|service)"
+    );
+    metrics::describe_counter!(
+        SOURCE_MISMATCH_TOTAL,
+        "canonical entries whose raw transaction does not hash to the canonical id, by source"
     );
     metrics::describe_counter!(
         RESYNC_TOTAL,

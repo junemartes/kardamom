@@ -671,6 +671,7 @@ fn replay_ahead_roundtrip() {
         EgressItem::ReplayAhead {
             head_index: 5,
             head_block: 3,
+            request_id: None,
         }
     );
 }
@@ -697,8 +698,53 @@ fn replay_unavailable_roundtrip() {
         EgressItem::ReplayUnavailable {
             oldest_index: 100,
             oldest_block: 7,
+            request_id: None,
         }
     );
+}
+
+#[test]
+fn feed_answers_carry_the_request_id() {
+    let answers = [
+        (EGRESS_KIND_REPLAY_UNAVAILABLE, 100, 7),
+        (EGRESS_KIND_REPLAY_DONE, 100, 7),
+        (EGRESS_KIND_REPLAY_AHEAD, 100, 7),
+    ];
+    let decoded: Vec<_> = answers
+        .iter()
+        .map(|&(kind, a, b)| EgressItem::decode(&encode_feed_answer(kind, a, b, 42)).unwrap())
+        .collect();
+    assert_eq!(
+        decoded,
+        [
+            EgressItem::ReplayUnavailable {
+                oldest_index: 100,
+                oldest_block: 7,
+                request_id: Some(42),
+            },
+            EgressItem::ReplayDone {
+                up_to_index: 100,
+                up_to_block: 7,
+                request_id: Some(42),
+            },
+            EgressItem::ReplayAhead {
+                head_index: 100,
+                head_block: 7,
+                request_id: Some(42),
+            },
+        ]
+    );
+}
+
+#[test]
+fn feed_request_has_the_replay_request_layout_and_the_id() {
+    let request = encode_feed_request(100, 7, 42);
+    assert_eq!(request.len(), FEED_ANSWER_LEN);
+    assert_eq!(
+        &request[..FEED_REQUEST_ID_OFFSET],
+        encode_replay_request(100, 7)
+    );
+    assert_eq!(request[FEED_REQUEST_ID_OFFSET..], 42u64.to_le_bytes());
 }
 
 #[test]

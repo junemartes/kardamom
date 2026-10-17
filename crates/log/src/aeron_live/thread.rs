@@ -495,6 +495,21 @@ impl AeronThread {
         })
     }
 
+    /// The count of images of the open subscription at `sub_id`.
+    fn cmd_image_count(&self, sub_id: u32) -> Result<usize, LogError> {
+        let row = self
+            .subs
+            .get(sub_id as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| LogError::Aeron(format!("image count: no subscription {sub_id}")))?;
+        let count = row
+            .entry
+            .image_count()
+            .map_err(|e| LogError::Aeron(format!("image count of {sub_id}: {e:?}")))?;
+        usize::try_from(count)
+            .map_err(|_| LogError::Aeron(format!("image count of {sub_id}: {count}")))
+    }
+
     /// Close a subscription: its destinations drop first, then the row
     /// itself. Each drop releases the handlers and closes the Aeron
     /// subscription of the row. The slot stays `None`.
@@ -580,6 +595,9 @@ impl AeronThread {
             }
             RuntimeCmd::SubRemoveDestination { sub_id, uri, ack } => {
                 let _ = ack.send(self.cmd_remove_destination(sub_id, &uri));
+            }
+            RuntimeCmd::SubImageCount { sub_id, ack } => {
+                let _ = ack.send(self.cmd_image_count(sub_id));
             }
             RuntimeCmd::CloseSubscription { sub_id, ack } => {
                 let _ = ack.send(self.cmd_close_subscription(sub_id));

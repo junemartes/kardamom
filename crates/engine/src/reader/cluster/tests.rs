@@ -4,7 +4,17 @@ use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
 use kardamom_cluster_adapter::wire::{
     GuardHeader, encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress,
 };
-use kardamom_types::TxRef;
+use kardamom_types::{TxOrderingMessage, TxRef};
+
+/// The next item of `sub`, as a message of the reference stream.
+fn next(
+    sub: &mut impl TxOrderingSubscription,
+) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
+    sub.next().map(|(pos, item)| match item {
+        Ordered::Message(msg) => (pos, msg),
+        Ordered::Tx(tx) => panic!("a reference stream yields no entry: {tx:?}"),
+    })
+}
 
 /// Format one delivered record as a short tag, for order assertions.
 fn label((pos, msg): (BPosition, TxOrderingMessage)) -> String {
@@ -58,7 +68,9 @@ fn replay_gap_is_reordered_and_deduped() {
     egress.close();
 
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
+    let got: Vec<String> = std::iter::from_fn(|| next(&mut sub).ok())
+        .map(label)
+        .collect();
     assert_eq!(got, vec!["r0", "r1", "b1", "r2", "r3", "b2", "r4", "r5"]);
 }
 
@@ -70,10 +82,10 @@ fn boundary_first_stream_delivers_in_emission_order() {
     egress.push(encode_egress_boundary(2, 0, 2_000, 0));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    let (p1, m1) = sub.next().unwrap();
+    let (p1, m1) = next(&mut sub).unwrap();
     assert!(matches!(m1, TxOrderingMessage::BoundaryStart(b) if b.block_number == 1));
     assert_eq!(p1.as_index(), 0);
-    let (_p2, m2) = sub.next().unwrap();
+    let (_p2, m2) = next(&mut sub).unwrap();
     assert!(matches!(m2, TxOrderingMessage::BoundaryStart(b) if b.block_number == 2));
 }
 
@@ -85,9 +97,12 @@ fn duplicates_below_cursor_are_skipped() {
     egress.push(encode_egress_record(1, &relayed_txref(1, 11)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    assert_eq!(sub.next().unwrap().0, BPosition::from_index(0));
-    assert_eq!(sub.next().unwrap().0, BPosition::from_index(1));
-    assert!(matches!(sub.next(), Err(ExecutorError::TxOrderingClosed)));
+    assert_eq!(next(&mut sub).unwrap().0, BPosition::from_index(0));
+    assert_eq!(next(&mut sub).unwrap().0, BPosition::from_index(1));
+    assert!(matches!(
+        next(&mut sub),
+        Err(ExecutorError::TxOrderingClosed)
+    ));
 }
 
 #[test]
@@ -97,7 +112,7 @@ fn replay_unavailable_is_fatal() {
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     assert!(matches!(
-        sub.next(),
+        next(&mut sub),
         Err(ExecutorError::ClusterReplayUnavailable {
             oldest_index: 100,
             oldest_block: 7,
@@ -116,7 +131,10 @@ fn replay_done_below_the_cursor_is_fatal() {
         egress.push(wire::encode_replay_done(up_to_index, up_to_block));
         egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
         egress.close();
-        ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3)).next()
+        next(&mut ClusterTxOrderingSubscription::with_cursor(
+            egress,
+            ReplayCursor::new(5, 3),
+        ))
     };
     assert!(matches!(
         behind(0, 1),
@@ -143,7 +161,7 @@ fn replay_ahead_is_fatal_and_starts_no_repair() {
     egress.push(encode_egress_record(0, &relayed_txref(1, 0)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3));
-    let err = sub.next().unwrap_err();
+    let err = next(&mut sub).unwrap_err();
     assert!(matches!(
         err,
         ExecutorError::ClusterBehindCursor {
@@ -179,7 +197,7 @@ fn replay_done_at_the_cursor_ends_the_catch_up() {
     egress.push(encode_egress_record(5, &relayed_txref(1, 5)).unwrap());
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(5, 3));
-    assert_eq!(label(sub.next().unwrap()), "r5");
+    assert_eq!(label(next(&mut sub).unwrap()), "r5");
 }
 
 #[test]
@@ -201,7 +219,9 @@ fn resume_cursor_skips_already_applied_range() {
     egress.push(wire::encode_replay_done(5, 3));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(3, 2));
-    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
+    let got: Vec<String> = std::iter::from_fn(|| next(&mut sub).ok())
+        .map(label)
+        .collect();
     assert_eq!(got, vec!["r3", "r4", "b2"]);
 }
 
@@ -213,14 +233,17 @@ fn yields_records_with_monotonic_bposition() {
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
 
-    let (p0, m0) = sub.next().unwrap();
+    let (p0, m0) = next(&mut sub).unwrap();
     assert_eq!(p0, BPosition::from_index(0));
     assert!(matches!(m0, TxOrderingMessage::TxRef(_)));
-    let (p1, _m1) = sub.next().unwrap();
+    let (p1, _m1) = next(&mut sub).unwrap();
     assert_eq!(p1, BPosition::from_index(1));
     // Stream closed gives TxOrderingClosed. The reader treats this as a
     // clean EOF.
-    assert!(matches!(sub.next(), Err(ExecutorError::TxOrderingClosed)));
+    assert!(matches!(
+        next(&mut sub),
+        Err(ExecutorError::TxOrderingClosed)
+    ));
 }
 
 #[test]
@@ -232,7 +255,7 @@ fn yields_boundary_with_fields_intact() {
     // boundary is the next in-order item, and must decode with its fields
     // intact.
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(42, 7));
-    let (pos, msg) = sub.next().unwrap();
+    let (pos, msg) = next(&mut sub).unwrap();
     match msg {
         TxOrderingMessage::BoundaryStart(b) => {
             assert_eq!(b.block_number, 7);
@@ -261,12 +284,12 @@ fn late_boundary_sealing_below_cursor_is_fatal() {
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));
     // Live mode: record 2 is next-index and delivers immediately.
-    let (p, m) = sub.next().unwrap();
+    let (p, m) = next(&mut sub).unwrap();
     assert_eq!(p.as_index(), 2);
     assert!(matches!(m, TxOrderingMessage::TxRef(_)));
     // The late replayed boundary proves the inversion. This is fatal.
     assert!(matches!(
-        sub.next(),
+        next(&mut sub),
         Err(ExecutorError::BoundaryMisaligned { .. })
     ));
 }
@@ -287,7 +310,9 @@ fn a_new_session_holds_its_live_records_until_the_replay_is_done() {
     egress.push(wire::encode_replay_done(4, 2));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));
-    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
+    let got: Vec<String> = std::iter::from_fn(|| next(&mut sub).ok())
+        .map(label)
+        .collect();
     assert_eq!(got, vec!["b1", "r2", "r3"]);
 }
 
@@ -306,7 +331,9 @@ fn a_replay_done_of_an_earlier_session_does_not_end_the_catch_up() {
     egress.push(wire::encode_replay_done(4, 2));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));
-    let got: Vec<String> = std::iter::from_fn(|| sub.next().ok()).map(label).collect();
+    let got: Vec<String> = std::iter::from_fn(|| next(&mut sub).ok())
+        .map(label)
+        .collect();
     assert_eq!(got, vec!["b1", "r2", "r3"]);
 }
 
@@ -318,7 +345,7 @@ fn malformed_frame_is_skipped_not_fatal() {
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
     // The malformed frame is skipped. The next good frame is returned.
-    let (_pos, msg) = sub.next().unwrap();
+    let (_pos, msg) = next(&mut sub).unwrap();
     assert!(matches!(msg, TxOrderingMessage::BoundaryStart(_)));
 }
 
@@ -385,6 +412,6 @@ fn status_and_lag_reject_frames_are_skipped() {
     egress.push(encode_egress_record(0, &relayed_txref(0, 1)).unwrap());
     egress.push(encode_egress_boundary(1, 1, 250, 0));
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    assert_eq!(label(sub.next().unwrap()), "r0");
-    assert_eq!(label(sub.next().unwrap()), "b1");
+    assert_eq!(label(next(&mut sub).unwrap()), "r0");
+    assert_eq!(label(next(&mut sub).unwrap()), "b1");
 }

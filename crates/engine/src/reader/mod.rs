@@ -43,13 +43,16 @@
 //! L2 position, not the `tx_data` position. Downstream consumers keep keying
 //! on this.
 
+pub mod carried;
 pub mod cluster;
 mod join;
+mod ordered;
 mod ports;
 mod threads;
 mod void;
 
 pub use join::{JoinBuffer, ReaderConfig};
+pub use ordered::Ordered;
 pub use ports::{
     EpochObserver, ExecSink, ExecStreamItem, ExecStreamSink, JoinRecovery, JoinRecoveryError,
     JoinRecoveryFactory, NoEpochCheck, NoExecStream, NoRemoteEpochCheck, RemoteEpochObserver,

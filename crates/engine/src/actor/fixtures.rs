@@ -99,11 +99,10 @@ impl crate::TxDataSubscription for ChanTxDataSub {
 pub struct ChanTxOrderingSub(pub Receiver<(crate::BPosition, crate::TxOrderingMessage)>);
 
 impl crate::TxOrderingSubscription for ChanTxOrderingSub {
-    fn next(
-        &mut self,
-    ) -> Result<(crate::BPosition, crate::TxOrderingMessage), crate::ExecutorError> {
+    fn next(&mut self) -> Result<(crate::BPosition, crate::reader::Ordered), crate::ExecutorError> {
         self.0
             .recv()
+            .map(|(pos, msg)| (pos, msg.into()))
             .map_err(|_| crate::ExecutorError::TxOrderingClosed)
     }
 }

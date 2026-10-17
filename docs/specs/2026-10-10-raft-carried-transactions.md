@@ -809,6 +809,56 @@ it needs from that service:
 - **The order of work.** The validator and the batcher read it after the cut-over, so the service
   runs before PR 13 deploys.
 
+#### The transport contract
+
+The executor reads the member feed and the serving service through one interface, `Transport`
+(`crates/engine/src/reader/carried/transport.rs`). The feed transport (`AeronFeed`) implements it.
+The transport of the serving service implements the same interface. One reader applies the frame
+rules of section 7.8 to both, and one pending set orders the frames of both (R14).
+
+| Method | Input | Output |
+|---|---|---|
+| `connected` | none | `true` when the source can take a request now. For the feed: the feed subscription has an image of the member's publication. |
+| `request` | `Request { from_index, from_block, request_id }`: the cursor and a new id | none. The source answers the newest request and ends each older answer. A lost request is not an error. |
+| `poll` | the longest wait | `Frame(bytes)`: one whole frame. `Idle`: no frame within the wait. `Closed`: the process stops. |
+| `close` | none | none. The source discards the frames that it sent and the reader did not read. |
+
+- The reader sends a request only while `connected` is `true`. It starts each connection with a
+  request, and it sends a new request with a new id for each new answer.
+- The reader leaves a source only between two frames. It calls `close` on the old source, and sends
+  a request from its cursor to the new one.
+
+**The frames.** The transport delivers the frames of the member feed, byte for byte (section 7.8):
+
+- kind 1 (relayed; record type 6 with the envelope) and kind 2 (boundary): the retained frames;
+- kinds 3, 4, 11 and 16: the answers, each with the `request_id` of its request at offset 17.
+
+The stream of the service also holds kind 9 (status) for the consumers that read the status. The
+executor's reader drops kind 9, as it does on the feed. The boundary of each tick shows that the
+source is alive. The reader drops each kind that it does not know.
+
+**The error cases.**
+
+| Case | What the reader does |
+|---|---|
+| Not connected | It sends no request. It leaves the source when no frame comes within the silence window (6 s). A source that loses its connection after a request: the reader leaves it at once. |
+| No answer | No frame of the answer within 2 s of the request: it sends a new request with a new id. |
+| An answer with an old id | It drops the frame. |
+| A retained frame below the cursor | It drops the frame. |
+| A hole (the index or block rule of section 7.8) | It does not apply the frame. It sends a new request from its cursor to the same source. |
+| Gap (`FEED_GAP`, kind 16) | It sends a new request from its cursor to the same source. |
+| Replay unavailable (kind 3, with the floor `oldest_index`, `oldest_block`) | It leaves the source. When the other source also failed since it last reached its head, it stops with `ClusterReplayUnavailable` and the lower floor, and the executor fetches a peer checkpoint (section 7.3). |
+| Replay ahead (kind 11, with the head) | It leaves the source. When both sources answered `REPLAY_AHEAD`, it stops with `ClusterBehindCursor`. |
+| Silent too long (no frame for 6 s) | It leaves the source. |
+| A frame of a known kind that does not decode | It leaves the source. |
+| `keccak256(raw_tx)` is not `canonical_id` | It does not execute the entry. It counts `kardamom_executor_source_mismatch_total{source}`, leaves the source, and replays from the other source at the same index. |
+
+- A source that the reader left for any other case than a floor or a head stays in the order: the
+  reader tries it again when the other source fails.
+- The reader takes `connected` of the feed as the readiness of the member in the return rule of
+  section 7.5: the feed has an image for 30 s without a break, then a replay of the feed from the
+  cursor reaches `REPLAY_DONE`.
+
 ### 8.2 The batcher's resume sources
 
 1. The spool: unchanged.
