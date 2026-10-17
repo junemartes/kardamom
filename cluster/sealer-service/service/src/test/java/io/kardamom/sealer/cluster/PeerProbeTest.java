@@ -8,6 +8,7 @@ import java.net.ServerSocket;
 import java.net.URI;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -17,7 +18,7 @@ final class PeerProbeTest {
     private static final MemberStatus.SnapshotVersions SNAPSHOT = MemberStatus.SnapshotVersions.of(0);
 
     private static MemberStatus status(final int memberId, final String role, final String election, final long commit) {
-        return new MemberStatus(memberId, role, election, commit, commit, SNAPSHOT);
+        return new MemberStatus(memberId, role, election, commit, commit, SNAPSHOT, OptionalLong.empty());
     }
 
     private static URI statusUri(final AdminServer admin) {
@@ -33,8 +34,8 @@ final class PeerProbeTest {
 
     @Test
     void findsAPeerWithAClosedElection() throws IOException {
-        try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG);
-             AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG)) {
+        try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG, Optional.empty());
+             AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG, Optional.empty())) {
             final PeerProbe probe = new PeerProbe(List.of(deadUri(), statusUri(electing), statusUri(joined)));
             assertEquals(Optional.of(2), probe.ask().closedPeer().map(PeerProbe.PeerStatus::memberId));
         }
@@ -44,10 +45,10 @@ final class PeerProbeTest {
     void aMemberThatShutsDownOrFailsIsNotLive() throws IOException {
         // A member on its way out reads CLOSED for its role and its
         // election. A failing status source answers an error object.
-        try (AdminServer stopping = AdminServer.start(0, () -> status(1, "CLOSED", "CLOSED", 10), LAG);
+        try (AdminServer stopping = AdminServer.start(0, () -> status(1, "CLOSED", "CLOSED", 10), LAG, Optional.empty());
              AdminServer failing = AdminServer.start(0, () -> {
                  throw new IllegalStateException("counters gone");
-             }, LAG)) {
+             }, LAG, Optional.empty())) {
             final PeerProbe probe = new PeerProbe(List.of(statusUri(stopping), statusUri(failing), deadUri()));
             assertEquals(Optional.empty(), probe.ask().closedPeer());
         }
@@ -55,8 +56,8 @@ final class PeerProbeTest {
 
     @Test
     void everyPeerMustAnswerForNoClosedElection() throws IOException {
-        try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG);
-             AdminServer leading = AdminServer.start(0, () -> status(2, "LEADER", "LEADER_READY", 10), LAG)) {
+        try (AdminServer electing = AdminServer.start(0, () -> status(1, "FOLLOWER", "CANVASS", 10), LAG, Optional.empty());
+             AdminServer leading = AdminServer.start(0, () -> status(2, "LEADER", "LEADER_READY", 10), LAG, Optional.empty())) {
             assertEquals(JoinWatchdog.PeerElections.NONE_CLOSED,
                 new PeerProbe(List.of(statusUri(electing), statusUri(leading))).ask().elections());
             assertEquals(JoinWatchdog.PeerElections.UNKNOWN,
@@ -69,7 +70,7 @@ final class PeerProbeTest {
     void aSilentPeerEndsTheRoundWithinItsBound() throws IOException {
         // The socket accepts the connection, and nobody answers.
         try (ServerSocket silent = new ServerSocket(0);
-             AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG)) {
+             AdminServer joined = AdminServer.start(0, () -> status(2, "FOLLOWER", "CLOSED", 10), LAG, Optional.empty())) {
             final URI silentUri = URI.create("http://127.0.0.1:" + silent.getLocalPort() + "/status");
             final long startNs = System.nanoTime();
             final PeerProbe.Round round = new PeerProbe(List.of(silentUri, statusUri(joined))).ask();
@@ -83,8 +84,8 @@ final class PeerProbeTest {
     @Test
     void theCommitMarkGrowsOnlyWithANewHighestCommit() throws IOException {
         final AtomicReference<MemberStatus> replaying = new AtomicReference<>(status(1, "FOLLOWER", "FOLLOWER_REPLAY", 100));
-        try (AdminServer peer = AdminServer.start(0, replaying::get, LAG);
-             AdminServer leader = AdminServer.start(0, () -> status(2, "LEADER", "LEADER_READY", 500), LAG)) {
+        try (AdminServer peer = AdminServer.start(0, replaying::get, LAG, Optional.empty());
+             AdminServer leader = AdminServer.start(0, () -> status(2, "LEADER", "LEADER_READY", 500), LAG, Optional.empty())) {
             final PeerProbe probe = new PeerProbe(List.of(statusUri(peer), statusUri(leader), deadUri()));
             assertEquals(600L, probe.commitMark());
             replaying.set(status(1, "FOLLOWER", "FOLLOWER_REPLAY", 40));
@@ -96,7 +97,7 @@ final class PeerProbeTest {
 
     @Test
     void theMembersListNamesEachOtherMemberAtTheAdminPort() throws IOException {
-        try (AdminServer peer = AdminServer.start(0, () -> status(1, "LEADER", "CLOSED", 10), LAG)) {
+        try (AdminServer peer = AdminServer.start(0, () -> status(1, "LEADER", "CLOSED", 10), LAG, Optional.empty())) {
             final String members = "0,10.9.9.9:40200,10.9.9.9:40201,10.9.9.9:40202,10.9.9.9:40203,10.9.9.9:40204"
                 + "|1,127.0.0.1:40200,127.0.0.1:40201,127.0.0.1:40202,127.0.0.1:40203,127.0.0.1:40204";
             assertEquals(Optional.of(1),

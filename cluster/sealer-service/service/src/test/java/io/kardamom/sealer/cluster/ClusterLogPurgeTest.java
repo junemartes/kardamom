@@ -20,6 +20,7 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
@@ -185,7 +186,7 @@ class ClusterLogPurgeTest {
         try {
             return AdminServer.start(0, () -> new MemberStatus(node.index(), String.valueOf(node.role()),
                     String.valueOf(node.electionState()), node.commitPosition(), node.commitPosition(),
-                    MemberStatus.SnapshotVersions.of(0)), 0L);
+                    MemberStatus.SnapshotVersions.of(0), OptionalLong.empty()), 0L, Optional.empty());
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }

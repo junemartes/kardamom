@@ -156,12 +156,23 @@ public final class CanonicalSealerState {
      * head; an older snapshot restores a state that started at genesis.
      * Version 11 adds the recorded cursors after the seed digest; an older
      * snapshot restores no cursor, and the record-lag guard refuses
-     * nothing until the first cursor.
+     * nothing until the first cursor. Version 12 has the state section of
+     * version 11, and the retention section of the retained file after it:
+     * the service writes it only when the member keeps its retained frames
+     * in a file. A member that cannot read the file section must not load
+     * the snapshot.
      *
      * <p>This is the newest version that {@link #load} reads. The writer
      * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 11;
+    private static final int SNAPSHOT_READ_VERSION = 12;
+
+    /**
+     * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
+     * state section of version 11, then the retention section of the
+     * retained file.
+     */
+    public static final int RETAINED_FILE_SNAPSHOT_VERSION = 12;
 
     /**
      * The version that {@link #takeSnapshot()} writes. It stays one step
@@ -1465,11 +1476,19 @@ public final class CanonicalSealerState {
     }
 
     /**
+     * The state section of a snapshot whose retention section is a
+     * retained file: version {@link #RETAINED_FILE_SNAPSHOT_VERSION}.
+     */
+    public byte[] takeSnapshotWithRetainedFile() {
+        return takeSnapshot(RETAINED_FILE_SNAPSHOT_VERSION);
+    }
+
+    /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has no
-     * recorded-cursor section, 11 has it. A version-10 snapshot is the same
-     * bytes that the previous release writes for the same state.
+     * recorded-cursor section, 11 and 12 have it. A version-10 snapshot is
+     * the same bytes that the previous release writes for the same state.
      *
-     * @param version 10 or 11
+     * @param version 10, 11 or 12
      */
     byte[] takeSnapshot(int version) {
         boolean withCursors = version >= 11;

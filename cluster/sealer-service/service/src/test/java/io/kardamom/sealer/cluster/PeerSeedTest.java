@@ -1,12 +1,22 @@
 package io.kardamom.sealer.cluster;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.Aeron;
+import io.aeron.ChannelUri;
+import io.aeron.ExclusivePublication;
+import io.aeron.Subscription;
+import io.aeron.driver.MediaDriver;
+import io.aeron.driver.ThreadingMode;
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
@@ -29,6 +39,7 @@ final class PeerSeedTest {
     private static final PeerSeed.Timing FAST = new PeerSeed.Timing(500, 100, 200);
     /** Long enough for several rounds of FAST. */
     private static final long WATCH_MS = 3_000;
+    private static final int STREAM_ID = 1_957;
 
     @TempDir
     Path dir;
@@ -42,7 +53,8 @@ final class PeerSeedTest {
                 dir.resolve("archive").toString(),
                 ClusterNode.memberEndpoints(MEMBERS, MEMBER_ID));
         final PeerSeed seed = new PeerSeed(
-                MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID), contexts, FAST);
+                MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID), contexts, FAST,
+                Optional.empty());
         final Thread seeding = new Thread(seed::run, "peer-seed-test");
         seeding.start();
 
@@ -53,5 +65,48 @@ final class PeerSeedTest {
 
         assertTrue(stillSeeding, "the seed must not return without a peer");
         assertFalse(contexts.clusterState().holdsRecordingLog(), "the member must stay blank");
+    }
+
+    private MemberContexts contexts() {
+        return new MemberContexts(
+                dir.resolve("aeron").toString(),
+                dir.resolve("cluster").toString(),
+                dir.resolve("archive").toString(),
+                ClusterNode.memberEndpoints(MEMBERS, MEMBER_ID));
+    }
+
+    @Test
+    void anUnreadSnapshotCountsAsAFailedRoundUpToTheLimit() {
+        final RetainedCopy copy = new RetainedCopy(List.of(), new SegmentDir(dir.resolve("retained")),
+                RetainedToken.of("t").orElseThrow(), MEMBER_ID);
+        final PeerSeed seed = new PeerSeed(MEMBER_ID, ClusterNode.peerConsensusEndpoints(MEMBERS, MEMBER_ID),
+                contexts(), FAST, Optional.of(copy));
+        assertTrue(seed.copiedRetained(new PeerSeed.NoSnapshot()), "a cluster with no snapshot needs no copy");
+        IntStream.range(1, PeerSeed.MAX_COPY_FAILURES)
+                .forEach(i -> assertFalse(seed.copiedRetained(new PeerSeed.Unread("the replay did not connect"))));
+        assertThrows(IllegalStateException.class,
+                () -> seed.copiedRetained(new PeerSeed.Unread("the replay did not connect")),
+                "the last failed round stops the start");
+    }
+
+    @Test
+    @InterruptAfter(value = 30, unit = TimeUnit.SECONDS)
+    void theWaitForAReplayImageEndsAtItsDeadline() {
+        try (MediaDriver driver = MediaDriver.launchEmbedded(new MediaDriver.Context()
+                    .threadingMode(ThreadingMode.SHARED).dirDeleteOnStart(true).dirDeleteOnShutdown(true));
+             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(driver.aeronDirectoryName()));
+             ExclusivePublication publication = aeron.addExclusivePublication("aeron:ipc", STREAM_ID);
+             Subscription absent = aeron.addSubscription(
+                     ChannelUri.addSessionId("aeron:ipc", publication.sessionId() + 1), STREAM_ID);
+             Subscription present = aeron.addSubscription(
+                     ChannelUri.addSessionId("aeron:ipc", publication.sessionId()), STREAM_ID)) {
+            final long timeoutNs = TimeUnit.MILLISECONDS.toNanos(200);
+            final long start = System.nanoTime();
+            assertTrue(new PeerSeed.ImageWait(absent, publication.sessionId() + 1, timeoutNs).await().isEmpty(),
+                    "no publication has that session");
+            assertTrue(System.nanoTime() - start >= timeoutNs, "the wait lasts until its deadline");
+            assertTrue(new PeerSeed.ImageWait(present, publication.sessionId(), TimeUnit.SECONDS.toNanos(10))
+                    .await().isPresent());
+        }
     }
 }

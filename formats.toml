@@ -27,15 +27,21 @@
 # The sealer's Aeron Cluster snapshot. The loader refuses a version outside
 # the read range, so a member that rolls back cannot load a newer
 # snapshot. A member that joins late can get a snapshot of another member,
-# so the format is shared. This release reads v11 and still writes v10.
+# so the format is shared. This release reads v12 and still writes v10.
+# With kardamom.cluster.carryBytes=true, the members write v12: the state
+# of v11, then the index of the retained file in place of the retained
+# frames. A release that reads only up to v11 refuses v12 and stops, so
+# switch the flag on only on a new chain or at a coordinated cut-over.
 [format.sealer-snapshot]
 writes = 10
 reads_min = 1
-reads_max = 11
+reads_max = 12
 shared = true
+activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
 code = [
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_WRITE_VERSION",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#SNAPSHOT_READ_VERSION",
+    "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/CanonicalSealerState.java#RETAINED_FILE_SNAPSHOT_VERSION",
 ]
 
 # The ingress message kinds of the sealer. The Rust writers send kinds 0
@@ -71,7 +77,7 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76
 # bytes with the retained bytes after the flag. This release sends 68
-# bytes. A reader of either release reads every size: an old reader
+# bytes, or 76 bytes with kardamom.cluster.carryBytes=true. A reader of either release reads every size: an old reader
 # ignores a tail it does not know, and a new reader reads a frame with no
 # tail as the guard off, no snapshot and no retained bytes.
 [format.sealer-egress-kinds]

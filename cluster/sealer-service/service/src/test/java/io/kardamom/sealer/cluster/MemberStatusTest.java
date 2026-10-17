@@ -15,7 +15,7 @@ final class MemberStatusTest {
 
     private static MemberStatus sample(
             final String role, final String election, final long commit, final long applied) {
-        return new MemberStatus(1, role, election, commit, applied, SNAPSHOT);
+        return new MemberStatus(1, role, election, commit, applied, SNAPSHOT, java.util.OptionalLong.of(0));
     }
 
     @Test
@@ -54,8 +54,17 @@ final class MemberStatusTest {
             "{\"memberId\":1,\"role\":\"LEADER\",\"election\":\"CLOSED\","
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
-                + "\"snapshotLatest\":9,\"ready\":true}",
+                + "\"snapshotLatest\":9,\"diskFreeBytes\":0,\"ready\":true}",
             sample("LEADER", "CLOSED", 5000, 4000).toJson(LAG));
+    }
+
+    @Test
+    void metricsCarryTheFreeDiskOfTheMember() {
+        assertEquals(
+            "# HELP kardamom_sealer_disk_free_bytes The free bytes of the disk of the member state.\n"
+                + "# TYPE kardamom_sealer_disk_free_bytes gauge\n"
+                + "kardamom_sealer_disk_free_bytes{member_id=\"1\"} 0\n",
+            sample("LEADER", "CLOSED", 5000, 4000).toMetrics());
     }
 
     @Test

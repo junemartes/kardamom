@@ -6,13 +6,20 @@ import static io.kardamom.sealer.cluster.IngressFrames.offerPostedCursor;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 
 import io.aeron.cluster.client.AeronCluster;
+import io.aeron.driver.DefaultNameResolver;
+import io.aeron.driver.NameResolver;
 import io.aeron.test.SystemTestWatcher;
 import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
-import io.aeron.test.driver.RedirectingNameResolver;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -20,7 +27,9 @@ import java.util.stream.Stream;
  * One 3-member in-JVM {@link TestCluster} for one log test: the members
  * host the real sealer service, the leader, and a connected client. The
  * log has a small term and segment, so a few hundred KB of log span
- * several archive segments.
+ * several archive segments. With carried bytes, each member keeps its
+ * retained frames in a file and serves the file on an admin endpoint, and
+ * a peer seed copies the file.
  */
 final class LogCluster implements AutoCloseable {
 
@@ -30,33 +39,70 @@ final class LogCluster implements AutoCloseable {
     static final long LOG_BYTES_TAIL = 8L * 1024;
 
     private static final int DEDUP_CAPACITY = 8192;
+    /** A small retained-file segment, so the frames of a short log span several segments. */
+    static final int RETAINED_SEGMENT_BYTES = 64 * 1024;
+    private static final long ADMIN_LAG_BYTES = 0;
+    private static final RetainedToken RETAINED_TOKEN = RetainedToken.of("log-cluster").orElseThrow();
     private static final long TICK_MS = 200L;
     private static final String LOG_CHANNEL = "aeron:udp?term-length=64k|alias=raft";
 
     /** The prefix of the node directories. TestCluster puts member {@code i} in {@code node-i}. */
     private static final String NODE_DIR = "node";
 
-    /** The TestCluster member host names, which every member's media driver maps to localhost. */
-    private static final String NODE_NAMES =
-            "node0,localhost,localhost|node1,localhost,localhost|node2,localhost,localhost";
 
     final TestCluster cluster;
     final TestNode leader;
     final MemberProbe leaderProbe;
     private final Path baseDir;
+    /** The admin endpoints that serve the retained files, one for each member; empty without carried bytes. */
+    private final List<AdminServer> admins;
     private AeronCluster client;
     private int nextRecordId = 0;
 
     LogCluster(final SystemTestWatcher watcher, final Path baseDir) {
+        this(watcher, baseDir, false);
+    }
+
+    /** A cluster whose members keep the retained frames in a file when {@code carryBytes} is true. */
+    LogCluster(final SystemTestWatcher watcher, final Path baseDir, final boolean carryBytes) {
         this.baseDir = baseDir;
-        this.cluster = ClusterTestHarness.start(watcher,
-                ClusterTestHarness.builder(MEMBER_COUNT, DEDUP_CAPACITY, TICK_MS)
-                        .withLogChannel(LOG_CHANNEL)
-                        .withSegmentFileLength(SEGMENT_LENGTH)
-                        .withClusterBaseDir(baseDir.resolve(NODE_DIR).toString()));
+        final TestCluster.Builder builder = ClusterTestHarness.builder(MEMBER_COUNT, DEDUP_CAPACITY, TICK_MS)
+                .withLogChannel(LOG_CHANNEL)
+                .withSegmentFileLength(SEGMENT_LENGTH)
+                .withClusterBaseDir(baseDir.resolve(NODE_DIR).toString());
+        if (carryBytes) {
+            builder.withServiceSupplier(memberId -> new TestNode.TestService[] {
+                new SealerTestService(new SealerClusteredService(DEDUP_CAPACITY, TICK_MS, memberId)
+                        .carryingBytes(new RetainedFile.Config(retainedDir(memberId), RETAINED_SEGMENT_BYTES)))
+                        .index(memberId)
+            });
+        }
+        this.cluster = ClusterTestHarness.start(watcher, builder);
+        this.admins = carryBytes
+                ? IntStream.range(0, MEMBER_COUNT).mapToObj(this::startAdmin).toList()
+                : List.of();
         this.leader = cluster.awaitLeader();
         this.leaderProbe = new MemberProbe(leader);
         this.client = cluster.connectClient();
+    }
+
+    /** The retained-file directory of a member: in its consensus module directory, as the node puts it. */
+    Path retainedDir(final int memberId) {
+        return nodeDir(memberId).resolve("consensus-module").resolve(RetainedFile.DIR_NAME);
+    }
+
+    /** The admin endpoint of a member: the segments of its retained file below its published head. */
+    private AdminServer startAdmin(final int memberId) {
+        final MemberStatus status = new MemberStatus(
+                memberId, MemberStatus.ROLE_FOLLOWER, MemberStatus.ELECTION_CLOSED, 0, 0,
+                MemberStatus.SnapshotVersions.of(0), OptionalLong.empty());
+        final RetainedEndpoint endpoint = RetainedEndpoint.start(new SegmentDir(retainedDir(memberId)),
+                () -> service(cluster.node(memberId)).retainedHead(), RETAINED_TOKEN);
+        try {
+            return AdminServer.start(0, () -> status, ADMIN_LAG_BYTES, Optional.of(endpoint));
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     /** A member that started from a peer seed, and the snapshot position of the seed. */
@@ -169,6 +215,7 @@ final class LogCluster implements AutoCloseable {
 
     @Override
     public void close() {
+        admins.forEach(AdminServer::close);
         cluster.close();
     }
 
@@ -176,17 +223,62 @@ final class LogCluster implements AutoCloseable {
         return baseDir.resolve(NODE_DIR + "-" + memberId);
     }
 
+    /**
+     * Clear a stopped member, and run its peer seed with a retained-file
+     * copy from {@code peers} and short backoffs. The member is not started.
+     */
+    void seedOnly(final int memberId, final List<URI> peers) {
+        new StateDir(nodeDir(memberId)).clear();
+        new PeerSeed(memberId, peerConsensusEndpoints(memberId), seedContexts(memberId),
+                new PeerSeed.Timing(20_000, 10, 10), Optional.of(retainedCopy(memberId, peers))).run();
+    }
+
     /** The production peer seed of a stopped member, with the member's TestCluster directories and endpoints. */
     private PeerSeed peerSeed(final int memberId) {
-        final String members = TestCluster.clusterMembers(0, MEMBER_COUNT);
-        final MemberContexts contexts = new MemberContexts(
+        return new PeerSeed(memberId, peerConsensusEndpoints(memberId),
+                seedContexts(memberId), PeerSeed.Timing.DEFAULT, retainedCopy(memberId));
+    }
+
+    /** The contexts of a peer seed of a stopped member: its TestCluster directories and endpoints. */
+    private MemberContexts seedContexts(final int memberId) {
+        return new MemberContexts(
                 baseDir.resolve("seed-aeron").toString(),
                 nodeDir(memberId).resolve("consensus-module").toString(),
                 nodeDir(memberId).resolve("archive").toString(),
-                ClusterNode.memberEndpoints(members, memberId),
-                new RedirectingNameResolver(NODE_NAMES));
-        return new PeerSeed(memberId, ClusterNode.peerConsensusEndpoints(members, memberId), contexts,
-                PeerSeed.Timing.DEFAULT);
+                ClusterNode.memberEndpoints(TestCluster.clusterMembers(0, MEMBER_COUNT), memberId),
+                LOCAL_NODE_NAMES);
+    }
+
+    /**
+     * Resolve each TestCluster member name to localhost. It keeps no state,
+     * so the media driver of each seed round can use it: Aeron's
+     * RedirectingNameResolver binds its counters to the first driver.
+     */
+    private static final NameResolver LOCAL_NODE_NAMES = new NameResolver() {
+        @Override
+        public InetAddress resolve(final String name, final String uriParamName, final boolean isReResolution) {
+            return DefaultNameResolver.INSTANCE.resolve(
+                    name.startsWith(NODE_DIR) ? "localhost" : name, uriParamName, isReResolution);
+        }
+    };
+
+    /** The copy of the retained file from the admin endpoints of the other members, with carried bytes. */
+    private Optional<RetainedCopy> retainedCopy(final int memberId) {
+        final List<URI> peers = IntStream.range(0, admins.size())
+                .filter(id -> id != memberId)
+                .mapToObj(id -> URI.create("http://127.0.0.1:" + admins.get(id).port()))
+                .toList();
+        return admins.isEmpty() ? Optional.empty() : Optional.of(retainedCopy(memberId, peers));
+    }
+
+    /** The copy of the retained file of {@code memberId} from {@code peers}. */
+    private RetainedCopy retainedCopy(final int memberId, final List<URI> peers) {
+        return new RetainedCopy(peers, new SegmentDir(retainedDir(memberId)), RETAINED_TOKEN, memberId);
+    }
+
+    /** The consensus endpoints of the members other than {@code memberId}. */
+    private static String peerConsensusEndpoints(final int memberId) {
+        return ClusterNode.peerConsensusEndpoints(TestCluster.clusterMembers(0, MEMBER_COUNT), memberId);
     }
 
     private static SealerClusteredService service(final TestNode member) {

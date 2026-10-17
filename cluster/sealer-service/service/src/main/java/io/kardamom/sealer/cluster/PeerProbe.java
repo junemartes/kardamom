@@ -64,8 +64,8 @@ final class PeerProbe {
         if (adminPort == 0) {
             return new PeerProbe(List.of());
         }
-        return new PeerProbe(ClusterNode.peerEntries(clusterMembers, memberId)
-            .map(fields -> URI.create("http://" + fields[1].trim().split(":")[0] + ":" + adminPort + "/status"))
+        return new PeerProbe(new ClusterMembers(clusterMembers).peerAdminEndpoints(memberId, adminPort).stream()
+            .map(admin -> admin.resolve("/status"))
             .toList());
     }
 

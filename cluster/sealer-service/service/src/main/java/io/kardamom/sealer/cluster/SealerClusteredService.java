@@ -94,8 +94,21 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private Optional<SealerSeed> seed = Optional.empty();
 
+    /**
+     * The retained-file settings, or empty to keep the retained frames on
+     * the heap. Replicated configuration: the choice decides the layout of
+     * the retention section of the snapshot, so every member runs the same.
+     */
+    private Optional<RetainedFile.Config> retainedFile = Optional.empty();
+
     private Cluster cluster;
     private CanonicalSealerState state;
+    /**
+     * The store of the retained frames. The service thread opens it in
+     * {@code onStart}. The admin thread reads its published head through
+     * {@link #retainedHead()}.
+     */
+    private volatile RetainedFrames retained;
     private SealerEgress egress;
     private SeedRecord seedRecord;
     private SnapshotRequests snapshots;
@@ -292,6 +305,15 @@ public final class SealerClusteredService implements ClusteredService {
         return this;
     }
 
+    /**
+     * Keep the retained frames in an append-only file, not on the heap.
+     * Every member must run the same choice.
+     */
+    SealerClusteredService carryingBytes(final RetainedFile.Config config) {
+        this.retainedFile = Optional.of(config);
+        return this;
+    }
+
     /** Ask for a snapshot on each boundary tick that {@code schedule} makes due. */
     SealerClusteredService snapshotEvery(final SnapshotSchedule schedule) {
         this.snapshotSchedule = Optional.of(schedule);
@@ -300,15 +322,23 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
+        // An unreadable or empty snapshot image is fatal. Restarting silently
+        // at genesis would diverge from the rest of the cluster, which assumes
+        // the snapshotted state (and the log replayed after it) is correct.
+        start(cluster, Optional.ofNullable(snapshotImage)
+            .map(image -> SnapshotIo.readSnapshot(image, cluster.idleStrategy())));
+    }
+
+    /** Start from {@code snapshot} when there is one, else from the seed or at genesis. */
+    void start(final Cluster cluster, final Optional<byte[]> snapshot) {
         this.cluster = cluster;
         this.seedRecord = new SeedRecord(cluster, memberId);
         this.snapshots = new SnapshotRequests(cluster, memberId);
-        if (snapshotImage != null) {
-            // Restore canonical state from the cluster snapshot. An unreadable
-            // or empty snapshot image is fatal. Restarting silently at genesis
-            // would diverge from the rest of the cluster, which assumes the
-            // snapshotted state (and the log replayed after it) is correct.
-            restore(SnapshotIo.readSnapshot(snapshotImage, cluster.idleStrategy()));
+        this.retained = retainedFile
+            .<RetainedFrames>map(config -> new RetainedFile(config, memberId))
+            .orElseGet(HeapFrames::new);
+        if (snapshot.isPresent()) {
+            restore(snapshot.get());
             // The log position of a start from a snapshot is the snapshot's position.
             purgeView = PurgeView.EMPTY
                 .withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()))
@@ -325,8 +355,7 @@ public final class SealerClusteredService implements ClusteredService {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voidConfig,
                 inclusionHorizonBlocks, window.capacity(), budgets);
-            this.egress = new SealerEgress(
-                cluster, memberId, 0L, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+            openEgress(Optional.empty());
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
         }
         // Do not call scheduleTimer here: Aeron rejects timer scheduling from
@@ -337,10 +366,13 @@ public final class SealerClusteredService implements ClusteredService {
     /**
      * The snapshot: the state section, then the egress retention above the
      * posted head. Every member writes the same bytes at the same log
-     * position.
+     * position. With the retained file, the snapshot is version
+     * {@link CanonicalSealerState#RETAINED_FILE_SNAPSHOT_VERSION}.
      */
     byte[] snapshot() {
-        final byte[] stateBytes = state.takeSnapshot();
+        final byte[] stateBytes = retainedFile.isPresent()
+            ? state.takeSnapshotWithRetainedFile()
+            : state.takeSnapshot();
         final byte[] retention = egress.writeSnapshot();
         final byte[] out = new byte[stateBytes.length + retention.length];
         System.arraycopy(stateBytes, 0, out, 0, stateBytes.length);
@@ -363,7 +395,30 @@ public final class SealerClusteredService implements ClusteredService {
             buf, dedupCapacity, remoteOrigins, voidConfig, inclusionHorizonBlocks, window.capacity(),
             budgets);
         latestSnapshotVersion = state.restoredSnapshotVersion();
-        openEgress(buf);
+        requireRetentionLayout(latestSnapshotVersion);
+        openEgress(Optional.of(buf));
+    }
+
+    /**
+     * Stop the member when the snapshot does not hold the retention layout
+     * of this member. A member with the retained file restores only a
+     * version-12 snapshot: a heap section would start its file at another
+     * position than the file of a peer that kept running. A member without
+     * the file cannot read a file section. The switch changes only with a
+     * new chain or a coordinated cut-over, never on a live chain.
+     */
+    private void requireRetentionLayout(final int version) {
+        final boolean fileSection = version >= CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION;
+        if (fileSection != retainedFile.isPresent()) {
+            final String why = "snapshot version " + version + (fileSection
+                ? " holds a retained file, and this member keeps the frames on the heap: start it with "
+                : " holds no retained file, and this member keeps the frames in a file: start it without ")
+                + RetainedFile.Config.SETTING + "=true, or start a new chain";
+            System.out.println("sealer RETAINED-FILE FATAL memberId=" + memberId + " " + why);
+            System.out.flush();
+            retained.close();
+            throw new AgentTerminationException(why);
+        }
     }
 
     /**
@@ -375,7 +430,7 @@ public final class SealerClusteredService implements ClusteredService {
     private void startSeeded(final SealerSeed seed) {
         this.state = CanonicalSealerState.seeded(
             seed, dedupCapacity, voidConfig, inclusionHorizonBlocks, window.capacity(), budgets);
-        openEgress(ByteBuffer.allocate(0));
+        openEgress(Optional.empty());
         // The seed head is on L1, so the purge floor starts there. The first
         // snapshot after the seed confirmation is the first purge mark.
         purgeView = PurgeView.EMPTY.withPostedHead(state.postedHead());
@@ -386,13 +441,13 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Open the egress at the state's head, restore the retained frames
-     * {@code retention} holds, and set the retention floor at the posted
-     * head.
+     * Open the egress at the state's head, restore the retention section
+     * of a snapshot or open an empty retention, and set the retention floor
+     * at the posted head.
      */
-    private void openEgress(final ByteBuffer retention) {
-        this.egress = new SealerEgress(cluster, memberId, state.canonicalCount(), state.blockNumber());
-        egress.readSnapshot(retention);
+    private void openEgress(final Optional<ByteBuffer> retention) {
+        this.egress = new SealerEgress(cluster, memberId, retained, state.canonicalCount(), state.blockNumber());
+        retention.ifPresentOrElse(egress::restore, egress::openEmpty);
         egress.setPostedHead(state.postedHead());
     }
 
@@ -932,6 +987,7 @@ public final class SealerClusteredService implements ClusteredService {
         } catch (final IllegalStateException ex) {
             System.out.println("sealer SEED-EPOCH FATAL memberId=" + memberId + ": " + ex.getMessage());
             System.out.flush();
+            retained.close();
             throw new AgentTerminationException(ex);
         }
         if (!confirmed) {
@@ -1079,6 +1135,7 @@ public final class SealerClusteredService implements ClusteredService {
         flushWindow();
         final Boundary boundary = state.onTick(cluster.time());
         egress.offerBoundary(boundary);
+        retained.checkHealth();
         // The status rides every tick, so an observer sees the guard flip
         // and the retention stretch without waiting for a cursor record.
         egress.offerStatus(status());
@@ -1143,7 +1200,9 @@ public final class SealerClusteredService implements ClusteredService {
         // window here, and the snapshot never has to carry held records.
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
-        latestSnapshotVersion = CanonicalSealerState.snapshotWriteVersion();
+        latestSnapshotVersion = retainedFile.isPresent()
+            ? CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION
+            : CanonicalSealerState.snapshotWriteVersion();
         purgeView = purgeView.withMark(new PurgeView.Mark(cluster.logPosition(), state.blockNumber()));
         // Log to stdout, like the role line below. The block= value is the
         // proof of catch-up. The SNAPSHOT action is itself a replicated-log
@@ -1180,7 +1239,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTerminate(Cluster cluster) {
-        // No external resources to release.
+        retained.close();
     }
 
     /** The log position of the last applied entry; 0 before the first. */
@@ -1196,6 +1255,19 @@ public final class SealerClusteredService implements ClusteredService {
     /** Ingress frames of an unknown kind this member dropped. */
     long droppedUnknownKindCount() {
         return unknownKindCount;
+    }
+
+    /** The store of the retained frames. */
+    RetainedFrames retained() {
+        return retained;
+    }
+
+    /**
+     * The position below which the retained file holds whole records, for
+     * the admin thread that serves the file. 0 before the start.
+     */
+    long retainedHead() {
+        return Optional.ofNullable(retained).map(RetainedFrames::publishedHead).orElse(0L);
     }
 
     /** The snapshot marks and the posted head that the log purge plans with. */

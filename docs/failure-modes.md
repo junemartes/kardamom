@@ -164,6 +164,22 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The batcher can always replay from its cursor.
   - The guard bounds the growth. The stretch is at most the budget plus one flush, in heap.
   - The retained frames are in the snapshot. A restored member keeps the floor at the posted head.
+- **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
+  - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
+  - The file is a function of the log. Every member holds the same bytes at the same position.
+  - The snapshot holds the floors, the front and head positions, and the index. It does not hold the frames. The member syncs the file to disk up to the head before it writes the snapshot.
+  - The snapshot is version 12. The switch turns on only with a new chain or a coordinated cut-over: a member with the file stops on an older snapshot, and a member without it stops on version 12.
+  - A restore truncates the file at the head position of the snapshot. The log replay appends the rest.
+  - A restore walks the records from the front to the head. It stops the member when a record is not a whole frame, a boundary is not in the index, or the walk does not end at the head with the counts of the snapshot. The member never serves a partial file. The next start stops again, because the member keeps its recording log. Wipe the cluster and archive directories of the member, and start it: the peer seed copies the file. The steps are in "Recover a member that stops on its retained file" in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
+  - A member that a peer seeds copies the segment files from the admin endpoint of a peer, and walks the copy against the backed-up snapshot. A peer serves only below its published head. After 5 rounds with no copy that passes, the seed stops the start with `GAVE-UP`; wipe the member and start it again, as above. So the file needs `kardamom.cluster.adminPort` and the env var `KARDAMOM_RETAINED_TOKEN`. The token and the bytes travel in cleartext HTTP on the node network.
+  - The purge runs at each snapshot. A segment leaves the disk one to two snapshot intervals after the front passes it. `snapshotIntervalS=0` with the file stops the start.
+  - The status frame gets the tail `retained_bytes`: the bytes of the file above the posted head.
+- **Disk full.** A helper thread writes zeros into each new segment before the member writes to it. A full disk fails that preallocation.
+  - The member logs `sealer RETAINED-FILE FATAL` and stops at its next boundary tick or segment change. Any other I/O error on the file does the same.
+  - The member never takes a different branch than the other members. It stops.
+  - All members retain the same bytes, so disks of one size fill at about the same time. When a quorum stops, the chain stops.
+  - The admin endpoint exports `kardamom_sealer_disk_free_bytes` (`GET /metrics`) and `diskFreeBytes` (`GET /status`).
+  - Recovery: free the disk or add disk. The member restarts, truncates its file at its snapshot, and replays its log.
 - The wire layouts are in [`../cluster/sealer-service/README.md`](../cluster/sealer-service/README.md).
 - Proof: `da-lag-halt` and `prune-floor`. Both run by name with `KARDAMOM_CHAOS_CASES`. They are in no shard.
   - `da-lag-halt` freezes the batcher and lets the sealed head pass the budget. It needs `KARDAMOM_DA_LAG_BUDGET_BLOCKS`, set to the small budget that the cluster runs with.

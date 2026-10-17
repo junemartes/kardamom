@@ -26,6 +26,8 @@ record StateDir(Path root) {
 
     /** Each Aeron process writes its own mark file when it starts. */
     private static final String MARK_FILE_SUFFIX = "-mark.dat";
+    /** The service id of the sealer: the only clustered service of the member. */
+    private static final int SERVICE_ID = 0;
 
     /**
      * Whether the directory holds a recording log with at least one entry.
@@ -43,6 +45,13 @@ record StateDir(Path root) {
                 .ofNullable(log.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID))
                 .map(entry -> entry.logPosition)
                 .orElse(AeronArchive.NULL_POSITION));
+    }
+
+    /** The archive recording of the latest snapshot of the sealer service, or empty when there is none. */
+    Optional<Long> latestServiceSnapshotRecording() {
+        return withRecordingLog(log -> Optional
+                .ofNullable(log.getLatestSnapshot(SERVICE_ID))
+                .map(entry -> entry.recordingId));
     }
 
     /** The log positions of the valid consensus module snapshots, in recording log order. */

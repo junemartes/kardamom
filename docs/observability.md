@@ -59,6 +59,9 @@ Notes on the table:
   - The series are on the executor port with the `host_id` of the executor.
     They show the boundary stream as one executor sees it.
   - For the sealer itself, use the admin port and the log lines (see below).
+- The admin port of each sealer member answers `GET /metrics` with one gauge in the Prometheus text format:
+  - `kardamom_sealer_disk_free_bytes{member_id}` is the free space of the disk that holds the Raft log and the retained file of the member.
+  - The deploy does not scrape it yet.
 
 ### Cluster client metrics
 
