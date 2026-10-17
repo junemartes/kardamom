@@ -236,10 +236,12 @@
   ansible.builtin.set_fact:
     workloads_gate_has_base: "{{ workloads_accepted.target.formats | default('') | length > 0 }}"
 
+# The deploy binary of the release holds the comparison: every release
+# ships it, signed, so the gate needs no other binary.
 - name: Compare the formats of the target with the accepted release
   ansible.builtin.command:
     argv:
-      - "{{ workloads_cluster_binary }}"
+      - "{{ workloads_deploy_binary }}"
       - formats
       - --base
       - "{{ workloads_record_dir }}/accepted.formats.toml"

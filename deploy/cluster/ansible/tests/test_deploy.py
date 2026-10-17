@@ -345,7 +345,8 @@ class Deploys(unittest.TestCase):
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
-        # The operator binary: the smoke, and the format findings of the
+        # One stub for both operator binaries: the smoke of the cluster
+        # binary, and the format findings of the deploy binary for the
         # release gate, which a test scripts in `smoke.sh.findings`.
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
         self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
@@ -370,6 +371,7 @@ class Deploys(unittest.TestCase):
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
+            'workloads_deploy_binary': str(self.smoke),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
