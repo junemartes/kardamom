@@ -1,31 +1,28 @@
 //! The cluster egress watermark thread: folds the cluster's egress
-//! progress into the proxy's on-quorum watermark bus, publishes a
-//! `Sealed` status for every relayed transaction, records its seal
-//! latency, and folds the cluster's
-//! status frames into the proxy's status channel.
+//! progress into the proxy's on-quorum watermark bus, records the seal
+//! latency of every relayed transaction, and folds the cluster's status
+//! frames into the proxy's status channel.
 
 use std::ops::ControlFlow;
 
 use kardamom_cluster_adapter::{LiveCluster, LiveEgress};
 use kardamom_ingress::cluster::{ClusterWatermarkObserver, EgressProgress, Observed};
 use kardamom_ingress::seal_latency::SealClock;
-use kardamom_log::aeron_live::TxStatusPublisherHandle;
-use kardamom_types::{ClusterStatus, QuorumWatermark, TxStatus};
+use kardamom_types::{ClusterStatus, QuorumWatermark};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-/// The watermark thread's state: the egress observer, the watermark bus,
-/// the status publisher, and the stop token. The observer holds the
-/// `!Send` cluster client, so the loop runs a blocking egress poll on a
-/// dedicated std thread. The bus is a tokio `broadcast` channel, so the
-/// send never blocks, and a send with no live receiver is not an error
-/// here. The status publish is fire-and-forget on the Aeron thread.
+/// The watermark thread's state: the egress observer, the seal clock,
+/// the watermark bus, the cluster status channel, and the stop token.
+/// The observer holds the `!Send` cluster client, so the loop runs a
+/// blocking egress poll on a dedicated std thread. The bus is a tokio
+/// `broadcast` channel, so the send never blocks, and a send with no live
+/// receiver is not an error here.
 pub(crate) struct ClusterWatermarkPump {
     observer: ClusterWatermarkObserver<LiveEgress>,
     seal_clock: SealClock,
     tx: broadcast::Sender<QuorumWatermark>,
     cluster_status: watch::Sender<ClusterStatus>,
-    status: TxStatusPublisherHandle,
     stop: CancellationToken,
 }
 
@@ -53,14 +50,12 @@ impl ClusterWatermarkPump {
         seal_clock: SealClock,
         tx: broadcast::Sender<QuorumWatermark>,
         cluster_status: watch::Sender<ClusterStatus>,
-        status: TxStatusPublisherHandle,
     ) -> Self {
         Self {
             observer,
             seal_clock,
             tx,
             cluster_status,
-            status,
             stop: CancellationToken::new(),
         }
     }
@@ -88,9 +83,9 @@ impl ClusterWatermarkPump {
         while let ControlFlow::Continue(()) = self.step() {}
     }
 
-    /// Poll one egress event: send a durable count and publish the
-    /// `Sealed` status of the transaction a frame relayed, or send a
-    /// status to the status channel. `Break` ends the thread: the stop
+    /// Poll one egress event: send a durable count and record the seal
+    /// latency of the transaction a frame relayed, or send a status to the
+    /// status channel. `Break` ends the thread: the stop
     /// token fired, or the observer ended.
     fn step(&mut self) -> ControlFlow<()> {
         if self.stop.is_cancelled() {
@@ -106,23 +101,14 @@ impl ClusterWatermarkPump {
         ControlFlow::Continue(())
     }
 
-    /// Send a frame's durable count, publish the `Sealed` status of the
-    /// transaction it relayed, and record its seal latency.
+    /// Send a frame's durable count, and record the seal latency of the
+    /// transaction it relayed.
     fn forward_progress(&mut self, progress: EgressProgress) {
         if let Some(position) = progress.durable {
             let _ = self.tx.send(QuorumWatermark { position });
         }
         if let Some(tx_hash) = progress.sealed {
             self.seal_clock.sealed(tx_hash);
-            self.publish_sealed(tx_hash);
-        }
-    }
-
-    /// Publish one `Sealed` status. An encode failure is logged and the
-    /// status dropped: the receipt stream stays the truth.
-    fn publish_sealed(&self, tx_hash: alloy_primitives::B256) {
-        if let Err(e) = self.status.publish_best_effort(&TxStatus::sealed(tx_hash)) {
-            tracing::warn!(error = %e, "tx_status publish failed (dropped)");
         }
     }
 }

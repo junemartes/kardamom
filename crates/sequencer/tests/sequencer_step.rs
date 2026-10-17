@@ -1,6 +1,6 @@
 //! Driver-level tests for `Sequencer::run_once` and `run`.
 
-use kardamom_types::{BlockBoundary, TxDataLoc, TxStage};
+use kardamom_types::{BlockBoundary, TxDataLoc};
 use std::num::NonZeroU32;
 
 use kardamom_sequencer::config::SequencerConfig;
@@ -52,11 +52,10 @@ fn past_nonce_emits_duplicate_notification() {
     ));
 }
 
-/// A fee rejection reaches both side channels: the `tx_errors` event for
-/// the parked client, and a `Rejected` status keyed by the transaction's
-/// hash. The transaction is never offered, so no `Offered` status goes out.
+/// A fee rejection reaches the side channel: the `tx_errors` event for
+/// the parked client. The transaction is never offered.
 #[test]
-fn fee_rejection_publishes_the_rejected_status() {
+fn fee_rejection_publishes_the_error() {
     let s = signer(9);
     let env = envelope_with(
         &s,
@@ -67,7 +66,6 @@ fn fee_rejection_publishes_the_rejected_status() {
             ..EnvelopeSpec::default()
         },
     );
-    let tx_hash = env.tx_hash;
     let mut rig = Rig::default();
     rig.push(TxDataLoc::new(0, pos(0)), env);
     let view = LatestBaseFee::new();
@@ -87,14 +85,8 @@ fn fee_rejection_publishes_the_rejected_status() {
         errs[0].reason,
         kardamom_sequencer::TxErrorReason::FeeTooLow { .. }
     ));
-    let statuses = rig.statuses();
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].tx_hash, tx_hash);
-    assert!(matches!(
-        &statuses[0].stage,
-        TxStage::Rejected { sender, nonce: 0, reason: kardamom_sequencer::TxErrorReason::FeeTooLow { .. } }
-            if *sender == s.address()
-    ));
+    assert_eq!(errs[0].sender, s.address());
+    assert_eq!(errs[0].nonce, 0);
 }
 
 #[test]

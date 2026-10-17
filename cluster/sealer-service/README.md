@@ -205,7 +205,7 @@ re-offer ordered twice. It never evicts an id. It prunes by deadline.
 | `PAST_DEADLINE` | kind 7 | It drops the ledger entry. It reports the error to the client. The client resubmits. |
 | `WINDOW_FULL` | kind 8 | It republishes the record later. The next tick that passes a deadline frees space. |
 
-- `PAST_DEADLINE` reaches a client as the `past-deadline` reason and as a JSON-RPC error. See [the client JSON-RPC API](../../docs/json-rpc.md) and [the status events](../../docs/tx-status-events.md).
+- `PAST_DEADLINE` reaches a client as the `past-deadline` reason and as a JSON-RPC error. See [the client JSON-RPC API](../../docs/json-rpc.md).
 - `WINDOW_FULL` is back-pressure. The sealer takes no decision on the record.
 - `dedupCapacity` is a hard cap. The default is `1 << 17` (131072 ids), about 20 MB of heap and 4 MB of snapshot.
   - An id stays in the window for at most `inclusionHorizonBlocks + 1` blocks.

@@ -117,11 +117,8 @@ tx_receipts_stream_id = 1002
 tx_errors_channel = "aeron:udp?endpoint=239.192.56.17:40030|interface={{ env "meta.node_ip" }}/32|ttl=1"
 tx_errors_stream_id = 1015
 
-# --- TxStatus: one record per step a transaction takes. The sequencers
-# publish Offered and Rejected, the ingress publishes Sealed, best effort;
-# the notifier subscribes. RAM only. Own group .29:40090, stream 1018.
-tx_status_channel = "aeron:udp?endpoint=239.192.56.29:40090|interface={{ env "meta.node_ip" }}/32|ttl=1"
-tx_status_stream_id = 1018
+# --- Stream 1018 and group .29:40090 stay reserved. In a rolling deploy, a
+# process of the release before can still publish on them.
 
 # --- TxDeposits: DA watcher publishes Deposit envelopes; sequencers subscribe.
 tx_deposits_channel = "aeron:udp?endpoint=239.192.56.19:40040|interface={{ env "meta.node_ip" }}/32|ttl=1"
@@ -138,7 +135,7 @@ tx_remote_epochs_stream_id = 1017
 # resumed), at once on a change and on a 5 s heartbeat. Every service
 # publishes, best effort; the ingress and the validator subscribe. RAM
 # only. Nothing that changes the canonical order reads it. Own group
-# .31:40100, stream 1019 (1018 is the transaction status stream). The term
+# .31:40100, stream 1019 (1018 stays reserved, see above). The term
 # length is 64 KiB, the Aeron minimum: every subscriber driver holds one
 # image of three terms per publisher, and the driver default (4 MiB) makes
 # that about 190 MB on an ingress node. The discovery plane sets the same

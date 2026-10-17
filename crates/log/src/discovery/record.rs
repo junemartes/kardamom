@@ -26,7 +26,6 @@ pub enum Topic {
     TxReceipts,
     TxReceiptBoundaries,
     TxErrors,
-    TxStatus,
     TxDeposits,
     TxRemoteEpochs,
     TxBal,
@@ -43,7 +42,6 @@ impl Topic {
             Self::TxReceipts => "tx_receipts",
             Self::TxReceiptBoundaries => "tx_receipt_boundaries",
             Self::TxErrors => "tx_errors",
-            Self::TxStatus => "tx_status",
             Self::TxDeposits => "tx_deposits",
             Self::TxRemoteEpochs => "tx_remote_epochs",
             Self::TxBal => "tx_bal",
@@ -67,7 +65,6 @@ impl Topic {
             | Self::TxReceipts
             | Self::TxReceiptBoundaries
             | Self::TxErrors
-            | Self::TxStatus
             | Self::TxDeposits
             | Self::TxRemoteEpochs
             | Self::TxBal
@@ -82,7 +79,6 @@ impl Topic {
             "tx_receipts" => Some(Self::TxReceipts),
             "tx_receipt_boundaries" => Some(Self::TxReceiptBoundaries),
             "tx_errors" => Some(Self::TxErrors),
-            "tx_status" => Some(Self::TxStatus),
             "tx_deposits" => Some(Self::TxDeposits),
             "tx_remote_epochs" => Some(Self::TxRemoteEpochs),
             "tx_bal" => Some(Self::TxBal),

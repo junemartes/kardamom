@@ -249,7 +249,9 @@ L1Cursor = "7 0x0707070707070707070707070707070707070707070707070707070707070707
 # Frozen layout. The rkyv records on the Aeron streams and in the tx_data
 # archives: receipts, block deltas, boundaries, service events, transaction
 # status, transaction errors, and transaction envelopes. An enum adds a
-# variant only at the end.
+# variant only at the end. No service of this release publishes or reads
+# the transaction status stream; its layout stays while a supported
+# release writes it.
 [format.aeron-stream-records]
 writes = 1
 reads_min = 1
@@ -272,17 +274,6 @@ ServiceEvent = "rkyv size 64 align 8"
 TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
-
-# Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
-# stage code reads as no stage.
-[format.notifier-outbox]
-writes = 1
-reads_min = 1
-reads_max = 1
-shared = false
-code = ["crates/notifier/src/outbox.rs#pub struct OutboxRecord"]
-[format.notifier-outbox.layout]
-OutboxRecord = "rkyv size 120 align 8"
 
 # Frozen layout. The Redis cache keys and values. Redis keeps no data on
 # disk, and the cache is advisory. A new layout uses a new key prefix.
@@ -322,6 +313,10 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 [coordinated]
 
 [retired]
+
+[retired.notifier-outbox]
+version = 1
+reason = "This release has no notifier. Only the notifier writes and reads its outbox (shared = false), so no other service reads it."
 
 # Frozen layout. The canary's nonce journal: one serde JSON file per ring
 # account. A file that does not parse stops the canary at start; the

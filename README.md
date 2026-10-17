@@ -27,7 +27,6 @@ The repository has these parts.
 | `kardamom-batcher` | Posts the canonical stream to L1 through EigenDA. It also builds `kardamom-da-store`, `kardamom-archive-rereplicate`, `kardamom-proof-submitter`, `kardamom-batch-claimer` and `kardamom-batch-watcher`. |
 | `kardamom-da-watcher` | Tails finalized L1 blocks. It republishes deposits into the pipeline. |
 | `kardamom-validator` | Re-executes every block. On a divergence, it halts and stays up. |
-| `kardamom-notifier` | Serves transaction status events to clients. |
 | `kardamom-canary` | Uses the chain as a user does and reports each success and each failure as a metric. |
 | `kardamom-state-mirror` | Writes the Redis projection of the account state, next to each executor. |
 | `kardamom-l1-indexer` | The L1 follower. It reads the finalized L1 once per finality step, publishes each block on the `l1_blocks` stream, and archives the batches and the epoch inputs. |
@@ -247,7 +246,6 @@ Beyond `cargo test`, two suites answer different questions.
 | [`docs/l1-data-path.md`](docs/l1-data-path.md) | The batcher, the EigenDA proxy, the settlement contract, the inbox indexer, the L1 followers and `kardamom-reconstruct`. |
 | [`docs/json-rpc.md`](docs/json-rpc.md) | The client JSON-RPC API of the ingress: methods, errors, receipt fields, fee RPCs and subscriptions. |
 | [`docs/priority-fees.md`](docs/priority-fees.md) | Priority fees from end to end. |
-| [`docs/tx-status-events.md`](docs/tx-status-events.md) | The notifier: the WebSocket status feed and the webhooks. |
 | [`docs/STYLE.md`](docs/STYLE.md) | The code style rules and the checks that `just style` runs. |
 | [`deploy/cluster/README.md`](deploy/cluster/README.md) | The cluster deploy: the local container profile, recipes, environment switches and images. |
 | [`deploy/cluster/PRODUCTION.md`](deploy/cluster/PRODUCTION.md) | The production profile: role placement, bootstrap, enrollment, and host and network settings. |

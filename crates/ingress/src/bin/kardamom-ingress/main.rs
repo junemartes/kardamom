@@ -32,9 +32,7 @@ use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{DEFAULT_MAX_TX_BYTES, IngressConfig, IngressFileConfig};
 use kardamom_ingress::proxy::{IngressHandle, IngressProxy};
 use kardamom_ingress::seal_latency::{SealClock, SealStamps};
-use kardamom_log::aeron_live::{
-    AeronRuntime, ServiceEventsPublisherHandle, TxStatusPublisherHandle,
-};
+use kardamom_log::aeron_live::{AeronRuntime, ServiceEventsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_log::recorder::RecorderThreads;
@@ -449,8 +447,8 @@ impl IngressService {
     /// into the proxy's on-quorum watermark bus. No standalone sealer
     /// publishes the durable watermark in the cluster-only topology, so this
     /// is the source of it: a record or boundary on egress is a
-    /// Raft-quorum-durability signal. The same session publishes the
-    /// `Sealed` status of every relayed transaction on `status`.
+    /// Raft-quorum-durability signal. The same session times the seal of
+    /// every relayed transaction on `seal_clock`.
     ///
     /// Returns the running thread's handle. Dropping it stops the thread
     /// and ends the cluster session.
@@ -458,7 +456,6 @@ impl IngressService {
         &self,
         subscription: &LiveIngressSubscription,
         ingress_endpoints: Option<String>,
-        status: TxStatusPublisherHandle,
         seal_clock: SealClock,
     ) -> Result<watermark::ClusterWatermark> {
         let args = &self.args;
@@ -484,12 +481,11 @@ impl IngressService {
             seal_clock,
             subscription.watermark_sender(),
             subscription.cluster_status_sender(),
-            status,
         )
         .spawn(guard)
         .context("spawn cluster watermark thread")?;
         tracing::info!(
-            "kardamom-ingress: on-quorum watermark and tx_status Sealed via Aeron Cluster egress"
+            "kardamom-ingress: on-quorum watermark and seal latency via Aeron Cluster egress"
         );
         Ok(running)
     }
@@ -515,19 +511,14 @@ impl IngressService {
         Ok(())
     }
 
-    /// Open the status publisher and start the egress tap on `opened`.
+    /// Start the egress tap on `opened`.
     async fn spawn_egress_tap(
         &self,
         opened: &mut OpenedAeron,
         seal_clock: SealClock,
     ) -> Result<watermark::ClusterWatermark> {
         let members = opened.plane.cluster_ingress_endpoints().await?;
-        let status = opened
-            .plane
-            .publisher::<TxStatusPublisherHandle>(&opened.rt)
-            .await
-            .context("open TxStatusPublisherHandle")?;
-        self.spawn_cluster_watermark(&opened.subscription, members, status, seal_clock)
+        self.spawn_cluster_watermark(&opened.subscription, members, seal_clock)
     }
 
     /// Whether the CLI or the config file names a cluster egress channel.
@@ -560,24 +551,25 @@ impl IngressService {
         // stamps: the full or closed channel drops them.
         let (stamps, seal_clock) = SealClock::pair();
         let mut opened = self.open_aeron_side(&cfg.live_accounts, stamps).await?;
-        // The egress tap is the `Sealed` publisher of the status stream,
-        // and under a quorum policy also the source of the durable
-        // watermark. It runs whenever an egress channel is configured. A
-        // quorum policy needs it, so a failure to connect is fatal there;
-        // under any other policy the ingress serves without it, so a
-        // cluster that is down at start never keeps the front door shut.
+        // The egress tap times the seal of each transaction and carries the
+        // cluster status, and under a quorum policy it is also the source
+        // of the durable watermark. It runs whenever an egress channel is
+        // configured. A quorum policy needs it, so a failure to connect is
+        // fatal there; under any other policy the ingress serves without
+        // it, so a cluster that is down at start never keeps the front
+        // door shut.
         let cluster_watermark = if cfg.ack_policy.requires_quorum() {
             Some(self.spawn_egress_tap(&mut opened, seal_clock).await?)
         } else if self.has_egress_channel() {
             self.spawn_egress_tap(&mut opened, seal_clock)
                 .await
                 .inspect_err(|e| {
-                    tracing::warn!(error = %e, "kardamom-ingress: cluster egress tap not started; tx_status Sealed is not published");
+                    tracing::warn!(error = %e, "kardamom-ingress: cluster egress tap not started; the seal latency is not recorded");
                 })
                 .ok()
         } else {
             tracing::warn!(
-                "kardamom-ingress: no cluster egress channel; tx_status Sealed is not published"
+                "kardamom-ingress: no cluster egress channel; the seal latency is not recorded"
             );
             None
         };

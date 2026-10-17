@@ -58,8 +58,7 @@ The streams and their publishers:
 | `tx_data` (one record per lane) | ingress | sequencer, executor, validator, batcher, ingress archives |
 | `tx_receipts` | executor | ingress, sequencer, validator |
 | `tx_receipt_boundaries` | executor | ingress |
-| `tx_errors` | sequencer | ingress, notifier |
-| `tx_status` | sequencer, ingress | notifier |
+| `tx_errors` | sequencer | ingress |
 | `tx_deposits` | DA watcher | sequencer, DA watcher archive |
 | `tx_remote_epochs` | DA watcher | sequencer |
 | `tx_bal` | executor | validator |
@@ -297,11 +296,11 @@ No job configures a publication control port.
 
 | Job | Publications |
 | --- | --- |
-| ingress | 8 `tx_data` lanes, `tx_status` |
+| ingress | 8 `tx_data` lanes |
 | executor | receipts, boundaries, BAL, the live `exec_txs` publication |
 | da-watcher | deposits, remote epochs (subscribes to `l1_blocks` and `events`) |
 | l1-indexer | `l1_blocks`, `events` |
-| sequencer lane `n` | `tx_errors`, `tx_status` |
+| sequencer lane `n` | `tx_errors` |
 
 The aeron system job registers the archive record with the `archive_topics`
 meta of the node:

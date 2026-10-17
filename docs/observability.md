@@ -23,7 +23,6 @@ Set the address with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`.
 | `kardamom-ingress` | `127.0.0.1:9006` | `0.0.0.0:9006` | `kardamom-ingress` |
 | `kardamom-validator` | `127.0.0.1:9007` | `0.0.0.0:9006` | `kardamom-validator` |
 | `kardamom-state-mirror` | `127.0.0.1:9007` | `0.0.0.0:9007` | `kardamom-state-mirror` |
-| `kardamom-notifier` | `127.0.0.1:9008` | `0.0.0.0:9008` | `kardamom-notifier` |
 | `kardamom-canary` | `127.0.0.1:9012` | `0.0.0.0:9012` | `kardamom-canary` |
 | `kardamom-l1-indexer` | `127.0.0.1:9549` | `0.0.0.0:9009` | none |
 
@@ -43,7 +42,7 @@ Notes on the table:
 - The monitoring job scrapes each exporter by its Consul node name: `<class>-<i>.node.<datacenter>.consul:<port>`.
   The job renders the targets from the node-class counts (`executor_count`, `sequencer_count`, `ingress_count`).
   A larger class gets its targets at the next deploy.
-- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower, the notifier and the canary) are targets in every health state.
+- The services that Consul lists (the validator, the da-watcher, the batcher, the L1 follower and the canary) are targets in every health state.
   A halt or a pause fails `/ready` by design, so Consul marks the service critical. A healthy-only list would drop the target exactly when the halt and pause alerts need its metrics.
   A dead process stays a registered target and reads as `up == 0`.
 
@@ -167,7 +166,6 @@ It answers 503 with the failed conditions when the rule does not hold.
 | `kardamom-state-mirror` | `kardamom_state_mirror_serving == 1`. |
 | `kardamom-da-watcher` | The last tick (`kardamom_da_watcher_last_tick_unix_seconds`) is fresher than two poll periods plus 10 s. |
 | `kardamom-l1-indexer` | Now is before the planned wake time (`kardamom_l1_follower_next_wake_seconds`) plus one poll interval and 10 s. A follower sleeps between finality steps, so a rule on the last tick would fail between steps. |
-| `kardamom-notifier` | Liveness only. |
 | `kardamom-canary` | Liveness only. A failed probe is a metric, not a readiness failure. |
 
 - `--ready-lag-blocks` (env `KARDAMOM_READY_LAG_BLOCKS`, default 8) is a flag of the executor and the validator.
@@ -228,7 +226,6 @@ Each dashboard is a JSON file in `deploy/grafana/provisioning/dashboards-json/`.
 | `kardamom-da-watcher` | The L1 watcher. |
 | `kardamom-validator` | The validator. |
 | `kardamom-state-mirror` | The account-state mirror. |
-| `kardamom-notifier` | The status feed and the webhooks. |
 | `kardamom-canary` | The transaction canary: the success ratio per probe and per endpoint, the failures by outcome, the stage latencies, the last success, the balances, the feed gaps and the stalled accounts. |
 
 - A dashboard queries `kardamom`-scoped metrics of its service.
@@ -521,30 +518,6 @@ All canary metrics start with `kardamom_canary_`. The dashboard is `kardamom-can
 | `pool_external_total` | Pool activity of another account between two canary calls. It is not a fault. |
 | `rwa_supply_tokens` | The test RWA token's total supply. |
 | `topups_total{outcome}` | Top-ups of ring accounts from the first one. |
-
-### Notifier
-
-All notifier metrics start with `kardamom_notifier_`. The dashboard is `kardamom-notifier`.
-See [tx-status-events.md](tx-status-events.md) for the feed and the webhooks.
-
-| Metric | Meaning |
-| --- | --- |
-| `events_total{stage}` | Status events that the ring stored. |
-| `duplicates_total` | Events dropped because the transaction already held the stage. |
-| `unresolved_errors_total` | `tx_errors` records that the ring could not join to a hash. |
-| `evicted_total` | Events that the ring evicted by age or by count. |
-| `ring_events`, `ring_transactions` | Events and transactions in the ring. |
-| `ws_subscriptions` | Open WebSocket subscriptions. |
-| `ws_events_total` | Events sent to WebSocket subscribers. |
-| `ws_lagged_total` | Lag markers sent to slow WebSocket subscribers. |
-| `webhook_subscriptions{owned}` | Webhook subscriptions that this instance holds. |
-| `webhook_feed_lagged_total` | Live events that the webhook fan-out missed. |
-| `webhook_queue_full_total{subscription}` | Events dropped by a full worker queue. |
-| `outbox_appended_total{subscription}` | Events appended to an outbox. |
-| `outbox_delivered_total{subscription,outcome}` | Events finished by a delivery loop. The outcomes are `delivered` and `gave_up`. |
-| `outbox_backlog_bytes{subscription}` | Bytes of an outbox that are not delivered. |
-| `webhook_attempts_total{outcome}` | Webhook POST attempts. The outcomes are `ok`, `status`, and `error`. |
-| `webhook_delivery_seconds` | Histogram of the time from event arrival to delivery. |
 
 ### State mirror
 

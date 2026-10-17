@@ -50,11 +50,11 @@
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
+use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
 use crate::config::{ConfigError, SequencerConfig};
@@ -120,17 +120,16 @@ struct RefMetadata {
 }
 
 /// The identity of one observed envelope: what every report about it
-/// names. The hash is the status stream's key.
+/// names.
 #[derive(Clone, Copy, Debug)]
 struct Observed {
     sender: Address,
     nonce: u64,
-    tx_hash: B256,
 }
 
 /// One `Sequencer::run_once` iteration's port set: the `tx_data`
-/// subscription, the `tx_ordering` publisher, and the side channels
-/// (`tx_errors`, `tx_status`). Groups the three bounds behind one type
+/// subscription, the `tx_ordering` publisher, and the side channel
+/// (`tx_errors`). Groups the three bounds behind one type
 /// parameter, instead of three separate ones on `run_once` and `run`.
 pub trait SequencerPorts: Send {
     type In: TxDataSubscriber;
@@ -337,20 +336,6 @@ impl Sequencer {
         rc.publish_error(err);
     }
 
-    /// Publish a rejection on both side channels: the `tx_errors` event
-    /// for the receipt feed, and the `Rejected` status for the status
-    /// feed. Silent for a sender in shadow mode, like `publish_error`.
-    fn publish_rejection<R>(&self, rc: &mut R, tx_hash: B256, err: TxError)
-    where
-        R: SideChannelPublisher,
-    {
-        if self.in_shadow(err.sender) {
-            return;
-        }
-        rc.publish_status(TxStatus::rejected(tx_hash, &err));
-        rc.publish_error(err);
-    }
-
     /// End shadow mode when the warm-up has passed. After the warm-up,
     /// this replica's buffers are a superset of the old shard's live
     /// state for the incoming slots, so publishing in parallel is safe:
@@ -488,7 +473,7 @@ impl Sequencer {
             .collect();
         let (_, b, rc) = ports.split();
         let (published, err) = b.try_publish_ref_batch(&refs);
-        self.record_published_prefix(rc, rest, published, ctx);
+        self.record_published_prefix(rest, published, ctx);
         match err {
             None => ControlFlow::Continue(()),
             Some(SequencerError::Backpressure) => {
@@ -508,25 +493,22 @@ impl Sequencer {
     /// commit. The whole batch can vanish in a dead-leader window exactly
     /// like a single offer, so every ref in the accepted prefix enters
     /// the unconfirmed ledger individually.
-    fn record_published_prefix<R: SideChannelPublisher>(
+    fn record_published_prefix(
         &mut self,
-        rc: &mut R,
         rest: &mut std::collections::VecDeque<(Address, u64, RefMetadata)>,
         published: usize,
         ctx: &'static str,
     ) {
         for (sender, n, meta) in rest.drain(..published) {
-            self.record_one_published(rc, sender, n, meta, ctx);
+            self.record_one_published(sender, n, meta, ctx);
         }
     }
 
     /// One published ref, for [`Self::record_published_prefix`]'s loop:
-    /// bumps the publish metric, traces it, publishes its `Offered`
-    /// status, and (if resync is active) records it in the unconfirmed
-    /// ledger.
-    fn record_one_published<R: SideChannelPublisher>(
+    /// bumps the publish metric, traces it, and (if resync is active)
+    /// records it in the unconfirmed ledger.
+    fn record_one_published(
         &mut self,
-        rc: &mut R,
         sender: Address,
         n: u64,
         meta: RefMetadata,
@@ -539,7 +521,6 @@ impl Sequencer {
             ctx,
             "published ref"
         );
-        rc.publish_status(TxStatus::offered(meta.tx_hash, sender, n));
         self.state.clear_refused(sender, n);
         if self.resync.is_some() {
             self.unconfirmed.record_published(sender, n, meta);
@@ -570,7 +551,7 @@ impl Sequencer {
         meta: RefMetadata,
     ) {
         if self.state.is_refused(sender, nonce) {
-            self.report_evicted(rc, sender, nonce, meta.tx_hash);
+            self.report_evicted(rc, sender, nonce);
             return;
         }
         self.state.reinsert_for_retry(sender, nonce, meta);
@@ -673,8 +654,8 @@ impl Sequencer {
         R: SideChannelPublisher,
     {
         let now = Instant::now();
-        for (sender, nonce, meta) in self.state.sweep_expired(now, 256) {
-            self.report_expired(rc, sender, nonce, meta.tx_hash);
+        for (sender, nonce, _) in self.state.sweep_expired(now, 256) {
+            self.report_expired(rc, sender, nonce);
         }
         self.shadow_tick(now);
         let depths = self.state.pending_depth_by(vslot_for);
@@ -688,7 +669,7 @@ impl Sequencer {
 
     /// One expired entry, for [`Self::expiry_tick`]'s loop: count it,
     /// trace it, and report `Expired` to the client.
-    fn report_expired<R>(&self, rc: &mut R, sender: Address, nonce: u64, tx_hash: B256)
+    fn report_expired<R>(&self, rc: &mut R, sender: Address, nonce: u64)
     where
         R: SideChannelPublisher,
     {
@@ -699,9 +680,8 @@ impl Sequencer {
             "pending entry expired after tx_ttl; reporting Expired"
         );
         let expected_nonce = self.state.next_nonce(sender);
-        self.publish_rejection(
+        self.publish_error(
             rc,
-            tx_hash,
             TxError {
                 sender,
                 nonce,
@@ -710,23 +690,18 @@ impl Sequencer {
         );
     }
 
-    /// Tell a client its transaction failed a fee check, on both side
-    /// channels. The transaction never enters the state machine, so it
+    /// Tell a client its transaction failed a fee check, on the side
+    /// channel. The transaction never enters the state machine, so it
     /// holds no nonce slot and the client signs again at once.
     fn report_fee_reject<R>(&self, rc: &mut R, observed: Observed, reason: TxErrorReason)
     where
         R: SideChannelPublisher,
     {
-        let Observed {
-            sender,
-            nonce,
-            tx_hash,
-        } = observed;
+        let Observed { sender, nonce } = observed;
         self.hot.fee_rejected.increment(1);
         trace!(sender = ?sender, nonce, ?reason, "fee check failed; reporting it");
-        self.publish_rejection(
+        self.publish_error(
             rc,
-            tx_hash,
             TxError {
                 sender,
                 nonce,
@@ -739,14 +714,13 @@ impl Sequencer {
     /// subscribers, that it will never be sequenced. A silent eviction
     /// would leave the client waiting forever, with its later nonces
     /// permanently gapped.
-    fn report_evicted<R>(&self, rc: &mut R, sender: Address, nonce: u64, tx_hash: B256)
+    fn report_evicted<R>(&self, rc: &mut R, sender: Address, nonce: u64)
     where
         R: SideChannelPublisher,
     {
         let expected_nonce = self.state.next_nonce(sender);
-        self.publish_rejection(
+        self.publish_error(
             rc,
-            tx_hash,
             TxError {
                 sender,
                 nonce,
@@ -826,11 +800,7 @@ impl Sequencer {
         // calls `recover_signer()`.
         let fields = decode_fields(&envelope.raw_tx)?;
         let nonce = fields.nonce;
-        let observed = Observed {
-            sender,
-            nonce,
-            tx_hash: envelope.tx_hash,
-        };
+        let observed = Observed { sender, nonce };
         let tip = match self.fees.admit(sender, &fields.fees) {
             Ok(tip) => tip,
             Err(reason) => {
@@ -885,11 +855,7 @@ impl Sequencer {
     where
         R: SideChannelPublisher,
     {
-        let Observed {
-            sender,
-            nonce,
-            tx_hash,
-        } = observed;
+        let Observed { sender, nonce } = observed;
         match result.outcome {
             NonceOutcome::Matched | NonceOutcome::Reoffered => {}
             NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
@@ -899,14 +865,11 @@ impl Sequencer {
             NonceOutcome::BufferedDisabled => {
                 self.hot.buffered_future.increment(1);
             }
-            NonceOutcome::BufferedEvicting {
-                evicted_nonce,
-                evicted,
-            } => {
+            NonceOutcome::BufferedEvicting { evicted_nonce, .. } => {
                 self.hot.buffered_future.increment(1);
                 self.hot.evictions.increment(1);
                 self.request_lookup(sender);
-                self.report_evicted(rc, sender, evicted_nonce, evicted.tx_hash);
+                self.report_evicted(rc, sender, evicted_nonce);
             }
             NonceOutcome::RejectedTooFar { nonce: rejected } => {
                 // The furthest-future nonce is shed to protect the
@@ -914,7 +877,7 @@ impl Sequencer {
                 // within the window. This counts as an eviction for
                 // observability (a load shed, not a wedge).
                 self.hot.evictions.increment(1);
-                self.report_evicted(rc, sender, rejected, tx_hash);
+                self.report_evicted(rc, sender, rejected);
             }
             NonceOutcome::Past => self.record_past_outcome(sender, nonce),
         }
@@ -1006,9 +969,8 @@ impl Sequencer {
         if self.proven_executed(sender, nonce) {
             return;
         }
-        self.publish_rejection(
+        self.publish_error(
             rc,
-            observed.tx_hash,
             TxError {
                 sender,
                 nonce,

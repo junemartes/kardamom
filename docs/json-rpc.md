@@ -7,7 +7,7 @@ receipt fields, the errors and the limits.
 - The server is `jsonrpsee`. HTTP serves the request-response methods. WebSocket serves the same methods and the subscription.
 - Health: `GET /health` on the same port answers `200 ok`. It answers `503 draining` from the start of a shutdown drain. A load balancer reads it.
 - The method set is a subset of the Ethereum API, plus the `kardamom_*` methods.
-- The notifier feed for transaction status is a separate service on a separate port. See [Transaction status events](tx-status-events.md).
+- There is no separate status feed. See [Transaction status](#transaction-status).
 
 ## Methods
 
@@ -38,7 +38,7 @@ receipt fields, the errors and the limits.
   - The timeout is 30 seconds. The `--pending-receipt-timeout-ms` flag (env `KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS`) sets it.
 - `kardamom_sendRawTransactionAsync` validates the transaction and publishes it. It returns the hash at once.
   - Use it to keep many transactions in flight on one connection.
-  - A rejection by the sequencer does not reach this call. It reaches the client through the receipt subscription or the status feed.
+  - A rejection by the sequencer does not reach this call. It reaches the client through the receipt subscription.
 - Both methods check the transaction in this order:
   1. Overload: refuse if too many submissions wait.
   2. Drain: refuse if the ingress is in shutdown drain.
@@ -166,7 +166,17 @@ A receipt is an Ethereum receipt with two more fields.
 
 - `null` means "not committed yet". It also means that the query was shed or failed. Poll again.
 - A transaction that the sequencer rejected never gets a receipt. The call returns `null` for it for ever.
-- The receipt is the truth. Use the status feed only for early information.
+- The receipt is the truth.
+
+### Transaction status
+
+The ingress is the one source of transaction status. A client follows a transaction in one of these ways:
+
+- Poll `eth_getTransactionReceipt`. A transaction that the sequencer or the sealer rejected never gets a receipt.
+- Use `eth_sendRawTransaction`. The call returns when the receipt arrives, or returns the rejection as an error.
+- Subscribe with `kardamom_subscribeReceipts`. A `txError` frame carries the rejection reason. See [Receipt subscription](#receipt-subscription).
+
+Kardamom has no notifier service. Issue #640 records the removal of the service, its status feed (`kardamom_subscribeTxStatus`) and its webhooks. A separate notification publisher does not fit the 50 ms target from submit to receipt.
 
 ## Receipt subscription
 
@@ -287,7 +297,6 @@ An error `-32010` means that the chain, or this ingress, does not take submits n
 
 ## Further reading
 
-- [Transaction status events](tx-status-events.md): the notifier feed and the webhooks.
 - [Priority fees](priority-fees.md): the fee rules, the admission checks and the settlement.
 - [Failure modes](failure-modes.md): how the ingress behaves when other actors fail. The section [halts and service events](failure-modes.md#halts-and-service-events) has the halt model.
 - [Runbooks](runbooks/README.md): one runbook for each halt cause.

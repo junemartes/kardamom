@@ -527,7 +527,7 @@ After a failed shard, the cluster stays up. The failure dump (`crates/chaos/src/
   - The docker driver removes a dead container, so the Nomad events are the record that stays.
   - The two records tell a kernel OOM kill from an external `SIGKILL` and from a Nomad kill.
 
-The jobs in the dump are `aeron`, `anvil`, `cluster`, `sealer`, `sequencer`, `executor`, `validator`, `ingress`, `batcher`, `da-watcher`, `l1-fault-proxy`, `l1-indexer`, `redis`, `state-mirror`, `notifier` and `monitoring`.
+The jobs in the dump are `aeron`, `anvil`, `cluster`, `sealer`, `sequencer`, `executor`, `validator`, `ingress`, `batcher`, `da-watcher`, `l1-fault-proxy`, `l1-indexer`, `redis`, `state-mirror` and `monitoring`.
 
 The harness reads each task log through the control agent of Nomad.
 

@@ -86,7 +86,7 @@ With priority fees on, the sequencer checks every transaction before it parks or
 - The base fee for `FeeTooLow` is the base fee of the next block. The sequencer computes it from the newest block boundary that it has seen. It can lag by a few blocks. Before the first boundary it is zero, so a cold replica admits every cap.
 - The balance comes from the local account layer. A sender that the layer does not hold passes. The executor is the truth: a transaction that cannot pay at its block becomes a skip receipt.
 - The ingress maps all three reasons to JSON-RPC code `-32000`. The messages have the shape of the geth messages. See [Client JSON-RPC API](json-rpc.md#errors).
-- The same reasons reach a subscriber as `fee-invalid`, `fee-too-low` and `insufficient-funds`. See [Transaction status events](tx-status-events.md).
+- The same reasons reach a subscriber as `fee-invalid`, `fee-too-low` and `insufficient-funds`. See [Receipt subscription](json-rpc.md#receipt-subscription).
 - The metric is `kardamom_sequencer_fee_rejected_total{partition}`. It counts the rejections of the three checks.
 - There is no tip floor. The sequencer never rejects a transaction for a low tip.
 - With priority fees off, the sequencer skips these checks. Every transaction gets a bid of zero.
@@ -151,7 +151,6 @@ The ingress serves the fee methods. A wallet prices a transaction as on Ethereum
 ## Further reading
 
 - [Client JSON-RPC API](json-rpc.md)
-- [Transaction status events](tx-status-events.md)
 - [Sealer README](../cluster/sealer-service/README.md)
 - [Deploy README](../deploy/cluster/README.md)
 - [Design record: priority fees](specs/2026-10-01-priority-fees.md)

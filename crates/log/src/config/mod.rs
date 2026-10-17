@@ -359,13 +359,6 @@ pub struct ChannelsConfig {
     pub tx_errors_channel: ChannelUri,
     pub tx_errors_stream_id: i32,
 
-    /// `TxStatus`: one record per step a transaction takes (offered,
-    /// sealed, rejected). The sequencers and the ingress publish, best
-    /// effort; the notifier subscribes. RAM only, not recorded: a client
-    /// signal, not canonical state.
-    pub tx_status_channel: ChannelUri,
-    pub tx_status_stream_id: i32,
-
     /// `TxDeposits`: the DA watcher publishes full `Deposit` envelopes here.
     /// The M sequencers subscribe and republish a `DepositRef` onto
     /// `tx_ordering`, so the canonical order interleaves L1 deposits with
@@ -500,7 +493,7 @@ impl ChannelsConfig {
 
     /// The id of every stream except the `tx_data` lanes, with the key
     /// that sets it.
-    fn single_stream_ids(&self) -> [(&'static str, i32); 11] {
+    fn single_stream_ids(&self) -> [(&'static str, i32); 10] {
         [
             ("tx_receipts_stream_id", self.tx_receipts_stream_id),
             (
@@ -508,7 +501,6 @@ impl ChannelsConfig {
                 self.tx_receipts_boundary_stream_id(),
             ),
             ("tx_errors_stream_id", self.tx_errors_stream_id),
-            ("tx_status_stream_id", self.tx_status_stream_id),
             ("tx_deposits_stream_id", self.tx_deposits_stream_id),
             (
                 "tx_remote_epochs_stream_id",
@@ -695,11 +687,6 @@ impl Default for ChannelsConfig {
             // between the receipt block (1002, 1003) and the
             // fsync-watermark block (1010).
             tx_errors_stream_id: 1015,
-            // 1018 follows tx_remote_epochs (1017) and stays clear of
-            // every other block: receipts (1002, 1003), BAL (1004), fsync
-            // (1010), tx_errors (1015), tx_deposits (1016).
-            tx_status_channel: "aeron:ipc?alias=tx-status".into(),
-            tx_status_stream_id: 1018,
             tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
             tx_deposits_stream_id: 1016,
             // 1017 sits next to tx_deposits (1016), the stream it mirrors. It
@@ -707,10 +694,11 @@ impl Default for ChannelsConfig {
             // (1004), fsync (1010), tx_errors (1015).
             tx_remote_epochs_channel: "aeron:ipc?alias=tx-remote-epochs".into(),
             tx_remote_epochs_stream_id: 1017,
-            // 1019 leaves 1018 to the transaction status stream and stays
-            // clear of every other block: receipts (1002, 1003), BAL
-            // (1004), fsync (1010), tx_errors (1015), tx_deposits (1016),
-            // tx_remote_epochs (1017).
+            // 1019 skips 1018, which stays reserved: in a rolling deploy,
+            // a process of the release before can still publish on it.
+            // 1019 stays clear of every other block: receipts (1002,
+            // 1003), BAL (1004), fsync (1010), tx_errors (1015),
+            // tx_deposits (1016), tx_remote_epochs (1017).
             events_channel: "aeron:ipc?alias=events".into(),
             events_stream_id: 1019,
             // 1004 sits in the free range between the receipt block

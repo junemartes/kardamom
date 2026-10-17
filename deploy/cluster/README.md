@@ -31,7 +31,7 @@ The local profile defines these classes:
 |-------|-------|------|
 | `control` | 1 | Nomad and Consul server, Docker registry, anvil (the in-cluster L1) |
 | `sequencer` | 2 | 2 lanes with 2 racing replicas each. One job group per lane (`seq-<lane>`, expanded by the Nomad HCL). The metrics port is `9001 + 10 * lane`. |
-| `ingress` | 2 | The active/active JSON-RPC front door (`:8545`) and the notifier status feed (`:8547`). Role `redis`. Instance 1 also has role `redis-replica`. |
+| `ingress` | 2 | The active/active JSON-RPC front door (`:8545`). Role `redis`. Instance 1 also has role `redis-replica`. |
 | `executor` | 3 | State-machine replica appliers (libmdbx state). The state mirror runs here too. |
 | `sealer` | 3 | A 3-member Aeron Cluster (Raft). The Java `cluster` job orders the transactions. The Raft log and its archive hold the canonical log. |
 | `aux` | 1 | The service roles `redis`, `redis-primary`, `batcher`, `monitoring`, `validator`, `da-watcher` and `indexer`. |
@@ -189,7 +189,7 @@ The `update` stanza of each job:
 | `ingress`, `sequencer` | 1 | `checks` | 15s | `true` | `canary = var.canary`, `auto_promote = false` |
 | `cluster` (sealer) | 1 | `checks` | 60s | `false` | One task group for each member |
 | `executor`, `validator`, `batcher`, `state-mirror` | 1 | `checks` | 15s | `false` | |
-| `notifier`, `canary` | 1 | `checks` | 10s | `false` | |
+| `canary` | 1 | `checks` | 10s | `false` | |
 | `da-watcher`, `l1-indexer`, `l1-light-client`, `da-proxy`, `da-store` | 1 | `task_states` | 10s | `false` | |
 | `aeron` (system job) | 1 | `task_states` | 15s | not set | `stagger = "30s"` |
 
@@ -446,7 +446,7 @@ ansible-playbook -i localhost, deploy/cluster/ansible/images.yml
 
 - `aeron`, `redis` and `cluster` (the Java sealer).
 - `l1-light-client`, built from the pinned helios release binary (`docker/helios/Dockerfile`). The build checks the SHA-256 of the release asset.
-- The 12 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy`, `notifier` and `canary`.
+- The 11 Rust service images of `roles/images/defaults/main.yml`: `ingress`, `sequencer`, `executor`, `validator`, `da-watcher`, `batcher`, `state-mirror`, `l1-indexer`, `da-store`, `l1-fault-proxy` and `canary`.
 
 The build:
 
@@ -536,7 +536,6 @@ deploy/cluster/
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
     state-mirror.nomad.hcl  redis.nomad.hcl  monitoring.nomad.hcl
-    notifier.nomad.hcl      the transaction status feed and webhooks, on the ingress nodes
     canary.nomad.hcl        the transaction canary, on the monitoring node
     da-proxy.nomad.hcl      the EigenDA proxy, on an EigenDA network
     da-store.nomad.hcl      the file-backed stand-in for it, without one

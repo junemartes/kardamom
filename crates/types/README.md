@@ -16,7 +16,7 @@ you have the wrong crate.
 - `Receipt`, `WireLog` — per-tx execution receipt + log entry
 - `BlockBoundaryStart`, `BlockBoundary` — block markers (no state root; `BlockBoundary` carries the block's `base_fee` and `gas_used`)
 - `TxError`, `TxErrorReason` — sequencer rejection signal on `tx_errors`; the reasons are `DuplicatedTx`, `Evicted`, `Expired`, `PastDeadline`, `FeeInvalid`, `FeeTooLow`, `InsufficientFunds`, `DaLag` (`sealed_head`, `posted_head`, `budget_blocks`: the sealer refused the tx on its DA-lag guard) `RecordLag` (`sealed_index`, `recorded_index`, `budget`: the sealer refused the tx on its record-lag guard) `SealerNonceAhead` (`expected_nonce`, `chain_nonce`: the sealer's nonce guard is above the chain after a skip) and `NonceInFlight` (`chain_nonce`: the guard is ahead, but the receipts have not settled yet); `TxErrorReason::word` gives the reason word that a client sees
-- `TxStatus`, `TxStage` — one step of a tx on the `tx_status` stream (`Offered`, `Sealed`, `Executed`, `Rejected`); `TxStageKind` is the stage without its payload
+- `tx_status::TxStatus`, `tx_status::TxStage` — the frozen record layout of the `tx_status` stream (id 1018). No service of this release publishes or reads the stream; `formats.toml` keeps the layout while a supported release writes it
 - `FeeSchedule` — the genesis `[fees]` section: `base_fee_initial` and `beneficiary`
 - `BlockFees` — the base fee and the tip beneficiary of one block; `BlockFees::NONE` is the chain with no schedule
 - `TxFees` — the fee fields of one tx: the ordering bid, the effective tip rate, the tip amount and the worst-case cost

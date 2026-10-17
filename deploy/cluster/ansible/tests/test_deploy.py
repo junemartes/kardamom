@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSIBLE = Path(__file__).resolve().parents[1]
 SERVICES = ['aeron', 'cluster', 'redis', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher',
-            'batcher', 'state-mirror', 'notifier', 'da-store', 'canary']
+            'batcher', 'state-mirror', 'da-store', 'canary']
 # The images the manifest pins beyond the default deployment: the jobs a
 # real L1 or the chaos-l1 shard adds.
 MANIFEST = SERVICES + ['l1-indexer', 'l1-fault-proxy']
@@ -392,7 +392,7 @@ class Deploys(unittest.TestCase):
 
     # The jobs a manifest with new digests changes, in deploy order: every
     # pinned image, and not anvil or the monitoring.
-    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror', 'notifier',
+    REPINNED = ['aeron', 'cluster', 'sequencer', 'redis', 'ingress', 'executor', 'state-mirror',
                 'validator', 'da-watcher', 'da-store', 'l1-indexer', 'batcher']
 
     def record(self):
@@ -425,7 +425,7 @@ class DeployTest(Deploys):
         self.run_deploy(environ=local_canary)
         self.assertIn('-Daeron.archive.file.sync.level=1', json.dumps(self.api.state['jobs']['aeron']))
         expected = ['aeron', 'anvil', 'cluster', 'sequencer', 'redis', 'ingress', 'executor',
-                    'state-mirror', 'notifier', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
+                    'state-mirror', 'validator', 'da-watcher', 'node-exporter', 'monitoring',
                     'da-store', 'l1-indexer', 'batcher', 'canary']
         self.assertEqual(self.api.state['writes'], expected)
         exporter = self.api.state['jobs']['node-exporter']['TaskGroups'][0]['Tasks'][0]['Config']['args']
@@ -832,7 +832,7 @@ class DeployTest(Deploys):
                    for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
         self.assertEqual({name for name, _ in parties}, {
             'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
-            'state-mirror', 'notifier', 'l1-indexer'})
+            'state-mirror', 'l1-indexer'})
         liveness_ns = tolerance * 1_000_000
         for name, task in parties:
             if name not in jvm_options:
@@ -1202,7 +1202,7 @@ class RollbackTest(Deploys):
         # The followers register before the role waits for the executor, so
         # the attempt reached them too.
         reverted = [w for w in self.api.state['writes'] if w.startswith('revert:')]
-        self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:notifier:0', 'revert:state-mirror:0',
+        self.assertEqual(reverted, ['revert:da-watcher:0', 'revert:validator:0', 'revert:state-mirror:0',
                                     'revert:executor:0', 'revert:ingress:0', 'revert:redis:0', 'revert:sequencer:0',
                                     'revert:aeron:0'])
         self.assertEqual(self.api.state['writes'].count('cluster'), 3)
@@ -1239,7 +1239,7 @@ class RollbackTest(Deploys):
         # the jobs before it recorded.
         self.api.state['deployments']['executor'] = Deployment('executor', ['failed'])
         self.run_rollback(success=False)
-        done = ['batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'notifier', 'state-mirror']
+        done = ['batcher', 'l1-indexer', 'da-store', 'da-watcher', 'validator', 'state-mirror']
         self.assertEqual(self.record()['attempt']['rolled_back'], done)
         self.assertEqual(self.record()['attempt']['status'], 'accepted', 'the rollback is not complete')
         self.assertEqual(self.api.state['writes'], [f'revert:{job}:0' for job in done + ['executor']])
