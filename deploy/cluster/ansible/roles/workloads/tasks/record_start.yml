@@ -28,8 +28,12 @@
   ansible.builtin.set_fact:
     workloads_target_formats: "{{ lookup('file', workloads_formats_file, rstrip=false) }}"
 
-# The same text always has the same hash, so a write of a stored text
-# changes nothing. The record refers to the text by its hash.
+- name: Keep the reference to the formats of the target
+  ansible.builtin.set_fact:
+    workloads_target_formats_ref: "sha256:{{ workloads_target_formats | hash('sha256') }}"
+
+# The variable of a text is named by the hash of the text, so it holds the
+# same text at each write. The record refers to the text by its hash.
 - name: Store the formats of the target
   ansible.builtin.uri:
     url: >-
@@ -46,7 +50,7 @@
         formats: "{{ workloads_target_formats }}"
   changed_when: true
   vars:
-    workloads_target_formats_hash: "{{ workloads_target_formats | hash('sha256') }}"
+    workloads_target_formats_hash: "{{ workloads_target_formats_ref | regex_replace('^sha256:', '') }}"
 
 - name: Compose the attempt record
   ansible.builtin.set_fact:
@@ -58,7 +62,7 @@
       target:
         revision: "{{ workloads_target_revision }}"
         manifest: "{{ workloads_image_refs }}"
-        formats: "sha256:{{ workloads_target_formats | hash('sha256') }}"
+        formats: "{{ workloads_target_formats_ref }}"
         decision_version: "{{ workloads_gate_decision_version | default('') }}"
       before:
         revision: "{{ workloads_accepted.target.revision | default('') }}"

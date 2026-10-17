@@ -1099,8 +1099,8 @@ class RecordTest(Deploys):
         self.assertIn('cluster', self.api.state['writes'])
 
     def test_a_record_with_the_formats_text_gates_and_then_refers_to_it(self):
-        # A record written before the references holds the registry text
-        # itself, and no formats variable exists.
+        # The record holds the registry text itself, and no formats
+        # variable exists.
         self.run_deploy()
         for document in self.record().values():
             document['target']['formats'] = FORMATS

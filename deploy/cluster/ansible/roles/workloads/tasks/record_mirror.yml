@@ -16,9 +16,9 @@
     label: "{{ item.key }}"
   check_mode: false
 
-# A record refers to the formats as sha256:<hex>, the variable
-# <formats path>/<hex>. A record written before the references holds the
-# text itself.
+# A record holds the formats as the reference sha256:<hex> to the variable
+# <formats path>/<hex>, or as the text itself. The mirror writes the text in
+# both cases.
 - name: Read the formats of the accepted release
   ansible.builtin.uri:
     url: >-
