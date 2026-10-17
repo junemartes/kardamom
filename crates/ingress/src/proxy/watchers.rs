@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxError};
 
-use crate::channels::{IngressPublication, IngressSubscription};
+use crate::channels::{IngressPublication, IngressSubscription, ReceiptItem};
 use crate::fee_history::FeeHistory;
 use crate::pending::PendingReceipts;
 use crate::receipt_cache::ReceiptCache;
@@ -47,13 +47,15 @@ where
     pub(super) fn spawn_tx_receipts_watcher(&self) {
         BroadcastWatcher::new(
             self.subscription.subscribe_receipts(),
-            TxReceiptsWatcher::new(
-                self.pending.clone(),
-                self.cache.clone(),
-                self.tx_error_dedup.clone(),
-                self.receipt_feed.clone(),
-                self.fee_history.clone(),
-            ),
+            TxReceiptsWatcher {
+                pending: self.pending.clone(),
+                cache: self.cache.clone(),
+                seen: SeenReceipts::default(),
+                error_dedup: self.tx_error_dedup.clone(),
+                feed: self.receipt_feed.clone(),
+                fee_history: self.fee_history.clone(),
+                latest: self.latest_block_number.clone(),
+            },
         )
         .spawn();
     }
@@ -181,31 +183,14 @@ struct TxReceiptsWatcher {
     cache: Arc<ReceiptCache>,
     seen: SeenReceipts,
     error_dedup: Arc<TxErrorDedup>,
-    feed: broadcast::Sender<Receipt>,
+    feed: broadcast::Sender<ReceiptItem>,
     fee_history: Arc<FeeHistory>,
+    /// The head that `eth_blockNumber` reads. A rollback lowers it.
+    latest: Arc<AtomicU64>,
 }
 
 impl TxReceiptsWatcher {
-    fn new(
-        pending: Arc<PendingReceipts>,
-        cache: Arc<ReceiptCache>,
-        error_dedup: Arc<TxErrorDedup>,
-        feed: broadcast::Sender<Receipt>,
-        fee_history: Arc<FeeHistory>,
-    ) -> Self {
-        Self {
-            pending,
-            cache,
-            seen: SeenReceipts::default(),
-            error_dedup,
-            feed,
-            fee_history,
-        }
-    }
-}
-
-impl Watch<Receipt> for TxReceiptsWatcher {
-    async fn on_item(&mut self, receipt: Receipt) {
+    async fn on_receipt(&mut self, receipt: Receipt) {
         // First-wins: `insert` returns false if the hash was already
         // present. That means this is a duplicate replica copy, so drop
         // it.
@@ -224,8 +209,34 @@ impl Watch<Receipt> for TxReceiptsWatcher {
         // This re-broadcasts the deduped event to subscription-mode
         // clients. `send` errors only when no subscriber exists, which is
         // fine.
-        let _ = self.feed.send(receipt.clone());
+        let _ = self.feed.send(receipt.clone().into());
         self.pending.on_receipt(sender, nonce, receipt).await;
+    }
+
+    /// An executor voided the receipts above `to_block`. Drop them from
+    /// the cache, the fee history and the head. Forget the seen hashes, so
+    /// a transaction that comes again with its old hash passes. The feed
+    /// carries the rollback on, and each receipt subscription ends on it.
+    fn on_rollback(&mut self, rollback: kardamom_types::ReceiptRollback) {
+        let to_block = rollback.to_block;
+        tracing::warn!(
+            to_block,
+            "an executor rolled back: dropping the receipts above the block"
+        );
+        self.cache.roll_back(to_block);
+        self.seen.clear();
+        self.fee_history.roll_back(to_block);
+        self.latest.fetch_min(to_block, Ordering::AcqRel);
+        let _ = self.feed.send(ReceiptItem::Rollback(rollback));
+    }
+}
+
+impl Watch<ReceiptItem> for TxReceiptsWatcher {
+    async fn on_item(&mut self, item: ReceiptItem) {
+        match item {
+            ReceiptItem::Receipt(receipt) => self.on_receipt(receipt).await,
+            ReceiptItem::Rollback(rollback) => self.on_rollback(rollback),
+        }
     }
 }
 

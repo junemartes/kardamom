@@ -70,7 +70,7 @@ type Proxy = IngressProxy<MockChannels, MockChannels>;
 /// the monotone `tx_ordering` position counter shared across shards.
 #[derive(Clone)]
 struct PumpPorts {
-    receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    receipt_bus: tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
     nonces: Arc<HashMap<B256, u64>>,
     position: Arc<AtomicI32>,
 }
@@ -136,7 +136,7 @@ fn reflect_one(ports: &PumpPorts, envelope: &kardamom_types::TxEnvelope) {
         nonce,
         ..Default::default()
     };
-    let _ = ports.receipt_bus.send(receipt);
+    let _ = ports.receipt_bus.send(receipt.into());
 }
 
 /// A production quorum watermark is a periodic egress-progress

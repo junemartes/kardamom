@@ -1,5 +1,6 @@
 //! The executed-truth observations the receipts stream gives the
-//! sequencer, and what each one proves about the nonce of its sender.
+//! sequencer, what each one proves about the nonce of its sender, and the
+//! rollback that voids the observations above a block.
 
 use alloy_primitives::Address;
 
@@ -17,6 +18,26 @@ use alloy_primitives::Address;
 pub struct FloorUpdate {
     pub sender: Address,
     pub outcome: Outcome,
+    /// The block of the receipt that gives the evidence. `None` for a
+    /// lookup answer: the committed state of an executor has no single
+    /// block of evidence, and a rollback does not reset it.
+    pub block: Option<u64>,
+}
+
+/// One item of the floor channel, in the order of the receipt stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorEvent {
+    /// One executed-truth observation.
+    Update(FloorUpdate),
+    /// An executor rolled its state back: the receipts above `to_block`
+    /// are void, and so is each floor that one of them set.
+    Rollback { to_block: u64 },
+}
+
+impl From<FloorUpdate> for FloorEvent {
+    fn from(update: FloorUpdate) -> Self {
+        Self::Update(update)
+    }
 }
 
 /// What one [`FloorUpdate`] proves about its sender.
@@ -109,6 +130,7 @@ impl FloorUpdate {
         Self {
             sender: receipt.from,
             outcome,
+            block: Some(receipt.block_number),
         }
     }
 
@@ -118,6 +140,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Executed { nonce },
+            block: None,
         }
     }
 
@@ -127,6 +150,16 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Skipped { nonce, reason },
+            block: None,
+        }
+    }
+
+    /// The same update, as evidence of a receipt in `block`.
+    #[must_use]
+    pub fn in_block(self, block: u64) -> Self {
+        Self {
+            block: Some(block),
+            ..self
         }
     }
 
@@ -136,6 +169,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Deposit,
+            block: None,
         }
     }
 }

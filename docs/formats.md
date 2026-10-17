@@ -61,6 +61,7 @@ The layout tests of the frozen formats:
 | `batcher-cursor` | `kardamom-batcher` | the JSON of a fixed sample |
 | `l1-cursor` | `kardamom-da-watcher` | the line of a fixed sample, and its parse |
 | `aeron-stream-records` | `kardamom-types` | rkyv archived size and alignment of the seven record types |
+| `receipt-rollback` | `kardamom-types` | rkyv archived size and alignment of `ReceiptRollback` |
 | `notifier-outbox` | `kardamom-notifier` | rkyv archived size and alignment of `OutboxRecord` |
 | `redis-cache` | `kardamom-cache` | the keys of fixed samples |
 | `canary-journal`, `canary-store`, `canary-market` | `kardamom-canary` | the JSON of fixed samples |
@@ -188,6 +189,7 @@ proves each one.
 | da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |
 | Sealer feed control | The member reads the first 25 bytes of a replay request on stream 1007 and ignores a longer tail. It drops a shorter message or another kind, with `sealer FEED ... DROPPED`. The executor writes the request and resends it after 2 s with no answer. | A later release can add a field at the tail of the request. An older member answers it from the first 25 bytes. |
 | Sealer egress reader | `EgressItem::decode` reads the fields of a kind that it knows and ignores the bytes after them. On the member feed, the answers (kinds 3, 4, 11 and 16) carry the request id as an 8-byte tail after the 17 bytes of the egress layout. The golden frame `feed_replay_done` is a feed answer that the egress reader reads as kind 4. | The member feed and the cluster egress share one codec. A field added at the tail of a frame does not break a reader of the release before. |
+| `tx_receipts` receipt stream | A frame of 8 bytes is a `ReceiptRollback`. Every other frame is a `ReceiptBatch`, which holds at least one receipt and so is longer. A reader of the release before fails to decode the rollback frame as a batch, logs it, and skips it. | A rolling deploy can publish the rollback record before every consumer reads it. A consumer of the release before keeps the receipts above the rollback, as before. |
 | Batcher cursor | serde JSON. The reader ignores a field it does not know. A new field gets `#[serde(default)]`. | The cursor of either release reads in the other. |
 
 ## Not in the registry

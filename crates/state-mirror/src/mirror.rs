@@ -1,12 +1,13 @@
 //! The mirror actor: apply every receipt batch to Redis, publish the
-//! head, and decide when a rebuild is due.
+//! head, and decide when a rebuild is due. A rollback frame of an
+//! executor clears the projection, and a rebuild follows.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kardamom_cache::AccountCache;
-use kardamom_log::aeron_live::TxReceiptsReceiver;
-use kardamom_types::{BPosition, ReceiptBatch};
+use kardamom_log::aeron_live::{ReceiptFrame, TxReceiptsReceiver};
+use kardamom_types::{BPosition, ReceiptBatch, ReceiptRollback};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -29,6 +30,7 @@ enum RebuildReason {
     Regression,
     Outage,
     Audit,
+    Rollback,
 }
 
 impl RebuildReason {
@@ -39,6 +41,7 @@ impl RebuildReason {
             Self::Regression => "regression",
             Self::Outage => "outage",
             Self::Audit => "audit",
+            Self::Rollback => "rollback",
         }
     }
 }
@@ -66,17 +69,13 @@ pub(crate) struct Mirror {
     rebuild: Rebuild,
     audit_every: Option<Duration>,
     shutdown: CancellationToken,
-    /// The highest batch end applied in this process, as an index.
-    applied: u64,
-    /// The rebuild that runs on the next batch, if any.
-    pending_rebuild: Option<RebuildReason>,
+    progress: Progress,
     last_rebuild: Instant,
     head_persisted: Instant,
 }
 
 impl Mirror {
     pub(crate) fn new(inputs: MirrorInputs) -> Self {
-        let pending_rebuild = inputs.force_rebuild.then_some(RebuildReason::Forced);
         Self {
             cache: inputs.cache,
             receipts: inputs.receipts,
@@ -87,8 +86,7 @@ impl Mirror {
             audit_every: (inputs.audit_hours > 0)
                 .then(|| Duration::from_secs(inputs.audit_hours.saturating_mul(3_600))),
             shutdown: inputs.shutdown,
-            applied: 0,
-            pending_rebuild,
+            progress: Progress::new(inputs.force_rebuild.then_some(RebuildReason::Forced)),
             last_rebuild: Instant::now(),
             head_persisted: Instant::now(),
         }
@@ -96,22 +94,46 @@ impl Mirror {
 
     /// Run until shutdown or the subscription closes.
     pub(crate) async fn run(mut self) -> Result<()> {
-        if self.pending_rebuild.is_none() {
-            self.pending_rebuild = self.resume_or_rebuild().await;
+        if self.progress.pending_rebuild.is_none() {
+            self.progress.pending_rebuild = self.resume_or_rebuild().await;
         }
         crate::metrics::set_serving(true);
         loop {
-            let batch = tokio::select! {
+            let frame = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return Ok(()),
-                batch = self.receipts.recv_batch() => batch,
+                frame = self.receipts.recv_frame() => frame,
             };
-            let Some((_, batch)) = batch else {
+            let Some((_, frame)) = frame else {
                 info!("tx_receipts closed; the mirror stops");
                 return Ok(());
             };
-            self.apply(batch).await?;
+            self.on_frame(frame).await?;
         }
+    }
+
+    /// Apply one frame, in stream order.
+    async fn on_frame(&mut self, frame: ReceiptFrame) -> Result<()> {
+        match frame {
+            ReceiptFrame::Batch(batch) => self.apply(batch).await,
+            ReceiptFrame::Rollback(rollback) => self.roll_back(rollback).await,
+        }
+    }
+
+    /// An executor rolled back: the receipts and rows above
+    /// `to_block` can be gone. The receipt index has no block index, and
+    /// the rows of the lost blocks carry positions above the new stream,
+    /// so the monotone rule would keep them. Thus the mirror deletes the
+    /// whole projection, and the next batch starts a rebuild from the
+    /// newest checkpoint of the executor.
+    async fn roll_back(&mut self, rollback: ReceiptRollback) -> Result<()> {
+        warn!(
+            to_block = rollback.to_block,
+            "an executor rolled back; clearing the projection"
+        );
+        self.write_until_landed(&Write::Clear).await?;
+        self.progress.roll_back();
+        Ok(())
     }
 
     /// Decide at start: resume when Redis carries a live head at or beyond
@@ -143,10 +165,11 @@ impl Mirror {
         let Some(end) = batch.end_tx_idx() else {
             return Ok(());
         };
-        if let Some(reason) = self.pending_rebuild.take() {
+        if let Some(reason) = self.progress.pending_rebuild.take() {
             self.run_rebuild(reason, end).await?;
         }
-        self.write_batch(&batch, end).await?;
+        self.write_until_landed(&Write::Batch { batch: &batch, end })
+            .await?;
         self.advance(end).await
     }
 
@@ -164,17 +187,17 @@ impl Mirror {
         Ok(())
     }
 
-    /// Write a batch's rows and receipts. A failure retries until the
-    /// write lands or shutdown. An outage past the bound schedules a
-    /// rebuild, because frames may have been lost behind the mirror.
-    async fn write_batch(&mut self, batch: &ReceiptBatch, end: BPosition) -> Result<()> {
+    /// Run one write. A failure retries until the write lands or
+    /// shutdown. An outage past the bound schedules a rebuild, because
+    /// frames may have been lost behind the mirror.
+    async fn write_until_landed(&mut self, write: &Write<'_>) -> Result<()> {
         let started = Instant::now();
         loop {
-            match self.try_write(batch, end).await {
+            match self.try_write(write).await {
                 Ok(()) => break,
                 Err(e) => {
                     crate::metrics::record_write_retry();
-                    warn!(error = %e, "batch write failed; retrying");
+                    warn!(error = %e, write = write.label(), "write failed; retrying");
                 }
             }
             tokio::select! {
@@ -183,23 +206,30 @@ impl Mirror {
             }
         }
         if started.elapsed() > OUTAGE_REBUILD_AFTER {
-            self.pending_rebuild = Some(RebuildReason::Outage);
+            self.progress.pending_rebuild = Some(RebuildReason::Outage);
         }
         Ok(())
     }
 
-    async fn try_write(&self, batch: &ReceiptBatch, end: BPosition) -> Result<()> {
-        let written = self.cache.write_rows(end, &batch.accounts).await?;
-        self.cache.write_receipts(&batch.receipts).await?;
-        crate::metrics::record_batch(written.disagreed);
+    async fn try_write(&self, write: &Write<'_>) -> Result<()> {
+        match write {
+            Write::Batch { batch, end } => {
+                let written = self.cache.write_rows(*end, &batch.accounts).await?;
+                self.cache.write_receipts(&batch.receipts).await?;
+                crate::metrics::record_batch(written.disagreed);
+            }
+            Write::Clear => {
+                let deleted = self.cache.clear_projection().await?;
+                info!(deleted, "projection cleared");
+            }
+        }
         Ok(())
     }
 
     /// Publish the head, wait for a replica, persist the local head, and
     /// schedule the audit rebuild when it is due.
     async fn advance(&mut self, end: BPosition) -> Result<()> {
-        self.applied = self.applied.max(end.as_index());
-        let head = BPosition::from_index(self.applied);
+        let head = self.progress.advance(end);
         if let Err(e) = self.cache.set_head(self.id, head).await {
             warn!(error = %e, "head publish failed; the next batch retries");
         }
@@ -208,17 +238,104 @@ impl Mirror {
             Ok(_) => {}
             Err(e) => warn!(error = %e, "WAIT failed"),
         }
-        crate::metrics::set_head(self.applied);
+        crate::metrics::set_head(head.as_index());
         if self.head_persisted.elapsed() >= HEAD_PERSIST_EVERY {
-            self.head.write(self.applied).context("persist the head")?;
+            self.head
+                .write(head.as_index())
+                .context("persist the head")?;
             self.head_persisted = Instant::now();
         }
         if self
             .audit_every
             .is_some_and(|every| self.last_rebuild.elapsed() >= every)
         {
-            self.pending_rebuild = Some(RebuildReason::Audit);
+            self.progress.pending_rebuild = Some(RebuildReason::Audit);
         }
         Ok(())
+    }
+}
+
+/// One Redis write of the mirror, retried as a unit.
+enum Write<'a> {
+    /// A batch's rows and receipts, at the batch end.
+    Batch {
+        batch: &'a ReceiptBatch,
+        end: BPosition,
+    },
+    /// The delete of the whole projection after a rollback.
+    Clear,
+}
+
+impl Write<'_> {
+    /// The `write` field of the retry log line.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Batch { .. } => "batch",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// How far the mirror got in this process, and the rebuild it owes.
+struct Progress {
+    /// The highest batch end applied since the start or the last
+    /// rollback, as an index.
+    applied: u64,
+    /// The rebuild that runs on the next batch, if any.
+    pending_rebuild: Option<RebuildReason>,
+}
+
+impl Progress {
+    fn new(pending_rebuild: Option<RebuildReason>) -> Self {
+        Self {
+            applied: 0,
+            pending_rebuild,
+        }
+    }
+
+    /// Take a batch end into the head, and return the head.
+    fn advance(&mut self, end: BPosition) -> BPosition {
+        self.applied = self.applied.max(end.as_index());
+        BPosition::from_index(self.applied)
+    }
+
+    /// Start again after a rollback. The new stream has lower positions
+    /// than the lost blocks, so the head follows it from zero. The
+    /// projection is gone, so the next batch rebuilds it.
+    fn roll_back(&mut self) {
+        self.applied = 0;
+        self.pending_rebuild = Some(RebuildReason::Rollback);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Progress, RebuildReason};
+    use kardamom_types::BPosition;
+
+    /// After a rollback, the head follows the lower positions of the new
+    /// stream, and the next batch runs a rollback rebuild.
+    #[test]
+    fn a_rollback_lowers_the_head_and_schedules_a_rebuild() {
+        let mut progress = Progress::new(None);
+        assert_eq!(progress.advance(BPosition::from_index(900)).as_index(), 900);
+        assert_eq!(progress.advance(BPosition::from_index(700)).as_index(), 900);
+        progress.roll_back();
+        assert_eq!(progress.pending_rebuild, Some(RebuildReason::Rollback));
+        assert_eq!(progress.advance(BPosition::from_index(700)).as_index(), 700);
+        assert_eq!(RebuildReason::Rollback.label(), "rollback");
+    }
+
+    /// A rollback replaces a rebuild that is already due: one rebuild
+    /// after the clear covers both.
+    #[test]
+    fn a_rollback_replaces_a_due_rebuild() {
+        let mut progress = Progress::new(Some(RebuildReason::Forced));
+        progress.roll_back();
+        assert_eq!(
+            progress.pending_rebuild.take(),
+            Some(RebuildReason::Rollback)
+        );
+        assert_eq!(progress.pending_rebuild, None);
     }
 }

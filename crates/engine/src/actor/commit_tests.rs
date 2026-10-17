@@ -404,3 +404,56 @@ fn commit_thread_exits_after_the_total_budget_without_a_subscriber() {
     );
     assert_eq!(*reopens.lock().unwrap(), 1, "one reopen, then the exit");
 }
+
+/// Records the rollback record and each receipt, in publish order, and
+/// rejects the first rollback attempt.
+struct RollbackPub {
+    log: Arc<Mutex<Vec<String>>>,
+    rollback_fails: u32,
+}
+
+impl TxReceiptsPublication for RollbackPub {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        let entry = match msg {
+            CMessage::Receipt(r) => format!("receipt {}", r.tx_idx.as_index()),
+            CMessage::BlockBoundary(b) => format!("boundary {}", b.block_number),
+        };
+        self.log.lock().unwrap().push(entry);
+        Ok(())
+    }
+
+    fn publish_rollback(
+        &mut self,
+        rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        if self.rollback_fails > 0 {
+            self.rollback_fails -= 1;
+            return Err(ExecutorError::State("not yet".into()));
+        }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("rollback {}", rollback.to_block));
+        Ok(())
+    }
+}
+
+/// A run that restored an older state publishes its rollback record
+/// before its first receipt, with the must-deliver retry.
+#[test]
+fn the_rollback_goes_out_before_the_first_receipt() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let rx = feed_commits(vec![ExecToCommit::Receipt(receipt(0xAB, 9))]);
+    let publication = RollbackPub {
+        log: log.clone(),
+        rollback_fails: 2,
+    };
+    let rollback = kardamom_types::ReceiptRollback { to_block: 4 };
+    CommitLoop::new(publication, rx)
+        .announcing(Some(rollback))
+        .spawn()
+        .join()
+        .expect("no panic")
+        .expect("ok");
+    assert_eq!(*log.lock().unwrap(), ["rollback 4", "receipt 9"]);
+}

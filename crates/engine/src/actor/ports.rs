@@ -8,7 +8,7 @@
 //! optional layers compose as `Either<Outer<Either<Inner<P>, P>>,
 //! Either<Inner<P>, P>>`; nesting further composes the same way.
 
-use kardamom_types::{BlockBoundary, BlockDelta, ReceiptRows, TxRef};
+use kardamom_types::{BlockBoundary, BlockDelta, ReceiptRollback, ReceiptRows, TxRef};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -46,6 +46,20 @@ pub trait TxReceiptsPublication: Send {
         publish_each(items, |item| {
             self.publish(CMessage::Receipt(item.receipt.clone()))
         })
+    }
+
+    /// Publish the record that voids the receipts above
+    /// `rollback.to_block`, before the first receipt of a run that
+    /// restored an older state. A sink with no consumer of the record, the
+    /// default, has nothing to publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the transport rejects or cannot deliver the
+    /// record.
+    fn publish_rollback(&mut self, rollback: ReceiptRollback) -> Result<(), ExecutorError> {
+        let _ = rollback;
+        Ok(())
     }
 
     /// Open the publication again, on a new session, after it stayed
@@ -153,6 +167,13 @@ impl<A: TxReceiptsPublication, B: TxReceiptsPublication> TxReceiptsPublication f
         match self {
             Self::Left(a) => a.publish_receipts(items),
             Self::Right(b) => b.publish_receipts(items),
+        }
+    }
+
+    fn publish_rollback(&mut self, rollback: ReceiptRollback) -> Result<(), ExecutorError> {
+        match self {
+            Self::Left(a) => a.publish_rollback(rollback),
+            Self::Right(b) => b.publish_rollback(rollback),
         }
     }
 

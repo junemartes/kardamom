@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kardamom_cache::AccountCache;
+use kardamom_state::BlockRange;
 use kardamom_state::checkpoint::latest_checkpoint;
 use kardamom_state::{StateEnvBuilder, StateSnapshot, restore_newest_readable};
 use kardamom_types::{AccountRow, BPosition};
@@ -143,7 +144,7 @@ impl Rebuild {
         first_live: BPosition,
         tried: &mut TriedCheckpoint,
     ) -> Result<Option<RebuildSnapshot>> {
-        let Some(newest) = latest_checkpoint(&self.checkpoints_dir)? else {
+        let Some(newest) = latest_checkpoint(&self.checkpoints_dir, BlockRange::ANY)? else {
             warn!(dir = %self.checkpoints_dir.display(), "rebuild: no checkpoint yet");
             return Ok(None);
         };

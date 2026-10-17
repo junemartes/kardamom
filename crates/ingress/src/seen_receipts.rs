@@ -69,6 +69,15 @@ impl SeenReceipts {
         true
     }
 
+    /// Forgets every hash. After a rollback, a transaction can come again
+    /// with its old hash in a new block. A copy of a receipt from before
+    /// the rollback can then pass once more, which the idempotent sinks
+    /// allow.
+    pub(crate) fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.set.len()
@@ -110,6 +119,16 @@ mod tests {
         assert_eq!(s.len(), 8);
         // Inserting any of them again is a duplicate.
         assert!(!s.insert(B256::repeat_byte(3)));
+    }
+
+    #[test]
+    fn a_hash_is_new_again_after_a_clear() {
+        let mut s = SeenReceipts::new(capacity(4));
+        let h = B256::repeat_byte(0xAB);
+        assert!(s.insert(h));
+        s.clear();
+        assert!(s.insert(h), "a cleared hash reads as new");
+        assert!(!s.insert(h));
     }
 
     #[test]

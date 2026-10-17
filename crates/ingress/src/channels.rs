@@ -20,10 +20,32 @@ use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
     AccountRow, BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxError,
+    ReceiptRollback, TxEnvelope, TxError,
 };
 
 use crate::error::IngressError;
+
+/// One item of the ordered `tx_receipts` bus. The bus keeps the order of
+/// the stream, so a rollback applies after every receipt before it and
+/// before every receipt after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "almost every item is a receipt: a box adds one allocation per receipt and saves nothing"
+)]
+pub enum ReceiptItem {
+    /// An executed transaction's receipt.
+    Receipt(Receipt),
+    /// An executor rolled its state back: the receipts above `to_block`
+    /// are void.
+    Rollback(ReceiptRollback),
+}
+
+impl From<Receipt> for ReceiptItem {
+    fn from(receipt: Receipt) -> Self {
+        Self::Receipt(receipt)
+    }
+}
 
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
 /// sender-sharded `tx_data` streams. `partition_for(envelope.sender, K)`
@@ -45,11 +67,11 @@ pub trait IngressPublication: Send + Sync + 'static {
 /// and client release; the quorum-watermark stream, for ack gating; and
 /// the `tx_receipts` `BlockBoundary` stream, for `eth_blockNumber`.
 pub trait IngressSubscription: Send + Sync + 'static {
-    /// Stream of enriched `Receipt`s observed on `tx_receipts`. Drives the
-    /// in-memory `tx_hash -> Receipt` and `(sender, nonce) -> Receipt`
-    /// indexes, and releases parked client submissions in
-    /// `PendingReceipts`.
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
+    /// Stream of enriched `Receipt`s observed on `tx_receipts`, with the
+    /// rollbacks in stream order. Drives the in-memory `tx_hash ->
+    /// Receipt` and `(sender, nonce) -> Receipt` indexes, and releases
+    /// parked client submissions in `PendingReceipts`.
+    fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem>;
     /// Stream of `QuorumWatermark` snapshots.
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
     /// Stream of `FsyncWatermark` snapshots from the local recorder: the
@@ -111,7 +133,7 @@ pub(crate) const BUS_CAPACITY: usize = 1024;
 pub struct MockChannels {
     /// One sender per `tx_data` shard.
     pub(crate) tx_data_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
-    pub receipt_bus: broadcast::Sender<Receipt>,
+    pub receipt_bus: broadcast::Sender<ReceiptItem>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub(crate) local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub(crate) block_boundary_bus: broadcast::Sender<BlockBoundary>,
@@ -209,7 +231,7 @@ impl IngressPublication for MockChannels {
 }
 
 impl IngressSubscription for MockChannels {
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt> {
+    fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem> {
         self.receipt_bus.subscribe()
     }
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {

@@ -1,0 +1,300 @@
+//! The comparison of the stream with the committed history: equal
+//! history, a divergence of a receipt and of a header, a head below the
+//! floor, a refused floor, and a new connection.
+
+use std::num::NonZeroU64;
+use std::time::{Duration, Instant};
+
+use alloy_primitives::B256;
+use kardamom_cluster_adapter::wire::{EGRESS_KIND_REPLAY_AHEAD, encode_feed_answer};
+use kardamom_state::{StateEnvBuilder, StateSnapshot, StateWriter, WriteBatch};
+use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt};
+
+use super::tests::{TIMING, boundary, done, entry, tx_at, unavailable};
+use super::*;
+
+/// The committed header of `block` that ends at `end`, as `boundary`
+/// encodes it.
+fn header(block: u64, end: u64) -> BlockBoundaryStart {
+    BlockBoundaryStart {
+        block_number: block,
+        end_tx_idx: BPosition::from_index(end),
+        l2_timestamp: 0,
+        l1_origin: 0,
+    }
+}
+
+/// A history of blocks `1..=blocks` with one entry each, compared from
+/// `floor`.
+fn history(floor: (u64, u64), blocks: u64) -> LocalHistory {
+    LocalHistory::of(
+        floor,
+        (blocks, blocks + 1),
+        (1..=blocks).map(|b| header(b, b)),
+        (0..blocks).map(|i| (i, entry(i).canonical_id)),
+    )
+}
+
+/// A compared reader of the in-memory feed, with no second source.
+fn reader(history: LocalHistory) -> (CarriedSubscription<MemoryTransport, NoSource>, MemoryRemote) {
+    let (feed, remote) = MemoryTransport::pair();
+    (
+        CarriedSubscription::compared_with_timing(feed, NoSource, history, TIMING),
+        remote,
+    )
+}
+
+/// Run the reader until the feed gets a request.
+fn request(
+    sub: &mut CarriedSubscription<MemoryTransport, NoSource>,
+    feed: &MemoryRemote,
+) -> Request {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    std::iter::repeat_with(|| {
+        assert!(Instant::now() < deadline, "no request");
+        sub.step().expect("a step of the reader");
+        feed.request(Duration::ZERO)
+    })
+    .find_map(|got| got)
+    .expect("a request")
+}
+
+/// Run the reader until it fails or delivers, and return the outcome.
+fn outcome(
+    sub: &mut CarriedSubscription<MemoryTransport, NoSource>,
+) -> Result<(BPosition, Ordered), ExecutorError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    std::iter::repeat_with(|| {
+        assert!(Instant::now() < deadline, "no outcome");
+        match sub.deliver() {
+            Ok(Some(item)) => Some(Ok(item)),
+            Ok(None) => sub.step().err().map(Err),
+            Err(e) => Some(Err(e)),
+        }
+    })
+    .find_map(|got| got)
+    .expect("an outcome")
+}
+
+/// Send one block of one entry each, for `blocks`, then the replay end.
+fn serve(feed: &MemoryRemote, id: u64, blocks: std::ops::Range<u64>) {
+    blocks.clone().for_each(|b| {
+        feed.send(tx_at(b - 1));
+        feed.send(boundary(b, b));
+    });
+    feed.send(done(id, blocks.end - 1, blocks.end));
+}
+
+#[test]
+fn an_equal_stream_delivers_from_the_cursor() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    assert_eq!(
+        (first.from_index, first.from_block),
+        (0, 1),
+        "from the floor"
+    );
+    serve(&feed, first.request_id, 1..4);
+    let second = request(&mut sub, &feed);
+    assert_eq!(
+        (second.from_index, second.from_block),
+        (3, 4),
+        "from the cursor"
+    );
+    feed.send(tx_at(3));
+    feed.send(boundary(4, 4));
+    feed.send(done(second.request_id, 4, 5));
+    let (pos, item) = outcome(&mut sub).expect("an entry");
+    assert_eq!(pos.as_index(), 3);
+    assert!(matches!(item, Ordered::Tx(_)));
+}
+
+#[test]
+fn another_entry_at_a_committed_index_is_the_divergence_point() {
+    let mut diverged = history((0, 1), 3);
+    diverged = LocalHistory::of(
+        (0, 1),
+        diverged.cursor(),
+        (1..=3).map(|b| header(b, b)),
+        [(0, entry(0).canonical_id), (1, B256::repeat_byte(9))],
+    );
+    let (mut sub, feed) = reader(diverged);
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..4);
+    match outcome(&mut sub) {
+        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (2, 1)),
+        other => panic!("expected the divergence, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_longer_block_is_the_divergence_point() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(tx_at(0));
+    feed.send(boundary(1, 1));
+    feed.send(tx_at(1));
+    feed.send(tx_at(2));
+    feed.send(boundary(2, 3));
+    feed.send(done(first.request_id, 3, 3));
+    match outcome(&mut sub) {
+        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (2, 3)),
+        other => panic!("expected the divergence, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_head_below_the_floor_asks_again_until_it_passes() {
+    let (mut sub, feed) = reader(history((1, 2), 3));
+    let first = request(&mut sub, &feed);
+    assert_eq!((first.from_index, first.from_block), (1, 2));
+    feed.send(encode_feed_answer(
+        EGRESS_KIND_REPLAY_AHEAD,
+        0,
+        1,
+        first.request_id,
+    ));
+    let again = request(&mut sub, &feed);
+    assert_ne!(again.request_id, first.request_id);
+    assert_eq!(
+        (again.from_index, again.from_block),
+        (1, 2),
+        "the same floor"
+    );
+    serve(&feed, again.request_id, 2..4);
+    let delivery = request(&mut sub, &feed);
+    assert_eq!((delivery.from_index, delivery.from_block), (3, 4));
+}
+
+#[test]
+fn a_refused_floor_inside_the_retention_is_a_divergence() {
+    let (mut sub, feed) = reader(history((1, 2), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(unavailable(first.request_id, 0, 1));
+    match outcome(&mut sub) {
+        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (1, 1)),
+        other => panic!("expected the divergence, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_floor_below_the_retention_moves_up() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(unavailable(first.request_id, 2, 2));
+    let raised = request(&mut sub, &feed);
+    assert_eq!((raised.from_index, raised.from_block), (2, 3));
+    serve(&feed, raised.request_id, 3..4);
+    let delivery = request(&mut sub, &feed);
+    assert_eq!((delivery.from_index, delivery.from_block), (3, 4));
+}
+
+#[test]
+fn a_retention_above_the_window_skips_the_comparison() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(unavailable(first.request_id, 5, 5));
+    let delivery = request(&mut sub, &feed);
+    assert_eq!((delivery.from_index, delivery.from_block), (3, 4));
+}
+
+#[test]
+fn a_new_connection_during_the_comparison_starts_it_again() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(tx_at(0));
+    feed.send(boundary(1, 1));
+    feed.send(done(first.request_id, 1, 2));
+    (0..10).for_each(|_| sub.step().expect("a step of the reader"));
+    feed.reconnect();
+    let again = std::iter::repeat_with(|| request(&mut sub, &feed))
+        .find(|r| (r.from_index, r.from_block) == (0, 1))
+        .expect("a request from the floor");
+    let newest = feed.requests().pop().unwrap_or(again);
+    assert_eq!((newest.from_index, newest.from_block), (0, 1));
+    serve(&feed, newest.request_id, 1..4);
+    let delivery = request(&mut sub, &feed);
+    assert_eq!((delivery.from_index, delivery.from_block), (3, 4));
+}
+
+#[test]
+fn a_new_connection_after_the_comparison_restarts_the_run() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..4);
+    request(&mut sub, &feed);
+    feed.reconnect();
+    match outcome(&mut sub) {
+        Err(ExecutorError::SourceRestarted {
+            next_index,
+            next_block,
+        }) => assert_eq!((next_index, next_block), (3, 4)),
+        other => panic!("expected the restart from the state DB, got {other:?}"),
+    }
+}
+
+/// Commit blocks `1..=blocks` with one receipt each, and read the history
+/// of a window from the database.
+#[test]
+fn the_history_reads_the_window_from_the_state_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+    let mut writer = StateWriter::spawn(env.clone()).unwrap();
+    (1..=5u64).for_each(|b| {
+        let receipt = Receipt {
+            tx_idx: BPosition::from_index(b - 1),
+            tx_hash: B256::repeat_byte(u8::try_from(b).unwrap()),
+            block_number: b,
+            ..Receipt::default()
+        };
+        let boundary = BlockBoundary {
+            block_number: b,
+            end_tx_idx: BPosition::from_index(b),
+            l2_timestamp: 100 + b,
+            l1_origin: 7,
+            ..BlockBoundary::default()
+        };
+        let delta = BlockDelta {
+            block_number: b,
+            receipts: vec![receipt],
+            ..BlockDelta::default()
+        };
+        writer
+            .delta_tx
+            .send(WriteBatch::new(boundary, delta))
+            .unwrap();
+    });
+    std::iter::from_fn(|| writer.snapshot_rx.recv())
+        .find(|s| s.block_number() >= 5)
+        .expect("block 5 commits");
+    writer.shutdown().unwrap();
+
+    let snapshot = StateSnapshot::open(&env).unwrap();
+    let window = NonZeroU64::new(3).unwrap();
+    let got = LocalHistory::read(&snapshot, (5, 6), window)
+        .unwrap()
+        .expect("a history");
+    let committed = |floor: (u64, u64)| {
+        LocalHistory::of(
+            floor,
+            (5, 6),
+            (floor.1..=5).map(|b| BlockBoundaryStart {
+                l2_timestamp: 100 + b,
+                l1_origin: 7,
+                ..header(b, b)
+            }),
+            (floor.0..5).map(|i| (i, B256::repeat_byte(u8::try_from(i + 1).unwrap()))),
+        )
+    };
+    assert_eq!(got, committed((2, 3)));
+
+    let whole = LocalHistory::read(&snapshot, (5, 6), NonZeroU64::new(50).unwrap())
+        .unwrap()
+        .expect("a history");
+    assert_eq!(whole, committed((0, 1)), "a long window starts at block 1");
+    assert_eq!(
+        LocalHistory::read(&snapshot, (0, 1), window).unwrap(),
+        None,
+        "nothing to compare at genesis"
+    );
+}

@@ -272,6 +272,32 @@ impl StateSnapshot {
         get_decoded(txn, headers, &encode_block_key(number), decode_header_value)
     }
 
+    /// The transaction hash of each receipt at a position in `from..to`,
+    /// in position order. A position without a receipt has no entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] if the cursor walk or a decode fails.
+    pub fn receipt_hashes(
+        &self,
+        from: BPosition,
+        to: BPosition,
+    ) -> Result<Vec<(BPosition, B256)>, StateError> {
+        let mut hashes = Vec::new();
+        for_each_range(
+            &self.inner.txn,
+            self.inner.receipts_db,
+            &encode_b_position(from),
+            &encode_b_position(to),
+            |_, v| {
+                let receipt = decode_receipt_value(&v)?;
+                hashes.push((receipt.tx_idx, receipt.tx_hash));
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(hashes)
+    }
+
     /// The end of the last block this node rebuilt from L1, or `None` when
     /// it rebuilt none. See `meta::KEY_L1_REBUILT_END_TX_POSITION`.
     ///

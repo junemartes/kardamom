@@ -8,6 +8,8 @@
 //! background stream watchers that [`IngressProxy::new`] spawns.
 
 mod accounts;
+#[cfg(test)]
+mod rollback_tests;
 mod submit;
 mod watchers;
 
@@ -166,8 +168,9 @@ where
     pub(crate) cold: Arc<ColdAccounts>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
-    /// value only increases, one writer, the `BlockBoundary` watcher, sets
-    /// it, and many readers read it.
+    /// `BlockBoundary` watcher raises it with `fetch_max`, the receipt
+    /// watcher lowers it with `fetch_min` on a rollback, and many readers
+    /// read it.
     pub(crate) latest_block_number: Arc<AtomicU64>,
     /// The fee history of recent blocks: the boundary and receipt
     /// watchers write it, the fee RPCs read it.
@@ -176,7 +179,7 @@ where
     /// each first-seen receipt here, so `kardamom_subscribeReceipts`
     /// sessions see exactly one copy per tx, instead of the raw
     /// N-replica MDS fan-in.
-    pub(crate) receipt_feed: broadcast::Sender<Receipt>,
+    pub(crate) receipt_feed: broadcast::Sender<crate::channels::ReceiptItem>,
     /// Post-dedup tx-error re-broadcast, the same pattern as
     /// `receipt_feed`.
     pub(crate) tx_error_feed: broadcast::Sender<TxError>,
@@ -475,8 +478,9 @@ where
     }
 
     /// Live feed of deduped receipts, one copy per tx, after MDS fan-in
-    /// dedup. Backs `kardamom_subscribeReceipts`.
-    pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<Receipt> {
+    /// dedup, with the rollbacks in stream order. Backs
+    /// `kardamom_subscribeReceipts`.
+    pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<crate::channels::ReceiptItem> {
         self.receipt_feed.subscribe()
     }
 

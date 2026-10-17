@@ -54,7 +54,7 @@ async fn a_peer_image_of_another_schema_is_skipped() {
     let later_addr = serve_ephemeral(later.path().to_path_buf());
     let current_addr = serve_ephemeral(current.path().to_path_buf());
 
-    let err = fetch(later_addr, local.path().to_path_buf(), 0)
+    let err = fetch(later_addr, local.path().to_path_buf(), BlockRange::ANY)
         .await
         .unwrap_err();
     assert!(
@@ -62,17 +62,20 @@ async fn a_peer_image_of_another_schema_is_skipped() {
         "{err}"
     );
     assert!(
-        latest_checkpoint(local.path()).unwrap().is_none(),
+        latest_checkpoint(local.path(), BlockRange::ANY)
+            .unwrap()
+            .is_none(),
         "nothing was downloaded"
     );
 
     let peers = vec![later_addr.to_string(), current_addr.to_string()];
     let local_dir = local.path().to_path_buf();
-    let best =
-        tokio::task::spawn_blocking(move || fetch_best_checkpoint(&peers, &local_dir, 0, None))
-            .await
-            .unwrap()
-            .expect("the readable peer serves");
+    let best = tokio::task::spawn_blocking(move || {
+        fetch_best_checkpoint(&peers, &local_dir, BlockRange::ANY, None)
+    })
+    .await
+    .unwrap()
+    .expect("the readable peer serves");
     assert_eq!(best.block, 40);
 }
 
@@ -90,7 +93,7 @@ async fn a_peer_without_a_schema_header_is_fetched() {
         ImageSchema::default(),
     );
     let addr = serve_ephemeral(remote.path().to_path_buf());
-    let got = fetch(addr, local.path().to_path_buf(), 0)
+    let got = fetch(addr, local.path().to_path_buf(), BlockRange::ANY)
         .await
         .unwrap()
         .expect("fetched");
@@ -114,10 +117,10 @@ fn serve_ephemeral(dir: PathBuf) -> SocketAddr {
 async fn fetch(
     addr: SocketAddr,
     local: PathBuf,
-    min_block: u64,
+    range: BlockRange,
 ) -> Result<Option<CheckpointInfo>, StateError> {
     tokio::task::spawn_blocking(move || {
-        fetch_latest_checkpoint(&addr.to_string(), &local, min_block, None)
+        fetch_latest_checkpoint(&addr.to_string(), &local, range, None)
     })
     .await
     .unwrap()
@@ -131,7 +134,7 @@ async fn fetch_round_trips_newest_checkpoint() {
     let addr = serve_ephemeral(served.path().to_path_buf());
 
     let local = tempfile::tempdir().unwrap();
-    let got = fetch(addr, local.path().to_path_buf(), 0)
+    let got = fetch(addr, local.path().to_path_buf(), BlockRange::ANY)
         .await
         .unwrap()
         .unwrap();
@@ -153,7 +156,7 @@ async fn fetch_from_empty_peer_returns_none() {
     let addr = serve_ephemeral(served.path().to_path_buf());
     let local = tempfile::tempdir().unwrap();
     assert!(
-        fetch(addr, local.path().to_path_buf(), 0)
+        fetch(addr, local.path().to_path_buf(), BlockRange::ANY)
             .await
             .unwrap()
             .is_none()
@@ -176,11 +179,12 @@ async fn fetch_best_picks_newest_across_peers_and_survives_dead_peer() {
         addr_b.to_string(),
     ];
     let local_dir = local.path().to_path_buf();
-    let best =
-        tokio::task::spawn_blocking(move || fetch_best_checkpoint(&peers, &local_dir, 0, None))
-            .await
-            .unwrap()
-            .unwrap();
+    let best = tokio::task::spawn_blocking(move || {
+        fetch_best_checkpoint(&peers, &local_dir, BlockRange::ANY, None)
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(best.block, 9);
     assert_eq!(image_bytes(&best.path), b"b9");
 }
@@ -194,10 +198,14 @@ async fn min_block_filters_stale_peer_checkpoint() {
     // The peer's newest checkpoint (block 6) is below the required
     // floor (block 10). It is skipped, and nothing is written locally.
     assert!(
-        fetch(addr, local.path().to_path_buf(), 10)
-            .await
-            .unwrap()
-            .is_none()
+        fetch(
+            addr,
+            local.path().to_path_buf(),
+            BlockRange::at_or_above(10)
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 0);
 }
@@ -210,11 +218,61 @@ async fn existing_local_checkpoint_short_circuits_transfer() {
 
     let local = tempfile::tempdir().unwrap();
     write_checkpoint(local.path(), 4, b"local bytes");
-    let got = fetch(addr, local.path().to_path_buf(), 0)
+    let got = fetch(addr, local.path().to_path_buf(), BlockRange::ANY)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(got.block, 4);
     // The local copy is kept. The peer's copy does not overwrite it.
     assert_eq!(image_bytes(&got.path), b"local bytes");
+}
+
+/// A fetch with a cap gets the newest checkpoint at or below the cap, and
+/// nothing when the server holds none there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capped_fetch_gets_the_newest_checkpoint_below_the_cap() {
+    let served = tempfile::tempdir().unwrap();
+    write_checkpoint(served.path(), 3, b"old image");
+    write_checkpoint(served.path(), 7, b"newest image bytes");
+    let addr = serve_ephemeral(served.path().to_path_buf());
+    let local = tempfile::tempdir().unwrap();
+
+    let below_seven = BlockRange::below(7).unwrap();
+    let got = fetch(addr, local.path().to_path_buf(), below_seven)
+        .await
+        .unwrap()
+        .expect("block 3 is below the cap");
+    assert_eq!(got.block, 3);
+    assert_eq!(image_bytes(&got.path), b"old image");
+
+    let below_three = BlockRange::below(3).unwrap();
+    assert_eq!(
+        fetch(addr, local.path().to_path_buf(), below_three)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// The request line round-trips its cap. A line with no query, the request
+/// of an older client, asks for every block.
+#[test]
+fn the_request_line_carries_the_cap() {
+    let capped = FetchRequest {
+        range: BlockRange { min: 0, max: 41 },
+    };
+    assert_eq!(
+        capped.line(),
+        "GET /checkpoint/latest?max_block=41 HTTP/1.0\r\n\r\n"
+    );
+    assert_eq!(FetchRequest::parse(&capped.line()), Some(capped));
+    let any = FetchRequest {
+        range: BlockRange::ANY,
+    };
+    assert_eq!(any.line(), "GET /checkpoint/latest HTTP/1.0\r\n\r\n");
+    assert_eq!(
+        FetchRequest::parse("GET /checkpoint/latest HTTP/1.0\r\n"),
+        Some(any)
+    );
+    assert_eq!(FetchRequest::parse("GET /other HTTP/1.0\r\n"), None);
 }

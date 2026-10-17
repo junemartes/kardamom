@@ -6,7 +6,9 @@
 
 use kardamom_types::TxDataLoc;
 
-use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer};
+use kardamom_sequencer::resync::{
+    FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer,
+};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{
     Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
@@ -17,7 +19,7 @@ use kardamom_sequencer::testkit::{
 /// exactly the state these tests exercise.
 type ResyncTestRig = (
     Sequencer,
-    crossbeam_channel::Sender<FloorUpdate>,
+    crossbeam_channel::Sender<FloorEvent>,
     crossbeam_channel::Sender<SealerAnswer>,
 );
 
@@ -33,7 +35,7 @@ fn resync_sequencer_with_rejects() -> ResyncTestRig {
     (seq, floor_tx, answer_tx)
 }
 
-fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
+fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorEvent>) {
     let (seq, floor_tx, _answer_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
@@ -55,7 +57,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     // notice. The transaction executed, so reporting it as a duplicate
     // to ingress would be spurious.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 1))
+        .send(FloorUpdate::executed(s.address(), 1).into())
         .unwrap();
 
     rig.step(&mut seq).unwrap();
@@ -110,7 +112,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
 
     // Execution evidence arrives. Nonce 4 is receipted, so the floor becomes 5.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 4))
+        .send(FloorUpdate::executed(s.address(), 4).into())
         .unwrap();
 
     // On the next iteration, the floor advances the state machine. The
@@ -141,7 +143,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     // Confirm nonce 1. This is cumulative per sender, and retires both
     // (0 and 1).
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 1))
+        .send(FloorUpdate::executed(s.address(), 1).into())
         .unwrap();
     rig.step(&mut seq).unwrap();
 
@@ -161,7 +163,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
 
     // Confirming it stops the churn.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 2))
+        .send(FloorUpdate::executed(s.address(), 2).into())
         .unwrap();
     rig.step(&mut seq).unwrap();
     let stable = rig.refs().len();
@@ -209,4 +211,35 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
         stable,
         "committed-proof reject must stop the republish loop"
     );
+}
+
+/// A rollback voids the floor that a receipt above its block set. The
+/// lost nonce is then not a proven duplicate: the sender's resubmit waits
+/// for the floor, and a new proof drains it.
+#[test]
+fn a_rollback_voids_the_floor_and_the_lost_nonce_publishes_again() {
+    let s = signer(5);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 1, 60));
+    rig.push(TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 2, 61));
+    let (mut seq, floor_tx) = resync_sequencer();
+
+    // The receipt of nonce 1 in block 10 raised the floor to 2. The
+    // executor then rolled back to block 5: that receipt is gone.
+    floor_tx
+        .send(FloorUpdate::executed(s.address(), 1).in_block(10).into())
+        .unwrap();
+    floor_tx.send(FloorEvent::Rollback { to_block: 5 }).unwrap();
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().is_empty(), "nonce 1 waits for an unknown floor");
+    assert!(rig.errors().is_empty(), "nonce 1 is not a duplicate now");
+
+    // The new stream proves nonce 0 in block 3: the floor is 1.
+    floor_tx
+        .send(FloorUpdate::executed(s.address(), 0).in_block(3).into())
+        .unwrap();
+    rig.step(&mut seq).unwrap();
+    rig.step(&mut seq).unwrap();
+    let published: Vec<_> = rig.refs().iter().map(|r| r.tx_data_position).collect();
+    assert_eq!(published, vec![pos(0), pos(64)], "nonces 1 and 2 publish");
 }

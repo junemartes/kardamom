@@ -5,7 +5,7 @@ fn s(byte: u8) -> Address {
     Address::repeat_byte(byte)
 }
 
-fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWatermark) {
+fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorEvent>, SharedWatermark) {
     let ResyncChannel {
         controller,
         floor_tx,
@@ -121,7 +121,7 @@ fn publish_stall_enters() {
 #[test]
 fn floor_updates_raise_and_report() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::executed(s(1), 4)).unwrap();
+    tx.send(FloorUpdate::executed(s(1), 4).into()).unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(raised, vec![(s(1), 5)]);
     assert_eq!(confirmations, vec![(s(1), 4)], "every receipt confirms");
@@ -138,12 +138,8 @@ fn skip_receipts_confirm_but_never_raise_floors() {
     // confirmation), while it proves no nonce was consumed. It is not
     // floor evidence.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(
-        s(1),
-        7,
-        kardamom_types::SkipReason::NonceTooLow,
-    ))
-    .unwrap();
+    tx.send(FloorUpdate::skip(s(1), 7, kardamom_types::SkipReason::NonceTooLow).into())
+        .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty(), "skip is not floor evidence");
     assert_eq!(c.floor(s(1)), None);
@@ -159,18 +155,18 @@ fn skip_receipts_confirm_but_never_raise_floors() {
 fn skip_receipts_release_to_the_chain_nonce() {
     use kardamom_types::SkipReason;
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds))
+    tx.send(FloorUpdate::skip(s(1), 0, SkipReason::InsufficientFunds).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh))
+    tx.send(FloorUpdate::skip(s(1), 1, SkipReason::NonceTooHigh).into())
         .unwrap();
-    tx.send(FloorUpdate::executed(s(2), 4)).unwrap();
-    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh))
+    tx.send(FloorUpdate::executed(s(2), 4).into()).unwrap();
+    tx.send(FloorUpdate::skip(s(2), 9, SkipReason::NonceTooHigh).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 7, SkipReason::InsufficientFunds))
+    tx.send(FloorUpdate::skip(s(2), 7, SkipReason::InsufficientFunds).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow))
+    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::NonceTooLow).into())
         .unwrap();
-    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds))
+    tx.send(FloorUpdate::skip(s(2), 3, SkipReason::InsufficientFunds).into())
         .unwrap();
     let ReceiptDrain {
         raised, released, ..
@@ -190,7 +186,7 @@ fn deposit_receipts_neither_confirm_nor_raise() {
     // floor. The code marks this by tx_type, not by inferring from the
     // nonce.
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::deposit(s(1))).unwrap();
+    tx.send(FloorUpdate::deposit(s(1)).into()).unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert!(raised.is_empty() && confirmations.is_empty());
 }
@@ -229,7 +225,8 @@ fn a_receipt_maps_to_its_outcome() {
             FloorUpdate::of_receipt(&receipt(tx_type, skip_reason)),
             FloorUpdate {
                 sender: s(1),
-                outcome
+                outcome,
+                block: Some(0),
             }
         );
     }
@@ -243,7 +240,7 @@ fn a_receipt_maps_to_its_outcome() {
 #[test]
 fn genuine_nonce_zero_tx_confirms_and_raises() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::executed(s(1), 0)).unwrap();
+    tx.send(FloorUpdate::executed(s(1), 0).into()).unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(
         confirmations,
@@ -258,12 +255,8 @@ fn genuine_nonce_zero_tx_confirms_and_raises() {
 #[test]
 fn nonce_zero_skip_confirms_without_raising() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::skip(
-        s(1),
-        0,
-        kardamom_types::SkipReason::NonceTooLow,
-    ))
-    .unwrap();
+    tx.send(FloorUpdate::skip(s(1), 0, kardamom_types::SkipReason::NonceTooLow).into())
+        .unwrap();
     let (raised, confirmations) = raised_and_confirmed(&mut c);
     assert_eq!(confirmations, vec![(s(1), 0)]);
     assert!(raised.is_empty(), "a skip consumed no nonce");
@@ -313,10 +306,10 @@ fn contiguity_rejects_split_drops_from_rewinds() {
 #[test]
 fn floors_are_monotonic() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::executed(s(1), 9)).unwrap();
+    tx.send(FloorUpdate::executed(s(1), 9).into()).unwrap();
     // A lower receipt arriving later (a late multicast frame) must not
     // regress the floor.
-    tx.send(FloorUpdate::executed(s(1), 3)).unwrap();
+    tx.send(FloorUpdate::executed(s(1), 3).into()).unwrap();
     let (raised, _) = raised_and_confirmed(&mut c);
     assert_eq!(raised, vec![(s(1), 10)]);
     assert_eq!(c.floor(s(1)), Some(10));
@@ -347,12 +340,12 @@ fn channels_are_bounded_to_dedup_capacity() {
     } = ResyncChannel::open(cfg, 0).unwrap();
 
     let one = FloorUpdate::executed(s(1), 0);
-    assert!(tx.try_send(one).is_ok());
-    assert!(tx.try_send(one).is_ok());
+    assert!(tx.try_send(one.into()).is_ok());
+    assert!(tx.try_send(one.into()).is_ok());
     // The channel is now at its 2-entry capacity: a third send must not
     // block, and must not be accepted.
     assert!(matches!(
-        tx.try_send(one),
+        tx.try_send(one.into()),
         Err(crossbeam_channel::TrySendError::Full(_))
     ));
 
@@ -388,4 +381,48 @@ fn enter_threshold_rejects_a_product_that_rounds_to_zero() {
         cfg.validate(),
         Err(ResyncConfigError::ThresholdTooSmall { .. })
     ));
+}
+
+/// A rollback forgets only the floors that a receipt above its block
+/// set. A floor of a lower block and a floor of a lookup answer stay. The
+/// drain ends at the rollback, so an update after it goes into the next
+/// drain.
+#[test]
+fn a_rollback_forgets_only_the_floors_set_above_its_block() {
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(FloorUpdate::executed(s(1), 4).in_block(10).into())
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(2), 7).in_block(5).into())
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(3), 9).into()).unwrap();
+    tx.send(FloorEvent::Rollback { to_block: 5 }).unwrap();
+    tx.send(FloorUpdate::executed(s(1), 2).in_block(6).into())
+        .unwrap();
+
+    let drain = c.drain_floor_updates();
+    assert_eq!(drain.raised, vec![(s(1), 5), (s(2), 8), (s(3), 10)]);
+    assert_eq!(drain.forgotten, vec![s(1)]);
+    assert_eq!(c.floor(s(1)), None, "a receipt of block 10 is void");
+    assert_eq!(c.floor(s(2)), Some(8), "block 5 stays");
+    assert_eq!(c.floor(s(3)), Some(10), "a lookup answer stays");
+
+    let next = c.drain_floor_updates();
+    assert_eq!(next.raised, vec![(s(1), 3)], "the new stream sets it again");
+    assert_eq!(next.forgotten, Vec::<Address>::new());
+    assert_eq!(c.floor(s(1)), Some(3));
+}
+
+/// A floor that a later receipt raised carries the block of that later
+/// receipt: a rollback between the two blocks forgets it.
+#[test]
+fn a_raised_floor_carries_the_block_of_the_receipt_that_raised_it() {
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(FloorUpdate::executed(s(1), 1).in_block(2).into())
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(1), 3).in_block(8).into())
+        .unwrap();
+    tx.send(FloorEvent::Rollback { to_block: 4 }).unwrap();
+    let drain = c.drain_floor_updates();
+    assert_eq!(drain.forgotten, vec![s(1)]);
+    assert_eq!(c.floor(s(1)), None);
 }

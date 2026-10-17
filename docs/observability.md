@@ -321,6 +321,11 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `unrecoverable`: the node could not repair itself and waits for an operator.
   - See "Replay-window overrun" in [failure-modes.md](failure-modes.md).
   - The validator counter is `validator_resync_total`. A `peer-checkpoint` increment there means the validator did not verify the blocks up to the adopted checkpoint.
+- `kardamom_executor_rollback_total{outcome}` counts the rollbacks of an executor that reads the member feed, after the canonical stream diverged from its committed history.
+  - `local-checkpoint` or `peer-checkpoint`: the executor parked its state and restores a checkpoint below the divergence.
+  - `no-checkpoint`: no checkpoint below the divergence exists. The executor stops and waits for an operator.
+  - See "A power loss on a majority of the sealers rolls the paired executors back" in [failure-modes.md](failure-modes.md).
+- `kardamom_sequencer_receipt_floors_forgotten_total` counts the nonce floors that a rollback of an executor reset to unknown.
 - `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
   - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
   - Growth on a steady fleet means a node runs a release of another schema.

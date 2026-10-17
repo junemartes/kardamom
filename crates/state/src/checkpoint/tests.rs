@@ -104,7 +104,9 @@ fn checkpoint_restore_roundtrips_state() {
     }
 
     // The latest checkpoint is block 5.
-    let latest = latest_checkpoint(ckpt_dir.path()).unwrap().unwrap();
+    let latest = latest_checkpoint(ckpt_dir.path(), BlockRange::ANY)
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.block, 5);
 
     // Restore into a fresh dir and confirm the state matches exactly.
@@ -277,7 +279,7 @@ fn restore_best_quarantines_bad_and_falls_back() {
     // Make the newest look like an image whose MANIFEST never arrived.
     std::fs::remove_file(manifest_path(&torn.path)).unwrap();
 
-    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), None)
+    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), BlockRange::ANY, None)
         .expect("restore_best must not error on a quarantinable checkpoint")
         .expect("the older good checkpoint must restore");
     assert_eq!(block, good.block);
@@ -300,9 +302,44 @@ fn restore_best_quarantines_bad_and_falls_back() {
     let dst2 = tempfile::tempdir().unwrap();
     std::fs::remove_file(manifest_path(&good.path)).unwrap();
     assert!(
-        restore_best_checkpoint(ckpt.path(), dst2.path(), None)
+        restore_best_checkpoint(ckpt.path(), dst2.path(), BlockRange::ANY, None)
             .unwrap()
             .is_none()
+    );
+}
+
+/// A restore with a capped range takes the newest checkpoint below the
+/// cap, and leaves the newer ones in place.
+#[test]
+fn restore_best_in_a_range_takes_the_newest_below_the_cap() {
+    let src = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let addr = Address::from([0x31; 20]);
+    let env = seeded_env_with_blocks(src.path(), addr, 2);
+    let c2 = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 4);
+    let c4 = create_checkpoint(&env, ckpt.path()).unwrap();
+    commit_blocks(&env, addr, 6);
+    let c6 = create_checkpoint(&env, ckpt.path()).unwrap();
+    drop(env);
+
+    let dst = tempfile::tempdir().unwrap();
+    let below_six = BlockRange::below(6).unwrap();
+    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), below_six, None)
+        .unwrap()
+        .expect("block 4 is below the cap");
+    assert_eq!((block, path), (c4.block, c4.path));
+    assert!(c6.path.exists() && c2.path.exists());
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(
+        restore_best_checkpoint(
+            ckpt.path(),
+            empty.path(),
+            BlockRange::below(2).unwrap(),
+            None
+        )
+        .unwrap(),
+        None
     );
 }
 
@@ -321,14 +358,20 @@ fn latest_picks_highest_block_and_prune_trims() {
     assert_eq!(c7.block, 7);
 
     assert_eq!(
-        latest_checkpoint(ckpt_dir.path()).unwrap().unwrap().block,
+        latest_checkpoint(ckpt_dir.path(), BlockRange::ANY)
+            .unwrap()
+            .unwrap()
+            .block,
         7
     );
 
     // Prune everything before block 7. This removes the block-3 checkpoint.
     assert_eq!(prune_checkpoints(ckpt_dir.path(), 7).unwrap(), 1);
     assert_eq!(
-        latest_checkpoint(ckpt_dir.path()).unwrap().unwrap().block,
+        latest_checkpoint(ckpt_dir.path(), BlockRange::ANY)
+            .unwrap()
+            .unwrap()
+            .block,
         7
     );
 }
@@ -470,7 +513,7 @@ fn restore_best_skips_a_checkpoint_of_another_schema_without_quarantine() {
     manifest.schema_version = ImageSchema::of(crate::meta::SCHEMA_VERSION + 1);
     std::fs::write(manifest_path(&later.path), manifest.encode()).unwrap();
 
-    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), None)
+    let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), BlockRange::ANY, None)
         .unwrap()
         .expect("the readable checkpoint restores");
     assert_eq!(block, readable.block);

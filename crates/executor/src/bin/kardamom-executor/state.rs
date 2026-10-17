@@ -5,8 +5,9 @@ use std::ops::ControlFlow;
 
 use anyhow::{Context, Result};
 use kardamom_engine::ResumePoint;
+use kardamom_engine::reader::carried::LocalHistory;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
-use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
+use kardamom_state::{BlockRange, StateEnv, StateEnvBuilder, StateSnapshot, read_recovery_point};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::Args;
@@ -21,19 +22,37 @@ pub(crate) struct PreparedState {
     pub(crate) start: ResumePoint,
 }
 
+impl PreparedState {
+    /// The committed history of the last `window` blocks, which the reader
+    /// of the member feed compares with the stream before it delivers.
+    /// `None` at genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a read of the state DB fails.
+    pub(crate) fn history(&self, window: std::num::NonZeroU64) -> Result<Option<LocalHistory>> {
+        let cursor = kardamom_engine::bin_support::cluster_replay_cursor(&self.start);
+        let snapshot = StateSnapshot::open(&self.env).context("open a snapshot for the history")?;
+        LocalHistory::read(&snapshot, cursor.position(), window)
+            .context("read the committed history")
+    }
+}
+
 /// Fast cold-start recovery, env open, cursor read, checkpointer spawn.
 ///
 /// Restore runs before the env opens. If the state dir is empty (a fresh
-/// or wiped node) and a checkpoint is available locally or from a peer,
-/// startup then sees a populated DB. It replays only the tail, instead of
-/// re-syncing from genesis.
+/// or wiped node) and a checkpoint in `restore` is available locally or
+/// from a peer, startup then sees a populated DB. It replays only the
+/// tail, instead of re-syncing from genesis. A rollback limits `restore`
+/// to the blocks below its divergence point.
 pub(crate) fn prepare_state(
     args: &Args,
     expected_genesis: Option<alloy_primitives::B256>,
+    restore: BlockRange,
     shutdown: CancellationToken,
 ) -> Result<PreparedState> {
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
-        restore_if_fresh(args, ckpt_dir, expected_genesis)?;
+        restore_if_fresh(args, ckpt_dir, restore, expected_genesis)?;
     }
 
     // Open the libmdbx state env and read the durable cursor.
@@ -65,6 +84,7 @@ pub(crate) fn prepare_state(
 fn restore_if_fresh(
     args: &Args,
     ckpt_dir: &std::path::Path,
+    restore: BlockRange,
     expected_genesis: Option<alloy_primitives::B256>,
 ) -> Result<()> {
     // The state dir is fresh only if it has no mdbx data file. Check this
@@ -79,6 +99,7 @@ fn restore_if_fresh(
         ckpt_dir,
         &args.state_dir,
         &args.checkpoint_peers,
+        restore,
         expected_genesis,
     )?;
     log_restore_outcome(ckpt_dir, restored);

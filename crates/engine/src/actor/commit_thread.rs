@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use tracing::{error, warn};
 
-use kardamom_types::{BlockBoundary, ReceiptRows};
+use kardamom_types::{BlockBoundary, ReceiptRollback, ReceiptRows};
 
 use crate::error::ExecutorError;
 use crate::exec_types::CMessage;
@@ -197,6 +197,8 @@ pub(crate) struct CommitLoop<C> {
     tx_receipts_pub: C,
     rx: Receiver<ExecToCommit>,
     retry: MustDeliver,
+    /// The rollback record to publish before the first receipt.
+    rollback: Option<ReceiptRollback>,
 }
 
 impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
@@ -207,7 +209,14 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
             tx_receipts_pub,
             rx,
             retry: MustDeliver::new(escalation),
+            rollback: None,
         }
+    }
+
+    /// The commit loop that publishes `rollback` before its first receipt.
+    pub(crate) fn announcing(mut self, rollback: Option<ReceiptRollback>) -> Self {
+        self.rollback = rollback;
+        self
     }
 
     /// The commit loop with `escalation` in place of the default.
@@ -311,11 +320,37 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     /// Must-deliver publish of one boundary. Same retry rule as
     /// [`Self::publish_batch`].
     fn publish_boundary(&mut self, b: &BlockBoundary) -> Result<(), ExecutorError> {
-        while let Err(e) = self
-            .tx_receipts_pub
-            .publish(CMessage::BlockBoundary(b.clone()))
-        {
-            self.recover(e, "tx_receipts boundary publish failed; retrying")?;
+        self.deliver("tx_receipts boundary publish failed; retrying", |p| {
+            p.publish(CMessage::BlockBoundary(b.clone()))
+        })
+    }
+
+    /// Must-deliver publish of the rollback record, before the first
+    /// receipt. Every consumer then reads it before the receipts of the
+    /// restored state. Same retry rule as [`Self::publish_batch`].
+    fn publish_rollback(&mut self) -> Result<(), ExecutorError> {
+        let Some(rollback) = self.rollback.take() else {
+            return Ok(());
+        };
+        self.deliver("tx_receipts rollback publish failed; retrying", |p| {
+            p.publish_rollback(rollback)
+        })?;
+        tracing::warn!(
+            to_block = rollback.to_block,
+            "published the rollback: the receipts above the block are void"
+        );
+        Ok(())
+    }
+
+    /// Run `attempt` until it succeeds, with the must-deliver recovery
+    /// between two attempts.
+    fn deliver(
+        &mut self,
+        msg: &'static str,
+        mut attempt: impl FnMut(&mut C) -> Result<(), ExecutorError>,
+    ) -> Result<(), ExecutorError> {
+        while let Err(e) = attempt(&mut self.tx_receipts_pub) {
+            self.recover(e, msg)?;
         }
         self.retry.delivered();
         Ok(())
@@ -350,6 +385,7 @@ impl<C: TxReceiptsPublication + 'static> CommitLoop<C> {
     }
 
     fn run(mut self) -> Result<(), ExecutorError> {
+        self.publish_rollback()?;
         let mut closed = false;
         while !closed && let Some(batch) = self.collect_batch() {
             closed = self.publish_one_batch(&batch)?;

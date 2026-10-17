@@ -92,6 +92,16 @@ impl ReceiptCache {
         });
     }
 
+    /// Drops every receipt of a block above `to_block` from both
+    /// indexes. The ring keeps their identities. A retired identity
+    /// removes only a row that still belongs to it, so a stale identity
+    /// costs one slot and nothing more.
+    pub(crate) fn roll_back(&self, to_block: u64) {
+        self.by_sender_nonce
+            .retain(|_, r| r.block_number <= to_block);
+        self.by_tx_hash.retain(|_, r| r.block_number <= to_block);
+    }
+
     pub(crate) fn lookup(&self, sender: Address, nonce: u64) -> Option<Receipt> {
         self.by_sender_nonce
             .get(&(sender, nonce))
@@ -123,6 +133,25 @@ mod tests {
         assert!(c.lookup(s, 2).is_none());
         // The same entry is also indexed by tx_hash.
         assert_eq!(c.lookup_by_tx_hash(h).unwrap().tx_hash, h);
+        assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
+    }
+
+    // A rollback drops the receipts above its block from both indexes,
+    // and keeps the receipts at or below it.
+    #[tokio::test]
+    async fn a_rollback_drops_the_receipts_above_its_block() {
+        let c = ReceiptCache::new(NonZeroUsize::new(8).unwrap());
+        let s = Address::repeat_byte(0x33);
+        let in_block = |nonce: u64, hash: u8, block_number: u64| Receipt {
+            block_number,
+            ..receipt(s, nonce, B256::repeat_byte(hash), 0)
+        };
+        c.insert(in_block(1, 0x11, 4));
+        c.insert(in_block(2, 0x22, 5));
+        c.roll_back(4);
+        assert_eq!(c.lookup(s, 1).unwrap().block_number, 4);
+        assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x11)).is_some());
+        assert!(c.lookup(s, 2).is_none());
         assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
     }
 

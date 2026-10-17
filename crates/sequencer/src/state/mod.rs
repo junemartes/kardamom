@@ -554,6 +554,15 @@ impl<T> PartitionState<T> {
         Some(cur)
     }
 
+    /// Forget the expected nonce of `sender`: a rollback voided the
+    /// receipt that set it, so it can be above the chain. The parked
+    /// entries stay. The next submit seeds the sender as a cold one, and a
+    /// lookup or a new receipt sets the floor again. Returns the forgotten
+    /// nonce, or `None` when the sender had none.
+    pub(crate) fn forget_floor(&mut self, sender: Address) -> Option<u64> {
+        self.next.remove(&sender)
+    }
+
     // A sequencer cannot locally tell "the twin already ordered the gap"
     // apart from "nobody ordered the gap" (a client-abandoned nonce
     // hole). So a stalled sender must stall here, where it is

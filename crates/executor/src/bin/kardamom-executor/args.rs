@@ -12,6 +12,10 @@ use kardamom_engine::bin_support::StateDurabilityArg;
 /// Default `--checkpoint-keep`.
 const DEFAULT_CHECKPOINT_KEEP: NonZeroU64 = NonZeroU64::new(3).unwrap();
 
+/// Default `--rollback-compare-blocks`: about one minute of 2 s blocks. A
+/// power loss on a majority of the members loses about 1 s of entries.
+const DEFAULT_ROLLBACK_COMPARE_BLOCKS: NonZeroU64 = NonZeroU64::new(32).unwrap();
+
 /// `checkpoint_interval_secs`'s parsed value: `None` (from `"0"`) means
 /// checkpointing is disabled. A newtype, not `Option<NonZeroU64>`
 /// directly, because clap-derive's special-cased handling of an
@@ -99,6 +103,16 @@ pub(crate) struct Args {
     /// the references of the cluster egress with `tx_data`.
     #[arg(long, env = "KARDAMOM_CARRY_BYTES", default_value_t = false)]
     pub(crate) carry_bytes: bool,
+    /// With `--carry-bytes`: how many committed blocks below its cursor the
+    /// executor compares with the member feed at each start, before it
+    /// executes a frame. A difference rolls the state back to a checkpoint
+    /// below it.
+    #[arg(
+        long,
+        env = "KARDAMOM_ROLLBACK_COMPARE_BLOCKS",
+        default_value_t = DEFAULT_ROLLBACK_COMPARE_BLOCKS
+    )]
+    pub(crate) rollback_compare_blocks: NonZeroU64,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,

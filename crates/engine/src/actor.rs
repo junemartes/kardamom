@@ -204,6 +204,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
         let (tx_data_handles, tx_ordering_handle, rx_r2e) = inbound.spawn_readers(&cfg);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth.get());
         let escalation = Escalation::from_stall_budget(cfg.stall_budget);
+        let rollback = cfg.rollback;
 
         let exec = ExecState::<W>::spawn(ExecInputs {
             cfg,
@@ -224,6 +225,7 @@ impl<W: EngineWiring + 'static> Executor<W> {
         });
         let commit = CommitLoop::new(tx_receipts, rx_e2c)
             .escalating(escalation)
+            .announcing(rollback)
             .spawn();
 
         Threads {

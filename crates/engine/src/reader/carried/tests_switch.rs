@@ -88,7 +88,7 @@ fn the_reader_comes_back_to_the_feed_after_the_ready_window() {
     rig.feed.set_connected(false);
     serve_block(&mut rig, Source::Service, 0, 1);
     assert_eq!(rig.deliver(5), ["t0", "b1"]);
-    rig.feed.set_connected(true);
+    rig.feed.resume();
     let probe = rig.request(Source::Feed);
     assert_eq!(
         rig.sub.source(),
@@ -228,7 +228,7 @@ fn a_large_feed_backlog_does_not_stop_the_return_to_the_feed() {
     assert_eq!(rig.deliver(5), ["t0", "b1"]);
     let old = tx_at(0);
     (0..200_000).for_each(|_| rig.feed.send(old.clone()));
-    rig.feed.set_connected(true);
+    rig.feed.resume();
     let started = std::time::Instant::now();
     let probe = rig.request(Source::Feed);
     (0..20_000).for_each(|_| rig.feed.send(old.clone()));
@@ -265,8 +265,11 @@ fn a_new_request_clears_the_old_floor_of_the_source() {
     );
 }
 
+/// Both sources have a head below the delivery cursor: they lost entries
+/// that the reader delivered. The run starts again from the state DB, and
+/// the comparison at the start finds the divergence.
 #[test]
-fn both_heads_below_the_cursor_stop_at_the_highest_head() {
+fn both_heads_below_the_cursor_restart_the_run_from_the_state_db() {
     let mut rig = Rig::new(20, 10);
     let request = rig.request(Source::Feed);
     rig.feed.send(encode_feed_answer(
@@ -283,11 +286,32 @@ fn both_heads_below_the_cursor_stop_at_the_highest_head() {
         request.request_id,
     ));
     match rig.error() {
-        ExecutorError::ClusterBehindCursor {
-            head_index,
-            head_block,
-            ..
-        } => assert_eq!((head_index, head_block), (9, 6)),
-        other => panic!("expected the behind-cursor error, got {other:?}"),
+        ExecutorError::SourceRestarted {
+            next_index,
+            next_block,
+        } => assert_eq!((next_index, next_block), (20, 10)),
+        other => panic!("expected the restart from the state DB, got {other:?}"),
+    }
+}
+
+/// The feed comes back on a new image after the reader delivered entries
+/// of the service. The stream of the new image can differ below the
+/// cursor, so the run starts again from the state DB.
+#[test]
+fn a_return_to_a_new_image_of_the_feed_restarts_the_run() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.set_connected(false);
+    serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    rig.feed.set_connected(true);
+    let probe = rig.request(Source::Feed);
+    rig.feed.send(done(probe.request_id, 1, 2));
+    match rig.error() {
+        ExecutorError::SourceRestarted {
+            next_index,
+            next_block,
+        } => assert_eq!((next_index, next_block), (1, 2)),
+        other => panic!("expected the restart from the state DB, got {other:?}"),
     }
 }

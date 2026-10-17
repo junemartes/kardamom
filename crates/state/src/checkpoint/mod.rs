@@ -64,6 +64,60 @@ pub struct CheckpointInfo {
     pub path: PathBuf,
 }
 
+/// The blocks that a checkpoint may capture: `min..=max`. The rollback of
+/// an executor needs a checkpoint below a block, and the resync fallback
+/// needs one at or above a floor, so one range type serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRange {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl BlockRange {
+    /// Every block.
+    pub const ANY: Self = Self {
+        min: 0,
+        max: u64::MAX,
+    };
+
+    /// The blocks at or above `min`.
+    #[must_use]
+    pub const fn at_or_above(min: u64) -> Self {
+        Self { min, max: u64::MAX }
+    }
+
+    /// The blocks below `block`, or `None` when `block` is 0.
+    #[must_use]
+    pub fn below(block: u64) -> Option<Self> {
+        block.checked_sub(1).map(|max| Self { min: 0, max })
+    }
+
+    /// The range without block 0. A genesis state needs no transfer, so a
+    /// peer fetch never asks for it.
+    #[must_use]
+    pub fn past_genesis(self) -> Self {
+        Self {
+            min: self.min.max(Self::FIRST_BLOCK),
+            ..self
+        }
+    }
+
+    /// The first block after genesis.
+    const FIRST_BLOCK: u64 = 1;
+
+    /// Whether the range holds `block`.
+    #[must_use]
+    pub fn contains(self, block: u64) -> bool {
+        (self.min..=self.max).contains(&block)
+    }
+
+    /// Whether the range has an upper bound below the newest block.
+    #[must_use]
+    pub fn is_capped(self) -> bool {
+        self.max < u64::MAX
+    }
+}
+
 /// The checkpoint directory name for `block`. It is zero-padded, so
 /// lexical order matches numeric order. [`latest_checkpoint`] depends on
 /// this.
@@ -212,21 +266,25 @@ fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
         .try_for_each(|(_, path)| remove_dir_or_file(&path))
 }
 
-/// Return the highest-block checkpoint under `checkpoints_dir`. Returns
-/// `None` if there are none, or the directory does not exist. A
-/// checkpoint is either a directory holding `mdbx.dat`, or a single
-/// file, depending on the mdbx build.
+/// Return the highest-block checkpoint under `checkpoints_dir` whose block
+/// is in `range`. Returns `None` if there is none, or the directory does not
+/// exist. A checkpoint is either a directory holding `mdbx.dat`, or a
+/// single file, depending on the mdbx build.
 ///
 /// # Errors
 ///
 /// Returns [`StateError`] if the directory listing fails partway through.
-pub fn latest_checkpoint(checkpoints_dir: &Path) -> Result<Option<CheckpointInfo>, StateError> {
+pub fn latest_checkpoint(
+    checkpoints_dir: &Path,
+    range: BlockRange,
+) -> Result<Option<CheckpointInfo>, StateError> {
     let best = entry_names(checkpoints_dir)?
         .into_iter()
         .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {
             CheckpointEntry::Checkpoint(block) => Some(CheckpointInfo { block, path }),
             CheckpointEntry::Tmp | CheckpointEntry::MdbxData | CheckpointEntry::Other => None,
         })
+        .filter(|c| range.contains(c.block))
         // `min_by_key` keeps the first of equal keys, unlike `max_by_key`
         // (which keeps the last); this matches the original loop's
         // `block > best.block` strict comparison.
@@ -304,10 +362,22 @@ fn clear_dir(dir: &Path) -> Result<(), StateError> {
 ///
 /// Returns [`StateError`] if the directory listing or a removal fails.
 pub fn prune_checkpoints(checkpoints_dir: &Path, keep_from: u64) -> Result<usize, StateError> {
+    BlockRange::below(keep_from).map_or(Ok(0), |old| remove_checkpoints(checkpoints_dir, old))
+}
+
+/// Delete every checkpoint whose block is in `range`. Returns how many were
+/// removed. A rollback removes the checkpoints at and above its divergence
+/// point: their state holds entries that the canonical stream lost, so no
+/// restore and no peer may take them.
+///
+/// # Errors
+///
+/// Returns [`StateError`] if the directory listing or a removal fails.
+pub fn remove_checkpoints(checkpoints_dir: &Path, range: BlockRange) -> Result<usize, StateError> {
     entry_names(checkpoints_dir)?
         .into_iter()
         .filter_map(|(name, path)| match CheckpointEntry::parse(&name) {
-            CheckpointEntry::Checkpoint(block) if block < keep_from => Some(path),
+            CheckpointEntry::Checkpoint(block) if range.contains(block) => Some(path),
             _ => None,
         })
         .try_fold(0usize, |removed, path| {
@@ -357,8 +427,9 @@ pub(crate) fn restore_checkpoint(
     Ok(block)
 }
 
-/// Restore the newest verifiable checkpoint under `checkpoints_dir`
-/// into `state_dir`. Returns `(restored_block, checkpoint_path)`.
+/// Restore the newest verifiable checkpoint under `checkpoints_dir` whose
+/// block is in `range`, into `state_dir`. Returns `(restored_block,
+/// checkpoint_path)`.
 ///
 /// A checkpoint that fails verification is quarantined: renamed to a
 /// hidden `.rejected-<name>` that the scanners never pick up. The
@@ -379,9 +450,13 @@ pub(crate) fn restore_checkpoint(
 pub fn restore_best_checkpoint(
     checkpoints_dir: &Path,
     state_dir: &Path,
+    range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
-    for ckpt in checkpoints_newest_first(checkpoints_dir)? {
+    let in_range = checkpoints_newest_first(checkpoints_dir)?
+        .into_iter()
+        .filter(|ckpt| range.contains(ckpt.block));
+    for ckpt in in_range {
         if let Some(block) = ckpt.restore_or_set_aside(state_dir, expected_genesis)? {
             return Ok(Some((block, ckpt.path)));
         }

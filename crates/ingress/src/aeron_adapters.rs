@@ -15,18 +15,18 @@ use tokio::sync::{broadcast, watch};
 
 use kardamom_cache::{LiveAccounts, LiveAccountsConfig, LiveAccountsWriter};
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, ServiceEventsSubscriberHandle,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, ReceiptFrame, ServiceEventsSubscriberHandle,
     TxDataPublisherHandle, TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
     TxReceiptsReceiver,
 };
 use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
-    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, Receipt,
-    ReceiptBatch, TxEnvelope, TxError,
+    BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, ReceiptBatch,
+    TxEnvelope, TxError,
 };
 
-use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription};
+use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription, ReceiptItem};
 use crate::error::IngressError;
 use crate::seal_latency::SealStamps;
 
@@ -172,15 +172,16 @@ impl_pump_source!(TxErrorsSubscriberHandle, TxError);
 /// The `tx_receipts` pump: one batch frame in, its account rows into the
 /// local layer, then its receipts onto the bus, one by one. The rows go
 /// first, so a client its receipt releases sees the new state on its
-/// next submit. `TxReceiptsReceiver` has no constructor outside the log
-/// crate, so [`Self::on_batch`] is the testable step.
+/// next submit. A rollback frame goes onto the same bus, so the order of
+/// the stream holds. `TxReceiptsReceiver` has no constructor outside the
+/// log crate, so [`Self::on_frame`] is the testable step.
 struct ReceiptBatchPump {
     writer: LiveAccountsWriter,
-    tx: broadcast::Sender<Receipt>,
+    tx: broadcast::Sender<ReceiptItem>,
 }
 
 impl ReceiptBatchPump {
-    fn new(writer: LiveAccountsWriter, tx: broadcast::Sender<Receipt>) -> Self {
+    fn new(writer: LiveAccountsWriter, tx: broadcast::Sender<ReceiptItem>) -> Self {
         Self { writer, tx }
     }
 
@@ -191,8 +192,23 @@ impl ReceiptBatchPump {
     }
 
     async fn run(mut self, mut rx: TxReceiptsReceiver) {
-        while let Some((_, batch)) = rx.recv_batch().await {
-            self.on_batch(batch);
+        while let Some((_, frame)) = rx.recv_frame().await {
+            self.on_frame(frame);
+        }
+    }
+
+    /// Put one frame onto the bus. A lagging or absent receiver is the
+    /// broadcast channel's concern, so this ignores the send result. A
+    /// rollback first empties the local account layer: the rows of the
+    /// lost blocks carry positions above the new stream, so the monotone
+    /// rule would keep their nonces.
+    fn on_frame(&mut self, frame: ReceiptFrame) {
+        match frame {
+            ReceiptFrame::Batch(batch) => self.on_batch(batch),
+            ReceiptFrame::Rollback(rollback) => {
+                self.writer.clear();
+                let _ = self.tx.send(ReceiptItem::Rollback(rollback));
+            }
         }
     }
 
@@ -205,7 +221,7 @@ impl ReceiptBatchPump {
             self.writer.apply(end, &batch.accounts);
         }
         for receipt in batch.receipts {
-            let _ = self.tx.send(receipt);
+            let _ = self.tx.send(receipt.into());
         }
     }
 }
@@ -214,7 +230,7 @@ impl ReceiptBatchPump {
 /// broadcast buses.
 #[derive(Clone)]
 pub struct LiveIngressSubscription {
-    receipts: broadcast::Sender<Receipt>,
+    receipts: broadcast::Sender<ReceiptItem>,
     live: Arc<LiveAccounts>,
     watermarks: broadcast::Sender<QuorumWatermark>,
     local_fsync: broadcast::Sender<FsyncWatermark>,
@@ -246,7 +262,7 @@ impl LiveIngressSubscription {
     ) -> Result<Self, IngressError> {
         let channels = plane.channels().clone();
         let channels = &channels;
-        let (receipts_tx, _) = broadcast::channel::<Receipt>(BUS_CAPACITY);
+        let (receipts_tx, _) = broadcast::channel::<ReceiptItem>(BUS_CAPACITY);
         let (live, live_writer) = LiveAccounts::new(live_cfg);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(BUS_CAPACITY);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(BUS_CAPACITY);
@@ -338,7 +354,7 @@ impl LiveIngressSubscription {
 }
 
 impl IngressSubscription for LiveIngressSubscription {
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt> {
+    fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem> {
         self.receipts.subscribe()
     }
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {
@@ -412,12 +428,12 @@ mod tests {
         use kardamom_types::AccountRow;
 
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
-        let (bus, mut sub) = broadcast::channel::<Receipt>(16);
+        let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
         let mut pump = ReceiptBatchPump::new(writer, bus);
         let end = BPosition::from_index(7);
-        let receipt = Receipt {
+        let receipt = kardamom_types::Receipt {
             tx_idx: end,
-            ..Receipt::default()
+            ..kardamom_types::Receipt::default()
         };
         let row = AccountRow {
             address: Address::repeat_byte(0xaa),
@@ -428,7 +444,9 @@ mod tests {
             receipts: vec![receipt],
             accounts: vec![row],
         });
-        let got = sub.recv().await.unwrap();
+        let Ok(ReceiptItem::Receipt(got)) = sub.recv().await else {
+            panic!("the receipt comes first");
+        };
         assert_eq!(got.tx_idx, end);
         let view = live.get(Address::repeat_byte(0xaa)).unwrap();
         assert_eq!((view.nonce, view.tx_idx), (3, 7));
@@ -437,6 +455,45 @@ mod tests {
             accounts: Vec::new(),
         });
         assert_eq!(live.head(), 7);
+    }
+
+    // A rollback frame goes onto the receipt bus between the receipts
+    // around it, in stream order.
+    #[tokio::test]
+    async fn receipt_pump_keeps_a_rollback_in_stream_order() {
+        let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
+        let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
+        let mut pump = ReceiptBatchPump::new(writer, bus);
+        let receipt = |block_number| kardamom_types::Receipt {
+            block_number,
+            ..kardamom_types::Receipt::default()
+        };
+        let rollback = kardamom_types::ReceiptRollback { to_block: 4 };
+        let row = kardamom_types::AccountRow {
+            address: alloy_primitives::Address::repeat_byte(0xAA),
+            nonce: 9,
+            balance: alloy_primitives::U256::from(1u64),
+        };
+        let batch = |block_number, accounts| {
+            ReceiptFrame::Batch(ReceiptBatch {
+                receipts: vec![receipt(block_number)],
+                accounts,
+            })
+        };
+        pump.on_frame(batch(6, vec![row.clone()]));
+        assert!(
+            live.get(row.address).is_some(),
+            "the row of block 6 is resident"
+        );
+        pump.on_frame(ReceiptFrame::Rollback(rollback));
+        assert!(
+            live.get(row.address).is_none(),
+            "the rollback empties the layer"
+        );
+        pump.on_frame(batch(5, Vec::new()));
+        assert_eq!(sub.recv().await.unwrap(), receipt(6).into());
+        assert_eq!(sub.recv().await.unwrap(), ReceiptItem::Rollback(rollback));
+        assert_eq!(sub.recv().await.unwrap(), receipt(5).into());
     }
 
     // A shard index past the publication vector must give an Internal

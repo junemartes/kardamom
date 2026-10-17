@@ -273,6 +273,20 @@ TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
 
+# Frozen layout. The rollback record on the tx_receipts receipt stream: an
+# 8-byte rkyv ReceiptRollback frame. A receipt batch frame always holds at
+# least one receipt, so a reader tells the two kinds apart by the length.
+# A reader of an older build fails to decode the frame as a batch, logs
+# it, and skips it: it keeps the receipts above the rollback, as before.
+[format.receipt-rollback]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/receipt.rs#pub struct ReceiptRollback"]
+[format.receipt-rollback.layout]
+ReceiptRollback = "rkyv size 8 align 8"
+
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.
 [format.notifier-outbox]

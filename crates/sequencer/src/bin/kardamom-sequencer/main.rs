@@ -443,7 +443,7 @@ impl ResyncWiring {
     )]
     fn spawn_lookup(
         cfg: &SequencerConfig,
-        floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorUpdate>,
+        floor_tx: crossbeam_channel::Sender<kardamom_sequencer::resync::FloorEvent>,
         shutdown: &Shutdown,
         live: std::sync::Arc<kardamom_cache::LiveAccounts>,
         redis: Option<std::sync::Arc<kardamom_cache::CacheReader>>,

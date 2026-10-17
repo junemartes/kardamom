@@ -37,6 +37,7 @@ pub(crate) mod pending;
 pub mod proxy;
 pub(crate) mod rate_limit;
 pub(crate) mod receipt_cache;
+pub(crate) mod receipt_subscription;
 pub mod routing;
 pub mod seal_latency;
 pub(crate) mod seen_receipts;
@@ -47,7 +48,7 @@ pub(crate) mod sync_util;
 pub mod test_support;
 pub(crate) mod tx_error_dedup;
 
-pub use channels::{IngressPublication, IngressSubscription, MockChannels};
+pub use channels::{IngressPublication, IngressSubscription, MockChannels, ReceiptItem};
 pub use config::IngressConfig;
 pub use error::IngressError;
 pub use pending::ReceiptResponse;

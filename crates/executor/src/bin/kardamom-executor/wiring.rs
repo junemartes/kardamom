@@ -235,6 +235,18 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         }
     }
 
+    /// The rollback record rides the receipt stream, so every subscriber
+    /// reads it before the receipts that follow it.
+    fn publish_rollback(
+        &mut self,
+        rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        self.handle
+            .publish_rollback(&rollback)
+            .map(|_| ())
+            .map_err(|e| Self::publish_error("publish_rollback", &e))
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
             CMessage::Receipt(r) => self

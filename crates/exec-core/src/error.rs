@@ -74,6 +74,26 @@ pub enum ExecutorError {
         head_block: u64,
     },
 
+    /// The canonical stream differs from the committed history of this
+    /// consumer. `block` and `index` name the first difference: the
+    /// divergence point. Every block below `block` is equal on both sides,
+    /// so a checkpoint below `block` is a valid restart point.
+    #[error(
+        "the canonical stream diverges from the committed history at block {block} (index {index})"
+    )]
+    StreamDiverged { block: u64, index: u64 },
+
+    /// The source of the canonical stream has a new connection, or its head
+    /// went below the delivery cursor, while this consumer has entries in
+    /// flight above its committed block. The stream of the new connection
+    /// can differ from the entries in flight, and only the committed
+    /// history can be compared. The pipeline starts again from the state
+    /// DB, and the comparison at the start runs again.
+    #[error(
+        "the stream source restarted (delivery cursor index {next_index}, block {next_block}): restart from the state DB"
+    )]
+    SourceRestarted { next_index: u64, next_block: u64 },
+
     /// `sequencer_id` is the `tx_data` lane index, `TxRef::shard_id`. It
     /// names the archive that holds the envelope, not the process that
     /// published the ref.
