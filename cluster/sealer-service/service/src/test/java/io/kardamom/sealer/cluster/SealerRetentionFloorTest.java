@@ -46,6 +46,8 @@ class SealerRetentionFloorTest {
     }
 
     private static final int SEGMENT_BYTES = 64 * 1024;
+    /** The first record tag: above every record type. */
+    private static final int TAG_BASE = 16;
     /** The status frame with the snapshot flag: the heap store sends it. */
     private static final int STATUS_LEN = 68;
     /** The offset of the snapshot flag in the status frame. */
@@ -103,7 +105,10 @@ class SealerRetentionFloorTest {
         final byte[] sender = new byte[CanonicalSealerState.SENDER_LEN];
         java.util.Arrays.fill(sender, (byte) 0xAA);
         for (int n = from; n < to; n++) {
-            deliver(svc, publisher, IngressFrames.recordFrame(n, sender, n));
+            // The tag is the record type of the one-byte payload: keep it
+            // off the canonical entry type, which a file member takes only
+            // from a full entry.
+            deliver(svc, publisher, IngressFrames.recordFrame(n + TAG_BASE, sender, n));
         }
         svc.onTimerEvent(SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, 250);
     }

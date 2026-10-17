@@ -144,6 +144,16 @@ impl Fixture {
             ),
             ("txref_ingress", txref_ingress),
             ("txref_egress", txref_egress),
+            ("sealer_info", encode_sealer_info(3, 0x0102)),
+            (
+                "nonce_release",
+                NonceRelease {
+                    sender: Address::repeat_byte(0x11),
+                    nonce: 7,
+                    tx_hash: B256::repeat_byte(0xAB),
+                }
+                .encode(),
+            ),
         ]
     }
 }

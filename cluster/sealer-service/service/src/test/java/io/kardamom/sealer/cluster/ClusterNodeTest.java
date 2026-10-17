@@ -186,6 +186,18 @@ final class ClusterNodeTest {
         assertThrows(NumberFormatException.class, () -> ClusterNode.requireDecisionVersion(""));
     }
 
+    /**
+     * The move to version 3 is a coordinated restart: a member of this image
+     * stops at start under a job of version 2, so no member of version 3
+     * runs beside one of version 2. The restart restores the version-10
+     * snapshot of the old members (see {@link SealerRecordPathTest}).
+     */
+    @Test
+    void thisImageRunsVersionThreeAndRefusesAJobOfVersionTwo() {
+        assertEquals(3, io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION);
+        assertThrows(IllegalStateException.class, () -> ClusterNode.requireDecisionVersion("2"));
+    }
+
     @Test
     void theSealerJobPassesTheDecisionVersionOfTheCode() throws IOException {
         final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));

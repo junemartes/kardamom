@@ -205,7 +205,9 @@ payload:       [canonical_id:32][record_type=6][lane:u8][envelope]
 |---|---|
 | Ingress kind 2 (subscribe) | Unchanged. The egress sends a subscriber kind 15, not kind 1, for each record type 6 entry. No egress session gets the bytes. |
 | Egress kind 15 `RELAYED_REF` (new) | `[kind=15][index:u64][canonical_id:32][record_type:u8]`, 42 bytes. Every egress subscriber gets it for each record type 6 entry. Other record types stay kind 1. |
-| Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). |
+| Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). A member with `carryBytes` drops them already (section 5.4). |
+| Ingress kind 10 `NONCE_RELEASE` (new, #627) | `[kind=10][sender:20][nonce:u64][canonical_id:32]`, 61 bytes. The sequencer sends it for a skip receipt that proves the chain nonce (section 5.4). |
+| Egress kind 17 `SEALER_INFO` (new) | `[kind=17][decision_version:u8][cluster_session_id:i64]`, 10 bytes. The sealer sends it to each session when the session opens. The sequencer sends kind 10 only after version 3 or above for its current session; the id ties the frame to the session whatever the order of the client's own session-start marker. |
 | Egress kind 13 (record-lag reject) | Retired. |
 | Egress kind 14 | Not used. An earlier draft used it for `ENVELOPE_FULL` (section 15, option A). |
 | Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). The byte tail `[retained_bytes:u64]` follows it: 75 bytes. A reader reads 50, 67 or 75 bytes (`crates/cluster-adapter/src/wire/egress.rs:204-229`). An old reader ignores the longer tail. |
@@ -296,6 +298,71 @@ envelope, and the void goes:
   coordinated restart of `cluster/sealer-service/README.md:396-422`.
 - The decision version stays as a mechanism (#568). Version 2's rule (the lower nonce after a
   void) has no input after version 3, because no void exists.
+- **Version 3 with and without `carryBytes`.** Version 3 ships before the cut-over, so a member
+  of version 3 runs with `carryBytes` off until PR 13:
+  - Off: the record path of today. The void stays in use, and the snapshot is version 10 with
+    the void ledger.
+  - On: the record path of section 5.1. The member drops the void request and the recorded
+    cursor as unknown kinds, and the snapshot is version 12 with no void ledger.
+  - So the rules of version 3 depend on `carryBytes`, and `carryBytes` is a setting that every
+    member must match. The release gate refuses a rolling change of it (the must-match list),
+    and a member stops on a snapshot of the other layout (`sealer RETAINED-FILE FATAL`).
+- **The nonce release (#627).** Version 3 also applies the nonce release, with `carryBytes` on
+  or off. The sealer's guard counts every ordered entry, and a skip uses no nonce on the chain,
+  so after a skip the guard expects a nonce above the chain.
+  - The sequencer sends ingress kind 10, with the skipped nonce and the hash of the skipped
+    entry, only for a skip that proves that the chain was at that nonce. The executor (revm)
+    checks the code of the sender, then the nonce, then the balance:
+    - an `insufficient_funds` skip proves it, with or without a receipt floor;
+    - a gas, fee, init-code, header, undecodable or sender-has-code skip comes from a check
+      before the nonce check, so it releases only exactly at a known receipt floor;
+    - a `nonce_too_high` or `nonce_too_low` skip never releases.
+  - Both twins send it. The sequencer sends one release for each skipped entry, and at most
+    1,024 releases wait for a blocked transport. It sends a release only after the sealer
+    reported decision version 3 on the current session (egress kind 17), so a sealer of an older
+    version never gets one, and its log holds none.
+  - The sealer applies it in log order, only when the guard tracks the sender and expects a
+    nonce above the released one: the expected nonce goes down to the released nonce. An
+    unknown or evicted sender needs no change.
+  - **Why a release never sets the guard below the chain.** The release of entry X at nonce `n`
+    proves that the chain was at `n` when X executed. The guard orders the entries of a sender
+    with contiguous nonces, so each entry ordered after X and before the release has a nonce
+    above `n`. The chain stays at `n`, so each of them skips: as `nonce_too_high`, or for a check
+    before the nonce check (`fee`, `gas_limit`, `sender_has_code`, and so on). Its nonce is above
+    the chain, and so above the receipt floor, so it sends no release. (A release for such a skip
+    above the floor would be late: after `n'` and `n+1'` are ordered, it would set the guard below
+    the chain.) The guard orders nothing at `n` until the release applies, and after that the mark
+    drops a repeat. So the run `n` (skip), `n + 1` (skip) recovers with the release of `n`, and
+    no second lowering follows.
+  - The one exception: an LRU eviction of the sender while X is in the window, a re-seed at `n`,
+    and the execution of that entry before the release applies. The eviction needs
+    `dedupCapacity` other senders ordered within the inclusion horizon of X. The guard is then
+    below the chain until the next eviction of the sender.
+  - The cluster network is the trust boundary. A session sends no identity, so any cluster
+    client can send kind 0 with any guard header, kind 7, and kind 10. The sealer does not tie
+    the id of a release to its sender, and does not tell a marker id from a user id.
+  - It applies only while the skipped id is in the dedup window, and only once. It adds a
+    release mark to the window: the id with its first byte inverted, held to the deadline of the
+    id. The twin copy finds the mark and drops. A release after the deadline drops.
+  - The mark cannot stand for a real id. A real id is a keccak hash, and the mark is a fixed
+    transform of an id that the window holds, so a real id equal to a mark is a hash collision.
+  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark
+    for each ordered entry, and the mark leaves with its entry at the deadline. So a snapshot
+    holds at most `2 * (dedupCapacity + 4096)` ids: each mark is the transform of an id in the window.
+  - The skipped id stays in the window, so the same signed bytes stay a duplicate until their
+    deadline, and one hash never has two canonical entries. No receipt store has to choose
+    between a skip receipt and a later success for one hash. The sender signs a new
+    transaction at the released nonce.
+  - The marks are ids of the dedup window, so the snapshots of version 10 and 12 carry them with
+    no change of layout.
+- **The change of the decision version.** A member replays the log after its snapshot with the
+  rules of its code, and versions 2 and 3 decide a release differently. So the log after the
+  last snapshot must hold no release, in both directions. The procedure pauses the submits,
+  stops the sequencers, and waits for a snapshot. `just sealer-quiesce-check <env>` reads
+  `releasesSinceSnapshot` on the admin `/status` of every member and records a passing check;
+  the release gate refuses a change of the decision version without one. A rollback to version
+  2 also waits one inclusion horizon, so the marks leave the window: the loader of version 2
+  takes at most `dedupCapacity + 4096` ids.
 
 ### 5.5 Retention, the snapshot, the purge and the floor
 
@@ -348,6 +415,7 @@ the posted head (`SealerEgress.java:420-449`). The frames now carry bytes.
 |---|---|---|
 | Dedup window, sender map, origins, remote peers | unchanged | unchanged |
 | Void ledger (v6) | present | gone |
+| Release marks (decision version 3) | ids in the dedup window | ids in the dedup window |
 | Ordering window, posted head, seed (v8 to v10) | unchanged | unchanged |
 | Recorded cursors (v11, never written) | absent | absent |
 | Retained frames | `TxRef` frames, 59 B | none: the floor and the head position of the retained file, and its index |
@@ -1186,7 +1254,7 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 
 | Format | Today | After the cut-over |
 |---|---|---|
-| `sealer-ingress-kinds` | writes 8, reads 0..9 | writes 8, reads 0..8. No new ingress kind: record type 5 rides kinds 0 and 3. Kinds 6 and 9 drop as unknown. |
+| `sealer-ingress-kinds` | writes 8, reads 0..9 | Version 3 (#591, #627): writes 10, reads 0..10. Record type 5 rides kinds 0 and 3. Kind 10 is the nonce release (section 5.4). A sealer of the base release drops kind 10, so the sequencer deploys first. After the cut-over, kinds 6 and 9 drop as unknown. |
 | `sealer-egress-kinds` | writes 12, reads 1..13 | writes 16, reads 1..16. Kind 13 is never sent. Kind 14 is not used. Kind 16 is sent on the feed only. The status frame is 75 bytes. |
 | `sealer-record-types` | writes 4, reads 0..4 | writes 6, reads 1..6. Types 0 and 4 are never written. |
 | `sealer-snapshot` | writes 10, reads 1..11 | writes 12, reads 10..12. A later release sets `reads_min = 12`. |

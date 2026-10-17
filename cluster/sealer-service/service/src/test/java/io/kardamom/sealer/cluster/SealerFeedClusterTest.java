@@ -113,6 +113,9 @@ class SealerFeedClusterTest {
         IntStream.range(from, to).forEach(i -> {
             final byte[] payload = new byte[payloadBytes];
             Arrays.fill(payload, (byte) i);
+            // Record type 0: a member with the retained file takes no
+            // canonical entry (type 6) from a session.
+            payload[0] = 0;
             offerRecord(client, canonicalId(i), payload);
         });
         awaitCondition(client, () -> egress.relayedIndexes.size() >= to);
@@ -253,7 +256,7 @@ class SealerFeedClusterTest {
         offerRecords(0, 2, 16);
         final int slots = 4;
         final AeronCluster client = cluster.reconnectClient();
-        offerFrame(client, originRecordFrame(canonicalId(1000), 100, slots, new byte[0]));
+        offerFrame(client, originRecordFrame(canonicalId(1000), 100, slots, new byte[] {2}));
         awaitCondition(client, () -> egress.relayedIndexes.size() >= 3);
         final long epochIndex = egress.relayedIndexes.get(2);
         final long afterEpoch = epochIndex + slots;

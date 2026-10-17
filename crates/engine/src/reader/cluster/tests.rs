@@ -303,7 +303,7 @@ fn late_boundary_sealing_below_cursor_is_fatal() {
 #[test]
 fn a_new_session_holds_its_live_records_until_the_replay_is_done() {
     let egress = FakeEgress::new();
-    egress.push(wire::encode_session_start());
+    egress.push(wire::encode_session_start(1));
     egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
     egress.push(encode_egress_record(3, &relayed_txref(1, 3)).unwrap());
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));
@@ -324,7 +324,7 @@ fn a_new_session_holds_its_live_records_until_the_replay_is_done() {
 fn a_replay_done_of_an_earlier_session_does_not_end_the_catch_up() {
     let egress = FakeEgress::new();
     egress.push(wire::encode_replay_done(2, 1));
-    egress.push(wire::encode_session_start());
+    egress.push(wire::encode_session_start(1));
     egress.push(encode_egress_record(2, &relayed_txref(1, 2)).unwrap());
     egress.push(encode_egress_record(3, &relayed_txref(1, 3)).unwrap());
     egress.push(encode_egress_boundary(1, 2, 1_000, 0));

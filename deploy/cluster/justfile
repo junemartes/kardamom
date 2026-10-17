@@ -49,6 +49,14 @@ deploy:
 rollback env:
     KARDAMOM_ENV="{{ env }}" ansible-playbook -i localhost, ansible/rollback.yml
 
+# Check that no sealer member applied a nonce release after its last
+# snapshot, and record the result for the release gate. Run it before the
+# stop of the sealer in a change of the decision version: pause the
+# submits, stop the sequencers, wait for a snapshot, then run it.
+# cluster/sealer-service/README.md ("Decision version") is the procedure.
+sealer-quiesce-check env:
+    KARDAMOM_ENV="{{ env }}" ansible-playbook -i localhost, ansible/quiesce.yml
+
 # Re-render the release before the last one when Nomad dropped the job
 # versions to revert to: a normal rolling deploy of the older images,
 # under the same checks, from the manifest that a refused `just rollback`

@@ -63,7 +63,7 @@ pub use egress_encode::{
 };
 pub use egress_encode::{
     encode_egress_boundary, encode_egress_record, encode_replay_ahead, encode_replay_done,
-    encode_replay_unavailable, encode_session_start,
+    encode_replay_unavailable, encode_sealer_info, encode_session_start,
 };
 pub use entry::{CanonicalTx, RelayedRef, encode_feed_request};
 #[cfg(any(test, feature = "testing"))]
@@ -71,10 +71,10 @@ pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    GuardHeader, encode_ingress_batch, encode_ingress_epoch, encode_ingress_posted_cursor,
-    encode_ingress_recorded_cursor, encode_ingress_remote_epoch, encode_ingress_txref,
-    encode_replay_request, encode_subscribe, encode_void_request, ingress_deadline,
-    ingress_sender_nonce, ingress_tip, split_ingress,
+    GuardHeader, NonceRelease, encode_ingress_batch, encode_ingress_epoch,
+    encode_ingress_posted_cursor, encode_ingress_recorded_cursor, encode_ingress_remote_epoch,
+    encode_ingress_txref, encode_replay_request, encode_subscribe, encode_void_request,
+    ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
 };
 pub(crate) use relay::MAX_INGRESS_PAYLOAD_LEN;
 
@@ -186,6 +186,14 @@ pub const KIND_POSTED_CURSOR: u8 = 7;
 /// sealer's own seed record, which no Rust producer sends. Matches Java
 /// `KIND_RECORDED_CURSOR`.
 pub const KIND_RECORDED_CURSOR: u8 = 9;
+/// Ingress kind: a sequencer's nonce release, a system record:
+/// `[kind:u8 = 10][sender:20][nonce:u64][tx_hash:32]`, 61 bytes. An executor
+/// skipped the ordered entry `tx_hash` of `sender`, and the chain expects
+/// `nonce` of the sender next. The sealer lowers the expected nonce of its
+/// contiguity guard to `nonce`, once for each skipped entry. A sealer that
+/// does not know the kind drops the frame. Matches Java
+/// `KIND_NONCE_RELEASE`.
+pub const KIND_NONCE_RELEASE: u8 = 10;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the
@@ -333,7 +341,22 @@ pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
 /// that it knows and ignores the tail.
 pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
-/// Client-local kind: a new session starts: `[kind:u8 = 255]`. The
+/// Egress kind: the sealer's rules:
+/// `[kind:u8 = 17][decision_version:u8][cluster_session_id:i64]`
+/// ([`SEALER_INFO_LEN`] bytes). The sealer sends it to each session when
+/// the session opens, with the id of that session. A sequencer sends a
+/// nonce release ([`KIND_NONCE_RELEASE`]) only after it got version 3 or
+/// above for its current session. The id ties the frame to its session, so
+/// a frame that arrives before the client's session-start marker still
+/// counts. Matches Java `EGRESS_KIND_SEALER_INFO`.
+pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
+/// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
+pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
+/// The first decision version of the sealer that applies a nonce release.
+pub const RELEASE_DECISION_VERSION: u8 = 3;
+
+/// Client-local kind: a new session starts:
+/// `[kind:u8 = 255][cluster_session_id:i64]`. The
 /// session thread puts this frame on the consumer channel when a session
 /// opens, before any frame of that session. The channel is FIFO, so every
 /// frame of an earlier session comes before the marker. The sealer never
@@ -568,6 +591,9 @@ fn rd_i32(b: &[u8], at: usize) -> Result<i32, WireError> {
 }
 fn rd_u64(b: &[u8], at: usize) -> Result<u64, WireError> {
     bytes::u64_le(b, at).ok_or_else(|| too_short(b, at, 8))
+}
+fn rd_i64(b: &[u8], at: usize) -> Result<i64, WireError> {
+    bytes::i64_le(b, at).ok_or_else(|| too_short(b, at, 8))
 }
 fn rd_u128(b: &[u8], at: usize) -> Result<u128, WireError> {
     rd_slice(b, at, 16).map(|s| {
