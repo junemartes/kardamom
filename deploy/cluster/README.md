@@ -232,7 +232,7 @@ The deploy record of an environment lives in the Nomad variable `kardamom/deploy
 | `operator` | `KARDAMOM_OPERATOR`, else `GITHUB_ACTOR`, else `USER`. |
 | `target.revision` | The revision of the deployed tree: `KARDAMOM_REVISION`, else `GITHUB_SHA`, else git, else jj. |
 | `target.manifest` | The image manifest, by service: `{"ingress": "<registry>/kardamom-ingress@sha256:..."}`. |
-| `target.formats` | The text of `formats.toml` of the deployed tree. |
+| `target.formats` | `sha256:<hex>`: the `formats.toml` of the deployed tree, by the SHA-256 of its text. The text is in the Nomad variable `kardamom/deploys/<env>/formats/<hex>`, one variable for each text, because Nomad limits a variable to 64 KiB. A record written before the references holds the text itself; the role reads both. |
 | `before.revision`, `before.manifest`, `before.formats` | The same three fields of the accepted release at the start of the attempt. |
 | `before.jobs` | The Nomad job version of every job the namespace knows at the start: `{"ingress": {"before": 3}}`. A registration adds `after`, the version the attempt registered. A job that the attempt adds has `before: null`. |
 | `changed` | The jobs the attempt registered, in registration order. A job joins before its registration. The rollback reverts them in reverse order. |
@@ -636,7 +636,7 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in `crates/chaos/tests/shards.rs`.
 - A shard test brings the cluster up itself. `container-test` runs it with `KARDAMOM_CHAOS_REUSE=1` against the cluster that `container-up` made.
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
-- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers | formats` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). `formats` prints the format findings of this tree against a `--base` registry as JSON; the release gate reads them.
+- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). The release gate reads the format findings from `kardamom-deploy formats`.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 
