@@ -188,20 +188,20 @@ struct AeronThread {
     /// The image log handlers of every subscription. They live as long
     /// as the process (see [`ImageHandlers`]).
     image_log: ImageHandlers,
-    /// Escalating idle wait for the busy branch: base
-    /// [`Self::POLL_BASE`], cap the [`IdleCap`] of the runtime, grace 10
-    /// (about 100 microseconds of consecutive emptiness before the first
-    /// escalation).
+    /// Escalating idle wait for the busy branch, grace 10. With no
+    /// [`IdleCap`]: base 100 microseconds, cap 1 ms (about 1 ms of
+    /// consecutive emptiness before the first escalation). With a cap:
+    /// base [`Self::CAPPED_BASE`], up to the cap.
     backoff: IdleBackoff,
 }
 
 impl AeronThread {
     /// The wait between two polls while traffic flows or a publish is
-    /// pending.
-    const POLL_BASE: Duration = Duration::from_micros(10);
+    /// pending, under an [`IdleCap`].
+    const CAPPED_BASE: Duration = Duration::from_micros(10);
 
-    /// Runs on the Aeron thread, so the idle backoff sets the timer slack
-    /// of that thread.
+    /// Runs on the Aeron thread, so an idle cap sets the timer slack of
+    /// that thread.
     fn new(
         aeron: Rc<AeronClient>,
         cmd_rx: CbReceiver<RuntimeCmd>,
@@ -217,7 +217,8 @@ impl AeronThread {
             pending: VecDeque::new(),
             dests: Vec::new(),
             image_log: ImageHandlers::leak(),
-            backoff: idle_cap.thread_backoff(Self::POLL_BASE, 10),
+            backoff: IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 10)
+                .under(idle_cap, Self::CAPPED_BASE),
         }
     }
 
@@ -274,7 +275,9 @@ impl AeronThread {
         // publisher that waits for its ack (the sequencer's offer path
         // first among them). A subscription has no wake-up, so a fragment
         // that arrives during the wait waits for its end. When quiet, the
-        // wait escalates to the idle cap (`IdleBackoff`). A non-empty
+        // wait escalates to its cap (`IdleBackoff`), since a short fixed
+        // wake dominates a quiet loop's CPU with crossbeam's pre-park
+        // spin, not work. A non-empty
         // `pending` pins the base cadence, because the retry timing of a
         // back-pressured offer must not degrade.
         let wait = self.backoff.next_wait(worked || !self.pending.is_empty());

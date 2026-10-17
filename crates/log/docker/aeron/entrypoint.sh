@@ -21,15 +21,14 @@ umask 0000
 # threading so each driver uses ONE thread instead of three.
 #
 # Idle strategy: Aeron's backoff (spin, then yield, then park), with the
-# longest park capped at KARDAMOM_IDLE_CAP_US (default 50 µs) instead of
-# Aeron's 1 ms. A frame that reaches an idle driver waits for the end of
-# the park. CappedBackoffIdleStrategy reads the cap from the environment.
-# Every driver and archive agent uses it, in each threading mode. A sleep of
-# a fixed 1 ms (SleepingMillisIdleStrategy) delays the Status-Message and
+# longest park capped at KARDAMOM_IDLE_CAP_US. Unset, the cap is Aeron's
+# own 1 ms. A frame that reaches an idle driver waits for the end of the
+# park. CappedBackoffIdleStrategy reads the cap from the environment. Every
+# driver and archive agent uses it, in each threading mode. A sleep of a
+# fixed 1 ms (SleepingMillisIdleStrategy) delays the Status-Message and
 # NAK service of the driver, and multicast liveness suffers.
 AERON_THREADING_MODE="${AERON_THREADING_MODE:-SHARED}"
 AERON_ARCHIVE_THREADING_MODE="${AERON_ARCHIVE_THREADING_MODE:-SHARED}"
-export KARDAMOM_IDLE_CAP_US="${KARDAMOM_IDLE_CAP_US:-50}"
 IDLE_STRATEGY=io.kardamom.aeron.CappedBackoffIdleStrategy
 IDLE_OPTS=""
 for agent in conductor sender receiver sharednetwork shared archive archive.recorder archive.replayer; do
@@ -49,11 +48,15 @@ AERON_ARCHIVE_CONTROL_RESPONSE_PORT="${AERON_ARCHIVE_CONTROL_RESPONSE_PORT:-8011
 AERON_ARCHIVE_REPLICATION_PORT="${AERON_ARCHIVE_REPLICATION_PORT:-8021}"
 
 # Timer slack: Linux ends a park up to the timer slack of the thread after
-# its deadline, 50 µs by default, so a 50 µs park can take 100 µs. This
-# shell sets its own slack to 1 µs. The JVM and each of its threads take
-# the slack of the thread that starts them. A kernel that refuses the
-# write keeps the default slack.
-{ echo 1000 > /proc/self/timerslack_ns; } 2>/dev/null || true
+# its deadline, 50 µs by default, so a 50 µs park can take 100 µs. With a
+# cap set, this shell sets its own slack to 1 µs. The JVM and each of its
+# threads take the slack of the thread that starts them. A kernel that
+# refuses the write keeps the default slack. The line after it prints the
+# slack that the JVM gets.
+if [[ -n "${KARDAMOM_IDLE_CAP_US:-}" ]]; then
+    echo 1000 > /proc/self/timerslack_ns || echo "could not set the timer slack" >&2
+fi
+echo "idle cap: KARDAMOM_IDLE_CAP_US=${KARDAMOM_IDLE_CAP_US:-<unset>} timerslack_ns=$(cat /proc/self/timerslack_ns 2>&1)"
 
 java \
     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \

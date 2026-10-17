@@ -151,7 +151,7 @@ public final class ClusterNode {
             .orElse(" <off: retained frames on the heap>"));
         // The longest idle park of every hot-path thread of the member.
         // -Dkardamom.cluster.idleCapUs wins over the KARDAMOM_IDLE_CAP_US
-        // env var. Default 50 µs.
+        // env var. Unset, the cap is 1 ms, the cap of Aeron's own backoff.
         final IdleCap idleCap = IdleCap.fromSettings();
         System.out.println("cluster idle cap memberId=" + memberId + " maxParkNs=" + idleCap.maxParkNs());
         final Optional<FeedConfig> feed = FeedConfig.parse(

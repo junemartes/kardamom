@@ -4,7 +4,6 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use kardamom_cache::{CacheConfig, LiveAccountsConfig};
-use kardamom_log::aeron_live::IdleCap;
 use kardamom_types::shard_map::{LANE_COUNT, VslotSet};
 use serde::{Deserialize, Serialize};
 
@@ -60,11 +59,6 @@ pub struct SequencerConfig {
     pub nonce_floor_lag_ms: Option<u64>,
     /// Optional CPU core to pin this process to. `None` means no pin.
     pub core_id: Option<usize>,
-    /// The longest idle sleep of the core loop. Not a TOML key: the
-    /// binary sets it from its `AeronRuntime`, which reads
-    /// `KARDAMOM_IDLE_CAP_US`. Default 50 µs.
-    #[serde(skip)]
-    pub idle_cap: IdleCap,
     /// Backpressure behaviour when `tx_ordering` blocks.
     pub backpressure_policy: BackpressurePolicy,
     /// Aeron Cluster (Raft) sealer client config. `tx_ordering` always goes
@@ -146,7 +140,6 @@ impl Default for SequencerConfig {
             tx_ttl_ms: DEFAULT_TX_TTL_MS,
             nonce_floor_lag_ms: None,
             core_id: None,
-            idle_cap: IdleCap::default(),
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
             cluster: ClusterConfig::default(),
             resync: crate::resync::ResyncConfig::default(),

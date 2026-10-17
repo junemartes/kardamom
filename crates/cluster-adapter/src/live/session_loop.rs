@@ -302,12 +302,14 @@ struct SessionLoop {
     // alive. The only thing that stops the session is `stop` (set when
     // the owning `LiveCluster` is dropped).
     egress_alive: bool,
-    // Escalating idle wait. It starts at `POLL_BASE`, caps at the idle cap
-    // of the runtime, with a grace of 5 (5 consecutive empty iterations
-    // before it escalates). Egress frames and offer requests wake the
-    // Select immediately, whatever the timeout. The time-based duties
-    // (keep-alive emission, reconnect backoff, the egress-silence
-    // watchdog) and the driver's outbound frames see the tick.
+    // Escalating idle wait. It starts at 1ms (the established duty-cycle
+    // cadence), caps at 5ms, with a grace of 5 (about 5ms of consecutive
+    // emptiness before it escalates). Egress frames and offer requests
+    // wake the Select immediately, whatever the timeout. So only the
+    // time-based duties (keep-alive emission, reconnect backoff, the
+    // egress-silence watchdog) see the coarser tick, and all of those run
+    // on 100ms-plus scales. Profiling showed the fixed 1ms wake cost
+    // about 8% of the sequencer's CPU while quiet.
     backoff: IdleBackoff,
 }
 
@@ -348,11 +350,6 @@ pub(super) fn run_session(
 }
 
 impl SessionLoop {
-    /// The wait after an iteration that moved anything.
-    const POLL_BASE: Duration = Duration::from_micros(10);
-
-    /// Runs on the session thread, so the idle backoff sets the timer
-    /// slack of that thread.
     fn new(
         rt: AeronRuntime,
         cfg: LiveClusterConfig,
@@ -369,7 +366,6 @@ impl SessionLoop {
         );
         let endpoints = cfg.ingress_endpoints.clone();
         let (target_member, ingress) = initial;
-        let backoff = rt.idle_cap().thread_backoff(Self::POLL_BASE, 5);
         Self {
             rt,
             cfg,
@@ -391,7 +387,7 @@ impl SessionLoop {
             subscribe_resend: Resend::new(SUBSCRIBE_RESEND_MS),
             subscribe_confirmed: false,
             egress_alive: true,
-            backoff,
+            backoff: IdleBackoff::new(Duration::from_millis(1), Duration::from_millis(5), 5),
         }
     }
 
@@ -677,11 +673,17 @@ impl SessionLoop {
     /// egress frame or an offer request is ready (not consumed; the
     /// drain loops at the top of the iteration consume it), capped so
     /// the keep-alive, replay, and subscribe duties keep their cadence.
-    /// The cap climbs from `POLL_BASE` to the idle cap while consecutive
-    /// iterations find nothing (`IdleBackoff`). Any activity snaps it
-    /// back.
+    /// The cap climbs from 1ms to 5ms while consecutive iterations find
+    /// nothing (`IdleBackoff`). Any activity snaps it back.
     fn idle_wait(&mut self, worked: bool) {
-        let wait = self.backoff.next_wait(worked);
+        if worked {
+            self.backoff.reset();
+        }
+        let wait = if worked {
+            Duration::from_millis(1)
+        } else {
+            self.backoff.idle_wait()
+        };
         // A disconnected channel counts as "ready" to crossbeam's Select.
         // Consumers legitimately drop their unused `LiveIngress` seam (for
         // example, `let (cluster, _ingress, egress) =

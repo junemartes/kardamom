@@ -183,12 +183,12 @@ variable "aeron_stall_tolerance_ms" {
 # An idle thread at the cap wakes about once per cap.
 variable "idle_cap_us" {
   type        = number
-  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US). Default 50."
+  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US), from 1 to 1000000. Default 50."
   default     = 50
 
   validation {
-    condition     = var.idle_cap_us >= 1 && floor(var.idle_cap_us) == var.idle_cap_us
-    error_message = "The idle cap must be a whole number of microseconds, at least 1."
+    condition     = var.idle_cap_us >= 1 && var.idle_cap_us <= 1000000 && floor(var.idle_cap_us) == var.idle_cap_us
+    error_message = "The idle cap must be a whole number of microseconds from 1 to 1000000."
   }
 }
 
@@ -391,10 +391,12 @@ job "cluster" {
         # decision rules of the image (CanonicalSealerState.DECISION_VERSION).
         # A member stops at start when the two differ. The release gate
         # refuses a rolling change of it.
-        # kardamom.cluster.idleCapUs is the longest idle park of the
-        # driver, archive, consensus module, service and feeder threads.
+        # KARDAMOM_IDLE_CAP_US is the longest idle park of the driver,
+        # archive, consensus module, service and feeder threads. The image
+        # entrypoint also sets the timer slack of the JVM when it is set.
         env {
-          JAVA_TOOL_OPTIONS = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.decisionVersion=2 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0} -Dkardamom.cluster.idleCapUs=${var.idle_cap_us}"
+          JAVA_TOOL_OPTIONS    = "-Daeron.mtu.length=1344 ${local.aeron_stall_opts} -Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.memberId=${meta.node_index} -Dkardamom.cluster.members=${local.members} -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.decisionVersion=2 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s} -Dkardamom.cluster.logPurgeKeepSnapshots=${var.cluster_log_purge_keep_snapshots} -Dkardamom.cluster.fileSyncLevel=${var.cluster_file_sync_level} -Dkardamom.cluster.remoteOrigins=${var.cluster_seed_snapshot != "" ? "" : var.cluster_remote_origins} -Dkardamom.cluster.seedSnapshot=${var.cluster_seed_snapshot} -Dkardamom.cluster.voidVoters=${local.void_voters} -Dkardamom.cluster.inclusionHorizonBlocks=${var.cluster_inclusion_horizon_blocks} -Dkardamom.cluster.daLagBudgetBlocks=${var.cluster_da_lag_budget_blocks} -Dkardamom.cluster.adminPort=${local.admin_port} -Dkardamom.cluster.orderingWindow=${var.priority_fees == "on" ? 20 : 0}"
+          KARDAMOM_IDLE_CAP_US = var.idle_cap_us
         }
 
         config {

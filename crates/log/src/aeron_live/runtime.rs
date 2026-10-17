@@ -335,9 +335,9 @@ impl AeronRuntime {
         self.start_open_limit
     }
 
-    /// The longest idle wait of the Aeron thread of this runtime. Every
-    /// other hot-path poll loop of the process takes the same cap from
-    /// here, so one deploy value sets every idle wait.
+    /// The idle cap of the Aeron thread of this runtime. Every other
+    /// hot-path poll loop of the process takes the same cap from here, so
+    /// one deploy value sets every idle wait.
     #[must_use]
     pub fn idle_cap(&self) -> IdleCap {
         self.idle_cap

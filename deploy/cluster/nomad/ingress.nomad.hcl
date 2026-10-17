@@ -79,12 +79,12 @@ variable "aeron_stall_tolerance_ms" {
 # An idle thread at the cap wakes about once per cap.
 variable "idle_cap_us" {
   type        = number
-  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US). Default 50."
+  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US), from 1 to 1000000. Default 50."
   default     = 50
 
   validation {
-    condition     = var.idle_cap_us >= 1 && floor(var.idle_cap_us) == var.idle_cap_us
-    error_message = "The idle cap must be a whole number of microseconds, at least 1."
+    condition     = var.idle_cap_us >= 1 && var.idle_cap_us <= 1000000 && floor(var.idle_cap_us) == var.idle_cap_us
+    error_message = "The idle cap must be a whole number of microseconds from 1 to 1000000."
   }
 }
 
