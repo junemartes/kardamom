@@ -1036,14 +1036,13 @@ impl Sequencer {
                 tracing::warn!(core, "failed to pin sequencer thread to core");
             }
         }
-        // Same escalation as the deposit pump: 1µs base, x2 per idle
-        // iteration, 100µs cap, snap back on work. IdleBackoff with
-        // grace 1 gives the exact old sleep sequence (1, 2, 4, ... 100).
-        let mut backoff = kardamom_log::aeron_live::IdleBackoff::new(
-            Duration::from_micros(1),
-            Duration::from_micros(100),
-            1,
-        );
+        // 1µs base, x2 per idle iteration up to the idle cap, snap back
+        // on work. The poll reads `tx_data` with no wake-up, so a quiet
+        // spell delays the next envelope by up to the cap.
+        let mut backoff = self
+            .cfg
+            .idle_cap
+            .thread_backoff(Duration::from_micros(1), 1);
         while !shutdown.is_signaled() && self.run_tick(ports, &mut backoff)? {}
         Ok(())
     }

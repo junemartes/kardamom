@@ -16,8 +16,9 @@ use tracing::warn;
 use super::add_wait::{AddWait, PubAdd, SubAdd};
 use super::bound::BoundControl;
 use super::destination::Destination;
+use super::idle::{IdleBackoff, IdleCap};
 use super::image_log::ImageHandlers;
-use super::pending::{IdleBackoff, PendingPublish, PubEntry, drain_pending};
+use super::pending::{PendingPublish, PubEntry, drain_pending};
 use super::runtime::{OpenedPub, RuntimeCmd};
 use super::table_pub::TablePub;
 use super::{ADD_PUB_TIMEOUT, ADD_SUB_TIMEOUT, AeronClient, FrameSink, Header, RawFrame, Sub};
@@ -157,8 +158,9 @@ pub(super) fn run_aeron_thread(
     aeron: Rc<AeronClient>,
     cmd_rx: CbReceiver<RuntimeCmd>,
     linger: Duration,
+    idle_cap: IdleCap,
 ) -> Result<(), LogError> {
-    AeronThread::new(aeron, cmd_rx, linger).run()
+    AeronThread::new(aeron, cmd_rx, linger, idle_cap).run()
 }
 
 /// The Aeron thread's whole state: every `!Send` rusteron object it owns,
@@ -186,15 +188,26 @@ struct AeronThread {
     /// The image log handlers of every subscription. They live as long
     /// as the process (see [`ImageHandlers`]).
     image_log: ImageHandlers,
-    /// Escalating idle wait for the busy branch: base 100 microseconds (the
-    /// established sub-poll/retry cadence), cap 1 ms (the empty-branch
-    /// cadence), grace 10 (about 1 ms of consecutive emptiness before the
-    /// first escalation).
+    /// Escalating idle wait for the busy branch: base
+    /// [`Self::POLL_BASE`], cap the [`IdleCap`] of the runtime, grace 10
+    /// (about 100 microseconds of consecutive emptiness before the first
+    /// escalation).
     backoff: IdleBackoff,
 }
 
 impl AeronThread {
-    fn new(aeron: Rc<AeronClient>, cmd_rx: CbReceiver<RuntimeCmd>, linger: Duration) -> Self {
+    /// The wait between two polls while traffic flows or a publish is
+    /// pending.
+    const POLL_BASE: Duration = Duration::from_micros(10);
+
+    /// Runs on the Aeron thread, so the idle backoff sets the timer slack
+    /// of that thread.
+    fn new(
+        aeron: Rc<AeronClient>,
+        cmd_rx: CbReceiver<RuntimeCmd>,
+        linger: Duration,
+        idle_cap: IdleCap,
+    ) -> Self {
         Self {
             aeron,
             cmd_rx,
@@ -204,7 +217,7 @@ impl AeronThread {
             pending: VecDeque::new(),
             dests: Vec::new(),
             image_log: ImageHandlers::leak(),
-            backoff: IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 10),
+            backoff: idle_cap.thread_backoff(Self::POLL_BASE, 10),
         }
     }
 
@@ -253,28 +266,18 @@ impl AeronThread {
             };
         }
 
-        // Keep the 100 microsecond sub-poll/retry cadence while traffic
-        // flows, but wake immediately on a new command instead of
-        // blocking on `recv_timeout` for the full interval. With any
-        // subscription open (always, in the services) this branch is the
-        // steady state. Blocking the full 100 microseconds under every
-        // ack-waited publish caps a serialized publisher's rate (the
-        // sequencer's offer path first among them), so the wait uses
-        // `recv_timeout` to wake early on a command. When quiet, the wait
-        // escalates toward 1 ms (`IdleBackoff`), since a fixed 100
-        // microsecond wake dominates a quiet loop's CPU with crossbeam's
-        // pre-park spin, not work. A non-empty `pending` pins the base
-        // cadence, because the retry timing of a back-pressured offer
-        // must not degrade.
-        let pending_or_worked = worked || !self.pending.is_empty();
-        if pending_or_worked {
-            self.backoff.reset();
-        }
-        let wait = if pending_or_worked {
-            Duration::from_micros(100)
-        } else {
-            self.backoff.idle_wait()
-        };
+        // Poll at the base cadence while traffic flows, but wake
+        // immediately on a new command instead of blocking on
+        // `recv_timeout` for the full interval. With any subscription open
+        // (always, in the services) this branch is the steady state. A
+        // wait that a command cannot end caps the rate of a serialized
+        // publisher that waits for its ack (the sequencer's offer path
+        // first among them). A subscription has no wake-up, so a fragment
+        // that arrives during the wait waits for its end. When quiet, the
+        // wait escalates to the idle cap (`IdleBackoff`). A non-empty
+        // `pending` pins the base cadence, because the retry timing of a
+        // back-pressured offer must not degrade.
+        let wait = self.backoff.next_wait(worked || !self.pending.is_empty());
         let outcome = self.wait_for_cmd(wait);
         self.finish_wait(outcome)
     }

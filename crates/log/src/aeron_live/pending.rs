@@ -1,10 +1,10 @@
-//! The parked-publish retry scheduler for the Aeron thread, plus the
-//! [`IdleBackoff`] cadence helper: one offer attempt per pending frame per
-//! loop iteration, per-publication FIFO, deadline-bounded. The pure core
-//! (`drain_pending_inner`) is unit-tested here without a media driver.
+//! The parked-publish retry scheduler for the Aeron thread: one offer
+//! attempt per pending frame per loop iteration, per-publication FIFO,
+//! deadline-bounded. The pure core (`drain_pending_inner`) is unit-tested
+//! here without a media driver.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::Sender as CbSender;
 use rkyv::util::AlignedVec;
@@ -31,57 +31,6 @@ pub(super) struct PubEntry {
 /// best-effort publisher never learns of a drop: this counter is the
 /// only trace of one, so a dashboard reads it per stream.
 pub const BEST_EFFORT_DROPPED_TOTAL: &str = "kardamom_log_best_effort_dropped_total";
-
-/// Escalating idle wait. This is the Rust analogue of Aeron's
-/// `BackoffIdleStrategy`, which is what keeps the Java sealer stack's
-/// duty-cycle threads cheap.
-///
-/// Poll loops here wait on a channel with a short timeout (the data-plane
-/// poll cadence). Waking every 100 microseconds regardless of traffic
-/// burns CPU on crossbeam's pre-park spin, not work, once traffic is low.
-/// The backoff mirrors the sealer's: stay at the base cadence while the
-/// loop is doing something, and once it has seen `grace` consecutive
-/// empty iterations, double the wait per iteration up to `cap`. Any work
-/// snaps it back to base.
-///
-/// Latency safety: senders wake the channel wait immediately regardless of
-/// the timeout, so command/publish latency stays unaffected. Only the
-/// first inbound data-plane fragment after a quiet spell can wait up to
-/// `cap`. Under steady traffic, every poll finds fragments, and the
-/// cadence never leaves base.
-pub struct IdleBackoff {
-    base: Duration,
-    cap: Duration,
-    grace: u32,
-    streak: u32,
-}
-
-impl IdleBackoff {
-    #[must_use]
-    pub fn new(base: Duration, cap: Duration, grace: u32) -> Self {
-        Self {
-            base,
-            cap,
-            grace,
-            streak: 0,
-        }
-    }
-
-    /// The loop did work this iteration. Snap back to the base cadence.
-    pub fn reset(&mut self) {
-        self.streak = 0;
-    }
-
-    /// Record an empty iteration and return the wait to use for it.
-    pub fn idle_wait(&mut self) -> Duration {
-        self.streak = self.streak.saturating_add(1);
-        if self.streak <= self.grace {
-            return self.base;
-        }
-        let doublings = (self.streak - self.grace).min(10);
-        self.base.saturating_mul(1u32 << doublings).min(self.cap)
-    }
-}
 
 /// A publish awaiting delivery on the Aeron thread.
 ///
@@ -319,6 +268,7 @@ where
 mod drain_pending_tests {
     use super::*;
     use crossbeam_channel::Receiver as CbReceiver;
+    use std::time::Duration;
 
     /// A successful offer outcome, decoded to an arbitrary position. Tests
     /// only check that an `Ok` ack arrives, never the exact position.
@@ -523,29 +473,5 @@ mod drain_pending_tests {
             Ok(Err(LogError::Aeron(m))) => assert!(m.contains("unknown pub_id")),
             other => panic!("expected unknown-pub error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn idle_backoff_escalates_after_grace_and_resets_on_work() {
-        let base = Duration::from_micros(100);
-        let cap = Duration::from_millis(1);
-        let mut b = IdleBackoff::new(base, cap, 3);
-        // Within grace: base cadence.
-        assert_eq!(b.idle_wait(), base);
-        assert_eq!(b.idle_wait(), base);
-        assert_eq!(b.idle_wait(), base);
-        // Past grace: doubles per idle iteration,
-        assert_eq!(b.idle_wait(), Duration::from_micros(200));
-        assert_eq!(b.idle_wait(), Duration::from_micros(400));
-        assert_eq!(b.idle_wait(), Duration::from_micros(800));
-        // and clamps at the cap, staying there.
-        assert_eq!(b.idle_wait(), cap);
-        for _ in 0..100 {
-            assert_eq!(b.idle_wait(), cap);
-        }
-        // Any work snaps back to base for a full new grace window.
-        b.reset();
-        assert_eq!(b.idle_wait(), base);
-        assert_eq!(b.idle_wait(), base);
     }
 }

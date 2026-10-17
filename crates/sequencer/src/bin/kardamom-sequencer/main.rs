@@ -587,6 +587,7 @@ async fn main() -> anyhow::Result<()> {
 
     let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    cfg.idle_cap = rt.idle_cap();
     let mut plane = StreamPlane::from_config(&log_cfg, &format!("sequencer-{}", cfg.lane()))
         .context("build the stream plane")?;
 

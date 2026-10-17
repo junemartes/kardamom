@@ -11,7 +11,6 @@ import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.Agent;
 import org.agrona.concurrent.AgentRunner;
-import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.ControlledMessageHandler;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.ringbuffer.RingBuffer;
@@ -85,7 +84,7 @@ final class Feeder implements Agent {
     /** Start this agent on its own daemon thread. */
     AgentRunner start() {
         final AgentRunner runner = new AgentRunner(
-            new BackoffIdleStrategy(100, 10, 1_000, 1_000_000),
+            config.idleCap().strategy(),
             error -> System.out.println("sealer FEED ERROR memberId=" + memberId + " " + error),
             null,
             this);

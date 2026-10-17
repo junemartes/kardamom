@@ -59,6 +59,21 @@ variable "aeron_stall_tolerance_ms" {
   }
 }
 
+# The longest idle wait of every hot-path thread, in microseconds: the
+# media driver and the archive, the sealer, and the poll loops of the Rust
+# services. A message that reaches an idle thread waits up to this long.
+# An idle thread at the cap wakes about once per cap.
+variable "idle_cap_us" {
+  type        = number
+  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US). Default 50."
+  default     = 50
+
+  validation {
+    condition     = var.idle_cap_us >= 1 && floor(var.idle_cap_us) == var.idle_cap_us
+    error_message = "The idle cap must be a whole number of microseconds, at least 1."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -217,6 +232,9 @@ job "aeron" {
         AERON_ARCHIVE_REPLICATION_PORT      = "${NOMAD_HOST_PORT_archive_replication}"
         AERON_TERM_BUFFER_LENGTH            = "4194304"
         AERON_IPC_TERM_BUFFER_LENGTH        = "4194304"
+        # The longest park of the driver and archive agents
+        # (CappedBackoffIdleStrategy in the image).
+        KARDAMOM_IDLE_CAP_US = var.idle_cap_us
         # Cap the ArchivingMediaDriver JVM heap, so the task fits its
         # trimmed memory reservation below. The driver's hot data (4
         # MB term buffers) sits off-heap in the tmpfs aeron.dir, so a

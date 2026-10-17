@@ -384,6 +384,7 @@ class Deploys(unittest.TestCase):
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
         env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.pop('KARDAMOM_IDLE_CAP_US', None)
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
@@ -823,6 +824,18 @@ class DeployTest(Deploys):
                 environ = {} if tolerance == 10000 else {'AERON_STALL_TOLERANCE_MS': str(tolerance)}
                 self.run_deploy(check=True, environ=environ)
                 self.assert_aeron_parties(self.api.state['plans'], tolerance)
+
+    def test_every_hot_path_party_takes_the_idle_cap(self):
+        for cap in (50, 200):
+            with self.subTest(cap=cap):
+                environ = {} if cap == 50 else {'KARDAMOM_IDLE_CAP_US': str(cap)}
+                self.run_deploy(check=True, environ=environ)
+                plans = self.api.state['plans']
+                for name in ('aeron', 'sequencer', 'ingress', 'executor'):
+                    env = plans[name]['TaskGroups'][0]['Tasks'][0]['Env']
+                    self.assertEqual(env['KARDAMOM_IDLE_CAP_US'], str(cap), name)
+                cluster = plans['cluster']['TaskGroups'][0]['Tasks'][0]['Env']['JAVA_TOOL_OPTIONS'].split()
+                self.assertIn(f'-Dkardamom.cluster.idleCapUs={cap}', cluster)
 
     def assert_aeron_parties(self, plans, tolerance):
         """Every task that maps the Aeron directory carries the tolerance:

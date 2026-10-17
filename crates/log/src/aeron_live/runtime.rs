@@ -16,6 +16,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::error;
 
 use super::add_wait::AddWait;
+use super::idle::IdleCap;
 use super::thread::run_aeron_thread;
 use super::{ACK_TIMEOUT, AeronClient, FrameSink, RawFrame};
 use crate::codec;
@@ -47,6 +48,8 @@ pub struct AeronRuntime {
     stall_budget: Duration,
     /// See [`Self::start_open_limit`].
     start_open_limit: Duration,
+    /// See [`Self::idle_cap`].
+    idle_cap: IdleCap,
     /// Shared owner of the Aeron thread: the last clone to drop tears it
     /// down (see [`AeronThread`]). Held only for its `Drop`.
     _thread: Arc<AeronThread>,
@@ -197,6 +200,7 @@ fn request_within<R>(
 fn aeron_thread_main<F>(
     make_ctx: F,
     cmd_rx: crossbeam_channel::Receiver<RuntimeCmd>,
+    idle_cap: IdleCap,
     report: &StartReport,
 ) where
     F: FnOnce() -> Result<rusteron_client::AeronContext, LogError>,
@@ -204,7 +208,7 @@ fn aeron_thread_main<F>(
     let Some((aeron, budget)) = report.start(make_ctx) else {
         return;
     };
-    if let Err(e) = run_aeron_thread(aeron, cmd_rx, budget.duration()) {
+    if let Err(e) = run_aeron_thread(aeron, cmd_rx, budget.duration(), idle_cap) {
         error!(error = %e, "aeron runtime thread exited with error");
     }
 }
@@ -273,9 +277,13 @@ impl AeronRuntime {
     /// driver, for example while a restarted driver comes up. The wait is
     /// the driver timeout plus 5 s, and at least 10 s.
     ///
+    /// The idle cap of the Aeron thread comes from `KARDAMOM_IDLE_CAP_US`
+    /// (see [`IdleCap`]).
+    ///
     /// # Errors
     ///
-    /// Returns an error if `make_ctx` fails, if building the `Aeron`
+    /// Returns an error if `KARDAMOM_IDLE_CAP_US` does not parse (see
+    /// [`IdleCap`]), if `make_ctx` fails, if building the `Aeron`
     /// client from the resulting context fails, if the OS thread spawn
     /// fails, if `make_ctx` does not return within 10 s, or if the Aeron
     /// thread does not signal a successful start within the wait above.
@@ -283,12 +291,13 @@ impl AeronRuntime {
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
     {
+        let idle_cap = IdleCap::from_env()?;
         let (report, wait) = StartWait::channel();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RuntimeCmd>();
 
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
-            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, &report))
+            .spawn(move || aeron_thread_main(make_ctx, cmd_rx, idle_cap, &report))
             .map_err(|e| LogError::Aeron(format!("spawn aeron thread: {e}")))?;
 
         let budget = wait.wait()?;
@@ -301,6 +310,7 @@ impl AeronRuntime {
             cmd_tx,
             stall_budget: budget.duration(),
             start_open_limit: budget.start_open_limit(),
+            idle_cap,
             _thread: thread,
         })
     }
@@ -323,6 +333,14 @@ impl AeronRuntime {
     #[must_use]
     pub fn start_open_limit(&self) -> Duration {
         self.start_open_limit
+    }
+
+    /// The longest idle wait of the Aeron thread of this runtime. Every
+    /// other hot-path poll loop of the process takes the same cap from
+    /// here, so one deploy value sets every idle wait.
+    #[must_use]
+    pub fn idle_cap(&self) -> IdleCap {
+        self.idle_cap
     }
 }
 

@@ -87,7 +87,7 @@ class SealerFeedClusterTest {
             memberId -> new SealerTestService(new SealerClusteredService(DEDUP_CAPACITY, TICK_MS, memberId)
                 .carryingBytes(new RetainedFile.Config(dir.resolve("retained-" + memberId), SEGMENT_BYTES),
                     Optional.of(new FeedConfig(driverDir(memberId),
-                        size.apply(memberId).ringBytes(), size.apply(memberId).termBytes()))))));
+                        size.apply(memberId).ringBytes(), size.apply(memberId).termBytes(), IdleCap.DEFAULT))))));
         cluster.awaitLeader();
         cluster.egressListener(egress);
         cluster.connectClient();

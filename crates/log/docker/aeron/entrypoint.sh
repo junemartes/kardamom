@@ -20,16 +20,21 @@ umask 0000
 # container cluster-e2e runs ~6 of them) pins every core. Default to SHARED
 # threading so each driver uses ONE thread instead of three.
 #
-# Idle strategy: deliberately left at Aeron's DEFAULT (a backoff that
-# spins→yields→parks). An earlier experiment forced SleepingMillisIdleStrategy
-# (sleep 1ms when idle) to save more CPU, but that delayed the driver's
-# Status-Message / NAK servicing enough to HURT multicast liveness and made the
-# tx_ordering freeze appear *sooner* — and it was never the real cause anyway.
-# The freeze was a client-side bug (a back-pressured publish starving the shared
-# Aeron thread's subscription polling), fixed in kardamom_log::aeron_live. So we
-# keep the responsive default idle here and only trim the thread COUNT.
+# Idle strategy: Aeron's backoff (spin, then yield, then park), with the
+# longest park capped at KARDAMOM_IDLE_CAP_US (default 50 µs) instead of
+# Aeron's 1 ms. A frame that reaches an idle driver waits for the end of
+# the park. CappedBackoffIdleStrategy reads the cap from the environment.
+# Every driver and archive agent uses it, in each threading mode. A sleep of
+# a fixed 1 ms (SleepingMillisIdleStrategy) delays the Status-Message and
+# NAK service of the driver, and multicast liveness suffers.
 AERON_THREADING_MODE="${AERON_THREADING_MODE:-SHARED}"
 AERON_ARCHIVE_THREADING_MODE="${AERON_ARCHIVE_THREADING_MODE:-SHARED}"
+export KARDAMOM_IDLE_CAP_US="${KARDAMOM_IDLE_CAP_US:-50}"
+IDLE_STRATEGY=io.kardamom.aeron.CappedBackoffIdleStrategy
+IDLE_OPTS=""
+for agent in conductor sender receiver sharednetwork shared archive archive.recorder archive.replayer; do
+    IDLE_OPTS="${IDLE_OPTS} -Daeron.${agent}.idle.strategy=${IDLE_STRATEGY}"
+done
 # Per-segment CRC32 on record AND replay-side validation on read. Without a
 # record-time checksum, `ArchiveTool verify` only validates frame structure —
 # a payload byte-flip in a .rec passes silently (and verify_mirror's length
@@ -42,6 +47,13 @@ AERON_ARCHIVE_CHECKSUM="${AERON_ARCHIVE_CHECKSUM:-io.aeron.archive.checksum.Crc3
 AERON_ARCHIVE_CONTROL_PORT="${AERON_ARCHIVE_CONTROL_PORT:-8010}"
 AERON_ARCHIVE_CONTROL_RESPONSE_PORT="${AERON_ARCHIVE_CONTROL_RESPONSE_PORT:-8011}"
 AERON_ARCHIVE_REPLICATION_PORT="${AERON_ARCHIVE_REPLICATION_PORT:-8021}"
+
+# Timer slack: Linux ends a park up to the timer slack of the thread after
+# its deadline, 50 µs by default, so a 50 µs park can take 100 µs. This
+# shell sets its own slack to 1 µs. The JVM and each of its threads take
+# the slack of the thread that starts them. A kernel that refuses the
+# write keeps the default slack.
+{ echo 1000 > /proc/self/timerslack_ns; } 2>/dev/null || true
 
 java \
     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
@@ -58,7 +70,8 @@ java \
     -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:${AERON_ARCHIVE_REPLICATION_PORT} \
     -Daeron.archive.record.checksum=${AERON_ARCHIVE_CHECKSUM} \
     -Daeron.archive.replay.checksum=${AERON_ARCHIVE_CHECKSUM} \
-    -cp /opt/aeron/aeron-all.jar \
+    ${IDLE_OPTS} \
+    -cp /opt/aeron/aeron-all.jar:/opt/aeron/kardamom-idle.jar \
     ${AERON_ARCHIVE_CLASS} &
 JAVA_PID=$!
 

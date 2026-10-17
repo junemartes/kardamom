@@ -73,6 +73,21 @@ variable "aeron_stall_tolerance_ms" {
   }
 }
 
+# The longest idle wait of every hot-path thread, in microseconds: the
+# media driver and the archive, the sealer, and the poll loops of the Rust
+# services. A message that reaches an idle thread waits up to this long.
+# An idle thread at the cap wakes about once per cap.
+variable "idle_cap_us" {
+  type        = number
+  description = "The longest idle wait of every hot-path thread, in microseconds (KARDAMOM_IDLE_CAP_US). Default 50."
+  default     = 50
+
+  validation {
+    condition     = var.idle_cap_us >= 1 && floor(var.idle_cap_us) == var.idle_cap_us
+    error_message = "The idle cap must be a whole number of microseconds, at least 1."
+  }
+}
+
 variable "datacenter" {
   type        = string
   description = "The Nomad datacenter of the job. A node record is <node>.node.<datacenter>.consul."
@@ -276,6 +291,8 @@ job "ingress" {
         # The Aeron C client reads its driver timeout from this variable,
         # and the service code never overrides it.
         AERON_DRIVER_TIMEOUT = var.aeron_stall_tolerance_ms
+        # The idle cap of the hot-path poll loops (kardamom_log IdleCap).
+        KARDAMOM_IDLE_CAP_US = var.idle_cap_us
         # Bind the exporter on the node, not loopback, so the monitoring
         # job scrapes it off-node. The port is the ingress convention,
         # 9006 (the validator uses the same number on the aux node).

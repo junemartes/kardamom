@@ -51,6 +51,9 @@ workloads_common_vars:
   # each media driver's client liveness timeout. The jobs derive the
   # rest from it.
   aeron_stall_tolerance_ms: "{{ workloads_aeron_stall_tolerance_ms }}"
+  # One value for the longest idle wait of every hot-path thread: the
+  # media drivers, the sealer and the Rust poll loops.
+  idle_cap_us: "{{ workloads_idle_cap_us }}"
 # The L1 RPC the controller uses for the settlement bootstrap. Empty means
 # discover the in-cluster anvil through the Nomad API (tasks/anvil.yml).
 # workloads_l1_rpc_given keeps the given value: anvil.yml overwrites
@@ -162,6 +165,10 @@ workloads_exec_cursor: "{{ lookup('env', 'KARDAMOM_EXEC_CURSOR') }}"
 # the detection of a dead process. CI raises it, so a host stall does not
 # kill a healthy client or driver.
 workloads_aeron_stall_tolerance_ms: "{{ lookup('env', 'AERON_STALL_TOLERANCE_MS') | default('10000', true) }}"
+# The longest idle wait of every hot-path thread, in microseconds. A
+# message that reaches an idle thread waits up to this long. A lower value
+# costs more idle CPU.
+workloads_idle_cap_us: "{{ lookup('env', 'KARDAMOM_IDLE_CAP_US') | default('50', true) }}"
 workloads_light_execution_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_EXECUTION_RPC') }}"
 workloads_light_consensus_rpc: "{{ lookup('env', 'L1_LIGHT_CLIENT_CONSENSUS_RPC') }}"
 workloads_light_checkpoint: "{{ lookup('env', 'L1_LIGHT_CLIENT_CHECKPOINT') }}"
