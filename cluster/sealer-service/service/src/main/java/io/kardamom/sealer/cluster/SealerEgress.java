@@ -526,6 +526,11 @@ final class SealerEgress {
         firstRetainedBlock = floors.block();
     }
 
+    /** Offer the sealer's rules to a session that opened. */
+    void offerSealerInfo(final ClientSession session) {
+        offerToSession(session, frames.sealerInfo(CanonicalSealerState.DECISION_VERSION));
+    }
+
     /** Open an empty retention: a start at genesis or from a seed. */
     void openEmpty() {
         retained.clear();

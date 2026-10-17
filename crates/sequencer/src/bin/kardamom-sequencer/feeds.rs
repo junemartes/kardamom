@@ -214,6 +214,9 @@ impl EgressWatermarkFeed {
     }
 
     fn on_frame(&mut self, frame: &[u8]) {
+        if self.on_rules_frame(frame) {
+            return;
+        }
         if self.on_reject_frame(frame) {
             return;
         }
@@ -242,6 +245,32 @@ impl EgressWatermarkFeed {
             return;
         }
         self.on_boundary_frame(frame);
+    }
+
+    /// Handle the sealer's rules and the start of a session. Returns `true`
+    /// when `frame` was either. The publish loop sends a nonce release only
+    /// while the sealer of the current session reported decision version 3
+    /// or above: a sealer of an older version drops the frame, and its log
+    /// would replay the frame under the new rules after a restart.
+    fn on_rules_frame(&self, frame: &[u8]) -> bool {
+        match frame.first() {
+            Some(&wire::EGRESS_KIND_SESSION_START) => {
+                self.watermark.forget_sealer_version();
+                true
+            }
+            Some(&wire::EGRESS_KIND_SEALER_INFO) => {
+                if let Ok(EgressItem::SealerInfo { decision_version }) = EgressItem::decode(frame) {
+                    tracing::info!(
+                        partition = self.partition,
+                        decision_version,
+                        "sealer rules received"
+                    );
+                    self.watermark.set_sealer_version(decision_version);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handle one contiguity-reject frame. Returns `true` when `frame`

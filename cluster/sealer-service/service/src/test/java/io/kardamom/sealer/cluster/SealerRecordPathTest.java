@@ -281,4 +281,33 @@ class SealerRecordPathTest {
         deliver(svc, consumer, IngressFrames.recordedCursorFrame(0, 0));
         assertEquals(2L, svc.droppedUnknownKindCount());
     }
+
+    @Test
+    void a_session_that_opens_gets_the_decision_version() {
+        final StubSession sequencer = cluster.addSession(1);
+        final SealerClusteredService svc = fileMember("a");
+        svc.onSessionOpen(sequencer, 0);
+        assertArrayEquals(new byte[] {SealerWire.EGRESS_KIND_SEALER_INFO, 3}, sequencer.offered.get(0));
+    }
+
+    @Test
+    void the_member_counts_the_releases_since_its_snapshot() {
+        final StubSession sequencer = cluster.addSession(1);
+        final SealerClusteredService svc = member(Optional.empty(), Optional.empty());
+        sameLog(svc, sequencer);
+        assertEquals(2L, svc.releasesSinceSnapshot(), "the release and its twin copy");
+        final SealerClusteredService restored = member(Optional.empty(), Optional.of(svc.snapshot()));
+        assertEquals(0L, restored.releasesSinceSnapshot());
+    }
+
+    @Test
+    void a_member_with_the_file_takes_no_canonical_entry_from_a_session() {
+        final StubSession sequencer = cluster.addSession(1);
+        final SealerClusteredService svc = fileMember("a");
+        final byte[] frame = offer(1, 0);
+        frame[SealerWire.CANONICAL_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN] = SealerWire.RT_TX;
+        deliver(svc, sequencer, frame);
+        tick(svc);
+        assertEquals(0L, svc.retained().wanted(0, 1).filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED).count());
+    }
 }

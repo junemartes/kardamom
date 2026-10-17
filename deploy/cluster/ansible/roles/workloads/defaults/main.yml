@@ -292,6 +292,11 @@ workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
 workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"
 workloads_record_path: "kardamom/deploys/{{ workloads_env }}"
 workloads_record_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_record_path }}?namespace={{ workloads_namespace | urlencode }}"
+# The quiesce check of the sealer before a change of its decision version
+# (`just sealer-quiesce-check <env>`): the variable holds the decision
+# version of the members and the time of the check.
+workloads_quiesce_path: "kardamom/quiesce/{{ workloads_env }}"
+workloads_quiesce_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_quiesce_path }}?namespace={{ workloads_namespace | urlencode }}"
 # The repository root and its format registry: the formats of the target.
 workloads_repo_root: "{{ workloads_cluster_dir ~ '/../..' }}"
 workloads_formats_file: "{{ workloads_repo_root }}/formats.toml"

@@ -47,7 +47,8 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - The service reads the header for the contiguity guard, the deadline check and the ordering window.
   - The service relays the payload from `canonical_id` on. The executor never sees the header.
   - An all-zero `sender` is exempt from the contiguity guard.
-  - A frame shorter than 85 bytes is malformed.
+  - A frame shorter than 86 bytes is malformed: it must hold the record type after the id. Kinds 4 and 5 also need the record type after their header.
+  - With `carryBytes`, a kind-0 record of type 6 (the canonical entry) is malformed: only a full entry (type 5) becomes a canonical entry.
 - Kind 1: a consumer sends it to resume. The sealer checks the cursor `(from_index, from_block)` in this order:
   1. A cursor past the head of the sealer gets `REPLAY_AHEAD` (egress kind 11). The cursor is past the head when `from_index` is above the canonical count, or `from_block` is above the block that the next tick stamps.
   2. A pair that does not name one point of the stream gets `REPLAY_UNAVAILABLE`. The log line ends with `SKEWED`.
@@ -97,9 +98,12 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
     - A release whose id has left the window changes nothing.
   - The id stays in the window, so the same signed bytes stay a duplicate until their deadline. One hash never has two canonical entries. The sender signs a new transaction at the released nonce.
   - The mark cannot stand for a real id: a real id is a keccak hash, and the mark is a fixed transform of an id in the window.
-  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark for each ordered entry, and the mark leaves with its entry. So a snapshot can hold up to `2 * dedupCapacity` ids, plus the epoch slack.
+  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark for each ordered entry, and the mark leaves with its entry. The window holds at most `dedupCapacity` user ids and 4,096 epoch ids, and at most one mark for each, so a snapshot holds at most `2 * (dedupCapacity + 4096)` ids. The loader refuses more.
   - A frame that is not 61 bytes is malformed. A release that applies prints `cluster NONCE-RELEASE` at power-of-two counts.
-  - A sealer that does not know kind 10 drops it as an unknown kind. So the sequencer can deploy before the sealer.
+  - A sealer that does not know kind 10 drops it as an unknown kind. The sequencer sends it only to a sealer that reported decision version 3 (egress kind 17), so a sealer of an older version gets none, and its log holds none.
+  - The guard goes down only when the expected nonce of the sender is above `nonce`. Every release proves that the chain was at `nonce` when the skipped entry executed, so a release never sets the guard below the chain. The spec (section 5.4) gives the proof, and its one exception: an LRU eviction of the sender while the id is in the window.
+  - The session sends no identity, so the sealer cannot tell a sequencer session from another client. The cluster network is the trust boundary: any cluster client can already send kind 0 with any guard header and kind 7, and now kind 10. The cluster network must admit only the services of the chain.
+  - The sealer does not tie the id to the sender, and cannot tell a marker id (an epoch) from a user id. A release that names a marker id adds one harmless mark. A release that names the id of another sender's entry is a forged frame: see the trust boundary above.
 
 ### Relayed record types
 
@@ -139,6 +143,10 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 11 | Replay ahead | `[kind=11][head_index:u64][head_block:u64]` | the requester |
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
 | 13 | Record-lag reject | `[kind=13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]` | the offering session |
+| 15 | Relayed reference | `[kind=15][index:u64][canonical_id:32][record_type:u8]` (42 bytes) | consumers, with `carryBytes` |
+| 17 | Sealer info | `[kind=17][decision_version:u8]` (2 bytes) | each session, when it opens |
+
+- Kind 17: a sequencer sends a nonce release (ingress kind 10) only after it got version 3 or above on its current session. A restart into another decision version opens every session again, so each session gets the new version. A reader that does not know kind 17 drops it.
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -496,11 +504,14 @@ Every member applies the same log. Two members on two rule versions can decide o
 A new version needs the coordinated restart of the sealer, not a rolling deploy:
 
 1. Pause the submits on every ingress: `curl -s -X POST 'http://127.0.0.1:<port>/pause?note=decision-version'`. No new entry is ordered.
+   - Stop the sequencers: `nomad job stop sequencer`. A stopped sequencer sends no nonce release (ingress kind 10). Versions 2 and 3 decide a release differently, so no release may be in the log after the last snapshot.
 2. Wait until no void vote is open. In the log of each member, each index of a `cluster VOID-VOTE` line also has a line with `result=DECIDED`. With the submits paused, no new entry can lose its data, so no new vote starts.
 3. Wait for a snapshot. In the log of each member, no `cluster VOID-VOTE` line with `result=DECIDED` comes after the last `sealer snapshot TAKEN` line.
+   - Run `just sealer-quiesce-check <env>`. It reads `releasesSinceSnapshot` and `decisionVersion` on the admin `/status` of every member, refuses when a member applied a release after its last snapshot, and records the passing check in the Nomad variable `kardamom/quiesce/<env>`. The release gate refuses a change of the decision version without a passing check of the members of the accepted version, made after the accepted release.
+   - For a rollback from version 3 to 2, also wait one inclusion horizon (`inclusionHorizonBlocks`, 64 blocks) after the stop of the sequencers before this snapshot. The release marks then leave the dedup window. A member of version 2 refuses a snapshot whose window holds more than `dedupCapacity + 4096` ids, and the marks can add up to `dedupCapacity` ids.
 4. Stop all members: `nomad job stop -purge cluster`. The members keep their snapshots and logs on the host.
 5. Resume the submits on every ingress: `curl -s -X POST http://127.0.0.1:<port>/resume`. The gate refuses an operator pause. The ingress then halts on `sealer_no_quorum`.
-6. Run `just deploy`. The gate excuses the `sealer_no_quorum` halt, because Nomad does not know the sealer job. The role registers all members in one step. Each member starts from its own snapshot and log.
+6. Run `just deploy`. The gate excuses the `sealer_no_quorum` halt, because Nomad does not know the sealer job. The role registers all members in one step. Each member starts from its own snapshot and log. The deploy registers the sequencers again; each sequencer sends a nonce release only after its session reports version 3.
 
 - The purge removes the job history of the sealer from Nomad.
 - The deploy record then holds no sealer version before the release. A `just rollback` of the release stops the sealer job and does not start the release before. It also restarts the ingress before it stops the sealer, and the restart drops the pause.

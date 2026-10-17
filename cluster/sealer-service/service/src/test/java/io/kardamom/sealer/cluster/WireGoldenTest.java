@@ -104,6 +104,12 @@ final class WireGoldenTest {
     }
 
     @Test
+    void theSealerInfoNamesTheDecisionVersion() {
+        assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3)));
+        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, 3);
+    }
+
+    @Test
     void theNonceReleaseHasItsFieldsAtTheServiceOffsets() {
         final UnsafeBuffer release = new UnsafeBuffer(golden.get("nonce_release"));
         assertEquals(SealerWire.NONCE_RELEASE_LEN, release.capacity());

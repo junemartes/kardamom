@@ -1,13 +1,12 @@
 //! The receipts of this shard's senders, as the publish loop drains them:
 //! the publish confirmations, the skip releases, and the executed-truth
 //! floors. Each one moves the publish ledger or the nonce floor of one
-//! sender. Each skip release also queues a nonce release for the sealer's
-//! guard.
+//! sender. A skip that proves the chain nonce also queues a nonce
+//! release for the sealer's guard.
 
 use std::time::Instant;
 
 use alloy_primitives::Address;
-use kardamom_cluster_adapter::wire::NonceRelease;
 use kardamom_types::num::usize_to_u64;
 use tracing::{info, trace};
 
@@ -26,6 +25,7 @@ impl Sequencer {
             raised,
             confirmations,
             released,
+            sealer,
         } = r.drain_floor_updates();
         // A receipt proves that every one of this sequencer's published
         // refs for that sender, at or below its nonce, committed. Drop
@@ -33,8 +33,11 @@ impl Sequencer {
         for (sender, confirmed) in confirmations {
             self.unconfirmed.confirm_through(sender, confirmed);
         }
-        for release in released {
-            self.apply_one_release(release);
+        for (sender, chain) in released {
+            self.apply_one_release(sender, chain);
+        }
+        for release in sealer {
+            self.releases.push(release);
         }
         for (sender, floor) in raised {
             self.apply_one_floor_update(sender, floor);
@@ -43,19 +46,11 @@ impl Sequencer {
     }
 
     /// One skip release, for [`Self::apply_receipt_drain`]'s loop: the
-    /// chain expects `release.nonce` of `release.sender` next, so the nonce
-    /// floor goes back to it. Without this, the floor stays above the
-    /// chain: every later nonce publishes into the gap and skips, and the
-    /// resubmit at the chain nonce is a past nonce. The sealer's guard
-    /// counts the skipped entry too, so the release also goes to the
-    /// sealer, whether or not the floor of this replica moved.
-    fn apply_one_release(&mut self, release: NonceRelease) {
-        self.releases.push(release);
-        let NonceRelease {
-            sender,
-            nonce: chain,
-            ..
-        } = release;
+    /// chain expects `chain` of `sender` next, so the nonce floor goes
+    /// back to it. Without this, the floor stays above the chain: every
+    /// later nonce publishes into the gap and skips, and the resubmit at
+    /// `chain` is a past nonce.
+    fn apply_one_release(&mut self, sender: Address, chain: u64) {
         let Some(from) = self.state.release_floor(sender, chain) else {
             return;
         };

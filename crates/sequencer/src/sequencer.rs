@@ -602,9 +602,12 @@ impl Sequencer {
         // contiguity reject finds no ref at the expected nonce.
         self.apply_deadline_rejects(&mut r, ports);
         self.apply_sealer_answers(&mut r, ports);
+        let releases = r.sealer_takes_releases();
         self.resync = Some(r);
-        let (_, refs, _) = ports.split();
-        self.releases.flush(refs);
+        if releases {
+            let (_, refs, _) = ports.split();
+            self.releases.flush(refs);
+        }
         self.sweep_confirm_timeouts();
     }
 

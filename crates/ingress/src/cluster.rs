@@ -116,8 +116,10 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
             // goes only to the offering sequencer session. The
             // session-start marker goes only to a replay consumer. None
             // can arrive here, so this arm ignores them as a safeguard.
+            // The sealer's rules matter to a sequencer only.
             Ok(
                 EgressItem::ReplayDone { .. }
+                | EgressItem::SealerInfo { .. }
                 | EgressItem::SessionStart
                 | EgressItem::ReplayAhead { .. }
                 | EgressItem::ReplayUnavailable { .. }

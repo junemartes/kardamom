@@ -32,11 +32,11 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use alloy_primitives::Address;
-use kardamom_cluster_adapter::wire::NonceRelease;
+use kardamom_cluster_adapter::wire::{NonceRelease, RELEASE_DECISION_VERSION};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -76,6 +76,10 @@ pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
 pub struct SharedWatermark {
     count: Arc<AtomicU64>,
     lag_gap_ms: Arc<AtomicU64>,
+    /// The decision version that the sealer reported on the current
+    /// session, 0 before its report. The feed thread writes it; the publish
+    /// loop reads it before it sends a nonce release.
+    sealer_version: Arc<AtomicU8>,
 }
 
 impl SharedWatermark {
@@ -96,6 +100,25 @@ impl SharedWatermark {
     pub fn flag_lag(&self, gap_ms: u64) {
         self.lag_gap_ms.fetch_max(gap_ms, Ordering::AcqRel);
     }
+    /// Feed thread: the sealer reported `version` on the current session.
+    pub fn set_sealer_version(&self, version: u8) {
+        self.sealer_version.store(version, Ordering::Release);
+    }
+
+    /// Feed thread: a new session starts, and the sealer has not reported
+    /// its rules on it yet.
+    pub fn forget_sealer_version(&self) {
+        self.set_sealer_version(0);
+    }
+
+    /// Whether the sealer of the current session applies a nonce release.
+    /// A sealer of an older decision version drops the frame, and its log
+    /// would replay the frame under the new rules after a restart.
+    #[must_use]
+    pub fn sealer_takes_releases(&self) -> bool {
+        self.sealer_version.load(Ordering::Acquire) >= RELEASE_DECISION_VERSION
+    }
+
     /// Controller: consume the pending lag flag, if any.
     #[must_use]
     pub fn take_lag(&self) -> Option<u64> {
@@ -355,10 +378,14 @@ pub struct ReceiptDrain {
     pub raised: Vec<(Address, u64)>,
     /// `(sender, nonce)` for each receipt that confirms a publish.
     pub confirmations: Vec<(Address, u64)>,
-    /// One nonce release for each skip receipt that proves the chain
-    /// expects `nonce` or a lower nonce of the sender next, with the hash
-    /// of the skipped entry. See [`Outcome::released`].
-    pub released: Vec<NonceRelease>,
+    /// `(sender, nonce)` for each skip receipt that proves the chain
+    /// expects `nonce` or a lower nonce of the sender next. See
+    /// [`Outcome::released`].
+    pub released: Vec<(Address, u64)>,
+    /// The nonce releases for the sealer's guard: one for each skip
+    /// receipt that proves the chain nonce. See
+    /// [`FloorUpdate::sealer_release`].
+    pub sealer: Vec<NonceRelease>,
 }
 
 impl ResyncController {
@@ -402,6 +429,12 @@ impl ResyncController {
     #[must_use]
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// Whether the sealer of the current session applies a nonce release.
+    #[must_use]
+    pub fn sealer_takes_releases(&self) -> bool {
+        self.watermark.sealer_takes_releases()
     }
 
     #[must_use]
@@ -458,9 +491,12 @@ impl ResyncController {
             return drain;
         };
         drain.confirmations.push((u.sender, nonce));
-        let floor = self.floor(u.sender).unwrap_or(0);
-        if let Some(release) = u.released(floor) {
-            drain.released.push(release);
+        let known = self.floor(u.sender);
+        if let Some(chain) = u.outcome.released(known.unwrap_or(0)) {
+            drain.released.push((u.sender, chain));
+        }
+        if let Some(release) = u.sealer_release(known) {
+            drain.sealer.push(release);
         }
         let Some(floor) = u.outcome.floor() else {
             return drain;

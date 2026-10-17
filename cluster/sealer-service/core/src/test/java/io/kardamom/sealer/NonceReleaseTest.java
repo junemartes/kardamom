@@ -83,17 +83,36 @@ class NonceReleaseTest {
     }
 
     @Test
-    void the_lowest_released_nonce_stays_open() {
+    void a_release_at_or_above_the_guard_changes_nothing() {
         CanonicalSealerState state = orderedThree();
         assertTrue(state.onRelease(sender(1), 1, id(2)));
-        assertTrue(state.onRelease(sender(1), 2, id(3)));
+        assertFalse(state.onRelease(sender(1), 2, id(3)), "the guard already expects 1");
+        assertFalse(state.onRelease(sender(1), 3, id(1)), "a nonce at the guard changes nothing");
         assertEquals(Optional.of(1L), state.expectedNonceOf(sender(1)));
+    }
+
+    /**
+     * The run n (skip), n + 1 (skip as a nonce too high): only n sends a
+     * release. It applies, n' is ordered at n, and no second lowering
+     * follows: the twin copy of the release finds the mark.
+     */
+    @Test
+    void a_run_of_skips_recovers_with_the_release_of_its_first_entry() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onRecord(id(1), sender(1), 5, NO_DEADLINE, payload("n"));
+        state.onRecord(id(2), sender(1), 6, NO_DEADLINE, payload("n+1"));
+        assertTrue(state.onRelease(sender(1), 5, id(1)));
+        assertEquals(Kind.RELAYED, state.onRecord(id(3), sender(1), 5, NO_DEADLINE, payload("n'")).kind);
+        assertFalse(state.onRelease(sender(1), 5, id(1)), "the twin copy drops");
+        assertEquals(Optional.of(6L), state.expectedNonceOf(sender(1)));
+        assertEquals(Kind.RELAYED, state.onRecord(id(4), sender(1), 6, NO_DEADLINE, payload("6")).kind);
     }
 
     @Test
     void a_release_of_an_unknown_sender_changes_no_guard() {
         CanonicalSealerState state = orderedThree();
-        assertTrue(state.onRelease(sender(7), 0, id(2)));
+        assertFalse(state.onRelease(sender(7), 0, id(2)));
+        assertEquals(3, state.dedupSize(), "no mark");
         assertEquals(Optional.empty(), state.expectedNonceOf(sender(7)));
         assertEquals(Optional.of(3L), state.expectedNonceOf(sender(1)));
     }

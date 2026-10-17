@@ -19,8 +19,6 @@ final class EgressFrames {
     /** The offset of the record type in a relayed frame: after the header and the canonical id. */
     private static final int ENTRY_RECORD_TYPE_OFFSET =
         SealerWire.RELAYED_HEADER_LEN + CanonicalSealerState.CANONICAL_ID_LEN;
-    /** The shortest relayed canonical entry: the header, the id, the record type and the lane. */
-    private static final int MIN_ENTRY_FRAME_LEN = ENTRY_RECORD_TYPE_OFFSET + Byte.BYTES + Byte.BYTES;
 
     private final MutableDirectBuffer buf;
 
@@ -66,12 +64,12 @@ final class EgressFrames {
     /**
      * A retained frame as an egress session gets it: a relayed canonical
      * entry becomes its relayed reference, and every other frame stays as
-     * is. A retained frame is one that this member framed, so its layout is
-     * known.
+     * is. A retained frame is one that this member framed: a relayed frame
+     * always holds the record type, because the service takes no ingress
+     * record without one ({@link RelayShape#minLength()}).
      */
     static byte[] forSession(final byte[] retained) {
         final boolean entry = retained[0] == SealerWire.EGRESS_KIND_RELAYED
-            && retained.length >= MIN_ENTRY_FRAME_LEN
             && retained[ENTRY_RECORD_TYPE_OFFSET] == SealerWire.RT_TX;
         if (!entry) {
             return retained;
@@ -95,6 +93,13 @@ final class EgressFrames {
         buf.putLong(pos, b, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         return pos;
+    }
+
+    /** The sealer's rules: {@code [kind:17][decision_version:u8]}. */
+    int sealerInfo(final int decisionVersion) {
+        buf.putByte(0, SealerWire.EGRESS_KIND_SEALER_INFO);
+        buf.putByte(Byte.BYTES, (byte) decisionVersion);
+        return SealerWire.SEALER_INFO_LEN;
     }
 
     /** A feed gap: {@code [kind:16][next_index:u64][next_block:u64]}. */

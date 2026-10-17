@@ -144,14 +144,39 @@ impl FloorUpdate {
         }
     }
 
-    /// The nonce release that this update proves, for a sender whose
-    /// receipt floor is `floor`. See [`Outcome::released`].
+    /// The nonce release for the sealer's guard that this update proves,
+    /// for a sender whose receipt floor is `floor` (`None` when no receipt
+    /// gave a floor yet). The release names the skipped nonce, and the
+    /// sealer lowers its guard to it, so the skip must prove that the chain
+    /// was at that nonce:
+    ///
+    /// - The executor (revm) checks the code of the sender, then the nonce,
+    ///   then the balance. So an insufficient-funds skip proves that the
+    ///   nonce matched the chain, with or without a floor. A late one
+    ///   below a known floor proves nothing new.
+    /// - A gas, fee, init-code, header or undecodable skip comes from a
+    ///   check before the nonce check, and so does a sender-has-code skip.
+    ///   It proves nothing about the nonce. It releases only at or above a
+    ///   known floor.
+    /// - A nonce skip never releases. A nonce-too-high skip follows a skip
+    ///   at the chain nonce, whose release already reopens the run.
     #[must_use]
-    pub(crate) fn released(self, floor: u64) -> Option<NonceRelease> {
-        let Outcome::Skipped { tx_hash, .. } = self.outcome else {
+    pub(crate) fn sealer_release(self, floor: Option<u64>) -> Option<NonceRelease> {
+        use kardamom_types::SkipReason;
+        let Outcome::Skipped {
+            nonce,
+            reason,
+            tx_hash,
+        } = self.outcome
+        else {
             return None;
         };
-        self.outcome.released(floor).map(|nonce| NonceRelease {
+        let proven = match reason {
+            SkipReason::NonceTooLow | SkipReason::NonceTooHigh => false,
+            SkipReason::InsufficientFunds => floor.is_none_or(|f| nonce >= f),
+            _ => floor.is_some_and(|f| nonce >= f),
+        };
+        proven.then_some(NonceRelease {
             sender: self.sender,
             nonce,
             tx_hash,

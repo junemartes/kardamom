@@ -76,7 +76,9 @@ code = [
 # never sends kind 16 on the egress. No frame uses kind 14: a reader drops
 # it as unknown. Kind 255 is local to the Rust client: the session thread
 # puts it on the consumer channel when a session opens. It is never on the
-# wire.
+# wire. The sealer sends kind 17 (its rules: the decision version) to each
+# session when the session opens. An older reader drops kind 17 as an
+# unknown kind, and the sequencer of the base release does not ask for it.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76
@@ -85,18 +87,19 @@ code = [
 # ignores a tail it does not know, and a new reader reads a frame with no
 # tail as the guard off, no snapshot and no retained bytes.
 [format.sealer-egress-kinds]
-writes = 12
+writes = 17
 reads_min = 1
-reads_max = 16
+reads_max = 17
 shared = true
 code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_SEALER_INFO",
+    "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_SEALER_INFO",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_RECORD_LAG_REJECT",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#EGRESS_KIND_FEED_GAP",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_RECORD_LAG_REJECT",
     "crates/cluster-adapter/src/wire/mod.rs#EGRESS_KIND_FEED_GAP",
     "crates/cluster-adapter/src/wire/mod.rs#STATUS_WITH_RETAINED_BYTES_LEN",
 ]
-activation = { flag = "recordLagBudget", writes = 13 }
 
 # The record type inside an ingress record and a relayed egress frame. The
 # Rust writers send types 0 to 3, and the sealer writes type 4 (void). This
@@ -301,9 +304,17 @@ code = ["crates/log/src/discovery/record.rs#DISCOVERY_VERSION"]
 
 [one_way.sealer-ingress-kinds]
 version = 10
-reason = "The sequencer sends the nonce release (kind 10). A sealer of the base release drops it as an unknown kind, so a rollback loses only the release, and the sender waits for the operator fix of the base release."
+reason = "The sequencer sends the nonce release (kind 10) only to a sealer that reported decision version 3 (egress kind 17). A sealer of the base release never reports it, so it gets no release; after a rollback, a sender whose guard stays ahead of the chain waits for an LRU eviction of the guard."
+
+[one_way.sealer-egress-kinds]
+version = 17
+reason = "The sealer sends its rules (kind 17) to each session. A reader of the base release drops kind 17 as an unknown kind, and a sequencer of the base release sends no release."
 
 [coordinated]
+
+[coordinated.sealer-egress-kinds]
+version = 17
+reason = "Kind 17 comes with decision version 3, which the sealer reaches in one coordinated restart. The clients of the base release drop the frame."
 
 [coordinated.sealer-ingress-kinds]
 version = 10

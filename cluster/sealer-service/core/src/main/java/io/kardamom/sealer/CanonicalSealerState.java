@@ -958,32 +958,53 @@ public final class CanonicalSealerState {
      * Apply a nonce release: an executor skipped the ordered entry
      * {@code canonicalId32} of {@code sender20}, and the chain expects
      * {@code nonce} of the sender next. A skip uses no nonce on the chain,
-     * so the expected nonce of the sender becomes the lower of the expected
-     * nonce and {@code nonce}. An evicted sender re-seeds on its next
-     * record, so it needs no change.
+     * so the expected nonce of the sender goes down to {@code nonce}.
+     *
+     * <p>The release applies only when all of these hold. Every check reads
+     * only replicated state, so every member decides alike.</p>
+     * <ul>
+     *   <li>The window holds the id, and holds no release mark of it. The
+     *       release then adds the mark: the id with its first byte inverted
+     *       ({@link #releaseMark}), held to the deadline of the id. Both
+     *       twins of a lane send each release, so the second copy finds the
+     *       mark and changes nothing. A release whose id left the window
+     *       changes nothing.</li>
+     *   <li>The guard tracks the sender, and expects a nonce above
+     *       {@code nonce}. An unknown or evicted sender re-seeds on its next
+     *       record, so it needs no change.</li>
+     * </ul>
+     *
+     * <p>Why a release never sets the guard below the chain. The sequencer
+     * sends a release only for a skip that proves that the chain was at
+     * {@code nonce} when the entry executed (an insufficient-funds skip:
+     * the executor checks the nonce before the balance), or for a skip at
+     * or above a known receipt floor. It sends none for a nonce skip. So:</p>
+     * <ul>
+     *   <li>The guard orders the entries of a sender with contiguous
+     *       nonces. Each entry ordered after the skipped one and before the
+     *       release has a nonce above {@code nonce}, and the chain stays at
+     *       {@code nonce}, so each of them skips as a nonce too high, and
+     *       sends no release.</li>
+     *   <li>The guard orders nothing at {@code nonce} until the release
+     *       applies. After it applies, the mark drops a repeat.</li>
+     *   <li>The one exception is an eviction of the sender from the guard
+     *       while the id is in the window, and a re-seed at {@code nonce}
+     *       that executes before the release. The eviction needs
+     *       {@code dedupCapacity} other senders ordered within the inclusion
+     *       horizon of the id. The cost is the state of a guard below the
+     *       chain, which the next eviction of the sender ends.</li>
+     * </ul>
      *
      * <p>The skipped id stays in the window, so the same signed bytes stay
      * a duplicate until their deadline, and one hash never has two
      * canonical entries. The sender signs a new transaction at the released
-     * nonce. The release applies only while the id is in the window, and
-     * only once:</p>
-     * <ul>
-     *   <li>It adds a release mark to the window: the id with its first byte
-     *       inverted ({@link #releaseMark}), held to the deadline of the id.
-     *       Both twins of a lane send a release for each skip, so the
-     *       second copy finds the mark and changes nothing.</li>
-     *   <li>A release whose id the window no longer holds is stale and
-     *       changes nothing.</li>
-     *   <li>The mark cannot stand for a real id. A real id is a keccak hash,
-     *       and the mark is a fixed transform of an id that the window
-     *       holds, so a real id equal to a mark is a hash collision.</li>
-     *   <li>The mark skips the capacity check, as an epoch marker does. The
-     *       window holds at most one mark for each ordered entry, and the
-     *       mark leaves with the entry at its deadline.</li>
-     * </ul>
+     * nonce.</p>
      *
-     * <p>The decision reads only replicated state, so every member decides
-     * alike, and the snapshot carries the mark with the window.</p>
+     * <p>The mark cannot stand for a real id: a real id is a keccak hash, and
+     * the mark is a fixed transform of an id that the window holds, so a
+     * real id equal to a mark is a hash collision. The mark skips the
+     * capacity check, as an epoch marker does. The window holds at most one
+     * mark for each ordered entry, and the mark leaves with its entry.</p>
      *
      * @return whether the release applied
      */
@@ -994,10 +1015,13 @@ public final class CanonicalSealerState {
         if (held == null || dedup.containsKey(mark)) {
             return false;
         }
+        ByteBuffer senderKey = ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer();
+        Long expected = expectedNonce.get(senderKey);
+        if (expected == null || expected <= nonce) {
+            return false;
+        }
         insertFresh(mark, held);
-        expectedNonce.computeIfPresent(
-            ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer(),
-            (sender, expected) -> Math.min(expected, nonce));
+        expectedNonce.put(senderKey, nonce);
         return true;
     }
 
@@ -1731,17 +1755,18 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
-        if (idCount < 0 || idCount > 2L * dedupCapacity + MARKER_SLACK) {
+        if (idCount < 0 || idCount > 2L * (dedupCapacity + MARKER_SLACK)) {
             // A snapshot taken with a larger configured window than this
             // member's would rebuild an oversized window, and members that
             // disagree on the capacity would decide differently. Fail
             // loudly. Markers do not meet the cap, so a window can hold
-            // MARKER_SLACK epoch ids above it, and one release mark for
-            // each ordered id. Shrinking the window across a restart needs
-            // an explicit migration.
+            // MARKER_SLACK epoch ids above it. A release mark is the
+            // transform of an id that the window holds, at most one for
+            // each, so the marks at most double the count. Shrinking the
+            // window across a restart needs an explicit migration.
             throw new IllegalArgumentException(
-                    "snapshot idCount " + idCount + " outside [0, 2 * dedupCapacity="
-                            + dedupCapacity + " + " + MARKER_SLACK
+                    "snapshot idCount " + idCount + " outside [0, 2 * (dedupCapacity="
+                            + dedupCapacity + " + " + MARKER_SLACK + ")"
                             + "] — members must agree on the configured window");
         }
         int idEntryLen = version >= 7 ? CANONICAL_ID_LEN + 8 : CANONICAL_ID_LEN;

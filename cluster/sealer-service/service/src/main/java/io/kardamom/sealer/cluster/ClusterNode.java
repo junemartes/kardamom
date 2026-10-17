@@ -372,7 +372,8 @@ public final class ClusterNode {
                 ? MemberStatus.ELECTION_CLOSED : String.valueOf(ElectionState.get(election));
             final long commit = commitPosition.isClosed() ? 0L : commitPosition.get();
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
-                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()), diskFreeBytes());
+                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion(), service.releasesSinceSnapshot()),
+                diskFreeBytes());
         }
 
         /**

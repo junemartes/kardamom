@@ -446,14 +446,19 @@ impl SessionLoop {
         }
     }
 
-    /// Tell a replay consumer that a new session starts. The marker goes on
-    /// the consumer channel before any frame of the new session, and after
-    /// every frame of the old one. So the consumer holds the new session's
-    /// live frames until the new session's replay is done. The marker
-    /// passes the kind filter: the consumer needs it whatever kinds it
-    /// reads.
+    /// Tell a replay consumer, or a consumer of the sealer's rules, that a
+    /// new session starts. The marker goes on the consumer channel before
+    /// any frame of the new session, and after every frame of the old one.
+    /// So a replay consumer holds the new session's live frames until the
+    /// new session's replay is done, and a consumer of the sealer's rules
+    /// forgets the rules of the old session. The marker passes the kind
+    /// filter: the consumer needs it whatever kinds it reads.
     fn mark_session_start(&mut self) {
-        if self.replay.is_none() {
+        let reads_rules = self
+            .egress_kind_filter
+            .as_ref()
+            .is_some_and(|ks| ks.contains(&crate::wire::EGRESS_KIND_SEALER_INFO));
+        if self.replay.is_none() && !reads_rules {
             return;
         }
         self.forward(crate::wire::encode_session_start());

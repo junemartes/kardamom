@@ -20,7 +20,7 @@ use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal,
+    FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal, SharedWatermark,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
@@ -48,6 +48,8 @@ struct Sealed {
     floor_tx: crossbeam_channel::Sender<FloorUpdate>,
     answer_tx: crossbeam_channel::Sender<SealerAnswer>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
+    /// The feed's view of the sealer: here, the rules it reported.
+    watermark: SharedWatermark,
     /// The next free `tx_data` offset.
     offset: i32,
 }
@@ -60,15 +62,18 @@ impl Sealed {
             floor_tx,
             answer_tx,
             deadline_tx,
+            watermark,
             ..
         } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
         seq.enable_resync(controller);
+        watermark.set_sealer_version(3);
         Self {
             seq,
             rig: Rig::default(),
             floor_tx,
             answer_tx,
             deadline_tx,
+            watermark,
             offset: 0,
         }
     }
@@ -647,25 +652,45 @@ fn a_skip_receipt_sends_one_nonce_release() {
     );
 }
 
-/// A nonce-too-low skip proves nothing new, so it sends no release. A
-/// nonce-too-high skip releases to the receipt floor.
+/// A nonce skip sends no release: the run of skips after the skip at
+/// the chain nonce reopens with the release of that first skip.
 #[test]
-fn a_release_names_the_nonce_that_the_chain_expects() {
+fn a_nonce_skip_sends_no_release() {
     let s = signer(52);
     let mut sealed = Sealed::new(one_partition_cfg());
     (0..3).for_each(|n| sealed.submit(&s, n));
     sealed.execute(s.address(), 0);
-    sealed.skip(s.address(), 1, SkipReason::NonceTooLow);
+    sealed.skip(s.address(), 1, SkipReason::InsufficientFunds);
     sealed.skip(s.address(), 2, SkipReason::NonceTooHigh);
+    sealed.skip(s.address(), 0, SkipReason::NonceTooLow);
     sealed.step();
     assert_eq!(
         sealed.rig.releases(),
         vec![NonceRelease {
             sender: s.address(),
             nonce: 1,
-            tx_hash: skipped_hash(s.address(), 2),
+            tx_hash: skipped_hash(s.address(), 1),
         }]
     );
+}
+
+/// A sealer that has not reported decision version 3 on the session gets
+/// no release. The release waits, and leaves after the report.
+#[test]
+fn a_release_waits_for_a_sealer_of_version_three() {
+    let s = signer(54);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.watermark.forget_sealer_version();
+    sealed.submit(&s, 0);
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.step();
+    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
+    sealed.watermark.set_sealer_version(2);
+    sealed.step();
+    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
+    sealed.watermark.set_sealer_version(3);
+    sealed.step();
+    assert_eq!(sealed.rig.releases().len(), 1);
 }
 
 /// A blocked transport keeps the release, and the next step sends it.

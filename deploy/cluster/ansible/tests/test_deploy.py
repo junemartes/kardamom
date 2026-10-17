@@ -146,7 +146,8 @@ class NomadAPI(BaseHTTPRequestHandler):
         # of a job.
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         path = self.path.split('?')[0].removeprefix('/v1/var/')
-        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/')) and body['Path'] == path, (self.path, body)
+        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
+            and body['Path'] == path, (self.path, body)
         if path.startswith('kardamom/deploys/'):
             # The deploy record: two JSON documents in one variable, written
             # with a check-and-set on the modify index. A test clobbers the
@@ -240,7 +241,9 @@ class NomadAPI(BaseHTTPRequestHandler):
             octet = int(self.headers['Host'].split(':')[0].rsplit('.', 1)[1])
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
-            self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED'})
+            self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
+                          'decisionVersion': state.get('decision_version', 3),
+                          'releasesSinceSnapshot': state.get('releases', {}).get(node, 0)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -1139,6 +1142,37 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_decision_version_change_needs_a_passing_quiesce_check(self):
+        self.run_deploy()
+        # The accepted release ran decision version 2: a record from before
+        # the field.
+        path = 'kardamom/deploys/local'
+        del self.api.state['records'][path]['accepted']['target']['decision_version']
+        self.api.state['decision_version'] = 2
+        # A member that applied a release after its snapshot fails the check.
+        self.api.state['releases'] = {'node-cluster-1': 1}
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('a member applied a nonce release after its last snapshot', output)
+        # The coordinated restart without a passing check is refused.
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.api.state['writes'] = []
+        output = self.run_deploy(success=False)
+        self.assertIn('changes the sealer decision version from 2 to 3', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
+        self.run_deploy()
+        path = 'kardamom/deploys/local'
+        del self.api.state['records'][path]['accepted']['target']['decision_version']
+        self.api.state['decision_version'] = 2
+        self.run_deploy(playbook='quiesce.yml')
+        self.assertEqual(self.api.state['variables']['kardamom/quiesce/local']['decision_version'], '2')
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.run_deploy()
+        self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()

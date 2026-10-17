@@ -384,6 +384,19 @@ public final class SealerWire {
      */
     public static final byte EGRESS_KIND_FEED_GAP = 16;
 
+    /**
+     * The sealer's rules: {@code [kind:17][decision_version:u8]}
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
+     * when the session opens. A member sends it again after a restart into
+     * another decision version, because every session opens again. A
+     * sequencer sends a nonce release only after it got version 3 or above
+     * on its current session. A reader that does not know the kind drops
+     * it. Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
+     */
+    public static final byte EGRESS_KIND_SEALER_INFO = 17;
+    /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
+    static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES;
+
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;
     /** Length of a status frame without its tails. */

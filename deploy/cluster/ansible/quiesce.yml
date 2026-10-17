@@ -1,0 +1,13 @@
+---
+- name: Check that no sealer member replays a nonce release across a decision version
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Check the members and record the result
+      ansible.builtin.include_role:
+        name: workloads
+        tasks_from: quiesce

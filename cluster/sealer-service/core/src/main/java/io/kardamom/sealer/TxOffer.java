@@ -45,6 +45,15 @@ public final class TxOffer {
             : Optional.empty();
     }
 
+    /**
+     * Whether a relayed payload names the canonical entry type
+     * ({@link #RT_TX}). The payload holds at least the id and the record
+     * type.
+     */
+    public static boolean isCanonical(final byte[] payload) {
+        return payload[RECORD_TYPE_OFFSET] == RT_TX;
+    }
+
     /** The transaction hash. */
     public byte[] canonicalId() {
         return Arrays.copyOf(payload, CanonicalSealerState.CANONICAL_ID_LEN);

@@ -310,8 +310,10 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             // ingress reads it, a consumer of the ordering does not. A
             // relayed reference repeats an entry without its bytes, and a
             // feed gap comes only on the member feed: both carry nothing
-            // for this reader.
+            // for this reader. The sealer's rules matter to a sequencer
+            // only.
             EgressItem::ContiguityReject { .. }
+            | EgressItem::SealerInfo { .. }
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::PastDeadline { .. }
             | EgressItem::WindowFull { .. }
