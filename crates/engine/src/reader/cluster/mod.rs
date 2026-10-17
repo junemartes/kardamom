@@ -413,10 +413,9 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         // connect re-delivers the whole window in order.
         //
         // The catch-up at each session-start marker prevents this order
-        // on a reconnect. A stream with no session
-        // count, or a sealer fault, can still give it. Frames within one
-        // Aeron session are ordered, so this condition has no false
-        // positives.
+        // on a reconnect. A stream with no session-start marker, or a
+        // sealer fault, can still give it. Frames within one Aeron session
+        // are ordered, so this condition has no false positives.
         if b.end_tx_idx.as_index() < ni {
             tracing::error!(
                 block = b.block_number,
