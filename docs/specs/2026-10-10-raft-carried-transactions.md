@@ -22,7 +22,7 @@
   - A member feeds only its own executor, over IPC. A separate service serves the validator,
     the batcher and external nodes (section 8.1, out of scope).
   - The boundary stream digest is a later follow-up.
-- Decided by the user on 2026-10-17 (decisions 10 to 13):
+- Decided by the user on 2026-10-17 (decisions 10 to 14):
   - The sealer keeps no retained file. Its Raft log and its snapshots are its only record.
   - The serving service reads only from the executors. It keeps the append-only log of the
     transactions above the posted head for the batcher and the attester.
@@ -32,7 +32,13 @@
     the serving service, read replicas of one log (cold). The ingress asks the serving service
     for a receipt that the executors pruned (section 8.4).
   - The notifier is removed for now: no WebSocket status feed and no webhooks (section 8.4).
-  - The target: a transaction lands within 50 ms of its submit (section 10.0).
+  - The target: a transaction lands within 50 ms of its submit. The ideal is a p99 of at most
+    20 ms from the ingress receipt of the submit to the executor's receipt emission (section
+    10.0).
+  - The answers to the open questions of the amendment (decision 14): one executor is enough; the
+    serving service keeps each attested range until its challenge window ends; it imports the
+    existing receipts at the cut-over; the read interface, the copies and the failover go to the
+    design of #585.
 - Scope: the ingress size cap, the sequencer offer with bytes, the `tx_heads` stream, the sealer
   state machine and its snapshot, the input of the executors, and the removal of the void path.
   The service that serves the canonical stream to the validator, the batcher and external nodes
@@ -66,8 +72,9 @@
 - A member keeps no frame with bytes. Its Raft log and its snapshots are its only record. The
   purge keeps the 3 newest snapshots and their log, and the log above the stored head of the
   serving service (section 5.5). The feed replays from that log (section 7.3).
-- The serving service keeps every entry above the posted head and above the attested head, with
-  its bytes and its receipt, for as long as L1 does not hold it. No byte budget stops the chain.
+- The serving service keeps every entry above the posted head, with its bytes and its receipt,
+  for as long as L1 does not hold it. It also keeps each range of an output root until the
+  challenge window of that output ends (decision 14). No byte budget stops the chain.
   The executors keep their output only until the serving service stores it (section 8.3).
 - The executors, the validator and the batcher no longer read `tx_data`. Only the sequencers read
   it. The ingress `tx_data` recordings go.
@@ -82,7 +89,7 @@
 | R4 | The service thread of a member never waits for a consumer. A slow executor never slows Raft. |
 | R5 | An executor executes index `i` only after it executed `i - 1`. It never skips an index. |
 | R6 | The bytes that one sequencer replica holds, in its parked buffer and its unconfirmed ledger, never pass a fixed bound (section 6.2). |
-| R7 | Every committed entry of a block above the posted head stays in at least one store until L1 holds it. The member's Raft log keeps it until the serving service stores it (the stored head). The executor's output keeps it until then too. The serving service keeps it until the posted head and the attested head pass it (sections 5.5, 8.1 and 8.3). |
+| R7 | Every committed entry of a block above the posted head stays in at least one store until L1 holds it. The member's Raft log keeps it until the serving service stores it (the stored head). The executor's output keeps it until then too. The serving service keeps it until the posted head and the final head pass it: the challenge window of its output root has ended (sections 5.5, 8.1 and 8.3). |
 
 ### 1.3 What the design does not guarantee
 
@@ -93,9 +100,10 @@
   ingress stamped, as today. The validator checks the signature (section 8).
 - It does not remove the leader as the bandwidth ceiling. The leader receives every entry, twice,
   and sends it to each follower (section 10).
-- It does not bound the disk of the serving service while L1 posts stop. That disk grows with
-  the DA lag. The disk of a member and of an executor grows only while the serving service
-  stores nothing. An alert warns before a disk fills (section 11).
+- It does not bound the disk of the serving service while L1 posts stop. That disk grows with the DA
+  lag, on top of the one-day challenge window that it always keeps (section 10.0). The disk of a
+  member and of an executor grows only while the serving service stores nothing. An alert warns
+  before a disk fills (section 11).
 - It does not stop ordered junk from an unfunded new key. The size cap bounds each entry. A
   stricter rule is a follow-up (section 6.6).
 
@@ -884,7 +892,7 @@ frame does not state the count. The reader computes it from the payload:
 |---|---|---|
 | Executor `0..2` | Cluster egress (references) + 8 `tx_data` lanes + ingress archives; votes (`crates/executor/src/bin/kardamom-executor/main.rs:494-513`, `:339`) | Its member's feed; the serving service as the fallback. No `tx_data`, no archive, no vote. It keeps its output (the frames, the receipts, the index) only until the serving service stores it (section 8.3). It checks `keccak256(raw_tx) == canonical_id` for each `RT_TX` entry (about 1 µs for a transfer). On a mismatch it does not execute the entry and does not halt: it drops that source, replays from the other source at the same index, counts `kardamom_executor_source_mismatch_total{source}`, and an alert fires. |
 | Elastic executor | As above | The serving service (section 8.1). |
-| Validator | Cluster egress + `tx_data` + ingress archives; votes (`crates/validator/src/bin/kardamom-validator/wiring/startup.rs:241-286`, `wiring/run.rs:170-178`) | The serving service (section 8.1). It checks `keccak256(raw_tx) == canonical_id` and that the signature recovers the sender (`crates/exec-core/src/stateless.rs:253-272`). A failed check halts it with `validator_divergence`. It does not trust the sealer's bytes. Its attester reads the receipts above the attested head from the serving service after a restart (section 8.3). |
+| Validator | Cluster egress + `tx_data` + ingress archives; votes (`crates/validator/src/bin/kardamom-validator/wiring/startup.rs:241-286`, `wiring/run.rs:170-178`) | The serving service (section 8.1). It checks `keccak256(raw_tx) == canonical_id` and that the signature recovers the sender (`crates/exec-core/src/stateless.rs:253-272`). A failed check halts it with `validator_divergence`. It does not trust the sealer's bytes. Its attester reads the receipts above the attested head from the serving service after a restart (section 8.3, a follow-up). |
 | Batcher | Cluster egress + `tx_data` + ingress archives; votes; the rebuild from `kardamom_getBlockRefs` and the archives (`crates/batcher/src/live/run.rs:292-357`, `:641-669`) | The serving service (section 8.1). It packs the KAR1 blocks from the `raw_tx` of each `RT_TX` entry. The spool, its group and cursor rules do not change. It keeps a publisher-only cluster session for the posted cursor (kind 7). |
 | Ingress observer | Full relayed frames (`crates/ingress/src/cluster.rs:173-174`) | The cluster egress: kind-15 frames, no bytes (section 6.4). |
 | Ingress receipt fallback | The receipt cache, then the executor state DB over HTTP (`crates/ingress/src/proxy/mod.rs:451-475`) | The cache, then an executor, which holds only the receipts above the stored head, then the serving service (section 8.4). |
@@ -904,20 +912,34 @@ calls it the egress service. This spec states only what it needs from that servi
   envelope for record type 6) and kind 2 (boundary). The frames are byte for byte the frames of
   a member feed (R3), so a consumer uses one codec for both. The service reads no sealer status,
   so its stream carries no kind 9. None of its readers needs one: the batcher counts its sealed
-  head from its own blocks (`crates/batcher/src/live/feed.rs:95-98`).
+  head from its own blocks (`crates/batcher/src/live/feed.rs:95-98`). A reader drops a kind 9
+  that it gets, as on the feed.
+- **Liveness on this transport.** The executor's reader uses the boundary (kind 2), as on the
+  feed. The sealer closes a block on each tick (2 s), also an empty block, so the executors commit
+  a boundary every tick, and the service serves it after its read delay. The reader leaves the
+  service after 6 s with no frame (the silence window of section 7.5, three ticks). The read delay
+  of the service must stay well below 4 s; its design states the bound. A source that stalls
+  because every executor stalls goes silent too, and the reader then tries its feed again.
 - **The replay.** A replay from a cursor `(index, block)`, with the answers of today: kinds 3, 4
   and 11 (`SealerEgress.java:201-253`).
-- **What it keeps (decision 10).** An append-only log of the canonical frames, and the receipts
-  of each block, on its own disk. It keeps every block above `min(posted_head, attested_head)`,
-  for the two readers that need a long window:
+- **What it keeps (decisions 10 and 14).** An append-only log of the canonical frames, and the
+  receipts of each block, on its own disk. It keeps every block above
+  `min(posted_head, final_head)`, for the two readers that need a long window:
   - the batcher, which posts to L1 (section 8.2);
-  - the withdrawal attester in the validator, which posts output roots to L1 (section 8.3).
-  The attested head is the newest block of an output root that is not deleted in
-  `WithdrawalOutputOracle` (`crates/validator/src/attester/oracle.rs`). With no oracle, the floor
-  is the posted head. Open question 16.1-8 asks if the floor also waits for the challenge
-  window. The service reads both heads from L1. It can keep a longer window for other external
-  readers: the public history RPC, indexers and explorers (section 8.4). Its design sets that
-  window.
+  - the withdrawal attester in the validator, which posts output roots to L1 (section 8.3), and
+    a challenger that checks an output root within its challenge window.
+- **The final head.** The newest block of an output root whose challenge window has ended:
+  `WithdrawalOutputOracle.isFinalizable` is true for it
+  (`contracts/src/L1/WithdrawalOutputOracle.sol:295-310`). The window is `finalizationWindow`,
+  1 day, on the settlement clock of the oracle: a pause of the oracle extends it. So the service
+  keeps an attested range for its whole window, also after the batcher posted it (decision 14).
+  The blocks above the attested head are above the final head, so the service keeps them too.
+  With no oracle, the floor is the posted head. The service reads both heads from L1.
+- **The receipt history.** The floor is a minimum. The service can keep a longer window for other
+  external readers: the public history RPC, indexers and explorers (section 8.4). The user wants
+  the receipt history to stay available after the executors prune (decision 14, the import of
+  section 12.3). So the design of #585 sets the receipt window, and the floor above does not
+  bound it.
 - **The rule "keep it, do not halt".** The service keeps the data until L1 holds it. No byte
   budget stops the chain (decision 5). Its disk grows with the DA lag (section 10.0).
 - **What it reads (decision 10).** The output of the executors only, not the members (section
@@ -995,8 +1017,8 @@ writes all of them in one transaction (`crates/state/src/writer/apply.rs:302-324
   and the persisted-state stage of chaos (`crates/chaos/src/stages/state.rs`) compare the output
   above the highest `output_floor_block` of the compared DBs.
 
-**What the serving service reads (proposal, open question 16.1-4).** The smallest option is a
-new range read on the executor's state query server, the server that already answers
+**What the serving service reads (proposal; the design of #585 decides, decision 14).** The smallest
+option is a new range read on the executor's state query server, the server that already answers
 `eth_getTransactionReceipt` (`crates/state/src/nonce_query.rs:197-209`):
 
 - The request: `[from_block:u64][stored_head:u64][max_bytes:u32][wait_ms:u32]`.
@@ -1024,7 +1046,7 @@ new range read on the executor's state query server, the server that already ans
 
 - **Definition.** The newest block `S` such that the serving service holds every frame and every
   receipt of each block up to `S` on its durable store. "Durable" is the number of copies that
-  open question 16.1-5 decides (section 8.4).
+  the design of #585 sets (decision 14, section 8.4).
 - **How the executor learns it.** Each range read carries `stored_head`. The serving service sends
   its stored head to every executor, also to the executors that it does not read from: a range
   read with `max_bytes = 0` is the ack alone. The executor keeps the highest value that it got.
@@ -1051,28 +1073,22 @@ above the last stored head. It does not stop or slow execution:
   current growth rate. At a full disk the commit fails and the executor stops, as an MDBX write
   error stops it today.
 
-**More than one executor.**
+**More than one executor (decision 14).**
 
 - The serving service reads the frames and the receipts from one executor at a time, in a
   configured order. It switches to the next one when the source is down or answers "pruned"
   below its need, as the executor reader switches its own sources (section 7.5).
-- It checks `keccak256(raw_tx) == canonical_id` for each `RT_TX` frame that it reads, as the
-  executor does (#595). On a mismatch it does not store the block, and it reads that block again
-  from the next executor.
-- **Agreement (proposal, open question 16.1-7).** Before it stores a block, the service compares
-  a digest of the block from a second executor: the keccak of the `block_frames` value and of the
-  receipt bytes. The receipts are deterministic, and the chaos stage already compares them byte
-  for byte across executors. The second read is the digest only, not the bytes.
-  - The digests agree: the service stores the block.
-  - They differ: the service stores neither, does not move the stored head, counts
-    `kardamom_serving_executor_mismatch_total`, and an alert fires. It does not choose an
-    executor. The validator is the judge: it re-executes and halts on a divergence.
-  - The cost: the stored head follows the second-fastest executor. With one executor up, the
-    stored head stops, and the sealer log and the executor buffer grow.
-- **Why the check matters now.** The validator reads the canonical stream through the serving
-  service, so through an executor. It checks each hash and signature, but it cannot tell an entry
-  that the sealer ordered from a valid signed entry that a faulty executor added. Two executors
-  that agree close most of that gap. The stream digest of decision 8 closes it.
+- One executor is enough: a block counts as stored when the service holds it as one executor
+  wrote it. No second executor confirms it.
+- The service checks `keccak256(raw_tx) == canonical_id` for each `RT_TX` frame that it reads, as
+  the executor does (#595). On a mismatch it does not store the block, and it reads that block
+  again from the next executor.
+- **What the hash check does not catch.** A wrong receipt, or a valid signed entry that the sealer
+  did not order. The validator re-executes each block that it reads from the service, so a wrong
+  receipt shows as a divergence of its receipt check where it sees the receipts of another
+  executor on `tx_receipts` (`crates/validator/src/buffers.rs:459-500`). An added entry passes
+  the validator, because the validator reads the same stream. The stream digest of decision 8
+  closes that gap (section 16.3).
 
 **The readers of the executor output today, and after.**
 
@@ -1100,7 +1116,7 @@ hot tier is the executor. The cold tier is the serving service.
 | Tier | Source | Readers | What it holds |
 |---|---|---|---|
 | Hot | The executor: the live `tx_receipts` stream and its boundaries, and the state query server | Internal services: the ingress (the live receipt stream into its cache, then the executor lookup), the state mirror and Redis, the sequencer | The live stream, and the output above the stored head |
-| Cold | The serving service: horizontally scaled read replicas of one append-only log | External services: the batcher, the attester (the L1 withdrawal proposer), the public history RPC, indexers and explorers, the validator, the unpaired executors, and the ingress fallback for a pruned receipt | Every block above `min(posted_head, attested_head)`, and the window of its design |
+| Cold | The serving service: horizontally scaled read replicas of one append-only log | External services: the batcher, the attester (the L1 withdrawal proposer), the public history RPC, indexers and explorers, the validator, the unpaired executors, and the ingress fallback for a pruned receipt | Every block above `min(posted_head, final_head)`, and the receipt window of its design |
 
 - **The hot tier gets no new hop.** The internal readers keep the sources of today. This is the
   path where the latency matters.
@@ -1135,12 +1151,13 @@ hot tier is the executor. The cold tier is the serving service.
     keeps one client, with a second list of endpoints.
 - **No gap between the tiers.** The executor prunes its output only at or below the stored head:
   the newest block that the serving service holds on its durable store (section 8.3). So each
-  receipt, and each frame, is always in at least one tier. A lookup between the two reads can miss
+  receipt, and each frame, is always in at least one tier, for as long as the receipt window of
+  the serving service keeps it (section 8.1). A lookup between the two reads can miss
   on the executor after a prune and find the receipt on the serving service.
 
 **The serving service scales out as read replicas of one append-only log.** This spec states the
-shape. The design of #585 settles the choices that the code does not settle (open questions
-16.1-5 and 16.1-6):
+shape. The design of #585 settles the choices that the code does not settle (decision 14: the
+former open questions 16.1-4 to 16.1-6 move to it):
 
 - **One writer.** One writer node reads the executors (section 8.3) and appends each block to the
   log: the frames of the block and its receipts, in block order. It is the only node that reads
@@ -1150,7 +1167,7 @@ shape. The design of #585 settles the choices that the code does not settle (ope
   a block only after it holds the whole block. Each replica serves the replay of section 8.1 and
   the receipt lookup.
 - **The stored head.** It is the newest block that the required number of copies hold on disk:
-  the writer alone, or the writer and one or more replicas (open question 16.1-5). The writer
+  the writer alone, or the writer and one or more replicas (the design of #585). The writer
   learns the progress of each replica, and computes the stored head from it.
 - **Writer failover.** When the writer stops, one replica becomes the writer and goes on from its
   own last block. The executors keep their output above the stored head, so the new writer reads
@@ -1229,9 +1246,21 @@ and the engine part of PR 14).
 ### 10.0 The design target
 
 The user set the target: **up to 5,000 tx/s, with mixed sizes**. On 2026-10-17 the user added a
-latency target: **a transaction lands within 50 ms of its submit** (decision 13). The percentile,
-and whether "lands" is the canonical seal or the receipt at the ingress, are open (16.1-10). The
-mix below is an example for the arithmetic. The benchmark uses the same mix, plus a pure 8 KB row as the worst case.
+latency target (decisions 13 and 14):
+
+- **The requirement:** a transaction lands within 50 ms of its submit.
+- **The ideal:** a p99 of at most 20 ms from the ingress receipt of the submit to the executor's
+  emission of the receipt on `tx_receipts`.
+- The benchmark gate measures that interval (section 10.6). The executor emits each receipt when
+  it executes the transaction: the commit thread does not wait for the block
+  (`crates/engine/src/actor/commit_thread.rs:237-249`). So the 2 s block is not in the interval.
+  The interval holds the ingress publish, the sequencer, the ordering window (up to 5 ms,
+  `cluster/sealer-service/README.md:258-275`), the Raft commit, the feed and the execution.
+  Today's receipt p99 is 47 ms at the edge (`docs/specs/2026-08-16-pipeline-cost-model.md`, "Gas
+  throughput and latency"), so the ideal needs a gain of more than half.
+
+The mix below is an example for the arithmetic. The benchmark uses the same mix, plus a pure 8 KB
+row as the worst case.
 
 - Example mix: 80 % transfers (110 B raw), 15 % 2 KB calls, 5 % 8 KB calls. The mean raw size is
   about 805 B. The log input is about 2.0 KB a transaction (two twin copies), and a canonical
@@ -1240,6 +1269,9 @@ mix below is an example for the arithmetic. The benchmark uses the same mix, plu
   entry: about 0.3 KB more for each transaction without logs (section 8.3). That is about
   0.54 KB a transaction with transfers only, 1.23 KB with the mix, 2.48 KB with 2 KB only and
   8.62 KB with 8 KB only.
+- The serving service always keeps the challenge window of 1 day (decision 14), plus the post
+  interval of the attester. The rows below give that steady state, and the growth on top of it
+  while no post lands.
 
 | At 5,000 tx/s | Transfers only | Example mix | 2 KB only | 8 KB only |
 |---|---|---|---|---|
@@ -1250,7 +1282,8 @@ mix below is an example for the arithmetic. The benchmark uses the same mix, plu
 | Leader out, total | 6.2 MB/s | 20.5 MB/s | 46 MB/s | 173 MB/s (1.38 Gbit/s) |
 | Log written in 15 minutes, each member | 2.6 GB | 9.0 GB | 21 GB | 78 GB |
 | Stored bytes for each 2 s block (frames + receipts) | 5.4 MB | 12.3 MB | 25 MB | 86 MB |
-| Disk growth while no post lands, each copy of the serving service | 2.7 MB/s | 6.2 MB/s | 12.4 MB/s | 43 MB/s |
+| Steady state, each copy of the serving service: the 1-day challenge window | 233 GB | 530 GB | 1.07 TB | 3.7 TB |
+| Disk growth while no post lands, each copy of the serving service, above the steady state | 2.7 MB/s | 6.2 MB/s | 12.4 MB/s | 43 MB/s |
 | The same, in one hour | 9.7 GB | 22 GB | 45 GB | 155 GB |
 | The same, at the block guard (10,000 blocks, about 5.6 hours) | 54 GB | 123 GB | 248 GB | 862 GB |
 | Disk growth while no post lands, each member and each executor | none above the margin and the buffer | none | none | none |
@@ -1260,13 +1293,12 @@ mix below is an example for the arithmetic. The benchmark uses the same mix, plu
 
 Findings from the arithmetic, for the benchmark to confirm:
 
-- **Network.** The leader sends only the replication and the 42-byte kind-15 frames. The mix
-  needs about 20.5 MB/s out of the leader, inside a 1 Gbit/s link. A stream of only 8 KB calls
-  needs 1.38 Gbit/s, above a 1 Gbit/s link: the worst case needs 10 GbE. The leader also receives
-  86 MB/s at 8 KB only. The serving service is not in these numbers (section 8.1): its writer
-  reads the frames and the receipts from one executor, about 6.2 MB/s at the mix, and a digest
-  from a second one (section 8.3). It adds no load to the leader. Only the staging run can
-  measure the network (section 10.6).
+- **Network.** The leader sends only the replication and the 42-byte kind-15 frames. The mix needs
+  about 20.5 MB/s out of the leader, inside a 1 Gbit/s link. A stream of only 8 KB calls needs 1.38
+  Gbit/s, above a 1 Gbit/s link: the worst case needs 10 GbE. The leader also receives 86 MB/s at 8
+  KB only. The serving service is not in these numbers (section 8.1): its writer reads the frames
+  and the receipts from one executor, about 6.2 MB/s at the mix (section 8.3). It adds no load to
+  the leader. Only the staging run can measure the network (section 10.6).
   - The evaluation of option B gives 30 MB/s and 2.05 Gbit/s. Those numbers include the full
     egress to the validator and the batcher. Decision 7 removes that egress.
   - Option A would need 12 MB/s and 0.71 Gbit/s: one copy in the log. The hedge of section 6.3
@@ -1277,9 +1309,11 @@ Findings from the arithmetic, for the benchmark to confirm:
 - **The sequencer.** Its input does not change: it already reads the full envelope. Its output
   grows from about 0.23 MB/s to 2.5 MB/s for each replica at the mix, and to 21.5 MB/s at 8 KB
   only. Two lanes share a node: about 43 MB/s (0.34 Gbit/s) at 8 KB only.
-- **The disk retention (decision 10).** No byte budget halts the chain (decision 5). While no
-  post lands, only the serving service grows: about 22 GB an hour for each copy at the mix, and
-  about 155 GB an hour at 8 KB only. The members and the executors do not grow, because the
+- **The disk retention (decisions 10 and 14).** No byte budget halts the chain (decision 5). Each
+  copy of the serving service always holds the 1-day challenge window: about 530 GB at the mix
+  and 5,000 tx/s, and 3.7 TB at 8 KB only. While no post lands, only the serving service grows
+  above that: about 22 GB an hour for each copy at the mix, and about 155 GB an hour at 8 KB
+  only. The members and the executors do not grow, because the
   stored head moves. Before decision 10 each of the 3 members grew by about 53 GB an hour at the
   mix (the log and the retained file). The disk size of the serving service sets how long the
   chain rides out a DA outage. The alert of section 11 gives the time to a full disk.
@@ -1368,8 +1402,10 @@ See sections 5.5, 8.1 and 8.3:
   `block_frames`) holds only the blocks above the stored head: seconds of output in steady state.
   While the serving service stores nothing, it grows at about 22 GB an hour at the mix.
 - **The serving service.** Each copy holds the frames and the receipts above
-  `min(posted_head, attested_head)`, plus the window of its own design. While no post lands, it
-  grows at about 22 GB an hour at the mix (section 10.0). No byte budget bounds it (decision 5).
+  `min(posted_head, final_head)`: at least the 1-day challenge window, about 530 GB at the mix
+  (section 10.0). It also holds the receipt window of its own design and the receipts imported
+  at the cut-over (section 12.3). While no post lands, it grows by about 22 GB an hour at the mix.
+  No byte budget bounds it (decision 5).
 - The snapshot holds the state of today. It does not grow with the DA lag.
 
 ### 10.5 The feed
@@ -1422,6 +1458,7 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 |---|---|
 | Commit latency p50, p99: ingress publish to the sealed id | the ingress observer, a new histogram `kardamom_ingress_seal_latency_seconds` |
 | Receipt latency p50, p99 | `kardamom-load` |
+| Submit to receipt p50, p99, p99.9: from the ingress receipt of the submit to the arrival of the receipt on `tx_receipts` at the same ingress (decision 13). One clock. It is an upper bound of the interval by one Aeron hop. | a new histogram `kardamom_ingress_submit_receipt_seconds` (PR 12) |
 | Sustained rate with zero loss | `kardamom-load --assert-all-delivered` |
 | Leader CPU: process, service thread, consensus thread | container CPU and per-thread `/proc` sampling |
 | Network bytes in and out of each member | node exporter or `docker stats` |
@@ -1437,16 +1474,19 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 
 - **Matrix rows for the target.** 5,000 tx/s with the example mix of section 10.0, and 5,000 tx/s
   with 8 KB only, beside the matrix above.
-- **The decision.** One Raft group carries the target when, at 5,000 tx/s with the mix and with
-  8 KB only, the p99 commit latency stays under 100 ms, the leader CPU stays under 70 %, and the
-  snapshot stays under 2 s. The container run answers for CPU, disk, GC and the snapshot. The
-  staging run answers for the network. The result also tunes `--parked-bytes`,
-  `--unconfirmed-bytes`, `feedRingBytes`, `readyLagBytes` and the sealer heap.
+- **The decision.** One Raft group carries the target when, at 5,000 tx/s with the mix and with 8 KB
+  only, the p99 of the submit-to-receipt interval stays at or below 50 ms, the leader CPU stays
+  under 70 %, and the snapshot stays under 2 s. The result also states whether the p99 reaches the
+  ideal of 20 ms, and how the interval splits into the seal latency and the rest. The container run
+  answers for CPU, disk, GC and the snapshot. The staging run answers for the network. The result
+  also tunes `--parked-bytes`, `--unconfirmed-bytes`, `feedRingBytes`, `readyLagBytes` and the
+  sealer heap.
 - **The hedge.** If the twin copy is the limit (the leader's network or the log disk), the
   hedged offer of section 6.3 is the next step. The result says so.
-- The 100 ms bound is this spec's proposal. It is above the user target of 50 ms (decision 13).
-  The gate changes when open question 16.1-10 is answered. Today's receipt p99 is 47 ms at the edge
-  (`docs/specs/2026-08-16-pipeline-cost-model.md`, "Gas throughput and latency").
+- The gate measures the interval of decisions 13 and 14. The 50 ms requirement is read at p99, as
+  the ideal is. The 100 ms bound on the commit latency of the first version of this spec goes.
+  Today's receipt p99 is 47 ms at the edge (`docs/specs/2026-08-16-pipeline-cost-model.md`, "Gas
+  throughput and latency").
 
 ## 11. Failure modes
 
@@ -1467,15 +1507,15 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 | A snapshot restore | The member restores its state. A v12 snapshot holds no frame. | It replays the log after the snapshot. Its feed serves replays from a walk of that log. |
 | All members restart | No commit until a quorum returns. | Each member restores its snapshot and replays its log. The executors reconnect to the feeds and replay. The sequencers re-offer. |
 | All members lose their state | The Raft logs and the snapshots are gone. The serving service still holds the blocks above the posted head. | The fleet rebuild from L1 at the posted head (`docs/runbooks/sealer-fleet-rebuild.md`). The unposted range is lost, as today. A rebuild that keeps the unposted range from the serving service is a later follow-up (section 16.3). |
-| L1 posts stop for a long time | The serving service keeps every block above the posted head on disk, and grows at the rates of section 10.0. The stored head moves, so the members and the executors do not grow. No byte budget refuses records. The block guard refuses user records at its block budget, as today. | The batcher posts again. The serving service then frees the blocks below `min(posted_head, attested_head)`. How the batcher posts a large backlog is out of scope (section 5.5). |
+| L1 posts stop for a long time | The serving service keeps every block above the posted head on disk, and grows above its steady state at the rates of section 10.0. The stored head moves, so the members and the executors do not grow. No byte budget refuses records. The block guard refuses user records at its block budget, as today. | The batcher posts again. The serving service then frees the blocks below `min(posted_head, final_head)`. How the batcher posts a large backlog is out of scope (section 5.5). |
 | The disk of a member fills | It happens only while the stored head does not move (an outage of the serving service or of every executor). The member cannot write its log. It logs a fatal error and stops. All members keep the same log, so disks of one size fill at about the same time. When a quorum stops, the cluster commits nothing: the chain stops. | The alert `KardamomSealerDiskLow` fires first: free disk under 25 %, or under 6 hours at the current growth rate (`kardamom_sealer_disk_free_bytes` and its derivative). The operator restores the serving service or adds disk. A stopped member restarts and replays its log. |
 | A member's feed bytes differ from the leader's | A bug: R3 is broken. | An executor whose entry fails its hash check drops that source and replays from the other source, with an alert (section 8). The validator checks every canonical entry it reads. A boundary carries no digest of the stream. A stream digest is a later follow-up (section 16.3). |
 | A feed ring fills | The member writes a `FEED_GAP` marker (section 7.2). | The executor asks for a replay at once and stays on the feed. |
 | The serving service stops (every writer and replica) | The stored head stops. The batcher, the attester, the validator and the unpaired executors stop reading. The ingress serves receipts from its cache and the executors only. Each member keeps its log, and each executor keeps its output buffer (section 10.0). | `KardamomExecutorOutputUnstored` fires after 10 minutes, then the disk alerts. When the service returns, its writer reads the blocks above its last block from an executor, the stored head moves, and the members and the executors prune. |
 | The writer of the serving service stops | The replicas serve reads. The stored head stops until a new writer runs. | A replica becomes the writer (section 8.4) and reads the blocks that it lacks from an executor. |
-| The serving service loses blocks above the posted head | A disk loss of fewer copies than the stored head needs loses nothing: the other copies hold the blocks. A loss of every copy loses the blocks between the posted head and the stored head: the members and the executors already pruned them. | The chain reverts to the posted head (`docs/runbooks/revert_to_posted_head.md`), as after the loss of every member. Open question 16.1-5 sets the copies that make this rare. |
+| The serving service loses blocks above the posted head | A disk loss of fewer copies than the stored head needs loses nothing: the other copies hold the blocks. A loss of every copy loses the blocks between the posted head and the stored head: the members and the executors already pruned them. | The chain reverts to the posted head (`docs/runbooks/revert_to_posted_head.md`), as after the loss of every member. The design of #585 sets the copies that make this rare. |
 | Every executor is down | No block is executed. The serving service has nothing new, so the stored head stops. The sealer keeps ordering into its log. | The log holds the range above the stored head (section 5.5). The executors return, replay from their feeds or a peer checkpoint, and the serving service goes on. |
-| Two executors disagree on a block | The serving service stores neither copy, and the stored head stops (section 8.3). | `kardamom_serving_executor_mismatch_total` and an alert. The validator re-executes and halts on a divergence. The operator replaces the faulty executor from a peer checkpoint. |
+| An executor serves a wrong block | The serving service stores what one executor wrote (decision 14). The hash check drops bytes that do not match their id (section 8.3). | The service reads the block again from the next executor. A wrong receipt shows at the validator's receipt check. An added valid entry passes until the stream digest of decision 8. |
 | The disk of an executor fills | It happens only while the stored head does not move. The commit fails, and the executor stops. | `KardamomExecutorDiskLow` fires first. The paired executors of the other hosts fill at about the same rate. |
 
 ## 12. Migration
@@ -1493,7 +1533,7 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 | `sealer-feed` (new) | none | The feed frames are the egress kinds. The feed control request is the kind-1 layout. |
 | `tx-heads` (new, PR 11) | none | Frozen layout of `TxHeader`. |
 | `state-db` | 11 tables | The new table `block_frames` and the meta key `output_floor_block` (section 8.3). A reader of the base ignores an unknown table and key, so the change is forward-compatible. The schema version rises only if the state DB rules of `docs/formats.md` require it. |
-| `executor-output` (new) | none | The range read of section 8.3: the request and the binary answer. Frozen at its first release. Its transport follows open question 16.1-4. |
+| `executor-output` (new) | none | The range read of section 8.3: the request and the binary answer. Frozen at its first release. Its transport follows the design of #585. It answers a block with no `block_frames` row with its receipts only (the import of section 12.3). |
 | `batcher-spool`, `batcher-cursor` | unchanged | Unchanged. |
 
 - Each change that the base cannot read gets a `[one_way.<id>]` and a `[coordinated.<id>]`
@@ -1549,9 +1589,10 @@ Production keeps its chain. The cut-over reuses the coordinated restart of the d
 4. Wait until all of these hold:
    - the posted head is at or above `D` (`kardamom_ingress_cluster_posted_head`);
    - when the attester runs: the attested head is at or above `D`. The attester keeps its leaves
-     in memory only (`crates/validator/src/attester/state.rs:44-63`), and the serving service
-     holds no block at or below the cut. So an output root that does not cover `D` before the cut
-     strands the withdrawals of the blocks above it. The attester posts on its interval
+     in memory only (`crates/validator/src/attester/state.rs:44-63`), and it does not read the
+     receipts that the serving service imports at step 8 (that read is a follow-up, section
+     16.3). So an output root that does not cover `D` before the cut strands the withdrawals of
+     the blocks above it. The attester posts on its interval
      (`--attester-post-interval`); the operator waits for it, or lowers the interval;
    - the cursor of every consumer equals the sealer's canonical count and the open block: each
      executor (feed or egress), the validator and the batcher. Then no consumer holds a `TxRef`
@@ -1574,14 +1615,23 @@ Production keeps its chain. The cut-over reuses the coordinated restart of the d
      `--carry-bytes` send no recorded cursor (#635).
 8. Turn the flags on. Start the executors, the validator and the batcher; they resume at the head
    with no `TxRef` frame to resolve. The validator and the batcher now read the serving service
-   (section 8.1), so it runs before this step. It starts empty, at the cut: every block at or
-   below `D` is posted, and the attested head is at or above `D`. Its first stored head is `D`,
-   so the sealer floor stays the posted head until it stores the first new block. Then the
-   sequencers, then the ingresses. Unpause.
-   - The executors of the old release hold receipts for all blocks. The first prune after the
-     cut-over drops the output at or below the stored head. Old receipts then come from the
-     validator's state DB only. Open question 16.1-9 asks if the serving service must import the
-     old receipts, so that `eth_getTransactionReceipt` keeps answering for them.
+   (section 8.1), so it runs before this step. Then the sequencers, then the ingresses. Unpause.
+   - **The receipt import (decision 14).** The serving service starts at the cut. Before it sends
+     its first stored head, it imports the existing receipts from one executor: the `receipts`
+     and `tx_hash_index` rows of every block at or below `D`, through the range read of section
+     8.3. These blocks have no `block_frames` row: the old release holds no transaction bytes,
+     and L1 holds them. So the service answers a receipt lookup for them, and a replay below `D`
+     gets `REPLAY_UNAVAILABLE`.
+   - The service sends its first stored head, `D`, only when the import is done. An executor
+     prunes nothing before its first stored head, so the import does not race a prune. Until then
+     the sealer floor stays the posted head.
+   - The output roots of the day before the cut are still in their challenge window. The service
+     holds their receipts from the import. Their transaction bytes are on L1.
+   - The import size is the receipt history of the chain: about 0.3 KB for each transaction
+     without logs, more with logs. The operator states it, and the disk of the service, before
+     the cut-over. The import can run while the old release still runs, from a checkpoint copy,
+     and catch up to `D` at step 8.
+   - Staging takes the chain reset of section 12.2, so it imports nothing.
 
 - A consumer that restores a checkpoint older than the cut-over cannot replay the old range: the
   floor is at the cut. It takes a newer checkpoint, or the replay answers `REPLAY_UNAVAILABLE`
@@ -1665,7 +1715,7 @@ Each item is one pull request and one issue. Each passes `just style` and CI alo
 
 The executor side of the handoff (section 8.3: `block_frames`, the range read, the prune, the
 alerts) and the ingress fallback to the serving service (section 8.4) are issues that the design
-of #585 opens, because their transport follows open question 16.1-4.
+of #585 opens, because their transport follows that design (decision 14).
 
 **PR 1. cluster: fragmented session messages up to 1 MiB.**
 
@@ -1760,7 +1810,8 @@ of #585 opens, because their transport follows open question 16.1-4.
 **PR 12. bench: run the matrix and gate on the target.**
 
 - Scope: section 10.6 on `main` and on the flagged build, in the container cluster and on staging.
-  The results go into this spec as section 17.
+  The histogram `kardamom_ingress_submit_receipt_seconds` of the submit-to-receipt interval
+  (decision 13). The results go into this spec as section 17.
 - Acceptance: section 17 answers whether one Raft group carries 5,000 tx/s with the mix and with
   8 KB only, gives the tuned values, and says if the hedge of section 6.3 is needed.
 
@@ -1820,11 +1871,12 @@ of #585 opens, because their transport follows open question 16.1-4.
   moves to the stored head; with no kind 11, the floor is the posted head. A `TestCluster` test:
   every member restores the same stored head from v12. A member of the base drops kind 11.
 
-Rules to check in each pull request: R1 (comments carry no phase or spec names), R5 (the feeder,
-the ring and the walk thread each have one owner, and the feed ring has one writer at a time), R6 (the feed is an associated type of
-the reader's wiring, not `dyn`), R9 (parse each frame once at the boundary), R12 (checked
-arithmetic for the byte counters and the wire lengths), R14 (one codec and one ingest path for the
-feed and the serving service), R16 (the release drain stays a one-step loop body).
+Rules to check in each pull request: R1 (comments carry no phase or spec names), R5 (the feeder, the
+ring and the walk thread each have one owner, and the feed ring has one writer at a time), R6 (the
+feed is an associated type of the reader's wiring, not `dyn`), R9 (parse each frame once at the
+boundary), R12 (checked arithmetic for the byte counters and the wire lengths), R14 (one codec and
+one ingest path for the feed and the serving service), R16 (the release drain stays a one-step loop
+body).
 
 ### 13.1 Chaos cases
 
@@ -1841,7 +1893,7 @@ feed and the serving service), R16 (the release drain stays a one-step loop body
 | `leader-kill` (new) | Kill the leader under `on-quorum` load with 8 KB transactions. | The sequencers re-offer from their unconfirmed ledgers. Every acknowledged transaction has a receipt. No transaction is ordered twice. |
 | `sequencer-byte-cap` (new, small `--parked-bytes`) | Flood lane 0 with large future-nonce transactions from new keys. | The parked bound of lane 0 holds and evicts. No flood transaction enters the Raft log. The commit latency of lane 1 does not rise. |
 | `sequencer-twin-kill` (new) | Kill one twin of lane 0 under load with 8 KB transactions. | No gap and no loss. Every acknowledged transaction has a receipt. |
-| `cutover-rehearsal` (new, container cluster only) | Run the drained cut-over of section 12.3 under load, from the release before PR 13. | The posted head reaches `D`; every consumer cursor equals the canonical count; the new members restore the v10 snapshot; the chain continues; root parity holds. |
+| `cutover-rehearsal` (new, container cluster only) | Run the drained cut-over of section 12.3 under load, from the release before PR 13. | The posted head reaches `D`; every consumer cursor equals the canonical count; the new members restore the v10 snapshot; the chain continues; root parity holds. The serving service imports the receipts at or below `D` before its first stored head, and the ingress answers a receipt of a block before the cut after the executors prune. |
 | `feed-driver-restart` (new) | Restart the aeron system job on executor node 1 under load. | Member 1's commit latency does not rise. The feeder reconnects. Executor 1 returns to its feed with no gap. |
 | `sealer-disk-full` (new, container cluster only) | Fill the disk of member 2 while the serving service is stopped. | `KardamomSealerDiskLow` fires before the disk is full. Member 2 stops with a fatal error. Quorum holds on members 0 and 1. After the operator frees space, member 2 restarts and catches up. |
 | `feed-log-walk` (new) | Stop executor 2 for longer than the ring holds and less than the feed floor, then for longer than the feed floor. | First: executor 2 catches up through a walk of its member's log, with `input_source="feed"`, and the walk frames equal the live frames. Second: the feed answers `REPLAY_UNAVAILABLE`, and executor 2 catches up from the serving service. |
@@ -1923,6 +1975,9 @@ feed and the serving service), R16 (the release drain stays a one-step loop body
   no executor wrote out and the serving service did not store lives only in the log. A purge with
   no floor loses it when every executor or the serving service is down for longer than the margin
   (section 5.5).
+- **Two executors agree before a block counts as stored.** The serving service would compare a
+  digest of each block from a second executor. The user chose one executor (decision 14). The
+  hash check of each entry stays. The stream digest of decision 8 is the later answer.
 - **Back-pressure on an executor when the serving service is down.** It saves no data, because the
   sealer keeps the log above the stored head, and it stops the receipts (section 8.3).
 - **`ExecTxRecord` for the remote consumers.** The serving service uses the canonical frames of
@@ -1937,7 +1992,7 @@ feed and the serving service), R16 (the release drain stays a one-step loop body
 
 ## 16. Decisions of the user
 
-Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 13 are of 2026-10-17.
+Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 14 are of 2026-10-17.
 
 
 1. **Target rate and size.** Up to 5,000 tx/s with mixed sizes. Section 10.0 states it as the
@@ -1983,7 +2038,8 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 13 are of 2026-10-17.
     - A long window matters only to the batcher, which posts to L1, and to the attester of the
       withdrawal off-ramp, which posts output roots to L1. The serving service keeps every block
       above the posted head and the attested head for them. The rule "keep the data until L1
-      holds it, do not halt" now applies to the serving service.
+      holds it, do not halt" now applies to the serving service. Decision 14 extends the window
+      to the end of the challenge window.
     - The member feed replays from the member's own Raft log, from a snapshot, not from a file
       (section 7.3, PR 16). An executor that is further behind falls back to the serving service
       or a peer checkpoint, as the reader of #595 (#635) does.
@@ -2005,8 +2061,24 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 13 are of 2026-10-17.
 12. **The notifier (2026-10-17).** It is removed for now: no WebSocket status feed and no
     webhooks. A separate PR removes the code. The serving service keeps nothing for it
     (section 8.4).
-13. **The latency target (2026-10-17).** A transaction lands within 50 ms of its submit
-    (section 10.0). Open question 16.1-10 asks for the percentile and the meaning of "lands".
+13. **The latency target (2026-10-17).** A transaction lands within 50 ms of its submit. The
+    ideal is a p99 of at most 20 ms from the ingress receipt of the submit to the executor's
+    receipt emission. The benchmark gate measures that interval (sections 10.0 and 10.6).
+14. **The answers to the open questions of decisions 10 to 13 (2026-10-17).**
+    - **16.1-10, the latency target:** "ideally 20 ms p99 from ingestion to receipt emission".
+      Decision 13 records it. The 50 ms landing figure stays the stated requirement. The gate
+      reads it at p99.
+    - **16.1-7, the executors:** one executor is enough before a block counts as stored. The hash
+      check of each entry (#595) stays (section 8.3).
+    - **16.1-8, the challenge window:** the serving service keeps each attested range until its
+      1-day challenge window ends, also after the batcher posted it. Its floor is
+      `min(posted_head, final_head)` (sections 8.1 and 10.0).
+    - **16.1-9, the cut-over:** the serving service imports the existing receipts from the
+      executors at the cut-over, so the history stays available after the executors prune
+      (section 12.3).
+    - **16.1-4, 16.1-5 and 16.1-6:** the read interface between the executor and the serving
+      service, the number of durable copies of the stored head, and the replication and the
+      failover of the serving service move to its design (#585).
 
 ### 16.1 Still open
 
@@ -2018,38 +2090,15 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 13 are of 2026-10-17.
    to each ingress, for the `on-quorum` ack (section 6.4). It carries no bytes. Is this inside
    decision 7, or does the ack move to the serving service too?
 3. **Superseded work.** Close #543, #542, #554 and #570 as superseded (section 9.2)?
-4. **The read interface between the executor and the serving service (section 8.3).** The
-   proposal: a new state DB table `block_frames`, and a binary range read on the executor's state
-   query server, with the stored head as the ack in each request. The other options: the live
-   `tx_receipts` stream with a new stream for the bytes, or a recorded Aeron stream from each
-   executor. The code does not settle it. The design of #585 proposes; the user decides.
-5. **The durable copies of the stored head (sections 8.3 and 8.4).** The stored head frees the
-   sealer log and the executor buffers. After that the serving service holds the only copy of
-   the blocks between the posted head and the stored head. Does the stored head need one copy
-   (the writer's disk), or two or more (the writer and replicas on other hosts)? A loss of every
-   copy reverts the chain to the posted head.
-6. **How the replicas of the serving service follow the writer, and how a replica becomes the
-   writer (section 8.4).** The options for the copy: an Aeron stream with a replay from the
-   writer's archive, a pull of the log files over HTTP, or a shared store. The options for the
-   failover: a Consul lock, a Nomad singleton job, or an operator step.
-7. **One executor or two before the serving service stores a block (section 8.3).** The proposal:
-   two executors agree on a digest of the block. It closes most of the gap that the validator
-   cannot see (an entry that a faulty executor adds), until the stream digest of decision 8. The
-   cost: the stored head stops while only one executor runs.
-8. **The challenge window.** The serving service keeps the blocks above the attested head. A
-   challenger, or a later ZK prover, may need the blocks of an output until its challenge window
-   ends (`finalizationWindow`, 1 day). No challenger daemon exists today. Does the floor wait for
-   the output to be final, or only for its post?
-9. **Old receipts at the cut-over (section 12.3).** The serving service starts empty at the cut.
-   The executors then prune the receipts of the blocks before the cut. Must the serving service
-   import them from an executor before the first prune, so that `eth_getTransactionReceipt` keeps
-   answering for them? Else only the validator's state DB holds them.
-10. **The latency target (decision 13, section 10.0).** The user target is "a transaction lands
-    within 50 ms of its submit". The benchmark gate of section 10.6 is a p99 commit latency under
-    100 ms. Which percentile does the 50 ms bound (p50, p99, or another)? Does "lands" mean the
-    canonical seal (the `on-quorum` ack, `kardamom_ingress_seal_latency_seconds`) or the receipt
-    at the ingress (`kardamom-load` receipt latency)? The gate of section 10.6 changes with the
-    answer.
+4. **Moved to the design of #585 (decision 14).** The read interface between the executor and
+   the serving service (section 8.3). The proposal of this spec: a `block_frames` table and a
+   binary range read on the executor's state query server.
+5. **Moved to the design of #585 (decision 14).** The number of durable copies of the stored head
+   (sections 8.3 and 8.4).
+6. **Moved to the design of #585 (decision 14).** How the replicas follow the writer, and how a
+   replica becomes the writer (section 8.4).
+
+Questions 7 to 10 are answered (decision 14).
 
 ### 16.2 Closed in review
 
@@ -2062,6 +2111,8 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 13 are of 2026-10-17.
 
 - **A stream digest (decision 8).** Each boundary carries a running hash of the canonical stream,
   so an executor that switches source detects a divergent member. It changes the boundary frame.
+  It also closes the gap of decision 14: the serving service stores what one executor wrote, and
+  the validator cannot see an entry that a faulty executor added (section 8.3).
 - **The inclusion cost (decision 5).** How the batcher posts a large backlog to L1 after a long
   DA outage.
 - **A second Raft group (decision 1).** Only when the staging run shows that one group does not
