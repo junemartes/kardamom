@@ -117,7 +117,7 @@ final class PeerSeed {
         clusterDir.clear();
         archiveDir.clear();
         final Round result = backUp();
-        if (result.outcome() == SeedWatch.Outcome.SEEDED && copiedRetained(result)) {
+        if (result.outcome() == SeedWatch.Outcome.SEEDED && copiedRetained(result.backup())) {
             clusterDir.dropMarkFiles();
             archiveDir.dropMarkFiles();
             return true;
@@ -137,10 +137,8 @@ final class PeerSeed {
      * backed-up snapshot. Stop the start after {@link #MAX_COPY_FAILURES}
      * failed copies.
      */
-    private boolean copiedRetained(final Round result) {
-        final boolean copied = retainedCopy
-            .map(copy -> result.snapshot().map(copy::run).orElse(true))
-            .orElse(true);
+    boolean copiedRetained(final Backup backup) {
+        final boolean copied = retainedCopy.map(copy -> backup.copiedBy(copy, memberId)).orElse(true);
         if (!copied) {
             copyFailures++;
             System.out.println("cluster SEED retained-copy MISMATCH memberId=" + memberId
@@ -158,10 +156,41 @@ final class PeerSeed {
 
     /**
      * The end of one round: its outcome, the last backup state it sampled,
-     * and the payload of the backed-up sealer snapshot when the member
-     * needs it for the retained-file check.
+     * and the backed-up sealer snapshot that the retained-file check needs.
      */
-    private record Round(SeedWatch.Outcome outcome, ClusterBackup.State lastState, Optional<byte[]> snapshot) {
+    private record Round(SeedWatch.Outcome outcome, ClusterBackup.State lastState, Backup backup) {
+    }
+
+    /** The backed-up sealer snapshot, as the retained-file check sees it. */
+    sealed interface Backup permits NoSnapshot, Payload, Unread {
+        /** Whether the retained file is in place after {@code copy} runs against this backup. */
+        boolean copiedBy(RetainedCopy copy, int memberId);
+    }
+
+    /** The cluster has no snapshot, or the member keeps no file: the member needs no copy. */
+    record NoSnapshot() implements Backup {
+        @Override
+        public boolean copiedBy(final RetainedCopy copy, final int memberId) {
+            return true;
+        }
+    }
+
+    /** The payload of the backed-up sealer snapshot. */
+    record Payload(byte[] bytes) implements Backup {
+        @Override
+        public boolean copiedBy(final RetainedCopy copy, final int memberId) {
+            return copy.run(bytes);
+        }
+    }
+
+    /** The backed-up snapshot could not be read, for example because its replay never connected: a failed round. */
+    record Unread(String why) implements Backup {
+        @Override
+        public boolean copiedBy(final RetainedCopy copy, final int memberId) {
+            System.out.println("cluster SEED retained-copy FAILED memberId=" + memberId
+                + " — the backed-up snapshot was not read: " + why);
+            return false;
+        }
     }
 
     private Round backUp() {
@@ -169,34 +198,57 @@ final class PeerSeed {
                 contexts.driver(), contexts.archive(), backupContext())) {
             final Round round = await(backup.clusterBackup().context().stateCounter());
             final boolean wanted = round.outcome() == SeedWatch.Outcome.SEEDED && retainedCopy.isPresent();
-            return new Round(round.outcome(), round.lastState(),
-                wanted ? clusterDir.latestServiceSnapshotRecording().map(this::readSnapshot) : Optional.empty());
+            return new Round(round.outcome(), round.lastState(), wanted
+                ? clusterDir.latestServiceSnapshotRecording().map(this::readSnapshot).orElseGet(NoSnapshot::new)
+                : new NoSnapshot());
         }
     }
 
-    /** The payload of the sealer snapshot in {@code recordingId}, replayed from the archive of the backup. */
-    private byte[] readSnapshot(final long recordingId) {
+    /**
+     * The payload of the sealer snapshot in {@code recordingId}, replayed
+     * from the archive of the backup. A replay whose image does not appear
+     * within the message timeout of the archive client, or any error of the
+     * archive, reads as {@link Unread}: the round fails and counts.
+     */
+    private Backup readSnapshot(final long recordingId) {
         try (AeronArchive archive = AeronArchive.connect(contexts.localArchiveClient())) {
             final int sessionId = (int) archive.startReplay(
                 recordingId, 0L, AeronArchive.NULL_LENGTH, REPLAY_CHANNEL, REPLAY_STREAM_ID);
             try (Subscription subscription = archive.context().aeron().addSubscription(
                     ChannelUri.addSessionId(REPLAY_CHANNEL, sessionId), REPLAY_STREAM_ID)) {
-                return SnapshotIo.readServicePayload(awaitImage(subscription, sessionId), YieldingIdleStrategy.INSTANCE);
+                return new ImageWait(subscription, sessionId, archive.context().messageTimeoutNs()).await()
+                    .<Backup>map(image -> new Payload(
+                        SnapshotIo.readServicePayload(image, YieldingIdleStrategy.INSTANCE)))
+                    .orElseGet(() -> new Unread("the replay of recording " + recordingId + " did not connect within "
+                        + archive.context().messageTimeoutNs() + " ns"));
             }
+        } catch (final RuntimeException e) {
+            return new Unread(String.valueOf(e));
         }
     }
 
-    private static Image awaitImage(final Subscription subscription, final int sessionId) {
-        Image image = subscription.imageBySessionId(sessionId);
-        while (image == null) {
-            image = nextImage(subscription, sessionId);
+    /**
+     * The wait for the image of a replay, up to {@code timeoutNs}.
+     *
+     * @param subscription the subscription of the replay
+     * @param sessionId    the session of the replay
+     * @param timeoutNs    the longest wait
+     */
+    record ImageWait(Subscription subscription, int sessionId, long timeoutNs) {
+        /** The image, or empty when it does not appear in time. */
+        Optional<Image> await() {
+            final long deadline = System.nanoTime() + timeoutNs;
+            Image image = subscription.imageBySessionId(sessionId);
+            while (image == null && System.nanoTime() - deadline < 0) {
+                image = next();
+            }
+            return Optional.ofNullable(image);
         }
-        return image;
-    }
 
-    private static Image nextImage(final Subscription subscription, final int sessionId) {
-        Thread.onSpinWait();
-        return subscription.imageBySessionId(sessionId);
+        private Image next() {
+            Thread.onSpinWait();
+            return subscription.imageBySessionId(sessionId);
+        }
     }
 
     private Round await(final AtomicCounter stateCounter) {
@@ -210,7 +262,7 @@ final class PeerSeed {
 
     private static Round sample(final SeedWatch watch, final AtomicCounter stateCounter) {
         final ClusterBackup.State state = ClusterBackup.State.get(stateCounter);
-        return new Round(watch.observe(state, System.currentTimeMillis()), state, Optional.empty());
+        return new Round(watch.observe(state, System.currentTimeMillis()), state, new NoSnapshot());
     }
 
     private ClusterBackup.Context backupContext() {

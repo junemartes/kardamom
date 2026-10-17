@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.aeron.cluster.service.Cluster;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
@@ -237,6 +238,31 @@ class SealerRetentionFloorTest {
         final byte[] after = publisher.offered.get(publisher.offered.size() - 1);
         assertEquals(0L, ByteBuffer.wrap(after).order(ByteOrder.LITTLE_ENDIAN)
             .getLong(RETAINED_BYTES_OFFSET), "nothing is above a posted head at the sealed head");
+    }
+
+    @Test
+    void the_file_store_sends_the_snapshot_notice_with_the_retained_bytes() {
+        System.setProperty("kardamom.cluster.retention", "3");
+        cluster = new StubCluster();
+        // A follower asks for no snapshot, so the stub needs no control toggle.
+        cluster.role = Cluster.Role.FOLLOWER;
+        service = new SealerClusteredService(64, 250, 0)
+            .carryingBytes(new RetainedFile.Config(dir.resolve("g"), SEGMENT_BYTES))
+            .snapshotEvery(new SnapshotSchedule(1));
+        service.start(cluster, Optional.empty());
+        started.add(service);
+        publisher = cluster.addSession(1);
+
+        // Every block is due: the status of each tick carries the notice.
+        block(service, 0, 2);
+        final byte[] status = publisher.offered.stream()
+            .filter(f -> f[0] == SealerWire.EGRESS_KIND_STATUS)
+            .reduce((first, second) -> second)
+            .orElseThrow();
+        assertEquals(STATUS_WITH_BYTES_LEN, status.length);
+        assertEquals(1, status[SNAPSHOT_FLAG_OFFSET], "a snapshot follows");
+        assertTrue(ByteBuffer.wrap(status).order(ByteOrder.LITTLE_ENDIAN).getLong(RETAINED_BYTES_OFFSET) > 0,
+            "the retained bytes follow the flag");
     }
 
     @Test

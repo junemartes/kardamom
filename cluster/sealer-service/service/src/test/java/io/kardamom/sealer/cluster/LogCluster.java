@@ -229,15 +229,13 @@ final class LogCluster implements AutoCloseable {
      */
     void seedOnly(final int memberId, final List<URI> peers) {
         new StateDir(nodeDir(memberId)).clear();
-        new PeerSeed(memberId, ClusterNode.peerConsensusEndpoints(TestCluster.clusterMembers(0, MEMBER_COUNT), memberId),
-                seedContexts(memberId), new PeerSeed.Timing(20_000, 10, 10),
-                Optional.of(new RetainedCopy(peers, new SegmentDir(retainedDir(memberId)), RETAINED_TOKEN, memberId)))
-                .run();
+        new PeerSeed(memberId, peerConsensusEndpoints(memberId), seedContexts(memberId),
+                new PeerSeed.Timing(20_000, 10, 10), Optional.of(retainedCopy(memberId, peers))).run();
     }
 
     /** The production peer seed of a stopped member, with the member's TestCluster directories and endpoints. */
     private PeerSeed peerSeed(final int memberId) {
-        return new PeerSeed(memberId, ClusterNode.peerConsensusEndpoints(TestCluster.clusterMembers(0, MEMBER_COUNT), memberId),
+        return new PeerSeed(memberId, peerConsensusEndpoints(memberId),
                 seedContexts(memberId), PeerSeed.Timing.DEFAULT, retainedCopy(memberId));
     }
 
@@ -270,7 +268,17 @@ final class LogCluster implements AutoCloseable {
                 .filter(id -> id != memberId)
                 .mapToObj(id -> URI.create("http://127.0.0.1:" + admins.get(id).port()))
                 .toList();
-        return admins.isEmpty() ? Optional.empty() : Optional.of(new RetainedCopy(peers, new SegmentDir(retainedDir(memberId)), RETAINED_TOKEN, memberId));
+        return admins.isEmpty() ? Optional.empty() : Optional.of(retainedCopy(memberId, peers));
+    }
+
+    /** The copy of the retained file of {@code memberId} from {@code peers}. */
+    private RetainedCopy retainedCopy(final int memberId, final List<URI> peers) {
+        return new RetainedCopy(peers, new SegmentDir(retainedDir(memberId)), RETAINED_TOKEN, memberId);
+    }
+
+    /** The consensus endpoints of the members other than {@code memberId}. */
+    private static String peerConsensusEndpoints(final int memberId) {
+        return ClusterNode.peerConsensusEndpoints(TestCluster.clusterMembers(0, MEMBER_COUNT), memberId);
     }
 
     private static SealerClusteredService service(final TestNode member) {
