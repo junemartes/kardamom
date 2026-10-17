@@ -573,7 +573,8 @@ Raft.
 | Channel | `aeron:ipc` on the media driver that member `i` and executor `i` share (section 7.6). There is no UDP feed: a member feeds only its co-located executor (decision 7). |
 | Publisher | One exclusive publication on each member, owned by a feeder thread in the member JVM. |
 | Subscriber | The paired executor only. |
-| Frames | The egress frames, unchanged: kind 1 (relayed), kind 2 (boundary), kind 9 (status), and the replay answers 3, 4, 11. The feed adds kind 16 (`FEED_GAP`). One codec for the feed and the egress. |
+| Frames | The egress frames: kind 1 (relayed), kind 2 (boundary), and the replay answers 3, 4, 11. The feed adds kind 16 (`FEED_GAP`). On the feed, the answers carry the request id as a tail (section 7.8). One codec for the feed and the egress. |
+| No status | The feed carries no kind 9. The status is not retained, so it has no place in a replay, and the executor does not read it. The boundary of each tick shows that the feed is alive. |
 
 - The service thread runs on every member, the leader and the followers alike. Each member applies
   the same log, so each member's feed carries the same frames (R3).
@@ -587,10 +588,12 @@ Raft.
   (`SealerEgress.java:420-449`). The write never waits.
 - The feeder thread reads the ring and offers each frame to the publication. A back-pressured
   offer makes the feeder thread wait. The service thread does not wait (R4).
-- **Bound.** `kardamom.cluster.feedRingBytes`, member-local. Proposed default: 64 MiB, which is
-  about 283,000 transfer frames or 8,000 frames of 8 KB.
+- **Bound.** `kardamom.cluster.feedRingBytes`, member-local. Default: 16 MiB, which is about
+  67,000 transfer frames or 2,000 frames of 8 KB. The sealer job has 1 GiB with a 384 MiB heap,
+  and the Aeron tmpfs counts against it, so the ring is a quarter of the first proposal (64 MiB).
+  The feed term (section 7.8) holds more frames beside it.
 - **Ring full.** The service writes a live frame only while the free space holds the frame plus a
-  64-byte reserve. When it does not, the service writes one gap marker into the reserve and marks
+  128-byte reserve. When it does not, the service writes one gap marker into the reserve and marks
   the feed `gapped`:
   - `FEED_GAP`: `[kind=16][next_index:u64][next_block:u64]`, 17 bytes, the first index and block
     that the feed did not carry. Kind 16 is a feed-only kind. The cluster egress never sends it.
@@ -605,7 +608,8 @@ Raft.
 ### 7.3 The catch-up path
 
 - The executor sends a replay request on the feed control stream (1007):
-  `[kind=1][from_index:u64][from_block:u64]`, the layout of ingress kind 1.
+  `[kind=1][from_index:u64][from_block:u64][request_id:u64]`, the layout of ingress kind 1 with
+  the request id as a tail (section 7.8).
 - The feeder thread passes the request to the service thread through a second one-to-one ring.
   The service thread polls it in `doBackgroundWork`. The request is member-local: it is not log
   input, and it changes no replicated state.
@@ -614,7 +618,7 @@ Raft.
   - a cursor below the retained floor: `REPLAY_UNAVAILABLE`;
   - else the retained frames from the cursor, then `REPLAY_DONE`.
 - The service walks the retained frames from the retained file (section 5.5) into the ring, at
-  most 4 MiB in each duty cycle. It does not write live frames during the walk. The file already
+  most 256 KiB in each duty cycle. It does not write live frames during the walk. The file already
   holds them, so the walk reaches the head and the feed turns `live`. A full ring pauses the walk to the next duty cycle.
   It does not gap the feed.
 - The retained frames are the catch-up source. The Raft log is not: the log holds the inputs
@@ -686,6 +690,7 @@ driver: the member boots its own `ClusteredMediaDriver` on a private
 | Executor node | The aeron system job sets `AERON_DIR=/opt/kardamom/pair-aeron/dir` on a paired node. The executor and every other service on the node use it, as they use `aeron-mount/dir` today. |
 | Sealer node | The cluster job binds `/opt/kardamom/pair-aeron` and passes `-Dkardamom.cluster.feedAeronDir=/opt/kardamom/pair-aeron/dir`. The member's own `ClusteredMediaDriver` stays on its private `cluster-dir`. Raft never uses the shared driver. |
 | Feed client | The feeder thread opens its own Aeron client on `feedAeronDir`. Its error handler closes only that client. It never ends the member JVM. |
+| Memory | The feed log lives in the shared driver. Its channel is `sparse=false`, so the driver writes every page of the 3 terms when it creates the log (Aeron 1.44 `MappedRawLog`), and the kernel charges the pages to the cgroup of the driver: the aeron system job on the executor node, not the sealer. The control log is the executor's publication, in the same driver. The sealer pays only for the two rings, off its heap (section 10.5). |
 | Liveness | Aeron clients find the driver through the CnC file and its heartbeat, not through a process id. Two containers on one kernel that map the same tmpfs file see one driver. |
 | Unpaired node | A node without a pair keeps `aeron-mount/dir`. `feedAeronDir` empty means the member opens no feed. |
 
@@ -718,6 +723,125 @@ driver: the member boots its own `ClusteredMediaDriver` on a private
 - An elastic executor, or an executor whose index has no member, reads the serving service
   (section 8.1). It costs the leader nothing.
 - A paired executor whose member is down also reads the serving service (section 7.5).
+
+### 7.8 The feed wire layout
+
+This section is the contract between the member (the feeder) and the reader of the executor.
+All integers are little-endian. Offsets are in bytes from the start of the frame.
+
+**The feed stream (1006, member to executor).**
+
+- Channel: `aeron:ipc` on `feedAeronDir`, stream 1006. The member owns one exclusive
+  publication with `term-length=8m|sparse=false`. One Aeron message is one frame. The largest
+  frame is below 1 MiB, the term divided by 8, so the reader polls through a fragment assembler.
+- The frames are egress frames, with one codec (`EgressFrames`):
+
+| Kind | Name | Layout (offset: field) | Length |
+|---|---|---|---|
+| 1 | Relayed record | 0: `kind=1`; 1: `index:u64`; 9: `payload_len:u32`; 13: `payload` | 13 + `payload_len` |
+| 2 | Boundary | 0: `kind=2`; 1: `block_number:u64`; 9: `end_tx_idx:u64`; 17: `l2_timestamp:u64`; 25: `l1_origin:u64` | 33 |
+| 3 | `REPLAY_UNAVAILABLE` | 0: `kind=3`; 1: `oldest_index:u64`; 9: `oldest_block:u64`; 17: `request_id:u64` | 25 |
+| 4 | `REPLAY_DONE` | 0: `kind=4`; 1: `up_to_index:u64`; 9: `up_to_block:u64`; 17: `request_id:u64` | 25 |
+| 11 | `REPLAY_AHEAD` | 0: `kind=11`; 1: `head_index:u64`; 9: `head_block:u64`; 17: `request_id:u64` | 25 |
+| 16 | `FEED_GAP` | 0: `kind=16`; 1: `next_index:u64`; 9: `next_block:u64`; 17: `request_id:u64` | 25 |
+
+- Kinds 1 and 2 are the retained frames. Their bytes are equal on every member (R3), and equal
+  to the bytes of the cluster egress.
+- Kinds 3, 4 and 11 on the feed are the egress frames with the tail `request_id`. The egress
+  reader (`EgressItem::decode`) reads the fields that it knows and ignores the tail, so one codec
+  reads both. The cluster egress sends these kinds without the tail.
+- The feed carries no other kind: no status (kind 9, section 7.1), no reject, no kind 15. A
+  reader drops a kind that it does not know.
+
+**The control stream (1007, executor to member).**
+
+- Channel: `aeron:ipc` on the same driver, stream 1007. The executor owns the publication. A
+  64 KiB term is enough. The member subscribes.
+- One message, the replay request: 0: `kind=1`; 1: `from_index:u64`; 9: `from_block:u64`;
+  17: `request_id:u64`. Length 25. It is the layout of ingress kind 1 with the id as a tail.
+- The member reads the first 25 bytes and ignores a longer tail. It drops a message that is
+  shorter, or of another kind, and logs `sealer FEED ... DROPPED`.
+- The reader picks the ids. Each new request gets a new id. The member does not check the order
+  of the ids: it answers the newest request that it read.
+
+**The answer rules.**
+
+1. The member answers each request that it reads, also a request that comes before the feed has
+   a subscriber, for example while the image of the reader appears. The frames of the answer wait
+   in the ring until the subscriber connects. The ring bounds that wait: a full ring pauses the
+   walk.
+2. The newest request wins. A request ends the answer to every earlier request at once. The
+   member discards each frame of an earlier answer that it did not yet publish.
+3. Each answer frame (kinds 3, 4, 11, 16) carries the id of its request. The reader drops an
+   answer frame with an id other than the id of its newest request.
+4. Frames of an earlier answer that the member already published can still arrive after a new
+   request, before the first frame of the new answer. They are retained frames of the same
+   stream: the reader drops each one below its cursor, and applies the next one at its cursor.
+5. The reader resends its request, with a new id, when no frame arrives within 2 s of the
+   request. A first request can reach a member whose feeder has no client yet, or whose
+   subscription is not yet connected.
+
+**The states of a feed.**
+
+| State | The member writes | It leaves the state |
+|---|---|---|
+| `idle` | nothing | on a replay request |
+| `walking` | the answer: the retained frames from the cursor, from the retained file | at the head, after `REPLAY_DONE`: `live` |
+| `live` | each new retained frame, when the service retains it | when a frame does not fit the ring: `gapped`; on a replay request |
+| `gapped` | nothing | on a replay request |
+
+- A feed starts `idle`. It turns `idle` again when the publication loses its subscriber, and
+  after a `REPLAY_AHEAD` or a `REPLAY_UNAVAILABLE`.
+- **The answer to a request.** The checks and their order are those of egress kind 1:
+  1. A cursor past the head: `REPLAY_AHEAD` with the head. The feed turns `idle`.
+  2. A cursor that does not name one point of the stream, or a cursor below the retained floor:
+     `REPLAY_UNAVAILABLE` with the floors. The feed turns `idle`.
+  3. Else each retained frame with `index >= from_index` (kind 1) or
+     `block_number >= from_block` (kind 2), in emission order, then `REPLAY_DONE`, then the
+     live frames. `up_to` is the head when the walk reaches it: the canonical count and the open
+     block. No live frame comes before `REPLAY_DONE`.
+- **`FEED_GAP`.** The member writes it once, as the last frame of the answer, when a live frame
+  does not fit the ring. It also writes it when the retained floor passes the walk. The feed is
+  then `gapped`.
+  - `(next_index, next_block)` is the cursor after the last frame that the answer carried:
+    - after a boundary: `next_index` is its `end_tx_idx`, and `next_block` is its
+      `block_number + 1`;
+    - after a relayed frame: `next_index` is its `index + 1`, and `next_block` stays;
+    - when the answer carried no frame: `(from_index, from_block)` of the request.
+  - A replay request from `(next_index, next_block)` is valid, and it carries every frame that
+    the feed did not carry. `next_index` is a lower bound: after an origin record, the next
+    relayed index can be higher (see the index rule below).
+  - The reader sends a request from its own cursor at once. It does not wait for the silence
+    of section 7.5.
+- **No subscriber.** The member discards the unsent frames and turns `idle`. The reader sends a
+  replay request at the start of each connection.
+
+**The index is not always contiguous.** A relayed frame takes the slots of its record, and the
+frame does not state the count. The reader computes it from the payload:
+
+| Record type | Slots |
+|---|---|
+| 2, epoch | `epoch_slots`: 1 for the marker, plus 1 for each deposit (`crates/cluster-adapter/src/wire/mod.rs`) |
+| 3, remote epoch | `remote_epoch_slots`: `2 + last_seq - first_seq` |
+| any other | 1 |
+
+- The next index after a relayed frame is its `index` plus its slots. A relayed frame whose
+  index is not that next index is a hole. A jump of more than one after an origin record is not
+  a hole.
+- A boundary closes the block: its `end_tx_idx` equals the next index, and its `block_number`
+  is one above the block of the boundary before it. A boundary that breaks either rule is a hole.
+- On a hole the reader does not apply the frame. It sends a replay request from its cursor.
+
+**Bounds of the member.**
+
+| Item | Value |
+|---|---|
+| Ring | `kardamom.cluster.feedRingBytes`, default 16 MiB, a power of two of at least 8 MiB. Off the heap, in the sealer JVM. |
+| Reserve | 128 bytes of the ring, for the one `FEED_GAP`: its record is 40 bytes. A write that wraps takes a padding record of up to 32 bytes at the end of the ring, and the record plus 8 bytes (48) at its start: 80 bytes at most. A frame goes in only while the free space holds the frame twice (for the padding at the end of the ring) plus the reserve. |
+| Walk | At most 256 KiB of frames (about 1,000 transfer frames) in each duty cycle of the service. The service also runs the walk inside the idle loops of a snapshot write and a timer re-arm, so a step stays short. A full ring pauses the walk; it does not gap the feed. |
+| Feed term | 8 MiB, 3 terms: 24 MiB in the shared driver. The largest frame is below one session message (1 MiB). |
+| Control ring | 64 KiB, off the heap. |
+| Client retry | 1 s, while `feedAeronDir` has no driver. |
 
 ## 8. The consumers
 
@@ -963,6 +1087,25 @@ See section 5.5:
 
 - The feed is IPC only, so it costs no network. Its cost is the copy into the ring
   (section 10.3) and the read of the retained file during a replay.
+- Memory, for each pair:
+
+| Item | Size | Paid by |
+|---|---|---|
+| Frame ring | 16 MiB, off the heap | the sealer job (1,024 MB, 384 MB heap) |
+| Control ring | 64 KiB, off the heap | the sealer job |
+| Feeder client | the conductor thread and its buffers, below 1 MiB; the CnC file belongs to the driver | the sealer job |
+| Feed log | 3 terms of 8 MiB, plus 4 KiB of metadata: 24 MiB | the aeron system job of the executor node (768 MB, 160 MB heap), because the log is not sparse |
+| Control log | 3 terms of 64 KiB: 192 KiB | the aeron system job of the executor node |
+
+- The sealer budget under load is about 734 MB of the 1,024 MB: the heap and the session logs on
+  the member's own tmpfs at a failover (`cluster/sealer-service/README.md`, the term table). The
+  feed adds about 17 MB to it. That leaves about 270 MB for the JVM outside its heap
+  (metaspace, code cache, thread stacks, the GC). The first proposal of a 64 MiB ring left
+  about 220 MB.
+- The aeron job of an executor node holds its 160 MB heap, the 12 MiB `exec_txs` log and the
+  logs of the node's clients. The feed adds 24 MiB. The executor-node tmpfs is 2 GB
+  (`aeron_tmpfs_size`). On staging the pair tmpfs of section 7.6 replaces it on a paired node;
+  PR 13 sizes it with the same 24 MiB.
 
 ### 10.6 The benchmark
 

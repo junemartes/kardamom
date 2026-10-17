@@ -393,6 +393,8 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.recordLagBudget` | `0` (env `KARDAMOM_RECORD_LAG_BUDGET`) | yes | The record-lag budget in canonical records. `0` turns the guard off. The property wins over the env var. An empty value gives the default. A value that is not a number, or is negative, stops the start. In this release a value above `0` also stops the start, because the snapshot writer writes version 10. |
 | `kardamom.cluster.retention` | `65536` | recommended | The minimum number of egress frames kept for replay. |
 | `kardamom.cluster.carryBytes` | `false` | yes | `true` keeps the retained frames in an append-only file, not on the heap, and writes snapshot version 12. It also relays a full entry as a canonical entry, and drops the void request and the recorded cursor. The release gate refuses a rolling change of it. It needs `adminPort`, the env var `KARDAMOM_RETAINED_TOKEN` and a `snapshotIntervalS` above `0`. Any value other than `true`, `false` or empty stops the start. See [Retained file](#retained-file). |
+| `kardamom.cluster.feedAeronDir` | empty (off) | no | The directory of the media driver that the member shares with its paired executor. A value turns the member feed on. It needs `carryBytes=true`; without it the start stops. See [Member feed](#member-feed). |
+| `kardamom.cluster.feedRingBytes` | `16777216` (16 MiB) | no | The frame ring of the member feed, off the heap. A power of two of at least 8 MiB; another value stops the start. |
 | env `KARDAMOM_RETAINED_TOKEN` | none | yes, with `carryBytes` | The shared token that a request for the retained file must carry. The member reads it only from the env var, because `ps` shows the system properties. A log line never prints it. |
 | `kardamom.cluster.retainedSegmentBytes` | `67108864` (64 MiB) | recommended | The size of a new segment of the retained file. The smallest value is 1 MiB, one session message. A smaller value stops the start. |
 | `kardamom.cluster.adminPort` | `0` (off) | no | The admin server port. |
@@ -470,6 +472,20 @@ With `carryBytes=true`, the member keeps its retained frames in an append-only f
 - A member that starts with no snapshot deletes every segment. The log replay writes the file again from position 0.
 - Any I/O error on the file stops the member with `sealer RETAINED-FILE FATAL`. A full disk fails the preallocation of the helper thread. The member stops at the next boundary tick, or at the next segment change. A file error never changes the replicated state or the egress.
 - The admin endpoint serves the segments to a member that a peer seeds, only below the head that the member published at its last boundary tick, snapshot or restore. See [Admin server](#admin-server).
+
+### Member feed
+
+With `feedAeronDir`, each member sends its retained frames to its paired executor over IPC, on the media driver of the executor node. The leader and the followers send the same frames. The wire layout, the answer rules and the states are in section 7.8 of `docs/specs/2026-10-10-raft-carried-transactions.md`.
+
+- Stream 1006 carries the feed, member to executor. Stream 1007 carries the replay requests, executor to member.
+- The feed frames are kinds 1 and 2, the answers 3, 4 and 11, and kind 16 (`FEED_GAP`). Each answer carries the id of its request as an 8-byte tail. The feed carries no status.
+- The service thread writes each retained frame into a ring off the heap. It never waits for the feed. The feeder thread (`sealer-feeder-<id>`) offers the frames to the publication. Only the feeder waits on a back-pressured offer.
+- A replay request goes from the feeder to the service through a second ring. The service checks the cursor as for egress kind 1, walks the retained file from it (at most 256 KiB in each duty cycle), sends `REPLAY_DONE`, and then sends each new frame. The walk does not depend on log traffic: the service runs it in `doBackgroundWork`.
+- A live frame that does not fit the ring ends the answer with `FEED_GAP`. The member then writes nothing until the next request. A full ring during a walk only pauses the walk.
+- A lost subscriber ends the answer. The feeder drops the unsent frames.
+- The feeder has its own Aeron client. When the driver goes, the client closes, and the feeder opens a new one every 1 s. A feed error never stops the member and never changes the replicated state.
+- The feed log is not sparse, so the driver of the executor node pays for its 24 MiB. The member pays for its 16 MiB ring.
+- Log lines: `sealer FEED START`, `OPEN`, `NO-DRIVER`, `CONNECTED`, `DISCONNECTED`, `CLOSED`, `DROPPED`, and for each request `REPLAY`, `LIVE`, `GAPPED` and `IDLE`.
 
 ### Recover a member that stops on its retained file
 

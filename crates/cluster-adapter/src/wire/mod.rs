@@ -66,7 +66,7 @@ pub use egress::{
 };
 pub use entry::{CanonicalTx, RelayedRef};
 #[cfg(any(test, feature = "testing"))]
-pub use entry::{TxOffer, encode_feed_gap};
+pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
@@ -325,11 +325,19 @@ pub const EGRESS_KIND_RELAYED_REF: u8 = 15;
 pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
 
 /// Egress kind, on the member feed only: the feed dropped frames because
-/// its ring was full: `[kind:u8 = 16][next_index:u64][next_block:u64]`.
-/// `next_index` and `next_block` are the first record index and the first
-/// block that the feed did not carry. The reader asks for a replay from its
-/// cursor. The cluster egress never sends it. No frame uses kind 14.
-/// Matches Java `EGRESS_KIND_FEED_GAP`.
+/// its ring was full:
+/// `[kind:u8 = 16][next_index:u64][next_block:u64][request_id:u64]`.
+/// `(next_index, next_block)` is the cursor after the last frame that the
+/// answer carried: after a boundary, its `end_tx_idx` and its block plus
+/// one; after a relayed frame, its index plus one. A replay from it carries
+/// every frame that the feed did not carry. `request_id` is the id of the request that the gap
+/// ends. The reader asks for a replay from its cursor. The cluster egress
+/// never sends it. No frame uses kind 14. Matches Java
+/// `EGRESS_KIND_FEED_GAP`.
+///
+/// On the member feed, kinds 3, 4 and 11 carry the same 8-byte tail
+/// `[request_id:u64]` at offset 17. [`EgressItem::decode`] reads the fields
+/// that it knows and ignores the tail.
 pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
 /// Egress kind: the sealer's rules:

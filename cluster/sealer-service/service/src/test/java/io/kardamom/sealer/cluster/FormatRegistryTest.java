@@ -98,6 +98,12 @@ final class FormatRegistryTest {
     }
 
     @Test
+    void feedControlIsFrozenAtVersionOne() {
+        assertExact("sealer-feed-control", 1);
+        assertEquals(Byte.BYTES + 3 * Long.BYTES, SealerWire.FEED_REQUEST_LEN);
+    }
+
+    @Test
     void seedVersionMatchesTheRegistry() {
         assertExact("sealer-seed", staticInt(SealerSeed.class, "VERSION"));
     }

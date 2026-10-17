@@ -73,12 +73,18 @@ code = [
 # relayed reference) and kind 16 (the feed gap, on the member feed only).
 # With kardamom.cluster.carryBytes=true, the sealer sends kind 15 to each
 # egress session in place of the kind-1 frame of a canonical entry. It
-# never sends kind 16 on the egress. No frame uses kind 14: a reader drops
-# it as unknown. Kind 255 is local to the Rust client: the session thread
-# puts it on the consumer channel when a session opens. It is never on the
-# wire. The sealer sends kind 17 (its rules: the decision version) to each
-# session when the session opens. An older reader drops kind 17 as an
-# unknown kind, and the sequencer of the base release does not ask for it.
+# sends kind 16 only on the member feed, which is off unless
+# kardamom.cluster.feedAeronDir is set. No frame uses kind 14: a reader
+# drops it as unknown. Kind 255 is local to the Rust client: the session
+# thread puts it on the consumer channel when a session opens. It is never
+# on the wire. The sealer sends kind 17 (its rules: the decision version)
+# to each session when the session opens. An older reader drops kind 17 as
+# an unknown kind, and the sequencer of the base release does not ask for
+# it.
+#
+# On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
+# the 17 bytes of the egress layout, then the request id. A reader reads
+# the fields that it knows and ignores the tail.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76
@@ -120,6 +126,24 @@ code = [
     "crates/cluster-adapter/src/wire/mod.rs#RT_TX",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/VoidLedger.java#RT_VOID",
     "cluster/sealer-service/core/src/main/java/io/kardamom/sealer/TxOffer.java#RT_TX",
+]
+
+# Frozen layout. The replay request on the member feed control stream
+# (IPC stream 1007): [kind=1][from_index:u64][from_block:u64][request_id:u64],
+# 25 bytes, little-endian. The executor writes it, and the sealer member
+# reads it. The member reads the first 25 bytes and ignores a longer tail,
+# so a later field goes at the tail. It drops a shorter message or another
+# kind with the log line `sealer FEED ... DROPPED`, and the executor resends
+# after 2 s. The golden frame `feed_request` holds the bytes.
+[format.sealer-feed-control]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = [
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#FEED_REQUEST_LEN",
+    "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/FeedRequest.java#record FeedRequest",
+    "crates/cluster-adapter/testdata/wire_golden.txt#feed_request",
 ]
 
 # The seed file that kardamom-reconstruct writes and an empty sealer
