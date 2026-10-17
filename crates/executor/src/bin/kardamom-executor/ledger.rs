@@ -9,9 +9,14 @@
 //! committed block (`PublishedTail`). A difference makes them void.
 //!
 //! - The file is a ring of fixed slots, one for each canonical index
-//!   modulo [`SLOTS`]. A slot is 48 bytes: the canonical index and the
-//!   block, as little-endian `u64`, then the transaction hash. Block 0
-//!   marks an empty slot: genesis has no receipt.
+//!   modulo [`SLOTS`]. A slot is 64 bytes: the canonical index and the
+//!   block, as little-endian `u64`, the transaction hash, and 16 zero
+//!   bytes. Block 0 marks an empty slot: genesis has no receipt.
+//! - A slot starts at a multiple of 64 bytes, so it never crosses a page.
+//!   A kill of the process during a write leaves each slot old or new,
+//!   never torn.
+//! - The open allocates the whole file, so a write into it does not need
+//!   a new block of the disk.
 //! - A write goes to the page cache with no disk sync, so it survives a
 //!   crash or a kill of the process. The process syncs the file at the end
 //!   of a run. The running marker tells the next start whether a restart
@@ -19,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
@@ -33,9 +39,12 @@ use crate::marker::Markers;
 /// the state writer commits a block a few blocks after its receipts.
 const SLOTS: u64 = 1 << 16;
 /// The bytes of one slot.
-const SLOT_LEN: usize = 48;
+const SLOT_LEN: usize = 64;
 /// The bytes of the ledger file.
 const LEDGER_BYTES: u64 = SLOTS * SLOT_LEN as u64;
+/// The most empty slots that one write fills between two receipts. A
+/// larger gap starts a new write.
+const MAX_GAP: u64 = 64;
 
 /// One receipt in the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,20 +73,69 @@ impl Slot {
         let mut bytes = [0u8; SLOT_LEN];
         bytes[..8].copy_from_slice(&self.index.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.block.to_le_bytes());
-        bytes[16..].copy_from_slice(self.hash.as_slice());
+        bytes[16..48].copy_from_slice(self.hash.as_slice());
         bytes
     }
 
     /// The receipt in one slot. `None` for an empty slot.
     fn decode(bytes: &[u8; SLOT_LEN]) -> Option<Self> {
         let (index, rest) = bytes.split_first_chunk::<8>()?;
-        let (block, hash) = rest.split_first_chunk::<8>()?;
+        let (block, rest) = rest.split_first_chunk::<8>()?;
+        let (hash, _) = rest.split_first_chunk::<32>()?;
         let slot = Self {
             index: u64::from_le_bytes(*index),
             block: u64::from_le_bytes(*block),
-            hash: B256::try_from(hash).ok()?,
+            hash: B256::from(*hash),
         };
         (slot.block != 0).then_some(slot)
+    }
+}
+
+/// One write of the ledger: the slots from `first` to `last`, with empty
+/// slots in the gaps between two receipts.
+struct Run {
+    first: u64,
+    last: u64,
+    bytes: Vec<u8>,
+}
+
+impl Run {
+    fn new(slot: Slot) -> Self {
+        Self {
+            first: slot.index,
+            last: slot.index,
+            bytes: slot.encode().to_vec(),
+        }
+    }
+
+    /// Add `slot` to the run, when it follows the last slot with at most
+    /// [`MAX_GAP`] empty slots between, in the same lap of the ring.
+    /// Returns the slot that does not fit.
+    fn take(&mut self, slot: Slot) -> Option<Slot> {
+        let gap = slot
+            .index
+            .checked_sub(self.last)
+            .filter(|step| (1..=MAX_GAP + 1).contains(step))
+            .filter(|_| slot.index / SLOTS == self.first / SLOTS)
+            .and_then(|step| usize::try_from(step - 1).ok());
+        let Some(gap) = gap else {
+            return Some(slot);
+        };
+        self.bytes.resize(self.bytes.len() + gap * SLOT_LEN, 0);
+        self.bytes.extend_from_slice(&slot.encode());
+        self.last = slot.index;
+        None
+    }
+
+    /// The writes of `slots`, in their order.
+    fn split(slots: impl Iterator<Item = Slot>) -> Vec<Self> {
+        slots.fold(Vec::new(), |mut runs, slot| {
+            let rest = runs
+                .last_mut()
+                .map_or(Some(slot), |run: &mut Self| run.take(slot));
+            runs.extend(rest.map(Self::new));
+            runs
+        })
     }
 }
 
@@ -90,12 +148,13 @@ pub(crate) struct ReceiptLedger {
 }
 
 impl ReceiptLedger {
-    /// Open the ledger, and create it when it does not exist.
+    /// Open the ledger, create it when it does not exist, and allocate all
+    /// its blocks on the disk.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the file does not open or does not take its
-    /// length.
+    /// Returns `Err` when the file does not open, or the disk has no room
+    /// for it.
     pub(crate) fn open(markers: Markers) -> Result<Self> {
         let path = markers.ledger_path();
         let file = File::options()
@@ -105,26 +164,32 @@ impl ReceiptLedger {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        file.set_len(LEDGER_BYTES)
-            .context("size the receipt ledger")?;
+        let len = libc::off_t::try_from(LEDGER_BYTES)?;
+        // SAFETY: `posix_fallocate` reads only the descriptor and the two
+        // integers. The descriptor stays open for the call: `file` owns it.
+        let errno = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
+        if errno != 0 {
+            return Err(std::io::Error::from_raw_os_error(errno))
+                .with_context(|| format!("allocate {}", path.display()));
+        }
         Ok(Self {
             file: Arc::new(file),
             markers,
         })
     }
 
-    /// Write the receipts of one batch, before their publish. A write that
-    /// fails stops the publish: a published receipt must be in the ledger.
+    /// Write the receipts of one batch, before their publish: one write for
+    /// each run of slots. A batch in index order is one write, plus one at
+    /// the end of the ring, plus one for each gap of more than [`MAX_GAP`]
+    /// slots with no receipt.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a write fails.
     pub(crate) fn record(&self, items: &[ReceiptRows]) -> std::io::Result<()> {
-        items.iter().try_for_each(|item| {
-            let slot = Slot::of(&item.receipt);
-            self.file
-                .write_all_at(&slot.encode(), Slot::offset(slot.index))
-        })
+        Run::split(items.iter().map(|item| Slot::of(&item.receipt)))
+            .iter()
+            .try_for_each(|run| self.file.write_all_at(&run.bytes, Slot::offset(run.first)))
     }
 
     /// Every receipt in the ledger.
@@ -175,6 +240,8 @@ impl ReceiptLedger {
 
     /// Remove the receipts of `from_block` and above, with a disk sync: a
     /// rollback record voids them, and the next run publishes them again.
+    /// After an unknown tail, `from_block` is the first block above the
+    /// committed block, so every receipt above the cursor goes.
     ///
     /// # Errors
     ///
@@ -188,6 +255,24 @@ impl ReceiptLedger {
                     .write_all_at(&[0u8; SLOT_LEN], Slot::offset(slot.index))
             })
             .context("void the receipt ledger")?;
+        self.sync()
+    }
+
+    /// Remove every receipt, with a disk sync. A restore to an older state
+    /// lowers the cursor, so the receipts of the diverged state could
+    /// otherwise span more than the ring above it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the write or the sync fails.
+    pub(crate) fn clear(&self) -> Result<()> {
+        self.file
+            .write_all_at(&vec![0u8; usize::try_from(LEDGER_BYTES)?], 0)
+            .context("clear the receipt ledger")?;
+        self.sync()
+    }
+
+    fn sync(&self) -> Result<()> {
         self.file.sync_data().context("sync the receipt ledger")
     }
 
@@ -198,7 +283,7 @@ impl ReceiptLedger {
     ///
     /// Returns `Err` when the sync or the removal fails.
     pub(crate) fn end_run(&self) -> Result<()> {
-        self.file.sync_data().context("sync the receipt ledger")?;
+        self.sync()?;
         self.markers.end_run()
     }
 

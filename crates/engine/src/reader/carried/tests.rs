@@ -174,7 +174,7 @@ pub(super) fn unavailable(id: u64, index: u64, block: u64) -> Vec<u8> {
 
 /// The relayed frame of an epoch with `deposits` deposits at `index`. The
 /// epoch takes one slot for its marker and one for each deposit.
-fn epoch_at(index: u64, deposits: usize) -> Vec<u8> {
+pub(super) fn epoch_at(index: u64, deposits: usize) -> Vec<u8> {
     let epoch = EpochRecord {
         l1_number: 7,
         l1_hash: alloy_primitives::B256::repeat_byte(7),

@@ -20,6 +20,14 @@ pub enum ExecutorError {
     #[error("proven divergence: {0}")]
     Divergence(String),
 
+    /// A write to a local file that a published output depends on failed,
+    /// for example the receipt ledger of an executor. This error is fatal
+    /// and not retryable: a full or broken disk does not heal by a retry.
+    /// The commit thread's must-deliver retry must not retry it, so the run
+    /// ends and the process exits.
+    #[error("local write failed: {0}")]
+    LocalWrite(String),
+
     #[error("revm execution failure at tx {idx:?}: {detail}")]
     Execution { idx: TxIndex, detail: String },
 

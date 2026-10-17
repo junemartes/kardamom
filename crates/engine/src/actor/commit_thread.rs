@@ -80,7 +80,10 @@ impl MustDeliver {
         listed: bool,
         msg: &'static str,
     ) -> Result<Step, ExecutorError> {
-        if matches!(e, ExecutorError::Divergence(_)) {
+        if matches!(
+            e,
+            ExecutorError::Divergence(_) | ExecutorError::LocalWrite(_)
+        ) {
             return Err(e);
         }
         // A wrap back toward 0 would only re-fire the "attempt 1" log line

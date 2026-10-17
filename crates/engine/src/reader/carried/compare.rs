@@ -66,14 +66,15 @@ impl Default for PublishedTail {
 }
 
 impl PublishedTail {
-    /// Whether the transaction `hash` at `index` of `block` in the stream
-    /// differs from the receipt published at `index`. An index with no
+    /// Whether the slot `index` of `block` in the stream differs from the
+    /// receipt published at `index`. `hash` is the transaction hash of the
+    /// slot, or `None` for a slot with no receipt. An index with no
     /// published receipt does not differ.
-    fn differs_at(&self, index: u64, block: u64, hash: B256) -> bool {
+    fn differs_at(&self, index: u64, block: u64, hash: Option<B256>) -> bool {
         match self {
             Self::Known(published) => published
                 .get(&index)
-                .is_some_and(|receipt| *receipt != (block, hash)),
+                .is_some_and(|(at, receipt)| (*at, Some(*receipt)) != (block, hash)),
             Self::Unknown => true,
         }
     }
@@ -420,12 +421,7 @@ impl Compare {
         let Some((pos, item)) = self.reorder.try_deliver()? else {
             return Ok(Some(Progress::Pending));
         };
-        // Epochs and deposits have no hash to compare here: the L1 origin
-        // of the header covers them.
-        let Some(own) = Self::fingerprint(&item) else {
-            return Ok(None);
-        };
-        let head = *self.head.get_or_insert(own);
+        let head = *self.head.get_or_insert(Self::fingerprint(&item));
         if item.is_boundary() {
             self.head = None;
         }
@@ -446,11 +442,12 @@ impl Compare {
         Ok(Some(progress))
     }
 
-    /// The fingerprint of an entry or a boundary: the canonical id of the
-    /// entry, or the hash of the fields of the boundary.
-    fn fingerprint(item: &Ordered) -> Option<B256> {
+    /// The fingerprint of a frame: the canonical id of an entry, an epoch
+    /// or a reference, the hash of a void, or the hash of the fields of a
+    /// boundary.
+    fn fingerprint(item: &Ordered) -> B256 {
         match item {
-            Ordered::Tx(tx) => Some(tx.canonical_id),
+            Ordered::Tx(tx) => tx.canonical_id,
             Ordered::Message(TxOrderingMessage::BoundaryStart(b)) => {
                 let fields = [
                     b.block_number,
@@ -458,34 +455,76 @@ impl Compare {
                     b.l2_timestamp,
                     b.l1_origin,
                 ];
-                Some(keccak256(fields.map(u64::to_be_bytes).concat()))
+                keccak256(fields.map(u64::to_be_bytes).concat())
             }
-            Ordered::Message(_) => None,
+            Ordered::Message(TxOrderingMessage::Epoch(e)) => e.canonical_id(),
+            Ordered::Message(TxOrderingMessage::RemoteEpoch(r)) => r.canonical_id(),
+            Ordered::Message(TxOrderingMessage::TxRef(r)) => r.tx_hash,
+            Ordered::Message(TxOrderingMessage::DepositRef(r)) => r.source_hash,
+            Ordered::Message(TxOrderingMessage::Void(v)) => v.tx_hash,
         }
     }
 
-    /// The block and the index of a difference at one entry or boundary,
-    /// if any.
+    /// The receipt of each slot of a frame at `pos`: the transaction hash,
+    /// or `None` for a slot with no receipt. An epoch has the marker and
+    /// then one slot for each deposit or message, whose receipt has its
+    /// source hash. A void has a slot with no receipt. A boundary has no
+    /// slot.
+    fn slots(pos: BPosition, item: &Ordered) -> Vec<(u64, Option<B256>)> {
+        let index = pos.as_index();
+        let marked =
+            |hashes: Vec<B256>| {
+                std::iter::once((index, None))
+                    .chain((1..).zip(hashes).filter_map(|(k, hash)| {
+                        index.checked_add(k).map(|slot| (slot, Some(hash)))
+                    }))
+                    .collect()
+            };
+        match item {
+            Ordered::Tx(tx) => vec![(index, Some(tx.canonical_id))],
+            Ordered::Message(TxOrderingMessage::Epoch(e)) => {
+                marked(e.deposits.iter().map(|d| d.source_hash).collect())
+            }
+            Ordered::Message(TxOrderingMessage::RemoteEpoch(r)) => {
+                marked(r.messages.into_iter().map(|m| m.source_hash).collect())
+            }
+            Ordered::Message(TxOrderingMessage::TxRef(r)) => vec![(index, Some(r.tx_hash))],
+            Ordered::Message(TxOrderingMessage::DepositRef(r)) => {
+                vec![(index, Some(r.source_hash))]
+            }
+            Ordered::Message(TxOrderingMessage::Void(_)) => vec![(index, None)],
+            Ordered::Message(TxOrderingMessage::BoundaryStart(_)) => Vec::new(),
+        }
+    }
+
+    /// Whether the slot `index` of `block` in the stream, with the receipt
+    /// `hash`, differs from this history. Below the cursor, a committed
+    /// receipt at the index must have the same hash; above it, see
+    /// [`PublishedTail::differs_at`]. An index with no receipt on this side
+    /// does not differ: a skipped transaction has no receipt.
+    fn differs(&self, index: u64, block: u64, hash: Option<B256>) -> bool {
+        if index < self.history.cursor.0 {
+            return self
+                .history
+                .receipts
+                .get(&index)
+                .is_some_and(|local| Some(*local) != hash);
+        }
+        self.history.tail.differs_at(index, block, hash)
+    }
+
+    /// The block and the index of a difference at one frame, if any.
     ///
-    /// - Below the cursor, an entry compares its hash with the committed
-    ///   receipt at its index, and a boundary compares itself with the
-    ///   committed header of its block.
-    /// - Above the cursor, an entry compares its block and its hash with
-    ///   the published receipt at its index, and a boundary must not seal
-    ///   its block before a published receipt of that block.
+    /// - Each slot of the frame compares its receipt with the history. A
+    ///   slot with no receipt in the stream, such as the marker of an
+    ///   epoch, differs from a receipt at its index.
+    /// - Below the cursor, a boundary compares itself with the committed
+    ///   header of its block. Above it, a boundary must not seal its block
+    ///   before a published receipt of that block.
     fn check(&self, pos: BPosition, item: &Ordered) -> Option<(u64, u64)> {
-        let (index, block) = (pos.as_index(), self.reorder.next().1);
+        let block = self.reorder.next().1;
         let cursor = self.history.cursor;
         match item {
-            Ordered::Tx(tx) if index < cursor.0 => {
-                let local = self.history.receipts.get(&index)?;
-                (*local != tx.canonical_id).then_some((block, index))
-            }
-            Ordered::Tx(tx) => self
-                .history
-                .tail
-                .differs_at(index, block, tx.canonical_id)
-                .then_some((block, index)),
             Ordered::Message(TxOrderingMessage::BoundaryStart(b)) if b.block_number < cursor.1 => {
                 (self.history.headers.get(&b.block_number) != Some(b))
                     .then_some((b.block_number, b.end_tx_idx.as_index()))
@@ -495,7 +534,10 @@ impl Compare {
                 .tail
                 .cut_by(b)
                 .then_some((b.block_number, b.end_tx_idx.as_index())),
-            Ordered::Message(_) => None,
+            _ => Self::slots(pos, item)
+                .into_iter()
+                .find(|(index, hash)| self.differs(*index, block, *hash))
+                .map(|(index, _)| (block, index)),
         }
     }
 }

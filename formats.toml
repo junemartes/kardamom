@@ -311,10 +311,10 @@ code = ["crates/executor/src/bin/kardamom-executor/marker.rs#struct Markers"]
 RollbackMarker = "7 0x0707070707070707070707070707070707070707070707070707070707070707\n"
 
 # Frozen layout. The receipt ledger of an executor (marker-receipts in the
-# state directory): a ring of 65536 slots of 48 bytes, one for each
+# state directory): a ring of 65536 slots of 64 bytes, one for each
 # canonical index modulo 65536. A slot holds the index and the block as
-# little-endian u64, then the transaction hash. Block 0 marks an empty
-# slot. Only an executor with --carry-bytes writes it. A release that does
+# little-endian u64, the transaction hash, and 16 zero bytes. A slot
+# never crosses a page. Block 0 marks an empty slot. Only an executor with --carry-bytes writes it. A release that does
 # not know the file ignores it.
 [format.receipt-ledger]
 writes = 1
@@ -323,7 +323,7 @@ reads_max = 1
 shared = false
 code = ["crates/executor/src/bin/kardamom-executor/ledger.rs#struct Slot"]
 [format.receipt-ledger.layout]
-Slot = "slots 65536 010000000000000002000000000000000303030303030303030303030303030303030303030303030303030303030303"
+Slot = "slots 65536 01000000000000000200000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000000000000000000000"
 
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.

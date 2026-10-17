@@ -264,13 +264,13 @@ impl Boot {
     /// The bookkeeping at the end of a run, the repairs between two runs,
     /// and the verdict. Every state handle is gone before this runs.
     ///
+    /// - The receipt ledger goes to disk, and the running marker goes.
     /// - The checkpoint task ends before a repair touches the checkpoints.
     /// - A replay-window overrun stages a peer checkpoint, so the next run
     ///   restores it instead of re-requesting the same refused
     ///   `REPLAY_FROM`. See `bin_support::replay_unavailable_fallback`.
     /// - A divergence of the canonical stream stages a rollback. See
     ///   [`RollbackRepair`].
-    /// - The receipt ledger goes to disk, and the running marker goes.
     ///
     /// # Errors
     ///
@@ -278,6 +278,13 @@ impl Boot {
     /// staged checkpoint exists but the stale state fails to park.
     pub(crate) async fn finish(&self, end: RunEnd) -> Result<Verdict> {
         let args = &self.args;
+        // First the ledger: a kill during the wait for the checkpoint task
+        // then finds no running marker, and the next start trusts the
+        // ledger. A repair below syncs its own change of the ledger.
+        end.ledger
+            .as_ref()
+            .map(ReceiptLedger::end_run)
+            .transpose()?;
         if let Some(checkpointer) = end.checkpointer {
             checkpointer.await?;
         }
@@ -308,10 +315,6 @@ impl Boot {
             })
             .transpose()?
             .unwrap_or(false);
-        end.ledger
-            .as_ref()
-            .map(ReceiptLedger::end_run)
-            .transpose()?;
         Ok(Verdict::of(end.engine_error, repaired, staged))
     }
 }

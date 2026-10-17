@@ -162,15 +162,17 @@ impl Markers {
     ///   the ledger.
     /// - A running marker with another boot id: the host restarted during
     ///   the last run, and the writes of the ledger can be gone.
+    /// - A running marker, and no boot id: the start cannot tell, so it
+    ///   counts as a restart of the host.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the boot id or a marker does not read, or the
-    /// write of the running marker fails.
+    /// Returns `Err` when the running marker exists but does not read, or
+    /// its write fails.
     pub(crate) fn start_run(&self) -> Result<bool> {
-        let boot = std::fs::read_to_string(BOOT_ID).context("read the boot id of the host")?;
+        let boot = Self::boot_id();
         let whole = match std::fs::read_to_string(self.running_path()) {
-            Ok(last) => last == boot,
+            Ok(last) => boot.as_deref() == Some(last.as_str()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             Err(e) => return Err(e).context("read the running marker"),
         };
@@ -179,8 +181,24 @@ impl Markers {
                 "the host restarted during the last run: every receipt it published above the committed block can be void"
             );
         }
-        self.write(&self.running_path(), boot.as_bytes())?;
+        self.write(&self.running_path(), boot.unwrap_or_default().as_bytes())?;
         Ok(whole)
+    }
+
+    /// The boot id of the host. In a sandbox runtime, such as gVisor or
+    /// Kata Containers, it is the boot id of the sandbox: a restart of the
+    /// sandbox also drops its page cache, so the rule of
+    /// [`Self::start_run`] holds. `None`, with a warning, when the file
+    /// does not read.
+    fn boot_id() -> Option<String> {
+        std::fs::read_to_string(BOOT_ID)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "the boot id of the host does not read: a start after a run that did not end counts as a restart of the host"
+                );
+            })
+            .ok()
     }
 
     /// Record that a run ended, after the disk sync of the ledger.

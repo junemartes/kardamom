@@ -194,15 +194,16 @@ impl LiveTxReceiptsPub {
     }
 
     /// Write the receipts to the ledger before their publish. A failed
-    /// write is a transient error: the must-deliver loop retries the
-    /// batch, and publishes no receipt that is not in the ledger.
+    /// write ends the run: the file is allocated, so a failure is a broken
+    /// or full disk, which a retry does not heal. No receipt that is not in
+    /// the ledger goes out.
     fn record(&self, items: &[kardamom_types::ReceiptRows]) -> Result<(), ExecutorError> {
         let Some(ledger) = &self.ledger else {
             return Ok(());
         };
         ledger
             .record(items)
-            .map_err(|e| ExecutorError::State(format!("write the receipt ledger: {e}")))
+            .map_err(|e| ExecutorError::LocalWrite(format!("write the receipt ledger: {e}")))
     }
 }
 

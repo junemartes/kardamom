@@ -37,6 +37,8 @@ tokio-util = { workspace = true }
 toml.workspace = true
 crossbeam-channel = "0.5"
 crc32fast = "1.5"
+# posix_fallocate for the receipt ledger.
+libc.workspace = true
 
 [[bin]]
 name = "kardamom-executor"

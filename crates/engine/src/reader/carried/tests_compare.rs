@@ -10,7 +10,7 @@ use kardamom_cluster_adapter::wire::{EGRESS_KIND_REPLAY_AHEAD, encode_feed_answe
 use kardamom_state::{StateEnvBuilder, StateSnapshot, StateWriter, WriteBatch};
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt};
 
-use super::tests::{TIMING, boundary, done, entry, tx_at, tx_frame, unavailable};
+use super::tests::{TIMING, boundary, done, entry, epoch_at, tx_at, tx_frame, unavailable};
 use super::*;
 
 /// The committed header of `block` that ends at `end`, as `boundary`
@@ -481,4 +481,45 @@ fn one_divergence_has_one_fingerprint() {
         }
         other => panic!("expected the divergence on both readers, got {other:?}"),
     }
+}
+
+/// A reader of `tail` on blocks `1..4` of one entry each, then block 4
+/// with an epoch of one deposit at index 3. The epoch marker takes index 3
+/// and the deposit index 4.
+fn epoch_block(
+    tail: PublishedTail,
+) -> (CarriedSubscription<MemoryTransport, NoSource>, MemoryRemote) {
+    let (mut sub, feed) = reader(with_tail(tail));
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..4);
+    feed.send(epoch_at(3, 1));
+    feed.send(boundary(4, 5));
+    feed.send(done(first.request_id, 5, 5));
+    (sub, feed)
+}
+
+/// A published entry at the index of an epoch marker is void: the marker
+/// has no receipt.
+#[test]
+fn a_marker_at_a_published_index_voids_it() {
+    let (mut sub, _feed) = epoch_block(published(entry(3).canonical_id));
+    match outcome(&mut sub) {
+        Err(ExecutorError::PublishedDiverged { block, index, .. }) => {
+            assert_eq!((block, index), (4, 3));
+        }
+        other => panic!("expected void published receipts, got {other:?}"),
+    }
+}
+
+/// A published deposit receipt at the slot of an equal deposit is equal:
+/// its hash is the source hash of the deposit.
+#[test]
+fn an_equal_epoch_with_a_published_deposit_is_equal() {
+    let (mut sub, feed) = epoch_block(PublishedTail::Known([(4, (4, B256::ZERO))].into()));
+    let delivery = request(&mut sub, &feed);
+    assert_eq!(
+        (delivery.from_index, delivery.from_block),
+        (3, 4),
+        "the comparison ends equal, and delivery starts at the cursor"
+    );
 }

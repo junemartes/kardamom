@@ -100,6 +100,58 @@ fn the_slot_layout_is_in_the_registry() {
         "slots {SLOTS} {}",
         alloy_primitives::hex::encode(slot.encode())
     );
+    assert_eq!(SLOT_LEN, 64, "a slot never crosses a page");
     kardamom_formats::Registry::assert_layout("receipt-ledger", "Slot", &fingerprint);
     assert_eq!(Slot::decode(&slot.encode()), Some(slot));
+}
+
+/// A batch in index order is one write. A gap of up to `MAX_GAP` empty
+/// slots stays in the write; a larger gap and the end of the ring start a
+/// new one.
+#[test]
+fn a_batch_is_one_write_for_each_run_of_slots() {
+    let writes = |indexes: &[u64]| {
+        Run::split(indexes.iter().map(|&index| Slot {
+            index,
+            block: 1,
+            hash: B256::ZERO,
+        }))
+        .iter()
+        .map(|run| (run.first, run.bytes.len() / SLOT_LEN))
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(writes(&[3, 4, 5]), [(3, 3)]);
+    assert_eq!(
+        writes(&[3, 4 + MAX_GAP]),
+        [(3, usize::try_from(2 + MAX_GAP).unwrap())]
+    );
+    assert_eq!(writes(&[3, 5 + MAX_GAP]), [(3, 1), (5 + MAX_GAP, 1)]);
+    assert_eq!(writes(&[SLOTS - 1, SLOTS]), [(SLOTS - 1, 1), (SLOTS, 1)]);
+}
+
+/// The empty slots of a gap hold no receipt.
+#[test]
+fn the_gap_of_a_write_is_empty() {
+    let (_dir, ledger) = ledger();
+    ledger.record(&[receipt(3, 2), receipt(6, 2)]).unwrap();
+    assert_eq!(known(ledger.tail(0, true).unwrap()), [(3, 2), (6, 2)]);
+}
+
+#[test]
+fn a_clear_removes_every_receipt() {
+    let (_dir, ledger) = ledger();
+    ledger.record(&[receipt(3, 2), receipt(9, 7)]).unwrap();
+    ledger.clear().unwrap();
+    assert_eq!(known(ledger.tail(0, true).unwrap()), []);
+}
+
+/// The open allocates every block of the file, so a write needs no new
+/// block of the disk.
+#[test]
+fn the_open_allocates_the_file() {
+    use std::os::unix::fs::MetadataExt;
+    let (_dir, ledger) = ledger();
+    let meta = std::fs::metadata(ledger.markers.ledger_path()).unwrap();
+    assert_eq!(meta.len(), LEDGER_BYTES);
+    assert!(meta.blocks() * 512 >= LEDGER_BYTES, "no hole in the file");
 }

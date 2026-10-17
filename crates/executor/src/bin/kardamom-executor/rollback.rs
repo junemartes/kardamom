@@ -5,7 +5,8 @@
 //! the executor published above it: the cluster continued from a shorter
 //! log after a power loss on a majority of the members. Between two runs,
 //! [`RollbackRepair`] writes the rollback record, and removes the void
-//! receipts from the receipt ledger.
+//! receipts from the receipt ledger: every receipt after a restore, else
+//! the receipts of the divergence block and above.
 //!
 //! - A divergence of the committed history also needs an older state. The
 //!   repair removes the local checkpoints at and above the divergence
@@ -111,19 +112,13 @@ impl RollbackRepair<'_> {
         match reach {
             Reach::Committed => self.restore(block, kept, record),
             Reach::Published => {
-                self.mark(block, record)?;
+                self.ledger.markers.raise(record)?;
+                self.ledger.void(block)?;
                 metrics::counter!(kardamom_engine::metrics::ROLLBACK_TOTAL, "outcome" => "receipts-only")
                     .increment(1);
                 Ok(true)
             }
         }
-    }
-
-    /// Write the rollback record, then remove the receipts that it voids
-    /// from the ledger: the receipts of `block` and above.
-    fn mark(&self, block: u64, record: ReceiptRollback) -> Result<()> {
-        self.ledger.markers.raise(record)?;
-        self.ledger.void(block)
     }
 
     /// Stage a checkpoint in `restore` for a divergence of the committed
@@ -141,7 +136,8 @@ impl RollbackRepair<'_> {
         let Some(found) = self.find(dir, restore) else {
             return Ok(Self::unrecoverable(block));
         };
-        self.mark(block, record)?;
+        self.ledger.markers.raise(record)?;
+        self.ledger.clear()?;
         kardamom_state::park_state_db(self.state_dir).context("park the diverged state DB")?;
         metrics::counter!(kardamom_engine::metrics::ROLLBACK_TOTAL, "outcome" => found.label())
             .increment(1);

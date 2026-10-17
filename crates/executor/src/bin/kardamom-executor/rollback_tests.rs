@@ -77,6 +77,25 @@ fn diverged(block: u64) -> ExecutorError {
     }
 }
 
+/// The receipt at `index` of `block`.
+fn receipt(index: u64, block: u64) -> kardamom_types::ReceiptRows {
+    kardamom_types::ReceiptRows::bare(kardamom_types::Receipt {
+        tx_idx: BPosition::from_index(index),
+        block_number: block,
+        ..kardamom_types::Receipt::default()
+    })
+}
+
+/// The indexes of the receipts in `ledger`.
+fn published(ledger: &ReceiptLedger) -> Vec<u64> {
+    match ledger.tail(0, true).unwrap() {
+        kardamom_engine::reader::carried::PublishedTail::Known(published) => {
+            published.into_keys().collect()
+        }
+        kardamom_engine::reader::carried::PublishedTail::Unknown => panic!("a known tail"),
+    }
+}
+
 struct Dirs {
     _root: tempfile::TempDir,
     state: PathBuf,
@@ -128,7 +147,13 @@ fn another_error_stages_nothing() {
 fn a_local_checkpoint_below_the_divergence_is_staged() {
     let dirs = Dirs::new();
     drop(chain(&dirs.state, &dirs.ckpt, 8, &[2, 4, 6, 8]));
+    dirs.ledger.record(&[receipt(3, 3), receipt(9, 9)]).unwrap();
     assert!(dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
+    assert_eq!(
+        published(&dirs.ledger),
+        [] as [u64; 0],
+        "a restore clears the whole ledger"
+    );
     let pending = dirs
         .ledger
         .markers
@@ -237,20 +262,13 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
 fn a_published_divergence_keeps_the_state() {
     let dirs = Dirs::new();
     drop(chain(&dirs.state, &dirs.ckpt, 4, &[2, 4]));
-    let receipt = |index: u64, block: u64| {
-        kardamom_types::ReceiptRows::bare(kardamom_types::Receipt {
-            tx_idx: BPosition::from_index(index),
-            block_number: block,
-            ..kardamom_types::Receipt::default()
-        })
-    };
     dirs.ledger.record(&[receipt(4, 5), receipt(5, 6)]).unwrap();
-    let published = ExecutorError::PublishedDiverged {
+    let void = ExecutorError::PublishedDiverged {
         block: 6,
         index: 5,
         stream: B256::repeat_byte(7),
     };
-    assert!(dirs.repair(&[]).stage(Some(&published)).unwrap());
+    assert!(dirs.repair(&[]).stage(Some(&void)).unwrap());
     assert_eq!(
         dirs.ledger.markers.pending().unwrap(),
         Some(
@@ -261,12 +279,7 @@ fn a_published_divergence_keeps_the_state() {
             .record()
         )
     );
-    match dirs.ledger.tail(0, true).unwrap() {
-        kardamom_engine::reader::carried::PublishedTail::Known(published) => {
-            assert_eq!(published.keys().copied().collect::<Vec<_>>(), [4]);
-        }
-        kardamom_engine::reader::carried::PublishedTail::Unknown => panic!("a known tail"),
-    }
+    assert_eq!(published(&dirs.ledger), [4], "the receipts of block 6 go");
     assert_eq!(blocks(&dirs.ckpt), [2, 4], "the checkpoints stay");
     assert!(
         kardamom_state::has_state_db(&dirs.state).unwrap(),

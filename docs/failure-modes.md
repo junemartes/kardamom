@@ -890,12 +890,15 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
   - the transaction hash of each receipt, by canonical index;
   - the end index, the timestamp and the L1 origin of each header.
 - **The published receipts.** The commit thread publishes the receipts of a block before the state writer commits the block. So it first writes each receipt to the receipt ledger `<state-dir>/marker-receipts`: the canonical index, the block and the transaction hash. The comparison reads on above the cursor, through the last block with a receipt in the ledger:
-  - an entry at the index of a published receipt must have the same block and the same hash;
+  - each slot of a frame at the index of a published receipt must have the same block and the same hash. A deposit or a cross-chain message in an epoch has the slot after the epoch marker, and its source hash. A slot with no receipt, such as an epoch marker or a void, differs from a published receipt;
   - a boundary must not seal its block before a published receipt of that block.
-- The ledger writes go to the page cache with no disk sync, so they survive a crash or a kill of the process. The run syncs the ledger at its end. The running marker `<state-dir>/marker-running` holds the boot id of the host while a run is live:
+- The ledger is a ring of 65536 slots of 64 bytes. A slot never crosses a page, so a kill during a write leaves each slot old or new. The open allocates the whole file. A batch is one write, plus one at the end of the ring and one for each gap of more than 64 slots with no receipt. A failed write is fatal: the run ends with `LocalWrite`, and the process exits, so no receipt goes out that is not in the ledger.
+- The ledger writes go to the page cache with no disk sync, so they survive a crash or a kill of the process. At its end, a run first syncs the ledger and removes the running marker, then waits for its checkpoint task. The Nomad job gives the executor 30 s to stop. The running marker `<state-dir>/marker-running` holds the boot id of the host while a run is live:
   - no running marker: the last run ended through its bookkeeping, so the ledger is on disk. A fresh state directory and the first start of this release have no ledger, so nothing is compared above the cursor;
   - a running marker of this boot: the process crashed or was killed, and the page cache holds the ledger;
-  - a running marker of another boot: the host restarted during a run, so the ledger can be short. Every receipt above the committed block can be void, and the first frame above the cursor is a difference.
+  - a running marker of another boot: the host restarted during a run, so the ledger can be short. Every receipt above the committed block can be void, and the first frame above the cursor is a difference;
+  - a running marker, and a boot id that does not read: the start counts it as a restart of the host, with a warning.
+  - In a sandbox runtime, such as gVisor or Kata Containers, the boot id is the one of the sandbox. A restart of the sandbox drops its page cache too, so the same rule holds.
 - The floor is `--rollback-compare-blocks` committed blocks (default 32) below the cursor. A floor below the retention of the member moves up to the first block that the member holds.
 - A head below the floor (`REPLAY_AHEAD`) is no fault. The executor asks again every 2 s. The sealer closes a block on each tick, so the head passes the floor, and the comparison runs.
 - **The divergence point.** The first difference after a block that compared equal is the divergence point `d`. With no difference, the executor delivers from its cursor as before. A difference above the committed history ends the run with `PublishedDiverged`: the state stays, and only the published receipts of `d` and above are void.
@@ -907,7 +910,8 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
   3. takes the newest local checkpoint below the block, else fetches the newest peer checkpoint below it (the request `GET /checkpoint/latest?max_block=<block - 1>`);
   4. writes the rollback marker `<state-dir>/marker-rollback` with a disk sync;
   5. parks the diverged state DB in `<state-dir>/stale/`. The park leaves the markers in place.
-- After `PublishedDiverged`, the executor writes the rollback marker, removes the receipts of `d` and above from the ledger, and keeps its state and its checkpoints.
+- After `StreamDiverged`, the executor also clears the whole ledger: the restore lowers the cursor, and the receipts of the diverged state could span more than the ring above it.
+- After `PublishedDiverged`, the executor writes the rollback marker, removes the receipts of `d` and above from the ledger, and keeps its state and its checkpoints. After an unknown ledger, `d` is the first block above the committed block, so every receipt above the cursor goes.
 - The next run restores only a checkpoint at or below the block of the marker, compares again from it, and executes the new stream.
 - **The signal.** Before its first receipt, a run with a rollback marker publishes `ReceiptRollback { to_block, id }` on the receipt stream of `tx_receipts`. The commit thread removes the marker only after the publish succeeds. So a crash, a shutdown, or a run that fails before the publish leaves the marker, and the next start publishes the same record.
   - `to_block = d - 1`. The blocks up to `to_block` are equal on both streams, so their receipts stay valid.

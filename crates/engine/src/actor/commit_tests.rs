@@ -273,10 +273,11 @@ fn commit_thread_resumes_batch_at_failed_suffix() {
     );
 }
 
-/// A sink that reports a proven divergence on every publish. This
-/// simulates the validator's receipt cross-check.
-struct DivergingPub;
-impl TxReceiptsPublication for DivergingPub {
+/// A sink that reports a fatal error on every publish: a proven
+/// divergence (the validator's receipt cross-check), or a failed local
+/// write (the receipt ledger of an executor).
+struct FatalPub(fn() -> ExecutorError);
+impl TxReceiptsPublication for FatalPub {
     fn publish_rollback(
         &mut self,
         _rollback: kardamom_types::ReceiptRollback,
@@ -285,30 +286,39 @@ impl TxReceiptsPublication for DivergingPub {
     }
 
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
-        Err(ExecutorError::Divergence("receipt mismatch at tx 0".into()))
+        Err((self.0)())
     }
 }
 
-// Regression test: the must-deliver retry must not spin on a proven
-// divergence. Spinning would defeat the fail-stop, because the retry finds
-// an empty buffer, lands in the "unverified" arm, and the pipeline keeps
-// committing. A Divergence error must propagate out of the commit thread
+// Regression test: the must-deliver retry must not spin on a fatal error.
+// Spinning on a divergence would defeat the fail-stop, because the retry
+// finds an empty buffer, lands in the "unverified" arm, and the pipeline
+// keeps committing. Spinning on a failed local write hangs the executor on
+// a full disk. Both errors must propagate out of the commit thread
 // immediately.
 #[test]
-fn commit_thread_fail_stops_on_divergence() {
-    let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
-        Receipt {
-            tx_idx: pos(0),
-            ..Default::default()
-        },
-    )))]);
-
-    let h = CommitLoop::new(DivergingPub, rx).spawn();
-    let res = h.join().expect("no panic");
-    assert!(
-        matches!(res, Err(ExecutorError::Divergence(_))),
-        "divergence must propagate, not be retried: {res:?}"
-    );
+fn commit_thread_fail_stops_on_a_fatal_error() {
+    let fatal: [fn() -> ExecutorError; 2] = [
+        || ExecutorError::Divergence("receipt mismatch at tx 0".into()),
+        || ExecutorError::LocalWrite("write the receipt ledger: no space".into()),
+    ];
+    for error in fatal {
+        let rx = feed_commits(vec![ExecToCommit::Receipt(Box::new(ReceiptRows::bare(
+            Receipt {
+                tx_idx: pos(0),
+                ..Default::default()
+            },
+        )))]);
+        let res = CommitLoop::new(FatalPub(error), rx)
+            .spawn()
+            .join()
+            .expect("no panic");
+        assert_eq!(
+            res.map_err(|e| e.to_string()),
+            Err(error().to_string()),
+            "a fatal error must propagate, not be retried"
+        );
+    }
 }
 
 /// A publication with no connected subscriber: every publish fails with
