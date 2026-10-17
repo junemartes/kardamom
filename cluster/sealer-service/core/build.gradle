@@ -7,3 +7,30 @@ dependencies {
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
+
+// The allocation gate (AllocationGateTest, tag "allocation") runs in its own
+// JVM with escape analysis off. The JIT then keeps every allocation that the
+// code asks for, so the count per record is exact and repeatable, and it is an
+// upper bound of what an optimised JVM allocates. The normal test task leaves
+// the gate out.
+tasks.named('test', Test) {
+    useJUnitPlatform {
+        excludeTags 'allocation'
+    }
+}
+
+def allocationGate = tasks.register('allocationGate', Test) {
+    description = 'Checks the heap bytes per record of the sealer record path against its baselines.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform {
+        includeTags 'allocation'
+    }
+    forkEvery = 1
+    jvmArgs '-XX:-DoEscapeAnalysis'
+}
+
+tasks.named('check') {
+    dependsOn allocationGate
+}

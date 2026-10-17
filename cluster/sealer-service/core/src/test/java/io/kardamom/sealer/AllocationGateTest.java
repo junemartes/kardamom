@@ -2,12 +2,15 @@ package io.kardamom.sealer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static io.kardamom.sealer.SealerStateFixtures.NO_DEADLINE;
+import static io.kardamom.sealer.SealerStateFixtures.distinctSender;
 
 import io.kardamom.sealer.CanonicalSealerState.RecordOutcome.Kind;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.util.Properties;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -15,14 +18,18 @@ import org.junit.jupiter.api.Test;
  * {@link CanonicalSealerState} allocates for each record in steady state.
  * The order is the only product of the sealer, so the target is zero.
  *
- * <p>Each case warms the state up, then measures the bytes that the test
- * thread allocates over many records. The inputs exist before the measured
+ * <p>The {@code allocationGate} task runs this class in its own JVM with
+ * escape analysis off, so the count is every allocation that the code asks
+ * for: exact, repeatable, and an upper bound of an optimised JVM. Each case
+ * warms the state up, then measures the bytes that the test thread
+ * allocates over many records. The inputs exist before the measured
  * part. Every measured record must have the outcome that the case names, so
  * a case measures the path it claims to. A case fails when it allocates more
  * than its baseline in {@code allocation-baseline.properties} allows. A
  * change that removes allocations lowers the baseline in the same pull
  * request, so the gate only moves down.
  */
+@Tag("allocation")
 final class AllocationGateTest {
 
     /** The production dedup capacity ({@code SealerWire.DEFAULT_DEDUP_CAPACITY}). */
@@ -43,10 +50,8 @@ final class AllocationGateTest {
     private static final long HOLD_BLOCKS = 60;
     /** A payload of the size of a small transfer envelope. */
     private static final byte[] PAYLOAD = new byte[120];
-    /** The share of a baseline that a measurement may exceed it by: JIT and TLAB noise. */
-    private static final double TOLERANCE = 1.05;
-    /** The bytes per record that a measurement may exceed a baseline by, for a baseline near zero. */
-    private static final double SLACK_BYTES = 4.0;
+    /** The bytes per record that a measurement may exceed its baseline by: the rounding of the average. */
+    private static final double SLACK_BYTES = 0.5;
 
     private static final com.sun.management.ThreadMXBean THREADS =
             (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
@@ -75,7 +80,7 @@ final class AllocationGateTest {
 
     private static void check(String name, double bytesPerRecord) {
         double baseline = baseline(name);
-        double limit = baseline * TOLERANCE + SLACK_BYTES;
+        double limit = baseline + SLACK_BYTES;
         System.out.printf("sealer allocation gate: %s %.1f bytes/record (baseline %.1f)%n",
                 name, bytesPerRecord, baseline);
         assertTrue(bytesPerRecord <= limit, String.format(
@@ -118,7 +123,7 @@ final class AllocationGateTest {
                 ids[i] = id(i);
             }
             for (int s = 0; s < SENDERS; s++) {
-                senders[s] = sender(s);
+                senders[s] = distinctSender(s);
             }
         }
 
@@ -131,7 +136,7 @@ final class AllocationGateTest {
             filled = DEDUP_CAPACITY - 1;
             for (int i = 0; i < filled; i++) {
                 int s = i % SENDERS;
-                state.onRecord(ids[i], senders[s], nonces[s]++, Long.MAX_VALUE, PAYLOAD);
+                state.onRecord(ids[i], senders[s], nonces[s]++, NO_DEADLINE, PAYLOAD);
             }
         }
 
@@ -165,13 +170,13 @@ final class AllocationGateTest {
         /** Offer again a record that the window holds. */
         Kind offerAgain(CanonicalSealerState state, int i) {
             int at = i % filled;
-            return state.onRecord(ids[at], senders[at % SENDERS], 0L, Long.MAX_VALUE, PAYLOAD).kind;
+            return state.onRecord(ids[at], senders[at % SENDERS], 0L, NO_DEADLINE, PAYLOAD).kind;
         }
 
         /** Offer a fresh record one nonce past the sender's next one. A reject stores nothing. */
         Kind skipNonce(CanonicalSealerState state, int i) {
             int s = i % SENDERS;
-            return state.onRecord(ids[filled + i], senders[s], nonces[s] + 1, Long.MAX_VALUE, PAYLOAD).kind;
+            return state.onRecord(ids[filled + i], senders[s], nonces[s] + 1, NO_DEADLINE, PAYLOAD).kind;
         }
 
         private static byte[] id(int i) {
@@ -181,14 +186,6 @@ final class AllocationGateTest {
             out[29] = (byte) (i >>> 16);
             out[30] = (byte) (i >>> 8);
             out[31] = (byte) i;
-            return out;
-        }
-
-        private static byte[] sender(int s) {
-            byte[] out = new byte[CanonicalSealerState.SENDER_LEN];
-            out[0] = (byte) 0x7a;
-            out[18] = (byte) (s >>> 8);
-            out[19] = (byte) s;
             return out;
         }
     }
