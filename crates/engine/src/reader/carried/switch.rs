@@ -66,7 +66,8 @@ pub(crate) enum Verdict {
     Behind { head_index: u64, head_block: u64 },
 }
 
-/// The last fault of each source since it last reached its head.
+/// The fault of the latest answer of each source. A new request to a
+/// source clears its mark, and so does a replay that reaches the head.
 #[derive(Debug, Default)]
 struct Marks {
     feed: Option<Fault>,
@@ -87,7 +88,7 @@ impl Marks {
     ///   its floor, or never connected in this run. The checkpoint is at or
     ///   above the lowest floor.
     /// - A stop when every source has a head below the cursor, or never
-    ///   connected.
+    ///   connected. The stop names the highest head.
     /// - Else the reader tries the other source again: a silent, lost or
     ///   bad source can serve again later, for example a member that
     ///   restarts.
@@ -108,13 +109,17 @@ impl Marks {
                 _ => None,
             })
             .min();
-        let head = pair.iter().flatten().find_map(|fault| match fault {
-            Fault::Ahead {
-                head_index,
-                head_block,
-            } => Some((*head_index, *head_block)),
-            _ => None,
-        });
+        let head = pair
+            .iter()
+            .flatten()
+            .filter_map(|fault| match fault {
+                Fault::Ahead {
+                    head_index,
+                    head_block,
+                } => Some((*head_index, *head_block)),
+                _ => None,
+            })
+            .max();
         match (floor, head) {
             (Some((oldest_block, oldest_index)), _)
                 if every(|f| matches!(f, Fault::Unavailable { .. })) =>
@@ -225,6 +230,7 @@ impl<F: Transport, S: Transport> Switch<F, S> {
     pub(crate) fn ask(&mut self, cursor: (u64, u64), now: Instant) {
         let id = self.take_id();
         let connection = self.connection();
+        *self.marks.slot(self.active) = None;
         let request = self.answer.ask(cursor, id, connection, now);
         tracing::debug!(
             source = self.active.label(),
@@ -314,8 +320,19 @@ impl<F: Transport, S: Transport> Switch<F, S> {
     /// window, and a replay of the feed from the cursor then reaches the
     /// head. One break of the readiness, or a failed replay, starts the
     /// window again. Returns whether the reader switched to the feed.
+    ///
+    /// Before the probe, the reader discards the frames of the feed at each
+    /// check. A member that stays live writes on, and a backlog would delay
+    /// the answer of the probe past its silence window.
     pub(crate) fn check_return(&mut self, cursor: (u64, u64), now: Instant) -> bool {
-        let (Source::Service, Some(image)) = (self.active, self.feed.connection()) else {
+        if self.active != Source::Service {
+            self.back = Return::default();
+            return false;
+        }
+        if self.back.probe.is_none() {
+            self.feed.close();
+        }
+        let Some(image) = self.feed.connection() else {
             self.back = Return::default();
             return false;
         };
@@ -331,36 +348,59 @@ impl<F: Transport, S: Transport> Switch<F, S> {
                 self.switch_to(Source::Feed, cursor, now);
                 true
             }
-            Some(_) => {
+            Some(Step::Fault(fault)) => {
+                *self.marks.slot(Source::Feed) = Some(fault);
                 self.back = Return::default();
                 false
             }
-            None => false,
+            _ => false,
         }
     }
 
     /// One step of the probe on the feed: its timers, then the frames that
-    /// the feed already sent. Returns the step that ends the probe, if any.
+    /// the feed already sent. A hole or a gap asks again. Returns the step
+    /// that ends the probe: the replay end, or a fault.
     fn probe(&mut self, cursor: (u64, u64), image: u64, now: Instant) -> Option<Step> {
-        let id = self.next_id;
-        let Self { feed, back, .. } = self;
-        let probe = back
+        let timing = self.timing;
+        let wake = self
+            .back
             .probe
-            .get_or_insert_with(|| Answer::new(self.timing, now));
-        match probe.wake(Some(image), now) {
+            .get_or_insert_with(|| Answer::new(timing, now))
+            .wake(Some(image), now);
+        match wake {
             Wake::Ask => {
-                self.next_id = self.next_id.wrapping_add(1);
-                feed.request(probe.ask(cursor, id, Some(image), now));
+                self.probe_ask(cursor, image, now);
                 None
             }
             Wake::Fault(fault) => Some(Step::Fault(fault)),
-            Wake::Wait => (0..PROBE_BATCH)
-                .map_while(|_| match feed.poll(Duration::ZERO) {
-                    Poll::Frame(bytes) => Some(bytes),
-                    Poll::Idle | Poll::Closed => None,
-                })
-                .map(|bytes| probe.frame(&bytes, now))
-                .find(|step| matches!(step, Step::Live { .. } | Step::Ask | Step::Fault(_))),
+            Wake::Wait => {
+                let Self { feed, back, .. } = self;
+                let probe = back.probe.as_mut()?;
+                let end = (0..PROBE_BATCH)
+                    .map_while(|_| match feed.poll(Duration::ZERO) {
+                        Poll::Frame(bytes) => Some(bytes),
+                        Poll::Idle | Poll::Closed => None,
+                    })
+                    .map(|bytes| probe.frame(&bytes, now))
+                    .find(|step| matches!(step, Step::Live { .. } | Step::Ask | Step::Fault(_)));
+                match end {
+                    Some(Step::Ask) => {
+                        self.probe_ask(cursor, image, now);
+                        None
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    /// Send a probe request from `cursor` on the feed image `image`. It is a
+    /// new request to the feed, so the old mark of the feed goes.
+    fn probe_ask(&mut self, cursor: (u64, u64), image: u64, now: Instant) {
+        let id = self.take_id();
+        *self.marks.slot(Source::Feed) = None;
+        if let Some(probe) = self.back.probe.as_mut() {
+            self.feed.request(probe.ask(cursor, id, Some(image), now));
         }
     }
 }

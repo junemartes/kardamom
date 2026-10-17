@@ -393,3 +393,18 @@ fn a_new_image_is_a_new_connection_with_a_new_request() {
     rig.feed.send(done(again.request_id, 1, 1));
     assert_eq!(rig.deliver(3), ["t0"]);
 }
+
+#[test]
+fn a_hole_and_the_frames_after_it_send_one_request() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.send(tx_at(2));
+    (3..43).for_each(|index| rig.feed.send(tx_at(index)));
+    let started = Instant::now();
+    rig.deliver(45);
+    assert!(
+        started.elapsed() < TIMING.resend,
+        "the test ran past a resend"
+    );
+    assert_eq!(rig.feed.requests().len(), 1, "one request for the hole");
+}

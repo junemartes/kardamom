@@ -50,7 +50,9 @@ pub trait Transport: Send {
     fn poll(&mut self, wait: Duration) -> Poll;
 
     /// Stop reading this source: discard the frames that it already sent.
-    /// The reader sends a new request before it reads the source again.
+    /// The reader sends a new request before it reads the source again. The
+    /// reader also calls it at each timer step while it reads the other
+    /// source, so the call must be cheap.
     fn close(&mut self);
 }
 

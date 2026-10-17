@@ -101,8 +101,15 @@ pub(crate) struct Answer {
     expect_block: u64,
     /// The replay of the newest request reached the head.
     live: bool,
+    /// A hole asked for a new answer, and no frame of it came yet. Each
+    /// later hole is a frame of the old answer: drop it, and send no
+    /// second request. The resend covers a lost request.
+    hole_open: bool,
     asked_at: Instant,
+    /// The last frame of the source, of any answer: the silence window.
     heard_at: Instant,
+    /// The last frame of the newest answer: the resend wait.
+    answered_at: Instant,
 }
 
 impl Answer {
@@ -116,8 +123,10 @@ impl Answer {
             expect_index: 0,
             expect_block: 0,
             live: false,
+            hole_open: false,
             asked_at: now,
             heard_at: now,
+            answered_at: now,
         }
     }
 
@@ -127,8 +136,10 @@ impl Answer {
         self.request_id = None;
         self.asked_on = None;
         self.live = false;
+        self.hole_open = false;
         self.asked_at = now;
         self.heard_at = now;
+        self.answered_at = now;
     }
 
     /// A new request from the cursor `(index, block)` with the new id
@@ -166,7 +177,7 @@ impl Answer {
         if now.duration_since(self.heard_at) >= self.timing.silence {
             return Wake::Fault(Fault::Silent);
         }
-        let quiet = now.duration_since(self.asked_at.max(self.heard_at));
+        let quiet = now.duration_since(self.asked_at.max(self.answered_at));
         let resend = !self.live && quiet >= self.timing.resend;
         if connection.is_some() && (!asked || connection != self.asked_on || resend) {
             return Wake::Ask;
@@ -187,8 +198,9 @@ impl Answer {
                 Step::Fault(Fault::Undecodable)
             }
         };
+        self.heard_at = now;
         if !matches!(step, Step::Drop) {
-            self.heard_at = now;
+            self.answered_at = now;
         }
         step
     }
@@ -251,6 +263,7 @@ impl Answer {
         if request_id != self.request_id {
             return Step::Drop;
         }
+        self.hole_open = false;
         let step = step();
         self.live = matches!(step, Step::Live { .. });
         step
@@ -267,10 +280,22 @@ impl Answer {
         match (index == self.expect_index, next) {
             (true, Some(next)) => {
                 self.expect_index = next;
+                self.hole_open = false;
                 Step::Record(index, item)
             }
-            _ => Step::Ask,
+            _ => self.hole(),
         }
+    }
+
+    /// A frame that does not follow the cursor. The first one asks for a
+    /// new answer from the cursor. The ones after it, until a frame of the
+    /// new answer comes, come from the old answer: drop them.
+    fn hole(&mut self) -> Step {
+        if self.hole_open {
+            return Step::Drop;
+        }
+        self.hole_open = true;
+        Step::Ask
     }
 
     /// A boundary. It closes the block at the cursor: its end is the next
@@ -286,9 +311,10 @@ impl Answer {
         ) {
             (true, Some(next)) => {
                 self.expect_block = next;
+                self.hole_open = false;
                 Step::Boundary(b)
             }
-            _ => Step::Ask,
+            _ => self.hole(),
         }
     }
 }

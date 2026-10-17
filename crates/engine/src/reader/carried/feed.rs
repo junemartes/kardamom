@@ -82,6 +82,6 @@ impl Transport for AeronFeed {
 
     fn close(&mut self) {
         let discarded = self.frames.try_iter().count();
-        tracing::debug!(discarded, "closed the member feed");
+        tracing::trace!(discarded, "discarded the frames of the member feed");
     }
 }

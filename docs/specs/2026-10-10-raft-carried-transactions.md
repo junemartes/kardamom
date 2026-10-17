@@ -597,6 +597,10 @@ The executor reads one source at a time, in this order:
     it switches.
   Until then the executor stays on the serving service. A probe that ends in another way restarts
   the 30 s.
+- While the executor reads the serving service, it discards the frames of the feed at each timer
+  step. A member that stays live writes on, and a backlog would hold the answer of the probe
+  behind it. During the probe, each frame of the feed, also a dropped one, shows that the feed is
+  alive.
 - The probe is the readiness check. A member that lags answers its replay only when its walk
   reaches its own head, so a member that lags cannot take the executor back before it reaches the
   head. The executor has no HTTP client, and it does not read the member admin endpoint.
@@ -858,17 +862,19 @@ source is alive. The reader drops each kind that it does not know.
 | No answer | No frame of the answer within 2 s of the request: it sends a new request with a new id. |
 | An answer with an old id | It drops the frame. |
 | A retained frame below the cursor | It drops the frame. |
-| A hole (the index or block rule of section 7.8) | It does not apply the frame. It sends a new request from its cursor to the same source. |
+| A hole (the index or block rule of section 7.8) | It does not apply the frame. It sends one new request from its cursor to the same source. It drops each later frame that does not follow the cursor, until a frame of the new answer comes: those frames come from the old answer. The 2 s resend covers a lost request. |
 | Gap (`FEED_GAP`, kind 16) | It sends a new request from its cursor to the same source. |
 | Replay unavailable (kind 3, with the floor `oldest_index`, `oldest_block`) | It leaves the source. When every source answered `REPLAY_UNAVAILABLE` or is absent, it stops with `ClusterReplayUnavailable` and the lowest floor, and the executor fetches a peer checkpoint (section 7.3). Else it tries the other source. |
-| Replay ahead (kind 11, with the head) | It leaves the source. When every source answered `REPLAY_AHEAD` or is absent, it stops with `ClusterBehindCursor`. Else it tries the other source. |
+| Replay ahead (kind 11, with the head) | It leaves the source. When every source answered `REPLAY_AHEAD` or is absent, it stops with `ClusterBehindCursor` and the highest head. Else it tries the other source. |
 | Silent too long (no frame for 6 s) | It leaves the source. |
 | A frame of a known kind that does not decode | It leaves the source. |
 | `keccak256(raw_tx)` is not `canonical_id` | It does not execute the entry. It counts `kardamom_executor_source_mismatch_total{source}`, leaves the source, and replays from the other source at the same index. |
 
 - A source that the reader left as silent, lost or bad stays in the order: the reader tries it
-  again when the other source fails. The reader keeps the last fault of each source until the
-  source reaches `REPLAY_DONE` again.
+  again when the other source fails. The reader keeps the fault of the latest answer of each
+  source. A new request to the source clears it, and so does a `REPLAY_DONE`. So a peer
+  checkpoint needs the latest answer of each source to be `REPLAY_UNAVAILABLE`, or the source to
+  be absent, and the floor comes from those latest answers.
 - The return to the feed follows section 7.5: the feed keeps one image for 30 s, then a probe
   replay of the feed from the cursor reaches `REPLAY_DONE`.
 

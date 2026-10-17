@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use kardamom_cluster_adapter::wire::{EGRESS_KIND_REPLAY_AHEAD, encode_feed_answer};
+
 use super::tests::{Rig, TIMING, boundary, done, entry, forged_at, tx_at, unavailable};
 use super::*;
 
@@ -16,6 +18,30 @@ fn serve_block(rig: &mut Rig, source: Source, index: u64, block: u64) -> Request
     remote.send(boundary(block, index + 1));
     remote.send(done(request.request_id, index + 1, block + 1));
     request
+}
+
+/// Run `sub` until it fails, and answer each request of `remote` with the
+/// frame that `answer` makes from the request id: a member that refuses
+/// each request, also the probe of the return check.
+fn fail_answering<S: Transport>(
+    sub: &mut CarriedSubscription<MemoryTransport, S>,
+    remote: &MemoryRemote,
+    answer: impl Fn(u64) -> Vec<u8>,
+) -> ExecutorError {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    std::iter::repeat_with(|| {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reader did not fail"
+        );
+        remote
+            .requests()
+            .iter()
+            .for_each(|request| remote.send(answer(request.request_id)));
+        sub.step()
+    })
+    .find_map(Result::err)
+    .expect("an error")
 }
 
 #[test]
@@ -138,16 +164,7 @@ fn both_sources_below_their_floor_go_to_a_peer_checkpoint() {
 fn a_feed_below_its_floor_with_no_service_goes_to_a_peer_checkpoint() {
     let (feed, remote) = MemoryTransport::pair();
     let mut sub = CarriedSubscription::with_timing(feed, NoSource, ReplayCursor::new(3, 2), TIMING);
-    let request = std::iter::repeat_with(|| {
-        sub.step().unwrap();
-        remote.request(Duration::ZERO)
-    })
-    .find_map(|request| request)
-    .unwrap();
-    remote.send(unavailable(request.request_id, 10, 5));
-    let error = std::iter::repeat_with(|| sub.step())
-        .find_map(Result::err)
-        .unwrap();
+    let error = fail_answering(&mut sub, &remote, |id| unavailable(id, 10, 5));
     assert!(matches!(
         error,
         ExecutorError::ClusterReplayUnavailable {
@@ -192,13 +209,85 @@ fn a_silent_feed_and_a_service_below_its_floor_try_the_feed_again() {
 fn a_service_that_never_connected_counts_as_absent() {
     let mut rig = Rig::new(3, 2);
     rig.service.set_connected(false);
-    let request = rig.request(Source::Feed);
-    rig.feed.send(unavailable(request.request_id, 10, 5));
-    match rig.error() {
+    let error = fail_answering(&mut rig.sub, &rig.feed, |id| unavailable(id, 10, 5));
+    match error {
         ExecutorError::ClusterReplayUnavailable { oldest_block, .. } => {
             assert_eq!(oldest_block, 5);
         }
         other => panic!("expected the peer-checkpoint error, got {other:?}"),
     }
     assert_eq!(rig.service.requests(), []);
+}
+
+#[test]
+fn a_large_feed_backlog_does_not_stop_the_return_to_the_feed() {
+    let mut rig = Rig::new(0, 1);
+    rig.request(Source::Feed);
+    rig.feed.set_connected(false);
+    serve_block(&mut rig, Source::Service, 0, 1);
+    assert_eq!(rig.deliver(5), ["t0", "b1"]);
+    let old = tx_at(0);
+    (0..200_000).for_each(|_| rig.feed.send(old.clone()));
+    rig.feed.set_connected(true);
+    let started = std::time::Instant::now();
+    let probe = rig.request(Source::Feed);
+    (0..20_000).for_each(|_| rig.feed.send(old.clone()));
+    rig.feed.send(done(probe.request_id, 1, 2));
+    rig.run_until(|rig| rig.sub.source() == Source::Feed);
+    assert!(
+        started.elapsed() < TIMING.ready + Duration::from_secs(1),
+        "the return took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_new_request_clears_the_old_floor_of_the_source() {
+    let mut rig = Rig::new(3, 2);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(unavailable(request.request_id, 10, 5));
+    rig.run_until(|rig| rig.sub.source() == Source::Service);
+    let service = rig.request(Source::Service);
+    rig.service.send(tx_at(3));
+    rig.service.send(boundary(2, 4));
+    rig.service.send(done(service.request_id, 4, 3));
+    assert_eq!(rig.deliver(5), ["t3", "b2"]);
+    assert_eq!(rig.feed.requests(), [], "no probe before the ready window");
+    rig.request(Source::Feed);
+    rig.feed.send(tx_at(4));
+    rig.service.send(unavailable(service.request_id, 8, 4));
+    rig.run_until(|rig| rig.sub.source() == Source::Feed);
+    let again = rig.request(Source::Feed);
+    assert_eq!(
+        (again.from_index, again.from_block),
+        (4, 3),
+        "no peer checkpoint at the old floor of the feed"
+    );
+}
+
+#[test]
+fn both_heads_below_the_cursor_stop_at_the_highest_head() {
+    let mut rig = Rig::new(20, 10);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(encode_feed_answer(
+        EGRESS_KIND_REPLAY_AHEAD,
+        5,
+        3,
+        request.request_id,
+    ));
+    let request = rig.request(Source::Service);
+    rig.service.send(encode_feed_answer(
+        EGRESS_KIND_REPLAY_AHEAD,
+        9,
+        6,
+        request.request_id,
+    ));
+    match rig.error() {
+        ExecutorError::ClusterBehindCursor {
+            head_index,
+            head_block,
+            ..
+        } => assert_eq!((head_index, head_block), (9, 6)),
+        other => panic!("expected the behind-cursor error, got {other:?}"),
+    }
 }
