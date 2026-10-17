@@ -19,6 +19,9 @@
 //! visible as `checkpoint-*` is a full, consistent image that will never
 //! change again, and copying one concurrently is always safe.
 //!
+//! The copy is then cut to its used pages, so the manifest hash and a
+//! peer transfer cover only the data, not the trailing hole of the file.
+//!
 //! Restore is a plain file copy of the checkpoint env into a fresh state
 //! directory. The normal startup path then sees a non-empty DB and
 //! resumes from its `last_committed_block` cursor.
@@ -27,6 +30,7 @@
 //! [`manifest`]. The peer-fetch path in [`crate::checkpoint_transfer`]
 //! also uses these helpers.
 
+mod image;
 mod manifest;
 
 #[cfg(test)]
@@ -36,6 +40,7 @@ mod tests;
 pub(crate) use manifest::manifest_path;
 pub(crate) use manifest::{CheckpointManifest, read_manifest, verify_checkpoint};
 
+use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
 
@@ -185,6 +190,7 @@ pub fn create_checkpoint(
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
     let tmp_data = tmp.join("mdbx.dat");
     compact_to(env, &tmp_data)?;
+    CompactedImage::new(&tmp_data).cut_to_used_pages()?;
     let manifest = CheckpointManifest {
         block,
         image_keccak: file_keccak(&tmp_data)?,

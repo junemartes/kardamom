@@ -21,6 +21,15 @@ use kardamom_bench::load::Completeness;
 /// The recovery probe's window.
 const PROBE_WINDOW: Duration = Duration::from_secs(30);
 
+/// How long one probe submit waits out the refusals of a paused ingress:
+/// two times the 10 s sealer silence budget. A `sealer_no_quorum` halt
+/// starts after that budget with no status frame, and it clears by itself
+/// when the session gets a frame again. Two budgets cover the halt and
+/// the reconnect after it, so a halt that clears by itself does not fail
+/// the probe. The submit keeps its nonce through the wait, so no nonce
+/// hole forms.
+const PROBE_PAUSE_WAIT: Duration = Duration::from_secs(20);
+
 /// One leg of the recovery probe: who submits, what its failure means,
 /// the least accepted submits, and the load.
 struct ProbeLeg {
@@ -36,13 +45,14 @@ impl ProbeLeg {
     fn judge(&self, case: Case, verdict: &Verdict) -> anyhow::Result<()> {
         anyhow::ensure!(
             verdict.pass && verdict.missing == 0,
-            "{}: recovery probe of {} not PASS for case {}: {:?} (missing={} of {} offered) — {}",
+            "{}: recovery probe of {} not PASS for case {}: {:?} (missing={} of {} offered, of them unlanded={}: never acked) — {}",
             crate::FAIL_PREFIX,
             self.who,
             case.name(),
             verdict.failures,
             verdict.missing,
             verdict.offered,
+            verdict.unlanded,
             self.meaning
         );
         anyhow::ensure!(
@@ -224,6 +234,7 @@ impl Harness {
             duration: PROBE_WINDOW,
             tps: self.probe_tps(),
             retry_submit: self.knobs.load_retry,
+            pause_wait: PROBE_PAUSE_WAIT,
             report_path: Self::report_path(&format!("{}-probe-{leg}", case.name())),
             ..self.load_spec(case, account, PROBE_WINDOW, nonce)
         }
@@ -317,6 +328,7 @@ impl Harness {
             duration: window,
             tps: case.tps(&self.knobs),
             retry_submit: case.load_retry(&self.knobs),
+            pause_wait: Duration::ZERO,
             max_gap: self.knobs.load_max_gap,
             drain_timeout: self
                 .knobs

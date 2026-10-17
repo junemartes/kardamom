@@ -34,9 +34,10 @@ variable "cluster_retention" {
 }
 
 # Automatic Raft snapshot interval, in seconds
-# (-Dkardamom.cluster.snapshotIntervalS; 0 disables). Every member runs
-# the scheduler, but only the current leader's toggle fires, and the
-# snapshot action replicates through the log, so all members snapshot
+# (-Dkardamom.cluster.snapshotIntervalS; 0 disables). The leader's service
+# asks for the snapshot on a boundary tick whose block is a multiple of
+# the interval in blocks, after a status frame with the snapshot notice.
+# The snapshot action replicates through the log, so all members snapshot
 # at the same position. The chaos-cluster shard shortens this; Ansible deployment
 # passes -var from KARDAMOM_CLUSTER_SNAPSHOT_S. This lets
 # cluster-member-rejoin wait for a snapshot inside one case.

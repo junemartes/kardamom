@@ -72,18 +72,27 @@ final class WireGoldenTest {
 
     @Test
     void theStatusFramesMatchWithAndWithoutTheByteTail() {
-        assertArrayEquals(golden.get("status_67"), frames.copy(frames.status(status())));
-        assertEquals(SealerWire.STATUS_WITH_RECORD_LAG_LEN, golden.get("status_67").length);
-        assertArrayEquals(golden.get("status_76"), frames.copy(frames.status(status(), RETAINED_BYTES)));
+        assertArrayEquals(golden.get("status_68"), frames.copy(frames.status(status(), false)));
+        assertEquals(SealerWire.STATUS_WITH_SNAPSHOT_FLAG_LEN, golden.get("status_68").length);
+        assertArrayEquals(golden.get("status_76"), frames.copy(frames.status(status(), false, RETAINED_BYTES)));
+        assertArrayEquals(golden.get("status_76_snapshot"),
+            frames.copy(frames.status(status(), true, RETAINED_BYTES)));
         assertEquals(SealerWire.STATUS_WITH_RETAINED_BYTES_LEN, golden.get("status_76").length);
+        // The frame of the release before the flag is the 68-byte frame without its last byte.
+        assertArrayEquals(golden.get("status_67"),
+            java.util.Arrays.copyOf(golden.get("status_68"), SealerWire.STATUS_WITH_RECORD_LAG_LEN));
     }
 
     @Test
     void theFlagByteSitsBetweenTheRecordLagTailAndTheByteTail() {
         final UnsafeBuffer status = new UnsafeBuffer(golden.get("status_76"));
-        assertEquals(0, status.getByte(SealerWire.STATUS_WITH_RECORD_LAG_LEN));
+        assertEquals(0, status.getByte(SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET));
+        assertEquals(1, new UnsafeBuffer(golden.get("status_76_snapshot"))
+            .getByte(SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET), "the snapshot notice");
         assertEquals(RETAINED_BYTES,
             status.getLong(SealerWire.STATUS_RETAINED_BYTES_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertEquals(67, SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET);
+        assertEquals(68, SealerWire.STATUS_WITH_SNAPSHOT_FLAG_LEN);
         assertEquals(68, SealerWire.STATUS_RETAINED_BYTES_OFFSET);
         assertEquals(76, SealerWire.STATUS_WITH_RETAINED_BYTES_LEN);
     }

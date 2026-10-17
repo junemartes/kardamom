@@ -32,6 +32,7 @@ pub(crate) fn base_input<'a>(base: &'a MetricsSnapshot, fin: &'a MetricsSnapshot
         counts: counts(300, 300, 300, 0),
         missing: 0,
         unlanded: 0,
+        completeness: Completeness::Accepted,
         base,
         fin,
         recheck: None,
@@ -168,4 +169,45 @@ fn sequencer_drop_is_soft_in_chaos() {
     });
     assert!(v.pass, "expected pass, failures: {:?}", v.failures);
     assert_eq!(v.seq_dropped, Some(2), "delta still reported");
+}
+
+/// Under the `Offered` completeness, the failure text names the accepted
+/// and the unlanded counts apart, and the verdict counts both as
+/// undelivered.
+#[test]
+fn offered_completeness_names_unlanded_apart_from_missing() {
+    let base = snap(&[("exec-0", 10)], 10);
+    let fin = snap(&[("exec-0", 50)], 50);
+    let v = evaluate(&EvalInput {
+        counts: counts(300, 297, 295, 0),
+        missing: 2,
+        unlanded: 3,
+        completeness: Completeness::Offered,
+        ..base_input(&base, &fin)
+    });
+    assert!(!v.pass);
+    assert_eq!((v.missing, v.unlanded), (5, 3));
+    let text = v
+        .failures
+        .iter()
+        .find(|f| f.contains("must-deliver"))
+        .expect("a must-deliver failure");
+    assert!(
+        text.contains("5 offered") && text.contains("2 accepted") && text.contains("3 unlanded"),
+        "{text}"
+    );
+}
+
+/// Under the `Accepted` completeness, an unlanded transaction is not
+/// undelivered.
+#[test]
+fn accepted_completeness_ignores_unlanded() {
+    let base = snap(&[("exec-0", 10)], 10);
+    let fin = snap(&[("exec-0", 50)], 50);
+    let v = evaluate(&EvalInput {
+        unlanded: 3,
+        ..base_input(&base, &fin)
+    });
+    assert!(v.pass, "{:?}", v.failures);
+    assert_eq!(v.missing, 0);
 }

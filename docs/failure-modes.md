@@ -112,7 +112,7 @@ Each service publishes its lifecycle state on the `events` stream. The stream gi
 
 | Root | Reaction |
 |---|---|
-| Sealer `sealer_no_quorum` | The ingress sets the root after 10 s with no status frame. It pauses submits. The sequencer pauses after 10 s with no boundary. Its publish loop offers nothing until a boundary returns. |
+| Sealer `sealer_no_quorum` | The ingress sets the root after 10 s with no status frame. It pauses submits. The sequencer pauses after 10 s with no boundary. Its publish loop offers nothing until a boundary returns. After a status with the snapshot notice, both wait 60 s: a Raft snapshot stops the frames until it is complete. |
 | Sealer `da_lag` | The ingress pauses submits. Deposits and boundaries continue. |
 | Sealer `record_lag` | The ingress pauses submits. Deposits and boundaries continue. |
 | Every executor halted | The ingress pauses submits. |
@@ -158,6 +158,7 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The ingress mirrors the frame in the gauges `kardamom_ingress_cluster_posted_head`, `_sealed_head`, `_retained_frames` and `_floor_block`.
   - The ingress raises `da_lag` while the frame says halted, and clears it when the frame says not halted.
   - Any status frame ends a `sealer_no_quorum` halt.
+  - The status before a Raft snapshot carries the snapshot notice. The consensus module sends nothing until the snapshot is complete, and on a loaded disk that takes many seconds. After the notice, the ingress waits 60 s for the next status, not 10 s.
 - **Retention floor.** `kardamom.cluster.retention` is a minimum, not a maximum.
   - A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor.
@@ -432,7 +433,7 @@ The executors are deterministic state machines. One dead or lagging replica neve
 - **State-DB volume loss**
   - Trigger: the state DB is wiped. The process did not only crash.
   - Effect: without a checkpoint, the executor must replay the whole canonical stream from genesis. That cost is unbounded as the chain ages.
-  - Recovery: with `--checkpoint-dir`, the executor writes periodic consistent snapshots (`compact_to`, an online read-only copy that never blocks the writer). On a cold start with an empty state directory, it restores the newest checkpoint before it opens the env. The normal resume path then replays only the short tail. The replicas are deterministic at the same block, so the checkpoint of a **peer** is a valid restore source.
+  - Recovery: with `--checkpoint-dir`, the executor writes periodic consistent snapshots (`compact_to`, an online read-only copy that never blocks the writer). The writer cuts each image to its used pages, so the manifest hash and a peer transfer read about the size of the state, not the 256 MiB growth step. On a cold start with an empty state directory, it restores the newest checkpoint before it opens the env. The normal resume path then replays only the short tail. The replicas are deterministic at the same block, so the checkpoint of a **peer** is a valid restore source.
   - Proof: `state-checkpoint-restore`. The case wipes the state of executor-0 and re-replicates the checkpoint of executor-1. It asserts that executor-0 restores from that checkpoint, not from genesis, and rejoins.
 - **Replay-window overrun**
   - Trigger: the cluster keeps a bounded canonical window (`kardamom.cluster.retention`, default 65,536 frames, about 5 minutes at 200 tps). A `REPLAY_FROM` below the floor of the window is refused with `REPLAY_UNAVAILABLE`. The window is a minimum. A frame past it stays until L1 holds its block (see "DA-lag guard and posted-head retention floor"). The retained frames are in the cluster snapshot, so a member that restores from a snapshot keeps the floor at the posted head. A cursor that is older than the window is the trigger.

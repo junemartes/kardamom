@@ -226,6 +226,9 @@ impl EgressItem {
             floor_index: rd_u64(buf, 34)?,
             floor_block: rd_u64(buf, 42)?,
             record_lag: Self::decode_record_lag_tail(buf)?,
+            snapshot_follows: buf
+                .get(super::STATUS_SNAPSHOT_FLAG_OFFSET)
+                .is_some_and(|flag| *flag != 0),
             retained_bytes: Self::decode_retained_bytes_tail(buf)?,
         }))
     }
@@ -586,8 +589,8 @@ pub fn encode_status(status: &ClusterStatus) -> Vec<u8> {
     b.extend_from_slice(&lag.best_recorded.unwrap_or(u64::MAX).to_le_bytes());
     b.extend_from_slice(&lag.budget.to_le_bytes());
     b.push(u8::from(lag.halted));
+    b.push(u8::from(status.snapshot_follows));
     if let Some(retained_bytes) = status.retained_bytes {
-        b.push(0);
         b.extend_from_slice(&retained_bytes.to_le_bytes());
     }
     b

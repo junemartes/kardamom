@@ -94,10 +94,11 @@ class SealerRecordLagTest {
         assertEquals(before + 1, ofKind(publisher, SealerWire.EGRESS_KIND_STATUS).size(),
             "a cursor that moves the best up broadcasts the status");
         final ByteBuffer s = lastStatus(publisher);
-        assertEquals(67, s.capacity());
+        assertEquals(68, s.capacity());
         assertEquals(2L, s.getLong(50), "best recorded");
         assertEquals(0L, s.getLong(58), "the guard is off");
         assertEquals(0, s.get(66));
+        assertEquals(0, s.get(67), "no snapshot follows");
 
         deliver(executor, IngressFrames.recordedCursorFrame(0, 1L));
         assertEquals(before + 1, ofKind(publisher, SealerWire.EGRESS_KIND_STATUS).size(),

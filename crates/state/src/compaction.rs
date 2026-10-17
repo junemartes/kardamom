@@ -47,12 +47,7 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let c_path = CString::new(dest.as_os_str().as_encoded_bytes()).map_err(|_| {
-        StateError::Recovery(format!(
-            "compaction dest path contains NUL: {}",
-            dest.display()
-        ))
-    })?;
+    let c_path = MdbxPath::new(dest, "compaction dest")?;
 
     let rc = env.raw().with_raw_env_ptr(|env_ptr| unsafe {
         ffi::mdbx_env_copy(env_ptr, c_path.as_ptr(), ffi::MDBX_CP_COMPACT)
@@ -65,4 +60,28 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
 
     info!("compaction complete");
     Ok(())
+}
+
+/// A path in the form that the libmdbx C API takes: NUL-terminated, with
+/// no NUL inside.
+pub(crate) struct MdbxPath(CString);
+
+impl MdbxPath {
+    /// Convert `path`. `what` names the path in the error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::Recovery`] if `path` contains a NUL byte.
+    pub(crate) fn new(path: &Path, what: &str) -> Result<Self, StateError> {
+        CString::new(path.as_os_str().as_encoded_bytes())
+            .map(Self)
+            .map_err(|_| {
+                StateError::Recovery(format!("{what} path contains NUL: {}", path.display()))
+            })
+    }
+
+    /// The pointer for the C call. It is valid while `self` lives.
+    pub(crate) fn as_ptr(&self) -> *const std::ffi::c_char {
+        self.0.as_ptr()
+    }
 }

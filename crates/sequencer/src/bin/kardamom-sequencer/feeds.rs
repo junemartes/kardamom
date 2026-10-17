@@ -36,7 +36,6 @@ use kardamom_log::aeron_live::{
     TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
     TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
-use kardamom_obs::events::SEALER_SILENCE;
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::process;
 use kardamom_sequencer::config::SequencerConfig;
@@ -53,6 +52,7 @@ use kardamom_sequencer::resync::{
     elapsed_ms_saturating,
 };
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
+use kardamom_types::cluster_status::SilenceDeadline;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{AccountRow, ReceiptBatch};
 use origin_pump::OriginPump;
@@ -139,10 +139,12 @@ pub(crate) struct EgressWatermarkFeed {
     /// condition persists, `flag`'s re-arm repeats the flag once per
     /// silence window: a bounded, genuinely alarming heartbeat.
     last_boundary_at: Option<Instant>,
-    /// When the last boundary arrived, never re-armed. Past
-    /// [`SEALER_SILENCE`] the replica pauses on the sealer's lost quorum;
-    /// the next boundary resumes it.
-    last_boundary_seen: Instant,
+    /// The silence since the last boundary, never re-armed. Past its
+    /// budget the replica pauses on the sealer's lost quorum; the next
+    /// boundary resumes it. A status with the snapshot notice gives the
+    /// snapshot budget: the leader sends no boundary until the snapshot
+    /// is complete, so that gap is neither a lag nor a lost quorum.
+    silence: SilenceDeadline,
 }
 
 impl EgressWatermarkFeed {
@@ -163,7 +165,7 @@ impl EgressWatermarkFeed {
             origins,
             last_origin: 0,
             last_boundary_at: Some(Instant::now()),
-            last_boundary_seen: Instant::now(),
+            silence: SilenceDeadline::new(Instant::now()),
         }
     }
 
@@ -195,15 +197,18 @@ impl EgressWatermarkFeed {
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
         let now = Instant::now();
+        if self.silence.in_snapshot(now) {
+            return;
+        }
         self.flag(now);
         self.pause_on_silence(now);
     }
 
     /// Pause the replica on the sealer's lost quorum once no boundary
-    /// arrived for [`SEALER_SILENCE`]. A frame that is not a boundary
+    /// arrived for the silence budget. A frame that is not a boundary
     /// does not end the silence.
     fn pause_on_silence(&self, now: Instant) {
-        if now.saturating_duration_since(self.last_boundary_seen) >= SEALER_SILENCE {
+        if self.silence.expired(now).is_some() {
             process().follow(Some(HaltRef::sealer(HaltCause::SealerNoQuorum)));
         }
     }
@@ -225,6 +230,9 @@ impl EgressWatermarkFeed {
             return;
         }
         if self.on_origin_gap_frame(frame) {
+            return;
+        }
+        if self.on_status_frame(frame) {
             return;
         }
         // Check the cheap kind byte first. Relayed records arrive at
@@ -405,17 +413,40 @@ impl EgressWatermarkFeed {
         true
     }
 
+    /// Handle one status frame. Returns `true` when `frame` was a status.
+    /// A status with the snapshot notice starts the snapshot stall: until
+    /// its budget ends or the next boundary arrives, the boundary gap
+    /// neither flags a lag nor pauses the replica. A plain status does
+    /// not prove the boundary clock, so it changes nothing here.
+    fn on_status_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.first() != Some(&wire::EGRESS_KIND_STATUS) {
+            return false;
+        }
+        if let Ok(EgressItem::Status(status)) = EgressItem::decode(frame)
+            && status.snapshot_follows
+        {
+            self.silence.on_status(&status, Instant::now());
+            tracing::info!(
+                partition = self.partition,
+                "sequencer: the sealer takes a snapshot; the boundaries stop until it is complete"
+            );
+        }
+        true
+    }
+
     /// Store the canonical count from one boundary frame, and re-arm the
     /// silence timer. A 30 second freeze shows up here as one long
     /// inter-arrival gap. The backlog drains instantly on resume, but
     /// the gap between the last pre-freeze arrival and this one is real
-    /// wall-clock time.
+    /// wall-clock time. A gap that a snapshot notice announced is no lag.
     fn on_boundary_frame(&mut self, frame: &[u8]) {
         if let Ok(EgressItem::Boundary(b)) = EgressItem::decode(frame) {
             let now = Instant::now();
-            self.flag(now);
+            if !self.silence.in_snapshot(now) {
+                self.flag(now);
+            }
             self.last_boundary_at = Some(now);
-            self.last_boundary_seen = now;
+            self.silence.on_boundary(now);
             process().follow(None);
             kardamom_obs::ready::mark_now(seq_metrics::LAST_BOUNDARY_UNIX_SECONDS);
             self.watermark.store(b.end_tx_idx.as_index());
