@@ -45,6 +45,9 @@ NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
+# The record refers to the formats by the SHA-256 of their text; the text
+# sits in its own variable under the record path.
+FORMATS_REF = 'sha256:' + hashlib.sha256(FORMATS.encode()).hexdigest()
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -148,11 +151,13 @@ class NomadAPI(BaseHTTPRequestHandler):
         path = self.path.split('?')[0].removeprefix('/v1/var/')
         assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
             and body['Path'] == path, (self.path, body)
-        if path.startswith('kardamom/deploys/'):
+        if path.startswith('kardamom/deploys/') and '/formats/' not in path:
             # The deploy record: two JSON documents in one variable, written
             # with a check-and-set on the modify index. A test clobbers the
-            # record once to stand for another controller.
+            # record once to stand for another controller. Nomad refuses a
+            # variable over 64 KiB.
             assert set(body['Items']) <= {'attempt', 'accepted'}, body
+            assert len(json.dumps(body['Items'])) <= 64 * 1024, len(json.dumps(body['Items']))
             state = self.server.state
             index = state['record_index'].get(path, 0) + int(state.pop('record_clobber', False))
             if int(self.path.split('cas=')[1]) != index:
@@ -164,6 +169,9 @@ class NomadAPI(BaseHTTPRequestHandler):
             state['record_writes'].append(state['records'][path]['attempt']['status'])
             self.respond(body | {'ModifyIndex': index + 1})
             return
+        elif '/formats/' in path:
+            # The registry text of a release, one variable for each text.
+            self.server.state['formats'][path] = body['Items']
         elif path == 'nomad/jobs/cluster':
             assert body['Items'] == {'bootstrap': 'true'}, body
             self.server.state['writes'].append('bootstrap-open')
@@ -202,8 +210,8 @@ class NomadAPI(BaseHTTPRequestHandler):
             if path.startswith('kardamom/deploys/') and path in state['records']:
                 self.respond({'Path': path, 'ModifyIndex': state['record_index'][path],
                               'Items': {k: json.dumps(v) for k, v in state['records'][path].items()}})
-            elif path in state['variables']:
-                self.respond({'Path': path, 'Items': state['variables'][path]})
+            elif path in state['variables'] | state['formats']:
+                self.respond({'Path': path, 'Items': (state['variables'] | state['formats'])[path]})
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -346,7 +354,7 @@ class Deploys(unittest.TestCase):
         # Every loopback address, so the sealer nodes' 127.0.0.<n> resolve here.
         self.api = ThreadingHTTPServer(('0.0.0.0', 0), NomadAPI)
         self.api.state = {'jobs': {}, 'writes': [], 'deployments': {}, 'roles': {},
-                          'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
+                          'variables': {}, 'variable_writes': [], 'formats': {}, 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # One stub for both operator binaries: the smoke of the cluster
@@ -963,7 +971,8 @@ class RecordTest(Deploys):
         self.assertEqual(self.record()['accepted'], attempt)
         self.assertEqual(attempt['status'], 'accepted')
         self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', 'rev-test'))
-        self.assertEqual(attempt['target']['formats'], FORMATS)
+        self.assertEqual(attempt['target']['formats'], FORMATS_REF)
+        self.assertEqual(self.api.state['formats'], {f'kardamom/deploys/local/formats/{FORMATS_REF[7:]}': {'formats': FORMATS}})
         self.assertEqual(attempt['target']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
         self.assertEqual(attempt['changed'], self.api.state['writes'])
         # Every job was new: no version before, version 0 after.
@@ -1088,6 +1097,23 @@ class RecordTest(Deploys):
         self.api.state['missing_images'] = set()
         self.run_deploy()
         self.assertIn('cluster', self.api.state['writes'])
+
+    def test_a_record_with_the_formats_text_gates_and_then_refers_to_it(self):
+        # The record holds the registry text itself, and no formats
+        # variable exists.
+        self.run_deploy()
+        for document in self.record().values():
+            document['target']['formats'] = FORMATS
+        self.api.state['formats'] = {}
+        (self.record_dir / 'accepted.formats.toml').unlink()
+        self.repin('b')
+        self.run_deploy()
+        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+        attempt = self.record()['attempt']
+        self.assertEqual((attempt['status'], attempt['target']['formats'], attempt['before']['formats']),
+                         ('accepted', FORMATS_REF, FORMATS))
+        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
 
     def test_a_coordinated_format_change_refuses_the_rolling_path(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'sealer-snapshot', 'head': 11, 'base': 10},
@@ -1243,7 +1269,7 @@ class RollbackTest(Deploys):
         self.assertEqual(record['attempt']['status'], 'rolled_back')
         self.assertEqual(record['accepted']['restored_from'], record['attempt']['started_at'])
         self.assertEqual(record['accepted']['target']['manifest'], record['attempt']['before']['manifest'])
-        self.assertEqual(record['accepted']['target']['formats'], FORMATS)
+        self.assertEqual(record['accepted']['target']['formats'], FORMATS_REF)
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
 

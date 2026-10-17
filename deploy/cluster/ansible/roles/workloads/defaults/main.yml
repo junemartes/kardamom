@@ -292,6 +292,11 @@ workloads_env: "{{ lookup('env', 'KARDAMOM_ENV') | default('local', true) }}"
 workloads_record_dir: "{{ [workloads_cluster_dir, 'deployed', workloads_env] | path_join }}"
 workloads_record_path: "kardamom/deploys/{{ workloads_env }}"
 workloads_record_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_record_path }}?namespace={{ workloads_namespace | urlencode }}"
+# The registry text of a release, in one Nomad variable for each text:
+# <record path>/formats/<hex>, with <hex> the SHA-256 of the text. Nomad
+# limits a variable to 64 KiB, so the record holds the reference
+# sha256:<hex>, not the text.
+workloads_formats_path: "{{ workloads_record_path }}/formats"
 # The quiesce check of the sealer before a change of its decision version
 # (`just sealer-quiesce-check <env>`): the variable holds the decision
 # version of the members and the time of the check.

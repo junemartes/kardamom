@@ -1,6 +1,6 @@
 ---
 # The attempt record, before the first registration. It holds the target
-# (the manifest, the formats, the revision), the version of every job
+# (the manifest, a reference to the formats, the revision), the version of every job
 # Nomad knows (the release that runs), and the rollback floor of the
 # gate. Each registration adds the job to `changed`; the acceptance
 # copies the attempt to `accepted`; a rollback fills `rolled_back`.
@@ -24,6 +24,34 @@
     label: "{{ item.ID }}"
   register: workloads_record_versions
 
+- name: Keep the formats of the target
+  ansible.builtin.set_fact:
+    workloads_target_formats: "{{ lookup('file', workloads_formats_file, rstrip=false) }}"
+
+- name: Keep the reference to the formats of the target
+  ansible.builtin.set_fact:
+    workloads_target_formats_ref: "sha256:{{ workloads_target_formats | hash('sha256') }}"
+
+# The variable of a text is named by the hash of the text, so it holds the
+# same text at each write. The record refers to the text by its hash.
+- name: Store the formats of the target
+  ansible.builtin.uri:
+    url: >-
+      {{ workloads_nomad_addr }}/v1/var/{{ workloads_formats_path }}/{{ workloads_target_formats_hash
+      }}?namespace={{ workloads_namespace | urlencode }}
+    method: PUT
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    body_format: json
+    body:
+      Namespace: "{{ workloads_namespace }}"
+      Path: "{{ workloads_formats_path }}/{{ workloads_target_formats_hash }}"
+      Items:
+        formats: "{{ workloads_target_formats }}"
+  changed_when: true
+  vars:
+    workloads_target_formats_hash: "{{ workloads_target_formats_ref | regex_replace('^sha256:', '') }}"
+
 - name: Compose the attempt record
   ansible.builtin.set_fact:
     workloads_attempt:
@@ -34,7 +62,7 @@
       target:
         revision: "{{ workloads_target_revision }}"
         manifest: "{{ workloads_image_refs }}"
-        formats: "{{ lookup('file', workloads_formats_file, rstrip=false) }}"
+        formats: "{{ workloads_target_formats_ref }}"
         decision_version: "{{ workloads_gate_decision_version | default('') }}"
       before:
         revision: "{{ workloads_accepted.target.revision | default('') }}"

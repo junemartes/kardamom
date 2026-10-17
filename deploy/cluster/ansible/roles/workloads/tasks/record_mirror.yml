@@ -16,9 +16,25 @@
     label: "{{ item.key }}"
   check_mode: false
 
+# A record holds the formats as the reference sha256:<hex> to the variable
+# <formats path>/<hex>, or as the text itself. The mirror writes the text in
+# both cases.
+- name: Read the formats of the accepted release
+  ansible.builtin.uri:
+    url: >-
+      {{ workloads_nomad_addr }}/v1/var/{{ workloads_formats_path }}/{{ workloads_accepted.target.formats
+      | regex_replace('^sha256:', '') }}?namespace={{ workloads_namespace | urlencode }}
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_accepted_formats
+  check_mode: false
+  when: workloads_accepted.target.formats | default('') is match('sha256:')
+
 - name: Mirror the formats of the accepted release
   ansible.builtin.copy:
-    content: "{{ workloads_accepted.target.formats }}"
+    content: >-
+      {{ workloads_accepted_formats.json.Items.formats
+         if workloads_accepted.target.formats is match('sha256:') else workloads_accepted.target.formats }}
     dest: "{{ workloads_record_dir }}/accepted.formats.toml"
     mode: "0644"
   check_mode: false
