@@ -73,6 +73,8 @@ activation = { flag = "KARDAMOM_EXEC_CURSOR", writes = 9 }
 # only when recordLagBudget is above 0. This release reads kind 15 (the
 # relayed reference) and kind 16 (the feed gap, on the member feed only),
 # and sends neither. No frame uses kind 14: a reader drops it as unknown.
+# Kind 255 is local to the Rust client: the session thread puts it on the
+# consumer channel when a session opens. It is never on the wire.
 #
 # The status frame (kind 9) is 50 bytes, 67 bytes with the record-lag
 # fields at the tail, 68 bytes with the snapshot flag after them, or 76

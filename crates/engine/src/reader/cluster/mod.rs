@@ -81,10 +81,19 @@ pub struct ClusterTxOrderingSubscription<E: ClusterEgress, I: ClusterIngress = N
     /// service's replay interleaves with live broadcasts.
     pending_records: BTreeMap<u64, TxOrderingMessage>,
     pending_boundaries: BTreeMap<u64, BlockBoundaryStart>,
-    /// True while a replay is outstanding, after a key gap was seen. In this
-    /// mode, a record may be delivered only once the boundary at `next_block`
-    /// proves it comes before it (`end_tx_idx > index`). In live mode, frames
-    /// arrive in emission order, so an absent boundary is a future boundary.
+    /// True while a replay is outstanding: after a session-start marker, or
+    /// after a key gap. In this mode, a record may be delivered only once
+    /// the boundary at `next_block` proves it comes before it
+    /// (`end_tx_idx > index`). Only `REPLAY_DONE` ends the mode. In live
+    /// mode, frames arrive in emission order, so an absent boundary is a
+    /// future boundary.
+    ///
+    /// A new session must enter this mode even with no key gap. The session
+    /// can receive live frames before its replay, and the first live record
+    /// can have exactly the next index. A boundary that precedes that record
+    /// then arrives only in the replay. Live delivery would put the record
+    /// in the open block, and the executor would execute it, and stream its
+    /// receipt, with the wrong block number.
     catching_up: bool,
     /// Whether deliveries re-export the sealer's boundary stream as
     /// `kardamom_sealer_*` metrics. Only one role per host should emit them:
@@ -284,6 +293,11 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             } => {
                 self.end_replay(up_to_index, up_to_block)?;
             }
+            // A new session starts. Every later frame belongs to it, and
+            // its replay is outstanding. A `REPLAY_DONE` of an earlier
+            // session comes before this marker, so it cannot end this
+            // catch-up.
+            EgressItem::SessionStart => self.catching_up = true,
             EgressItem::ReplayAhead {
                 head_index,
                 head_block,
@@ -389,24 +403,19 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         if b.block_number < nb {
             return Ok(());
         }
-        // Canonical-order guard, for a boundary-only gap across a session
-        // reconnect. A boundary we still owe downstream (block_number >=
-        // next_block) that seals at a record count below the delivery
-        // cursor proves we already delivered records that canonically
-        // follow it. The missed boundary was emitted during a session
-        // outage. The reconnect's first live frame was exactly the
-        // next-index record (no key gap, so no catch-up), and the replayed
-        // boundary arrived too late. Delivering it now would seal its
-        // block with a later block's records inside: a silent
-        // canonical-order divergence between replicas. Fail-stop instead.
-        // A restart resumes from the persisted cursor, and the
-        // REPLAY_FROM on connect re-delivers the whole window in order.
+        // Canonical-order guard. A boundary we still owe downstream
+        // (block_number >= next_block) that seals at a record count below
+        // the delivery cursor proves we already delivered records that
+        // canonically follow it. Delivering it now would seal its block
+        // with a later block's records inside: a silent canonical-order
+        // divergence between replicas. Fail-stop instead. A restart
+        // resumes from the persisted cursor, and the REPLAY_FROM on
+        // connect re-delivers the whole window in order.
         //
-        // Entering catch-up on every session re-establishment would
-        // prevent the inversion. But the session thread lives in
-        // kardamom-cluster-adapter and exposes no reconnect signal. Frames
-        // within one Aeron session are ordered, so this condition has no
-        // false positives.
+        // The catch-up at each session-start marker prevents this order
+        // on a reconnect. A stream with no session-start marker, or a
+        // sealer fault, can still give it. Frames within one Aeron session
+        // are ordered, so this condition has no false positives.
         if b.end_tx_idx.as_index() < ni {
             tracing::error!(
                 block = b.block_number,

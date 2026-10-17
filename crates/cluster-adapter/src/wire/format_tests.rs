@@ -15,11 +15,15 @@ fn known_bytes(known: impl Fn(u8) -> bool) -> Vec<u32> {
         .collect()
 }
 
+/// Whether the reader decodes `kind` as a sealer frame. The client-local
+/// session-start marker is never on the wire, so the registry does not
+/// list it.
 fn is_known_egress_kind(kind: u8) -> bool {
-    !matches!(
-        EgressItem::decode(&[kind]),
-        Err(WireError::BadEgressKind(_))
-    )
+    kind != EGRESS_KIND_SESSION_START
+        && !matches!(
+            EgressItem::decode(&[kind]),
+            Err(WireError::BadEgressKind(_))
+        )
 }
 
 fn is_known_record_type(record_type: u8) -> bool {

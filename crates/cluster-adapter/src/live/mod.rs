@@ -187,6 +187,11 @@ impl ClusterEgress for LiveEgress {
 /// is what keeps the canonical stream gapless across a lost session.
 /// Without it, frames committed between session death and reconnect are
 /// lost forever.
+///
+/// A replay consumer also gets a session-start marker
+/// ([`EgressItem::SessionStart`](crate::wire::EgressItem::SessionStart))
+/// on its channel when each session opens, before any frame of that
+/// session.
 #[derive(Clone)]
 pub struct ReplayOnConnect {
     pub next_index: std::sync::Arc<std::sync::atomic::AtomicU64>,
