@@ -115,6 +115,24 @@ impl AeronRuntime {
         Ok((sub_id, rx))
     }
 
+    /// The correlation id of the first image of the subscription `sub_id`,
+    /// or `None` when it has no image. The driver gives each image its own
+    /// id, so a new image of a publisher that restarted has a new id. A
+    /// subscriber that sends a request to its publisher waits for an image
+    /// first, and sends the request again on each new image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `sub_id` is unknown or closed, or if the command
+    /// round trip times out.
+    pub fn image_id(&self, sub_id: u32) -> Result<Option<i64>, LogError> {
+        request(
+            &self.cmd_tx,
+            |ack| RuntimeCmd::SubImageId { sub_id, ack },
+            "image_id",
+        )
+    }
+
     /// Attach a source endpoint to the subscription `sub_id`. The endpoint
     /// gets its own Aeron subscription, which feeds the frame stream of
     /// `sub_id`. No Aeron multi-destination subscription is used: the

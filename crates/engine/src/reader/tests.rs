@@ -95,10 +95,11 @@ struct VecTxOrderingSub {
     queue: VecDeque<Result<(BPosition, TxOrderingMessage), ExecutorError>>,
 }
 impl TxOrderingSubscription for VecTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
         self.queue
             .pop_front()
             .unwrap_or(Err(ExecutorError::TxOrderingClosed))
+            .map(|(pos, msg)| (pos, msg.into()))
     }
 }
 

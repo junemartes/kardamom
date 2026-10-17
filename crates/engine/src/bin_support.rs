@@ -350,6 +350,35 @@ pub type LiveTxOrderingSub = crate::reader::cluster::ClusterTxOrderingSubscripti
     kardamom_cluster_adapter::LiveIngress,
 >;
 
+/// The live canonical stream with its bytes: the member feed, and no
+/// second source.
+pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
+    crate::reader::carried::AeronFeed,
+    crate::reader::carried::NoSource,
+>;
+
+/// Open the member feed on a dedicated Aeron runtime on `aeron_dir`, the
+/// media driver that the executor shares with its member, and read it from
+/// `cursor`. The feed reads as closed once `stop` is cancelled.
+///
+/// # Errors
+///
+/// Returns `Err` when the runtime fails to spawn, or the feed streams fail
+/// to open.
+pub fn open_member_feed(
+    aeron_dir: Option<&Path>,
+    cursor: crate::reader::cluster::ReplayCursor,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<LiveCarriedSub> {
+    let rt = AeronRuntime::spawn(aeron_dir).context("spawn the member feed AeronRuntime")?;
+    let feed = crate::reader::carried::AeronFeed::open(rt, stop).context("open the member feed")?;
+    Ok(crate::reader::carried::CarriedSubscription::new(
+        feed,
+        crate::reader::carried::NoSource,
+        cursor,
+    ))
+}
+
 /// The batcher's posted-cursor publisher over the live cluster session,
 /// named here for the same reason as [`LiveTxOrderingSub`].
 pub type LiveCursorPublisher =
@@ -597,10 +626,12 @@ pub use kardamom_obs::bin::{init_tracing, wait_for_shutdown};
 /// engine sees `TxDataClosed`. The `tx_ordering` reader blocks on the
 /// cluster egress `recv()`, which returns `None` only once the
 /// `LiveCluster` guard drops, so the reader sees `TxOrderingClosed` next.
+/// An executor that reads the member feed has no cluster session: its
+/// reader sees the feed closed once the token is cancelled.
 pub struct LiveStreams {
     pub stop: tokio_util::sync::DropGuard,
     pub rt: AeronRuntime,
-    pub cluster_guard: kardamom_cluster_adapter::LiveCluster,
+    pub cluster_guard: Option<kardamom_cluster_adapter::LiveCluster>,
 }
 
 /// End the streams. Dropping `streams` at the end of this function

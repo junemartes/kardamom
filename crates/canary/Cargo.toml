@@ -40,5 +40,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 kardamom-formats.workspace = true
+# The fake ingress of the ring tests.
+jsonrpsee = { workspace = true, features = ["server"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

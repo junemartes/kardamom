@@ -119,6 +119,21 @@ impl SubEntry {
         self.sub.image_count()
     }
 
+    /// The correlation id of the first image, or `None` with no image or
+    /// with unreadable image constants. The client retains the image that
+    /// `image_at_index` returns, so this releases it before it returns.
+    fn first_image_id(&self) -> Option<i64> {
+        let image = self.sub.image_at_index(0);
+        if image.get_inner().is_null() {
+            return None;
+        }
+        let id = image.get_constants().ok().map(|c| c.correlation_id());
+        if let Err(e) = self.sub.image_release(&image) {
+            warn!(error = ?e, "image release failed");
+        }
+        id
+    }
+
     /// Log on the transition into the poll-failed state, then latch it. A
     /// run of failing polls on the thread's hot loop then logs once, not
     /// on every pass.
@@ -495,6 +510,16 @@ impl AeronThread {
         })
     }
 
+    /// The correlation id of the first image of the open subscription at
+    /// `sub_id`.
+    fn cmd_image_id(&self, sub_id: u32) -> Result<Option<i64>, LogError> {
+        self.subs
+            .get(sub_id as usize)
+            .and_then(Option::as_ref)
+            .map(|row| row.entry.first_image_id())
+            .ok_or_else(|| LogError::Aeron(format!("image id: no subscription {sub_id}")))
+    }
+
     /// Close a subscription: its destinations drop first, then the row
     /// itself. Each drop releases the handlers and closes the Aeron
     /// subscription of the row. The slot stays `None`.
@@ -580,6 +605,9 @@ impl AeronThread {
             }
             RuntimeCmd::SubRemoveDestination { sub_id, uri, ack } => {
                 let _ = ack.send(self.cmd_remove_destination(sub_id, &uri));
+            }
+            RuntimeCmd::SubImageId { sub_id, ack } => {
+                let _ = ack.send(self.cmd_image_id(sub_id));
             }
             RuntimeCmd::CloseSubscription { sub_id, ack } => {
                 let _ = ack.send(self.cmd_close_subscription(sub_id));

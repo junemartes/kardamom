@@ -28,6 +28,8 @@ metrics = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
 crossbeam-channel = "0.5"
+# The aligned buffer of a raw publish on the member feed's control stream.
+rkyv.workspace = true
 dashmap = { workspace = true }
 # bin_support: shared wiring for the two engine-driven binaries (executor +
 # validator) — CLI arg mirror, genesis loading, async→sync stream bridging,
@@ -49,6 +51,9 @@ kardamom-test-support = { workspace = true, optional = true }
 # instead of copying it. Off by default: a production build never
 # compiles test fixtures in.
 test-support = ["dep:kardamom-test-support"]
+# Tests against a real media driver in a container. They need Docker and
+# run with `--ignored`.
+docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dev-dependencies]
 kardamom-test-support = { workspace = true }

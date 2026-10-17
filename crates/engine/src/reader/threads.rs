@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 
 use tracing::{debug, info, warn};
 
+use kardamom_cluster_adapter::wire::CanonicalTx;
 use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
     BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxEnvelope, TxOrderingMessage, VoidRecord,
@@ -14,7 +15,7 @@ use kardamom_types::{
 
 use crate::error::ExecutorError;
 
-use super::cluster::slot_width;
+use super::Ordered;
 use super::join::{JoinBuffer, JoinOutcome, JoinWait, ReaderConfig, TxDataKey};
 use super::ports::{
     ExecSink, ExecStreamSink, JoinRecovery, JoinRecoveryFactory, TxDataSubscription,
@@ -461,16 +462,15 @@ where
         }
     }
 
-    /// The last canonical slot that `msg` at `position` takes. A boundary
-    /// takes no slot. Every other record takes `slot_width` slots from its
-    /// own index.
-    fn last_slot(position: BPosition, msg: &TxOrderingMessage) -> Option<u64> {
-        if let TxOrderingMessage::BoundaryStart(_) = msg {
+    /// The last canonical slot that `item` at `position` takes. A boundary
+    /// takes no slot. Every other item takes its slots from its own index.
+    fn last_slot(position: BPosition, item: &Ordered) -> Option<u64> {
+        if item.is_boundary() {
             return None;
         }
         position
             .as_index()
-            .checked_add(slot_width(msg).checked_sub(1)?)
+            .checked_add(item.slots().checked_sub(1)?)
     }
 
     /// Send the progress mark of a dispatched message, when it takes a
@@ -482,8 +482,31 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Dispatch one message to its handler.
-    fn dispatch(
+    /// Dispatch one item to its handler.
+    fn dispatch(&mut self, position: BPosition, item: Ordered) -> Result<Flow, ExecutorError> {
+        match item {
+            Ordered::Message(msg) => self.dispatch_message(position, msg),
+            Ordered::Tx(tx) => self.on_carried(tx, position),
+        }
+    }
+
+    /// A canonical entry with its bytes: send its record to the executor
+    /// stream, then dispatch the envelope. No join waits: the entry carries
+    /// the envelope.
+    fn on_carried(&mut self, tx: CanonicalTx, position: BPosition) -> Result<Flow, ExecutorError> {
+        let tx_ref = tx.tx_ref();
+        self.exec_stream
+            .record(position.as_index(), &tx_ref, &tx.envelope)
+            .map_err(|_| Self::stream_closed())?;
+        Ok(self.send(ReaderToExec::Tx {
+            envelope: tx.envelope,
+            position,
+            tx_ref,
+        }))
+    }
+
+    /// Dispatch one message of the reference stream to its handler.
+    fn dispatch_message(
         &mut self,
         position: BPosition,
         msg: TxOrderingMessage,

@@ -4,7 +4,11 @@
 use std::num::NonZeroUsize;
 
 use anyhow::{Context, Result};
+use kardamom_cluster_adapter::{LiveIngress, OfferOutcome};
 use kardamom_engine::bin_support;
+use kardamom_engine::reader::Ordered;
+use kardamom_engine::reader::cluster::RecordedCursorPublisher;
+use kardamom_engine::{BPosition, TxOrderingSubscription};
 use kardamom_engine::{
     CMessage, EngineWiring, ExecPorts, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue,
     MdbxWriterSignal, NoEpochCheck, NoRemoteEpochCheck, NoTxHook, TxReceiptsPublication,
@@ -13,6 +17,7 @@ use kardamom_executor::parallel::StmBlockExec;
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::discovery::{StreamPlane, TxReceiptsReopen};
 use kardamom_state::StateSnapshot;
+use kardamom_types::VoidRecord;
 
 use crate::args::Args;
 
@@ -106,9 +111,51 @@ impl ExecPorts for ExecutorWiring {
 
 impl EngineWiring for ExecutorWiring {
     type TxData = bin_support::LiveTxDataSub;
-    type TxOrdering = bin_support::LiveTxOrderingSub;
+    type TxOrdering = ExecutorOrdering;
     type TxReceipts = LiveTxReceiptsPub;
     type ExecStream = crossbeam_channel::Sender<kardamom_engine::ExecStreamItem>;
+}
+
+/// The canonical stream of the executor.
+pub(crate) enum ExecutorOrdering {
+    /// The references of the cluster egress. The reader joins each one
+    /// with its envelope from `tx_data`.
+    Refs(bin_support::LiveTxOrderingSub),
+    /// The entries with their bytes, from the member feed. It is boxed: it
+    /// is far larger than the reference subscription.
+    Carried(Box<bin_support::LiveCarriedSub>),
+}
+
+impl ExecutorOrdering {
+    /// A publisher of the recorded cursor of executor `executor_id` over
+    /// the cluster session. The member feed has no cluster session.
+    pub(crate) fn recorded_cursor_publisher(
+        &self,
+        executor_id: u8,
+    ) -> Option<RecordedCursorPublisher<LiveIngress>> {
+        match self {
+            Self::Refs(sub) => Some(sub.recorded_cursor_publisher(executor_id)),
+            Self::Carried(_) => None,
+        }
+    }
+}
+
+impl TxOrderingSubscription for ExecutorOrdering {
+    fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
+        match self {
+            Self::Refs(sub) => sub.next(),
+            Self::Carried(sub) => sub.next(),
+        }
+    }
+
+    /// Only the reference stream has entries to void. The carried stream
+    /// has no join, so it never votes.
+    fn vote(&mut self, voter_id: u8, void: &VoidRecord) -> OfferOutcome {
+        match self {
+            Self::Refs(sub) => sub.vote(voter_id, void),
+            Self::Carried(_) => OfferOutcome::NotConnected,
+        }
+    }
 }
 
 /// The live `tx_receipts` publication of this replica, with what a reopen

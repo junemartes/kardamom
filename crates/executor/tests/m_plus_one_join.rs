@@ -118,12 +118,12 @@ struct FakeTxOrderingSubAdapter {
     closed: Arc<AtomicBool>,
 }
 impl TxOrderingSubscription for FakeTxOrderingSubAdapter {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, kardamom_engine::reader::Ordered), ExecutorError> {
         loop {
             let ControlFlow::Break(result) = self.poll_once() else {
                 continue;
             };
-            return result;
+            return result.map(|(pos, msg)| (pos, msg.into()));
         }
     }
 }

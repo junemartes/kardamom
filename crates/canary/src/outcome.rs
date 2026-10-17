@@ -38,8 +38,13 @@ pub enum Outcome {
     RpcError(String),
     /// The status feed reported a rejection with this reason.
     Rejected(String),
-    /// The transaction executed and reverted.
+    /// The transaction executed and reverted: its nonce is used.
     ReceiptStatus0,
+    /// The chain skipped the transaction: the receipt has status 0, and
+    /// the committed nonce did not pass the transaction's nonce. The
+    /// executors skip an invalid transaction, for example one without
+    /// funds for its gas or one with a nonce gap.
+    Skipped,
     Timeout(Stage),
     /// The chain's committed nonce of a ring account is past the
     /// canary's next nonce: another party used the key, or the journal
@@ -93,6 +98,7 @@ impl Outcome {
             Self::RpcError(_) => "rpc_error",
             Self::Rejected(_) => "rejected",
             Self::ReceiptStatus0 => "receipt_status_0",
+            Self::Skipped => "skipped",
             Self::Timeout(_) => "timeout",
             Self::NonceGap => "nonce_gap",
             Self::Unfunded => "unfunded",

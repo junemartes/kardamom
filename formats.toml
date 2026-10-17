@@ -143,6 +143,7 @@ shared = true
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#FEED_REQUEST_LEN",
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/FeedRequest.java#record FeedRequest",
+    "crates/cluster-adapter/src/wire/entry.rs#encode_feed_request",
     "crates/cluster-adapter/testdata/wire_golden.txt#feed_request",
 ]
 
