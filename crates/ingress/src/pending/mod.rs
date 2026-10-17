@@ -449,6 +449,18 @@ fn reason_to_error(sender: Address, nonce: u64, reason: &TxErrorReason) -> Ingre
             recorded_index,
             budget,
         } => IngressError::record_lag(*sealed_index, *recorded_index, *budget),
+        TxErrorReason::SealerNonceAhead {
+            expected_nonce,
+            chain_nonce,
+        } => IngressError::SealerNonceAhead {
+            sender_nonce: (sender, nonce),
+            expected_nonce: *expected_nonce,
+            chain_nonce: *chain_nonce,
+        },
+        TxErrorReason::NonceInFlight { chain_nonce } => IngressError::NonceInFlight {
+            sender_nonce: (sender, nonce),
+            chain_nonce: *chain_nonce,
+        },
     }
 }
 

@@ -178,9 +178,11 @@ async fn reader_connects_lazily_and_gates_freshness_on_the_head() {
     assert_eq!((view.nonce, view.tx_idx), (4, 10));
     assert!(reader.account(Address::repeat_byte(0xbb)).await.is_none());
 
-    // No live head: not fresh. A head within the bound: fresh. The local
-    // layer far beyond the head: stale.
+    // No live head: not fresh. A head within the bound, after the local
+    // layer saw a frame: fresh. The local layer far beyond the head:
+    // stale.
     assert!(!reader.fresh());
+    writer.apply(BPosition::from_index(10), &[]);
     cache.set_head(1, BPosition::from_index(10)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(reader.head(), Some(10));

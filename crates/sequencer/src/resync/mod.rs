@@ -41,8 +41,10 @@ use serde::{Deserialize, Serialize};
 use crate::metrics;
 
 mod answers;
+mod floor;
 
 pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
+pub use floor::{FloorUpdate, Outcome};
 
 /// Milliseconds since `since`, saturated to `u64::MAX`. An elapsed time
 /// this large never happens in practice, and saturating keeps a
@@ -51,109 +53,6 @@ pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
 #[must_use]
 pub fn elapsed_ms_saturating(now: Instant, since: Instant) -> u64 {
     kardamom_types::time::duration_to_ms_saturating(now.duration_since(since))
-}
-
-/// One executed-truth observation. Two sources produce it:
-///
-/// - The `tx_receipts` stream: one update per receipt of this replica's
-///   senders. See [`FloorUpdate::of_receipt`].
-/// - The nonce lookup (`crate::lookup`): an executor reports the committed
-///   account nonce `c`, so every nonce below `c` executed. The task sends
-///   [`Outcome::Executed`] at `c - 1`, and nothing for `c == 0`. The
-///   controller treats both sources the same: the floor rises to `c`, and
-///   published refs at or below `c - 1` count as confirmed, because the
-///   committed state proves them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FloorUpdate {
-    pub sender: Address,
-    pub outcome: Outcome,
-}
-
-/// What one [`FloorUpdate`] proves about its sender.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// The tx at `nonce` executed. It confirms the publish, and it is
-    /// floor evidence: the floor rises to `nonce + 1`.
-    Executed { nonce: u64 },
-    /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
-    /// nonce. Ordering in the canonical log confirms the publish. The
-    /// floor does not rise. The floor logic does not read `reason`.
-    Skipped {
-        nonce: u64,
-        reason: kardamom_types::SkipReason,
-    },
-    /// An L1-originated deposit. It has no L2 nonce, so it is neither a
-    /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
-    /// it, so a genuine nonce-0 tx is never taken for a deposit.
-    Deposit,
-}
-
-impl Outcome {
-    /// The nonce whose publish this confirms. `None` for a deposit.
-    #[must_use]
-    pub(crate) fn confirmed(self) -> Option<u64> {
-        match self {
-            Self::Executed { nonce } | Self::Skipped { nonce, .. } => Some(nonce),
-            Self::Deposit => None,
-        }
-    }
-
-    /// The floor this proves. `Some` only for an executed tx.
-    #[must_use]
-    pub(crate) fn floor(self) -> Option<u64> {
-        match self {
-            Self::Executed { nonce } => Some(nonce.saturating_add(1)),
-            Self::Skipped { .. } | Self::Deposit => None,
-        }
-    }
-}
-
-impl FloorUpdate {
-    /// The update for one receipt. A deposit wins over a skip reason.
-    #[must_use]
-    pub fn of_receipt(receipt: &kardamom_types::Receipt) -> Self {
-        let outcome = match (receipt.is_deposit(), receipt.skip_reason) {
-            (true, _) => Outcome::Deposit,
-            (false, Some(reason)) => Outcome::Skipped {
-                nonce: receipt.nonce,
-                reason,
-            },
-            (false, None) => Outcome::Executed {
-                nonce: receipt.nonce,
-            },
-        };
-        Self {
-            sender: receipt.from,
-            outcome,
-        }
-    }
-
-    /// An executed tx of `sender` at `nonce`.
-    #[must_use]
-    pub fn executed(sender: Address, nonce: u64) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Executed { nonce },
-        }
-    }
-
-    /// A skipped tx of `sender` at `nonce`.
-    #[must_use]
-    pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Skipped { nonce, reason },
-        }
-    }
-
-    /// A deposit to `sender`.
-    #[must_use]
-    pub fn deposit(sender: Address) -> Self {
-        Self {
-            sender,
-            outcome: Outcome::Deposit,
-        }
-    }
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -237,6 +136,11 @@ pub struct ResyncConfig {
     /// Republishing early is harmless, since dedup absorbs it. Republishing
     /// late leaves voided refs unrecovered longer.
     pub confirm_timeout_ms: u64,
+    /// How long a sender must stay behind the sealer's nonce guard before
+    /// the sequencer calls it stuck. Within this time an ordered ref can
+    /// still execute and raise the receipt floor. Sized as the confirm
+    /// timeout: past it, the receipts of every ordered ref have arrived.
+    pub nonce_ahead_settle_ms: u64,
 }
 
 /// [`ResyncConfig::default`]'s dedup ring capacity: `2^17` entries.
@@ -254,6 +158,7 @@ impl Default for ResyncConfig {
             publish_stall_ms: 10_000,
             exit_hold_ms: 2_000,
             confirm_timeout_ms: 15_000,
+            nonce_ahead_settle_ms: 15_000,
         }
     }
 }
@@ -440,10 +345,20 @@ fn warn_once_dead(dead: &mut bool, partition: u32, on_dead: &str) {
     tracing::warn!(partition, "{}", on_dead);
 }
 
-/// One drain of the receipts channel: `(raised_floors, confirmations)`.
-/// Both are `(sender, nonce-or-floor)` lists. See
+/// One drain of the receipts channel. Each list holds
+/// `(sender, nonce-or-floor)` pairs. See
 /// [`ResyncController::drain_floor_updates`].
-pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReceiptDrain {
+    /// The senders whose executed-truth floor rose, with the new floor.
+    pub raised: Vec<(Address, u64)>,
+    /// `(sender, nonce)` for each receipt that confirms a publish.
+    pub confirmations: Vec<(Address, u64)>,
+    /// `(sender, nonce)` for each skip receipt that proves the chain
+    /// expects `nonce` or a lower nonce of the sender next. See
+    /// [`Outcome::released`].
+    pub released: Vec<(Address, u64)>,
+}
 
 impl ResyncController {
     /// # Errors
@@ -494,9 +409,9 @@ impl ResyncController {
     }
 
     /// Drain pending receipt updates (bounded per iteration). Returns
-    /// `(raised_floors, confirmations)`:
+    /// three lists:
     ///
-    /// - `raised_floors`: senders whose executed-truth floor rose, for
+    /// - `raised`: senders whose executed-truth floor rose, for
     ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts
     ///   and deposit receipts are not floor evidence: a skip consumed no
     ///   nonce, and a deposit has no L2 nonce at all.
@@ -510,9 +425,12 @@ impl ResyncController {
     ///   transaction. `Receipt::tx_type` tells the two apart at
     ///   the source, so the exclusion is exactly "is this a deposit?",
     ///   not "is the nonce 0?".
+    /// - `released`: the nonce the chain expects after each skip receipt,
+    ///   for [`crate::state::PartitionState::release_floor`]. Each value
+    ///   is at or above the receipt floor at the time of its skip. So a
+    ///   caller that applies `released` before `raised` ends at the
+    ///   newest proof: a raise that comes after a skip in the stream wins.
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
-        let mut raised = Vec::new();
-        let mut confirmations = Vec::new();
         let updates = drain_bounded(
             &self.floor_rx,
             &mut self.floor_rx_dead,
@@ -520,36 +438,38 @@ impl ResyncController {
             self.partition,
             "floor-update producer disconnected; resync floors are frozen",
         );
-        for u in updates {
-            self.fold_floor_update(u, &mut raised, &mut confirmations);
-        }
-        if !raised.is_empty() {
+        let drain = updates
+            .into_iter()
+            .fold(ReceiptDrain::default(), |drain, u| {
+                self.fold_floor_update(drain, u)
+            });
+        if !drain.raised.is_empty() {
             metrics::record_floor_senders(self.partition, self.floors.len());
         }
-        (raised, confirmations)
+        drain
     }
 
-    /// Fold one floor update into `raised`/`confirmations`, for
-    /// [`Self::drain_floor_updates`]'s loop. See [`Outcome`] for what each
-    /// case proves.
-    fn fold_floor_update(
-        &mut self,
-        u: FloorUpdate,
-        raised: &mut Vec<(Address, u64)>,
-        confirmations: &mut Vec<(Address, u64)>,
-    ) {
+    /// Fold one floor update into `drain`, for
+    /// [`Self::drain_floor_updates`]. See [`Outcome`] for what each case
+    /// proves.
+    fn fold_floor_update(&mut self, mut drain: ReceiptDrain, u: FloorUpdate) -> ReceiptDrain {
         let Some(nonce) = u.outcome.confirmed() else {
-            return;
+            return drain;
         };
-        confirmations.push((u.sender, nonce));
+        drain.confirmations.push((u.sender, nonce));
+        let floor = self.floor(u.sender).unwrap_or(0);
+        if let Some(chain) = u.outcome.released(floor) {
+            drain.released.push((u.sender, chain));
+        }
         let Some(floor) = u.outcome.floor() else {
-            return;
+            return drain;
         };
         let e = self.floors.entry(u.sender).or_insert(0);
         if floor > *e {
             *e = floor;
-            raised.push((u.sender, floor));
+            drain.raised.push((u.sender, floor));
         }
+        drain
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.

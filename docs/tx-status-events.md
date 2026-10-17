@@ -85,6 +85,8 @@ The keys are `snake_case`. An optional field that has no value is left out. It i
 | `insufficient-funds` | left out | The balance does not cover the worst-case cost. |
 | `da-lag` | left out | The sealer refused the transaction because the sealed head is too far past the posted head. Submit again after the batcher posts. |
 | `record-lag` | left out | The sealer refused the transaction because no executor recorded the chain within the record-lag budget. Submit again after an executor records. The guard is off by default until a later release. |
+| `sealer-nonce-ahead` | left out | The sealer nonce guard expects a nonce above the chain nonce after a skipped transaction. The sender is stuck until an operator acts. See [Failure modes](failure-modes.md). |
+| `nonce-in-flight` | left out | The sealer refused the nonce, and an earlier transaction of the sender can still be in flight. Wait for its receipt, then submit again. |
 
 - The reason words are the same as in the `txError` frames of `kardamom_subscribeReceipts`. See [Client JSON-RPC API](json-rpc.md#receipt-subscription).
 - The sequencer fee gate gives `fee-invalid`, `fee-too-low` and `insufficient-funds`. The gate runs only when priority fees are on. See [Priority fees](priority-fees.md).

@@ -5,11 +5,13 @@
 use std::time::Instant;
 
 use alloy_primitives::Address;
+use kardamom_types::num::usize_to_u64;
 use kardamom_types::{TxError, TxErrorReason};
-use tracing::{trace, warn};
+use tracing::warn;
 
 use super::{RefMetadata, Sequencer, SequencerPorts};
 use crate::metrics;
+use crate::nonce_ahead::Verdict;
 use crate::resync::{AnswerDrain, SealerRefusal};
 use crate::state::FreedNonce;
 
@@ -17,20 +19,28 @@ impl Sequencer {
     /// The sealer did not take refs of this sequencer. Three cases, split
     /// in the drain (see `ResyncController::drain_answers`):
     ///
-    /// - Committed-proof (nonce < expected): drop the ledger entry
-    ///   exactly like a receipt confirmation. See
-    ///   `UnconfirmedLedger::drop_committed` for the full story.
+    /// - Past nonce (nonce < expected): see [`Self::apply_past_reject`].
     /// - Gap (nonce >= expected): the sealer did not order `expected`.
     ///   See [`Self::apply_gap`].
     /// - Window full: see [`Self::republish_held`].
-    pub(super) fn apply_sealer_answers(&mut self, r: &mut crate::resync::ResyncController) {
+    pub(super) fn apply_sealer_answers<P: SequencerPorts>(
+        &mut self,
+        r: &mut crate::resync::ResyncController,
+        ports: &mut P,
+    ) {
         let AnswerDrain {
             drops,
             gaps,
             window_full,
         } = r.drain_answers();
-        for (sender, n) in drops {
-            self.drop_committed_and_trace(sender, n);
+        for (sender, nonce, expected) in drops {
+            let past = PastReject {
+                sender,
+                nonce,
+                expected,
+                chain: r.floor(sender).unwrap_or(0),
+            };
+            self.apply_past_reject(ports, past);
         }
         for (sender, expected) in gaps {
             self.apply_gap(sender, expected);
@@ -164,16 +174,66 @@ impl Sequencer {
         Some(refused)
     }
 
-    /// One committed-proof contiguity reject, for
-    /// [`Self::apply_sealer_answers`]'s first loop.
-    fn drop_committed_and_trace(&mut self, sender: Address, n: u64) {
-        if self.unconfirmed.drop_committed(sender, n).is_some() {
-            trace!(
-                sender = ?sender,
-                nonce = n,
-                "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
-            );
+    /// One contiguity reject below the expected nonce, for
+    /// [`Self::apply_sealer_answers`]'s first loop. A copy or a republish
+    /// of an ordered ref has the same id, so the sealer answers it as a
+    /// duplicate or past its deadline before the guard. So a ref that
+    /// reaches the guard below the expected nonce is another transaction
+    /// at a nonce the sealer already holds, or the sealer counted a
+    /// skipped transaction. Four cases:
+    ///
+    /// - The ledger no longer holds the ref: a receipt or an earlier answer
+    ///   settled it. Nothing to tell.
+    /// - `expected` is at most the receipt floor plus the refs in flight:
+    ///   another transaction at the nonce is in flight, for example the
+    ///   one a speed-up replaces. Refuse the ref with the retryable
+    ///   `NonceInFlight`, so its client does not wait for a receipt that
+    ///   never comes.
+    /// - `expected` is above that bound, but the settle time has not
+    ///   passed: the sealer can still hold an ordered ref that this
+    ///   replica does not know, for example after a restart. Refuse the
+    ///   ref with `NonceInFlight` too.
+    /// - `expected` stays above that bound for the settle time: an
+    ///   executor skipped a transaction that the guard counted, and the
+    ///   guard refuses every lower nonce of the sender. Refuse the ref
+    ///   with `SealerNonceAhead`, which names both nonces.
+    ///
+    /// Each refusal takes the ref out of the ledger and marks the nonce,
+    /// so a resubmit is offered again.
+    fn apply_past_reject<P: SequencerPorts>(&mut self, ports: &mut P, past: PastReject) {
+        let PastReject {
+            sender,
+            nonce,
+            expected,
+            chain,
+        } = past;
+        if !self.unconfirmed.contains(sender, nonce) {
+            return;
         }
+        let in_flight = usize_to_u64(self.unconfirmed.count_from(sender, chain));
+        let verdict = if expected <= chain.saturating_add(in_flight) {
+            Verdict::InFlight
+        } else {
+            self.nonce_ahead.observe(sender, chain, Instant::now())
+        };
+        let reason = match verdict {
+            Verdict::Stuck => {
+                metrics::record_sealer_nonce_ahead(self.cfg.partition_index);
+                TxErrorReason::SealerNonceAhead {
+                    expected_nonce: expected,
+                    chain_nonce: chain,
+                }
+            }
+            Verdict::InFlight => TxErrorReason::NonceInFlight { chain_nonce: chain },
+        };
+        self.report_refusal(
+            ports,
+            SealerRefusal {
+                sender,
+                nonce,
+                reason,
+            },
+        );
     }
 
     /// One gap contiguity reject, for
@@ -194,6 +254,20 @@ impl Sequencer {
         );
         self.rewind_for_republish(taken);
     }
+}
+
+/// One contiguity reject below the expected nonce, with the receipt
+/// floor of its sender. See [`Sequencer::apply_past_reject`].
+#[derive(Clone, Copy)]
+struct PastReject {
+    sender: Address,
+    nonce: u64,
+    /// The expected nonce of the reject, raised to the receipt floor.
+    expected: u64,
+    /// The receipt floor of the sender: the next nonce on the chain, as
+    /// far as the receipts prove it. 0 for a sender with no executed
+    /// receipt.
+    chain: u64,
 }
 
 impl RefMetadata {

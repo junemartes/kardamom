@@ -182,6 +182,209 @@ async fn the_receipt_cache_answers_a_retry_before_the_nonce_check() {
     assert!(matches!(err, IngressError::Duplicate(_)), "{err:?}");
 }
 
+/// A skip receipt at the nonce proves that the chain did not use it. The
+/// same tx gets its skip receipt, and another tx at the nonce publishes:
+/// it is not a duplicate.
+#[tokio::test]
+async fn a_skip_receipt_leaves_its_nonce_open() {
+    let f = Fixture::new();
+    let (p, mock) = (&f.proxy, &f.mock);
+    let signer = PrivateKeySigner::random();
+    let raw = sign_legacy(&signer, 0);
+    let tx_hash = alloy_primitives::keccak256(&raw);
+    let skip = kardamom_types::Receipt {
+        status: false,
+        gas_used: 0,
+        skip_reason: Some(kardamom_types::SkipReason::InsufficientFunds),
+        ..receipt(signer.address(), 0, tx_hash, 1)
+    };
+    mock.receipt_bus.send(skip).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let got = p
+        .submit_raw_async(IP, raw)
+        .await
+        .expect("the same tx gets its skip receipt");
+    assert_eq!(got, tx_hash);
+    let other = sign_legacy_value(&signer, 0, 1);
+    let got = p
+        .submit_raw_async(IP, other.clone())
+        .await
+        .expect("another tx at a skipped nonce publishes");
+    assert_eq!(got, alloy_primitives::keccak256(&other));
+}
+
+/// An executor query stub: it answers a balance query with `balance_hex`
+/// and a nonce query with `0x0`, sends `tx_idx` as the snapshot position,
+/// and counts the queries. A raw HTTP server, so it can send the
+/// `x-state-tx-idx` header of the real executor.
+struct ExecutorStub {
+    url: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExecutorStub {
+    async fn start(balance_hex: &'static str, tx_idx: u64) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(Self::answer(sock, balance_hex, tx_idx));
+            }
+        });
+        Self { url, calls, task }
+    }
+
+    /// Read one request and answer it, then close the connection.
+    async fn answer(mut sock: tokio::net::TcpStream, balance_hex: &str, tx_idx: u64) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let value = if request.contains("eth_getBalance") {
+            balance_hex
+        } else {
+            "0x0"
+        };
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{value}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-state-tx-idx: {tx_idx}\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for ExecutorStub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A proxy whose executor query asks `endpoint`. The local layer has seen
+/// position 100.
+fn with_query(endpoint: String) -> Fixture {
+    let cfg = IngressConfig {
+        executor_query: kardamom_cache::ExecutorQueryConfig {
+            endpoints: vec![endpoint],
+            ..kardamom_cache::ExecutorQueryConfig::default()
+        },
+        ..IngressConfig::default()
+    };
+    let f = Fixture::with(cfg, &LiveAccountsConfig::default());
+    let _ = f.mock.apply_rows(
+        BPosition::from_index(100),
+        &[row(Address::repeat_byte(0xee), 0, 0)],
+    );
+    f
+}
+
+/// A sender with no row in any cache layer and no funds on the chain is
+/// refused: the executor answers for it once, and the answer serves the
+/// next submit too.
+#[tokio::test]
+async fn a_cold_unfunded_sender_is_refused_with_one_query() {
+    let stub = ExecutorStub::start("0x0", 100).await;
+    let f = with_query(stub.url.clone());
+    let signer = PrivateKeySigner::random();
+    for nonce in [0, 1] {
+        let err = f
+            .proxy
+            .submit_raw_async(IP, sign_legacy(&signer, nonce))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngressError::InsufficientFunds { have, .. } if have == U256::ZERO),
+            "{err:?}"
+        );
+    }
+    assert_eq!(
+        stub.calls(),
+        2,
+        "one nonce query and one balance query for the cold sender"
+    );
+}
+
+/// An executor far behind the newest position this ingress has seen can
+/// show a new account as unfunded. Its answer is stale: the submit
+/// admits, and the next submit admits too with no new query.
+#[tokio::test]
+async fn a_lagging_executor_answer_admits() {
+    let stub = ExecutorStub::start("0x0", 1).await;
+    let f = with_query(stub.url.clone());
+    let _ = f.mock.apply_rows(
+        BPosition::from_index(1_000_000),
+        &[row(Address::repeat_byte(0xef), 0, 0)],
+    );
+    let signer = PrivateKeySigner::random();
+    for nonce in [0, 1] {
+        f.proxy
+            .submit_raw_async(IP, sign_legacy(&signer, nonce))
+            .await
+            .expect("a stale answer never refuses");
+    }
+    assert_eq!(stub.calls(), 2, "the stale outcome is kept");
+}
+
+/// A restarted ingress on an idle chain has seen no receipt frame, so it
+/// has no head to measure an executor answer against. An unfunded answer
+/// admits and is not kept as a refusal.
+#[tokio::test]
+async fn an_answer_before_the_first_head_admits() {
+    let stub = ExecutorStub::start("0x0", 100).await;
+    let cfg = IngressConfig {
+        executor_query: kardamom_cache::ExecutorQueryConfig {
+            endpoints: vec![stub.url.clone()],
+            ..kardamom_cache::ExecutorQueryConfig::default()
+        },
+        ..IngressConfig::default()
+    };
+    let f = Fixture::with(cfg, &LiveAccountsConfig::default());
+    let signer = PrivateKeySigner::random();
+    for nonce in [0, 1] {
+        f.proxy
+            .submit_raw_async(IP, sign_legacy(&signer, nonce))
+            .await
+            .expect("no head: the answer is stale");
+    }
+    assert_eq!(stub.calls(), 2, "the stale outcome is kept");
+}
+
+/// A cold sender that the executor shows funded is admitted. A failed
+/// query admits, and the next submit of the sender admits at once with
+/// no new query.
+#[tokio::test]
+async fn a_cold_funded_sender_or_a_failed_query_admits() {
+    let stub = ExecutorStub::start("0xde0b6b3a7640000", 100).await;
+    let f = with_query(stub.url.clone());
+    f.proxy
+        .submit_raw_async(IP, sign_legacy(&PrivateKeySigner::random(), 0))
+        .await
+        .expect("a funded cold sender is admitted");
+    // A port that was bound and released: nothing listens on it.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let f = with_query(dead);
+    let signer = PrivateKeySigner::random();
+    for nonce in [0, 1] {
+        f.proxy
+            .submit_raw_async(IP, sign_legacy(&signer, nonce))
+            .await
+            .expect("a failed query admits");
+    }
+}
+
 /// A legacy tx with a value, so its hash differs from `sign_legacy`'s.
 fn sign_legacy_value(signer: &PrivateKeySigner, nonce: u64, value: u64) -> alloy_primitives::Bytes {
     use alloy_consensus::TxLegacy;

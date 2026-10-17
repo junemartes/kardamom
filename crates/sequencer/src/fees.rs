@@ -10,7 +10,8 @@
 //! 3. the sender's balance, as the local account layer sees it, covers
 //!    the worst case the transaction can be charged (`InsufficientFunds`
 //!    otherwise). A sender the layer does not hold passes: the ingress
-//!    checked a fresh balance, and the executor is the truth.
+//!    checked its balance, from a cache layer or from the executor query
+//!    for a cold sender, and the executor is the truth.
 //!
 //! An admitted envelope gets its bid, the tip as an amount in wei, which
 //! rides the sealer's guard header. With the setting off every bid is

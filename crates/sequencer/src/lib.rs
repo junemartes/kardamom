@@ -41,6 +41,7 @@ pub mod fees;
 pub mod inbound;
 pub mod lookup;
 pub mod metrics;
+pub(crate) mod nonce_ahead;
 pub mod outbound;
 pub mod partition;
 mod pause_gate;

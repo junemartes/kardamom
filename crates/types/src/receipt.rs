@@ -293,6 +293,15 @@ impl Receipt {
     pub fn is_deposit(&self) -> bool {
         self.tx_type == TX_TYPE_DEPOSIT
     }
+
+    /// Returns true if this receipt proves that its sender used its
+    /// nonce on the chain: an executed L2 transaction. A skip uses no
+    /// nonce ([`Receipt::is_invalid_skip`]), and a deposit has no L2
+    /// nonce ([`Receipt::is_deposit`]).
+    #[must_use]
+    pub fn uses_nonce(&self) -> bool {
+        !self.is_invalid_skip() && !self.is_deposit()
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +344,29 @@ mod tests {
         assert_eq!(ReceiptBatch::default().end_tx_idx(), None);
         let batch = ReceiptBatch::merge(&[item(0, Vec::new()), item(64, Vec::new())]);
         assert_eq!(batch.end_tx_idx().map(|p| p.term_offset), Some(64));
+    }
+
+    /// An executed transaction uses its nonce, even when it reverts. A
+    /// skip and a deposit use none.
+    #[test]
+    fn only_an_executed_l2_tx_uses_its_nonce() {
+        let executed = Receipt {
+            status: false,
+            gas_used: 21_000,
+            ..Receipt::default()
+        };
+        assert!(executed.uses_nonce());
+        let skip = Receipt {
+            gas_used: 0,
+            ..executed.clone()
+        };
+        assert!(!skip.uses_nonce());
+        let deposit = Receipt {
+            tx_type: TX_TYPE_DEPOSIT,
+            status: true,
+            ..executed
+        };
+        assert!(!deposit.uses_nonce());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_types::{TxDataLoc, TxErrorReason};
+use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::resync::{
@@ -156,6 +156,13 @@ impl Sealed {
         self.floor_tx.send(FloorUpdate::executed(s, nonce)).unwrap();
     }
 
+    /// The skip receipt of the tx of `s` at `nonce` arrives.
+    fn skip(&self, s: Address, nonce: u64, reason: SkipReason) {
+        self.floor_tx
+            .send(FloorUpdate::skip(s, nonce, reason))
+            .unwrap();
+    }
+
     fn errors_of(&self, nonce: u64) -> Vec<TxErrorReason> {
         self.rig
             .errors()
@@ -237,7 +244,9 @@ fn a_refused_tail_is_offered_again_on_resubmit() {
 /// to 3 long ago, and no receipt came. The confirm sweep republishes
 /// them, and the sealer refuses each late copy. The floor stays, a new
 /// nonce publishes at once, and nothing expires. A resubmit of a refused
-/// nonce is offered, and the sealer answers it as a past nonce.
+/// nonce is offered, and the sealer answers it as a past nonce. The
+/// replica holds no ref of the ordered nonces now, and no receipt came,
+/// so the client hears that a nonce is in flight.
 #[test]
 fn a_late_copy_of_an_ordered_ref_keeps_the_floor() {
     let s = signer(23);
@@ -259,7 +268,11 @@ fn a_late_copy_of_an_ordered_ref_keeps_the_floor() {
     sealed.step_after_ttl();
     sealed.submit(&s, 5);
     assert_eq!(sealed.offered_nonces(10), vec![5], "the floor stays at 5");
-    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+    assert_eq!(
+        sealed.errors_but_refusals(),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }],
+        "nothing expires"
+    );
 }
 
 /// The twins of a shard get the same sealer answers in a different
@@ -447,10 +460,10 @@ fn a_reject_below_the_receipt_floor_keeps_the_floor() {
 }
 
 /// The executors are down, so no receipt comes. The sealer ordered 0 to
-/// 3 and rejects a late copy of 2 with `expected=4`, so the ledger entry
-/// of 2 drops. Then a window-full answer for an older copy of 2 comes.
-/// The answer names no expected nonce, so it frees nothing: 4 publishes,
-/// and nothing expires.
+/// 3 and rejects another transaction at 2 with `expected=4`, so the
+/// ledger entry of 2 drops and its client hears `NonceInFlight`. Then a
+/// window-full answer for an older copy of 2 comes. The answer names no
+/// expected nonce, so it frees nothing: 4 publishes, and nothing expires.
 #[test]
 fn a_window_full_answer_never_frees_a_nonce() {
     let s = signer(31);
@@ -463,7 +476,11 @@ fn a_window_full_answer_never_frees_a_nonce() {
     sealed.submit(&s, 4);
     assert_eq!(sealed.offered_nonces(4), vec![4], "no stall");
     sealed.step_after_ttl();
-    assert_eq!(sealed.errors_but_refusals(), vec![], "nothing expires");
+    assert_eq!(
+        sealed.errors_but_refusals(),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }],
+        "nothing expires"
+    );
 }
 
 /// The window has no room for 1 and 2. The ledger holds both, so they
@@ -476,4 +493,126 @@ fn a_window_full_answer_republishes_a_held_ref() {
     sealed.window_full(s.address(), &[1, 2]);
     sealed.step();
     assert_eq!(sealed.offered_nonces(3), vec![1, 2]);
+}
+
+/// The executors skip nonce 0 for lack of funds. The skip uses no nonce,
+/// so the floor goes back to 0: nonce 1 waits on the gap and does not
+/// publish into a nonce gap of the chain, and the resubmit at 0
+/// publishes, with 1 behind it.
+#[test]
+fn a_skip_receipt_reopens_the_skipped_nonce() {
+    let s = signer(41);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.submit(&s, 0);
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(1), Vec::<u64>::new(), "1 waits");
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(1), vec![0, 1]);
+    assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
+}
+
+/// A sequencer whose nonce-guard settle time is 20 ms.
+fn short_settle() -> Sealed {
+    let mut cfg = one_partition_cfg();
+    cfg.resync.nonce_ahead_settle_ms = 20;
+    Sealed::new(cfg)
+}
+
+/// The sealer's guard counted nonces 0 to 2, and the executors skipped
+/// all three. The resubmit at 0 publishes, and the guard rejects it with
+/// `expected=3`. Within the settle time, the client gets the retryable
+/// `NonceInFlight`. The next resubmit is offered again, and after the
+/// settle time its reject tells the client that the guard is ahead of
+/// the chain.
+#[test]
+fn a_guard_ahead_of_the_chain_answers_the_client() {
+    let s = signer(42);
+    let mut sealed = short_settle();
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
+    sealed.skip(s.address(), 1, SkipReason::NonceTooHigh);
+    sealed.skip(s.address(), 2, SkipReason::NonceTooHigh);
+    sealed.step();
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(3), vec![0]);
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    let in_flight = TxErrorReason::NonceInFlight { chain_nonce: 0 };
+    assert_eq!(sealed.errors_of(0), vec![in_flight.clone()]);
+    std::thread::sleep(Duration::from_millis(40));
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(3), vec![0, 0], "offered again");
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    assert_eq!(
+        sealed.errors_of(0),
+        vec![
+            in_flight,
+            TxErrorReason::SealerNonceAhead {
+                expected_nonce: 3,
+                chain_nonce: 0,
+            }
+        ]
+    );
+}
+
+/// The ledger holds nonces 0 to 2, and the guard rejects a ref at 0 with
+/// `expected=3`. A copy of an ordered ref gets a duplicate answer before
+/// the guard, so this ref is another transaction at a nonce in flight,
+/// for example a speed-up. Its client hears `NonceInFlight` and does not
+/// wait for a receipt that never comes. That is the chain nonce plus the
+/// refs in flight, so it is never `SealerNonceAhead`.
+#[test]
+fn another_tx_at_a_nonce_in_flight_hears_of_it() {
+    let s = signer(43);
+    let mut sealed = short_settle();
+    (0..3).for_each(|n| sealed.submit(&s, n));
+    std::thread::sleep(Duration::from_millis(40));
+    sealed.reject(s.address(), &[0], 3);
+    sealed.step();
+    assert_eq!(
+        sealed.errors_of(0),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 0 }]
+    );
+}
+
+/// A receipt settled this replica's own refs at 0 and 1, and then a stale
+/// reject of its copy at 1 arrives. The ledger no longer holds the ref, so
+/// nobody waits on it, and the client hears nothing.
+#[test]
+fn a_stale_reject_of_a_settled_copy_is_silent() {
+    let s = signer(45);
+    let mut sealed = short_settle();
+    (0..4).for_each(|n| sealed.submit(&s, n));
+    sealed.execute(s.address(), 1);
+    sealed.step();
+    sealed.reject(s.address(), &[1], 3);
+    sealed.step();
+    assert_eq!(sealed.errors_but_refusals(), Vec::<TxErrorReason>::new());
+    sealed.submit(&s, 4);
+    assert_eq!(sealed.offered_nonces(4), vec![4], "the floor stays");
+}
+
+/// A replica that restarted holds no ledger entry for the ordered ref at
+/// 1, which has not executed. The client sends a new transaction at 1,
+/// and the guard rejects it with `expected=2`. That is the chain nonce
+/// plus the one ref in flight, so the client hears `NonceInFlight`, after
+/// the settle time too, and never `SealerNonceAhead`.
+#[test]
+fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
+    let s = signer(44);
+    let mut sealed = short_settle();
+    sealed.execute(s.address(), 0);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(0), vec![1]);
+    std::thread::sleep(Duration::from_millis(40));
+    sealed.reject(s.address(), &[1], 2);
+    sealed.step();
+    assert_eq!(
+        sealed.errors_of(1),
+        vec![TxErrorReason::NonceInFlight { chain_nonce: 1 }]
+    );
 }

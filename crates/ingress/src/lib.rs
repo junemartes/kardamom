@@ -27,6 +27,7 @@ pub(crate) mod binary;
 pub mod chain;
 pub mod channels;
 pub mod cluster;
+pub(crate) mod cold_accounts;
 pub mod config;
 pub mod error;
 pub(crate) mod fee_history;

@@ -388,3 +388,48 @@ fn sweep_is_bounded_per_call() {
     assert_eq!(st.sweep_expired(t0 + TTL, 2).len(), 1);
     assert!(st.sweep_expired(t0 + TTL, 2).is_empty());
 }
+
+/// A skip at nonce 0 lowers the floor back to 0. The next nonce 1 then
+/// waits on the gap and does not publish, and a resubmit at 0 publishes.
+/// A release never raises the floor.
+#[test]
+fn release_floor_reopens_the_skipped_nonce() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    st.process(s(1), 0, 0);
+    assert_eq!(st.next_nonce(s(1)), 1);
+    assert_eq!(st.release_floor(s(1), 0), Some(1));
+    assert_eq!(st.release_floor(s(1), 3), None, "a release only lowers");
+    assert_eq!(st.release_floor(s(2), 0), None, "an unknown sender stays");
+    assert_eq!(st.next_nonce(s(1)), 0);
+    assert_eq!(st.process(s(1), 1, 11).outcome, NonceOutcome::Buffered);
+    let out = st.process(s(1), 0, 100);
+    assert_eq!(out.outcome, NonceOutcome::Matched);
+    assert_eq!(
+        out.actions,
+        vec![
+            ProcessAction::Publish {
+                nonce: 0,
+                payload: 100
+            },
+            ProcessAction::Publish {
+                nonce: 1,
+                payload: 11
+            },
+        ]
+    );
+}
+
+/// A refused mark at or above the released floor ends: a submit at that
+/// nonce is no longer a past nonce.
+#[test]
+fn release_floor_ends_the_refused_marks_above_it() {
+    let mut st: PartitionState<u32> = PartitionState::new(8, TTL);
+    (0..4).for_each(|n| {
+        st.process(s(1), n, 0);
+    });
+    st.mark_refused(s(1), 1);
+    st.mark_refused(s(1), 3);
+    st.release_floor(s(1), 2);
+    assert!(st.is_refused(s(1), 1));
+    assert!(!st.is_refused(s(1), 3));
+}

@@ -29,6 +29,7 @@ const LEGACY_COST: u64 = 21_000 * 1_000_000_000;
 /// a test holds so a publish never sees a closed lane.
 struct Fixture {
     proxy: IngressProxy<MockChannels, MockChannels>,
+    mock: MockChannels,
     cache: AccountCache,
     _shard_rx: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
 }
@@ -41,7 +42,7 @@ impl Fixture {
             cache: cfg.clone(),
             ..IngressConfig::default()
         };
-        let proxy = IngressProxy::new(ingress, mock.clone(), mock);
+        let proxy = IngressProxy::new(ingress, mock.clone(), mock.clone());
         // The reader connects in the background.
         for _ in 0..50 {
             if proxy.redis_connected() {
@@ -52,13 +53,15 @@ impl Fixture {
         assert!(proxy.redis_connected(), "the reader connects");
         Self {
             proxy,
+            mock,
             cache,
             _shard_rx: shard_rx,
         }
     }
 
     /// Write one account row at position 10 and publish a live head at
-    /// the same position, so the balance is fresh.
+    /// the same position. The local layer sees a frame at position 10 for
+    /// another account, so it has a head, and the balance is fresh.
     async fn seed(&self, address: Address, nonce: u64, balance: u64) {
         let row = AccountRow {
             address,
@@ -73,6 +76,14 @@ impl Fixture {
             .set_head(0, BPosition::from_index(10))
             .await
             .unwrap();
+        let _ = self.mock.apply_rows(
+            BPosition::from_index(10),
+            &[AccountRow {
+                address: Address::repeat_byte(0xee),
+                nonce: 0,
+                balance: U256::ZERO,
+            }],
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }

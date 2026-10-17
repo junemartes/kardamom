@@ -116,6 +116,33 @@ pub enum IngressError {
         root: kardamom_types::service::HaltRef,
         detail: String,
     },
+    /// The sealer's nonce guard expects a nonce of the sender above the
+    /// nonce the chain expects. An executor skipped an earlier
+    /// transaction of the sender: the skip used no nonce on the chain,
+    /// but the guard counted it. Every lower nonce of the sender is
+    /// refused until an operator resets the guard.
+    #[error(
+        "sender nonce stuck: the sealer expects nonce {expected_nonce} of (sender, nonce) \
+         {sender_nonce:?}, but the chain expects nonce {chain_nonce}; a skipped transaction \
+         advanced the sealer's nonce guard; an operator must reset it"
+    )]
+    SealerNonceAhead {
+        sender_nonce: (Address, u64),
+        expected_nonce: u64,
+        chain_nonce: u64,
+    },
+    /// The sealer's nonce guard is ahead of the chain nonce, but an
+    /// earlier transaction of the sender can still be in flight. The
+    /// client waits for its receipts, then resubmits.
+    #[error(
+        "nonce in flight: the sealer refused (sender, nonce) {sender_nonce:?}; the chain \
+         expects nonce {chain_nonce}, and an earlier transaction of the sender can still be \
+         in flight; wait for its receipt, then resubmit"
+    )]
+    NonceInFlight {
+        sender_nonce: (Address, u64),
+        chain_nonce: u64,
+    },
     /// An operator paused this ingress, for example for maintenance.
     #[error("ingress paused by an operator ({note}); resubmit after the operator resumes it")]
     OperatorPaused { note: String },
@@ -195,6 +222,8 @@ impl From<IngressError> for ErrorObjectOwned {
             | IngressError::InsufficientFunds { .. }
             | IngressError::FeeInvalid { .. }
             | IngressError::FeeTooLow { .. }
+            | IngressError::SealerNonceAhead { .. }
+            | IngressError::NonceInFlight { .. }
             | IngressError::StateUnavailable(_) => -32000,
             // Internal error.
             IngressError::Internal(_) => -32603,
@@ -302,6 +331,36 @@ mod tests {
         .into();
         assert_eq!(rpc.code(), CHAIN_HALTED_CODE);
         assert!(rpc.message().contains("disk swap"), "{}", rpc.message());
+    }
+
+    /// A sender stuck behind the sealer's nonce guard gets a server error
+    /// that names both nonces and the cause, not the invalid-params
+    /// error of a duplicate.
+    #[test]
+    fn sealer_nonce_ahead_names_the_cause() {
+        let rpc: ErrorObjectOwned = IngressError::SealerNonceAhead {
+            sender_nonce: (Address::repeat_byte(0x87), 0),
+            expected_nonce: 25,
+            chain_nonce: 0,
+        }
+        .into();
+        assert_eq!(rpc.code(), -32000);
+        let msg = rpc.message();
+        assert!(msg.starts_with("sender nonce stuck"), "{msg}");
+        assert!(msg.contains("expects nonce 25"), "{msg}");
+        assert!(msg.contains("chain expects nonce 0"), "{msg}");
+        assert!(msg.contains("skipped transaction"), "{msg}");
+        let rpc: ErrorObjectOwned = IngressError::NonceInFlight {
+            sender_nonce: (Address::repeat_byte(0x87), 4),
+            chain_nonce: 4,
+        }
+        .into();
+        assert_eq!(rpc.code(), -32000);
+        assert!(
+            rpc.message().starts_with("nonce in flight"),
+            "{}",
+            rpc.message()
+        );
     }
 
     #[test]

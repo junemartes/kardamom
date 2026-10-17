@@ -3,20 +3,23 @@
 //! validate, cache-answer, admission-check, and publish stages.
 //!
 //! The admission checks read the local account layer, then Redis on a
-//! miss when `[cache]` is on. A miss in both admits: the executor query
-//! is never on this path, so a flood of cold senders costs the
-//! executors nothing. A past nonce answers from a receipt: the local
-//! receipt cache, then the Redis receipt index. The same tx gets its
-//! receipt, across an ingress restart when Redis holds it; another tx
-//! at the nonce is `Duplicate`. With no receipt in either index, it
-//! publishes and the sequencer decides. An unfunded sender rejects as
-//! `InsufficientFunds`, only when the balance is fresh.
+//! miss when `[cache]` is on, then the executor answer for a cold sender
+//! (see `crate::cold_accounts`). Only a fresh answer refuses: a stale,
+//! failed or shed query admits. A past nonce answers from a receipt:
+//! the local receipt cache, then the Redis receipt index. The same tx
+//! gets its receipt, across an ingress restart when Redis holds it;
+//! another tx at a nonce that a receipt proves used is `Duplicate`. A
+//! skip receipt proves no used nonce, so another tx at its nonce
+//! publishes. With no receipt in either index, it publishes and the
+//! sequencer decides. An unfunded sender rejects as `InsufficientFunds`,
+//! only when the balance is fresh. Each refusal is counted by reason and
+//! logged at debug level with the sender and the nonce.
 
 use std::net::IpAddr;
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{B256, Bytes as AlloyBytes, U256};
+use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256};
 use alloy_rlp::Decodable;
 
 use kardamom_cache::metrics as cache_metrics;
@@ -254,19 +257,24 @@ where
     }
 
     /// The sender's latest known state: the local layer, then Redis on a
-    /// miss. Each read is counted.
-    async fn account_state(&self, sender: alloy_primitives::Address) -> Option<AccountState> {
+    /// miss, then the executor answer for a cold sender. Each read is
+    /// counted.
+    async fn account_state(&self, sender: Address) -> Option<AccountState> {
         if let Some(view) = self.live.get(sender) {
             cache_metrics::record_lookup("live", "hit");
             return Some(AccountState { view, fresh: true });
         }
         cache_metrics::record_lookup("live", "miss");
-        let redis = self.redis.as_ref()?;
-        let view = redis.account(sender).await?;
-        Some(AccountState {
-            view,
-            fresh: redis.fresh(),
-        })
+        if let Some(redis) = &self.redis
+            && let Some(view) = redis.account(sender).await
+        {
+            return Some(AccountState {
+                view,
+                fresh: redis.fresh(),
+            });
+        }
+        let view = self.cold.fresh_state(sender).await?;
+        Some(AccountState { view, fresh: true })
     }
 
     /// A past nonce: a receipt index may hold the landed tx. The local
@@ -297,12 +305,7 @@ where
             return Ok(None);
         };
         self.cache.insert(receipt.clone());
-        if receipt.tx_hash != v.tx_hash {
-            count_reject("nonce-conflict");
-            return Err(IngressError::Duplicate((v.sender, v.nonce)));
-        }
-        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
-        Ok(Some(receipt))
+        v.answer_from(&receipt).transpose()
     }
 
     /// The newest sealed block this proxy knows of, the base of the
@@ -391,14 +394,41 @@ impl ValidatedSubmission {
     /// hash, as if it had landed. The submit response must never carry
     /// another tx's identity.
     fn answer_from_cache(&self) -> Option<Result<Receipt, IngressError>> {
-        let prev = self.cached.as_ref()?;
-        if prev.tx_hash != self.tx_hash {
-            count_reject("nonce-conflict");
-            return Some(Err(IngressError::Duplicate((self.sender, self.nonce))));
+        self.answer_from(self.cached.as_ref()?)
+    }
+
+    /// The answer a receipt at the submission's `(sender, nonce)` gives.
+    /// The same tx gets the receipt. Another tx at a nonce that the
+    /// receipt proves used is `Duplicate`. A skip receipt, or a deposit's,
+    /// proves no used nonce: the chain still expects the nonce, so another
+    /// tx at it gets `None` and publishes.
+    fn answer_from(&self, prev: &Receipt) -> Option<Result<Receipt, IngressError>> {
+        if prev.tx_hash == self.tx_hash {
+            // Count it, so received == accepted + rejected holds on every
+            // path.
+            metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+            return Some(Ok(prev.clone()));
         }
-        // Count it, so received == accepted + rejected holds on every path.
-        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
-        Some(Ok(prev.clone()))
+        prev.uses_nonce().then(|| {
+            Err(self.refuse(
+                "nonce-conflict",
+                IngressError::Duplicate((self.sender, self.nonce)),
+            ))
+        })
+    }
+
+    /// Count a refusal of this submission by `reason`, log it at debug
+    /// level with the sender and the nonce, and return `err`.
+    fn refuse(&self, reason: &'static str, err: IngressError) -> IngressError {
+        count_reject(reason);
+        tracing::debug!(
+            sender = %self.sender,
+            nonce = self.nonce,
+            reason,
+            error = %err,
+            "submit refused"
+        );
+        err
     }
 
     /// The balance check against a known state. A stale balance admits
@@ -413,12 +443,14 @@ impl ValidatedSubmission {
             return Ok(());
         }
         if state.view.balance < want {
-            count_reject("insufficient-funds");
-            return Err(IngressError::InsufficientFunds {
-                address: self.sender,
-                have: state.view.balance,
-                want,
-            });
+            return Err(self.refuse(
+                "insufficient-funds",
+                IngressError::InsufficientFunds {
+                    address: self.sender,
+                    have: state.view.balance,
+                    want,
+                },
+            ));
         }
         Ok(())
     }

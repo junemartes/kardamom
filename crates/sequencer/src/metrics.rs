@@ -54,6 +54,16 @@ pub(crate) const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skip
 pub(crate) const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub(crate) const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
 pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
+/// Skip receipts that moved a sender's nonce floor back down. A skip uses
+/// no nonce, so the floor goes back to the nonce the chain expects.
+pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
+/// Contiguity rejects whose expected nonce stays above the chain nonce
+/// plus the refs in flight for the settle time: the sealer's nonce guard
+/// is ahead of the chain after a skip. The sender is stuck until an
+/// operator acts. A client that keeps resubmitting counts once per try,
+/// so alert on a rate that stays above zero over some minutes, not on
+/// one increase.
+pub(crate) const SEALER_NONCE_AHEAD: &str = "kardamom_sequencer_sealer_nonce_ahead_total";
 /// The unix time of the last boundary frame the cluster egress delivered.
 /// The readiness rule requires one within the boundary-silence window:
 /// the sealer emits a boundary every tick, so a recent one proves the
@@ -218,6 +228,14 @@ pub(crate) fn record_floor_senders(partition: u32, senders: usize) {
 
 pub(crate) fn record_floor_advance(partition: u32) {
     bump(RECEIPT_FLOOR_ADVANCES, partition, 1);
+}
+
+pub(crate) fn record_skip_release(partition: u32) {
+    bump(SKIP_RELEASES, partition, 1);
+}
+
+pub(crate) fn record_sealer_nonce_ahead(partition: u32) {
+    bump(SEALER_NONCE_AHEAD, partition, 1);
 }
 
 pub(crate) fn record_canonical_watermark(partition: u32, count: u64) {

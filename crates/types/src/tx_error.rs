@@ -96,6 +96,24 @@ pub enum TxErrorReason {
         recorded_index: u64,
         budget: u64,
     },
+    /// The sealer's nonce guard expects `expected_nonce` of the sender.
+    /// That is above `chain_nonce`, the next nonce on the chain as the
+    /// receipts prove it. An executor skipped a transaction of the
+    /// sender: the skip used no nonce on the chain, but the guard counted
+    /// it. The sealer refuses every lower nonce of the sender until an
+    /// operator resets the guard. The transaction is not ordered.
+    SealerNonceAhead {
+        expected_nonce: u64,
+        chain_nonce: u64,
+    },
+    /// The sealer's nonce guard expects a nonce of the sender above
+    /// `chain_nonce` and above the transactions the sequencer knows are
+    /// in flight. The sealer can hold an ordered transaction that is not
+    /// executed yet, so the sequencer does not call the sender stuck
+    /// before the receipts settle. The transaction is not ordered. The
+    /// client waits for the receipts of its earlier transactions, then
+    /// resubmits.
+    NonceInFlight { chain_nonce: u64 },
 }
 
 impl TxErrorReason {
@@ -113,13 +131,17 @@ impl TxErrorReason {
             Self::InsufficientFunds { .. } => "insufficient-funds",
             Self::DaLag { .. } => "da-lag",
             Self::RecordLag { .. } => "record-lag",
+            Self::SealerNonceAhead { .. } => "sealer-nonce-ahead",
+            Self::NonceInFlight { .. } => "nonce-in-flight",
         }
     }
 
     /// The next nonce the sequencer expects from the sender, for the
     /// reasons that name one. A deadline names a block, a fee reason
     /// names amounts, and a halt names the chain's state, so these
-    /// reasons name no nonce.
+    /// reasons name no nonce. A nonce-guard reason names no nonce either:
+    /// the sealer refuses the chain nonce, and the nonce of the guard is
+    /// above the chain, so neither nonce is one the client can sign.
     #[must_use]
     pub fn expected_nonce(&self) -> Option<u64> {
         match self {
@@ -131,7 +153,9 @@ impl TxErrorReason {
             | Self::FeeTooLow { .. }
             | Self::InsufficientFunds { .. }
             | Self::DaLag { .. }
-            | Self::RecordLag { .. } => None,
+            | Self::RecordLag { .. }
+            | Self::SealerNonceAhead { .. }
+            | Self::NonceInFlight { .. } => None,
         }
     }
 }

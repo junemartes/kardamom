@@ -534,6 +534,26 @@ impl<T> PartitionState<T> {
         Some((cur, dropped))
     }
 
+    /// A skip receipt proves that the chain expects `chain` of `sender`
+    /// next: the skipped transaction used no nonce. Lower the expected
+    /// nonce of `sender` to `chain`, so the sender can sign that nonce
+    /// again. Without this, the floor stays at the skipped nonce plus one:
+    /// the next nonces publish into a nonce gap on the chain and skip too,
+    /// and a resubmit at `chain` is a past nonce for good.
+    ///
+    /// The parked entries stay. An entry at `chain` drains on the next
+    /// [`Self::drain_pending`]. The refused marks at or above `chain` end,
+    /// because a submit at such a nonce is no longer a past nonce.
+    ///
+    /// Returns the previous expected nonce when the floor went down, or
+    /// `None` when it was already at or below `chain`.
+    pub(crate) fn release_floor(&mut self, sender: Address, chain: u64) -> Option<u64> {
+        let cur = self.next_nonce_known(sender).filter(|cur| *cur > chain)?;
+        self.next.insert(sender, chain);
+        self.trim_refused(sender, |n| n < chain);
+        Some(cur)
+    }
+
     // A sequencer cannot locally tell "the twin already ordered the gap"
     // apart from "nobody ordered the gap" (a client-abandoned nonce
     // hole). So a stalled sender must stall here, where it is

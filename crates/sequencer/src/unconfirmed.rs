@@ -71,6 +71,13 @@ impl<T> UnconfirmedLedger<T> {
         self.entries.contains_key(&(sender, nonce))
     }
 
+    /// The refs of `sender` the ledger holds at `from` or a later nonce.
+    pub(crate) fn count_from(&self, sender: Address, from: u64) -> usize {
+        self.entries
+            .range((sender, from)..=(sender, u64::MAX))
+            .count()
+    }
+
     /// Retain a just-published ref until a receipt proves canonical
     /// commitment, and queue it for the confirm-timeout sweep.
     pub(crate) fn record_published(&mut self, sender: Address, nonce: u64, meta: T) {

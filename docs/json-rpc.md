@@ -48,8 +48,8 @@ receipt fields, the errors and the limits.
   6. Decode: the bytes must be an EIP-2718 transaction.
   7. Protocol limits: refuse a blob transaction (type `0x03`). Refuse a gas limit above 16777216 (the EIP-7825 cap).
   8. Signature: recover the sender.
-  9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error.
-  10. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`.
+  9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error. A skip receipt (`status=false`, `gas_used=0`) uses no nonce, so a different transaction at its nonce goes on.
+  10. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`. For a sender that no cache layer holds, the ingress asks an executor once and keeps the answer for 30 s. Only an answer within `max_stale_txs` of the newest position can refuse. A stale, failed or shed query lets the transaction go on.
 - The ingress publishes the transaction with an inclusion deadline: the newest block it has seen plus `--inclusion-horizon-blocks` (default 64).
   - The sealer refuses the transaction after that block. See `past deadline` in [Errors](#errors).
 - Blob (EIP-4844) transactions are not supported.
@@ -195,6 +195,8 @@ A receipt is an Ethereum receipt with two more fields.
 | `insufficient-funds` | `null` | The balance does not cover the worst-case cost. |
 | `da-lag` | `null` | The sealer refused the transaction because the sealed head is too far past the posted head. Submit again after the batcher posts. |
 | `record-lag` | `null` | The sealer refused the transaction because no executor recorded the chain within the record-lag budget. Submit again after an executor records. |
+| `sealer-nonce-ahead` | `null` | The sealer nonce guard expects a nonce above the chain nonce after a skipped transaction. The sender is stuck until an operator acts. |
+| `nonce-in-flight` | `null` | The sealer refused the nonce. An earlier transaction of the sender can still be in flight. Wait for its receipt, then submit again. |
 
 - After a `lagged` frame, the client must poll `eth_getTransactionReceipt` for the transactions it waits for. Then it can continue to read the stream.
 - The subscription ends if the sink closes or a feed closes.
@@ -237,6 +239,8 @@ An error has a JSON-RPC `code` and a `message`. Most errors have no `data` field
 | `-32000` | `max priority fee per gas higher than max fee per gas` | The tip rate is above the fee cap. | No. Sign again with a tip rate within the cap. |
 | `-32000` | `max fee per gas less than block base fee` | The fee cap is below the base fee. | Sign again with a higher cap. |
 | `-32000` | `account state unavailable` | No read layer could answer. | Yes. |
+| `-32000` | `nonce in flight: the sealer refused` | The sealer nonce guard is ahead of the chain nonce, and an earlier transaction of the sender can still be in flight. | Yes, after the receipt of the earlier transaction. |
+| `-32000` | `sender nonce stuck: the sealer expects nonce E ... but the chain expects nonce C` | An executor skipped an earlier transaction of the sender. The sealer nonce guard counted it, and it refuses every lower nonce. See "A skipped transaction leaves its nonce open" in [`failure-modes.md`](failure-modes.md). | No. An operator must act, or the sender moves to a new key. |
 | `-32000` | `block N is not in the fee history` | `eth_feeHistory` asked for a block that the ring does not hold. | Ask for a newer block. |
 | `-32010` | `chain halted: <cause> at <service> (<detail>)` | A halt upstream (the sealer or an executor) stops the chain. The ingress pauses submits. The sealer refuses user records on a DA lag. | Yes, after the root clears. The ingress resumes by itself. |
 | `-32010` | `ingress paused by an operator (<note>)` | An operator paused this ingress. | Yes, after the operator resumes it. |
