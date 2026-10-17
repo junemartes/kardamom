@@ -174,7 +174,7 @@ impl_pump_source!(TxErrorsSubscriberHandle, TxError);
 /// local layer, then its receipts onto the bus, one by one. The rows go
 /// first, so a client its receipt releases sees the new state on its
 /// next submit. A rollback frame goes onto the same bus, so the order of
-/// the stream holds. The pump also puts each rollback into the rollback
+/// the stream holds. The pump then puts each rollback into the rollback
 /// log, which a reader that lags on the bus reads. `TxReceiptsReceiver` has
 /// no constructor outside the log crate, so [`Self::on_frame`] is the
 /// testable step.
@@ -219,12 +219,20 @@ impl ReceiptBatchPump {
     /// rows of the new stream stay. A new one empties the local account
     /// layer first: the rows of the lost blocks carry positions above the
     /// new stream, so the monotone rule would keep their nonces.
+    ///
+    /// The bus takes the rollback before the log does. So a reader that
+    /// lags finds each rollback of the log in the queue of the bus, or the
+    /// bus dropped it. It never finds a rollback that the bus has yet to
+    /// carry.
     fn on_rollback(&mut self, rollback: ReceiptRollback) {
-        if !self.log.send_if_modified(|log| log.push(rollback)) {
+        if self.log.borrow().contains(rollback.id) {
             return;
         }
         self.writer.clear();
         let _ = self.tx.send(ReceiptItem::Rollback(rollback));
+        self.log.send_modify(|log| {
+            log.push(rollback);
+        });
     }
 
     /// Apply the batch's rows at its end position, then fan its receipts

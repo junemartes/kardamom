@@ -37,6 +37,15 @@ pub enum Evidence {
     Lookup { generation: u64 },
 }
 
+impl Evidence {
+    /// Whether a rollback voids this evidence when the controller has
+    /// seen `generation` rollbacks: a lookup answer to a request from
+    /// before the latest of them.
+    pub(crate) fn stale_at(self, generation: u64) -> bool {
+        matches!(self, Self::Lookup { generation: asked } if asked < generation)
+    }
+}
+
 /// One item of the floor channel, in the order of the receipt stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FloorEvent {

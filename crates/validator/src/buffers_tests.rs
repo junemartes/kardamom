@@ -269,11 +269,11 @@ fn receipt_in(idx: u64, block: u64, wsh: u8) -> Receipt {
     }
 }
 
-/// A rollback of one session withdraws its receipts above the block, and
-/// its rows at the positions of those receipts. The other session, and
-/// the receipts and rows at or below the block, stay.
+/// A rollback withdraws the receipts of every session above its block,
+/// and the rows at the positions of those receipts. The receipts and rows
+/// at or below the block stay.
 #[test]
-fn a_rollback_withdraws_one_session_above_its_block() {
+fn a_rollback_withdraws_every_session_above_its_block() {
     let buf = ReceiptBuffer::new();
     let rows = vec![AccountRow::default()];
     for (replica, wsh) in [(R1, 0xaa), (R2, 0xbb)] {
@@ -287,7 +287,7 @@ fn a_rollback_withdraws_one_session_above_its_block() {
             .insert(BPosition::from_index(5), replica, rows.clone());
     }
 
-    buf.roll_back(R1, 2);
+    buf.roll_back(2);
 
     let sessions = |taken: &[Distinct<Receipt>]| -> Vec<ReplicaId> {
         taken.iter().flat_map(|d| d.replicas.clone()).collect()
@@ -296,16 +296,14 @@ fn a_rollback_withdraws_one_session_above_its_block() {
     let at4 = buf.receipts.take(BPosition::from_index(4), wait);
     assert_eq!(sessions(&at4.current), [R1, R2], "block 2 stays");
     let at5 = buf.receipts.take(BPosition::from_index(5), wait);
-    assert_eq!(
-        sessions(&at5.current),
-        [R2],
-        "R1 is withdrawn above block 2"
+    assert!(
+        at5.current.is_empty(),
+        "every session is withdrawn above block 2"
     );
     let rows4 = buf.rows.take(BPosition::from_index(4), wait);
     assert_eq!(Distinct::results(&rows4.current), 2);
     let rows5 = buf.rows.take(BPosition::from_index(5), wait);
-    assert_eq!(rows5.current.len(), 1);
-    assert_eq!(rows5.current[0].replicas, [R2]);
+    assert!(rows5.current.is_empty());
 }
 
 /// A rollback withdraws the BALs of every session above its block: a

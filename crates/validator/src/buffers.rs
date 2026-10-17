@@ -551,16 +551,23 @@ impl ReceiptBuffer {
         reach: Self::REACH,
     };
 
-    /// Withdraw what `replica` published above `to_block`: its receipts of
-    /// the higher blocks, and its rows at the positions of those receipts.
-    /// A rows entry sits at the position of the last receipt of its batch,
-    /// which the same frame carried.
-    pub fn roll_back(&self, replica: ReplicaId, to_block: u64) {
+    /// Withdraw the receipts of every session above `to_block`, and the
+    /// rows at the positions of those receipts. Each run of an executor
+    /// publishes on a new session, so the session of the rollback does not
+    /// name the session of the stale receipts. A rows entry sits at the
+    /// position of the last receipt of its batch, which the same frame
+    /// carried.
+    ///
+    /// The withdrawal also removes valid receipts above `to_block`: those
+    /// of the executors that did not roll back, and those that a late copy
+    /// of the rollback finds already published again. Their positions go
+    /// unverified, never to a divergence. The withdrawal acts only on what
+    /// the buffer holds when the rollback arrives.
+    pub fn roll_back(&self, to_block: u64) {
         let voided = self
             .receipts
-            .withdraw(|_, session, receipt| session == replica && receipt.block_number > to_block);
-        self.rows
-            .withdraw(|pos, session, _| session == replica && voided.contains(&pos));
+            .withdraw(|_, _, receipt| receipt.block_number > to_block);
+        self.rows.withdraw(|pos, _, _| voided.contains(&pos));
     }
 
     #[must_use]

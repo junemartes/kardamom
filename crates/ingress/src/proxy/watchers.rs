@@ -3,9 +3,11 @@
 //! boundaries. Each watcher is a struct that holds the proxy state it
 //! folds items into; [`BroadcastWatcher`] drains the stream into it.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, watch};
 
 use kardamom_types::{
@@ -188,9 +190,9 @@ impl Watch<TxError> for TxErrorsWatcher {
 /// this task ever touches `seen`, so it owns the set by value, with no
 /// `Arc` or lock.
 ///
-/// A rollback applies once for each event. It comes on the bus in stream
-/// order. When the bus drops items, the watcher reads the rollbacks that it
-/// missed from the rollback log of the subscription.
+/// A rollback applies once for each event, in the order of the bus. When
+/// the bus drops items, the watcher reads the rollbacks that it missed
+/// from the rollback log of the subscription. See [`Self::catch_up`].
 struct TxReceiptsWatcher {
     pending: Arc<PendingReceipts>,
     cache: Arc<ReceiptCache>,
@@ -268,18 +270,113 @@ impl Watch<ReceiptItem> for TxReceiptsWatcher {
         }
     }
 
-    /// The bus dropped items, and a rollback can be among them. Apply each
-    /// recent rollback of the log: the ones that this watcher applied
-    /// already change nothing.
-    fn on_lagged(&mut self) {
-        let recent: Vec<ReceiptRollback> = self
-            .rollbacks
+    /// The bus dropped items, and a rollback can be among them. Read on
+    /// until a read of the queue sees no new gap.
+    async fn on_lagged(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) {
+        while self.catch_up(rx).await.is_continue() {}
+    }
+}
+
+impl TxReceiptsWatcher {
+    /// One read of the queue after a gap. The pump puts a rollback on the
+    /// bus before it puts it in the log. So each rollback of the log that
+    /// this watcher did not apply is in the queue, or the bus dropped it.
+    ///
+    /// - A rollback in the queue applies in bus order. The receipts before
+    ///   it on the bus can be above its block, and it must drop them.
+    /// - A rollback that the bus dropped came before the whole queue. It
+    ///   applies first.
+    ///
+    /// When the bus drops items again during the read, a missing rollback
+    /// can still come after the new gap. None then applies from the log,
+    /// and the next read decides. A late rollback only drops valid
+    /// receipts, which the receipt lookup serves again. An early one keeps
+    /// void receipts. `Continue` means a new gap.
+    async fn catch_up(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) -> ControlFlow<()> {
+        let missed = self.unapplied();
+        let queue = LagQueue::read(rx);
+        queue
+            .dropped(missed)
+            .into_iter()
+            .for_each(|rollback| self.on_rollback(rollback));
+        let next = queue.next();
+        for item in queue.items {
+            self.on_item(item).await;
+        }
+        next
+    }
+
+    /// The rollbacks of the subscription log that this watcher did not
+    /// apply, oldest first.
+    fn unapplied(&mut self) -> Vec<ReceiptRollback> {
+        let applied = self.applied.borrow();
+        self.rollbacks
             .borrow_and_update()
             .since(0)
+            .filter(|rollback| !applied.contains(rollback.id))
             .copied()
-            .collect();
-        for rollback in recent {
-            self.on_rollback(rollback);
+            .collect()
+    }
+}
+
+/// The items that the receipt bus holds after a gap, oldest first.
+struct LagQueue {
+    items: Vec<ReceiptItem>,
+    /// False when the bus dropped items again during the read.
+    complete: bool,
+}
+
+impl LagQueue {
+    /// Read the items that `rx` holds now. The read stops at the count of
+    /// its start, so a fast pump does not keep it going.
+    fn read(rx: &mut broadcast::Receiver<ReceiptItem>) -> Self {
+        let held = rx.len();
+        let mut queue = Self {
+            items: Vec::with_capacity(held),
+            complete: true,
+        };
+        while queue.items.len() < held && queue.take(rx).is_continue() {}
+        queue
+    }
+
+    /// Take one item of `rx`. `Break` when the bus is empty, or when it
+    /// dropped items again.
+    fn take(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) -> ControlFlow<()> {
+        match rx.try_recv() {
+            Ok(item) => {
+                self.items.push(item);
+                ControlFlow::Continue(())
+            }
+            Err(TryRecvError::Lagged(_)) => {
+                self.complete = false;
+                ControlFlow::Break(())
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => ControlFlow::Break(()),
+        }
+    }
+
+    /// The rollbacks of `missed` that the bus dropped: after a complete
+    /// read, the ones that are not in the queue.
+    fn dropped(&self, missed: Vec<ReceiptRollback>) -> Vec<ReceiptRollback> {
+        missed
+            .into_iter()
+            .filter(|rollback| self.complete && !self.holds(rollback))
+            .collect()
+    }
+
+    /// Whether the queue holds a rollback of the event of `rollback`.
+    fn holds(&self, rollback: &ReceiptRollback) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, ReceiptItem::Rollback(r) if r.id == rollback.id))
+    }
+
+    /// `Continue` when the bus dropped items again during the read.
+    fn next(&self) -> ControlFlow<()> {
+        if self.complete {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     }
 }

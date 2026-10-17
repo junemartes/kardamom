@@ -34,7 +34,10 @@
 //!
 //! The core does not own the in-flight set or the timeout. The task does.
 //! The core sends one request per park, and the task drops the duplicates.
-//! A timed-out lookup therefore retries on the sender's next park.
+//! A timed-out lookup therefore retries on the sender's next park. The core
+//! also asks again when it drops an answer to a request from before a
+//! rollback. The task does not count a request of a newer generation as a
+//! duplicate, so the new request goes out at once.
 
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;

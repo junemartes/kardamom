@@ -78,12 +78,26 @@ pub enum ExecutorError {
     /// consumer. `block` and `index` name the first difference: the
     /// divergence point. Every block below `block` is equal on both sides,
     /// so a checkpoint below `block` is a valid restart point.
-    /// `stream` is the fingerprint of the frame of the stream at the
-    /// divergence, the same for every consumer of that stream.
+    /// `stream` is the fingerprint of the first frame of `block` in the
+    /// stream. Every consumer of that stream has that frame, so every
+    /// consumer that finds one divergence gets the same fingerprint.
     #[error(
         "the canonical stream diverges from the committed history at block {block} (index {index})"
     )]
     StreamDiverged {
+        block: u64,
+        index: u64,
+        stream: B256,
+    },
+
+    /// The canonical stream differs from the receipts that this consumer
+    /// published above its committed block. The committed history is
+    /// equal, so the state stays. The receipts at and above `block` are
+    /// void. `index` and `stream` are as in [`Self::StreamDiverged`].
+    #[error(
+        "the canonical stream differs from the receipts published above the committed history at block {block} (index {index})"
+    )]
+    PublishedDiverged {
         block: u64,
         index: u64,
         stream: B256,

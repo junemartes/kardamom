@@ -8,7 +8,7 @@ use kardamom_state::{StateEnv, StateEnvBuilder, StateWriter, WriteBatch};
 use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta};
 
 use super::*;
-use crate::marker::Cause;
+use crate::marker::Markers;
 
 /// A state DB with genesis and blocks `1..=upto`, and a checkpoint of each
 /// block in `checkpoints`, in `ckpt_dir`.
@@ -81,7 +81,7 @@ struct Dirs {
     _root: tempfile::TempDir,
     state: PathBuf,
     ckpt: PathBuf,
-    markers: Markers,
+    ledger: ReceiptLedger,
 }
 
 impl Dirs {
@@ -90,8 +90,9 @@ impl Dirs {
         let state = root.path().join("state");
         let ckpt = root.path().join("ckpt");
         std::fs::create_dir_all(&ckpt).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
         Self {
-            markers: Markers::new(&state),
+            ledger: ReceiptLedger::open(Markers::new(&state)).unwrap(),
             state,
             ckpt,
             _root: root,
@@ -104,7 +105,7 @@ impl Dirs {
             checkpoint_peers: peers,
             state_dir: &self.state,
             expected_genesis: None,
-            markers: &self.markers,
+            ledger: &self.ledger,
         }
     }
 }
@@ -118,7 +119,7 @@ fn another_error_stages_nothing() {
         .stage(Some(&ExecutorError::TxOrderingClosed))
         .unwrap();
     assert!(!staged);
-    assert_eq!(dirs.markers.pending().unwrap(), None);
+    assert_eq!(dirs.ledger.markers.pending().unwrap(), None);
     assert_eq!(blocks(&dirs.ckpt), [2, 4]);
     assert!(kardamom_state::has_state_db(&dirs.state).unwrap());
 }
@@ -128,13 +129,19 @@ fn a_local_checkpoint_below_the_divergence_is_staged() {
     let dirs = Dirs::new();
     drop(chain(&dirs.state, &dirs.ckpt, 8, &[2, 4, 6, 8]));
     assert!(dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
-    let pending = dirs.markers.pending().unwrap().expect("a rollback marker");
+    let pending = dirs
+        .ledger
+        .markers
+        .pending()
+        .unwrap()
+        .expect("a rollback marker");
     assert_eq!(
         pending,
-        Cause::Diverged {
+        Void {
+            kept: 5,
             stream: B256::repeat_byte(7)
         }
-        .record(5),
+        .record(),
         "the marker is on disk before the park"
     );
     assert_eq!(blocks(&dirs.ckpt), [2, 4], "the diverged checkpoints go");
@@ -162,7 +169,7 @@ fn no_checkpoint_below_the_divergence_keeps_the_state() {
     drop(chain(&dirs.state, &dirs.ckpt, 6, &[6]));
     assert!(!dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
     assert_eq!(blocks(&dirs.ckpt), [] as [u64; 0]);
-    assert_eq!(dirs.markers.pending().unwrap(), None);
+    assert_eq!(dirs.ledger.markers.pending().unwrap(), None);
     assert!(
         kardamom_state::has_state_db(&dirs.state).unwrap(),
         "the state DB stays for the operator"
@@ -195,7 +202,7 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
     let staged = tokio::task::spawn_blocking({
         let dirs_state = dirs.state.clone();
         let dirs_ckpt = dirs.ckpt.clone();
-        let markers = dirs.markers.clone();
+        let ledger = dirs.ledger.clone();
         move || {
             drop(chain(&dirs_state, &dirs_ckpt, 6, &[6]));
             RollbackRepair {
@@ -203,7 +210,7 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
                 checkpoint_peers: &peers,
                 state_dir: &dirs_state,
                 expected_genesis: None,
-                markers: &markers,
+                ledger: &ledger,
             }
             .stage(Some(&diverged(5)))
             .unwrap()
@@ -212,10 +219,57 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
     .await
     .unwrap();
     assert!(staged);
-    assert_eq!(dirs.markers.pending().unwrap().map(|r| r.to_block), Some(4));
+    assert_eq!(
+        dirs.ledger.markers.pending().unwrap().map(|r| r.to_block),
+        Some(4)
+    );
     assert_eq!(
         blocks(&dirs.ckpt),
         [3],
         "the peer checkpoint below the block"
+    );
+}
+
+/// The stream differs only from receipts published above the committed
+/// history: the record voids them, the ledger drops them, and the state
+/// and the checkpoints stay.
+#[test]
+fn a_published_divergence_keeps_the_state() {
+    let dirs = Dirs::new();
+    drop(chain(&dirs.state, &dirs.ckpt, 4, &[2, 4]));
+    let receipt = |index: u64, block: u64| {
+        kardamom_types::ReceiptRows::bare(kardamom_types::Receipt {
+            tx_idx: BPosition::from_index(index),
+            block_number: block,
+            ..kardamom_types::Receipt::default()
+        })
+    };
+    dirs.ledger.record(&[receipt(4, 5), receipt(5, 6)]).unwrap();
+    let published = ExecutorError::PublishedDiverged {
+        block: 6,
+        index: 5,
+        stream: B256::repeat_byte(7),
+    };
+    assert!(dirs.repair(&[]).stage(Some(&published)).unwrap());
+    assert_eq!(
+        dirs.ledger.markers.pending().unwrap(),
+        Some(
+            Void {
+                kept: 5,
+                stream: B256::repeat_byte(7)
+            }
+            .record()
+        )
+    );
+    match dirs.ledger.tail(0, true).unwrap() {
+        kardamom_engine::reader::carried::PublishedTail::Known(published) => {
+            assert_eq!(published.keys().copied().collect::<Vec<_>>(), [4]);
+        }
+        kardamom_engine::reader::carried::PublishedTail::Unknown => panic!("a known tail"),
+    }
+    assert_eq!(blocks(&dirs.ckpt), [2, 4], "the checkpoints stay");
+    assert!(
+        kardamom_state::has_state_db(&dirs.state).unwrap(),
+        "the state stays"
     );
 }

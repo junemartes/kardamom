@@ -25,6 +25,7 @@
 //! tear down.
 
 mod args;
+mod ledger;
 mod marker;
 mod rollback;
 mod state;
@@ -47,8 +48,8 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
-use marker::RunLedger;
-use turns::{RunEnd, RunInput, Turns, Verdict};
+use ledger::ReceiptLedger;
+use turns::{RunEnd, Turns, Verdict};
 use wiring::{ExecutorOrdering, ExecutorWiring};
 
 /// The state writer and the adapters built from its handle, plus the
@@ -230,7 +231,7 @@ async fn connect_cluster(
     file_cfg: &ExecutorFileConfig,
     plane: &StreamPlane,
     state: &state::PreparedState,
-    window: std::num::NonZeroU64,
+    history: Option<kardamom_engine::reader::carried::LocalHistory>,
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<(
     Option<kardamom_cluster_adapter::LiveCluster>,
@@ -239,7 +240,6 @@ async fn connect_cluster(
     let cursor = bin_support::cluster_replay_cursor(&state.start);
     let aeron_dir = args.aeron_dir.as_deref();
     if args.carry_bytes {
-        let history = state.history(window)?;
         let sub = bin_support::open_member_feed(aeron_dir, cursor, history, stop.clone())?;
         tracing::info!("kardamom-executor: canonical entries via the member feed");
         return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
@@ -294,7 +294,7 @@ struct OutputsConfig<'a> {
     plane: &'a mut StreamPlane,
     aeron_cfg: &'a kardamom_log::config::AeronConfig,
     stop: tokio_util::sync::CancellationToken,
-    ledger: RunLedger,
+    ledger: Option<ReceiptLedger>,
 }
 
 impl Outputs {
@@ -467,7 +467,7 @@ async fn run() -> Result<()> {
 /// its end, repair a refused replay, and return the verdict. Every
 /// handle, the nonce query server's clone of the state env included, is
 /// gone before the repair parks the state.
-async fn run_once(boot: &Boot, input: RunInput) -> Result<Verdict> {
+async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> {
     let args = &boot.args;
     let file_cfg = &boot.file_cfg;
     let Transport {
@@ -492,7 +492,8 @@ async fn run_once(boot: &Boot, input: RunInput) -> Result<Verdict> {
         prepared,
         rollback,
         ledger,
-    } = boot.start_run(input, expected_genesis, shutdown.clone())?;
+        history,
+    } = boot.start_run(window, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions, plus tx_deposits, bridged from async to
     // sync (shared with the validator binary; see `bin_support`). These
@@ -513,20 +514,19 @@ async fn run_once(boot: &Boot, input: RunInput) -> Result<Verdict> {
     let exec_stream_threads = outputs.exec_stream.threads;
 
     let (cluster_guard, tx_ordering_sub) =
-        connect_cluster(args, file_cfg, &plane, &prepared, input.window, &shutdown).await?;
+        connect_cluster(args, file_cfg, &plane, &prepared, history, &shutdown).await?;
     let state::PreparedState {
         env,
         start,
         checkpointer,
     } = prepared;
-    let start_block = start.block;
     outputs.exec_stream.cursor.start(
         boot.cursor_id
             .and_then(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
     );
 
     let WriterAdapters {
-        writer,
+        mut writer,
         snapshots,
         writer_signal,
         writer_queue,
@@ -599,13 +599,17 @@ async fn run_once(boot: &Boot, input: RunInput) -> Result<Verdict> {
         .context("join the exec stream threads")?;
     // The plane's registrations deregister once the engine has stopped.
     plane.shutdown().await;
-    let committed = RunEnd::stop_writer(writer, start_block);
+    // Stop the state writer thread (this closes the delta channel, joins
+    // it, and surfaces its final result). The executor task has finished,
+    // so its adapter clones of the delta sender are already dropped.
+    if let Err(e) = writer.shutdown() {
+        tracing::error!(error = %e, "state writer shutdown returned an error");
+    }
     // End the nonce query server before the repair: it holds a clone of
     // the state env, and the repair parks that env.
     stop_nonce_query(nonce_query).await;
     boot.finish(RunEnd {
         engine_error,
-        committed,
         ledger,
         checkpointer,
         expected_genesis,

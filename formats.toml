@@ -296,6 +296,35 @@ code = ["crates/types/src/receipt.rs#pub struct ReceiptRollback"]
 [format.receipt-rollback.layout]
 ReceiptRollback = "rkyv size 40 align 8"
 
+# Frozen layout. The markers of an executor in its state directory, as
+# text. The rollback marker holds the block and the id of the rollback
+# record that the next run publishes. The running marker holds the boot id
+# of the host while a run is live. Only an executor with --carry-bytes
+# writes them. A release that does not know a marker ignores it.
+[format.executor-markers]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/executor/src/bin/kardamom-executor/marker.rs#struct Markers"]
+[format.executor-markers.layout]
+RollbackMarker = "7 0x0707070707070707070707070707070707070707070707070707070707070707\n"
+
+# Frozen layout. The receipt ledger of an executor (marker-receipts in the
+# state directory): a ring of 65536 slots of 48 bytes, one for each
+# canonical index modulo 65536. A slot holds the index and the block as
+# little-endian u64, then the transaction hash. Block 0 marks an empty
+# slot. Only an executor with --carry-bytes writes it. A release that does
+# not know the file ignores it.
+[format.receipt-ledger]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/executor/src/bin/kardamom-executor/ledger.rs#struct Slot"]
+[format.receipt-ledger.layout]
+Slot = "slots 65536 010000000000000002000000000000000303030303030303030303030303030303030303030303030303030303030303"
+
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.
 [format.notifier-outbox]

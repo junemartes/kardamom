@@ -79,3 +79,27 @@ fn the_window_widens_up_to_its_limit() {
     assert_eq!(turns.window, MAX_COMPARE_BLOCKS);
     assert!(turns.widen(below()).is_err());
 }
+
+/// A run after a widened run compares the configured window again,
+/// unless it ends below the window again.
+#[test]
+fn the_window_resets_after_a_run_that_is_not_below_it() {
+    let mut turns = Turns::new(NonZeroU64::new(32).unwrap());
+    turns
+        .widen(ExecutorError::DivergedBelowWindow {
+            floor_block: 5,
+            widen: true,
+        })
+        .unwrap();
+    assert_eq!(turns.window.get(), 128);
+    turns.settle(&Verdict::Revolve);
+    assert_eq!(turns.window.get(), 32);
+}
+
+/// The pause doubles from 1 s up to the longest pause.
+#[test]
+fn the_pause_doubles_up_to_its_limit() {
+    let mut turns = Turns::new(NonZeroU64::new(32).unwrap());
+    let pauses: Vec<u64> = (0..8).map(|_| turns.next_pause().as_secs()).collect();
+    assert_eq!(pauses, [1, 2, 4, 8, 16, 30, 30, 30]);
+}

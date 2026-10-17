@@ -6,6 +6,7 @@
 
 use kardamom_types::TxDataLoc;
 
+use kardamom_sequencer::lookup::{LookupRequest, LookupRequester};
 use kardamom_sequencer::resync::{
     Evidence, FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer,
 };
@@ -256,4 +257,50 @@ fn a_rollback_voids_the_floor_and_the_lost_nonce_publishes_again() {
     rig.step(&mut seq).unwrap();
     let published: Vec<_> = rig.refs().iter().map(|r| r.tx_data_position).collect();
     assert_eq!(published, vec![pos(0), pos(64)], "nonces 1 and 2 publish");
+}
+
+/// A rollback voids the lookup answer to a request from before it. The
+/// sequencer then asks again at the new generation, and the answer to that
+/// request drains the parked transaction of the cold sender.
+#[test]
+fn a_stale_lookup_answer_asks_the_lookup_again() {
+    let s = signer(6);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 5, 70));
+    let (mut seq, floor_tx) = resync_sequencer();
+    let (requester, mut requests) = LookupRequester::channel();
+    seq.enable_nonce_lookup(requester);
+    let asked = |generation| LookupRequest {
+        sender: s.address(),
+        generation,
+    };
+    let answer = |generation| {
+        FloorEvent::from(
+            FloorUpdate::executed(s.address(), 4).with_evidence(Evidence::Lookup { generation }),
+        )
+    };
+
+    rig.step(&mut seq).unwrap();
+    assert_eq!(requests.try_recv().ok(), Some(asked(0)), "the park asks");
+
+    floor_tx
+        .send(FloorEvent::Rollback(ReceiptRollback {
+            to_block: 5,
+            ..Default::default()
+        }))
+        .unwrap();
+    rig.step(&mut seq).unwrap();
+    floor_tx.send(answer(0)).unwrap();
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().is_empty(), "the stale answer sets no floor");
+    assert_eq!(
+        requests.try_recv().ok(),
+        Some(asked(1)),
+        "the sequencer asks again at the new generation"
+    );
+
+    floor_tx.send(answer(1)).unwrap();
+    rig.step(&mut seq).unwrap();
+    let published: Vec<_> = rig.refs().iter().map(|r| r.tx_data_position).collect();
+    assert_eq!(published, vec![pos(0)], "the new answer drains nonce 5");
 }

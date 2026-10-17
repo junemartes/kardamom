@@ -1,15 +1,23 @@
 //! The automatic rollback after a divergence of the canonical stream.
 //!
 //! The reader of the member feed ends a run with the divergence point when
-//! the stream differs from the committed history: the cluster continued
-//! from a shorter log after a power loss on a majority of the members.
-//! Between two runs, [`RollbackRepair`] removes the local checkpoints at and
-//! above the divergence block, chooses the newest checkpoint below it (a
-//! local one first, then one of a peer), and parks the diverged state DB.
-//! The next run restores a checkpoint below the block, publishes the
-//! rollback record of the marker before its first receipt, and executes
-//! the new stream from the checkpoint. With no checkpoint below the block,
-//! the executor stops as before, and the operator restores it.
+//! the stream differs from the committed history, or from the receipts that
+//! the executor published above it: the cluster continued from a shorter
+//! log after a power loss on a majority of the members. Between two runs,
+//! [`RollbackRepair`] writes the rollback record, and removes the void
+//! receipts from the receipt ledger.
+//!
+//! - A divergence of the committed history also needs an older state. The
+//!   repair removes the local checkpoints at and above the divergence
+//!   block, chooses the newest checkpoint below it (a local one first, then
+//!   one of a peer), and parks the diverged state DB. The next run restores
+//!   that checkpoint. With no checkpoint below the block, the executor
+//!   stops as before, and the operator restores it.
+//! - A divergence of the published receipts keeps the state: the committed
+//!   history is equal.
+//!
+//! The next run publishes the rollback record before its first receipt, and
+//! executes the new stream.
 
 use std::path::Path;
 
@@ -17,8 +25,10 @@ use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use kardamom_engine::ExecutorError;
 use kardamom_state::BlockRange;
+use kardamom_types::ReceiptRollback;
 
-use crate::marker::{Cause, Markers};
+use crate::ledger::ReceiptLedger;
+use crate::marker::Void;
 
 /// Where the checkpoint of a rollback is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,19 +47,29 @@ impl Found {
     }
 }
 
+/// What a divergence voids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The committed history: the state rolls back to a checkpoint.
+    Committed,
+    /// Only the receipts published above the committed history.
+    Published,
+}
+
 /// What the rollback between two runs needs.
 pub(crate) struct RollbackRepair<'a> {
     pub(crate) checkpoint_dir: Option<&'a Path>,
     pub(crate) checkpoint_peers: &'a [String],
     pub(crate) state_dir: &'a Path,
     pub(crate) expected_genesis: Option<B256>,
-    pub(crate) markers: &'a Markers,
+    pub(crate) ledger: &'a ReceiptLedger,
 }
 
 impl RollbackRepair<'_> {
     /// Stage the rollback for `err`, when it is a divergence. Returns
     /// whether a rollback is staged: `false` for every other error, and
-    /// when no checkpoint below the divergence block exists.
+    /// when no checkpoint below a divergence of the committed history
+    /// exists.
     ///
     /// The rollback marker is on disk before the park, so a crash after
     /// the park still publishes the record, and the next start restores
@@ -58,35 +78,70 @@ impl RollbackRepair<'_> {
     /// # Errors
     ///
     /// Returns `Err` when the removal of a diverged checkpoint, the write
-    /// of the marker, or the park of the state DB fails.
+    /// of the marker, the void of the ledger, or the park of the state DB
+    /// fails.
     pub(crate) fn stage(&self, err: Option<&ExecutorError>) -> Result<bool> {
-        let Some(ExecutorError::StreamDiverged {
-            block,
-            index,
-            stream,
-        }) = err
-        else {
-            return Ok(false);
+        let (reach, block, index, stream) = match err {
+            Some(ExecutorError::StreamDiverged {
+                block,
+                index,
+                stream,
+            }) => (Reach::Committed, *block, *index, *stream),
+            Some(ExecutorError::PublishedDiverged {
+                block,
+                index,
+                stream,
+            }) => (Reach::Published, *block, *index, *stream),
+            _ => return Ok(false),
         };
         tracing::warn!(
             block,
             index,
-            "the canonical stream diverges from the committed history; rolling back"
+            ?reach,
+            "the canonical stream diverges from this executor; rolling back"
         );
-        let (Some(dir), Some(restore)) = (self.checkpoint_dir, BlockRange::below(*block)) else {
-            return Ok(Self::unrecoverable(*block));
+        let Some(kept) = BlockRange::below(block) else {
+            return Ok(Self::unrecoverable(block));
+        };
+        let record = Void {
+            kept: kept.max,
+            stream,
+        }
+        .record();
+        match reach {
+            Reach::Committed => self.restore(block, kept, record),
+            Reach::Published => {
+                self.mark(block, record)?;
+                metrics::counter!(kardamom_engine::metrics::ROLLBACK_TOTAL, "outcome" => "receipts-only")
+                    .increment(1);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Write the rollback record, then remove the receipts that it voids
+    /// from the ledger: the receipts of `block` and above.
+    fn mark(&self, block: u64, record: ReceiptRollback) -> Result<()> {
+        self.ledger.markers.raise(record)?;
+        self.ledger.void(block)
+    }
+
+    /// Stage a checkpoint in `restore` for a divergence of the committed
+    /// history at `block`, and park the diverged state DB.
+    fn restore(&self, block: u64, restore: BlockRange, record: ReceiptRollback) -> Result<bool> {
+        let Some(dir) = self.checkpoint_dir else {
+            return Ok(Self::unrecoverable(block));
         };
         let diverged = BlockRange {
-            min: *block,
+            min: block,
             ..BlockRange::ANY
         };
         let removed = kardamom_state::remove_checkpoints(dir, diverged)
             .context("remove the diverged checkpoints")?;
         let Some(found) = self.find(dir, restore) else {
-            return Ok(Self::unrecoverable(*block));
+            return Ok(Self::unrecoverable(block));
         };
-        let record = Cause::Diverged { stream: *stream }.record(restore.max);
-        self.markers.raise(record)?;
+        self.mark(block, record)?;
         kardamom_state::park_state_db(self.state_dir).context("park the diverged state DB")?;
         metrics::counter!(kardamom_engine::metrics::ROLLBACK_TOTAL, "outcome" => found.label())
             .increment(1);

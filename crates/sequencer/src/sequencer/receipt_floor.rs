@@ -22,12 +22,21 @@ impl Sequencer {
     /// rollback that voids them. Proven-duplicate buffered entries drop,
     /// and newly contiguous runs surface through `drain_pending` in
     /// `run_once`.
-    pub(super) fn apply_receipt_drain(&mut self, r: &mut crate::resync::ResyncController) {
+    ///
+    /// Returns the senders whose floor a new lookup must learn: each
+    /// forgotten floor, and each sender whose lookup answer a rollback
+    /// voided. A request carries the rollback generation of `r`, so the
+    /// caller sends the requests after `r` is back in `self.resync`.
+    pub(super) fn apply_receipt_drain(
+        &mut self,
+        r: &mut crate::resync::ResyncController,
+    ) -> Vec<Address> {
         let ReceiptDrain {
             raised,
             confirmations,
             released,
             forgotten,
+            stale_lookups,
             sealer,
         } = r.drain_floor_updates();
         // A receipt proves that every one of this sequencer's published
@@ -45,14 +54,15 @@ impl Sequencer {
         for (sender, floor) in raised {
             self.apply_one_floor_update(sender, floor);
         }
-        for sender in forgotten {
+        for &sender in &forgotten {
             self.forget_one_floor(sender);
         }
         r.observe(Instant::now());
+        forgotten.into_iter().chain(stale_lookups).collect()
     }
 
     /// One voided floor, for [`Self::apply_receipt_drain`]'s loop: the
-    /// nonce state forgets the sender, and a lookup learns its floor again
+    /// nonce state forgets the sender. A lookup learns its floor again
     /// from the committed state.
     fn forget_one_floor(&mut self, sender: Address) {
         self.nonce_ahead.forget(sender);
@@ -63,7 +73,6 @@ impl Sequencer {
             forgotten,
             "rollback: the nonce floor is unknown again; asking for the committed nonce"
         );
-        self.request_lookup(sender);
     }
 
     /// One skip release, for [`Self::apply_receipt_drain`]'s loop: the

@@ -59,6 +59,9 @@ rand_chacha = "0.9"
 kardamom-obs = { path = "../obs", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile.workspace = true
+# The format registry: a test checks the layout of the state-dir files
+# against it.
+kardamom-formats.workspace = true
 
 [[bench]]
 name = "sequential_throughput"

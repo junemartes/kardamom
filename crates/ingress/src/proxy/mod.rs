@@ -46,10 +46,13 @@ use crate::tx_error_dedup::TxErrorDedup;
 pub(crate) trait Watch<T> {
     fn on_item(&mut self, item: T) -> impl Future<Output = ()> + Send;
 
-    /// The stream dropped items that this watcher did not read. The
-    /// default skips the gap: a watcher whose stream carries no state to
-    /// recover reads on.
-    fn on_lagged(&mut self) {}
+    /// The stream dropped items that this watcher did not read. `rx`
+    /// reads the items after the gap. The default skips the gap: a watcher
+    /// whose stream carries no state to recover reads on.
+    fn on_lagged(&mut self, rx: &mut broadcast::Receiver<T>) -> impl Future<Output = ()> + Send {
+        let _ = rx;
+        std::future::ready(())
+    }
 }
 
 /// Owns a `broadcast::Receiver<T>` and the watcher it feeds. Drains the
@@ -80,7 +83,9 @@ where
             match self.rx.recv().await {
                 Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => self.watcher.on_lagged(),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    self.watcher.on_lagged(&mut self.rx).await;
+                }
             }
         }
     }

@@ -20,7 +20,7 @@ use kardamom_state::StateSnapshot;
 use kardamom_types::VoidRecord;
 
 use crate::args::Args;
-use crate::marker::RunLedger;
+use crate::ledger::ReceiptLedger;
 
 /// `tx_receipts` publication: the receipt stream and the boundary
 /// side-stream, opened through the stream plane. With discovery, this
@@ -33,7 +33,7 @@ pub(crate) async fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
     plane: &mut StreamPlane,
     args: &Args,
-    ledger: RunLedger,
+    ledger: Option<ReceiptLedger>,
 ) -> Result<LiveTxReceiptsPub> {
     let handle = plane
         .tx_receipts_publisher(rt_pub, args.recorder_id)
@@ -170,8 +170,9 @@ pub(crate) struct LiveTxReceiptsPub {
     reopen: TxReceiptsReopen,
     rt_pub: AeronRuntime,
     tokio: tokio::runtime::Handle,
-    /// The blocks of the published receipts, and the rollback marker.
-    ledger: RunLedger,
+    /// The receipt ledger and the rollback marker, with `--carry-bytes`
+    /// only.
+    ledger: Option<ReceiptLedger>,
 }
 
 impl LiveTxReceiptsPub {
@@ -190,6 +191,18 @@ impl LiveTxReceiptsPub {
             };
         }
         ExecutorError::State(detail)
+    }
+
+    /// Write the receipts to the ledger before their publish. A failed
+    /// write is a transient error: the must-deliver loop retries the
+    /// batch, and publishes no receipt that is not in the ledger.
+    fn record(&self, items: &[kardamom_types::ReceiptRows]) -> Result<(), ExecutorError> {
+        let Some(ledger) = &self.ledger else {
+            return Ok(());
+        };
+        ledger
+            .record(items)
+            .map_err(|e| ExecutorError::State(format!("write the receipt ledger: {e}")))
     }
 }
 
@@ -231,14 +244,14 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         &mut self,
         items: &[kardamom_types::ReceiptRows],
     ) -> (usize, Option<ExecutorError>) {
+        if let Err(e) = self.record(items) {
+            return (0, Some(e));
+        }
         match self
             .handle
             .publish_receipts(&kardamom_types::ReceiptBatch::merge(items))
         {
-            Ok(_) => {
-                self.ledger.published(items);
-                (items.len(), None)
-            }
+            Ok(_) => (items.len(), None),
             Err(e) => (0, Some(Self::publish_error("publish_receipts", &e))),
         }
     }
@@ -252,7 +265,9 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         self.handle
             .publish_rollback(&rollback)
             .map_err(|e| Self::publish_error("publish_rollback", &e))?;
-        self.ledger.rollback_published(rollback);
+        if let Some(ledger) = &self.ledger {
+            ledger.rollback_published(rollback);
+        }
         Ok(())
     }
 
@@ -260,10 +275,10 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         match msg {
             CMessage::Receipt(r) => {
                 let rows = [kardamom_types::ReceiptRows::bare(r)];
+                self.record(&rows)?;
                 self.handle
                     .publish_receipt(&rows[0].receipt)
                     .map_err(|e| Self::publish_error("publish_receipt", &e))?;
-                self.ledger.published(&rows);
                 Ok(())
             }
             // Best-effort: a block-boundary marker. Ingress acks on the receipt

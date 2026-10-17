@@ -337,17 +337,19 @@ impl ReceiptsSinks {
         }
     }
 
-    /// `replica` rolled its state back to `rollback.to_block`. Its
+    /// `replica` rolled its state back to `rollback.to_block`. The
     /// buffered results above the block can be gone from the chain, and
-    /// it publishes them again from the new stream. Withdraw them, so an
-    /// old result does not meet the local result as a divergence.
+    /// the executor publishes them again from the new stream. Its earlier
+    /// sessions published the stale results, so withdraw the results of
+    /// every session. Then an old result does not meet the local result
+    /// as a divergence.
     fn roll_back(&self, replica: ReplicaId, rollback: kardamom_types::ReceiptRollback) {
         tracing::warn!(
             session = replica.session(),
             to_block = rollback.to_block,
-            "an executor rolled back: withdrawing its buffered results above the block"
+            "an executor rolled back: withdrawing the buffered results above the block"
         );
-        self.receipts.roll_back(replica, rollback.to_block);
+        self.receipts.roll_back(rollback.to_block);
         self.bals.roll_back(rollback.to_block);
     }
 }

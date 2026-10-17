@@ -592,7 +592,7 @@ impl Sequencer {
         let Some(mut r) = self.resync.take() else {
             return;
         };
-        self.apply_receipt_drain(&mut r);
+        let lookups = self.apply_receipt_drain(&mut r);
         // The refusals go before the contiguity rejects, so a refused ref
         // and the rejects of the later refs settle in one iteration. The
         // two arrive on different channels, so the order is not certain,
@@ -604,6 +604,11 @@ impl Sequencer {
         self.apply_sealer_answers(&mut r, ports);
         let releases = r.sealer_takes_releases();
         self.resync = Some(r);
+        // A lookup request reads the rollback generation from
+        // `self.resync`, so the requests go after the controller is back.
+        for sender in lookups {
+            self.request_lookup(sender);
+        }
         if releases {
             let (_, refs, _) = ports.split();
             self.releases.flush(refs);

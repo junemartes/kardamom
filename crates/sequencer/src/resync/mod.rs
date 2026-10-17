@@ -348,7 +348,7 @@ impl Floor {
     fn voided_by(self, cut: Cut) -> bool {
         match self.evidence {
             Evidence::Receipt { block } => cut.to_block.is_some_and(|to_block| block > to_block),
-            Evidence::Lookup { generation } => generation < cut.generation,
+            Evidence::Lookup { .. } => self.evidence.stale_at(cut.generation),
         }
     }
 }
@@ -420,6 +420,10 @@ pub struct ReceiptDrain {
     /// now. A drain ends at a rollback, so these apply after the other
     /// lists of the same drain.
     pub forgotten: Vec<Address>,
+    /// The senders of the lookup answers that a rollback after their
+    /// request voided. Their floor is still unknown, and nothing else asks
+    /// the lookup again for a parked sender, so the caller asks again.
+    pub stale_lookups: Vec<Address>,
     /// The nonce releases for the sealer's guard: one for each skip
     /// receipt that proves the chain nonce. See
     /// [`FloorUpdate::sealer_release`].
@@ -489,7 +493,7 @@ impl ResyncController {
     }
 
     /// Drain pending receipt updates (bounded per iteration). Returns
-    /// three lists:
+    /// these lists:
     ///
     /// - `raised`: senders whose executed-truth floor rose, for
     ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts
@@ -513,6 +517,8 @@ impl ResyncController {
     /// - `forgotten`: the senders whose floor a rollback voided. A drain
     ///   ends at a rollback, so a caller that applies `forgotten` last
     ///   ends where the stream is.
+    /// - `stale_lookups`: the senders of the lookup answers that a
+    ///   rollback voided, for a new lookup request.
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let drain =
             self.take_floor_events()
@@ -598,9 +604,11 @@ impl ResyncController {
     /// [`Self::drain_floor_updates`]. See [`Outcome`] for what each case
     /// proves.
     fn fold_floor_update(&mut self, mut drain: ReceiptDrain, u: FloorUpdate) -> ReceiptDrain {
-        let stale =
-            matches!(u.evidence, Evidence::Lookup { generation } if generation < self.generation);
-        let Some(nonce) = u.outcome.confirmed().filter(|_| !stale) else {
+        if u.evidence.stale_at(self.generation) {
+            drain.stale_lookups.push(u.sender);
+            return drain;
+        }
+        let Some(nonce) = u.outcome.confirmed() else {
             return drain;
         };
         drain.confirmations.push((u.sender, nonce));

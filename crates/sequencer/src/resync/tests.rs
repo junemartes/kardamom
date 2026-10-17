@@ -461,7 +461,14 @@ fn a_lookup_answer_to_a_request_from_before_a_rollback_sets_no_floor() {
 
     tx.send(lookup_floor(1, 9, 0)).unwrap();
     let stale = c.drain_floor_updates();
-    assert_eq!(stale, ReceiptDrain::default(), "a stale answer is nothing");
+    assert_eq!(
+        stale,
+        ReceiptDrain {
+            stale_lookups: vec![s(1)],
+            ..ReceiptDrain::default()
+        },
+        "a stale answer only asks again"
+    );
     assert_eq!(c.floor(s(1)), None);
 
     tx.send(lookup_floor(1, 9, 1)).unwrap();

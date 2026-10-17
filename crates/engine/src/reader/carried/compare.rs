@@ -9,8 +9,13 @@
 //! floor below its cursor. It compares each frame below the cursor with
 //! its committed history: the transaction hash of each receipt by index,
 //! and the end, the timestamp and the L1 origin of each header. The first
-//! difference is the divergence point. With no difference, delivery starts
-//! at the cursor.
+//! difference is the divergence point.
+//!
+//! A consumer publishes the receipts of a block before it commits the
+//! block. So the comparison also reads on above the cursor, through the
+//! last block with a receipt that the consumer published there
+//! ([`PublishedTail`]). A difference there makes those receipts void, and
+//! the state stays. With no difference, delivery starts at the cursor.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
@@ -38,6 +43,54 @@ pub struct LocalHistory {
     /// The transaction hash of each receipt from the floor to the cursor,
     /// by canonical index. A skipped transaction has no receipt.
     receipts: HashMap<u64, B256>,
+    /// The receipts published above the cursor.
+    tail: PublishedTail,
+}
+
+/// The receipts that a consumer published above its delivery cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishedTail {
+    /// Every receipt published above the cursor, by canonical index: the
+    /// block and the transaction hash. Empty when none was published.
+    Known(BTreeMap<u64, (u64, B256)>),
+    /// The record of the published receipts can be short, for example
+    /// after a restart of the host. Every receipt above the cursor can be
+    /// void.
+    Unknown,
+}
+
+impl Default for PublishedTail {
+    fn default() -> Self {
+        Self::Known(BTreeMap::new())
+    }
+}
+
+impl PublishedTail {
+    /// Whether the transaction `hash` at `index` of `block` in the stream
+    /// differs from the receipt published at `index`. An index with no
+    /// published receipt does not differ.
+    fn differs_at(&self, index: u64, block: u64, hash: B256) -> bool {
+        match self {
+            Self::Known(published) => published
+                .get(&index)
+                .is_some_and(|receipt| *receipt != (block, hash)),
+            Self::Unknown => true,
+        }
+    }
+
+    /// Whether the boundary `b` of the stream seals its block before a
+    /// receipt that was published in that block or in a block below it.
+    /// The receipts are in index order, so the first one at or above the
+    /// end of the block has the lowest block of them.
+    fn cut_by(&self, b: &BlockBoundaryStart) -> bool {
+        match self {
+            Self::Known(published) => published
+                .range(b.end_tx_idx.as_index()..)
+                .next()
+                .is_some_and(|(_, (block, _))| *block <= b.block_number),
+            Self::Unknown => true,
+        }
+    }
 }
 
 impl LocalHistory {
@@ -86,7 +139,14 @@ impl LocalHistory {
             cursor,
             headers,
             receipts,
+            tail: PublishedTail::default(),
         }))
+    }
+
+    /// This history with the receipts published above its cursor.
+    #[must_use]
+    pub fn with_tail(self, tail: PublishedTail) -> Self {
+        Self { tail, ..self }
     }
 
     /// The committed header of `block`, as the boundary that sealed it.
@@ -121,6 +181,7 @@ impl LocalHistory {
             cursor,
             headers: headers.into_iter().map(|h| (h.block_number, h)).collect(),
             receipts: receipts.into_iter().collect(),
+            tail: PublishedTail::default(),
         }
     }
 
@@ -135,25 +196,21 @@ impl LocalHistory {
 pub(crate) struct Divergence {
     pub(crate) block: u64,
     pub(crate) index: u64,
-    /// The fingerprint of the frame of the stream at the divergence: the
-    /// canonical id of an entry, or the hash of a boundary. Every reader of
-    /// one stream gets the same fingerprint.
+    /// The fingerprint of the first frame of `block` in the stream: the
+    /// canonical id of an entry, or the hash of the boundary of an empty
+    /// block. Every reader of one stream has that frame, also a reader
+    /// that finds the difference at a later frame of the block.
     pub(crate) stream: B256,
 }
 
 impl Divergence {
-    /// The divergence at the boundary `b` of the stream.
-    fn at_boundary(b: &BlockBoundaryStart) -> Self {
-        let fields = [
-            b.block_number,
-            b.end_tx_idx.as_index(),
-            b.l2_timestamp,
-            b.l1_origin,
-        ];
-        Self {
-            block: b.block_number,
-            index: b.end_tx_idx.as_index(),
-            stream: keccak256(fields.map(u64::to_be_bytes).concat()),
+    /// The error of a divergence above the committed history: the
+    /// published receipts at and above the block are void.
+    fn published(self) -> ExecutorError {
+        ExecutorError::PublishedDiverged {
+            block: self.block,
+            index: self.index,
+            stream: self.stream,
         }
     }
 }
@@ -182,6 +239,9 @@ pub(crate) enum Progress {
     Skipped,
     /// The stream differs from a block that equals the history before it.
     Diverged(Divergence),
+    /// The committed history is equal, and the stream differs from a
+    /// receipt published above it.
+    Published(Divergence),
     /// The stream differs at the floor of the window: the first compared
     /// block, or a floor that the source refuses as no point of its
     /// stream. The divergence can be below the floor. A wider window can
@@ -203,6 +263,7 @@ impl Progress {
             Self::Equal => Ok(Some(Settled::Equal)),
             Self::Skipped => Ok(Some(Settled::Skipped)),
             Self::Diverged(d) => Err(d.into()),
+            Self::Published(d) => Err(d.published()),
             Self::BelowWindow { floor_block, widen } => {
                 Err(ExecutorError::DivergedBelowWindow { floor_block, widen })
             }
@@ -240,6 +301,9 @@ pub(crate) struct Compare {
     /// The retention of the source moved the floor up, so a wider window
     /// finds nothing more.
     raised: bool,
+    /// The fingerprint of the first frame of the block that the comparison
+    /// reads now.
+    head: Option<B256>,
 }
 
 impl Compare {
@@ -250,6 +314,7 @@ impl Compare {
             reorder,
             equal_block: false,
             raised: false,
+            head: None,
         }
     }
 
@@ -275,6 +340,7 @@ impl Compare {
     pub(crate) fn rewind(&mut self) {
         self.reorder = Self::reorder_at(self.history.floor);
         self.equal_block = false;
+        self.head = None;
     }
 
     /// The progress of a difference at the floor.
@@ -331,45 +397,104 @@ impl Compare {
         }
     }
 
-    /// Compare one frame. `None` when the frame is equal and the cursor is
-    /// not reached yet.
+    /// Whether the comparison has every frame that it needs: the stream
+    /// is at the delivery cursor, and it sealed each block with a receipt
+    /// published above the cursor. With an unknown tail, the first frame
+    /// above the cursor ends the comparison instead.
+    fn reached(&self) -> bool {
+        let next = self.reorder.next();
+        match &self.history.tail {
+            PublishedTail::Known(published) => published
+                .last_key_value()
+                .map_or(next == self.history.cursor, |(_, (last, _))| next.1 > *last),
+            PublishedTail::Unknown => false,
+        }
+    }
+
+    /// Compare one frame. `None` when the frame is equal and the
+    /// comparison needs more frames.
     fn step(&mut self) -> Result<Option<Progress>, ExecutorError> {
-        if self.reorder.next() == self.history.cursor {
+        if self.reached() {
             return Ok(Some(Progress::Equal));
         }
         let Some((pos, item)) = self.reorder.try_deliver()? else {
             return Ok(Some(Progress::Pending));
         };
-        let progress = match (self.check(pos, &item), self.equal_block) {
-            (None, _) => {
-                self.equal_block |= item.is_boundary();
-                None
-            }
-            (Some(d), true) => Some(Progress::Diverged(d)),
-            (Some(_), false) => Some(self.below_window()),
+        // Epochs and deposits have no hash to compare here: the L1 origin
+        // of the header covers them.
+        let Some(own) = Self::fingerprint(&item) else {
+            return Ok(None);
         };
-        Ok(progress)
+        let head = *self.head.get_or_insert(own);
+        if item.is_boundary() {
+            self.head = None;
+        }
+        let Some((block, index)) = self.check(pos, &item) else {
+            self.equal_block |= item.is_boundary();
+            return Ok(None);
+        };
+        let divergence = Divergence {
+            block,
+            index,
+            stream: head,
+        };
+        let progress = match (block >= self.history.cursor.1, self.equal_block) {
+            (true, _) => Progress::Published(divergence),
+            (false, true) => Progress::Diverged(divergence),
+            (false, false) => self.below_window(),
+        };
+        Ok(Some(progress))
     }
 
-    /// The divergence at one delivered frame, if any. A record compares its
-    /// hash with the receipt at its index. A boundary compares itself with
-    /// the header of its block. Epochs and deposits have no hash to compare
-    /// here: the L1 origin of the header covers them.
-    fn check(&self, pos: BPosition, item: &Ordered) -> Option<Divergence> {
+    /// The fingerprint of an entry or a boundary: the canonical id of the
+    /// entry, or the hash of the fields of the boundary.
+    fn fingerprint(item: &Ordered) -> Option<B256> {
         match item {
-            Ordered::Tx(tx) => {
-                let index = pos.as_index();
-                let local = self.history.receipts.get(&index)?;
-                (*local != tx.canonical_id).then(|| Divergence {
-                    block: self.reorder.next().1,
-                    index,
-                    stream: tx.canonical_id,
-                })
-            }
+            Ordered::Tx(tx) => Some(tx.canonical_id),
             Ordered::Message(TxOrderingMessage::BoundaryStart(b)) => {
-                (self.history.headers.get(&b.block_number) != Some(b))
-                    .then(|| Divergence::at_boundary(b))
+                let fields = [
+                    b.block_number,
+                    b.end_tx_idx.as_index(),
+                    b.l2_timestamp,
+                    b.l1_origin,
+                ];
+                Some(keccak256(fields.map(u64::to_be_bytes).concat()))
             }
+            Ordered::Message(_) => None,
+        }
+    }
+
+    /// The block and the index of a difference at one entry or boundary,
+    /// if any.
+    ///
+    /// - Below the cursor, an entry compares its hash with the committed
+    ///   receipt at its index, and a boundary compares itself with the
+    ///   committed header of its block.
+    /// - Above the cursor, an entry compares its block and its hash with
+    ///   the published receipt at its index, and a boundary must not seal
+    ///   its block before a published receipt of that block.
+    fn check(&self, pos: BPosition, item: &Ordered) -> Option<(u64, u64)> {
+        let (index, block) = (pos.as_index(), self.reorder.next().1);
+        let cursor = self.history.cursor;
+        match item {
+            Ordered::Tx(tx) if index < cursor.0 => {
+                let local = self.history.receipts.get(&index)?;
+                (*local != tx.canonical_id).then_some((block, index))
+            }
+            Ordered::Tx(tx) => self
+                .history
+                .tail
+                .differs_at(index, block, tx.canonical_id)
+                .then_some((block, index)),
+            Ordered::Message(TxOrderingMessage::BoundaryStart(b)) if b.block_number < cursor.1 => {
+                (self.history.headers.get(&b.block_number) != Some(b))
+                    .then_some((b.block_number, b.end_tx_idx.as_index()))
+            }
+            Ordered::Message(TxOrderingMessage::BoundaryStart(b)) => self
+                .history
+                .tail
+                .cut_by(b)
+                .then_some((b.block_number, b.end_tx_idx.as_index())),
             Ordered::Message(_) => None,
         }
     }

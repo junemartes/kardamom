@@ -349,3 +349,136 @@ fn the_history_reads_the_window_from_the_state_db() {
         "nothing to compare at genesis"
     );
 }
+
+/// The history of blocks `1..=3`, with the receipts in `tail` published
+/// above its cursor.
+fn with_tail(tail: PublishedTail) -> LocalHistory {
+    history((0, 1), 3).with_tail(tail)
+}
+
+/// A known tail with one receipt published at index 3 of block 4.
+fn published(hash: B256) -> PublishedTail {
+    PublishedTail::Known([(3, (4, hash))].into())
+}
+
+/// Run a reader of `history` on blocks `1..5` of one entry each, and
+/// return the outcome.
+fn compared(history: LocalHistory) -> Result<(BPosition, Ordered), ExecutorError> {
+    let (mut sub, feed) = reader(history);
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..5);
+    outcome(&mut sub)
+}
+
+#[test]
+fn an_equal_published_tail_delivers_from_the_cursor() {
+    let (mut sub, feed) = reader(with_tail(published(entry(3).canonical_id)));
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..5);
+    let delivery = request(&mut sub, &feed);
+    assert_eq!(
+        (delivery.from_index, delivery.from_block),
+        (3, 4),
+        "the comparison read the published block, and delivery starts at the cursor"
+    );
+}
+
+#[test]
+fn another_entry_at_a_published_index_voids_the_published_receipts() {
+    match compared(with_tail(published(B256::repeat_byte(9)))) {
+        Err(ExecutorError::PublishedDiverged {
+            block,
+            index,
+            stream,
+        }) => assert_eq!((block, index, stream), (4, 3, entry(3).canonical_id)),
+        other => panic!("expected void published receipts, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_block_sealed_before_a_published_receipt_voids_it() {
+    let (mut sub, feed) = reader(with_tail(published(entry(3).canonical_id)));
+    let first = request(&mut sub, &feed);
+    serve(&feed, first.request_id, 1..4);
+    feed.send(boundary(4, 3));
+    feed.send(done(first.request_id, 3, 5));
+    match outcome(&mut sub) {
+        Err(ExecutorError::PublishedDiverged { block, index, .. }) => {
+            assert_eq!((block, index), (4, 3));
+        }
+        other => panic!("expected void published receipts, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_tail_voids_from_the_first_frame_above_the_cursor() {
+    match compared(with_tail(PublishedTail::Unknown)) {
+        Err(ExecutorError::PublishedDiverged {
+            block,
+            index,
+            stream,
+        }) => assert_eq!((block, index, stream), (4, 3, entry(3).canonical_id)),
+        other => panic!("expected void published receipts, got {other:?}"),
+    }
+}
+
+/// Block 3 has two entries, and the second one differs. A reader that
+/// committed block 3 and a reader that only published its receipts name
+/// the divergence with one fingerprint: the first entry of block 3.
+#[test]
+fn one_divergence_has_one_fingerprint() {
+    let lost = B256::repeat_byte(9);
+    let committed = LocalHistory::of(
+        (0, 1),
+        (4, 4),
+        [header(1, 1), header(2, 2), header(3, 4)],
+        [
+            (0, entry(0).canonical_id),
+            (1, entry(1).canonical_id),
+            (2, entry(2).canonical_id),
+            (3, lost),
+        ],
+    );
+    let in_flight = LocalHistory::of(
+        (0, 1),
+        (2, 3),
+        [header(1, 1), header(2, 2)],
+        [(0, entry(0).canonical_id), (1, entry(1).canonical_id)],
+    )
+    .with_tail(PublishedTail::Known(
+        [(2, (3, entry(2).canonical_id)), (3, (3, lost))].into(),
+    ));
+    let run = |history: LocalHistory| {
+        let (mut sub, feed) = reader(history);
+        let first = request(&mut sub, &feed);
+        let frames = [
+            tx_at(0),
+            boundary(1, 1),
+            tx_at(1),
+            boundary(2, 2),
+            tx_at(2),
+            tx_at(3),
+            boundary(3, 4),
+            done(first.request_id, 4, 4),
+        ];
+        for frame in frames {
+            feed.send(frame);
+        }
+        outcome(&mut sub)
+    };
+    match (run(committed), run(in_flight)) {
+        (
+            Err(ExecutorError::StreamDiverged { block, stream, .. }),
+            Err(ExecutorError::PublishedDiverged {
+                block: other_block,
+                stream: other,
+                ..
+            }),
+        ) => {
+            assert_eq!((block, other_block), (3, 3));
+            assert_eq!(stream, entry(2).canonical_id);
+            assert_eq!(other, stream, "one divergence, one fingerprint");
+        }
+        other => panic!("expected the divergence on both readers, got {other:?}"),
+    }
+}

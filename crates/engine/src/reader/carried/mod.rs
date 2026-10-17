@@ -10,8 +10,10 @@
 //! Before it delivers a frame, a reader with a committed history compares
 //! the stream with that history ([`compare`]). A difference ends the run
 //! with the divergence point. A new connection after the comparison ends
-//! the run too: the entries in flight above the committed block are not in
-//! the history, so the run starts again from the state DB.
+//! the run too: the stream of the new connection can differ from the
+//! entries in flight, so the run starts again from the state DB, and the
+//! comparison at its start also checks the receipts that the run published
+//! above the committed block.
 
 mod answer;
 mod compare;
@@ -33,7 +35,7 @@ use std::time::{Instant, SystemTime};
 
 use kardamom_types::BPosition;
 
-pub use compare::LocalHistory;
+pub use compare::{LocalHistory, PublishedTail};
 pub use feed::AeronFeed;
 pub use transport::{NoSource, Poll, Request, Transport};
 

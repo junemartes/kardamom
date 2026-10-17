@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use kardamom_cache::{CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, QueryError};
@@ -45,9 +45,25 @@ pub(crate) struct NonceLookupFeed {
     done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
     in_flight: HashSet<Address>,
-    /// The last request time per sender. It bounds the retry rate to one
-    /// lookup per timeout per sender.
-    recent: HashMap<Address, Instant>,
+    /// The last request per sender. It bounds the retry rate to one
+    /// lookup per timeout per sender and rollback generation.
+    recent: HashMap<Address, Asked>,
+}
+
+/// The time and the rollback generation of the last request of a sender.
+#[derive(Clone, Copy)]
+struct Asked {
+    at: Instant,
+    generation: u64,
+}
+
+impl Asked {
+    /// Whether this request makes `request` at `now` a repeat. A request of
+    /// a newer generation is not a repeat: a rollback voids the answer to
+    /// this one, and the core asks again for the sender.
+    fn covers(self, request: LookupRequest, now: Instant, timeout: Duration) -> bool {
+        self.generation >= request.generation && now.duration_since(self.at) < timeout
+    }
 }
 
 impl NonceLookupFeed {
@@ -149,7 +165,7 @@ impl NonceLookupFeed {
 
     /// One request from the core: answer it from the local layer when
     /// the sender is resident, else drop it if the sender is in flight
-    /// or asked within the last timeout, shed it at the concurrency
+    /// or asked within the last timeout at the same generation, shed it at the concurrency
     /// bound, else start a query task.
     fn on_request(&mut self, request: LookupRequest) {
         let sender = request.sender;
@@ -164,7 +180,7 @@ impl NonceLookupFeed {
         let asked_recently = self
             .recent
             .get(&sender)
-            .is_some_and(|t| now.duration_since(*t) < timeout);
+            .is_some_and(|asked| asked.covers(request, now, timeout));
         if self.in_flight.contains(&sender) || asked_recently {
             return;
         }
@@ -173,9 +189,16 @@ impl NonceLookupFeed {
             return;
         }
         if self.recent.len() >= Self::RECENT_CAP {
-            self.recent.retain(|_, t| now.duration_since(*t) < timeout);
+            self.recent
+                .retain(|_, asked| now.duration_since(asked.at) < timeout);
         }
-        self.recent.insert(sender, now);
+        self.recent.insert(
+            sender,
+            Asked {
+                at: now,
+                generation: request.generation,
+            },
+        );
         self.in_flight.insert(sender);
         seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
         self.spawn_query(request);
@@ -226,5 +249,27 @@ impl NonceLookupFeed {
         seq_metrics::record_nonce_lookup(self.partition, outcome);
         tracing::warn!(sender = ?sender, error = %e, "nonce lookup failed");
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repeat at the same generation within the timeout is dropped. A
+    /// request after a rollback passes at once: the answer to the first
+    /// request is void.
+    #[test]
+    fn a_request_of_a_newer_generation_is_not_a_repeat() {
+        let at = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let asked = Asked { at, generation: 1 };
+        let request = |generation| LookupRequest {
+            sender: Address::repeat_byte(0x11),
+            generation,
+        };
+        assert!(asked.covers(request(1), at, timeout));
+        assert!(!asked.covers(request(2), at, timeout));
+        assert!(!asked.covers(request(1), at + timeout, timeout));
     }
 }

@@ -159,13 +159,7 @@ async fn a_rollback_lost_on_bus_lag_is_still_applied() {
     mock.rollback_log.send_modify(|log| {
         log.push(lost);
     });
-    (0..crate::channels::BUS_CAPACITY + 8).for_each(|i| {
-        let filler = Receipt {
-            tx_hash: B256::from(alloy_primitives::U256::from(i + 1_000)),
-            ..in_block(u64::try_from(i).unwrap() + 10, 0x00, 3)
-        };
-        mock.receipt_bus.send(filler.into()).unwrap();
-    });
+    send_fillers(&mock, crate::channels::BUS_CAPACITY + 8);
     settle().await;
     assert!(
         proxy
@@ -175,6 +169,49 @@ async fn a_rollback_lost_on_bus_lag_is_still_applied() {
     );
     let applied = proxy.subscribe_rollbacks();
     assert_eq!(applied.borrow().generation(), 1, "applied once");
+}
+
+/// Send `count` receipts of block 3, each with a hash of its own.
+fn send_fillers(mock: &MockChannels, count: usize) {
+    (0..count).for_each(|i| {
+        let filler = Receipt {
+            tx_hash: B256::from(alloy_primitives::U256::from(i + 1_000)),
+            ..in_block(u64::try_from(i).unwrap() + 10, 0x00, 3)
+        };
+        mock.receipt_bus.send(filler.into()).unwrap();
+    });
+}
+
+/// The receipt watcher falls behind the bus, but the bus still holds the
+/// rollback, and the log holds it too. The rollback applies in bus order:
+/// it drops the receipt above its block that comes before it on the bus,
+/// and keeps the receipt of the new stream after it.
+#[tokio::test]
+async fn a_rollback_still_on_the_bus_after_a_gap_applies_in_bus_order() {
+    let (mock, proxy) = proxy();
+    let (void, new) = (B256::repeat_byte(0x44), B256::repeat_byte(0x55));
+    let held = rollback(5, 8);
+
+    // The test task does not yield, so the watcher reads none of these
+    // until the bus has dropped the oldest fillers. The pump puts the
+    // rollback on the bus, then in the log.
+    send_fillers(&mock, crate::channels::BUS_CAPACITY);
+    mock.receipt_bus.send(in_block(1, 0x44, 10).into()).unwrap();
+    mock.receipt_bus.send(ReceiptItem::Rollback(held)).unwrap();
+    mock.rollback_log.send_modify(|log| {
+        log.push(held);
+    });
+    mock.receipt_bus.send(in_block(2, 0x55, 6).into()).unwrap();
+    settle().await;
+    assert!(
+        proxy.lookup_receipt_by_hash(void).is_none(),
+        "the receipt before the rollback is void"
+    );
+    assert!(
+        proxy.lookup_receipt_by_hash(new).is_some(),
+        "the receipt of the new stream stays"
+    );
+    assert_eq!(proxy.subscribe_rollbacks().borrow().generation(), 1);
 }
 
 /// A late copy of one rollback event from another executor changes
