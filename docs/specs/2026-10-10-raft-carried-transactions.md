@@ -769,7 +769,7 @@ frame does not state the count. The reader computes it from the payload:
 | Item | Value |
 |---|---|
 | Ring | `kardamom.cluster.feedRingBytes`, default 16 MiB, a power of two of at least 8 MiB. Off the heap, in the sealer JVM. |
-| Reserve | 128 bytes of the ring, for the one `FEED_GAP`: its record is 40 bytes, and a padding record at the end of the ring takes up to 32 more. A frame goes in only while the free space holds the frame twice (for the padding at the end of the ring) plus the reserve. |
+| Reserve | 128 bytes of the ring, for the one `FEED_GAP`: its record is 40 bytes. A write that wraps takes a padding record of up to 32 bytes at the end of the ring, and the record plus 8 bytes (48) at its start: 80 bytes at most. A frame goes in only while the free space holds the frame twice (for the padding at the end of the ring) plus the reserve. |
 | Walk | At most 256 KiB of frames (about 1,000 transfer frames) in each duty cycle of the service. The service also runs the walk inside the idle loops of a snapshot write and a timer re-arm, so a step stays short. A full ring pauses the walk; it does not gap the feed. |
 | Feed term | 8 MiB, 3 terms: 24 MiB in the shared driver. The largest frame is below one session message (1 MiB). |
 | Control ring | 64 KiB, off the heap. |

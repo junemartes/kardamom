@@ -12,8 +12,9 @@ import org.agrona.concurrent.ringbuffer.RingBuffer;
  *
  * <p>The marker is 25 bytes: a record of 40 bytes with its header and its
  * alignment. When the marker does not fit before the end of the ring, the
- * ring also writes a padding record there, of at most 32 bytes. So the
- * marker needs at most 72 bytes. The reserve is 128.</p>
+ * ring writes a padding record there, of at most 32 bytes, and needs the
+ * record plus 8 bytes at the start of the ring: 48 bytes. So the marker
+ * needs at most 80 bytes. The reserve is 128.</p>
  */
 final class FrameRing {
 
