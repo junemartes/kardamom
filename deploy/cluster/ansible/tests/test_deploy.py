@@ -579,7 +579,7 @@ class DeployTest(Deploys):
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_log_purge_keep': '5',
-            'workloads_cluster_file_sync_level': '2',
+            'workloads_cluster_file_sync_level': '1',
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -606,7 +606,7 @@ class DeployTest(Deploys):
         self.assertNotIn('--beacon-api', follower)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
-        self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=1', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
         self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
@@ -807,6 +807,12 @@ class DeployTest(Deploys):
             # is: a live chain refuses a changed genesis.
             template = self.genesis_template(plans[name]).encode()
             self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
+
+    def test_the_sealer_log_append_waits_for_no_disk_sync_by_default(self):
+        # The kernel writes the Raft log back. Each member runs on its own
+        # machine, so only a power loss of a majority loses an entry.
+        self.run_deploy(check=True)
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=0', json.dumps(self.api.state['plans']['cluster']))
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):

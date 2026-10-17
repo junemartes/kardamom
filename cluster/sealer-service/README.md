@@ -386,8 +386,13 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `voidVoters`: the deploy sets the list to `0` to `executor_count + 1`. Executor `i` has voter id `i`. The validator has `executor_count`. The batcher has `executor_count + 1`.
 - `remoteOrigins`, `voidVoters` and `voidWindow` are not in the snapshot. A different value on one member makes it decide differently from the others.
 - `fileSyncLevel`: `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs the data and the file metadata.
-  - At level 0 an entry that a quorum acknowledged can exist only in page caches. A power loss that takes the members together drops it.
-  - The deploy passes `1` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+  - The level sets the archive (the log and snapshot recordings, the catalog) and the consensus module (the recording log, the node state file).
+  - At level 1 or 2 each commit waits for a disk sync on a quorum of members. At level 0 it waits for none.
+  - At level 0 the kernel writes the log back within about 30 s (`vm.dirty_expire_centisecs`, default 3000). An entry that a quorum acknowledged is lost only when a majority of members lose power or their kernels in that window. A process kill or a container restart loses nothing.
+  - So each member runs on its own dedicated machine: no two members share a machine, a power feed or a hypervisor.
+  - Aeron has no time-based sync setting. There is no level between "each block" and "never".
+  - The level is local to a member, so members can differ during a rolling deploy.
+  - The deploy passes `0` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`). See [the durability of the Raft log](../../docs/failure-modes.md#durability-of-the-raft-log).
 - `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
   - The stretch has a bound: the budget plus one flush of blocks, in heap.
@@ -660,7 +665,7 @@ The chaos suite and operators read these lines. The admin server also exports on
   - A member with `carryBytes` stops on a snapshot before version 12. A member without it stops on version 12.
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
-- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.
+- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s. The deploy uses level `0`, so the snapshot waits for none of these syncs. The retained file still forces its mapped segments before the snapshot.
   - So the status of the due tick carries the snapshot notice (`snapshot_follows`). The notice leaves before the leader sets its toggle.
   - After the notice, the ingress, the sequencer and the session watchdog of each client wait 60 s (`SNAPSHOT_SILENCE`), not 10 s, for the next frame. A stall past 60 s is still a lost quorum.
   - A snapshot that an operator asks for with `ClusterTool` carries no notice.

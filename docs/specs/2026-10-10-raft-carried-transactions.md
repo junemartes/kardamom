@@ -325,6 +325,9 @@ the posted head (`SealerEgress.java:420-449`). The frames now carry bytes.
   - The file needs no fsync on each frame. The Raft log is the durable source. After a crash, the
     member truncates the file at the position of its snapshot, and the log replay appends the
     rest.
+  - The Raft log itself has no fsync on each append either (sync level 0, section 10.4). The
+    kernel writes it back within about 30 s. Only a power loss or a kernel crash on a majority
+    of members in that window loses a committed entry.
   - The purge deletes each segment whose last frame is at or below the posted head and below the
     `retention` floor.
   - The replays of the feed (section 7.3) read the file.
@@ -356,7 +359,8 @@ the posted head (`SealerEgress.java:420-449`). The frames now carry bytes.
   window holds at most 20 records with their envelopes.
 - The snapshot size is the state of today, minus the void ledger, plus the index of the retained
   file. It does not grow with the DA lag. The snapshot forces the mapped segments to disk up to
-  its position.
+  its position. This force does not depend on the sync level of the Raft log. At level 0 the
+  archive does not sync the snapshot recording: the kernel writes it back.
 - The heap holds the same data. The sealer runs with `-Xmx384m` and 1,024 MB of job memory
   (`deploy/cluster/nomad/cluster.nomad.hcl:362`, `:413`). The accepted starting value is a 2 GiB
   heap. The retained frames do not count against it, and there is no envelope store, so the heap
@@ -984,7 +988,7 @@ either. Today the 3 executors, the validator and the batcher read the leader's e
 - 4,000 tx/s is about today's measured sustained rate of 3,800 tx/s
   (`docs/specs/2026-08-16-pipeline-cost-model.md`, "System context").
 - 333,000 tx/s is the blended mix of 10 Ggas/s (`docs/specs/2026-08-16-10-ggas-cluster-shape.md`).
-  At that rate the leader writes 193 MB/s of log with an fsync for each batch, and sends
+  At that rate the leader writes 193 MB/s of log with no fsync on the commit path, and sends
   3.3 Gbit/s. One Raft group then needs a 10 GbE network and a fast NVMe. The cluster shape
   already names the single ordering point as the first limit. With bytes in the log, the way past
   it is the sharding of the sealer, not more references.
@@ -1014,6 +1018,14 @@ See section 5.5:
   the rates of section 10.0: about 53 GB an hour at the mix.
 - The snapshot holds the state of today and the index of the retained file. It does not grow
   with the DA lag.
+- No disk sync is on the commit path. The deploy sets `kardamom.cluster.fileSyncLevel=0`: a
+  member acknowledges a log position when the write is in its page cache, and the kernel writes
+  it back within about 30 s (`vm.dirty_expire_centisecs`). At level 1 or 2 the archive syncs each
+  written block before the member acknowledges it, so each commit waits for a sync on a quorum.
+  Aeron has no time-based sync.
+- The loss window needs each member on its own dedicated machine: a committed entry is lost only
+  when a majority of members lose power or their kernels within the window
+  (`docs/failure-modes.md`, "Durability of the Raft log").
 
 ### 10.5 The feed
 
@@ -1066,7 +1078,7 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 | Sustained rate with zero loss | `kardamom-load --assert-all-delivered` |
 | Leader CPU: process, service thread, consensus thread | container CPU and per-thread `/proc` sampling |
 | Network bytes in and out of each member | node exporter or `docker stats` |
-| Log bytes written a second, fsync time | the archive directory size, `iostat` |
+| Log bytes written a second, the kernel writeback | the archive directory size, `iostat`, `Dirty` and `Writeback` in `/proc/meminfo` |
 | Snapshot size and time, with a full dedup window (bound: 2 s, section 5.5) | `sealer snapshot TAKEN`, with a new `ms=` field |
 | Retained file: write rate, replay read rate, disk growth while the batcher is stopped | the file size, `iostat`, `kardamom_ingress_cluster_retained_bytes` |
 | GC pause p99 of the leader | `-Xlog:gc` |

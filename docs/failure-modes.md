@@ -326,7 +326,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
-  - Recovery: the sealer runs `ArchiveTool.verify` with truncation on the archive directory. It then launches again, within the attempt bound. The log line is `cluster LAUNCH REPAIR`. The truncated bytes are the unacknowledged tail of the member. The leader fills the gap when the member rejoins.
+  - Recovery: the sealer runs `ArchiveTool.verify` with truncation on the archive directory. It then launches again, within the attempt bound. The log line is `cluster LAUNCH REPAIR`. After a process kill, the truncated bytes are the unacknowledged tail of the member. After a power loss at sync level 0, they can be acknowledged entries (see **Durability of the Raft log**). In both cases the leader fills the gap when the member rejoins.
 - **Back-pressured client session**
   - Trigger: a client session does not take its egress frames. A wedged client is the usual cause.
   - Effect: the service thread must not wait. It also runs the boundary tick and relays records for every session.
@@ -399,10 +399,28 @@ The voter list must equal the set of consumers that execute.
 The kill-based cases prove the restart logic. They do not prove durability against a power loss. A process kill or a container kill leaves the host kernel and its page cache alive. Every member finds its whole log again.
 
 - The sealer syncs the Raft log and the archive to disk with `kardamom.cluster.fileSyncLevel`.
-- Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 is also valid. Any other value refuses to start.
-- The code default is 0. The deploy sets 1 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- At level 0, an entry that a quorum acknowledged can exist only in the page caches of its members. A rack-level power loss would drop it. `pipeline-blackout-recover` stands for that event.
-- Only a test that cuts the power of a VM can prove this end to end.
+- Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 also syncs the file metadata. Any other value refuses to start.
+- The code default is 0. The deploy also sets 0 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+- The level is local to a member. It changes no decision, so members can have different levels during a rolling deploy.
+- At level 0 a commit waits for no disk sync. Each member acknowledges a log position when the write is in its page cache.
+  - At level 1 or 2 the archive syncs each written block before the member acknowledges it, so each commit waits for a sync on a quorum.
+  - Aeron has no time-based sync. The kernel writes the page cache back on its own schedule.
+- The loss window is the kernel writeback.
+  - The kernel writes a dirty page back when it is older than `vm.dirty_expire_centisecs` (default 3000, 30 s). The flusher thread wakes every `vm.dirty_writeback_centisecs` (default 500, 5 s).
+  - So by default the window is about 30 s to 35 s. A writeback that falls behind under a heavy write load makes it longer.
+  - This repository does not set these values. The host setup is in the `kardamom-infra` repository. A host that changes them changes the window.
+- A committed entry is lost only when every member that holds it loses power or its kernel within the window, or is out of the next quorum.
+  - With all members in step, that is a power loss or a kernel crash on a majority of members at the same time.
+  - A process kill, an OOM kill, a container restart or a Nomad restart loses nothing: the host kernel keeps the page cache.
+- **Requirement:** each sealer member runs on its own dedicated machine.
+  - Two members on one machine, one power feed or one hypervisor make one event a majority loss.
+  - The deploy places member `i` on the node `sealer-<i>` (`meta.role` is `sealer`). The operator keeps those nodes on separate machines.
+- One member that loses power can come back with a torn log tail or a torn newest snapshot.
+  - The launch truncates a torn last fragment of the archive (`cluster LAUNCH REPAIR`). The member then catches up from the leader.
+  - A member whose newest snapshot does not load stops at start. Wipe its cluster and archive directories and start it: the member then seeds from a peer.
+- The log purge cuts the log only below a snapshot that is older than the `logPurgeKeepSnapshots` newest snapshots (3 x 300 s in the deploy). The kernel writes that snapshot back long before the purge.
+- The retained file of the sealer still forces its mapped segments before a snapshot. That force does not depend on the level.
+- `pipeline-blackout-recover` stands for a correlated power loss. It kills the processes, so the page cache stays. Only a test that cuts the power of a VM can prove the window end to end.
 
 ## Executor
 
