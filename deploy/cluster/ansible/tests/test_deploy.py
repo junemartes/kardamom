@@ -3,6 +3,7 @@
 Run with: python3 -m unittest discover -s deploy/cluster/ansible/tests -v
 Requires ansible-playbook and nomad on PATH; never connects to a real cluster.
 """
+import copy
 import hashlib
 import json
 import os
@@ -412,9 +413,32 @@ class Deploys(unittest.TestCase):
     def run_rollback(self, success=True, environ=None):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
+    # The result of a default deploy on a fresh fixture, kept per test class:
+    # the state of the fake API, and a copy of the record directory.
+    deployed = None
+    deployed_state = None
+
+    def deploy(self):
+        """Run a default deploy on the fresh fixture of this test.
+
+        A deploy of the whole pipeline takes minutes on a loaded runner, and
+        its result is the same for every test. The first test of a class runs
+        it. Every later test restores the state and the files that it left.
+        """
+        cls = type(self)
+        if cls.deployed is None:
+            self.run_deploy()
+            cls.deployed = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
+            cls.addClassCleanup(cls.deployed.cleanup)
+            shutil.copytree(self.record_dir, Path(cls.deployed.name) / 'deployed')
+            cls.deployed_state = copy.deepcopy(self.api.state)
+            return
+        self.api.state = copy.deepcopy(cls.deployed_state)
+        shutil.copytree(Path(cls.deployed.name) / 'deployed', self.record_dir)
+
     def gate_formats(self, findings):
         """Deploy once, then script the format findings of the next deploy."""
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
         Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
@@ -958,7 +982,7 @@ class RecordTest(Deploys):
     """The deploy record and the release gate."""
 
     def test_the_record_follows_the_attempt_to_the_accepted_release(self):
-        self.run_deploy()
+        self.deploy()
         attempt = self.record()['attempt']
         self.assertEqual(self.record()['accepted'], attempt)
         self.assertEqual(attempt['status'], 'accepted')
@@ -987,7 +1011,7 @@ class RecordTest(Deploys):
         self.assertEqual(attempt['before']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
 
     def test_a_failed_attempt_stays_distinct_from_the_accepted_release(self):
-        self.run_deploy()
+        self.deploy()
         accepted = self.record()['accepted']
         self.repin('b')
         self.api.state['deployments']['ingress'] = Deployment('ingress', ['failed'])
@@ -1010,7 +1034,7 @@ class RecordTest(Deploys):
                          'the record holds the mixed versions that ran: the failed release of the ingress')
 
     def test_a_record_that_another_controller_changed_stops_the_deploy(self):
-        self.run_deploy()
+        self.deploy()
         self.repin('b')
         self.api.state['writes'] = []
         self.api.state['record_clobber'] = True
@@ -1019,7 +1043,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [], 'the first write of the attempt is the check-and-set that fails')
 
     def test_a_halted_chain_refuses_the_release(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
         self.api.state['chain_status'] = HEALTHY_CHAIN | {
@@ -1045,7 +1069,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
 
     def test_a_purged_sealer_excuses_only_its_own_no_quorum_halt(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         output = self.run_deploy(success=False)
@@ -1112,7 +1136,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': 'rev-test'})
 
     def test_a_must_match_sealer_setting_refuses_the_rolling_path(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         output = self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, success=False)
         self.assertIn('every member must match: daLagBudgetBlocks.', output)
@@ -1127,7 +1151,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
 
     def test_a_new_sealer_decision_version_refuses_the_rolling_path(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
@@ -1137,7 +1161,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
 
     def test_a_carry_bytes_flip_refuses_the_rolling_path(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
@@ -1148,7 +1172,7 @@ class RecordTest(Deploys):
 
     def to_version_two(self):
         """Deploy, then stand for an accepted release of decision version 2."""
-        self.run_deploy()
+        self.deploy()
         del self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version']
         self.api.state['decision_version'] = 2
 
@@ -1208,7 +1232,7 @@ class RecordTest(Deploys):
         self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
-        self.run_deploy()
+        self.deploy()
         self.api.state['writes'] = []
         task = self.api.state['jobs']['ingress']['TaskGroups'][0]['Tasks'][0]
         template = next(t for t in task['Templates'] if t['DestPath'] == 'local/shard-map.toml')
