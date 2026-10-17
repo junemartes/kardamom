@@ -1603,9 +1603,10 @@ writes v12 before PR 13, so they need no waiver of their own:
 1. #634 (PR 6, with the retained-file section in v12) merges as it is. It has passed three review
    rounds, and the removal touches the same classes. One removal after it is less work than a
    rework of #634.
-2. PR 16 (the feed walk of the Raft log) merges next. The feed then no longer reads the file.
-3. PR 15 (the removal of the file and its v12 section) merges after PR 16, and before PR 13.
-4. PR 17 (the stored cursor) merges after #634, and before PR 13.
+2. PR 16 (#638, the feed walk of the Raft log) merges next. The feed then no longer reads the file.
+3. PR 15 (#637, the removal of the file and its v12 section) merges after PR 16, and before
+   PR 13.
+4. PR 17 (#639, the stored cursor) merges after #634, and before PR 13.
 5. PR 13 sets `writes = 12` and turns `carryBytes` on. From then v12 is frozen.
 
 ### 12.5 Rollback (production)
@@ -1658,9 +1659,9 @@ Each item is one pull request and one issue. Each passes `just style` and CI alo
 | 12 | bench: run the matrix and gate on the target | 2, 3, 6, 7, 8, 9, 10, 15, 16, 17 |
 | 13 | release: cut-over to bytes in the Raft log | 12, 15, 16, 17, the serving service and the executor handoff |
 | 14 | cleanup: remove the void, the join and the archives | 13 |
-| 15 | sealer: remove the retained file and its v12 section | 6, 16 |
-| 16 | sealer: the member feed replays from the Raft log | 7 |
-| 17 | sealer: the stored cursor (ingress kind 11) and the purge floor | 6 |
+| 15 | sealer: remove the retained file and its v12 section (#637) | 6, 16 |
+| 16 | sealer: the member feed replays from the Raft log (#638) | 7 |
+| 17 | sealer: the stored cursor (ingress kind 11) and the purge floor (#639) | 6 |
 
 The executor side of the handoff (section 8.3: `block_frames`, the range read, the prune, the
 alerts) and the ingress fallback to the serving service (section 8.4) are issues that the design
@@ -1782,7 +1783,7 @@ of #585 opens, because their transport follows open question 16.1-4.
 - Scope: everything in section 9.1. `reads_min` of the snapshot goes to 12 in the release after.
 - Acceptance: no reference to the removed items is left. The chaos shards pass.
 
-**PR 15. sealer: remove the retained file and its v12 section.**
+**PR 15 (#637). sealer: remove the retained file and its v12 section.**
 
 - Scope: sections 5.5 and 9.1 (decision 10). Remove the retained file of #608 and every class
   that only it uses, the `/retained` endpoint and its token, the retained-file copy of the peer
@@ -1795,7 +1796,7 @@ of #585 opens, because their transport follows open question 16.1-4.
   `carryBytes` on restores a v10 snapshot with retained frames, and every member then holds the
   same state. A member with `carryBytes` off refuses v12. The status frame is 68 bytes.
 
-**PR 16. sealer: the member feed replays from the Raft log.**
+**PR 16 (#638). sealer: the member feed replays from the Raft log.**
 
 - Scope: section 7.3. The walk thread, the snapshot load into a private state machine, the
   archive replay of the log recording, the one dispatch shared with the clustered service, the
@@ -1808,7 +1809,7 @@ of #585 opens, because their transport follows open question 16.1-4.
   `REPLAY_UNAVAILABLE`; a purge that overtakes a walk ends it with `FEED_GAP`, and the next
   request reaches `REPLAY_DONE`.
 
-**PR 17. sealer: the stored cursor and the purge floor.**
+**PR 17 (#639). sealer: the stored cursor and the purge floor.**
 
 - Scope: section 5.5. Ingress kind 11 `STORED_CURSOR`, the replicated stored head, its place in
   v12, the purge floor `max(posted_head, stored_head)`, `storedHead` on `/status`, the log line
