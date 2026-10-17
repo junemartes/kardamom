@@ -454,7 +454,7 @@ With `feedAeronDir`, each member sends its retained frames to its paired executo
 - Stream 1006 carries the feed, member to executor. Stream 1007 carries the replay requests, executor to member.
 - The feed frames are kinds 1 and 2, the answers 3, 4 and 11, and kind 16 (`FEED_GAP`). Each answer carries the id of its request as an 8-byte tail. The feed carries no status.
 - The service thread writes each retained frame into a ring off the heap. It never waits for the feed. The feeder thread (`sealer-feeder-<id>`) offers the frames to the publication. Only the feeder waits on a back-pressured offer.
-- A replay request goes from the feeder to the service through a second ring. The service checks the cursor as for egress kind 1, walks the retained file from it (at most 4 MiB in each duty cycle), sends `REPLAY_DONE`, and then sends each new frame. The walk does not depend on log traffic: the service runs it in `doBackgroundWork`.
+- A replay request goes from the feeder to the service through a second ring. The service checks the cursor as for egress kind 1, walks the retained file from it (at most 256 KiB in each duty cycle), sends `REPLAY_DONE`, and then sends each new frame. The walk does not depend on log traffic: the service runs it in `doBackgroundWork`.
 - A live frame that does not fit the ring ends the answer with `FEED_GAP`. The member then writes nothing until the next request. A full ring during a walk only pauses the walk.
 - A lost subscriber ends the answer. The feeder drops the unsent frames.
 - The feeder has its own Aeron client. When the driver goes, the client closes, and the feeder opens a new one every 1 s. A feed error never stops the member and never changes the replicated state.

@@ -318,8 +318,10 @@ pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
 /// Egress kind, on the member feed only: the feed dropped frames because
 /// its ring was full:
 /// `[kind:u8 = 16][next_index:u64][next_block:u64][request_id:u64]`.
-/// A replay from `(next_index, next_block)` carries every frame that the
-/// feed did not carry. `request_id` is the id of the request that the gap
+/// `(next_index, next_block)` is the cursor after the last frame that the
+/// answer carried: after a boundary, its `end_tx_idx` and its block plus
+/// one; after a relayed frame, its index plus one. A replay from it carries
+/// every frame that the feed did not carry. `request_id` is the id of the request that the gap
 /// ends. The reader asks for a replay from its cursor. The cluster egress
 /// never sends it. No frame uses kind 14. Matches Java
 /// `EGRESS_KIND_FEED_GAP`.

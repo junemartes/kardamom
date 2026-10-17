@@ -525,7 +525,7 @@ Raft.
   and the Aeron tmpfs counts against it, so the ring is a quarter of the first proposal (64 MiB).
   The feed term (section 7.8) holds more frames beside it.
 - **Ring full.** The service writes a live frame only while the free space holds the frame plus a
-  64-byte reserve. When it does not, the service writes one gap marker into the reserve and marks
+  128-byte reserve. When it does not, the service writes one gap marker into the reserve and marks
   the feed `gapped`:
   - `FEED_GAP`: `[kind=16][next_index:u64][next_block:u64]`, 17 bytes, the first index and block
     that the feed did not carry. Kind 16 is a feed-only kind. The cluster egress never sends it.
@@ -550,7 +550,7 @@ Raft.
   - a cursor below the retained floor: `REPLAY_UNAVAILABLE`;
   - else the retained frames from the cursor, then `REPLAY_DONE`.
 - The service walks the retained frames from the retained file (section 5.5) into the ring, at
-  most 4 MiB in each duty cycle. It does not write live frames during the walk. The file already
+  most 256 KiB in each duty cycle. It does not write live frames during the walk. The file already
   holds them, so the walk reaches the head and the feed turns `live`. A full ring pauses the walk to the next duty cycle.
   It does not gap the feed.
 - The retained frames are the catch-up source. The Raft log is not: the log holds the inputs
@@ -735,9 +735,11 @@ All integers are little-endian. Offsets are in bytes from the start of the frame
 - **`FEED_GAP`.** The member writes it once, as the last frame of the answer, when a live frame
   does not fit the ring. It also writes it when the retained floor passes the walk. The feed is
   then `gapped`.
-  - `next_index` is one above the index of the last relayed frame of the answer, or
-    `from_index` when the answer has none. `next_block` is one above the block of the last
-    boundary of the answer, or `from_block` when the answer has none.
+  - `(next_index, next_block)` is the cursor after the last frame that the answer carried:
+    - after a boundary: `next_index` is its `end_tx_idx`, and `next_block` is its
+      `block_number + 1`;
+    - after a relayed frame: `next_index` is its `index + 1`, and `next_block` stays;
+    - when the answer carried no frame: `(from_index, from_block)` of the request.
   - A replay request from `(next_index, next_block)` is valid, and it carries every frame that
     the feed did not carry. `next_index` is a lower bound: after an origin record, the next
     relayed index can be higher (see the index rule below).
@@ -767,8 +769,8 @@ frame does not state the count. The reader computes it from the payload:
 | Item | Value |
 |---|---|
 | Ring | `kardamom.cluster.feedRingBytes`, default 16 MiB, a power of two of at least 8 MiB. Off the heap, in the sealer JVM. |
-| Reserve | 64 bytes of the ring, for the one `FEED_GAP`. A frame goes in only while the free space holds the frame twice (for the padding at the end of the ring) plus the reserve. |
-| Walk | At most 4 MiB of frames in each duty cycle of the service. A full ring pauses the walk; it does not gap the feed. |
+| Reserve | 128 bytes of the ring, for the one `FEED_GAP`: its record is 40 bytes, and a padding record at the end of the ring takes up to 32 more. A frame goes in only while the free space holds the frame twice (for the padding at the end of the ring) plus the reserve. |
+| Walk | At most 256 KiB of frames (about 1,000 transfer frames) in each duty cycle of the service. The service also runs the walk inside the idle loops of a snapshot write and a timer re-arm, so a step stays short. A full ring pauses the walk; it does not gap the feed. |
 | Feed term | 8 MiB, 3 terms: 24 MiB in the shared driver. The largest frame is below one session message (1 MiB). |
 | Control ring | 64 KiB, off the heap. |
 | Client retry | 1 s, while `feedAeronDir` has no driver. |

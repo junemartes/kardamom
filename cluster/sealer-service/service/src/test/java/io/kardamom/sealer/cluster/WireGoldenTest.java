@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -71,6 +72,11 @@ final class WireGoldenTest {
         assertArrayEquals(golden.get("feed_replay_done"),
             frames.copy(frames.feedAnswer(SealerWire.EGRESS_KIND_REPLAY_DONE, 9, 4, 7)));
         assertEquals(SealerWire.FEED_ANSWER_LEN, golden.get("feed_gap").length);
+        final UnsafeBuffer request = new UnsafeBuffer(new byte[SealerWire.FEED_REQUEST_LEN]);
+        new FeedRequest(9, 4, 7).write(request);
+        assertArrayEquals(golden.get("feed_request"), request.byteArray());
+        assertEquals(Optional.of(new FeedRequest(9, 4, 7)),
+            FeedRequest.parse(new UnsafeBuffer(golden.get("feed_request")), 0, SealerWire.FEED_REQUEST_LEN));
     }
 
     @Test

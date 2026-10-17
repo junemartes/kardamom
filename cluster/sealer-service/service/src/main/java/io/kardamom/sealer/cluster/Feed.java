@@ -47,20 +47,11 @@ sealed interface Feed permits MemberFeed, Feed.Off {
     }
 
     /**
-     * Start the feed of {@code config} on the retained frames, or return
-     * {@link Off} when the config is empty.
-     *
-     * @throws IllegalStateException when the frames are not in a retained file: the feed replays from the file
+     * Start the feed of {@code config} on the retained file, or return
+     * {@link Off} when either is empty. The settings refuse a feed without
+     * the retained file at the start ({@link FeedConfig#parse}).
      */
-    static Feed open(final Optional<FeedConfig> config, final RetainedFrames retained, final int memberId) {
-        return config.<Feed>map(c -> MemberFeed.start(c, requireFile(retained), memberId)).orElse(Off.INSTANCE);
-    }
-
-    private static RetainedFile requireFile(final RetainedFrames retained) {
-        if (retained instanceof RetainedFile file) {
-            return file;
-        }
-        throw new IllegalStateException(FeedConfig.DIR_SETTING + " needs " + RetainedFile.Config.SETTING
-            + "=true: the feed replays from the retained file");
+    static Feed open(final Optional<FeedConfig> config, final Optional<RetainedFile> file, final int memberId) {
+        return file.<Feed>flatMap(f -> config.map(c -> MemberFeed.start(c, f, memberId))).orElse(Off.INSTANCE);
     }
 }

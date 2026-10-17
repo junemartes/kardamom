@@ -128,6 +128,11 @@ impl Fixture {
                 "feed_replay_done",
                 encode_feed_answer(EGRESS_KIND_REPLAY_DONE, 9, 4, 7),
             ),
+            // The request has the layout of a feed answer, with kind 1.
+            (
+                "feed_request",
+                encode_feed_answer(KIND_REPLAY_REQUEST, 9, 4, 7),
+            ),
             (
                 "status_76",
                 encode_status(&Self::status(Some(1_048_583), false)),

@@ -359,8 +359,10 @@ public final class SealerWire {
     /**
      * A feed gap, on the member feed only:
      * {@code [kind:16][next_index:u64 LE][next_block:u64 LE][request_id:u64 LE]}.
-     * A replay from {@code (next_index, next_block)} carries every frame
-     * that the feed did not carry. The cluster egress never sends it. No
+     * {@code (next_index, next_block)} is the cursor after the last frame
+     * that the answer carried: after a boundary, its {@code end_tx_idx} and
+     * its block plus one; after a relayed frame, its index plus one. A
+     * replay from it carries every frame that the feed did not carry. The cluster egress never sends it. No
      * frame uses kind 14. Matches Rust {@code EGRESS_KIND_FEED_GAP}.
      */
     public static final byte EGRESS_KIND_FEED_GAP = 16;

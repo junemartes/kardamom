@@ -314,13 +314,13 @@ public final class SealerClusteredService implements ClusteredService {
      * Every member must run the same choice.
      */
     SealerClusteredService carryingBytes(final RetainedFile.Config config) {
-        this.retainedFile = Optional.of(config);
-        return this;
+        return carryingBytes(config, Optional.empty());
     }
 
-    /** Send the retained frames to the paired executor. It needs {@link #carryingBytes}. */
-    SealerClusteredService feeding(final FeedConfig config) {
-        this.feedConfig = Optional.of(config);
+    /** Keep the retained frames in a file, and send them to the paired executor through {@code feed}. */
+    SealerClusteredService carryingBytes(final RetainedFile.Config config, final Optional<FeedConfig> feed) {
+        this.retainedFile = Optional.of(config);
+        this.feedConfig = feed;
         return this;
     }
 
@@ -344,10 +344,9 @@ public final class SealerClusteredService implements ClusteredService {
         this.cluster = cluster;
         this.seedRecord = new SeedRecord(cluster, memberId);
         this.snapshots = new SnapshotRequests(cluster, memberId);
-        this.retained = retainedFile
-            .<RetainedFrames>map(config -> new RetainedFile(config, memberId))
-            .orElseGet(HeapFrames::new);
-        this.feed = Feed.open(feedConfig, retained, memberId);
+        final Optional<RetainedFile> file = retainedFile.map(config -> new RetainedFile(config, memberId));
+        this.retained = file.<RetainedFrames>map(f -> f).orElseGet(HeapFrames::new);
+        this.feed = Feed.open(feedConfig, file, memberId);
         if (snapshot.isPresent()) {
             restore(snapshot.get());
             // The log position of a start from a snapshot is the snapshot's position.
@@ -457,8 +456,7 @@ public final class SealerClusteredService implements ClusteredService {
      * at the posted head.
      */
     private void openEgress(final Optional<ByteBuffer> retention) {
-        this.egress = new SealerEgress(
-            cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber());
+        this.egress = new SealerEgress(cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber());
         retention.ifPresentOrElse(egress::restore, egress::openEmpty);
         egress.setPostedHead(state.postedHead());
     }

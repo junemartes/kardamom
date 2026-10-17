@@ -11,6 +11,8 @@
 # feed_replay_done  egress kind 4 on the member feed: up to index 9, block 4,
 #                   with the request id 7 as a tail; an egress reader reads
 #                   it as kind 4 and ignores the tail
+# feed_request      the replay request on the feed control stream: from
+#                   index 9, block 4, request id 7
 # status_76         egress kind 9 with the record-lag tail, the flag byte
 #                   (snapshot_follows, 0) and the byte tail
 # status_76_snapshot  status_76 with the flag byte at 1 (a snapshot follows)
@@ -24,6 +26,7 @@ tx_egress 0105000000000000007a000000abababababababababababababababababababababab
 relayed_ref 0f0500000000000000abababababababababababababababababababababababababababababababab06
 feed_gap 10090000000000000004000000000000000700000000000000
 feed_replay_done 04090000000000000004000000000000000700000000000000
+feed_request 01090000000000000004000000000000000700000000000000
 status_76 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff000000000000000000000700100000000000
 status_76_snapshot 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff000000000000000000010700100000000000
 status_68 096400000000000000a000000000000000320000000000000000581b000000000000905f0100000000005f00000000000000ffffffffffffffff00000000000000000000

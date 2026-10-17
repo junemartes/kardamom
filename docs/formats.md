@@ -47,9 +47,11 @@ The version tests:
 | `kardamom-cluster-adapter` | sealer ingress kinds, egress kinds, record types | the egress decoder and the record type decoder accept exactly the read range; the Rust ingress kinds stay at or below `reads_max` |
 | `kardamom-cluster-client` | `cluster-app-version` | the major of the app version |
 | `kardamom-reconstruct` | `sealer-seed` | the constant |
+| `kardamom-cluster-adapter` | `sealer-feed-control` | the golden frame `feed_request` from the Rust encoder |
 | `kardamom-log` | `discovery-record` | the constant |
 | sealer `FormatRegistryTest` | `sealer-snapshot` | the loader accepts exactly `reads_min..=reads_max`, and the write constant is `writes` |
 | sealer `FormatRegistryTest` | ingress kinds, egress kinds, record types, seed, app version | the constants |
+| sealer `FormatRegistryTest`, `WireGoldenTest` | `sealer-feed-control` | version 1, the 25-byte length, and the golden frame `feed_request` from the Java writer and reader |
 
 The layout tests of the frozen formats:
 
@@ -184,6 +186,7 @@ proves each one.
 | Batcher spool | The spool of a layout version lives in `spool/v<N>`. A release opens only its own directory. Every other entry of the root, and a spool whose block does not decode, is dropped with a warning and `kardamom_batcher_spool_dropped_total{reason}`. The range is read again from the sealer. | A spool of either release never stops the batcher. A rollback and a roll forward both start, and the sealer, which keeps every frame above the posted head, serves the dropped range. |
 | Checkpoint manifest and peer fetch | The manifest states `schema_version`, and the peer header `x-checkpoint-schema` carries it. An adopter skips an image of a schema it does not read, before the copy, with a log line and `kardamom_checkpoint_unreadable_schema_skips_total`. An image without a stated schema passes, and says its schema when it opens. | After a schema bump, an executor or a validator of the old release does not adopt a checkpoint of the new release, from its own disk or from a peer. It takes the next checkpoint that it reads. |
 | da-watcher L1 cursor | The reader takes the block number and the hash, and ignores any field after the hash. A line with fewer fields, or a field that does not parse, is still the `l1_cursor_unreadable` halt. | A later release can add a field at the tail, and this release still reads the file after a rollback. |
+| Sealer feed control | The member reads the first 25 bytes of a replay request on stream 1007 and ignores a longer tail. It drops a shorter message or another kind, with `sealer FEED ... DROPPED`. The executor writes the request and resends it after 2 s with no answer. | A later release can add a field at the tail of the request. An older member answers it from the first 25 bytes. |
 | Sealer egress reader | `EgressItem::decode` reads the fields of a kind that it knows and ignores the bytes after them. On the member feed, the answers (kinds 3, 4, 11 and 16) carry the request id as an 8-byte tail after the 17 bytes of the egress layout. The golden frame `feed_replay_done` is a feed answer that the egress reader reads as kind 4. | The member feed and the cluster egress share one codec. A field added at the tail of a frame does not break a reader of the release before. |
 | Batcher cursor | serde JSON. The reader ignores a field it does not know. A new field gets `#[serde(default)]`. | The cursor of either release reads in the other. |
 

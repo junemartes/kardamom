@@ -2,7 +2,10 @@ package io.kardamom.sealer.cluster;
 
 import static io.kardamom.sealer.cluster.ClusterTestHarness.awaitCondition;
 import static io.kardamom.sealer.cluster.IngressFrames.canonicalId;
+import static io.kardamom.sealer.cluster.IngressFrames.offerFrame;
 import static io.kardamom.sealer.cluster.IngressFrames.offerRecord;
+import static io.kardamom.sealer.cluster.IngressFrames.offerReplayRequest;
+import static io.kardamom.sealer.cluster.IngressFrames.originRecordFrame;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -20,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 import java.util.function.Predicate;
@@ -51,6 +55,8 @@ class SealerFeedClusterTest {
     /** A ring and a term that a few hundred records of {@link #PAYLOAD_BYTES} fill. */
     private static final FeedSize SMALL = new FeedSize(64 * 1024, 64 * 1024);
     private static final FeedSize ROOMY = new FeedSize(1 << 20, 1 << 20);
+    /** A ring that takes a boundary or an epoch frame, and never a frame of {@link #PAYLOAD_BYTES} or more. */
+    private static final FeedSize TINY = new FeedSize(2 * 1024, 64 * 1024);
 
     /** The ring and the term of a test feed. */
     private record FeedSize(int ringBytes, int termBytes) {
@@ -79,9 +85,9 @@ class SealerFeedClusterTest {
     private void startCluster(final IntFunction<FeedSize> size) {
         cluster = ClusterTestHarness.start(systemTestWatcher, ClusterTestHarness.builder(MEMBER_COUNT,
             memberId -> new SealerTestService(new SealerClusteredService(DEDUP_CAPACITY, TICK_MS, memberId)
-                .carryingBytes(new RetainedFile.Config(dir.resolve("retained-" + memberId), SEGMENT_BYTES))
-                .feeding(new FeedConfig(driverDir(memberId),
-                    size.apply(memberId).ringBytes(), size.apply(memberId).termBytes())))));
+                .carryingBytes(new RetainedFile.Config(dir.resolve("retained-" + memberId), SEGMENT_BYTES),
+                    Optional.of(new FeedConfig(driverDir(memberId),
+                        size.apply(memberId).ringBytes(), size.apply(memberId).termBytes()))))));
         cluster.awaitLeader();
         cluster.egressListener(egress);
         cluster.connectClient();
@@ -96,11 +102,16 @@ class SealerFeedClusterTest {
         return reader;
     }
 
-    /** Offer records {@code from..to - 1} and await their relay on the egress. */
+    /** Offer records {@code from..to - 1} of {@link #PAYLOAD_BYTES} and await their relay on the egress. */
     private void offerRecords(final int from, final int to) {
+        offerRecords(from, to, PAYLOAD_BYTES);
+    }
+
+    /** Offer records {@code from..to - 1} of {@code payloadBytes} and await their relay on the egress. */
+    private void offerRecords(final int from, final int to, final int payloadBytes) {
         final AeronCluster client = cluster.reconnectClient();
         IntStream.range(from, to).forEach(i -> {
-            final byte[] payload = new byte[PAYLOAD_BYTES];
+            final byte[] payload = new byte[payloadBytes];
             Arrays.fill(payload, (byte) i);
             offerRecord(client, canonicalId(i), payload);
         });
@@ -226,5 +237,47 @@ class SealerFeedClusterTest {
         joined.addAll(after);
         assertSameFrames(canonicalThrough(full.frames(), batch + 5), canonicalThrough(joined, batch + 5),
             "the frames before the gap and the replay from it");
+    }
+
+    /**
+     * An epoch record with deposits takes several index slots. The feed
+     * carries it and the boundary after it, then gaps on a frame that never
+     * fits. The gap cursor is the cursor after that boundary: its end index,
+     * not one above the index of the epoch. A replay from it is served.
+     */
+    @Test
+    @InterruptAfter(value = 120, unit = TimeUnit.SECONDS)
+    void the_gap_after_an_epoch_with_deposits_names_a_cursor_that_replays() {
+        startCluster(memberId -> memberId == 0 ? TINY : ROOMY);
+        final FeedReader reader = readFromGenesis(cluster.node(0));
+        offerRecords(0, 2, 16);
+        final int slots = 4;
+        final AeronCluster client = cluster.reconnectClient();
+        offerFrame(client, originRecordFrame(canonicalId(1000), 100, slots, new byte[0]));
+        awaitCondition(client, () -> egress.relayedIndexes.size() >= 3);
+        final long epochIndex = egress.relayedIndexes.get(2);
+        final long afterEpoch = epochIndex + slots;
+        // The next tick seals the block of the epoch.
+        reader.pollUntil(frames -> frames.stream()
+            .anyMatch(f -> f.kind() == SealerWire.EGRESS_KIND_BOUNDARY && f.b() == afterEpoch));
+
+        offerRecords(3, 4);
+        reader.pollUntil(frames -> has(frames, SealerWire.EGRESS_KIND_FEED_GAP, 1));
+        final List<FeedReader.Frame> frames = reader.frames();
+        final FeedReader.Frame gap = frames.get(frames.size() - 1);
+        final FeedReader.Frame lastBoundary = frames.stream()
+            .filter(f -> f.kind() == SealerWire.EGRESS_KIND_BOUNDARY)
+            .reduce((a, b) -> b)
+            .orElseThrow();
+        assertEquals(SealerWire.EGRESS_KIND_BOUNDARY, frames.get(frames.size() - 2).kind(),
+            "a boundary is the last frame before the gap");
+        assertEquals(afterEpoch, gap.a(), "next_index is the end index of the boundary");
+        assertEquals(lastBoundary.a() + 1, gap.b(), "next_block");
+
+        final long served = egress.replayDoneCount;
+        final AeronCluster current = cluster.client();
+        offerReplayRequest(current, gap.a(), gap.b());
+        awaitCondition(current, () -> egress.replayDoneCount > served || egress.replayUnavailableCount > 0);
+        assertEquals(0, egress.replayUnavailableCount, "the cursor of the gap names one point of the stream");
     }
 }

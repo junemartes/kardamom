@@ -2,7 +2,6 @@ package io.kardamom.sealer.cluster;
 
 import java.nio.ByteBuffer;
 import java.util.Optional;
-import org.agrona.BitUtil;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
@@ -10,7 +9,6 @@ import org.agrona.concurrent.AgentRunner;
 import org.agrona.concurrent.MessageHandler;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.ringbuffer.OneToOneRingBuffer;
-import org.agrona.concurrent.ringbuffer.RecordDescriptor;
 import org.agrona.concurrent.ringbuffer.RingBuffer;
 import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
 
@@ -39,10 +37,13 @@ import org.agrona.concurrent.ringbuffer.RingBufferDescriptor;
  */
 final class MemberFeed implements Feed {
 
-    /** The most frame bytes that the walk moves in one duty cycle. */
-    static final int WALK_BYTES = 4 << 20;
-    /** The free bytes that a live frame leaves for the one gap marker and its padding. */
-    static final int RESERVE = 64;
+    /**
+     * The most frame bytes that the walk moves in one duty cycle: about
+     * 1,000 transfer frames. The service also runs the walk inside the idle
+     * loops of a snapshot write and a timer re-arm, so a small step keeps
+     * those loops short.
+     */
+    static final int WALK_BYTES = 256 << 10;
     /** The capacity of the control ring: requests are rare and small. */
     static final int CONTROL_RING_BYTES = 64 << 10;
     /** The most control messages that one duty cycle reads. */
@@ -61,27 +62,10 @@ final class MemberFeed implements Feed {
         GAPPED
     }
 
-    /**
-     * A point of the canonical stream: the next record index and the next
-     * block that the feed carries.
-     */
-    private record Cursor(long index, long block) {
-        Cursor after(final FrameKey key) {
-            return key.boundary()
-                ? new Cursor(index, Math.addExact(key.key(), 1))
-                : new Cursor(Math.addExact(key.key(), 1), block);
-        }
-
-        @Override
-        public String toString() {
-            return "(" + index + "," + block + ")";
-        }
-    }
-
     private final int memberId;
     private final RetainedFile file;
     /** Written by this thread, read by the feeder. */
-    private final RingBuffer frames;
+    private final FrameRing frames;
     /** Written by the feeder, read by this thread. */
     private final RingBuffer control;
     private final AgentRunner feeder;
@@ -97,14 +81,16 @@ final class MemberFeed implements Feed {
     /** The newest request that this duty cycle read, or empty. */
     private Optional<FeedRequest> asked = Optional.empty();
     private FeedRequest request = new FeedRequest(0, 0, 0);
-    /** The next point that the answer carries. */
-    private Cursor cursor = new Cursor(0, 0);
+    /** The point after the frames that the answer carried. */
+    private final FeedCursor cursor = new FeedCursor();
     private long walkPos;
+    /** The frame bytes that the walk can still move in this duty cycle. */
+    private long walkLeft;
     /** The length of the refusal in {@link #staging}. */
     private int refusalLength;
 
     private MemberFeed(
-            final int memberId, final RetainedFile file, final RingBuffer frames, final RingBuffer control,
+            final int memberId, final RetainedFile file, final FrameRing frames, final RingBuffer control,
             final AgentRunner feeder) {
         this.memberId = memberId;
         this.file = file;
@@ -120,7 +106,7 @@ final class MemberFeed implements Feed {
         final AgentRunner feeder = new Feeder(config, memberId, frames, control).start();
         System.out.println("sealer FEED START memberId=" + memberId + " aeronDir=" + config.aeronDir()
             + " ringBytes=" + config.ringBytes() + " termBytes=" + config.termBytes());
-        return new MemberFeed(memberId, file, frames, control, feeder);
+        return new MemberFeed(memberId, file, new FrameRing(frames), control, feeder);
     }
 
     /** A ring off the heap of {@code capacity} bytes, a power of two. */
@@ -162,7 +148,7 @@ final class MemberFeed implements Feed {
     /** Start the answer to {@code next}: a refusal, or the walk from its cursor. */
     private void answer(final FeedRequest next, final SealerEgress egress, final long upToIndex, final long upToBlock) {
         request = next;
-        cursor = new Cursor(next.fromIndex(), next.fromBlock());
+        cursor.reset(next.fromIndex(), next.fromBlock());
         final ReplayVerdict verdict = egress.replayVerdict(next.fromIndex(), next.fromBlock(), upToIndex, upToBlock);
         switch (verdict.kind()) {
             case AHEAD -> refuse(SealerWire.EGRESS_KIND_REPLAY_AHEAD, upToIndex, upToBlock, verdict);
@@ -191,55 +177,53 @@ final class MemberFeed implements Feed {
     }
 
     private int sendRefusal() {
-        if (!put(staging, refusalLength)) {
+        if (!frames.put(generation, staging, refusalLength)) {
             return 0;
         }
         state = State.IDLE;
         return 1;
     }
 
-    /** Move the walk by at most {@link #WALK_BYTES}. */
+    /** Move the walk by at most {@link #WALK_BYTES}, one record in each step. */
     private int walk(final long upToIndex, final long upToBlock) {
-        long moved = 0;
-        while (moved < WALK_BYTES) {
-            final long bytes = walkStep(upToIndex, upToBlock);
-            if (bytes < 0) {
-                return 1;
-            }
-            moved += bytes;
+        walkLeft = WALK_BYTES;
+        boolean more = true;
+        while (more) {
+            more = walkStep(upToIndex, upToBlock);
         }
         return 1;
     }
 
     /**
      * Carry the record at the walk position when the request wants it, and
-     * move past it. Return the bytes of the record, or -1 when the walk
-     * stops in this duty cycle: at the head, at a full ring, or behind the
-     * front of the file.
+     * move past it. False when the walk stops in this duty cycle: at the
+     * head, at a full ring, behind the front of the file, or at the end of
+     * the budget.
      */
-    private long walkStep(final long upToIndex, final long upToBlock) {
+    private boolean walkStep(final long upToIndex, final long upToBlock) {
         if (walkPos >= file.headPos()) {
             finishWalk(upToIndex, upToBlock);
-            return -1;
+            return false;
         }
         if (walkPos < file.frontPos()) {
             // The floor passed the walk: the frames from here are gone.
             gap();
-            return -1;
+            return false;
         }
         file.view(walkPos, view);
         final int length = view.capacity();
         if (FrameKey.of(view).wanted(request.fromIndex(), request.fromBlock()) && !carry(view, length)) {
-            return -1;
+            return false;
         }
         walkPos = file.next(walkPos);
-        return length;
+        walkLeft -= length;
+        return walkLeft > 0;
     }
 
     private void finishWalk(final long upToIndex, final long upToBlock) {
         final int length = codec.feedAnswer(
             SealerWire.EGRESS_KIND_REPLAY_DONE, upToIndex, upToBlock, request.requestId());
-        if (put(staging, length)) {
+        if (frames.put(generation, staging, length)) {
             state = State.LIVE;
             log("LIVE at=" + cursor);
         }
@@ -247,29 +231,17 @@ final class MemberFeed implements Feed {
 
     /** Write one retained frame, and move the cursor past it. False when the ring has no room. */
     private boolean carry(final DirectBuffer frame, final int length) {
-        if (!put(frame, length)) {
+        if (!frames.put(generation, frame, length)) {
             return false;
         }
-        cursor = cursor.after(FrameKey.of(frame));
+        cursor.pass(frame);
         return true;
-    }
-
-    /**
-     * Write the first {@code length} bytes of {@code frame} when the ring
-     * keeps {@link #RESERVE} free after it. The check counts the frame
-     * twice: a frame that does not fit before the end of the ring takes a
-     * padding record of at most its own size.
-     */
-    private boolean put(final DirectBuffer frame, final int length) {
-        final long record = BitUtil.align(length + RecordDescriptor.HEADER_LENGTH, RecordDescriptor.ALIGNMENT);
-        final long free = (long) frames.capacity() - frames.size();
-        return free >= 2 * record + RESERVE && frames.write(generation, frame, 0, length);
     }
 
     /** Write the gap marker into the reserve, and stop the answer. */
     private void gap() {
         final int length = codec.feedGap(cursor.index(), cursor.block(), request.requestId());
-        final String lost = frames.write(generation, staging, 0, length) ? "" : " marker=LOST";
+        final String lost = frames.putMarker(generation, staging, length) ? "" : " marker=LOST";
         state = State.GAPPED;
         log("GAPPED next=" + cursor + lost);
     }

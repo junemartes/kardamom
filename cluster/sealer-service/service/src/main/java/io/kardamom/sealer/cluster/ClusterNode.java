@@ -228,8 +228,8 @@ public final class ClusterNode {
                     inclusionHorizonBlocks, orderingWindow,
                     new LagBudgets(daLagBudgetBlocks, recordLagBudget));
                 seed.ifPresent(service::seededFrom);
-                carryBytes.map(CarryBytes::file).ifPresent(service::carryingBytes);
-                feed.ifPresent(service::feeding);
+                final SealerClusteredService built = service;
+                carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
                 snapshotSchedule.ifPresent(service::snapshotEvery);
                 container = ClusteredServiceContainer.launch(
                     serviceContext(aeronDir, clusterDir, memberId, service, stop));
