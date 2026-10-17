@@ -144,7 +144,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 12 | Origin gap | `[kind=12][offered_origin:u64][expected_origin:u64]` | the offering session |
 | 13 | Record-lag reject | `[kind=13][sender:20][nonce:u64][sealed_index:u64][recorded_index:u64][budget:u64]` | the offering session |
 | 15 | Relayed reference | `[kind=15][index:u64][canonical_id:32][record_type:u8]` (42 bytes) | consumers, with `carryBytes` |
-| 17 | Sealer info | `[kind=17][decision_version:u8]` (2 bytes) | each session, when it opens |
+| 17 | Sealer info | `[kind=17][decision_version:u8][cluster_session_id:i64]` (10 bytes) | each session, when it opens |
 
 - Kind 17: a sequencer sends a nonce release (ingress kind 10) only after it got version 3 or above on its current session. A restart into another decision version opens every session again, so each session gets the new version. A reader that does not know kind 17 drops it.
 
@@ -496,6 +496,12 @@ The member list names each member by its Consul node name, for example `sealer-0
 
 Every member applies the same log. Two members on two rule versions can decide one entry differently, and the replicated state forks.
 
+> **Warning: a rollback from version 3 to 2 has no gate.** The release gate checks the quiesce
+> check only for a move to the version of the target, and the gate of the release before does not
+> know it. Before a rollback, run `just sealer-quiesce-check <env>` from the checkout of the newer
+> release, and do not purge the sealer until it passes. Follow "Rollback across a decision
+> version" in [`docs/runbooks/deploy-rollback.md`](../../docs/runbooks/deploy-rollback.md).
+
 - `CanonicalSealerState.DECISION_VERSION` is the version of the rules. A change that decides an ordered entry differently raises it.
 - The job spec names the version in `kardamom.cluster.decisionVersion`. A member stops at start when the job spec and the code disagree.
 - The setting is in the must-match list of the release gate. The gate refuses a rolling deploy that changes it.
@@ -507,7 +513,8 @@ A new version needs the coordinated restart of the sealer, not a rolling deploy:
    - Stop the sequencers: `nomad job stop sequencer`. A stopped sequencer sends no nonce release (ingress kind 10). Versions 2 and 3 decide a release differently, so no release may be in the log after the last snapshot.
 2. Wait until no void vote is open. In the log of each member, each index of a `cluster VOID-VOTE` line also has a line with `result=DECIDED`. With the submits paused, no new entry can lose its data, so no new vote starts.
 3. Wait for a snapshot. In the log of each member, no `cluster VOID-VOTE` line with `result=DECIDED` comes after the last `sealer snapshot TAKEN` line.
-   - Run `just sealer-quiesce-check <env>`. It reads `releasesSinceSnapshot` and `decisionVersion` on the admin `/status` of every member, refuses when a member applied a release after its last snapshot, and records the passing check in the Nomad variable `kardamom/quiesce/<env>`. The release gate refuses a change of the decision version without a passing check of the members of the accepted version, made after the accepted release.
+   - Run `just sealer-quiesce-check <env>`. It reads `releasesSinceSnapshot` and `decisionVersion` on the admin `/status` of every configured member, and it refuses when a member applied a release after its last snapshot, when a configured member is down (start it, or wipe it so that it seeds from a peer), or when a sequencer allocation still runs. It records the passing check, with `sequencers_stopped`, in the Nomad variable `kardamom/quiesce/<env>`.
+   - The release gate refuses a change of the decision version without a passing check of the members of the accepted version, made after the accepted release, with the sequencers stopped, and at most `KARDAMOM_QUIESCE_MAX_AGE_S` (default 600) seconds before the deploy. So run the check just before step 4.
    - For a rollback from version 3 to 2, also wait one inclusion horizon (`inclusionHorizonBlocks`, 64 blocks) after the stop of the sequencers before this snapshot. The release marks then leave the dedup window. A member of version 2 refuses a snapshot whose window holds more than `dedupCapacity + 4096` ids, and the marks can add up to `dedupCapacity` ids.
 4. Stop all members: `nomad job stop -purge cluster`. The members keep their snapshots and logs on the host.
 5. Resume the submits on every ingress: `curl -s -X POST http://127.0.0.1:<port>/resume`. The gate refuses an operator pause. The ingress then halts on `sealer_no_quorum`.

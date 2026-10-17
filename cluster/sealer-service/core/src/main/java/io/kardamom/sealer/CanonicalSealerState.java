@@ -977,13 +977,15 @@ public final class CanonicalSealerState {
      * <p>Why a release never sets the guard below the chain. The sequencer
      * sends a release only for a skip that proves that the chain was at
      * {@code nonce} when the entry executed (an insufficient-funds skip:
-     * the executor checks the nonce before the balance), or for a skip at
-     * or above a known receipt floor. It sends none for a nonce skip. So:</p>
+     * the executor checks the nonce before the balance), or for a skip
+     * exactly at a known receipt floor. It sends none for a nonce skip. So:</p>
      * <ul>
      *   <li>The guard orders the entries of a sender with contiguous
      *       nonces. Each entry ordered after the skipped one and before the
      *       release has a nonce above {@code nonce}, and the chain stays at
-     *       {@code nonce}, so each of them skips as a nonce too high, and
+     *       {@code nonce}, so each of them skips: as a nonce too high, or for
+     *       a check before the nonce check (a fee, the gas, the code). Its
+     *       nonce is above the chain, and so above the receipt floor, so it
      *       sends no release.</li>
      *   <li>The guard orders nothing at {@code nonce} until the release
      *       applies. After it applies, the mark drops a repeat.</li>

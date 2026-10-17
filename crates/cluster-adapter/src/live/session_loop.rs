@@ -434,7 +434,7 @@ impl SessionLoop {
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
                 self.replay_ask.rearm();
-                self.mark_session_start();
+                self.mark_session_start(cluster_session_id);
                 self.subscribe_resend.rearm();
                 self.subscribe_confirmed = false;
                 self.egress_watch.on_connect(Instant::now());
@@ -453,7 +453,7 @@ impl SessionLoop {
     /// new session's replay is done, and a consumer of the sealer's rules
     /// forgets the rules of the old session. The marker passes the kind
     /// filter: the consumer needs it whatever kinds it reads.
-    fn mark_session_start(&mut self) {
+    fn mark_session_start(&mut self, session_id: i64) {
         let reads_rules = self
             .egress_kind_filter
             .as_ref()
@@ -461,7 +461,7 @@ impl SessionLoop {
         if self.replay.is_none() && !reads_rules {
             return;
         }
-        self.forward(crate::wire::encode_session_start());
+        self.forward(crate::wire::encode_session_start(session_id));
     }
 
     /// Send one payload to the consumer. A closed consumer channel ends the

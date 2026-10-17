@@ -139,7 +139,7 @@ impl Fixture {
             ),
             ("txref_ingress", txref_ingress),
             ("txref_egress", txref_egress),
-            ("sealer_info", encode_sealer_info(3)),
+            ("sealer_info", encode_sealer_info(3, 0x0102)),
             (
                 "nonce_release",
                 NonceRelease {

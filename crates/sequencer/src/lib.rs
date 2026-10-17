@@ -50,6 +50,7 @@ pub mod pump;
 mod release;
 pub mod remote_epoch;
 pub mod resync;
+pub mod sealer_rules;
 pub(crate) mod sender;
 pub mod sequencer;
 pub mod shutdown;

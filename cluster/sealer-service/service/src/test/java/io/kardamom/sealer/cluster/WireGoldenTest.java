@@ -105,7 +105,7 @@ final class WireGoldenTest {
 
     @Test
     void theSealerInfoNamesTheDecisionVersion() {
-        assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3)));
+        assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3, 0x0102)));
         assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, 3);
     }
 

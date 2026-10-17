@@ -528,7 +528,7 @@ final class SealerEgress {
 
     /** Offer the sealer's rules to a session that opened. */
     void offerSealerInfo(final ClientSession session) {
-        offerToSession(session, frames.sealerInfo(CanonicalSealerState.DECISION_VERSION));
+        offerToSession(session, frames.sealerInfo(CanonicalSealerState.DECISION_VERSION, session.id()));
     }
 
     /** Open an empty retention: a start at genesis or from a seed. */

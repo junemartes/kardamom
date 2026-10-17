@@ -357,11 +357,14 @@
       - workloads_gate_quiesce.status == 200
       - workloads_gate_quiesce.json.Items.decision_version | int == workloads_gate_accepted_decision_version | int
       - workloads_gate_quiesce.json.Items.checked_at >= workloads_accepted.accepted_at | default('')
+      - workloads_gate_quiesce.json.Items.sequencers_stopped | default('') == 'true'
+      - (now().timestamp() | int) - (workloads_gate_quiesce.json.Items.checked_unix | default(0) | int)
+        <= workloads_quiesce_max_age_s | int
     fail_msg: >-
       Refused: the release changes the sealer decision version from
       {{ workloads_gate_accepted_decision_version }} to {{ workloads_gate_decision_version }}, and no
       quiesce check of the members of version {{ workloads_gate_accepted_decision_version }} passed after the
-      accepted release. Follow "Decision version" in cluster/sealer-service/README.md: pause, stop the
+      accepted release, with the sequencers stopped, within the last {{ workloads_quiesce_max_age_s }} s. Follow "Decision version" in cluster/sealer-service/README.md: pause, stop the
       sequencers, wait for a snapshot, run `just sealer-quiesce-check {{ workloads_env }}`, then stop the sealer.
   when:
     - workloads_gate_accepted_decision_version | int >= 0

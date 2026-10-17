@@ -105,12 +105,6 @@ impl SharedWatermark {
         self.sealer_version.store(version, Ordering::Release);
     }
 
-    /// Feed thread: a new session starts, and the sealer has not reported
-    /// its rules on it yet.
-    pub fn forget_sealer_version(&self) {
-        self.set_sealer_version(0);
-    }
-
     /// Whether the sealer of the current session applies a nonce release.
     /// A sealer of an older decision version drops the frame, and its log
     /// would replay the frame under the new rules after a restart.

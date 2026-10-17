@@ -332,18 +332,22 @@ pub const RELAYED_REF_LEN: usize = 1 + 8 + CANONICAL_ID_LEN + 1;
 /// Matches Java `EGRESS_KIND_FEED_GAP`.
 pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
-/// Egress kind: the sealer's rules: `[kind:u8 = 17][decision_version:u8]`
+/// Egress kind: the sealer's rules:
+/// `[kind:u8 = 17][decision_version:u8][cluster_session_id:i64]`
 /// ([`SEALER_INFO_LEN`] bytes). The sealer sends it to each session when
-/// the session opens. A sequencer sends a nonce release
-/// ([`KIND_NONCE_RELEASE`]) only after it got version 3 or above on its
-/// current session. Matches Java `EGRESS_KIND_SEALER_INFO`.
+/// the session opens, with the id of that session. A sequencer sends a
+/// nonce release ([`KIND_NONCE_RELEASE`]) only after it got version 3 or
+/// above for its current session. The id ties the frame to its session, so
+/// a frame that arrives before the client's session-start marker still
+/// counts. Matches Java `EGRESS_KIND_SEALER_INFO`.
 pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
 /// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
-pub const SEALER_INFO_LEN: usize = 2;
+pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
 /// The first decision version of the sealer that applies a nonce release.
 pub const RELEASE_DECISION_VERSION: u8 = 3;
 
-/// Client-local kind: a new session starts: `[kind:u8 = 255]`. The
+/// Client-local kind: a new session starts:
+/// `[kind:u8 = 255][cluster_session_id:i64]`. The
 /// session thread puts this frame on the consumer channel when a session
 /// opens, before any frame of that session. The channel is FIFO, so every
 /// frame of an earlier session comes before the marker. The sealer never
@@ -556,6 +560,9 @@ fn rd_i32(b: &[u8], at: usize) -> Result<i32, WireError> {
 }
 fn rd_u64(b: &[u8], at: usize) -> Result<u64, WireError> {
     bytes::u64_le(b, at).ok_or_else(|| too_short(b, at, 8))
+}
+fn rd_i64(b: &[u8], at: usize) -> Result<i64, WireError> {
+    bytes::i64_le(b, at).ok_or_else(|| too_short(b, at, 8))
 }
 fn rd_u128(b: &[u8], at: usize) -> Result<u128, WireError> {
     rd_slice(b, at, 16).map(|s| {

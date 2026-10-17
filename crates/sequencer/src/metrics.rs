@@ -57,6 +57,10 @@ pub(crate) const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_water
 /// Skip receipts that moved a sender's nonce floor back down. A skip uses
 /// no nonce, so the floor goes back to the nonce the chain expects.
 pub(crate) const SKIP_RELEASES: &str = "kardamom_sequencer_skip_releases_total";
+/// The decision version that the sealer reported for the current session,
+/// 0 before its report. The sequencer sends a nonce release only at 3 or
+/// above.
+pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
 /// The nonce releases for the sealer, by outcome: `sent` to the sealer,
 /// `duplicate` for a skipped entry that already has a release, `dropped`
 /// when the bounded queue was full or the transport refused the frame.
@@ -237,6 +241,10 @@ pub(crate) fn record_floor_advance(partition: u32) {
 
 pub(crate) fn record_skip_release(partition: u32) {
     bump(SKIP_RELEASES, partition, 1);
+}
+
+pub(crate) fn record_sealer_version(partition: u32, version: u8) {
+    set(SEALER_VERSION, partition, f64::from(version));
 }
 
 pub(crate) fn record_nonce_release(partition: u32, outcome: &'static str) {

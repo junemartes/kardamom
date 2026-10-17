@@ -680,7 +680,7 @@ fn a_nonce_skip_sends_no_release() {
 fn a_release_waits_for_a_sealer_of_version_three() {
     let s = signer(54);
     let mut sealed = Sealed::new(one_partition_cfg());
-    sealed.watermark.forget_sealer_version();
+    sealed.watermark.set_sealer_version(0);
     sealed.submit(&s, 0);
     sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
     sealed.step();

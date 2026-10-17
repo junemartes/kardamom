@@ -297,7 +297,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             // its replay is outstanding. A `REPLAY_DONE` of an earlier
             // session comes before this marker, so it cannot end this
             // catch-up.
-            EgressItem::SessionStart => self.catching_up = true,
+            EgressItem::SessionStart { .. } => self.catching_up = true,
             EgressItem::ReplayAhead {
                 head_index,
                 head_block,

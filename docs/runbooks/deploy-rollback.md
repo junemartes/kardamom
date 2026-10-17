@@ -114,14 +114,26 @@ A release that raises the sealer decision version (`cluster/sealer-service/READM
 - Its record holds no sealer version before it, so `just rollback` stops the sealer job and does not start the release before.
 - `just rollback` reverts the jobs in reverse deploy order. The ingress restarts before the sealer stops, and a restart drops an operator pause. Submits then reach the sealer of the new rules after the snapshot check.
 
+> **Required: the quiesce check.** No gate guards a rollback from decision version 3 to 2: the
+> gate of the release before does not know the check. A nonce release in the log after the last
+> snapshot forks the members of the release before from the state that the executors read. Do not
+> purge the sealer before this command passes, run from the checkout of the newer release:
+>
+> ```sh
+> just sealer-quiesce-check <env>
+> ```
+
 Do a coordinated restart into the release before instead. The deploy order starts the sealer before the services that wait on it.
 
-1. Do steps 1 to 4 of the coordinated restart in the sealer README: pause the submits, stop the sequencers (`nomad job stop sequencer`), wait until no void vote is open, wait one inclusion horizon, wait for a snapshot after the last decided void, and purge the sealer job (`nomad job stop -purge cluster`). The members of the release before replay the log after their snapshot with the old rules. After the purge no void can be decided, so a lost pause does no harm.
-   - Before the purge, run `just sealer-quiesce-check <env>` from the checkout of the newer release. It refuses when a member applied a nonce release after its last snapshot: the release before drops the release frames, so a replay of them would decide differently from the members that wrote the log. Wait for the next snapshot and run it again. The gate of the release before does not run this check, so the runbook step is the only guard in this direction.
-   - The wait of one inclusion horizon (`inclusionHorizonBlocks`, 64 blocks) after the stop of the sequencers lets the release marks of version 3 leave the dedup window. A member of version 2 refuses a snapshot whose window holds more than `dedupCapacity + 4096` ids.
-2. Purge the ingress job: `nomad job stop -purge ingress`. The gate of a release before the decision version does not excuse the `sealer_no_quorum` halt of a purged sealer. Without an ingress job the gate reads no chain status. The ingress keeps no state.
-3. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, before the ingress. Each member starts from its own snapshot and log.
-4. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
+1. Pause the submits on every ingress, as in step 1 of the coordinated restart in the sealer README.
+2. Stop the sequencers: `nomad job stop sequencer`. A stopped sequencer sends no nonce release.
+3. Wait until no void vote is open, then wait one inclusion horizon (`inclusionHorizonBlocks`, 64 blocks). The release marks of version 3 then leave the dedup window: a member of version 2 refuses a snapshot whose window holds more than `dedupCapacity + 4096` ids.
+4. Wait for a snapshot after the last decided void.
+5. **Required.** Run `just sealer-quiesce-check <env>` from the checkout of the newer release. It must pass. It refuses when a member applied a nonce release after its last snapshot, when a configured member is down, or when a sequencer still runs. On a refusal, fix the cause, wait for the next snapshot, and run it again.
+6. Purge the sealer job (`nomad job stop -purge cluster`). The members of the release before replay the log after their snapshot with the old rules. After the purge no void can be decided, so a lost pause does no harm.
+7. Purge the ingress job: `nomad job stop -purge ingress`. The gate of a release before the decision version does not excuse the `sealer_no_quorum` halt of a purged sealer. Without an ingress job the gate reads no chain status. The ingress keeps no state.
+8. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, before the ingress. Each member starts from its own snapshot and log.
+9. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
 
 ## Clear
 

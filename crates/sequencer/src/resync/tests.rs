@@ -434,7 +434,7 @@ fn release(who: u8, nonce: u64, hash: u8) -> NonceRelease {
 /// sealer's guard with no receipt floor: the first transaction of a new
 /// key. A skip from a check before the nonce check proves nothing about
 /// the nonce: with no floor it sends no release, and with a floor it
-/// releases only at or above the floor. A nonce skip never releases.
+/// releases only at the floor. A nonce skip never releases.
 #[test]
 fn a_release_to_the_sealer_needs_a_proof_of_the_chain_nonce() {
     use kardamom_types::SkipReason;
@@ -458,7 +458,36 @@ fn a_release_to_the_sealer_needs_a_proof_of_the_chain_nonce() {
     tx.send(FloorUpdate::skip(s(3), 2, SkipReason::NonceTooLow, h(6)))
         .unwrap();
     let ReceiptDrain { sealer, .. } = c.drain_floor_updates();
-    assert_eq!(sealer, vec![release(1, 0, 1), release(3, 3, 3)]);
+    assert_eq!(
+        sealer,
+        vec![release(1, 0, 1), release(3, 3, 3)],
+        "a fee skip at the floor releases; below it, or with no floor, none"
+    );
+}
+
+/// Floor f. Entry f skips for insufficient funds, and f + 1 skips for a fee
+/// check that runs before the nonce check. Only f releases: the guard
+/// reopens at f, and a late release of f + 1 cannot set it below the chain
+/// after f' and f+1' are ordered. A fee skip at the floor itself releases.
+#[test]
+fn a_skip_before_the_nonce_check_releases_only_at_the_floor() {
+    use kardamom_types::SkipReason;
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(FloorUpdate::executed(s(1), 4)).unwrap();
+    tx.send(FloorUpdate::skip(
+        s(1),
+        5,
+        SkipReason::InsufficientFunds,
+        h(5),
+    ))
+    .unwrap();
+    tx.send(FloorUpdate::skip(s(1), 6, SkipReason::Fee, h(6)))
+        .unwrap();
+    tx.send(FloorUpdate::executed(s(2), 1)).unwrap();
+    tx.send(FloorUpdate::skip(s(2), 2, SkipReason::Fee, h(7)))
+        .unwrap();
+    let ReceiptDrain { sealer, .. } = c.drain_floor_updates();
+    assert_eq!(sealer, vec![release(1, 5, 5), release(2, 2, 7)]);
 }
 
 /// A sealer that has not reported decision version 3 on the current
@@ -471,6 +500,6 @@ fn the_sealer_takes_releases_only_after_it_reported_version_three() {
     assert!(!c.sealer_takes_releases());
     w.set_sealer_version(3);
     assert!(c.sealer_takes_releases());
-    w.forget_sealer_version();
+    w.set_sealer_version(0);
     assert!(!c.sealer_takes_releases());
 }

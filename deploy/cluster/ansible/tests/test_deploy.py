@@ -282,7 +282,8 @@ class NomadAPI(BaseHTTPRequestHandler):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
                 # A job the test names has no running allocation: a crash loop.
-                running = name not in state.get('not_running', ())
+                running = name not in state.get('not_running', ()) \
+                    and group['Name'] not in state.get('down_groups', ())
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
                                'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
                                'NodeID': f'node-{group["Name"]}',
@@ -1143,35 +1144,54 @@ class RecordTest(Deploys):
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def test_a_decision_version_change_needs_a_passing_quiesce_check(self):
+    def to_version_two(self):
+        """Deploy, then stand for an accepted release of decision version 2."""
         self.run_deploy()
-        # The accepted release ran decision version 2: a record from before
-        # the field.
-        path = 'kardamom/deploys/local'
-        del self.api.state['records'][path]['accepted']['target']['decision_version']
+        del self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version']
         self.api.state['decision_version'] = 2
-        # A member that applied a release after its snapshot fails the check.
-        self.api.state['releases'] = {'node-cluster-1': 1}
-        output = self.run_deploy(playbook='quiesce.yml', success=False)
-        self.assertIn('a member applied a nonce release after its last snapshot', output)
-        # The coordinated restart without a passing check is refused.
+
+    def coordinated_restart(self, success):
+        """Stop the sealer, and deploy the release of decision version 3."""
         del self.api.state['jobs']['cluster']
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.api.state['writes'] = []
-        output = self.run_deploy(success=False)
+        return self.run_deploy(success=success)
+
+    def test_a_quiesce_check_refuses_a_release_after_a_snapshot(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.api.state['releases'] = {'node-cluster-1': 1}
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('a member applied a nonce release after its last snapshot', output)
+        output = self.coordinated_restart(success=False)
         self.assertIn('changes the sealer decision version from 2 to 3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
-        self.run_deploy()
-        path = 'kardamom/deploys/local'
-        del self.api.state['records'][path]['accepted']['target']['decision_version']
-        self.api.state['decision_version'] = 2
+    def test_a_quiesce_check_refuses_a_running_sequencer_and_a_member_that_is_down(self):
+        self.to_version_two()
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('a sequencer allocation still runs', output)
+        del self.api.state['jobs']['sequencer']
+        self.api.state['down_groups'] = ['cluster-2']
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('the sealer members cluster-2 do not run', output)
+
+    def test_a_stale_quiesce_check_is_refused(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
         self.run_deploy(playbook='quiesce.yml')
-        self.assertEqual(self.api.state['variables']['kardamom/quiesce/local']['decision_version'], '2')
-        del self.api.state['jobs']['cluster']
-        self.api.state['chain_status'] = NO_QUORUM_CHAIN
-        self.run_deploy()
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        check['checked_unix'] = str(int(check['checked_unix']) - 601)
+        output = self.coordinated_restart(success=False)
+        self.assertIn('within the last 600 s', output)
+
+    def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.run_deploy(playbook='quiesce.yml')
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        self.assertEqual((check['decision_version'], check['sequencers_stopped']), ('2', 'true'))
+        self.coordinated_restart(success=True)
         self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):

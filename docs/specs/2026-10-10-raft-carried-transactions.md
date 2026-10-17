@@ -207,7 +207,7 @@ payload:       [canonical_id:32][record_type=6][lane:u8][envelope]
 | Egress kind 15 `RELAYED_REF` (new) | `[kind=15][index:u64][canonical_id:32][record_type:u8]`, 42 bytes. Every egress subscriber gets it for each record type 6 entry. Other record types stay kind 1. |
 | Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). A member with `carryBytes` drops them already (section 5.4). |
 | Ingress kind 10 `NONCE_RELEASE` (new, #627) | `[kind=10][sender:20][nonce:u64][canonical_id:32]`, 61 bytes. The sequencer sends it for a skip receipt that proves the chain nonce (section 5.4). |
-| Egress kind 17 `SEALER_INFO` (new) | `[kind=17][decision_version:u8]`, 2 bytes. The sealer sends it to each session when the session opens. The sequencer sends kind 10 only after version 3 or above on its current session. |
+| Egress kind 17 `SEALER_INFO` (new) | `[kind=17][decision_version:u8][cluster_session_id:i64]`, 10 bytes. The sealer sends it to each session when the session opens. The sequencer sends kind 10 only after version 3 or above for its current session; the id ties the frame to the session whatever the order of the client's own session-start marker. |
 | Egress kind 13 (record-lag reject) | Retired. |
 | Egress kind 14 | Not used. An earlier draft used it for `ENVELOPE_FULL` (section 15, option A). |
 | Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). The byte tail `[retained_bytes:u64]` follows it: 75 bytes. A reader reads 50, 67 or 75 bytes (`crates/cluster-adapter/src/wire/egress.rs:204-229`). An old reader ignores the longer tail. |
@@ -315,7 +315,7 @@ envelope, and the void goes:
     checks the code of the sender, then the nonce, then the balance:
     - an `insufficient_funds` skip proves it, with or without a receipt floor;
     - a gas, fee, init-code, header, undecodable or sender-has-code skip comes from a check
-      before the nonce check, so it releases only at or above a known receipt floor;
+      before the nonce check, so it releases only exactly at a known receipt floor;
     - a `nonce_too_high` or `nonce_too_low` skip never releases.
   - Both twins send it. The sequencer sends one release for each skipped entry, and at most
     1,024 releases wait for a blocked transport. It sends a release only after the sealer
@@ -327,8 +327,11 @@ envelope, and the void goes:
   - **Why a release never sets the guard below the chain.** The release of entry X at nonce `n`
     proves that the chain was at `n` when X executed. The guard orders the entries of a sender
     with contiguous nonces, so each entry ordered after X and before the release has a nonce
-    above `n`; the chain stays at `n`, so each of them skips as `nonce_too_high` and sends no
-    release. The guard orders nothing at `n` until the release applies, and after that the mark
+    above `n`. The chain stays at `n`, so each of them skips: as `nonce_too_high`, or for a check
+    before the nonce check (`fee`, `gas_limit`, `sender_has_code`, and so on). Its nonce is above
+    the chain, and so above the receipt floor, so it sends no release. (A release for such a skip
+    above the floor would be late: after `n'` and `n+1'` are ordered, it would set the guard below
+    the chain.) The guard orders nothing at `n` until the release applies, and after that the mark
     drops a repeat. So the run `n` (skip), `n + 1` (skip) recovers with the release of `n`, and
     no second lowering follows.
   - The one exception: an LRU eviction of the sender while X is in the window, a re-seed at `n`,

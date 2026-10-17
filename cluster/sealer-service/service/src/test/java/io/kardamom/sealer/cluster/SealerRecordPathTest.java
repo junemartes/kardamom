@@ -287,7 +287,8 @@ class SealerRecordPathTest {
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = fileMember("a");
         svc.onSessionOpen(sequencer, 0);
-        assertArrayEquals(new byte[] {SealerWire.EGRESS_KIND_SEALER_INFO, 3}, sequencer.offered.get(0));
+        assertArrayEquals(new byte[] {SealerWire.EGRESS_KIND_SEALER_INFO, 3, 1, 0, 0, 0, 0, 0, 0, 0},
+            sequencer.offered.get(0));
     }
 
     @Test

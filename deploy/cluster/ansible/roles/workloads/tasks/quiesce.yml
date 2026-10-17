@@ -5,6 +5,16 @@
 # the two versions decide a release differently. The operator pauses the
 # submits, stops the sequencers and waits for a snapshot; this check then
 # reads every member and records the result for the release gate.
+- name: Read the registered sealer
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
+
+- name: Refuse a check without a registered sealer
+  ansible.builtin.assert:
+    that: workloads_registered_job.status == 200
+    fail_msg: "Refused: Nomad does not know the sealer job. Run the check before the stop of the sealer job."
+
 - name: Read the sealer allocations
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/cluster/allocations?namespace={{ workloads_namespace | urlencode }}"
@@ -12,16 +22,48 @@
       X-Nomad-Token: "{{ workloads_nomad_token }}"
   register: workloads_quiesce_allocs
 
-- name: Keep the running sealer members
+# The job has one group for each configured member. Every member must
+# answer: a member that is down replays its log at its next start, so
+# its log after its snapshot counts as much as the log of a live member.
+- name: Keep the configured and the running sealer members
+  ansible.builtin.set_fact:
+    workloads_quiesce_groups: "{{ workloads_registered_job.json.TaskGroups | map(attribute='Name') | list }}"
+    workloads_quiesce_running: >-
+      {{ workloads_quiesce_allocs.json | selectattr('ClientStatus', 'equalto', 'running') | list }}
+
+- name: Keep the running node of each member
   ansible.builtin.set_fact:
     workloads_quiesce_nodes: >-
-      {{ workloads_quiesce_allocs.json | selectattr('ClientStatus', 'equalto', 'running')
+      {{ workloads_quiesce_running | selectattr('TaskGroup', 'in', workloads_quiesce_groups)
          | map(attribute='NodeID') | unique | list }}
+    workloads_quiesce_down: >-
+      {{ workloads_quiesce_groups | difference(workloads_quiesce_running | map(attribute='TaskGroup') | list) }}
 
-- name: Refuse a check with no running member
+- name: Refuse a check while a configured member is down
   ansible.builtin.assert:
-    that: workloads_quiesce_nodes | length > 0
-    fail_msg: "Refused: no sealer member runs. Run the check before the stop of the sealer job."
+    that: workloads_quiesce_down | length == 0
+    fail_msg: >-
+      Refused: the sealer members {{ workloads_quiesce_down | join(', ') }} do not run. A member that is down
+      replays its log after its snapshot at its next start, so the check must read it. Start it and let it catch
+      up, or wipe its state so that it seeds from a peer (docs/runbooks/sealer-fleet-rebuild.md), then run the
+      check again.
+
+- name: Read the sequencer allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/sequencer/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    status_code: [200, 404]
+  register: workloads_quiesce_sequencers
+
+- name: Refuse a check while a sequencer runs
+  ansible.builtin.assert:
+    that: >-
+      workloads_quiesce_sequencers.status == 404
+      or workloads_quiesce_sequencers.json | selectattr('ClientStatus', 'in', ['running', 'pending']) | list | length == 0
+    fail_msg: >-
+      Refused: a sequencer allocation still runs, and a sequencer can send a nonce release after this check.
+      Stop the sequencers (`nomad job stop sequencer`), wait for the next snapshot, and run the check again.
 
 - name: Read the node of each member
   ansible.builtin.uri:
@@ -74,6 +116,8 @@
       Path: "{{ workloads_quiesce_path }}"
       Items:
         checked_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+        checked_unix: "{{ now().timestamp() | int | string }}"
+        sequencers_stopped: "true"
         decision_version: "{{ workloads_quiesce_versions | first | string }}"
         members: "{{ workloads_quiesce_members | length | string }}"
   changed_when: true

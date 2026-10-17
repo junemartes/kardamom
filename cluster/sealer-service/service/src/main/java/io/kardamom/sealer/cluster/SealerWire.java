@@ -385,9 +385,11 @@ public final class SealerWire {
     public static final byte EGRESS_KIND_FEED_GAP = 16;
 
     /**
-     * The sealer's rules: {@code [kind:17][decision_version:u8]}
+     * The sealer's rules:
+     * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
      * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
-     * when the session opens. A member sends it again after a restart into
+     * when the session opens, with the id of that session, so a client ties
+     * it to its session whatever the order of its own session events. A member sends it again after a restart into
      * another decision version, because every session opens again. A
      * sequencer sends a nonce release only after it got version 3 or above
      * on its current session. A reader that does not know the kind drops
@@ -395,7 +397,7 @@ public final class SealerWire {
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */
-    static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES;
+    static final int SEALER_INFO_LEN = Byte.BYTES + Byte.BYTES + Long.BYTES;
 
     /** The egress header in front of a relayed payload: {@code [kind:1][index:u64][payload_len:u32]}. */
     static final int RELAYED_HEADER_LEN = Byte.BYTES + Long.BYTES + Integer.BYTES;

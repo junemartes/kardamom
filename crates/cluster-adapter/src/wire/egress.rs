@@ -23,7 +23,7 @@ use super::{
     EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, RT_DEPOSITREF, RT_EPOCH, RT_REMOTE_EPOCH, RT_TX,
     RT_TX_OFFER, RT_TXREF, RT_VOID, RemoteOriginRejectReason, SENDER_LEN, STATUS_LEN,
     STATUS_RETAINED_BYTES_OFFSET, STATUS_WITH_RETAINED_BYTES_LEN, WireError, encode_kind_2u64,
-    rd_i32, rd_len, rd_slice, rd_u8, rd_u64, too_short,
+    rd_i32, rd_i64, rd_len, rd_slice, rd_u8, rd_u64, too_short,
 };
 
 // ── decode (egress: cluster to Rust) ────────────────────────────────────────
@@ -51,11 +51,15 @@ pub enum EgressItem {
     ReplayDone { up_to_index: u64, up_to_block: u64 },
     /// Replay refused: the requested cursor is past the sealer's head.
     ReplayAhead { head_index: u64, head_block: u64 },
-    /// The sealer's rules on this session: its decision version.
-    SealerInfo { decision_version: u8 },
-    /// A new session starts. Every later frame belongs to the new session.
-    /// The session thread makes this item; the sealer never sends it.
-    SessionStart,
+    /// The sealer's rules on the session `session_id`: its decision version.
+    SealerInfo {
+        decision_version: u8,
+        session_id: i64,
+    },
+    /// The session `session_id` starts. Every later frame belongs to the new
+    /// session. The session thread makes this item; the sealer never sends
+    /// it.
+    SessionStart { session_id: i64 },
     /// Contiguity reject. The service refused to seal `sender`'s ref at
     /// `nonce`, because it expected `expected`. Republish from `expected`:
     /// the unconfirmed ledger holds the missing refs.
@@ -158,9 +162,12 @@ impl EgressItem {
             }),
             super::EGRESS_KIND_RECORD_LAG_REJECT => Self::decode_record_lag_reject(buf),
             super::EGRESS_KIND_RELAYED_REF => RelayedRef::parse(buf).map(Self::RelayedRef),
-            super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart),
+            super::EGRESS_KIND_SESSION_START => Ok(Self::SessionStart {
+                session_id: rd_i64(buf, 1)?,
+            }),
             super::EGRESS_KIND_SEALER_INFO => Ok(Self::SealerInfo {
                 decision_version: rd_u8(buf, 1)?,
+                session_id: rd_i64(buf, 2)?,
             }),
             super::EGRESS_KIND_FEED_GAP => Ok(Self::FeedGap {
                 next_index: rd_u64(buf, 1)?,
@@ -506,15 +513,19 @@ pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
 
 /// Frame the sealer's rules exactly as the Java service does.
 #[must_use]
-pub fn encode_sealer_info(decision_version: u8) -> Vec<u8> {
-    vec![super::EGRESS_KIND_SEALER_INFO, decision_version]
+pub fn encode_sealer_info(decision_version: u8, session_id: i64) -> Vec<u8> {
+    let mut b = vec![super::EGRESS_KIND_SEALER_INFO, decision_version];
+    b.extend_from_slice(&session_id.to_le_bytes());
+    b
 }
 
 /// Frame the client-local session-start marker. Only the session thread
 /// sends it, on the consumer channel.
 #[must_use]
-pub fn encode_session_start() -> Vec<u8> {
-    vec![super::EGRESS_KIND_SESSION_START]
+pub fn encode_session_start(session_id: i64) -> Vec<u8> {
+    let mut b = vec![super::EGRESS_KIND_SESSION_START];
+    b.extend_from_slice(&session_id.to_le_bytes());
+    b
 }
 
 /// Frame a replay-ahead refusal exactly as the Java service does.

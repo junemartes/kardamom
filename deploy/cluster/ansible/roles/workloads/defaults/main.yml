@@ -297,6 +297,10 @@ workloads_record_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_record_pat
 # version of the members and the time of the check.
 workloads_quiesce_path: "kardamom/quiesce/{{ workloads_env }}"
 workloads_quiesce_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_quiesce_path }}?namespace={{ workloads_namespace | urlencode }}"
+# How old the quiesce check may be when the gate reads it, in seconds
+# (KARDAMOM_QUIESCE_MAX_AGE_S). The check reads the members before the
+# stop; the deploy follows within this window.
+workloads_quiesce_max_age_s: "{{ lookup('env', 'KARDAMOM_QUIESCE_MAX_AGE_S') | default('600', true) }}"
 # The repository root and its format registry: the formats of the target.
 workloads_repo_root: "{{ workloads_cluster_dir ~ '/../..' }}"
 workloads_formats_file: "{{ workloads_repo_root }}/formats.toml"

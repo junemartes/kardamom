@@ -95,10 +95,11 @@ final class EgressFrames {
         return pos;
     }
 
-    /** The sealer's rules: {@code [kind:17][decision_version:u8]}. */
-    int sealerInfo(final int decisionVersion) {
+    /** The sealer's rules: {@code [kind:17][decision_version:u8][cluster_session_id:i64]}. */
+    int sealerInfo(final int decisionVersion, final long sessionId) {
         buf.putByte(0, SealerWire.EGRESS_KIND_SEALER_INFO);
         buf.putByte(Byte.BYTES, (byte) decisionVersion);
+        buf.putLong(Byte.BYTES + Byte.BYTES, sessionId, ByteOrder.LITTLE_ENDIAN);
         return SealerWire.SEALER_INFO_LEN;
     }
 

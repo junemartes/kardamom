@@ -120,7 +120,7 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
             Ok(
                 EgressItem::ReplayDone { .. }
                 | EgressItem::SealerInfo { .. }
-                | EgressItem::SessionStart
+                | EgressItem::SessionStart { .. }
                 | EgressItem::ReplayAhead { .. }
                 | EgressItem::ReplayUnavailable { .. }
                 | EgressItem::ContiguityReject { .. }

@@ -51,6 +51,7 @@ use kardamom_sequencer::resync::{
     FloorUpdate, ResyncController, SealerAnswer, SealerRefusal, SharedWatermark,
     elapsed_ms_saturating,
 };
+use kardamom_sequencer::sealer_rules::SealerRules;
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::cluster_status::SilenceDeadline;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
@@ -145,6 +146,8 @@ pub(crate) struct EgressWatermarkFeed {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
+    /// The sealer's decision version for the current session.
+    rules: SealerRules,
 }
 
 impl EgressWatermarkFeed {
@@ -156,7 +159,9 @@ impl EgressWatermarkFeed {
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
     ) -> Self {
+        let rules = SealerRules::new(partition, watermark.clone(), Instant::now());
         Self {
+            rules,
             silence_ms,
             partition,
             watermark,
@@ -197,6 +202,7 @@ impl EgressWatermarkFeed {
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
         let now = Instant::now();
+        self.rules.check(now);
         if self.silence.in_snapshot(now) {
             return;
         }
@@ -214,6 +220,7 @@ impl EgressWatermarkFeed {
     }
 
     fn on_frame(&mut self, frame: &[u8]) {
+        self.rules.check(Instant::now());
         if self.on_rules_frame(frame) {
             return;
         }
@@ -252,25 +259,27 @@ impl EgressWatermarkFeed {
     /// while the sealer of the current session reported decision version 3
     /// or above: a sealer of an older version drops the frame, and its log
     /// would replay the frame under the new rules after a restart.
-    fn on_rules_frame(&self, frame: &[u8]) -> bool {
-        match frame.first() {
-            Some(&wire::EGRESS_KIND_SESSION_START) => {
-                self.watermark.forget_sealer_version();
-                true
-            }
-            Some(&wire::EGRESS_KIND_SEALER_INFO) => {
-                if let Ok(EgressItem::SealerInfo { decision_version }) = EgressItem::decode(frame) {
-                    tracing::info!(
-                        partition = self.partition,
-                        decision_version,
-                        "sealer rules received"
-                    );
-                    self.watermark.set_sealer_version(decision_version);
-                }
-                true
-            }
-            _ => false,
+    fn on_rules_frame(&mut self, frame: &[u8]) -> bool {
+        if !matches!(
+            frame.first(),
+            Some(&(wire::EGRESS_KIND_SESSION_START | wire::EGRESS_KIND_SEALER_INFO))
+        ) {
+            return false;
         }
+        let now = Instant::now();
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::SessionStart { session_id }) => {
+                self.rules.on_session_start(session_id, now);
+            }
+            Ok(EgressItem::SealerInfo {
+                decision_version,
+                session_id,
+            }) => {
+                self.rules.on_sealer_info(session_id, decision_version, now);
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Handle one contiguity-reject frame. Returns `true` when `frame`

@@ -156,8 +156,11 @@ impl FloorUpdate {
     ///   below a known floor proves nothing new.
     /// - A gas, fee, init-code, header or undecodable skip comes from a
     ///   check before the nonce check, and so does a sender-has-code skip.
-    ///   It proves nothing about the nonce. It releases only at or above a
-    ///   known floor.
+    ///   It proves nothing about the nonce. It releases only at the known
+    ///   floor: the floor proves that the chain reached the nonce, and the
+    ///   skip used none. Above the floor, the entry can be a later entry of
+    ///   a run whose first skip already releases, and a late release of it
+    ///   would set the guard below the chain.
     /// - A nonce skip never releases. A nonce-too-high skip follows a skip
     ///   at the chain nonce, whose release already reopens the run.
     #[must_use]
@@ -174,7 +177,7 @@ impl FloorUpdate {
         let proven = match reason {
             SkipReason::NonceTooLow | SkipReason::NonceTooHigh => false,
             SkipReason::InsufficientFunds => floor.is_none_or(|f| nonce >= f),
-            _ => floor.is_some_and(|f| nonce >= f),
+            _ => floor == Some(nonce),
         };
         proven.then_some(NonceRelease {
             sender: self.sender,
