@@ -9,6 +9,8 @@
 
 mod answer;
 mod feed;
+#[cfg(all(test, feature = "docker-e2e"))]
+mod feed_tests;
 #[cfg(test)]
 mod memory;
 mod switch;

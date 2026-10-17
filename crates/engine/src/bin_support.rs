@@ -379,35 +379,6 @@ pub fn open_member_feed(
     ))
 }
 
-/// Connect a publisher-only cluster session: no replay, no egress
-/// subscription, and no egress frame reaches the caller. The executor that
-/// reads the member feed sends its recorded cursor over it.
-///
-/// # Errors
-///
-/// Returns `Err` when the cluster Aeron runtime fails to spawn, or the
-/// cluster session fails to connect.
-pub fn connect_cluster_publisher(
-    aeron_dir: Option<&Path>,
-    cfg: kardamom_cluster_adapter::LiveClusterConfig,
-) -> Result<(
-    kardamom_cluster_adapter::LiveCluster,
-    kardamom_cluster_adapter::LiveIngress,
-)> {
-    let cluster_rt = AeronRuntime::spawn(aeron_dir).context("spawn cluster AeronRuntime")?;
-    let (cluster, ingress, _egress) = kardamom_cluster_adapter::live::connect_with(
-        cluster_rt,
-        cfg,
-        kardamom_cluster_adapter::live::ConnectOptions {
-            replay: None,
-            subscribe: false,
-            egress_kind_filter: Some(Vec::new()),
-        },
-    )
-    .context("connect the publisher-only cluster session")?;
-    Ok((cluster, ingress))
-}
-
 /// The batcher's posted-cursor publisher over the live cluster session,
 /// named here for the same reason as [`LiveTxOrderingSub`].
 pub type LiveCursorPublisher =
@@ -655,10 +626,12 @@ pub use kardamom_obs::bin::{init_tracing, wait_for_shutdown};
 /// engine sees `TxDataClosed`. The `tx_ordering` reader blocks on the
 /// cluster egress `recv()`, which returns `None` only once the
 /// `LiveCluster` guard drops, so the reader sees `TxOrderingClosed` next.
+/// An executor that reads the member feed has no cluster session: its
+/// reader sees the feed closed once the token is cancelled.
 pub struct LiveStreams {
     pub stop: tokio_util::sync::DropGuard,
     pub rt: AeronRuntime,
-    pub cluster_guard: kardamom_cluster_adapter::LiveCluster,
+    pub cluster_guard: Option<kardamom_cluster_adapter::LiveCluster>,
 }
 
 /// End the streams. Dropping `streams` at the end of this function

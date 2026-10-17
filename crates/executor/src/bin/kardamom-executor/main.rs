@@ -213,7 +213,8 @@ fn open_transport(args: &Args) -> Result<Transport> {
 /// reader never sees an image rotation. The subscription's canonical-index
 /// cursor drops any reconnect overlap. The cluster-session guard (`LiveCluster`) must outlive the executor loop,
 /// so [`bin_support::LiveStreams`] holds it. It drops only after the
-/// shutdown wait ends.
+/// shutdown wait ends. With `--carry-bytes` the executor reads the member
+/// feed and opens no cluster session.
 ///
 /// The member ingress endpoints come from the catalog when discovery
 /// lists them, else from the static `[cluster]` section. The executor is
@@ -225,28 +226,24 @@ async fn connect_cluster(
     plane: &StreamPlane,
     start: &kardamom_engine::ResumePoint,
     stop: &tokio_util::sync::CancellationToken,
-) -> Result<(kardamom_cluster_adapter::LiveCluster, ExecutorOrdering)> {
+) -> Result<(
+    Option<kardamom_cluster_adapter::LiveCluster>,
+    ExecutorOrdering,
+)> {
+    let cursor = bin_support::cluster_replay_cursor(start);
+    let aeron_dir = args.aeron_dir.as_deref();
+    if args.carry_bytes {
+        let sub = bin_support::open_member_feed(aeron_dir, cursor, stop.clone())?;
+        tracing::info!("kardamom-executor: canonical entries via the member feed");
+        return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
+    }
     let mut cluster_cfg = file_cfg.cluster.to_live();
     if let Some(endpoints) = plane.cluster_ingress_endpoints().await? {
         cluster_cfg.ingress_endpoints = endpoints;
     }
-    let cursor = bin_support::cluster_replay_cursor(start);
-    let aeron_dir = args.aeron_dir.as_deref();
-    if args.carry_bytes {
-        let (guard, ingress) = bin_support::connect_cluster_publisher(aeron_dir, cluster_cfg)?;
-        let sub = bin_support::open_member_feed(aeron_dir, cursor, stop.clone())?;
-        tracing::info!("kardamom-executor: canonical entries via the member feed");
-        return Ok((
-            guard,
-            ExecutorOrdering::Carried {
-                sub: Box::new(sub),
-                ingress,
-            },
-        ));
-    }
     let (guard, sub) = bin_support::connect_cluster_ordering(aeron_dir, cluster_cfg, cursor)?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
-    Ok((guard, ExecutorOrdering::Refs(sub)))
+    Ok((Some(guard), ExecutorOrdering::Refs(sub)))
 }
 
 /// The `tx_data` lanes and their join-miss refetch. The member feed carries
@@ -542,7 +539,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         connect_cluster(args, file_cfg, &plane, &start, &shutdown).await?;
     outputs.exec_stream.cursor.start(
         boot.cursor_id
-            .map(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
+            .and_then(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
     );
 
     let WriterAdapters {
@@ -676,7 +673,7 @@ async fn stop_nonce_query(server: Option<kardamom_state::NonceQueryServer>) {
 /// value.
 async fn wait_for_engine(
     rt: AeronRuntime,
-    cluster_guard: kardamom_cluster_adapter::LiveCluster,
+    cluster_guard: Option<kardamom_cluster_adapter::LiveCluster>,
     shutdown: tokio_util::sync::CancellationToken,
     join: tokio::task::JoinHandle<Result<(), ExecutorError>>,
 ) -> Option<ExecutorError> {

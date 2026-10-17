@@ -170,3 +170,35 @@ fn a_service_that_never_connects_sends_the_reader_back_to_the_feed() {
     assert_eq!((request.from_index, request.from_block), (0, 1));
     assert_eq!(rig.service.requests(), []);
 }
+
+#[test]
+fn a_silent_feed_and_a_service_below_its_floor_try_the_feed_again() {
+    let mut rig = Rig::new(3, 2);
+    let first = rig.request(Source::Feed);
+    let request = rig.request(Source::Service);
+    let resends = rig.feed.requests();
+    assert!(
+        !resends.is_empty(),
+        "the feed got resends before the silence"
+    );
+    rig.service.send(unavailable(request.request_id, 8, 4));
+    let again = rig.request(Source::Feed);
+    assert_eq!(rig.sub.source(), Source::Feed, "no peer checkpoint");
+    assert_ne!(again.request_id, first.request_id);
+    assert_eq!((again.from_index, again.from_block), (3, 2));
+}
+
+#[test]
+fn a_service_that_never_connected_counts_as_absent() {
+    let mut rig = Rig::new(3, 2);
+    rig.service.set_connected(false);
+    let request = rig.request(Source::Feed);
+    rig.feed.send(unavailable(request.request_id, 10, 5));
+    match rig.error() {
+        ExecutorError::ClusterReplayUnavailable { oldest_block, .. } => {
+            assert_eq!(oldest_block, 5);
+        }
+        other => panic!("expected the peer-checkpoint error, got {other:?}"),
+    }
+    assert_eq!(rig.service.requests(), []);
+}

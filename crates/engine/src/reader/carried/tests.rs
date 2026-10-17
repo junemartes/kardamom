@@ -375,3 +375,21 @@ fn an_unknown_kind_is_dropped() {
     assert_eq!(rig.deliver(5), ["t0"]);
     assert_eq!(rig.sub.source(), Source::Feed);
 }
+
+#[test]
+fn a_new_image_is_a_new_connection_with_a_new_request() {
+    let mut rig = Rig::new(0, 1);
+    let first = rig.request(Source::Feed);
+    rig.feed.send(done(first.request_id, 0, 1));
+    rig.deliver(1);
+    rig.feed.reconnect();
+    let again = rig.request(Source::Feed);
+    assert_ne!(again.request_id, first.request_id);
+    assert_eq!((again.from_index, again.from_block), (0, 1));
+    assert_eq!(rig.sub.source(), Source::Feed, "a new image is no fault");
+    rig.feed.send(done(first.request_id, 0, 1));
+    rig.feed.send(tx_at(0));
+    assert_eq!(rig.deliver(3), [] as [String; 0], "the old answer is old");
+    rig.feed.send(done(again.request_id, 1, 1));
+    assert_eq!(rig.deliver(3), ["t0"]);
+}

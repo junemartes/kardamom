@@ -30,13 +30,16 @@ pub enum Poll {
 /// retained frames), and the answers 3, 4, 11 and 16 with the request id
 /// as their tail. The reader drops every other kind.
 ///
-/// The reader drives the source from one thread. It asks [`Self::connected`]
-/// before it sends a request, starts each connection with a request, and
-/// sends a new request with a new id when the answer does not come.
+/// The reader drives the source from one thread. It asks
+/// [`Self::connection`] before it sends a request, starts each connection
+/// with a request, and sends a new request with a new id when the answer
+/// does not come.
 pub trait Transport: Send {
-    /// Whether the source can take a request now: for the member feed, the
-    /// feed subscription has an image of the member's publication.
-    fn connected(&mut self) -> bool;
+    /// The id of the current connection, or `None` when the source cannot
+    /// take a request now. Each new connection has a new id, also when it
+    /// replaces the old one between two calls. For the member feed, the id
+    /// is the correlation id of the image of the member's publication.
+    fn connection(&mut self) -> Option<u64>;
 
     /// Send `request`. The source answers the newest request that it got,
     /// and ends every older answer. A lost request is not an error: the
@@ -57,8 +60,8 @@ pub trait Transport: Send {
 pub struct NoSource;
 
 impl Transport for NoSource {
-    fn connected(&mut self) -> bool {
-        false
+    fn connection(&mut self) -> Option<u64> {
+        None
     }
 
     fn request(&mut self, _request: Request) {}

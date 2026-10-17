@@ -121,28 +121,21 @@ pub(crate) enum ExecutorOrdering {
     /// The references of the cluster egress. The reader joins each one
     /// with its envelope from `tx_data`.
     Refs(bin_support::LiveTxOrderingSub),
-    /// The entries with their bytes, from the member feed. `ingress` is the
-    /// publisher-only cluster session that carries the recorded cursor.
-    /// The subscription is boxed: it is far larger than the reference
-    /// subscription.
-    Carried {
-        sub: Box<bin_support::LiveCarriedSub>,
-        ingress: LiveIngress,
-    },
+    /// The entries with their bytes, from the member feed. It is boxed: it
+    /// is far larger than the reference subscription.
+    Carried(Box<bin_support::LiveCarriedSub>),
 }
 
 impl ExecutorOrdering {
     /// A publisher of the recorded cursor of executor `executor_id` over
-    /// the cluster session.
+    /// the cluster session. The member feed has no cluster session.
     pub(crate) fn recorded_cursor_publisher(
         &self,
         executor_id: u8,
-    ) -> RecordedCursorPublisher<LiveIngress> {
+    ) -> Option<RecordedCursorPublisher<LiveIngress>> {
         match self {
-            Self::Refs(sub) => sub.recorded_cursor_publisher(executor_id),
-            Self::Carried { ingress, .. } => {
-                RecordedCursorPublisher::new(ingress.clone(), executor_id)
-            }
+            Self::Refs(sub) => Some(sub.recorded_cursor_publisher(executor_id)),
+            Self::Carried(_) => None,
         }
     }
 }
@@ -151,7 +144,7 @@ impl TxOrderingSubscription for ExecutorOrdering {
     fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
         match self {
             Self::Refs(sub) => sub.next(),
-            Self::Carried { sub, .. } => sub.next(),
+            Self::Carried(sub) => sub.next(),
         }
     }
 
@@ -160,7 +153,7 @@ impl TxOrderingSubscription for ExecutorOrdering {
     fn vote(&mut self, voter_id: u8, void: &VoidRecord) -> OfferOutcome {
         match self {
             Self::Refs(sub) => sub.vote(voter_id, void),
-            Self::Carried { .. } => OfferOutcome::NotConnected,
+            Self::Carried(_) => OfferOutcome::NotConnected,
         }
     }
 }

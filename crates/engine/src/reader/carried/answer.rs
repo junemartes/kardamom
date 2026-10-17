@@ -56,6 +56,8 @@ pub(crate) enum Fault {
     Silent,
     /// The source lost its connection.
     Lost,
+    /// The source never had a connection in this run of the reader.
+    Absent,
 }
 
 /// What the reader does with one frame.
@@ -91,6 +93,8 @@ pub(crate) struct Answer {
     /// The id of the newest request. `None` until the first request of the
     /// connection.
     request_id: Option<u64>,
+    /// The connection that the newest request went out on.
+    asked_on: Option<u64>,
     /// The next index and the next block that the source must send: the
     /// cursor of the frames that the reader took from this answer.
     expect_index: u64,
@@ -108,6 +112,7 @@ impl Answer {
         Self {
             timing,
             request_id: None,
+            asked_on: None,
             expect_index: 0,
             expect_block: 0,
             live: false,
@@ -120,20 +125,24 @@ impl Answer {
     /// window starts now.
     pub(crate) fn reset(&mut self, now: Instant) {
         self.request_id = None;
+        self.asked_on = None;
         self.live = false;
         self.asked_at = now;
         self.heard_at = now;
     }
 
     /// A new request from the cursor `(index, block)` with the new id
-    /// `request_id`. The answer starts again from that cursor.
+    /// `request_id`, on the connection `connection`. The answer starts
+    /// again from that cursor.
     pub(crate) fn ask(
         &mut self,
         (index, block): (u64, u64),
         request_id: u64,
+        connection: Option<u64>,
         now: Instant,
     ) -> Request {
         self.request_id = Some(request_id);
+        self.asked_on = connection;
         self.expect_index = index;
         self.expect_block = block;
         self.live = false;
@@ -145,18 +154,21 @@ impl Answer {
         }
     }
 
-    /// The step of the timers when no frame came. `connected` is the
-    /// state of the source now.
-    pub(crate) fn wake(&self, connected: bool, now: Instant) -> Wake {
+    /// The step of the timers when no frame came. `connection` is the
+    /// connection of the source now. A connection other than the one of
+    /// the newest request is a new connection: it starts with a new
+    /// request, because the member of a new image answers nothing yet.
+    pub(crate) fn wake(&self, connection: Option<u64>, now: Instant) -> Wake {
         let asked = self.request_id.is_some();
-        if !connected && asked {
+        if connection.is_none() && asked {
             return Wake::Fault(Fault::Lost);
         }
         if now.duration_since(self.heard_at) >= self.timing.silence {
             return Wake::Fault(Fault::Silent);
         }
         let quiet = now.duration_since(self.asked_at.max(self.heard_at));
-        if connected && (!asked || (!self.live && quiet >= self.timing.resend)) {
+        let resend = !self.live && quiet >= self.timing.resend;
+        if connection.is_some() && (!asked || connection != self.asked_on || resend) {
             return Wake::Ask;
         }
         Wake::Wait

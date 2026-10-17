@@ -2,15 +2,21 @@
 //! for byte. The Java service is the real encoder; tests and the in-Rust
 //! service mock use these.
 
+#[cfg(any(test, feature = "testing"))]
 use alloy_primitives::Address;
+#[cfg(any(test, feature = "testing"))]
 use kardamom_types::ClusterStatus;
+#[cfg(any(test, feature = "testing"))]
 use kardamom_types::cluster_status::RecordLagStatus;
 
 use super::{
-    EGRESS_KIND_BOUNDARY, EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_DA_LAG_REJECT,
-    EGRESS_KIND_PAST_DEADLINE, EGRESS_KIND_RELAYED, EGRESS_KIND_REPLAY_DONE,
-    EGRESS_KIND_REPLAY_UNAVAILABLE, EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, SENDER_LEN,
-    WireError, encode_kind_2u64,
+    EGRESS_KIND_BOUNDARY, EGRESS_KIND_RELAYED, EGRESS_KIND_REPLAY_DONE,
+    EGRESS_KIND_REPLAY_UNAVAILABLE, WireError, encode_kind_2u64,
+};
+#[cfg(any(test, feature = "testing"))]
+use super::{
+    EGRESS_KIND_CONTIGUITY_REJECT, EGRESS_KIND_DA_LAG_REJECT, EGRESS_KIND_PAST_DEADLINE,
+    EGRESS_KIND_STATUS, EGRESS_KIND_WINDOW_FULL, SENDER_LEN,
 };
 
 /// Frame a relayed record exactly as the Java service does. `payload` is the

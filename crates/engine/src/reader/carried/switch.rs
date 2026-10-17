@@ -35,6 +35,14 @@ impl Source {
         }
     }
 
+    /// The index of this source in a `[feed, service]` pair.
+    fn slot(self) -> usize {
+        match self {
+            Self::Feed => 0,
+            Self::Service => 1,
+        }
+    }
+
     fn other(self) -> Self {
         match self {
             Self::Feed => Self::Service,
@@ -73,40 +81,55 @@ impl Marks {
         }
     }
 
-    /// The verdict of two faults, one of each source. A source that cannot
-    /// serve because of its floor wins: a peer checkpoint repairs it. Two
-    /// heads below the cursor stop the reader. Any other pair is a fault
-    /// that can pass, so the reader tries the other source again.
+    /// The verdict of two faults, one of each source.
+    ///
+    /// - A peer checkpoint only when every source refused the cursor below
+    ///   its floor, or never connected in this run. The checkpoint is at or
+    ///   above the lowest floor.
+    /// - A stop when every source has a head below the cursor, or never
+    ///   connected.
+    /// - Else the reader tries the other source again: a silent, lost or
+    ///   bad source can serve again later, for example a member that
+    ///   restarts.
     fn verdict(&self) -> Verdict {
         let pair = [self.feed, self.service];
+        let every = |accept: fn(&Fault) -> bool| {
+            pair.iter()
+                .all(|mark| mark.is_some_and(|f| f == Fault::Absent || accept(&f)))
+        };
         let floor = pair
             .iter()
+            .flatten()
             .filter_map(|fault| match fault {
-                Some(Fault::Unavailable {
+                Fault::Unavailable {
                     oldest_index,
                     oldest_block,
-                }) => Some((*oldest_block, *oldest_index)),
+                } => Some((*oldest_block, *oldest_index)),
                 _ => None,
             })
             .min();
-        match (floor, pair) {
-            (Some((oldest_block, oldest_index)), _) => Verdict::Unavailable {
-                oldest_index,
-                oldest_block,
-            },
-            (
-                None,
-                [
-                    Some(Fault::Ahead {
-                        head_index,
-                        head_block,
-                    }),
-                    Some(Fault::Ahead { .. }),
-                ],
-            ) => Verdict::Behind {
+        let head = pair.iter().flatten().find_map(|fault| match fault {
+            Fault::Ahead {
                 head_index,
                 head_block,
-            },
+            } => Some((*head_index, *head_block)),
+            _ => None,
+        });
+        match (floor, head) {
+            (Some((oldest_block, oldest_index)), _)
+                if every(|f| matches!(f, Fault::Unavailable { .. })) =>
+            {
+                Verdict::Unavailable {
+                    oldest_index,
+                    oldest_block,
+                }
+            }
+            (_, Some((head_index, head_block))) if every(|f| matches!(f, Fault::Ahead { .. })) => {
+                Verdict::Behind {
+                    head_index,
+                    head_block,
+                }
+            }
             _ => Verdict::Switched,
         }
     }
@@ -116,8 +139,9 @@ impl Marks {
 /// service.
 #[derive(Default)]
 struct Return {
-    /// Since when the member is ready without a break.
-    ready_since: Option<Instant>,
+    /// The image of the feed, and since when the feed has that image
+    /// without a break. A new image starts the window again.
+    ready_since: Option<(u64, Instant)>,
     /// The request on the feed that checks that its replay reaches the
     /// head. The reader drops the frames of its answer.
     probe: Option<Answer>,
@@ -131,6 +155,9 @@ pub(crate) struct Switch<F, S> {
     active: Source,
     answer: Answer,
     marks: Marks,
+    /// Whether each source had a connection in this run, as `[feed,
+    /// service]`.
+    seen: [bool; 2],
     back: Return,
     /// The id of the next request on either source. Ids are labels, so
     /// they wrap.
@@ -147,6 +174,7 @@ impl<F: Transport, S: Transport> Switch<F, S> {
             active: Source::Feed,
             answer: Answer::new(timing, now),
             marks: Marks::default(),
+            seen: [false; 2],
             back: Return::default(),
             next_id: first_id,
         };
@@ -170,13 +198,21 @@ impl<F: Transport, S: Transport> Switch<F, S> {
         self.answer.frame(bytes, now)
     }
 
+    /// The connection of the active source now. A source that has one
+    /// counts as seen for the rest of the run.
+    fn connection(&mut self) -> Option<u64> {
+        let connection = match self.active {
+            Source::Feed => self.feed.connection(),
+            Source::Service => self.service.connection(),
+        };
+        self.seen[self.active.slot()] |= connection.is_some();
+        connection
+    }
+
     /// The timers of the active source.
     pub(crate) fn wake(&mut self, now: Instant) -> Wake {
-        let connected = match self.active {
-            Source::Feed => self.feed.connected(),
-            Source::Service => self.service.connected(),
-        };
-        self.answer.wake(connected, now)
+        let connection = self.connection();
+        self.answer.wake(connection, now)
     }
 
     fn take_id(&mut self) -> u64 {
@@ -188,7 +224,8 @@ impl<F: Transport, S: Transport> Switch<F, S> {
     /// Send a new request from `cursor` to the active source.
     pub(crate) fn ask(&mut self, cursor: (u64, u64), now: Instant) {
         let id = self.take_id();
-        let request = self.answer.ask(cursor, id, now);
+        let connection = self.connection();
+        let request = self.answer.ask(cursor, id, connection, now);
         tracing::debug!(
             source = self.active.label(),
             from_index = request.from_index,
@@ -223,7 +260,12 @@ impl<F: Transport, S: Transport> Switch<F, S> {
             )
             .increment(1);
         }
-        *self.marks.slot(self.active) = Some(fault);
+        let mark = if self.seen[self.active.slot()] {
+            fault
+        } else {
+            Fault::Absent
+        };
+        *self.marks.slot(self.active) = Some(mark);
         let verdict = match self.marks.slot(self.active.other()) {
             Some(_) => self.marks.verdict(),
             None => Verdict::Switched,
@@ -273,15 +315,18 @@ impl<F: Transport, S: Transport> Switch<F, S> {
     /// head. One break of the readiness, or a failed replay, starts the
     /// window again. Returns whether the reader switched to the feed.
     pub(crate) fn check_return(&mut self, cursor: (u64, u64), now: Instant) -> bool {
-        if self.active != Source::Service || !self.feed.connected() {
+        let (Source::Service, Some(image)) = (self.active, self.feed.connection()) else {
             self.back = Return::default();
             return false;
+        };
+        if self.back.ready_since.is_some_and(|(seen, _)| seen != image) {
+            self.back = Return::default();
         }
-        let since = *self.back.ready_since.get_or_insert(now);
+        let (_, since) = *self.back.ready_since.get_or_insert((image, now));
         if now.duration_since(since) < self.timing.ready {
             return false;
         }
-        match self.probe(cursor, now) {
+        match self.probe(cursor, image, now) {
             Some(Step::Live { .. }) => {
                 self.switch_to(Source::Feed, cursor, now);
                 true
@@ -296,16 +341,16 @@ impl<F: Transport, S: Transport> Switch<F, S> {
 
     /// One step of the probe on the feed: its timers, then the frames that
     /// the feed already sent. Returns the step that ends the probe, if any.
-    fn probe(&mut self, cursor: (u64, u64), now: Instant) -> Option<Step> {
+    fn probe(&mut self, cursor: (u64, u64), image: u64, now: Instant) -> Option<Step> {
         let id = self.next_id;
         let Self { feed, back, .. } = self;
         let probe = back
             .probe
             .get_or_insert_with(|| Answer::new(self.timing, now));
-        match probe.wake(true, now) {
+        match probe.wake(Some(image), now) {
             Wake::Ask => {
                 self.next_id = self.next_id.wrapping_add(1);
-                feed.request(probe.ask(cursor, id, now));
+                feed.request(probe.ask(cursor, id, Some(image), now));
                 None
             }
             Wake::Fault(fault) => Some(Step::Fault(fault)),

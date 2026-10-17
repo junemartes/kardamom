@@ -51,6 +51,9 @@ kardamom-test-support = { workspace = true, optional = true }
 # instead of copying it. Off by default: a production build never
 # compiles test fixtures in.
 test-support = ["dep:kardamom-test-support"]
+# Tests against a real media driver in a container. They need Docker and
+# run with `--ignored`.
+docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dev-dependencies]
 kardamom-test-support = { workspace = true }

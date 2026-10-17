@@ -132,11 +132,11 @@ pub(super) enum RuntimeCmd {
         uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
-    /// Count the images of a subscription: one for each publisher session
-    /// that the subscription sees.
-    SubImageCount {
+    /// Read the correlation id of the first image of a subscription, or
+    /// `None` when the subscription has no image.
+    SubImageId {
         sub_id: u32,
-        ack: CbSender<Result<usize, LogError>>,
+        ack: CbSender<Result<Option<i64>, LogError>>,
     },
     /// Close a subscription: drop its destinations, its handlers, and the
     /// Aeron subscription itself. Its `sub_id` is never reused.

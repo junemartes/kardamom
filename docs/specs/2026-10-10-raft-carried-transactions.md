@@ -579,21 +579,32 @@ The executor reads one source at a time, in this order:
 
 | Order | Source | Use it while |
 |---|---|---|
-| 1 | The feed of its paired member | The feed delivers a frame or a status at least every 3 boundary ticks (6 s). |
-| 2 | The serving service (section 8.1) | The feed is silent, or it answered `REPLAY_UNAVAILABLE` and the service's floor is lower. |
-| 3 | A peer checkpoint | Every source answered `REPLAY_UNAVAILABLE` (`crates/engine/src/bin_support.rs:529-576`). |
+| 1 | The feed of its paired member | The feed delivers a frame at least every 3 boundary ticks (6 s), and keeps its image. |
+| 2 | The serving service (section 8.1) | The feed is silent, lost its image, sent an entry that fails the hash check, or answered `REPLAY_UNAVAILABLE` or `REPLAY_AHEAD`. |
+| 3 | A peer checkpoint | Every source answered `REPLAY_UNAVAILABLE`, or never connected in this run of the reader (`crates/engine/src/bin_support.rs:529-576`). |
+
+- A peer checkpoint replaces the state, so the reader takes one only when no source can serve the
+  cursor. A silent or lost source does not count: a member that restarts (section 7.4) can serve
+  the cursor a few seconds later. The reader then tries the other source again.
 
 - The switch happens at a frame boundary. The executor closes the old source and asks the new one
   for a replay from its cursor. R3 makes the frames at each index equal.
-- The executor goes back to its feed when both hold:
-  - the member admin endpoint answered ready (`cluster/sealer-service/README.md:423-445`) for
-    30 s without a break;
-  - the feed's replay from the executor's cursor reached `REPLAY_DONE`, which is the head.
-  Until then the executor stays on the serving service. One not-ready answer restarts the 30 s.
-- `kardamom.cluster.readyLagBytes` (`cluster/sealer-service/README.md:362`) scales with the log
-  bytes. The default 4 MiB is about 500 log entries of 8 KB, so a busy follower would flap. The
-  new default is 64 MiB, and the setting gets a hysteresis: a member turns not ready above the
-  value and ready again below half of it.
+- The executor goes back to its feed when both hold, in this order:
+  - the feed subscription has one image of the member's publication for 30 s without a break. A
+    lost image, or a new image (a new correlation id), restarts the 30 s;
+  - then a probe replay of the feed from the executor's cursor reaches `REPLAY_DONE`, which is the
+    head of the member. The reader drops the frames of the probe, and it sends a new request when
+    it switches.
+  Until then the executor stays on the serving service. A probe that ends in another way restarts
+  the 30 s.
+- The probe is the readiness check. A member that lags answers its replay only when its walk
+  reaches its own head, so a member that lags cannot take the executor back before it reaches the
+  head. The executor has no HTTP client, and it does not read the member admin endpoint.
+- The reader does not use `kardamom.cluster.readyLagBytes`. The member uses it for its own admin
+  endpoint only (`cluster/sealer-service/README.md:362`). It scales with the log bytes. The
+  default 4 MiB is about 500 log entries of 8 KB, so a busy follower would flap. The new default is
+  64 MiB, and the setting gets a hysteresis: a member turns not ready above the value and ready
+  again below half of it.
 - `kardamom_executor_input_source{source="feed|service"}` shows the source. An alert fires when an
   executor reads the serving service for more than 10 minutes.
 
@@ -818,12 +829,13 @@ rules of section 7.8 to both, and one pending set orders the frames of both (R14
 
 | Method | Input | Output |
 |---|---|---|
-| `connected` | none | `true` when the source can take a request now. For the feed: the feed subscription has an image of the member's publication. |
+| `connection` | none | The id of the current connection, or `None` when the source cannot take a request now. Each new connection has a new id. For the feed: the correlation id of the image of the member's publication. |
 | `request` | `Request { from_index, from_block, request_id }`: the cursor and a new id | none. The source answers the newest request and ends each older answer. A lost request is not an error. |
 | `poll` | the longest wait | `Frame(bytes)`: one whole frame. `Idle`: no frame within the wait. `Closed`: the process stops. |
 | `close` | none | none. The source discards the frames that it sent and the reader did not read. |
 
-- The reader sends a request only while `connected` is `true`. It starts each connection with a
+- The reader sends a request only while `connection` is not `None`. It starts each connection,
+  also a new id that replaces the old one with no gap between, with a
   request, and it sends a new request with a new id for each new answer.
 - The reader leaves a source only between two frames. It calls `close` on the old source, and sends
   a request from its cursor to the new one.
@@ -841,23 +853,24 @@ source is alive. The reader drops each kind that it does not know.
 
 | Case | What the reader does |
 |---|---|
-| Not connected | It sends no request. It leaves the source when no frame comes within the silence window (6 s). A source that loses its connection after a request: the reader leaves it at once. |
+| Not connected | It sends no request. It leaves the source when no frame comes within the silence window (6 s). A source that loses its connection after a request: the reader leaves it at once. A source that never connected in this run counts as absent. |
+| A new connection | It sends a new request with a new id to the same source. |
 | No answer | No frame of the answer within 2 s of the request: it sends a new request with a new id. |
 | An answer with an old id | It drops the frame. |
 | A retained frame below the cursor | It drops the frame. |
 | A hole (the index or block rule of section 7.8) | It does not apply the frame. It sends a new request from its cursor to the same source. |
 | Gap (`FEED_GAP`, kind 16) | It sends a new request from its cursor to the same source. |
-| Replay unavailable (kind 3, with the floor `oldest_index`, `oldest_block`) | It leaves the source. When the other source also failed since it last reached its head, it stops with `ClusterReplayUnavailable` and the lower floor, and the executor fetches a peer checkpoint (section 7.3). |
-| Replay ahead (kind 11, with the head) | It leaves the source. When both sources answered `REPLAY_AHEAD`, it stops with `ClusterBehindCursor`. |
+| Replay unavailable (kind 3, with the floor `oldest_index`, `oldest_block`) | It leaves the source. When every source answered `REPLAY_UNAVAILABLE` or is absent, it stops with `ClusterReplayUnavailable` and the lowest floor, and the executor fetches a peer checkpoint (section 7.3). Else it tries the other source. |
+| Replay ahead (kind 11, with the head) | It leaves the source. When every source answered `REPLAY_AHEAD` or is absent, it stops with `ClusterBehindCursor`. Else it tries the other source. |
 | Silent too long (no frame for 6 s) | It leaves the source. |
 | A frame of a known kind that does not decode | It leaves the source. |
 | `keccak256(raw_tx)` is not `canonical_id` | It does not execute the entry. It counts `kardamom_executor_source_mismatch_total{source}`, leaves the source, and replays from the other source at the same index. |
 
-- A source that the reader left for any other case than a floor or a head stays in the order: the
-  reader tries it again when the other source fails.
-- The reader takes `connected` of the feed as the readiness of the member in the return rule of
-  section 7.5: the feed has an image for 30 s without a break, then a replay of the feed from the
-  cursor reaches `REPLAY_DONE`.
+- A source that the reader left as silent, lost or bad stays in the order: the reader tries it
+  again when the other source fails. The reader keeps the last fault of each source until the
+  source reaches `REPLAY_DONE` again.
+- The return to the feed follows section 7.5: the feed keeps one image for 30 s, then a probe
+  replay of the feed from the cursor reaches `REPLAY_DONE`.
 
 ### 8.2 The batcher's resume sources
 

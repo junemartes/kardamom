@@ -49,12 +49,15 @@ impl AeronFeed {
 }
 
 impl Transport for AeronFeed {
-    /// The feed has an image of the member's publication. A failed count
-    /// reads as no image.
-    fn connected(&mut self) -> bool {
+    /// The correlation id of the image of the member's publication. The
+    /// publication is exclusive, so the feed has at most one image. A
+    /// failed read reads as no image.
+    fn connection(&mut self) -> Option<u64> {
         self.rt
-            .image_count(self.sub_id)
-            .is_ok_and(|count| count > 0)
+            .image_id(self.sub_id)
+            .ok()
+            .flatten()
+            .map(i64::cast_unsigned)
     }
 
     /// One offer, with no retry: the reader sends a new request when no
