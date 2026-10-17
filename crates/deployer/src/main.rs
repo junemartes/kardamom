@@ -25,9 +25,8 @@ struct Cli {
 
     /// Canonical owner address (Safe or EOA). The same owner gives the same
     /// factory address. Each command that reads or writes the contracts
-    /// requires it; `formats` reads no chain.
-    ///
-    /// This field is not `global`. Pass `--owner` before the subcommand.
+    /// requires it; `formats` reads no chain. Pass `--owner` before the
+    /// subcommand.
     #[arg(long)]
     owner: Option<Address>,
 
@@ -202,7 +201,12 @@ async fn main() -> Result<()> {
         } => run_addresses(cli.rpc_url, owner?, l2_chain_id, contract, json).await,
         Command::Verify => run_verify(cli.rpc_url, owner?).await,
         Command::Formats { base, root } => {
-            let findings = FormatGate { base, root }.findings()?;
+            let context = format!(
+                "compare the registry of {} with the accepted registry {}",
+                root.display(),
+                base.display()
+            );
+            let findings = FormatGate { base, root }.findings().context(context)?;
             println!("{}", serde_json::to_string(&findings)?);
             Ok(())
         }
