@@ -22,7 +22,7 @@
   - A member feeds only its own executor, over IPC. A separate service serves the validator,
     the batcher and external nodes (section 8.1, out of scope).
   - The boundary stream digest is a later follow-up.
-- Decided by the user on 2026-10-17 (decisions 10 to 14):
+- Decided by the user on 2026-10-17 (decisions 10 to 15):
   - The sealer keeps no retained file. Its Raft log and its snapshots are its only record.
   - The serving service reads only from the executors. It keeps the append-only log of the
     transactions above the posted head for the batcher and the attester.
@@ -39,6 +39,9 @@
     serving service keeps each attested range until its challenge window ends; it imports the
     existing receipts at the cut-over; the read interface, the copies and the failover go to the
     design of #585.
+  - After a lost tail of the Raft log (sync level 0, a power loss on a majority), the cluster
+    recovers the entries first, and then overrides what it cannot recover. The executors roll
+    back by themselves (decision 15, section 11.1).
 - Scope: the ingress size cap, the sequencer offer with bytes, the `tx_heads` stream, the sealer
   state machine and its snapshot, the input of the executors, and the removal of the void path.
   The service that serves the canonical stream to the validator, the batcher and external nodes
@@ -90,6 +93,7 @@
 | R5 | An executor executes index `i` only after it executed `i - 1`. It never skips an index. |
 | R6 | The bytes that one sequencer replica holds, in its parked buffer and its unconfirmed ledger, never pass a fixed bound (section 6.2). |
 | R7 | Every committed entry of a block above the posted head stays in at least one store until L1 holds it. The member's Raft log keeps it until the serving service stores it (the stored head). The executor's output keeps it until then too. The serving service keeps it until the posted head and the final head pass it: the challenge window of its output root has ended (sections 5.5, 8.1 and 8.3). |
+| R8 | The cluster never overrides a block at or below the stored head. After a lost tail of the Raft log, it restores those blocks from the serving service (section 11.1). The posted head is at or below the stored head, so the cluster never forks from L1. |
 
 ### 1.3 What the design does not guarantee
 
@@ -104,6 +108,10 @@
   lag, on top of the one-day challenge window that it always keeps (section 10.0). The disk of a
   member and of an executor grows only while the serving service stores nothing. An alert warns
   before a disk fills (section 11).
+- It does not keep the order of the entries above the stored head through a lost tail of the
+  Raft log (sync level 0, a power loss on a majority). It recovers their transactions where a
+  sequencer still holds them, and the executors roll back (section 11.1). A receipt above the
+  stored head is not final.
 - It does not stop ordered junk from an unfunded new key. The size cap bounds each entry. A
   stricter rule is a follow-up (section 6.6).
 
@@ -242,8 +250,10 @@ payload:       [canonical_id:32][record_type=6][lane:u8][envelope]
 | Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). |
 | Egress kind 13 (record-lag reject) | Retired. |
 | Egress kind 14 | Not used. An earlier draft used it for `ENVELOPE_FULL` (section 15, option A). |
-| Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). There is no byte tail: a member retains no bytes (section 5.5). The frame stays 68 bytes, as with `carryBytes` off. The 76-byte frame with `[retained_bytes:u64]` of #608 goes with the retained file. A reader still accepts a longer frame and ignores the tail. |
+| Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). There is no byte tail: a member retains no bytes (section 5.5). The 76-byte frame with `[retained_bytes:u64]` of #608 goes with the retained file. A new tail `[stored_head:u64][held:u8]` follows byte 67: 77 bytes. The sequencers read it (section 11.1). A reader accepts 68 or 77 bytes and ignores a longer tail. |
 | Ingress kind 11 `STORED_CURSOR` (new) | `[kind=11][stored_head:u64]`, 9 bytes. The serving service sends it, as the batcher sends kind 7. It has no guard header. The sealer keeps the highest value (section 5.5). |
+| Ingress kind 12 `RESTORE_FRAME` (new) | `[kind=12][sender:20][nonce:u64][deadline:u64][frame]`. The writer of the serving service sends it after a lost tail of the Raft log. The sealer applies it only while `restoring` (section 11.1). Decision version 4. |
+| Egress kind 18 `HELD` (new) | The answer to a user record while the sealer is `held` or `restoring` (section 11.1). The sequencer keeps the entry and offers it again. |
 | Egress kind 16 `FEED_GAP` (new, feed only) | `[kind=16][next_index:u64][next_block:u64]`, 17 bytes (section 7.2). |
 | Record types 0 (`TxRef`) and 4 (void) | Retired after the cut-over (section 12). |
 
@@ -396,8 +406,9 @@ head.** The floor moves from the posted head to the stored head:
   the floor is the posted head of today.
 - **The input.** The serving service sends ingress kind 11 `STORED_CURSOR` (section 4.3) through
   a publisher-only cluster session, as the batcher sends kind 7. The sealer keeps the highest
-  value, and replicates it, so every member plans the purge from the same value. It does not
-  change the decision of any record, so it needs no new decision version. The snapshot carries it
+  value, and replicates it, so every member plans the purge from the same value. Kind 11 alone
+  changes the decision of no record, so it needs no new decision version. The hold and the
+  restore of section 11.1 use it, and they come with decision version 4. The snapshot carries it
   (below).
 
 **Disk full.** The Raft log cannot write. The member logs a fatal error and stops, as Aeron does
@@ -405,7 +416,8 @@ today. Section 11 gives the effect and the alert. `kardamom_sealer_disk_free_byt
 it now watches the log.
 
 **Gauges.** The admin `/status` of a member shows `storedHead` beside `postedHead`. The status frame
-gets no new field. The sealer logs `cluster STORED-CURSOR` when the stored head moves up.
+carries the stored head as a tail for the sequencers (section 4.3). The sealer logs
+`cluster STORED-CURSOR` when the stored head moves up.
 
 **The snapshot (version 12).** `CanonicalSealerState.java:1474-1538` and
 `SealerEgress.java:558-610` change as follows:
@@ -485,6 +497,12 @@ Raft.
 - The unconfirmed ledger holds bytes until a receipt confirms the entry (`confirm_timeout_ms`
   15,000). At 2,500 tx/s for each lane and 1 s of receipt latency, it holds about 2.4 MB with
   the mix and 21 MB with 8 KB only. The 256 MiB bound covers about 12 s at 8 KB only.
+- **The retention for recovery (decision 15).** The unconfirmed ledger keeps an entry after its
+  receipt, until its block is at or below `max(stored_head, posted_head)` (section 11.1). That
+  adds the lag of the stored head, about 4 s, to the receipt latency: about 10 MB with the mix
+  and 86 MB with 8 KB only, for each replica at 2,500 tx/s. While the serving service is down,
+  the stored head stops, and the bound fills in about 100 s with the mix and 12 s with 8 KB
+  only. Open question 16.1-13 sets what the sequencer does then.
 - The benchmark tunes both values (section 10.6).
 - Metrics: `kardamom_sequencer_parked_bytes`, `kardamom_sequencer_unconfirmed_bytes`,
   `kardamom_sequencer_byte_evictions_total`.
@@ -496,7 +514,8 @@ Raft.
 - **One re-offer path.** A leader change loses the offers in flight (cluster ingress is at most
   once, `docs/failure-modes.md:257-258`). The unconfirmed ledger re-offers them with their bytes
   after `confirm_timeout_ms` (`crates/sequencer/src/unconfirmed.rs:1-13`). The dedup drops the
-  copies that did commit.
+  copies that did commit. After a lost tail of the Raft log, the same ledger also re-offers the
+  entries that had a receipt above the sealed head (section 11.1).
 - **Durability.** A transaction in flight lives in the memory of both twins until the commit. One
   twin can die without a loss. A lane that loses both twins loses its transactions in flight, as
   today.
@@ -948,6 +967,12 @@ calls it the egress service. This spec states only what it needs from that servi
   opens a feed for it.
 - **The stored head.** It sends the newest block that it holds on its durable store to every
   executor and to the sealer (section 8.3).
+- **It serves only blocks at or below its stored head** (decision 15). So the batcher posts only
+  stored blocks (`posted_head <= stored_head`), and no cold-tier reader sees a block that a lost
+  tail of the Raft log can override (section 11.1). The cold tier trails the head by the stored
+  head: about one block.
+- **The restore.** After a lost tail of the Raft log, its writer sends the frames above the
+  sealed head back to the sealer (ingress kind 12, section 11.1).
 - **The cold tier (decision 11).** It is the cold tier of section 8.4: horizontally scaled read
   replicas of one append-only log, with one writer that reads the executors. It also answers the
   receipt lookup of the ingress for a receipt that the executors pruned.
@@ -1511,12 +1536,212 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 | The disk of a member fills | It happens only while the stored head does not move (an outage of the serving service or of every executor). The member cannot write its log. It logs a fatal error and stops. All members keep the same log, so disks of one size fill at about the same time. When a quorum stops, the cluster commits nothing: the chain stops. | The alert `KardamomSealerDiskLow` fires first: free disk under 25 %, or under 6 hours at the current growth rate (`kardamom_sealer_disk_free_bytes` and its derivative). The operator restores the serving service or adds disk. A stopped member restarts and replays its log. |
 | A member's feed bytes differ from the leader's | A bug: R3 is broken. | An executor whose entry fails its hash check drops that source and replays from the other source, with an alert (section 8). The validator checks every canonical entry it reads. A boundary carries no digest of the stream. A stream digest is a later follow-up (section 16.3). |
 | A feed ring fills | The member writes a `FEED_GAP` marker (section 7.2). | The executor asks for a replay at once and stays on the feed. |
+| A power loss on a majority of the members loses the tail of the Raft log (sync level 0) | The canonical head goes back. The paired executors are ahead of it. | The recovery of section 11.1: hold, restore from the serving service, re-offer from the sequencers, then override. The paired executors roll back by themselves. |
 | The serving service stops (every writer and replica) | The stored head stops. The batcher, the attester, the validator and the unpaired executors stop reading. The ingress serves receipts from its cache and the executors only. Each member keeps its log, and each executor keeps its output buffer (section 10.0). | `KardamomExecutorOutputUnstored` fires after 10 minutes, then the disk alerts. When the service returns, its writer reads the blocks above its last block from an executor, the stored head moves, and the members and the executors prune. |
 | The writer of the serving service stops | The replicas serve reads. The stored head stops until a new writer runs. | A replica becomes the writer (section 8.4) and reads the blocks that it lacks from an executor. |
 | The serving service loses blocks above the posted head | A disk loss of fewer copies than the stored head needs loses nothing: the other copies hold the blocks. A loss of every copy loses the blocks between the posted head and the stored head: the members and the executors already pruned them. | The chain reverts to the posted head (`docs/runbooks/revert_to_posted_head.md`), as after the loss of every member. The design of #585 sets the copies that make this rare. |
 | Every executor is down | No block is executed. The serving service has nothing new, so the stored head stops. The sealer keeps ordering into its log. | The log holds the range above the stored head (section 5.5). The executors return, replay from their feeds or a peer checkpoint, and the serving service goes on. |
 | An executor serves a wrong block | The serving service stores what one executor wrote (decision 14). The hash check drops bytes that do not match their id (section 8.3). | The service reads the block again from the next executor. A wrong receipt shows at the validator's receipt check. An added valid entry passes until the stream digest of decision 8. |
 | The disk of an executor fills | It happens only while the stored head does not move. The commit fails, and the executor stops. | `KardamomExecutorDiskLow` fires first. The paired executors of the other hosts fill at about the same rate. |
+
+### 11.1 Recovery after a lost log tail
+
+**The cause (decision 15).** The sealer runs with `kardamom.cluster.fileSyncLevel=0` (a separate
+PR; today the deploy passes `1`, `cluster/sealer-service/README.md:379-390`). A write then stays
+in the page cache until the kernel writes it back, about 30 s. A power loss on the hosts of a
+majority of the members can lose the newest committed entries of the Raft log on each of them.
+The members restart, elect a leader, and the canonical head is lower than before: `H'` (index,
+block) is the head after the restart, and `H` is the head before the loss. The entries
+`(H', H]` are lost from the cluster.
+
+The user wants recovery, not a halt. The cluster first gets the lost entries back, and then
+overrides what it cannot get back.
+
+**Where the lost entries still are.**
+
+| Range | Source | Exact? |
+|---|---|---|
+| Every block at or below the stored head `S` (section 8.3) | The serving service: the frames and the receipts, on its durable store | Yes: the canonical frames, byte for byte |
+| The committed blocks above `S` of an executor that survived | Its output buffer, `block_frames` (section 8.3). The serving service reads it as usual, so its stored head moves up to the newest block that a reachable executor committed | Yes |
+| The transactions of the rest of `(H', H]` | The unconfirmed ledgers of the sequencers, with the retention change below | No: the bytes, but not the order |
+
+- `S` trails `H` by a few seconds: the block of the executor (2 s), the read of the serving
+  service and its copies. The loss reaches back about 30 s. So after a loss `S` is usually
+  above `H'`: the serving service holds exact entries that the cluster lost.
+- The serving service serves only blocks at or below its stored head (section 8.1). So no reader
+  of the cold tier (the batcher, the attester, the validator, the unpaired executors, the history
+  readers) ever saw a block above `S`. Only the paired executors, the ingress and the sequencers
+  (the hot tier) saw entries above `S`.
+
+**The floors that the cluster never overrides.**
+
+- **The posted head `P`.** L1 holds every block at or below `P`. A cluster that overrides one of
+  them forks from L1: the batcher cannot post, and a rebuild from L1 gives another chain. The
+  cluster never needs to: the batcher posts only what it read from the serving service, so
+  `P <= S` (section 8.1), and the cluster restores up to `S`.
+- **The stored head `S`.** The serving service holds every frame and every receipt at or below `S`
+  durably. The cold-tier readers built on them: the batcher posted from them, the attester built
+  output roots from them, the validator executed them, and the executors pruned their own copies
+  (section 8.3). An override below `S` invalidates all of that, and it loses data that the
+  cluster can restore. So the floor is `S`. `P <= S`, so `S` is the one floor that the rule needs.
+- This is invariant R8 (section 1.2).
+
+**Phase 1: hold.** A leader cannot tell by itself whether its log lost a tail. So:
+
+- On each new leadership term (a log event, so every member decides alike), the sealer enters
+  `held`. It refuses user records with a new answer, egress kind 18 `HELD`. The status frame
+  states the hold (section 4.3). The sequencer keeps a refused entry and
+  offers it again after the hold, as on back-pressure. Origin records, posted cursors and stored
+  cursors still apply.
+- The writer of the serving service sends its stored head (ingress kind 11) again after each
+  leader change (`NewLeaderEvent`, `crates/cluster-adapter/src/live/session_loop.rs`).
+- With `S` at or below the sealed head, the sealer leaves `held`: nothing was lost below `S`. The
+  hold costs one round trip of the writer after each election.
+- With `S` above the sealed head, a loss is proven. The sealer enters `restoring` (phase 2).
+- When no kind 11 arrives within `kardamom.cluster.recoveryHoldMs` (proposal: 10 s, on the cluster
+  clock), the policy of open question 16.1-12 applies.
+
+**Phase 2: restore from the serving service (exact).**
+
+- The writer sends the canonical frames of each block above the sealed head, up to its stored
+  head, as a new ingress kind 12 `RESTORE_FRAME`:
+  `[kind=12][sender:20][nonce:u64][deadline:u64][frame]`. `frame` is the canonical frame (kind 1
+  or kind 2) byte for byte. The writer takes the guard fields from the envelope: `sender`, the
+  nonce from `raw_tx`, and `max_inclusion_block`. They are zero for a frame that is not of
+  record type 6.
+- The sealer applies a restore frame only in `restoring`, in log order:
+  - a kind-1 frame of record type 6: its index must be the next canonical index. Insert the id in
+    the dedup window with its deadline, set the expected nonce of the sender to `nonce + 1`, and
+    relay the frame as it is;
+  - a kind-1 frame of an origin record (types 1, 2 and 3): apply it through the origin path of
+    today with the fields that the frame carries, and relay it;
+  - a kind-2 frame: it must close the open block, with `end_tx_idx` equal to the next index.
+    Close the block with its timestamp and its L1 origin, as the frame states.
+  - A frame that breaks a rule ends the restore: the sealer logs `cluster RESTORE REFUSED` and
+    stays `restoring`, and an alert fires. It does not override below `S`.
+- At the stored head the sealer leaves `restoring` and opens. Every member applied the same log,
+  so every member holds the same stream (R1, R3). The feeds carry the restored frames to the
+  paired executors as usual.
+- The restore is log input that changes the decisions of the sealer, so it needs decision
+  version 4 (proposal: ship it before the cut-over, so that the coordinated restart of PR 13
+  covers it).
+
+**Phase 3: re-offer from the sequencers (the transactions, not the order).**
+
+- **The retention change.** Today a sequencer drops an entry from its unconfirmed ledger when a
+  receipt at or above its nonce arrives (`crates/sequencer/src/unconfirmed.rs:89-94`,
+  `crates/sequencer/src/sequencer/receipt_floor.rs:32`). Now it keeps the entry, with the block of
+  that receipt, until the entry is **durable elsewhere**: its block is at or below
+  `max(stored_head, posted_head)`. Both heads come from the sealer status (kind 9, with the stored
+  head as a new tail, section 4.3). `P <= S`, so in practice it is the stored head.
+- **The re-offer.** When the cluster opens after a hold, each kept entry whose receipt block is
+  above the sealed head of the status was lost. The sequencer offers it again at once, in nonce
+  order for each sender, with its bytes. An entry that the restore brought back is in the dedup
+  window, so its copy drops. Both twins re-offer; the dedup keeps one copy.
+- **The cost (section 6.2).** The ledger now holds the entries of the receipt latency plus the lag
+  of the stored head, about 4 s, not about 1 s. At 2,500 tx/s for each replica that is about
+  10 MB with the mix and about 86 MB with 8 KB only, inside the bound of 256 MiB.
+- **The serving service down.** The stored head stops, and the ledger grows. It reaches the bound
+  after about 100 s with the mix and about 12 s with 8 KB only. Open question 16.1-13 sets what
+  the sequencer does then.
+- The re-offered entries get a new order: the arrival of the offers, the ordering window and the
+  ticks differ from before. So the history above the restored head differs from what the paired
+  executors ran. That part is the override.
+
+**Phase 4: override.** The cluster goes on from the restored head `R` (at or above `S`). Every
+entry of `(R, H]` that no source gave back in its order is gone. Its transaction is ordered
+again if a sequencer still holds it, at a new index. Else it is lost, as a lane that loses both
+twins loses its transactions in flight today (section 1.3).
+
+**Who detects the loss.**
+
+| Detector | Signal | Action |
+|---|---|---|
+| The writer of the serving service | Its stored head is above the sealed head in the new term | It sends kind 11, and the restore frames (phase 2) |
+| The sealer | A kind 11 above its sealed head while `held` | `restoring`, then open |
+| A sequencer | A kept entry with a receipt block above the sealed head, after the cluster opens | The re-offer (phase 3) |
+| A paired executor | `REPLAY_AHEAD` from its feed: its cursor is above the head | It waits while the cluster restores. When the head reaches its cursor, it checks for a divergence (below) |
+
+**The automatic rollback of an executor (replaces the operator path of #615).**
+
+Today the executor stops with `ClusterBehindCursor`, and an operator acts
+(`docs/failure-modes.md:854-866`; #615, closed by #616 as "by design"). The new path:
+
+1. **Wait.** On `REPLAY_AHEAD` the executor drops what it executed above its last committed
+   block: it restarts from its state DB, as it does today after `ClusterBehindCursor`. It marks
+   its cursor as suspect, and asks again from its cursor every 2 s. The head grows during the
+   restore, and the restored frames equal the executor's own.
+2. **Find the divergence.** When an answer shows a head at or above its cursor, the reader first
+   asks for a replay from its output floor (the stored head that it knows, section 8.3). It
+   compares each frame up to its cursor with its own `block_frames` rows, byte for byte. The
+   first frame that differs is the divergence point `d`. With no difference, there is no
+   divergence: the executor clears the mark and resumes as today.
+3. **Choose a checkpoint.** The executor takes the newest checkpoint whose block is below the
+   block of `d`. Any such checkpoint holds only history that the new stream shares:
+   - first its own local checkpoints (every 20 s, 3 kept,
+     `deploy/cluster/nomad/executor.nomad.hcl:268`; about 40 to 60 s back, more than the lost
+     tail);
+   - then a peer checkpoint at or below that block: the checkpoint fetch gets a `max_block`
+     beside its `min_block` (`crates/state/src/checkpoint_transfer.rs:253-273`). A peer that ran
+     the lost entries too is still a valid source below `d`.
+   - With no such checkpoint, the executor stops as today, and the operator path stays.
+4. **Roll back.** It parks the diverged state DB, as the replay-unavailable repair does, restores
+   the checkpoint, and re-executes the new canonical stream from the cursor of the checkpoint.
+5. **Signal.** Before it publishes the first new receipt, it publishes a new record
+   `Rollback { to_block }` on `tx_receipts`. `to_block` is the block of the checkpoint. The record
+   is added at the end of the stream enum (`aeron-stream-records`).
+
+- `d` is above the stored head, by R8. So the rollback never touches what the executor pruned.
+- The divergence check and the rollback are per executor. The unpaired executors and the validator
+  read the serving service, so they are never above `S`, and they never roll back.
+
+**The receipts that clients already got.**
+
+- **What a client sees.** A receipt of a block above the restored head `R` was emitted by an
+  executor, but its block is gone. After the override, `eth_getTransactionReceipt` for that hash
+  answers `null` until the transaction executes again. Then it answers the new receipt: a new
+  block, a new index, and possibly another status. If the transaction is not ordered again (no
+  sequencer held it, its deadline passed, or the sender used the nonce again), the answer stays
+  `null`. The `on-quorum` ack of such a transaction was also lost.
+- **The ingress cache.** On `Rollback { to_block }`, the ingress drops every cached receipt with a
+  block above `to_block`, so the dedup of `tx_receipts` takes the new receipt for the same hash.
+  It also closes each `kardamom_subscribeReceipts` subscription with an error that names the
+  rollback, so a client polls again. Its fee history and its head drop the blocks above
+  `to_block`.
+- **Redis.** On `Rollback`, the state mirror deletes the `rcpt:` keys (they live 600 s, and they
+  are not indexed by block, so it deletes them all), and rebuilds its account rows from the
+  rolled-back executor (`crates/state-mirror/src/rebuild.rs`).
+- **The serving service.** It holds nothing above `S` durably, and it serves nothing above `S`.
+  It drops any partial block above the restored head. So it needs no correction.
+- **The notifier** no longer exists (decision 12). There is no status feed to correct.
+- **Finality for clients.** A receipt is final against this failure at or below the stored head,
+  and final on L1 at or below the posted head. The ingress states both (open question 16.1-15).
+
+**The nonce floors and the sealer guard after an override.**
+
+- **The sealer guard.** Its expected nonces are replicated state at the restored head `R`. The
+  restore sets them for each restored entry. So they match the chain at `R`. The re-offers come in
+  nonce order. A gap, for example a lost entry that no sequencer kept, gets
+  `CONTIGUITY_REJECT`, and the sequencer frees the nonce as today (#561).
+- **The sequencer floors.** A receipt floor learned from a receipt above `to_block` is wrong. On
+  `Rollback { to_block }`, the sequencer resets the floor of each sender whose floor came from a
+  block above `to_block` to unknown, and learns it again by the resync of today (Redis, then the
+  executor). It keeps the block of the receipt that set each floor for this.
+- **The ingress nonce view** (`eth_getTransactionCount`) reads Redis and the executors. Both roll
+  back.
+
+**What is not recovered.**
+
+- A loss on the hosts of every member, with the serving service down too and holding no copy: the
+  cluster cannot prove where `S` is. Open question 16.1-12.
+- A loss of every copy of the serving service (section 11): the chain reverts to the posted head.
+- The order of the entries above the restored head.
+
+**Proof.** A chaos case `sealer-tail-loss` (section 13.1). A process kill keeps the page cache,
+so the case puts the cluster directories of a majority of the members on a device that drops
+unsynced writes (device-mapper `dm-flakey` with `drop_writes`), and stops them under load. It
+checks the restore, the re-offers, the rollback of the paired executors, and that no block at or
+below the stored head changed.
 
 ## 12. Migration
 
@@ -1541,6 +1766,15 @@ The target is in section 10.0. The benchmark gives the curve that the decision n
 - `sealer-ingress-kinds` also gets kind 11 `STORED_CURSOR` (section 4.3), above kind 10 of the
   nonce release (#634). A member of the base drops kind 11 as an unknown kind, so the serving
   service can send it before the sealer reads it.
+- Decision 15 adds (section 11.1):
+  - `sealer-ingress-kinds`: kind 12 `RESTORE_FRAME`;
+  - `sealer-egress-kinds`: kind 18 `HELD`, and the status tail `[stored_head:u64][held:u8]`
+    (77 bytes);
+  - `aeron-stream-records`: the record `Rollback { to_block }` on `tx_receipts`, added at the end
+    of the stream enum;
+  - decision version 4: the hold, the restore and the new answer change the decisions of the
+    sealer. Proposal: ship it before the cut-over, so that the coordinated restart of PR 13
+    covers it.
 - **The P3 snapshot rule.** Today the writer stays one version behind the reader: reads 11,
   writes 10 (`CanonicalSealerState.java:164`, `:181`). The removal of the cursor and the void
   sections does not get its own two-release step. It rides the coordinated cut-over: the release
@@ -1659,6 +1893,11 @@ writes v12 before PR 13, so they need no waiver of their own:
 4. PR 17 (#639, the stored cursor) merges after #634, and before PR 13.
 5. PR 13 sets `writes = 12` and turns `carryBytes` on. From then v12 is frozen.
 
+**Decision 15 adds PR 18 to PR 20** (section 11.1). PR 20 (the sealer hold and restore) needs
+PR 17 and the writer of the serving service. PR 18 (the sequencer retention) needs the status tail
+of PR 17 and the `HELD` answer of PR 20. PR 19 (the executor rollback) needs `block_frames` of the
+executor handoff. All three precede the deploy of sync level 0 (open question 16.1-14).
+
 ### 12.5 Rollback (production)
 
 This section applies to production. Staging has no rollback across the reset: a failed staging
@@ -1712,6 +1951,9 @@ Each item is one pull request and one issue. Each passes `just style` and CI alo
 | 15 | sealer: remove the retained file and its v12 section (#637) | 6, 16 |
 | 16 | sealer: the member feed replays from the Raft log (#638) | 7 |
 | 17 | sealer: the stored cursor (ingress kind 11) and the purge floor (#639) | 6 |
+| 18 | sequencer: keep an entry until it is durable elsewhere, and re-offer after a lost tail (#642) | 17, 20 |
+| 19 | executor: roll back by itself after a lost tail (#643) | the executor handoff (section 8.3) |
+| 20 | sealer and serving service: hold, restore and override after a lost tail (#644) | 17, the serving service |
 
 The executor side of the handoff (section 8.3: `block_frames`, the range read, the prune, the
 alerts) and the ingress fallback to the serving service (section 8.4) are issues that the design
@@ -1871,6 +2113,42 @@ of #585 opens, because their transport follows that design (decision 14).
   moves to the stored head; with no kind 11, the floor is the posted head. A `TestCluster` test:
   every member restores the same stored head from v12. A member of the base drops kind 11.
 
+**PR 18 (#642). sequencer: keep an entry until it is durable elsewhere, and re-offer after a lost tail.**
+
+- Scope: section 11.1, phase 3, and section 6.2. The ledger keeps an entry after its receipt, with
+  the block of the receipt, until the block is at or below `max(stored_head, posted_head)` of the
+  status. After a hold, it re-offers each kept entry whose block is above the sealed head. It keeps
+  an entry that gets `HELD`. On `Rollback { to_block }` it resets the floors learned above
+  `to_block`. The bound policy of open question 16.1-13. Metrics for the kept entries and bytes.
+- Acceptance: unit tests: an entry stays after its receipt until the stored head passes its
+  block; a sealed head below the block of a kept entry re-offers it, in nonce order; a `Rollback`
+  resets the floor. An integration test: a loss of the tail re-offers every lost entry, and each
+  commits once.
+
+**PR 19 (#643). executor: roll back by itself after a lost tail.**
+
+- Scope: section 11.1, the automatic rollback. The suspect cursor after `REPLAY_AHEAD`, the
+  comparison with `block_frames`, the choice of the newest checkpoint below the divergence (local,
+  then a peer with `max_block`), the park and the restore, the `Rollback { to_block }` record. The
+  ingress reaction (the cache, the subscriptions, the fee history) and the state-mirror reaction
+  (the `rcpt:` keys, the account rebuild). `docs/failure-modes.md`: the refusal of a cursor ahead
+  of the head becomes this path when a divergence is found.
+- Acceptance: a test where an executor ahead of the head with equal frames resumes with no
+  rollback; a test where a diverged executor restores the newest checkpoint below `d` and reaches
+  the root of the new stream; a test where no checkpoint is below `d` and the executor stops as
+  today; the ingress drops the receipts above `to_block`.
+
+**PR 20 (#644). sealer and serving service: hold, restore and override after a lost tail.**
+
+- Scope: section 11.1, phases 1, 2 and 4. The `held` state on each new term, `HELD`,
+  `recoveryHoldMs`, the `restoring` state, ingress kind 12, decision version 4, the status tail
+  `held`. The sender of kind 12 in the writer of the serving service (#585). The chaos case
+  `sealer-tail-loss`.
+- Acceptance: a `TestCluster` test: a majority that restarts with a shorter log, and a stored head
+  above it, restores every frame up to the stored head byte for byte, then opens; the restore
+  refuses a frame with a wrong index; every member holds the same stream. `sealer-tail-loss`
+  passes.
+
 Rules to check in each pull request: R1 (comments carry no phase or spec names), R5 (the feeder, the
 ring and the walk thread each have one owner, and the feed ring has one writer at a time), R6 (the
 feed is an associated type of the reader's wiring, not `dyn`), R9 (parse each frame once at the
@@ -1899,6 +2177,7 @@ body).
 | `feed-log-walk` (new) | Stop executor 2 for longer than the ring holds and less than the feed floor, then for longer than the feed floor. | First: executor 2 catches up through a walk of its member's log, with `input_source="feed"`, and the walk frames equal the live frames. Second: the feed answers `REPLAY_UNAVAILABLE`, and executor 2 catches up from the serving service. |
 | `serving-service-outage` (new) | Stop the serving service under load for 15 minutes, then start it. | The chain goes on. `KardamomExecutorOutputUnstored` fires. The stored head stops, and the members keep their log above it. After the start the writer reads the missed blocks from an executor, the stored head reaches the head, and the members and the executors prune. Every receipt is in at least one tier during the run. |
 | `receipt-tier-fallback` (new) | Ask the ingress for a receipt below the stored head, after a restart of the ingress. | The receipt comes from the serving service, with the same bytes as the executor gave before its prune. |
+| `sealer-tail-loss` (new) | Put the cluster directories of two members on a device that drops unsynced writes (`dm-flakey` with `drop_writes`), and stop both under load with sync level 0. | The members restart with a shorter log. The sealer holds, restores up to the stored head, and opens. No block at or below the stored head changes. The sequencers re-offer the lost entries. The paired executors roll back by themselves and match the validator's root. No `ClusterBehindCursor` stop. |
 | Planned and dropped | `exec-peer-fetch`, `record-lag-halt`, `validator-exec-archive-catchup`, `exec-archive-prune` of the archived-data spec | Not built. |
 
 ## 14. Docs that change with the code
@@ -1907,7 +2186,9 @@ body).
   the stored-head floor and a full disk), the executor output buffer and its alerts, the void
   section goes, the executor section (the feed), the sequencer section (the full entry, the byte
   bounds, the twin copy), the ingress section (the size cap, the ack policies, the receipt
-  fallback to the serving service), the batcher resume sources.
+  fallback to the serving service), the batcher resume sources, the recovery after a lost tail of
+  the Raft log (section 11.1), which replaces the refusal of a cursor ahead of the head
+  (`docs/failure-modes.md:854-866`).
 - `cluster/sealer-service/README.md`: kinds (kind 11), record types, settings, snapshot v12 with
   no retention section, the feed and its walk of the log, the purge floor, the decision version
   table (version 3). The "Retained file" section goes (PR 15).
@@ -1978,6 +2259,12 @@ body).
 - **Two executors agree before a block counts as stored.** The serving service would compare a
   digest of each block from a second executor. The user chose one executor (decision 14). The
   hash check of each entry stays. The stream digest of decision 8 is the later answer.
+- **A halt after a lost tail of the Raft log.** The executors stop with `ClusterBehindCursor`, and
+  an operator acts (#615). The user chose recovery (decision 15, section 11.1).
+- **Recovery by the sequencer re-offers alone.** The re-offers give back the transactions, not
+  their order, and an override below the stored head would invalidate what the batcher, the
+  attester and the validator read. The restore from the serving service keeps the order up to the
+  stored head (section 11.1).
 - **Back-pressure on an executor when the serving service is down.** It saves no data, because the
   sealer keeps the log above the stored head, and it stops the receipts (section 8.3).
 - **`ExecTxRecord` for the remote consumers.** The serving service uses the canonical frames of
@@ -1992,7 +2279,7 @@ body).
 
 ## 16. Decisions of the user
 
-Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 14 are of 2026-10-17.
+Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 15 are of 2026-10-17.
 
 
 1. **Target rate and size.** Up to 5,000 tx/s with mixed sizes. Section 10.0 states it as the
@@ -2080,6 +2367,23 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 14 are of 2026-10-17.
       service, the number of durable copies of the stored head, and the replication and the
       failover of the serving service move to its design (#585).
 
+15. **Recovery after a lost tail of the Raft log (2026-10-17).** The sealer runs with sync level
+    0 (a separate PR). A power loss on a majority of the members can lose the newest committed
+    entries, up to the kernel writeback (about 30 s). The user wants recovery, not a halt:
+    - **Recover first.** The cluster gets the lost entries back. A sequencer keeps an entry until
+      it is durable elsewhere (the stored head or the posted head), and re-offers it. From the
+      review of the decision: the serving service is the second source, and the exact one. It
+      restores every block up to its stored head, so the order there is kept (section 11.1).
+    - **Then override.** What the cluster cannot get back, it overrides. It continues from its
+      restored head. The executors that ran the lost entries roll back by themselves: they
+      restore a checkpoint below the divergence and execute the new stream. This replaces the
+      operator path of #615. Issues: #642 (the sequencers), #643 (the executors), #644 (the
+      sealer and the serving service).
+    - **The limits.** The cluster never overrides at or below the stored head (R8), and the
+      posted head is at or below it. The receipts of the lost entries become invalid: the
+      ingress and Redis drop them, and the serving service never held them. The notifier is gone,
+      so no status feed needs a correction.
+
 ### 16.1 Still open
 
 1. **A reader for `tx_heads`.** Under option B the sequencer must read the bytes on `tx_data`, so
@@ -2099,6 +2403,28 @@ Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 14 are of 2026-10-17.
    replica becomes the writer (section 8.4).
 
 Questions 7 to 10 are answered (decision 14).
+
+11. **Aeron Cluster with a shorter log on a majority (section 11.1).** With sync level 0, a member
+    can restart with a log below the commit position that it acknowledged, and a snapshot can be
+    lost too. The design assumes that the members elect a leader and serve the shorter log. The
+    PR that sets sync level 0 must prove it, with `sealer-tail-loss`, before PR 20 builds on it.
+12. **The hold when the serving service does not answer (section 11.1).** After `recoveryHoldMs`
+    with no stored head: (a) the sealer stays `held` until the serving service answers. That is
+    safe (no override below the stored head is possible), but the chain waits for the serving
+    service after each election in which it is down. (b) The sealer opens. If a loss happened,
+    the blocks between its head and the stored head are overridden, and the serving service then
+    holds a history that the cluster does not: a manual repair. Proposal: (a), with an alert,
+    because (b) breaks R8.
+13. **The sequencer bound while the stored head stops (section 6.2).** (a) Release the oldest
+    entries that have a receipt, count them, and alert: no stall, but a loss in that window loses
+    those transactions. (b) Back-pressure the lane: the chain stalls with the serving service.
+    (c) Spill the ledger to disk. Proposal: (a).
+14. **The order of deployment.** Does the PR that sets sync level 0 wait for PR 18 to PR 20? Until
+    they run, a lost tail stops the paired executors, as in #615.
+15. **Finality for clients (section 11.1).** A receipt is final against a lost tail at or below
+    the stored head, and on L1 at or below the posted head. Proposal: the ingress answers the
+    block tag `safe` with the stored head and `finalized` with the posted head
+    (`kardamom_blockNumberByTag`).
 
 ### 16.2 Closed in review
 
