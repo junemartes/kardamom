@@ -7,13 +7,13 @@ use crossbeam_channel::Sender;
 use kardamom_cluster_adapter::OfferOutcome;
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
-    BPosition, EpochRecord, ExecTxRecord, StateDatabase, TxDataLoc, TxEnvelope, TxOrderingMessage,
-    TxRef, VoidRecord,
+    BPosition, EpochRecord, ExecTxRecord, StateDatabase, TxDataLoc, TxEnvelope, TxRef, VoidRecord,
 };
 
 use crate::delta::ParentState;
 use crate::error::ExecutorError;
 
+use super::Ordered;
 use super::threads::ReaderToExec;
 
 /// Subscription to one `tx_data`[i].
@@ -42,9 +42,11 @@ pub trait TxDataSubscription: Send {
 
 /// Subscription to `tx_ordering`, the canonical orderer.
 ///
-/// Yields tiny [`TxOrderingMessage`] records (`TxRef`, `DepositRef`, or
-/// `BoundaryStart`), each tagged with its canonical `BPosition` — the
-/// system's canonical L2 tx order on `tx_ordering` (invariant I1).
+/// Yields [`Ordered`] items, each tagged with its canonical `BPosition` —
+/// the system's canonical L2 tx order on `tx_ordering` (invariant I1). A
+/// reference stream yields tiny [`kardamom_types::TxOrderingMessage`] records (`TxRef`,
+/// `DepositRef`, or `BoundaryStart`). A stream that carries the bytes also
+/// yields canonical entries.
 ///
 /// In production: `kardamom_log::TxOrderingSubscriber`, on a dedicated OS
 /// thread. In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.
@@ -53,7 +55,7 @@ pub trait TxOrderingSubscription: Send {
     ///
     /// Returns `Err(ExecutorError::TxOrderingClosed)` when the subscription
     /// closes cleanly, or another `ExecutorError` on a transport failure.
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
+    fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError>;
 
     /// Ask the sealer to void `void`, as voter `voter_id`. The default has
     /// no sealer to ask, so it reports no connection. Only the cluster

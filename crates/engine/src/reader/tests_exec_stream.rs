@@ -78,8 +78,11 @@ impl ExecStreamSink for StreamLog {
 struct QueueSub(VecDeque<(BPosition, TxOrderingMessage)>);
 
 impl TxOrderingSubscription for QueueSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.pop_front().ok_or(ExecutorError::TxOrderingClosed)
+    fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
+        self.0
+            .pop_front()
+            .map(|(pos, msg)| (pos, msg.into()))
+            .ok_or(ExecutorError::TxOrderingClosed)
     }
 }
 

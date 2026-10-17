@@ -375,7 +375,7 @@ impl Ready {
             streams: bin_support::LiveStreams {
                 stop: stop.drop_guard(),
                 rt,
-                cluster_guard,
+                cluster_guard: Some(cluster_guard),
             },
             plane,
             writer,

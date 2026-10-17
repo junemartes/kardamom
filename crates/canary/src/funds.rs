@@ -1,6 +1,7 @@
 //! The balances of the ring. A task reads each account's L2 balance on a
 //! timer, exports it, and marks an account under the floor unfunded, so
-//! the probes report `unfunded` instead of failing sends. The deposits
+//! the probes report `unfunded` instead of failing sends. An account is
+//! unfunded until its first balance read. The deposits
 //! credit the first ring account; the task tops up the others from it
 //! when they fall under the floor and it can spare the amount.
 
@@ -93,3 +94,7 @@ impl Funds {
         ::metrics::counter!(metrics::TOPUPS_TOTAL, "outcome" => outcome).increment(1);
     }
 }
+
+#[cfg(test)]
+#[path = "funds_tests.rs"]
+mod tests;

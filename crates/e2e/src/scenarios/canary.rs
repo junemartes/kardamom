@@ -21,8 +21,8 @@ use kardamom_canary::config::Endpoint;
 use kardamom_canary::feed::{Board, BoardHandle};
 use kardamom_canary::outcome::Outcome;
 use kardamom_canary::ring::journal::{InFlight, Journal};
-use kardamom_canary::ring::{self, Call, DerivedSigner, Lease, Ring, Sent};
-use kardamom_canary::rpc::Rpc;
+use kardamom_canary::ring::{self, Call, DerivedSigner, Lease, Ring, Sent, Settled};
+use kardamom_canary::rpc::{Receipt, Rpc};
 use kardamom_canary::wait::Poll;
 
 use super::Target;
@@ -57,7 +57,9 @@ pub const L1_KEY: &str = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf70
 /// deposit probes one) on the canary at `canary`, then require that no
 /// probe but `read` failed, and that the feed reported the `executed`
 /// stage. A `read` run can see the head not move between two runs on an
-/// idle local chain.
+/// idle local chain. An `unfunded` run is no failure: the ring is
+/// unfunded until the balance task's first read, and the first runs can
+/// come before it.
 ///
 /// # Errors
 /// Returns an error when the successes do not come within the patience,
@@ -87,7 +89,11 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
     let raw = kardamom_obs::testkit::scrape(&format!("http://{canary}/metrics")).await;
     let failures: Vec<&str> = raw
         .lines()
-        .filter(|l| l.starts_with(PROBE_TOTAL) && !l.contains("outcome=\"success\""))
+        .filter(|l| {
+            l.starts_with(PROBE_TOTAL)
+                && !l.contains("outcome=\"success\"")
+                && !l.contains("outcome=\"unfunded\"")
+        })
         .collect();
     for probe in PROBES
         .iter()
@@ -95,9 +101,10 @@ pub async fn probes_succeed(canary: SocketAddr, runs: f64) -> Result<()> {
         .filter(|p| !p.contains("read"))
     {
         let all = s.value_where_all(PROBE_TOTAL, &[probe]).unwrap_or(0.0);
-        let ok = s
-            .value_where_all(PROBE_TOTAL, &success(probe))
-            .unwrap_or(0.0);
+        let ok = [success(probe), [probe, "outcome=\"unfunded\""]]
+            .iter()
+            .map(|labels| s.value_where_all(PROBE_TOTAL, labels).unwrap_or(0.0))
+            .sum::<f64>();
         anyhow::ensure!(
             (all - ok).abs() < f64::EPSILON,
             "{probe}: {} of {all} runs failed: {failures:#?}",
@@ -192,7 +199,7 @@ async fn lost_answer(
     if submitted {
         let _ = rpc.send(&journaled.raw).await;
     }
-    let ring = Ring::open(dir, signers, t.chain_id, board()).await?;
+    let ring = open_ring(dir, signers, t.chain_id).await?;
     let lease = lease_when_free(&ring, rpc).await?;
     anyhow::ensure!(
         rpc.receipt(journaled.hash).await.ok().flatten().is_some(),
@@ -210,7 +217,7 @@ async fn lost_answer(
 /// nonces are distinct and contiguous.
 async fn concurrent(t: &Target, rpc: &Rpc, dir: &Path, signers: Vec<DerivedSigner>) -> Result<()> {
     let start = rpc.nonce(signers[0].address).await?;
-    let ring = std::sync::Arc::new(Ring::open(dir, signers, t.chain_id, board()).await?);
+    let ring = std::sync::Arc::new(open_ring(dir, signers, t.chain_id).await?);
     let tasks: Vec<_> = (0..6)
         .map(|_| {
             let ring = std::sync::Arc::clone(&ring);
@@ -259,7 +266,7 @@ pub async fn receipts_match_their_blocks(
         LAND,
     )?;
     let signers = ring::signers(DEV_MNEMONIC, index, NonZeroU32::MIN)?;
-    let ring = Ring::open(dir, signers, t.chain_id, board()).await?;
+    let ring = open_ring(dir, signers, t.chain_id).await?;
     let mut hashes = Vec::with_capacity(BLOCK_CHECKS);
     for _ in 0..BLOCK_CHECKS {
         hashes.push(
@@ -358,6 +365,14 @@ impl BlockCheck<'_> {
     }
 }
 
+/// Open a ring on `dir` with every account marked funded: the ring
+/// cases run without the balance task.
+async fn open_ring(dir: &Path, signers: Vec<DerivedSigner>, chain_id: u64) -> Result<Ring> {
+    let ring = Ring::open(dir, signers, chain_id, board()).await?;
+    (0..ring.size()).for_each(|index| ring.set_funded(index, true));
+    Ok(ring)
+}
+
 /// A status board with no feed: the ring cases resolve by receipt and
 /// nonce alone.
 fn board() -> BoardHandle {
@@ -381,29 +396,32 @@ async fn lease_when_free(ring: &Ring, rpc: &Rpc) -> Result<Lease> {
 }
 
 /// Send one transfer on `lease`, wait for its receipt, settle, and
-/// return what was sent.
+/// return what was sent. The chain must apply the transaction.
 async fn transfer(rpc: &Rpc, mut lease: Lease) -> Result<Sent> {
+    let call = Call::new(
+        TxKind::Call(Address::repeat_byte(0x5d)),
+        U256::from(1),
+        Bytes::new(),
+        21_000,
+    );
     let sent = lease
-        .send(
-            rpc,
-            Call::new(
-                TxKind::Call(Address::repeat_byte(0x5d)),
-                U256::from(1),
-                Bytes::new(),
-                21_000,
-            ),
-        )
+        .send(rpc, call)
         .await
         .map_err(|o| anyhow::anyhow!("send: {o:?}"))?;
-    landed(rpc, sent.hash).await?;
-    lease.settle().await;
+    let receipt = landed(rpc, sent.hash).await?;
+    let settled = lease.settle(rpc, &receipt, Poll::within(LAND, POLL)).await;
+    anyhow::ensure!(
+        settled == Settled::Applied && receipt.succeeded(),
+        "{:#x} at nonce {} did not apply: {settled:?}",
+        sent.hash,
+        sent.nonce
+    );
     Ok(sent)
 }
 
-async fn landed(rpc: &Rpc, hash: B256) -> Result<()> {
+async fn landed(rpc: &Rpc, hash: B256) -> Result<Receipt> {
     Poll::within(LAND, POLL)
         .until(|| async { rpc.receipt(hash).await.ok().flatten() })
         .await
-        .map(|_| ())
         .with_context(|| format!("{hash:#x} did not land"))
 }

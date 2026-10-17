@@ -89,6 +89,16 @@ pub(crate) struct Args {
     /// on only after every sealer member reads it.
     #[arg(long, env = "KARDAMOM_EXEC_CURSOR", default_value_t = false)]
     pub(crate) exec_cursor: bool,
+    /// Read the canonical entries with their bytes from the feed of the
+    /// paired sealer member, on `aeron:ipc` of the media driver at
+    /// `--aeron-dir`. The executor then opens no `tx_data` lane, joins
+    /// nothing, votes no void, opens no cluster session and sends no
+    /// recorded cursor, so `--exec-cursor` is refused with it. Switch this
+    /// on only with a sealer that
+    /// carries the bytes and runs the member feed. Off: the executor joins
+    /// the references of the cluster egress with `tx_data`.
+    #[arg(long, env = "KARDAMOM_CARRY_BYTES", default_value_t = false)]
+    pub(crate) carry_bytes: bool,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     pub(crate) chain_id: u64,
@@ -190,12 +200,19 @@ impl Args {
     /// # Errors
     ///
     /// Returns an error when `--exec-cursor` is on with no
-    /// `--void-voter-id`: the sealer takes a cursor only from a voter.
+    /// `--void-voter-id`: the sealer takes a cursor only from a voter. Also
+    /// when `--exec-cursor` is on with `--carry-bytes`: an executor that
+    /// reads the member feed opens no cluster session, and the sealer that
+    /// carries the bytes has no record-lag guard to feed.
     pub(crate) fn recorded_cursor_id(&self) -> anyhow::Result<Option<u8>> {
-        match (self.exec_cursor, self.void_voter_id) {
-            (false, _) => Ok(None),
-            (true, Some(id)) => Ok(Some(id)),
-            (true, None) => anyhow::bail!("--exec-cursor needs --void-voter-id"),
+        match (self.exec_cursor, self.carry_bytes, self.void_voter_id) {
+            (false, _, _) => Ok(None),
+            (true, true, _) => anyhow::bail!(
+                "--exec-cursor does not go with --carry-bytes: the executor that reads \
+                 the member feed opens no cluster session and sends no recorded cursor"
+            ),
+            (true, false, Some(id)) => Ok(Some(id)),
+            (true, false, None) => anyhow::bail!("--exec-cursor needs --void-voter-id"),
         }
     }
 }
@@ -226,6 +243,15 @@ mod tests {
             no_voter.recorded_cursor_id().is_err(),
             "a cursor needs a voter id"
         );
+    }
+
+    #[test]
+    fn the_recorded_cursor_does_not_go_with_carry_bytes() {
+        let both = parse(&["--void-voter-id", "2", "--exec-cursor", "--carry-bytes"]);
+        let error = both.recorded_cursor_id().expect_err("refused");
+        assert!(error.to_string().contains("--carry-bytes"), "{error}");
+        let feed = parse(&["--void-voter-id", "2", "--carry-bytes"]);
+        assert_eq!(feed.recorded_cursor_id().expect("valid"), None);
     }
 
     /// `CheckpointInterval` gives clap one concrete type for this

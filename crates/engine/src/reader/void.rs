@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use kardamom_cluster_adapter::OfferOutcome;
-use kardamom_types::{BPosition, TxOrderingMessage, VoidRecord};
+use kardamom_types::{BPosition, VoidRecord};
 
 use crate::error::ExecutorError;
 
+use super::Ordered;
 use super::ports::TxOrderingSubscription;
 
 /// The read-ahead bound, in messages. It equals the sealer's default void
@@ -39,7 +40,7 @@ pub(super) const MAX_READ_AHEAD: usize = 65_536;
 const REVOTE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Messages read from the canonical order, not yet dispatched.
-pub(super) type ReadAhead = VecDeque<(BPosition, TxOrderingMessage)>;
+pub(super) type ReadAhead = VecDeque<(BPosition, Ordered)>;
 
 /// How a wait for a void record ended.
 pub(super) enum ParkOutcome {

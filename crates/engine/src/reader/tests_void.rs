@@ -54,9 +54,10 @@ impl VotingSub {
 }
 
 impl TxOrderingSubscription for VotingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, Ordered), ExecutorError> {
         self.queue
             .pop_front()
+            .map(|(pos, msg)| (pos, msg.into()))
             .ok_or(ExecutorError::TxOrderingClosed)
     }
 
@@ -280,14 +281,17 @@ fn the_wait_reads_the_backlog_first_and_keeps_the_canonical_order() {
     // among them, so this wait ends inside the backlog.
     let mut backlog: ReadAhead = [boundary(1), void(5, LOST), boundary(2)]
         .into_iter()
-        .map(|msg| (pos(0), msg))
+        .map(|msg| (pos(0), msg.into()))
         .collect();
     let mut sub = VotingSub::new(0, vec![boundary(3)]);
     let outcome = park(&mut sub, &mut backlog, 5).run().expect("voided");
     assert!(matches!(outcome, ParkOutcome::Voided));
     let blocks: Vec<Option<u64>> = backlog
         .iter()
-        .map(|(_, msg)| msg.as_boundary().map(|b| b.block_number))
+        .map(|(_, item)| match item {
+            Ordered::Message(msg) => msg.as_boundary().map(|b| b.block_number),
+            Ordered::Tx(_) => None,
+        })
         .collect();
     assert_eq!(blocks, vec![Some(1), None, Some(2)]);
     assert_eq!(sub.queue.len(), 1);

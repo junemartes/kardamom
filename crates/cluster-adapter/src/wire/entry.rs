@@ -15,14 +15,16 @@
 //! sealer does not parse it.
 
 use alloy_primitives::B256;
-use kardamom_types::TxEnvelope;
+use kardamom_types::{BPosition, TxEnvelope, TxRef};
 
 use super::egress::decode_rkyv_body;
-use super::{CANONICAL_ID_LEN, WireError, rd_slice, rd_u8, rd_u64};
+use super::{
+    CANONICAL_ID_LEN, KIND_REPLAY_REQUEST, WireError, encode_kind_2u64_id, rd_slice, rd_u8, rd_u64,
+};
 #[cfg(any(test, feature = "testing"))]
 use super::{
     EGRESS_KIND_FEED_GAP, EGRESS_KIND_RELAYED_REF, GuardHeader, KIND_INGRESS_RECORD,
-    RELAYED_REF_LEN, RT_TX, RT_TX_OFFER, encode_kind_2u64,
+    RELAYED_REF_LEN, RT_TX, RT_TX_OFFER,
 };
 
 /// A full entry: one transaction and its archived envelope, offered on
@@ -92,6 +94,14 @@ impl CanonicalTx {
         })
     }
 
+    /// The reference that a receipt of this entry keeps. No `tx_data`
+    /// archive holds the entry, so the archive fields are zero. The lane is
+    /// the shard.
+    #[must_use]
+    pub fn tx_ref(&self) -> TxRef {
+        TxRef::new(self.canonical_id, self.lane, BPosition::from_index(0), 0)
+    }
+
     /// The relayed payload of this entry, as the sealer builds it:
     /// `[canonical_id:32][record_type=6][lane:u8][envelope]`.
     ///
@@ -152,9 +162,16 @@ impl RelayedRef {
 #[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn encode_feed_answer(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
-    let mut frame = encode_kind_2u64(kind, a, b);
-    frame.extend_from_slice(&request_id.to_le_bytes());
-    frame
+    encode_kind_2u64_id(kind, a, b, request_id)
+}
+
+/// Frame a feed request on the control stream:
+/// `[kind=1][from_index:u64][from_block:u64][request_id:u64]`, the layout of
+/// ingress kind 1 with the request id as a tail. The member answers the
+/// newest request, and each frame of its answer carries `request_id`.
+#[must_use]
+pub fn encode_feed_request(from_index: u64, from_block: u64, request_id: u64) -> Vec<u8> {
+    encode_kind_2u64_id(KIND_REPLAY_REQUEST, from_index, from_block, request_id)
 }
 
 /// Frame a feed gap exactly as the Java service does.

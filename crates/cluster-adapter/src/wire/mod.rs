@@ -44,6 +44,7 @@ use kardamom_types::epoch::EpochRecord;
 use thiserror::Error;
 
 mod egress;
+mod egress_encode;
 mod entry;
 #[cfg(test)]
 mod entry_tests;
@@ -54,16 +55,17 @@ mod relay;
 #[cfg(test)]
 mod tests;
 
-pub use egress::{
-    EgressItem, RemoteOriginReject, encode_egress_boundary, encode_egress_record,
-    encode_replay_ahead, encode_replay_done, encode_replay_unavailable, encode_session_start,
-};
+pub use egress::{EgressItem, RemoteOriginReject};
 #[cfg(any(test, feature = "testing"))]
-pub use egress::{
+pub use egress_encode::{
     encode_contiguity_reject, encode_da_lag_reject, encode_origin_gap, encode_past_deadline,
     encode_record_lag_reject, encode_status, encode_window_full,
 };
-pub use entry::{CanonicalTx, RelayedRef};
+pub use egress_encode::{
+    encode_egress_boundary, encode_egress_record, encode_replay_ahead, encode_replay_done,
+    encode_replay_unavailable, encode_session_start,
+};
+pub use entry::{CanonicalTx, RelayedRef, encode_feed_request};
 #[cfg(any(test, feature = "testing"))]
 pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
@@ -338,6 +340,20 @@ pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 /// sends this kind, and no frame on the wire uses it.
 pub const EGRESS_KIND_SESSION_START: u8 = 255;
 
+/// The offset of `request_id` in a feed answer (kinds 3, 4, 11 and 16) and
+/// in a feed request.
+pub const FEED_REQUEST_ID_OFFSET: usize = 1 + 8 + 8;
+/// The length of a feed answer: the 17 bytes of the egress layout, then the
+/// request id.
+pub const FEED_ANSWER_LEN: usize = FEED_REQUEST_ID_OFFSET + 8;
+
+/// The stream of the member feed (member to executor), on `aeron:ipc`.
+pub const FEED_STREAM_ID: i32 = 1006;
+/// The control stream of the member feed (executor to member), on
+/// `aeron:ipc`. It carries one message, the feed request
+/// `[kind=1][from_index:u64][from_block:u64][request_id:u64]`.
+pub const FEED_CONTROL_STREAM_ID: i32 = 1007;
+
 /// Why the sealer refused a [`KIND_REMOTE_ORIGIN_RECORD`] frame. The wire
 /// byte (in an [`EGRESS_KIND_REMOTE_ORIGIN_REJECT`] frame) is the
 /// discriminant below. Matches the Java `REMOTE_ORIGIN_REJECT_*` constants.
@@ -522,10 +538,18 @@ pub enum WireError {
 /// ([`EGRESS_KIND_REPLAY_AHEAD`]) messages are byte-identical, apart from
 /// the kind byte.
 fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 8 + 8);
+    let mut buf = Vec::with_capacity(FEED_ANSWER_LEN);
     buf.push(kind);
     buf.extend_from_slice(&a.to_le_bytes());
     buf.extend_from_slice(&b.to_le_bytes());
+    buf
+}
+
+/// The frame of [`encode_kind_2u64`] with a request id as its tail: the
+/// feed request, and the feed answers.
+fn encode_kind_2u64_id(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
+    let mut buf = encode_kind_2u64(kind, a, b);
+    buf.extend_from_slice(&request_id.to_le_bytes());
     buf
 }
 
