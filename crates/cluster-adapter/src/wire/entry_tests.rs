@@ -123,7 +123,16 @@ impl Fixture {
                 encode_egress_record(Self::INDEX, &Self::tx().payload().unwrap()).unwrap(),
             ),
             ("relayed_ref", Self::relayed_ref().encode()),
-            ("feed_gap", encode_feed_gap(9, 4)),
+            ("feed_gap", encode_feed_gap(9, 4, 7)),
+            (
+                "feed_replay_done",
+                encode_feed_answer(EGRESS_KIND_REPLAY_DONE, 9, 4, 7),
+            ),
+            // The request has the layout of a feed answer, with kind 1.
+            (
+                "feed_request",
+                encode_feed_answer(KIND_REPLAY_REQUEST, 9, 4, 7),
+            ),
             (
                 "status_76",
                 encode_status(&Self::status(Some(1_048_583), false)),
@@ -214,8 +223,17 @@ fn the_golden_egress_frames_decode() {
         EgressItem::decode(&golden_frame("feed_gap")).unwrap(),
         EgressItem::FeedGap {
             next_index: 9,
-            next_block: 4
+            next_block: 4,
+            request_id: 7
         }
+    );
+    assert_eq!(
+        EgressItem::decode(&golden_frame("feed_replay_done")).unwrap(),
+        EgressItem::ReplayDone {
+            up_to_index: 9,
+            up_to_block: 4
+        },
+        "an egress reader ignores the request id of a feed answer"
     );
     let status = golden_frame("status_76");
     assert_eq!(status.len(), STATUS_WITH_RETAINED_BYTES_LEN);

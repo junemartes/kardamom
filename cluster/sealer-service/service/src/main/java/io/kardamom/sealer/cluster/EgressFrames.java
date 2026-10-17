@@ -57,7 +57,7 @@ final class EgressFrames {
         return pos;
     }
 
-    /** A control message {@code [kind][a:u64][b:u64]}: the replay answers, the origin gap, the feed gap. */
+    /** A control message {@code [kind][a:u64][b:u64]}: the replay answers and the origin gap. */
     int control(final byte kind, final long a, final long b) {
         int pos = 0;
         buf.putByte(pos, kind);
@@ -69,9 +69,20 @@ final class EgressFrames {
         return pos;
     }
 
-    /** A feed gap: {@code [kind:16][next_index:u64][next_block:u64]}. */
-    int feedGap(final long nextIndex, final long nextBlock) {
-        return control(SealerWire.EGRESS_KIND_FEED_GAP, nextIndex, nextBlock);
+    /**
+     * An answer on the member feed: {@code [kind][a:u64][b:u64][request_id:u64]}.
+     * It is the control message of {@link #control} with the id of the
+     * request that it answers as a tail.
+     */
+    int feedAnswer(final byte kind, final long a, final long b, final long requestId) {
+        final int pos = control(kind, a, b);
+        buf.putLong(pos, requestId, ByteOrder.LITTLE_ENDIAN);
+        return pos + Long.BYTES;
+    }
+
+    /** A feed gap: {@code [kind:16][next_index:u64][next_block:u64][request_id:u64]}. */
+    int feedGap(final long nextIndex, final long nextBlock, final long requestId) {
+        return feedAnswer(SealerWire.EGRESS_KIND_FEED_GAP, nextIndex, nextBlock, requestId);
     }
 
     /**

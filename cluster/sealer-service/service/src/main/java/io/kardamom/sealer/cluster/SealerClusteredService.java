@@ -100,6 +100,10 @@ public final class SealerClusteredService implements ClusteredService {
      * the retention section of the snapshot, so every member runs the same.
      */
     private Optional<RetainedFile.Config> retainedFile = Optional.empty();
+    /** The member feed settings, or empty for no feed. */
+    private Optional<FeedConfig> feedConfig = Optional.empty();
+    /** The member feed. The service thread opens it in {@code onStart}. */
+    private Feed feed = Feed.Off.INSTANCE;
 
     private Cluster cluster;
     private CanonicalSealerState state;
@@ -310,7 +314,13 @@ public final class SealerClusteredService implements ClusteredService {
      * Every member must run the same choice.
      */
     SealerClusteredService carryingBytes(final RetainedFile.Config config) {
+        return carryingBytes(config, Optional.empty());
+    }
+
+    /** Keep the retained frames in a file, and send them to the paired executor through {@code feed}. */
+    SealerClusteredService carryingBytes(final RetainedFile.Config config, final Optional<FeedConfig> feed) {
         this.retainedFile = Optional.of(config);
+        this.feedConfig = feed;
         return this;
     }
 
@@ -334,9 +344,9 @@ public final class SealerClusteredService implements ClusteredService {
         this.cluster = cluster;
         this.seedRecord = new SeedRecord(cluster, memberId);
         this.snapshots = new SnapshotRequests(cluster, memberId);
-        this.retained = retainedFile
-            .<RetainedFrames>map(config -> new RetainedFile(config, memberId))
-            .orElseGet(HeapFrames::new);
+        final Optional<RetainedFile> file = retainedFile.map(config -> new RetainedFile(config, memberId));
+        this.retained = file.<RetainedFrames>map(f -> f).orElseGet(HeapFrames::new);
+        this.feed = Feed.open(feedConfig, file, memberId);
         if (snapshot.isPresent()) {
             restore(snapshot.get());
             // The log position of a start from a snapshot is the snapshot's position.
@@ -446,7 +456,7 @@ public final class SealerClusteredService implements ClusteredService {
      * at the posted head.
      */
     private void openEgress(final Optional<ByteBuffer> retention) {
-        this.egress = new SealerEgress(cluster, memberId, retained, state.canonicalCount(), state.blockNumber());
+        this.egress = new SealerEgress(cluster, memberId, retained, feed, state.canonicalCount(), state.blockNumber());
         retention.ifPresentOrElse(egress::restore, egress::openEmpty);
         egress.setPostedHead(state.postedHead());
     }
@@ -1239,7 +1249,14 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTerminate(Cluster cluster) {
+        feed.close();
         retained.close();
+    }
+
+    /** Move the member feed on. It never waits, and it changes no replicated state. */
+    @Override
+    public int doBackgroundWork(final long nowNs) {
+        return feed.doWork(egress, state.canonicalCount(), state.blockNumber());
     }
 
     /** The log position of the last applied entry; 0 before the first. */
