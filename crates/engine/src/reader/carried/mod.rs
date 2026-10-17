@@ -235,21 +235,13 @@ impl<F: Transport, S: Transport> CarriedSubscription<F, S> {
 
     /// Act on the progress of the comparison.
     fn close_compare(&mut self, progress: Progress) -> Result<(), ExecutorError> {
-        match progress {
-            Progress::Pending => return Ok(()),
-            Progress::Diverged(d) => {
-                tracing::error!(
-                    block = d.block,
-                    index = d.index,
-                    "the stream diverges from the committed history"
-                );
-                return Err(d.into());
-            }
-            Progress::Equal => tracing::info!("the stream equals the committed history"),
-            Progress::Skipped => tracing::warn!(
-                "the source retains no frame of the comparison window; delivering without a comparison"
-            ),
-        }
+        let settled = progress.settle().inspect_err(|err| {
+            tracing::error!(error = %err, "the stream diverges from the committed history");
+        })?;
+        let Some(settled) = settled else {
+            return Ok(());
+        };
+        settled.log();
         self.compare = None;
         self.ask(Instant::now());
         Ok(())

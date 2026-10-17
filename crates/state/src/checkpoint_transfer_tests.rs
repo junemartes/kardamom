@@ -201,7 +201,7 @@ async fn min_block_filters_stale_peer_checkpoint() {
         fetch(
             addr,
             local.path().to_path_buf(),
-            BlockRange::at_or_above(10)
+            BlockRange::at_or_above(std::num::NonZeroU64::new(10).unwrap())
         )
         .await
         .unwrap()
@@ -259,7 +259,10 @@ async fn a_capped_fetch_gets_the_newest_checkpoint_below_the_cap() {
 #[test]
 fn the_request_line_carries_the_cap() {
     let capped = FetchRequest {
-        range: BlockRange { min: 0, max: 41 },
+        range: BlockRange {
+            max: 41,
+            ..BlockRange::ANY
+        },
     };
     assert_eq!(
         capped.line(),

@@ -4,6 +4,7 @@
 
 use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::NonceRelease;
+use kardamom_types::ReceiptRollback;
 
 /// One executed-truth observation. Two sources produce it:
 ///
@@ -19,10 +20,21 @@ use kardamom_cluster_adapter::wire::NonceRelease;
 pub struct FloorUpdate {
     pub sender: Address,
     pub outcome: Outcome,
-    /// The block of the receipt that gives the evidence. `None` for a
-    /// lookup answer: the committed state of an executor has no single
-    /// block of evidence, and a rollback does not reset it.
-    pub block: Option<u64>,
+    pub evidence: Evidence,
+}
+
+/// Where the evidence of a [`FloorUpdate`] comes from. A rollback voids it
+/// by its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A receipt of `block`. A rollback below `block` voids it.
+    Receipt { block: u64 },
+    /// A lookup answer, asked while the controller had seen `generation`
+    /// rollbacks. The committed state of a source has no single block of
+    /// evidence, and a source can answer from a state that a rollback
+    /// voids. So every later rollback voids the answer, and an answer to a
+    /// request from before the latest rollback counts for nothing.
+    Lookup { generation: u64 },
 }
 
 /// One item of the floor channel, in the order of the receipt stream.
@@ -32,7 +44,7 @@ pub enum FloorEvent {
     Update(FloorUpdate),
     /// An executor rolled its state back: the receipts above `to_block`
     /// are void, and so is each floor that one of them set.
-    Rollback { to_block: u64 },
+    Rollback(ReceiptRollback),
 }
 
 impl From<FloorUpdate> for FloorEvent {
@@ -135,7 +147,9 @@ impl FloorUpdate {
         Self {
             sender: receipt.from,
             outcome,
-            block: Some(receipt.block_number),
+            evidence: Evidence::Receipt {
+                block: receipt.block_number,
+            },
         }
     }
 
@@ -145,7 +159,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Executed { nonce },
-            block: None,
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 
@@ -164,17 +178,14 @@ impl FloorUpdate {
                 reason,
                 tx_hash,
             },
-            block: None,
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 
-    /// The same update, as evidence of a receipt in `block`.
+    /// The same update, with the evidence `evidence`.
     #[must_use]
-    pub fn in_block(self, block: u64) -> Self {
-        Self {
-            block: Some(block),
-            ..self
-        }
+    pub fn with_evidence(self, evidence: Evidence) -> Self {
+        Self { evidence, ..self }
     }
 
     /// The nonce release for the sealer's guard that this update proves,
@@ -225,7 +236,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Deposit,
-            block: None,
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 }

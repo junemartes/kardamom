@@ -8,6 +8,7 @@ use kardamom_state::{StateEnv, StateEnvBuilder, StateWriter, WriteBatch};
 use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta};
 
 use super::*;
+use crate::marker::Cause;
 
 /// A state DB with genesis and blocks `1..=upto`, and a checkpoint of each
 /// block in `checkpoints`, in `ckpt_dir`.
@@ -69,13 +70,18 @@ fn blocks(dir: &Path) -> Vec<u64> {
 }
 
 fn diverged(block: u64) -> ExecutorError {
-    ExecutorError::StreamDiverged { block, index: 0 }
+    ExecutorError::StreamDiverged {
+        block,
+        index: 0,
+        stream: B256::repeat_byte(7),
+    }
 }
 
 struct Dirs {
     _root: tempfile::TempDir,
     state: PathBuf,
     ckpt: PathBuf,
+    markers: Markers,
 }
 
 impl Dirs {
@@ -85,6 +91,7 @@ impl Dirs {
         let ckpt = root.path().join("ckpt");
         std::fs::create_dir_all(&ckpt).unwrap();
         Self {
+            markers: Markers::new(&state),
             state,
             ckpt,
             _root: root,
@@ -97,6 +104,7 @@ impl Dirs {
             checkpoint_peers: peers,
             state_dir: &self.state,
             expected_genesis: None,
+            markers: &self.markers,
         }
     }
 }
@@ -109,7 +117,8 @@ fn another_error_stages_nothing() {
         .repair(&[])
         .stage(Some(&ExecutorError::TxOrderingClosed))
         .unwrap();
-    assert_eq!(staged, None);
+    assert!(!staged);
+    assert_eq!(dirs.markers.pending().unwrap(), None);
     assert_eq!(blocks(&dirs.ckpt), [2, 4]);
     assert!(kardamom_state::has_state_db(&dirs.state).unwrap());
 }
@@ -118,13 +127,15 @@ fn another_error_stages_nothing() {
 fn a_local_checkpoint_below_the_divergence_is_staged() {
     let dirs = Dirs::new();
     drop(chain(&dirs.state, &dirs.ckpt, 8, &[2, 4, 6, 8]));
-    let staged = dirs.repair(&[]).stage(Some(&diverged(6))).unwrap();
+    assert!(dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
+    let pending = dirs.markers.pending().unwrap().expect("a rollback marker");
     assert_eq!(
-        staged,
-        Some(Rollback {
-            restore: BlockRange { min: 0, max: 5 },
-            record: ReceiptRollback { to_block: 5 },
-        })
+        pending,
+        Cause::Diverged {
+            stream: B256::repeat_byte(7)
+        }
+        .record(5),
+        "the marker is on disk before the park"
     );
     assert_eq!(blocks(&dirs.ckpt), [2, 4], "the diverged checkpoints go");
     assert!(
@@ -134,7 +145,10 @@ fn a_local_checkpoint_below_the_divergence_is_staged() {
     let restored = kardamom_state::restore_best_checkpoint(
         &dirs.ckpt,
         &dirs.state,
-        staged.unwrap().restore,
+        BlockRange {
+            max: pending.to_block,
+            ..BlockRange::ANY
+        },
         None,
     )
     .unwrap()
@@ -146,9 +160,9 @@ fn a_local_checkpoint_below_the_divergence_is_staged() {
 fn no_checkpoint_below_the_divergence_keeps_the_state() {
     let dirs = Dirs::new();
     drop(chain(&dirs.state, &dirs.ckpt, 6, &[6]));
-    let staged = dirs.repair(&[]).stage(Some(&diverged(6))).unwrap();
-    assert_eq!(staged, None);
+    assert!(!dirs.repair(&[]).stage(Some(&diverged(6))).unwrap());
     assert_eq!(blocks(&dirs.ckpt), [] as [u64; 0]);
+    assert_eq!(dirs.markers.pending().unwrap(), None);
     assert!(
         kardamom_state::has_state_db(&dirs.state).unwrap(),
         "the state DB stays for the operator"
@@ -163,7 +177,7 @@ fn no_checkpoint_dir_stages_nothing() {
         checkpoint_dir: None,
         ..dirs.repair(&[])
     };
-    assert_eq!(repair.stage(Some(&diverged(2))).unwrap(), None);
+    assert!(!repair.stage(Some(&diverged(2))).unwrap());
 }
 
 /// With no local checkpoint below the block, a peer checkpoint below it is
@@ -181,6 +195,7 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
     let staged = tokio::task::spawn_blocking({
         let dirs_state = dirs.state.clone();
         let dirs_ckpt = dirs.ckpt.clone();
+        let markers = dirs.markers.clone();
         move || {
             drop(chain(&dirs_state, &dirs_ckpt, 6, &[6]));
             RollbackRepair {
@@ -188,6 +203,7 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
                 checkpoint_peers: &peers,
                 state_dir: &dirs_state,
                 expected_genesis: None,
+                markers: &markers,
             }
             .stage(Some(&diverged(5)))
             .unwrap()
@@ -195,7 +211,8 @@ async fn a_peer_checkpoint_below_the_divergence_is_fetched() {
     })
     .await
     .unwrap();
-    assert_eq!(staged.map(|r| r.record.to_block), Some(4));
+    assert!(staged);
+    assert_eq!(dirs.markers.pending().unwrap().map(|r| r.to_block), Some(4));
     assert_eq!(
         blocks(&dirs.ckpt),
         [3],

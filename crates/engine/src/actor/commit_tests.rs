@@ -14,6 +14,13 @@ use super::{CommitLoop, Escalation, ExecToCommit, TxReceiptsPublication};
 
 struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
 impl TxReceiptsPublication for RecordPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         self.0.lock().unwrap().push(msg);
         Ok(())
@@ -74,6 +81,13 @@ struct FlakyPub {
     log: Arc<Mutex<Vec<CMessage>>>,
 }
 impl TxReceiptsPublication for FlakyPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         if self.fails_left > 0 {
             self.fails_left -= 1;
@@ -131,6 +145,13 @@ struct BatchRecordPub {
     boundaries: Arc<Mutex<Vec<BlockBoundary>>>,
 }
 impl TxReceiptsPublication for BatchRecordPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
             CMessage::Receipt(r) => self.batches.lock().unwrap().push(vec![r]),
@@ -195,6 +216,13 @@ struct PartialPub {
     delivered: Arc<Mutex<Vec<Receipt>>>,
 }
 impl TxReceiptsPublication for PartialPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
         Ok(())
     }
@@ -249,6 +277,13 @@ fn commit_thread_resumes_batch_at_failed_suffix() {
 /// simulates the validator's receipt cross-check.
 struct DivergingPub;
 impl TxReceiptsPublication for DivergingPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
         Err(ExecutorError::Divergence("receipt mismatch at tx 0".into()))
     }
@@ -305,6 +340,13 @@ impl UnconnectedPub {
 }
 
 impl TxReceiptsPublication for UnconnectedPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         *self.attempts.lock().unwrap() += 1;
         if !self.connected() {
@@ -448,7 +490,10 @@ fn the_rollback_goes_out_before_the_first_receipt() {
         log: log.clone(),
         rollback_fails: 2,
     };
-    let rollback = kardamom_types::ReceiptRollback { to_block: 4 };
+    let rollback = kardamom_types::ReceiptRollback {
+        to_block: 4,
+        ..Default::default()
+    };
     CommitLoop::new(publication, rx)
         .announcing(Some(rollback))
         .spawn()

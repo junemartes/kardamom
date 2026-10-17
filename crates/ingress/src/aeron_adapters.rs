@@ -23,11 +23,12 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_obs::events::BoardView;
 use kardamom_types::{
     BPosition, BlockBoundary, ClusterStatus, FsyncWatermark, QuorumWatermark, ReceiptBatch,
-    TxEnvelope, TxError,
+    ReceiptRollback, TxEnvelope, TxError,
 };
 
 use crate::channels::{BUS_CAPACITY, IngressPublication, IngressSubscription, ReceiptItem};
 use crate::error::IngressError;
+use crate::rollback_log::RollbackLog;
 use crate::seal_latency::SealStamps;
 
 // ---------------------------------------------------------------------------
@@ -173,16 +174,23 @@ impl_pump_source!(TxErrorsSubscriberHandle, TxError);
 /// local layer, then its receipts onto the bus, one by one. The rows go
 /// first, so a client its receipt releases sees the new state on its
 /// next submit. A rollback frame goes onto the same bus, so the order of
-/// the stream holds. `TxReceiptsReceiver` has no constructor outside the
-/// log crate, so [`Self::on_frame`] is the testable step.
+/// the stream holds. The pump also puts each rollback into the rollback
+/// log, which a reader that lags on the bus reads. `TxReceiptsReceiver` has
+/// no constructor outside the log crate, so [`Self::on_frame`] is the
+/// testable step.
 struct ReceiptBatchPump {
     writer: LiveAccountsWriter,
     tx: broadcast::Sender<ReceiptItem>,
+    log: watch::Sender<RollbackLog>,
 }
 
 impl ReceiptBatchPump {
-    fn new(writer: LiveAccountsWriter, tx: broadcast::Sender<ReceiptItem>) -> Self {
-        Self { writer, tx }
+    fn new(
+        writer: LiveAccountsWriter,
+        tx: broadcast::Sender<ReceiptItem>,
+        log: watch::Sender<RollbackLog>,
+    ) -> Self {
+        Self { writer, tx, log }
     }
 
     /// Start the pump on the runtime. It ends when the source closes, on
@@ -198,18 +206,25 @@ impl ReceiptBatchPump {
     }
 
     /// Put one frame onto the bus. A lagging or absent receiver is the
-    /// broadcast channel's concern, so this ignores the send result. A
-    /// rollback first empties the local account layer: the rows of the
-    /// lost blocks carry positions above the new stream, so the monotone
-    /// rule would keep their nonces.
+    /// broadcast channel's concern, so this ignores the send result.
     fn on_frame(&mut self, frame: ReceiptFrame) {
         match frame {
             ReceiptFrame::Batch(batch) => self.on_batch(batch),
-            ReceiptFrame::Rollback(rollback) => {
-                self.writer.clear();
-                let _ = self.tx.send(ReceiptItem::Rollback(rollback));
-            }
+            ReceiptFrame::Rollback(rollback) => self.on_rollback(rollback),
         }
+    }
+
+    /// Take one rollback. A rollback of an event that the log holds already
+    /// is a late copy from another executor: it changes nothing, so the
+    /// rows of the new stream stay. A new one empties the local account
+    /// layer first: the rows of the lost blocks carry positions above the
+    /// new stream, so the monotone rule would keep their nonces.
+    fn on_rollback(&mut self, rollback: ReceiptRollback) {
+        if !self.log.send_if_modified(|log| log.push(rollback)) {
+            return;
+        }
+        self.writer.clear();
+        let _ = self.tx.send(ReceiptItem::Rollback(rollback));
     }
 
     /// Apply the batch's rows at its end position, then fan its receipts
@@ -231,6 +246,7 @@ impl ReceiptBatchPump {
 #[derive(Clone)]
 pub struct LiveIngressSubscription {
     receipts: broadcast::Sender<ReceiptItem>,
+    rollbacks: watch::Receiver<RollbackLog>,
     live: Arc<LiveAccounts>,
     watermarks: broadcast::Sender<QuorumWatermark>,
     local_fsync: broadcast::Sender<FsyncWatermark>,
@@ -291,7 +307,9 @@ impl LiveIngressSubscription {
         // `into_receiver()`: the pump task must not hold an
         // `AeronRuntime` clone. Holding one would keep the runtime alive
         // forever; see `TxReceiptsSubscriberHandle::into_receiver`.
-        ReceiptBatchPump::new(live_writer, receipts_tx.clone()).spawn(receipts_sub.into_receiver());
+        let (rollback_log, rollbacks) = watch::channel(RollbackLog::default());
+        ReceiptBatchPump::new(live_writer, receipts_tx.clone(), rollback_log)
+            .spawn(receipts_sub.into_receiver());
 
         // Quorum and durable watermark: in the cluster-only topology,
         // there is no Aeron `quorum_watermark` subscription here. The
@@ -325,6 +343,7 @@ impl LiveIngressSubscription {
 
         Ok(Self {
             receipts: receipts_tx,
+            rollbacks,
             live,
             watermarks: watermarks_tx,
             local_fsync: local_fsync_tx,
@@ -356,6 +375,9 @@ impl LiveIngressSubscription {
 impl IngressSubscription for LiveIngressSubscription {
     fn subscribe_receipts(&self) -> broadcast::Receiver<ReceiptItem> {
         self.receipts.subscribe()
+    }
+    fn rollbacks(&self) -> watch::Receiver<RollbackLog> {
+        self.rollbacks.clone()
     }
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {
         self.watermarks.subscribe()
@@ -429,7 +451,7 @@ mod tests {
 
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
-        let mut pump = ReceiptBatchPump::new(writer, bus);
+        let mut pump = ReceiptBatchPump::new(writer, bus, watch::channel(RollbackLog::default()).0);
         let end = BPosition::from_index(7);
         let receipt = kardamom_types::Receipt {
             tx_idx: end,
@@ -463,12 +485,16 @@ mod tests {
     async fn receipt_pump_keeps_a_rollback_in_stream_order() {
         let (live, writer) = LiveAccounts::new(&LiveAccountsConfig::default());
         let (bus, mut sub) = broadcast::channel::<ReceiptItem>(16);
-        let mut pump = ReceiptBatchPump::new(writer, bus);
+        let (log, mut log_rx) = watch::channel(RollbackLog::default());
+        let mut pump = ReceiptBatchPump::new(writer, bus, log);
         let receipt = |block_number| kardamom_types::Receipt {
             block_number,
             ..kardamom_types::Receipt::default()
         };
-        let rollback = kardamom_types::ReceiptRollback { to_block: 4 };
+        let rollback = kardamom_types::ReceiptRollback {
+            to_block: 4,
+            ..Default::default()
+        };
         let row = kardamom_types::AccountRow {
             address: alloy_primitives::Address::repeat_byte(0xAA),
             nonce: 9,
@@ -490,10 +516,22 @@ mod tests {
             live.get(row.address).is_none(),
             "the rollback empties the layer"
         );
-        pump.on_frame(batch(5, Vec::new()));
+        pump.on_frame(batch(5, vec![row.clone()]));
         assert_eq!(sub.recv().await.unwrap(), receipt(6).into());
         assert_eq!(sub.recv().await.unwrap(), ReceiptItem::Rollback(rollback));
         assert_eq!(sub.recv().await.unwrap(), receipt(5).into());
+        assert!(log_rx.has_changed().unwrap(), "the log takes the rollback");
+        assert_eq!(log_rx.borrow_and_update().generation(), 1);
+
+        // A late copy of the same event from another executor keeps the
+        // rows of the new stream, and goes neither on the bus nor in the log.
+        pump.on_frame(ReceiptFrame::Rollback(rollback));
+        assert!(live.get(row.address).is_some(), "the new rows stay");
+        assert!(!log_rx.has_changed().unwrap());
+        assert!(matches!(
+            sub.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     // A shard index past the publication vector must give an Internal

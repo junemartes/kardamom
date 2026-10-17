@@ -10,7 +10,7 @@ use kardamom_cluster_adapter::wire::{EGRESS_KIND_REPLAY_AHEAD, encode_feed_answe
 use kardamom_state::{StateEnvBuilder, StateSnapshot, StateWriter, WriteBatch};
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt};
 
-use super::tests::{TIMING, boundary, done, entry, tx_at, unavailable};
+use super::tests::{TIMING, boundary, done, entry, tx_at, tx_frame, unavailable};
 use super::*;
 
 /// The committed header of `block` that ends at `end`, as `boundary`
@@ -122,7 +122,11 @@ fn another_entry_at_a_committed_index_is_the_divergence_point() {
     let first = request(&mut sub, &feed);
     serve(&feed, first.request_id, 1..4);
     match outcome(&mut sub) {
-        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (2, 1)),
+        Err(ExecutorError::StreamDiverged {
+            block,
+            index,
+            stream,
+        }) => assert_eq!((block, index, stream), (2, 1, entry(1).canonical_id)),
         other => panic!("expected the divergence, got {other:?}"),
     }
 }
@@ -138,7 +142,9 @@ fn a_longer_block_is_the_divergence_point() {
     feed.send(boundary(2, 3));
     feed.send(done(first.request_id, 3, 3));
     match outcome(&mut sub) {
-        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (2, 3)),
+        Err(ExecutorError::StreamDiverged { block, index, .. }) => {
+            assert_eq!((block, index), (2, 3));
+        }
         other => panic!("expected the divergence, got {other:?}"),
     }
 }
@@ -166,14 +172,59 @@ fn a_head_below_the_floor_asks_again_until_it_passes() {
     assert_eq!((delivery.from_index, delivery.from_block), (3, 4));
 }
 
+/// A floor that the source refuses inside its retention names no point
+/// of its stream: the divergence can be below the window, and a wider
+/// window can find it.
 #[test]
-fn a_refused_floor_inside_the_retention_is_a_divergence() {
+fn a_refused_floor_inside_the_retention_is_below_the_window() {
     let (mut sub, feed) = reader(history((1, 2), 3));
     let first = request(&mut sub, &feed);
     feed.send(unavailable(first.request_id, 0, 1));
     match outcome(&mut sub) {
-        Err(ExecutorError::StreamDiverged { block, index }) => assert_eq!((block, index), (1, 1)),
-        other => panic!("expected the divergence, got {other:?}"),
+        Err(ExecutorError::DivergedBelowWindow { floor_block, widen }) => {
+            assert_eq!((floor_block, widen), (2, true));
+        }
+        other => panic!("expected a divergence below the window, got {other:?}"),
+    }
+}
+
+/// The first compared block differs: the divergence can be below it, so
+/// the reader reports no divergence point. At the first block of the
+/// chain, no wider window exists.
+#[test]
+fn a_difference_in_the_first_compared_block_is_below_the_window() {
+    let below = |floor: (u64, u64)| {
+        let (mut sub, feed) = reader(history(floor, 3));
+        let first = request(&mut sub, &feed);
+        feed.send(tx_frame(floor.0, &entry(floor.0 + 100)));
+        feed.send(boundary(floor.1, floor.0 + 1));
+        feed.send(done(first.request_id, floor.0 + 1, floor.1 + 1));
+        match outcome(&mut sub) {
+            Err(ExecutorError::DivergedBelowWindow { floor_block, widen }) => (floor_block, widen),
+            other => panic!("expected a divergence below the window, got {other:?}"),
+        }
+    };
+    assert_eq!(below((1, 2)), (2, true));
+    assert_eq!(below((0, 1)), (1, false));
+}
+
+/// A floor that moved up to the retention of the source cannot widen: a
+/// difference at the raised floor needs the operator.
+#[test]
+fn a_difference_at_a_raised_floor_cannot_widen() {
+    let (mut sub, feed) = reader(history((0, 1), 3));
+    let first = request(&mut sub, &feed);
+    feed.send(unavailable(first.request_id, 2, 2));
+    let raised = request(&mut sub, &feed);
+    assert_eq!((raised.from_index, raised.from_block), (2, 3));
+    feed.send(tx_frame(2, &entry(99)));
+    feed.send(boundary(3, 3));
+    feed.send(done(raised.request_id, 3, 4));
+    match outcome(&mut sub) {
+        Err(ExecutorError::DivergedBelowWindow { floor_block, widen }) => {
+            assert_eq!((floor_block, widen), (3, false));
+        }
+        other => panic!("expected a divergence below the window, got {other:?}"),
     }
 }
 

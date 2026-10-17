@@ -22,8 +22,9 @@ pub mod trie;
 pub mod writer;
 
 pub use checkpoint::{
-    BlockRange, CheckpointInfo, create_checkpoint, has_state_db, latest_checkpoint, park_state_db,
-    prune_checkpoints, remove_checkpoints, restore_best_checkpoint, restore_newest_readable,
+    BlockRange, CheckpointInfo, MARKER_PREFIX, create_checkpoint, has_state_db, latest_checkpoint,
+    park_state_db, prune_checkpoints, remove_checkpoints, restore_best_checkpoint,
+    restore_newest_readable,
 };
 pub use checkpoint_transfer::{CheckpointServer, fetch_best_checkpoint, serve_checkpoints};
 pub use compaction::compact_to;

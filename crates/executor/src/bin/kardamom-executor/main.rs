@@ -25,8 +25,10 @@
 //! tear down.
 
 mod args;
+mod marker;
 mod rollback;
 mod state;
+mod turns;
 mod wiring;
 
 use std::process::ExitCode;
@@ -45,7 +47,8 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
-use rollback::{Rollback, RollbackRepair};
+use marker::RunLedger;
+use turns::{RunEnd, RunInput, Turns, Verdict};
 use wiring::{ExecutorOrdering, ExecutorWiring};
 
 /// The state writer and the adapters built from its handle, plus the
@@ -227,6 +230,7 @@ async fn connect_cluster(
     file_cfg: &ExecutorFileConfig,
     plane: &StreamPlane,
     state: &state::PreparedState,
+    window: std::num::NonZeroU64,
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<(
     Option<kardamom_cluster_adapter::LiveCluster>,
@@ -235,7 +239,7 @@ async fn connect_cluster(
     let cursor = bin_support::cluster_replay_cursor(&state.start);
     let aeron_dir = args.aeron_dir.as_deref();
     if args.carry_bytes {
-        let history = state.history(args.rollback_compare_blocks)?;
+        let history = state.history(window)?;
         let sub = bin_support::open_member_feed(aeron_dir, cursor, history, stop.clone())?;
         tracing::info!("kardamom-executor: canonical entries via the member feed");
         return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
@@ -290,6 +294,7 @@ struct OutputsConfig<'a> {
     plane: &'a mut StreamPlane,
     aeron_cfg: &'a kardamom_log::config::AeronConfig,
     stop: tokio_util::sync::CancellationToken,
+    ledger: RunLedger,
 }
 
 impl Outputs {
@@ -303,8 +308,9 @@ impl Outputs {
             plane,
             aeron_cfg,
             stop,
+            ledger,
         } = cfg;
-        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args).await?;
+        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args, ledger).await?;
         // This replica's lifecycle on the `events` stream: the ingress pauses
         // submits once every executor is halted.
         plane
@@ -423,39 +429,6 @@ impl Boot {
     }
 }
 
-/// What the process does after one revolution of the pipeline.
-enum Verdict {
-    /// The engine returned cleanly: the operator asked for shutdown.
-    Done,
-    /// Run the pipeline again. A staged peer checkpoint, or the checkpoint
-    /// of a rollback, waits with the stale state parked, and the next run
-    /// restores it. A run after a restart of the stream source starts from
-    /// the state DB as it is.
-    Revolve(Option<Rollback>),
-    /// The pipeline failed and the process cannot repair it.
-    Failed(ExecutorError),
-}
-
-impl Verdict {
-    /// The verdict for one engine result and the results of the repairs.
-    /// `repaired` is the resync outcome label the fallback returned, or
-    /// `None` when the error was not a refused replay, or the fallback is
-    /// not configured. `rollback` is the staged rollback of a divergence.
-    fn of(
-        engine_error: Option<ExecutorError>,
-        repaired: Option<&str>,
-        rollback: Option<Rollback>,
-    ) -> Self {
-        match (engine_error, repaired, rollback) {
-            (None, _, _) => Self::Done,
-            (Some(_), _, Some(rollback)) => Self::Revolve(Some(rollback)),
-            (Some(ExecutorError::SourceRestarted { .. }), _, None)
-            | (Some(_), Some("peer-checkpoint"), None) => Self::Revolve(None),
-            (Some(e), _, None) => Self::Failed(e),
-        }
-    }
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> ExitCode {
     match run().await {
@@ -485,54 +458,16 @@ async fn run() -> Result<()> {
     // here for the next turn, which restores the checkpoint in-process,
     // with no orchestrator restart in between; every other end leaves the
     // loop.
-    let mut turns = Turns::default();
+    let mut turns = Turns::new(boot.args.rollback_compare_blocks);
     while turns.turn(&boot).await?.is_continue() {}
     Ok(())
-}
-
-/// The state that passes from one turn of the process loop to the next.
-#[derive(Default)]
-struct Turns {
-    revolutions: u32,
-    /// The rollback that the next run carries out.
-    rollback: Option<Rollback>,
-}
-
-impl Turns {
-    /// One turn of the process loop: a revolution, then its verdict.
-    /// `Continue` means run again; `Break` means the process is done. A
-    /// failure the process cannot repair returns `Err`, so the process
-    /// exits non-zero: the orchestrator tells a dead pipeline from a clean
-    /// shutdown by the exit status, which the whole "fail loudly, resume
-    /// from the cursor" loop relies on.
-    async fn turn(&mut self, boot: &Boot) -> Result<std::ops::ControlFlow<()>> {
-        let rollback = match Box::pin(run_once(boot, self.rollback.take())).await? {
-            Verdict::Done => return Ok(std::ops::ControlFlow::Break(())),
-            Verdict::Failed(e) => {
-                return Err(anyhow::Error::new(e).context("executor pipeline failed"));
-            }
-            Verdict::Revolve(rollback) => rollback,
-        };
-        if boot.stop.is_cancelled() {
-            tracing::info!("shutdown signal received during the repair; not revolving");
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        self.revolutions += 1;
-        self.rollback = rollback;
-        tracing::info!(
-            revolutions = self.revolutions,
-            rollback_to_block = rollback.map(|r| r.record.to_block),
-            "the pipeline starts again in-process from the state DB or a staged checkpoint"
-        );
-        Ok(std::ops::ControlFlow::Continue(()))
-    }
 }
 
 /// One revolution: open the transport and the state, run the engine to
 /// its end, repair a refused replay, and return the verdict. Every
 /// handle, the nonce query server's clone of the state env included, is
 /// gone before the repair parks the state.
-async fn run_once(boot: &Boot, rollback: Option<Rollback>) -> Result<Verdict> {
+async fn run_once(boot: &Boot, input: RunInput) -> Result<Verdict> {
     let args = &boot.args;
     let file_cfg = &boot.file_cfg;
     let Transport {
@@ -553,8 +488,11 @@ async fn run_once(boot: &Boot, rollback: Option<Rollback>) -> Result<Verdict> {
     // The guard in `LiveStreams` cancels this token on the way out; that
     // stops the periodic checkpointer task.
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let restore = rollback.map_or(kardamom_state::BlockRange::ANY, |r| r.restore);
-    let prepared = state::prepare_state(args, expected_genesis, restore, shutdown.clone())?;
+    let turns::RunStart {
+        prepared,
+        rollback,
+        ledger,
+    } = boot.start_run(input, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions, plus tx_deposits, bridged from async to
     // sync (shared with the validator binary; see `bin_support`). These
@@ -569,20 +507,26 @@ async fn run_once(boot: &Boot, rollback: Option<Rollback>) -> Result<Verdict> {
         plane: &mut plane,
         aeron_cfg: &aeron_cfg,
         stop: shutdown.clone(),
+        ledger: ledger.clone(),
     })
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
 
     let (cluster_guard, tx_ordering_sub) =
-        connect_cluster(args, file_cfg, &plane, &prepared, &shutdown).await?;
-    let state::PreparedState { env, start } = prepared;
+        connect_cluster(args, file_cfg, &plane, &prepared, input.window, &shutdown).await?;
+    let state::PreparedState {
+        env,
+        start,
+        checkpointer,
+    } = prepared;
+    let start_block = start.block;
     outputs.exec_stream.cursor.start(
         boot.cursor_id
             .and_then(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
     );
 
     let WriterAdapters {
-        mut writer,
+        writer,
         snapshots,
         writer_signal,
         writer_queue,
@@ -596,7 +540,7 @@ async fn run_once(boot: &Boot, rollback: Option<Rollback>) -> Result<Verdict> {
     // The must-deliver escalation of the commit thread follows the stall
     // budget of the publication runtime.
     cfg.stall_budget = rt_pub.stall_budget();
-    cfg.rollback = rollback.map(|r| r.record);
+    cfg.rollback = rollback;
 
     let block_exec = wiring::build_block_exec(args);
 
@@ -655,59 +599,18 @@ async fn run_once(boot: &Boot, rollback: Option<Rollback>) -> Result<Verdict> {
         .context("join the exec stream threads")?;
     // The plane's registrations deregister once the engine has stopped.
     plane.shutdown().await;
-    // Stop the state writer thread (this closes the delta channel, joins
-    // it, and surfaces its final result). The executor task has finished,
-    // so its adapter clones of the delta sender are already dropped.
-    if let Err(e) = writer.shutdown() {
-        tracing::error!(error = %e, "state writer shutdown returned an error");
-    }
+    let committed = RunEnd::stop_writer(writer, start_block);
     // End the nonce query server before the repair: it holds a clone of
     // the state env, and the repair parks that env.
     stop_nonce_query(nonce_query).await;
-    boot.repair(engine_error, expected_genesis)
-}
-
-impl Boot {
-    /// The repairs between two revolutions, after every state handle is
-    /// gone, and the verdict of the revolution.
-    ///
-    /// - A replay-window overrun stages a peer checkpoint, so the next
-    ///   revolution restores it instead of re-requesting the same refused
-    ///   `REPLAY_FROM`. See `bin_support::replay_unavailable_fallback`.
-    /// - A divergence of the canonical stream stages a checkpoint below the
-    ///   divergence block. See [`RollbackRepair`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when a staged checkpoint exists but the stale state
-    /// fails to park.
-    fn repair(
-        &self,
-        engine_error: Option<ExecutorError>,
-        expected_genesis: Option<alloy_primitives::B256>,
-    ) -> Result<Verdict> {
-        let args = &self.args;
-        let repaired = bin_support::replay_unavailable_fallback(
-            engine_error.as_ref(),
-            args.checkpoint_dir.as_deref(),
-            &args.checkpoint_peers,
-            &args.state_dir,
-            expected_genesis,
-            false,
-        )?;
-        if let Some(outcome) = repaired {
-            metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
-                .increment(1);
-        }
-        let rollback = RollbackRepair {
-            checkpoint_dir: args.checkpoint_dir.as_deref(),
-            checkpoint_peers: &args.checkpoint_peers,
-            state_dir: &args.state_dir,
-            expected_genesis,
-        }
-        .stage(engine_error.as_ref())?;
-        Ok(Verdict::of(engine_error, repaired, rollback))
-    }
+    boot.finish(RunEnd {
+        engine_error,
+        committed,
+        ledger,
+        checkpointer,
+        expected_genesis,
+    })
+    .await
 }
 
 /// End the nonce query server, when one runs, and wait until its task is

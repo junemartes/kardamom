@@ -7,12 +7,13 @@
 use kardamom_types::TxDataLoc;
 
 use kardamom_sequencer::resync::{
-    FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer,
+    Evidence, FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{
     Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
 };
+use kardamom_types::ReceiptRollback;
 
 /// A sequencer with resync enabled. Returns the floor-update sender.
 /// The controller starts in resync mode (the startup trigger), which is
@@ -227,16 +228,29 @@ fn a_rollback_voids_the_floor_and_the_lost_nonce_publishes_again() {
     // The receipt of nonce 1 in block 10 raised the floor to 2. The
     // executor then rolled back to block 5: that receipt is gone.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 1).in_block(10).into())
+        .send(
+            FloorUpdate::executed(s.address(), 1)
+                .with_evidence(Evidence::Receipt { block: 10 })
+                .into(),
+        )
         .unwrap();
-    floor_tx.send(FloorEvent::Rollback { to_block: 5 }).unwrap();
+    floor_tx
+        .send(FloorEvent::Rollback(ReceiptRollback {
+            to_block: 5,
+            ..Default::default()
+        }))
+        .unwrap();
     rig.step(&mut seq).unwrap();
     assert!(rig.refs().is_empty(), "nonce 1 waits for an unknown floor");
     assert!(rig.errors().is_empty(), "nonce 1 is not a duplicate now");
 
     // The new stream proves nonce 0 in block 3: the floor is 1.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 0).in_block(3).into())
+        .send(
+            FloorUpdate::executed(s.address(), 0)
+                .with_evidence(Evidence::Receipt { block: 3 })
+                .into(),
+        )
         .unwrap();
     rig.step(&mut seq).unwrap();
     rig.step(&mut seq).unwrap();

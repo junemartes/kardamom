@@ -326,13 +326,7 @@ pub fn restore_or_fetch_checkpoint(
     let mut restored = restore().context("restore local checkpoint")?;
     if restored.is_none()
         && !peers.is_empty()
-        && kardamom_state::fetch_best_checkpoint(
-            peers,
-            ckpt_dir,
-            range.past_genesis(),
-            expected_genesis,
-        )
-        .is_some()
+        && kardamom_state::fetch_best_checkpoint(peers, ckpt_dir, range, expected_genesis).is_some()
     {
         restored = restore().context("restore fetched checkpoint")?;
     }
@@ -516,7 +510,10 @@ impl ResyncFallback<'_> {
         let Some(ckpt) = kardamom_state::fetch_best_checkpoint(
             self.checkpoint_peers,
             ckpt_dir,
-            kardamom_state::BlockRange::at_or_above(oldest_block),
+            kardamom_state::BlockRange {
+                min: oldest_block,
+                ..kardamom_state::BlockRange::ANY
+            },
             self.expected_genesis,
         ) else {
             return Ok(None);

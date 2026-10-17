@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use kardamom_cache::AccountCache;
+use kardamom_cache::{AccountCache, AppliedRollbacks};
 use kardamom_log::aeron_live::{ReceiptFrame, TxReceiptsReceiver};
 use kardamom_types::{BPosition, ReceiptBatch, ReceiptRollback};
 use tokio_util::sync::CancellationToken;
@@ -125,15 +125,24 @@ impl Mirror {
     /// the rows of the lost blocks carry positions above the new stream,
     /// so the monotone rule would keep them. Thus the mirror deletes the
     /// whole projection, and the next batch starts a rebuild from the
-    /// newest checkpoint of the executor.
+    /// newest checkpoint of the executor. A copy of a rollback that the
+    /// mirror applied comes after rows of the new stream, so it changes
+    /// nothing.
     async fn roll_back(&mut self, rollback: ReceiptRollback) -> Result<()> {
+        if !self.progress.roll_back(&rollback) {
+            info!(
+                to_block = rollback.to_block,
+                id = %rollback.id,
+                "a copy of an applied rollback; the projection stays"
+            );
+            return Ok(());
+        }
         warn!(
             to_block = rollback.to_block,
+            id = %rollback.id,
             "an executor rolled back; clearing the projection"
         );
-        self.write_until_landed(&Write::Clear).await?;
-        self.progress.roll_back();
-        Ok(())
+        self.write_until_landed(&Write::Clear).await
     }
 
     /// Decide at start: resume when Redis carries a live head at or beyond
@@ -283,6 +292,8 @@ struct Progress {
     applied: u64,
     /// The rebuild that runs on the next batch, if any.
     pending_rebuild: Option<RebuildReason>,
+    /// The rollback events applied in this process.
+    rollbacks: AppliedRollbacks,
 }
 
 impl Progress {
@@ -290,6 +301,7 @@ impl Progress {
         Self {
             applied: 0,
             pending_rebuild,
+            rollbacks: AppliedRollbacks::default(),
         }
     }
 
@@ -299,19 +311,33 @@ impl Progress {
         BPosition::from_index(self.applied)
     }
 
-    /// Start again after a rollback. The new stream has lower positions
-    /// than the lost blocks, so the head follows it from zero. The
-    /// projection is gone, so the next batch rebuilds it.
-    fn roll_back(&mut self) {
+    /// Start again after a rollback with a new id. The new stream has
+    /// lower positions than the lost blocks, so the head follows it from
+    /// zero. The projection goes, so the next batch rebuilds it. Returns
+    /// whether the id is new: a copy of an applied rollback changes
+    /// nothing.
+    fn roll_back(&mut self, rollback: &ReceiptRollback) -> bool {
+        if !self.rollbacks.first_time(rollback) {
+            return false;
+        }
         self.applied = 0;
         self.pending_rebuild = Some(RebuildReason::Rollback);
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Progress, RebuildReason};
-    use kardamom_types::BPosition;
+    use alloy_primitives::B256;
+    use kardamom_types::{BPosition, ReceiptRollback};
+
+    fn rollback(id: u8) -> ReceiptRollback {
+        ReceiptRollback {
+            to_block: 3,
+            id: B256::repeat_byte(id),
+        }
+    }
 
     /// After a rollback, the head follows the lower positions of the new
     /// stream, and the next batch runs a rollback rebuild.
@@ -320,7 +346,7 @@ mod tests {
         let mut progress = Progress::new(None);
         assert_eq!(progress.advance(BPosition::from_index(900)).as_index(), 900);
         assert_eq!(progress.advance(BPosition::from_index(700)).as_index(), 900);
-        progress.roll_back();
+        assert!(progress.roll_back(&rollback(1)));
         assert_eq!(progress.pending_rebuild, Some(RebuildReason::Rollback));
         assert_eq!(progress.advance(BPosition::from_index(700)).as_index(), 700);
         assert_eq!(RebuildReason::Rollback.label(), "rollback");
@@ -331,11 +357,28 @@ mod tests {
     #[test]
     fn a_rollback_replaces_a_due_rebuild() {
         let mut progress = Progress::new(Some(RebuildReason::Forced));
-        progress.roll_back();
+        assert!(progress.roll_back(&rollback(1)));
         assert_eq!(
             progress.pending_rebuild.take(),
             Some(RebuildReason::Rollback)
         );
         assert_eq!(progress.pending_rebuild, None);
+    }
+
+    /// A copy of an applied rollback leaves the head and the rebuild as
+    /// they are: the rows after the first copy belong to the new stream.
+    #[test]
+    fn a_copy_of_an_applied_rollback_changes_nothing() {
+        let mut progress = Progress::new(None);
+        assert!(progress.roll_back(&rollback(7)));
+        assert_eq!(
+            progress.pending_rebuild.take(),
+            Some(RebuildReason::Rollback)
+        );
+        progress.advance(BPosition::from_index(40));
+        assert!(!progress.roll_back(&rollback(7)), "the copy is no news");
+        assert_eq!(progress.pending_rebuild, None);
+        assert_eq!(progress.advance(BPosition::from_index(10)).as_index(), 40);
+        assert!(progress.roll_back(&rollback(8)), "a new event applies");
     }
 }

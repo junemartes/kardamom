@@ -17,17 +17,14 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+mod lookup;
 mod origin_pump;
 mod receipts;
 mod steps;
 
-use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Address;
-use kardamom_cache::{CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, QueryError};
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
@@ -42,17 +39,17 @@ use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
-use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
+use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
-    FloorEvent, FloorUpdate, ResyncController, SealerAnswer, SealerRefusal, SharedWatermark,
-    elapsed_ms_saturating,
+    ResyncController, SealerAnswer, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
 use kardamom_sequencer::sealer_rules::SealerRules;
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::cluster_status::SilenceDeadline;
+pub(crate) use lookup::NonceLookupFeed;
 use origin_pump::OriginPump;
 pub(crate) use receipts::ReceiptFloorFeed;
 
@@ -510,198 +507,6 @@ impl EgressWatermarkFeed {
             self.last_boundary_at = Some(now);
         }
     }
-}
-
-/// One lookup result, from a query task back to the drain.
-struct LookupDone {
-    sender: Address,
-    result: Result<u64, QueryError>,
-}
-
-/// The nonce lookup task. It drains the core's requests, answers a
-/// resident sender from the local account layer, dedups the senders in
-/// flight, bounds the concurrency and the per-sender retry rate, asks
-/// Redis when `[cache]` is on, then the executors, and delivers each
-/// answer as a `FloorUpdate`. See `kardamom_sequencer::lookup`.
-///
-/// One query runs on its own task, so a slow executor never blocks the
-/// drain. The endpoints rotate per query, and a query walks the list until
-/// one endpoint answers within the timeout. A Redis nonce needs no
-/// freshness gate: like the executor's answer, it is a lower bound.
-pub(crate) struct NonceLookupFeed {
-    cfg: LookupConfig,
-    partition: u32,
-    /// The core's lookup requests.
-    rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-    shutdown: Shutdown,
-    floor_tx: crossbeam_channel::Sender<FloorEvent>,
-    /// The local account layer. A resident sender is answered from it.
-    live: Arc<LiveAccounts>,
-    /// The Redis layer. `None` with `[cache]` off.
-    redis: Option<Arc<CacheReader>>,
-    query: ExecutorQuery,
-    done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
-    done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
-    in_flight: HashSet<Address>,
-    /// The last request time per sender. It bounds the retry rate to one
-    /// lookup per timeout per sender.
-    recent: HashMap<Address, Instant>,
-}
-
-impl NonceLookupFeed {
-    /// The `recent` map is pruned once it holds this many senders.
-    const RECENT_CAP: usize = 4096;
-
-    /// Build the feed over the core's request channel. `None` when the
-    /// config names no executor endpoint.
-    pub(crate) fn new(
-        cfg: LookupConfig,
-        partition: u32,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-        shutdown: Shutdown,
-        floor_tx: crossbeam_channel::Sender<FloorEvent>,
-        live: Arc<LiveAccounts>,
-        redis: Option<Arc<CacheReader>>,
-    ) -> Option<Self> {
-        let query = ExecutorQuery::new(&ExecutorQueryConfig {
-            endpoints: cfg.executor_endpoints.clone(),
-            timeout_ms: cfg.timeout_ms,
-            max_in_flight: cfg.max_in_flight,
-        })?;
-        let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
-        Some(Self {
-            cfg,
-            partition,
-            rx,
-            shutdown,
-            floor_tx,
-            live,
-            redis,
-            query,
-            done_tx,
-            done_rx,
-            in_flight: HashSet::new(),
-            recent: HashMap::new(),
-        })
-    }
-
-    /// Spawn the drain as a plain async task over the core's requests.
-    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run())
-    }
-
-    async fn run(mut self) {
-        while self.tick().await.is_continue() {}
-    }
-
-    /// One [`Self::run`] pass: wait for a finished query, a new request,
-    /// or shutdown. `Break` means the task should stop: shutdown, a
-    /// closed channel, or the publish loop is gone.
-    async fn tick(&mut self) -> ControlFlow<()> {
-        tokio::select! {
-            biased;
-            () = self.shutdown.cancelled() => ControlFlow::Break(()),
-            done = self.done_rx.recv() => match done {
-                Some(done) => self.on_done(done),
-                None => ControlFlow::Break(()),
-            },
-            req = self.rx.recv() => match req {
-                Some(sender) => self.on_lookup_request(sender),
-                None => ControlFlow::Break(()),
-            },
-        }
-    }
-
-    /// One finished query: count it, and forward an answer above nonce 0
-    /// as floor evidence. `Break` means the publish loop is gone.
-    fn on_done(&mut self, done: LookupDone) -> ControlFlow<()> {
-        self.in_flight.remove(&done.sender);
-        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
-        let nonce = match done.result {
-            Ok(nonce) => nonce,
-            Err(e) => return self.record_lookup_error(done.sender, &e),
-        };
-        seq_metrics::record_nonce_lookup(self.partition, "ok");
-        tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");
-        self.floor_from_committed(done.sender, nonce)
-    }
-
-    /// A committed nonce `c` proves every nonce below it executed, so it
-    /// is floor evidence of the same kind as a receipt. Nonce 0 proves
-    /// nothing. `Break` means the publish loop is gone.
-    fn floor_from_committed(&self, sender: Address, nonce: u64) -> ControlFlow<()> {
-        let Some(executed_nonce) = nonce.checked_sub(1) else {
-            return ControlFlow::Continue(());
-        };
-        match self
-            .floor_tx
-            .send(FloorUpdate::executed(sender, executed_nonce).into())
-        {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
-    }
-
-    /// One request from the core: answer it from the local layer when
-    /// the sender is resident, else drop it if the sender is in flight
-    /// or asked within the last timeout, shed it at the concurrency
-    /// bound, else start a query task.
-    fn on_request(&mut self, sender: Address) {
-        if let Some(view) = self.live.get(sender) {
-            seq_metrics::record_nonce_lookup(self.partition, "local");
-            // A gone publish loop ends the drain on its next tick.
-            let _ = self.floor_from_committed(sender, view.nonce);
-            return;
-        }
-        let now = Instant::now();
-        let timeout = self.cfg.timeout();
-        let asked_recently = self
-            .recent
-            .get(&sender)
-            .is_some_and(|t| now.duration_since(*t) < timeout);
-        if self.in_flight.contains(&sender) || asked_recently {
-            return;
-        }
-        if self.in_flight.len() >= self.cfg.max_in_flight.get() {
-            seq_metrics::record_nonce_lookup(self.partition, "shed");
-            return;
-        }
-        if self.recent.len() >= Self::RECENT_CAP {
-            self.recent.retain(|_, t| now.duration_since(*t) < timeout);
-        }
-        self.recent.insert(sender, now);
-        self.in_flight.insert(sender);
-        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
-        self.spawn_query(sender);
-    }
-
-    /// Start one query task for `sender`: Redis first when it is on, then
-    /// the executors.
-    fn spawn_query(&self, sender: Address) {
-        let query = self.query.clone();
-        let redis = self.redis.clone();
-        let done_tx = self.done_tx.clone();
-        let partition = self.partition;
-        tokio::spawn(async move {
-            let result = match redis_nonce(redis.as_deref(), sender).await {
-                Some(nonce) => {
-                    seq_metrics::record_nonce_lookup(partition, "redis");
-                    Ok(nonce)
-                }
-                None => query.nonce(sender).await.and_then(|answer| {
-                    u64::try_from(answer.value)
-                        .map_err(|e| QueryError::new(format!("nonce out of range: {e}"), false))
-                }),
-            };
-            let _ = done_tx.send(LookupDone { sender, result });
-        });
-    }
-}
-
-/// The sender's nonce from the Redis projection. `None` with the layer
-/// off, on a miss, and on every degraded read, which the reader counts.
-async fn redis_nonce(redis: Option<&CacheReader>, sender: Address) -> Option<u64> {
-    redis?.account(sender).await.map(|view| view.nonce)
 }
 
 /// The executor-boundary feed into the base fee view: every closed

@@ -114,7 +114,10 @@ impl FetchRequest {
             .and_then(|block| block.parse().ok())
             .unwrap_or(u64::MAX);
         Some(Self {
-            range: BlockRange { min: 0, max },
+            range: BlockRange {
+                max,
+                ..BlockRange::ANY
+            },
         })
     }
 }

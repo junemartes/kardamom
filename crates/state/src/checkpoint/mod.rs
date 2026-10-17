@@ -44,6 +44,7 @@ use image::CompactedImage;
 use manifest::stored_genesis_digest;
 pub(crate) use manifest::{ImageSchema, check_image_identity, file_keccak, publish_checkpoint};
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::B256;
@@ -66,7 +67,8 @@ pub struct CheckpointInfo {
 
 /// The blocks that a checkpoint may capture: `min..=max`. The rollback of
 /// an executor needs a checkpoint below a block, and the resync fallback
-/// needs one at or above a floor, so one range type serves both.
+/// needs one at or above a floor, so one range type serves both. A state at
+/// genesis needs no checkpoint, so every range starts at block 1 or above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRange {
     pub min: u64,
@@ -74,36 +76,33 @@ pub struct BlockRange {
 }
 
 impl BlockRange {
-    /// Every block.
+    /// Every block after genesis.
     pub const ANY: Self = Self {
-        min: 0,
+        min: 1,
         max: u64::MAX,
     };
 
     /// The blocks at or above `min`.
     #[must_use]
-    pub const fn at_or_above(min: u64) -> Self {
-        Self { min, max: u64::MAX }
-    }
-
-    /// The blocks below `block`, or `None` when `block` is 0.
-    #[must_use]
-    pub fn below(block: u64) -> Option<Self> {
-        block.checked_sub(1).map(|max| Self { min: 0, max })
-    }
-
-    /// The range without block 0. A genesis state needs no transfer, so a
-    /// peer fetch never asks for it.
-    #[must_use]
-    pub fn past_genesis(self) -> Self {
+    pub const fn at_or_above(min: NonZeroU64) -> Self {
         Self {
-            min: self.min.max(Self::FIRST_BLOCK),
-            ..self
+            min: min.get(),
+            max: u64::MAX,
         }
     }
 
-    /// The first block after genesis.
-    const FIRST_BLOCK: u64 = 1;
+    /// The blocks after genesis and below `block`, or `None` when no such
+    /// block exists.
+    #[must_use]
+    pub fn below(block: u64) -> Option<Self> {
+        block
+            .checked_sub(1)
+            .and_then(NonZeroU64::new)
+            .map(|max| Self {
+                max: max.get(),
+                ..Self::ANY
+            })
+    }
 
     /// Whether the range holds `block`.
     #[must_use]
@@ -381,7 +380,7 @@ pub fn remove_checkpoints(checkpoints_dir: &Path, range: BlockRange) -> Result<u
             _ => None,
         })
         .try_fold(0usize, |removed, path| {
-            remove_dir_or_file(&path).map(|()| removed + 1)
+            CheckpointInfo::retire(&path).map(|()| removed + 1)
         })
 }
 
@@ -453,18 +452,31 @@ pub fn restore_best_checkpoint(
     range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Result<Option<(u64, PathBuf)>, StateError> {
-    let in_range = checkpoints_newest_first(checkpoints_dir)?
+    checkpoints_newest_first(checkpoints_dir)?
         .into_iter()
-        .filter(|ckpt| range.contains(ckpt.block));
-    for ckpt in in_range {
-        if let Some(block) = ckpt.restore_or_set_aside(state_dir, expected_genesis)? {
-            return Ok(Some((block, ckpt.path)));
-        }
-    }
-    Ok(None)
+        .filter(|ckpt| range.contains(ckpt.block))
+        .find_map(|ckpt| {
+            ckpt.restore_or_set_aside(state_dir, expected_genesis)
+                .map(|restored| restored.map(|block| (block, ckpt.path)))
+                .transpose()
+        })
+        .transpose()
 }
 
 impl CheckpointInfo {
+    /// Delete the checkpoint at `path`: first rename it out of the scan
+    /// path, then remove it. A reader never sees a part of a checkpoint
+    /// under a `checkpoint-*` name, and a crash leaves only a hidden
+    /// `.removing-*` entry that no scanner takes.
+    fn retire(path: &Path) -> Result<(), StateError> {
+        let name = path
+            .file_name()
+            .map_or_else(|| "checkpoint".into(), |n| n.to_string_lossy().into_owned());
+        let hidden = path.with_file_name(format!(".removing-{name}"));
+        std::fs::rename(path, &hidden)?;
+        remove_dir_or_file(&hidden)
+    }
+
     /// Restore this checkpoint into `state_dir`, and return its block. When
     /// it does not restore, set it aside and return `None`, so the caller
     /// tries the next-newest. A checkpoint of a schema this release does
@@ -580,10 +592,19 @@ pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
     Ok(Some(parked))
 }
 
+/// The name prefix of the files that a park leaves in the state
+/// directory: the markers of the process, which outlive one state DB.
+pub const MARKER_PREFIX: &str = "marker-";
+
 /// Move one `read_dir` entry into `parked`, unless it already is
-/// `parked` itself (the directory this same call just created).
+/// `parked` itself (the directory this same call just created) or a
+/// marker of the process.
 fn park_one(entry: &std::fs::DirEntry, parked: &Path) -> Result<(), StateError> {
-    if entry.path() != parked {
+    let marker = entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| name.starts_with(MARKER_PREFIX));
+    if entry.path() != parked && !marker {
         std::fs::rename(entry.path(), parked.join(entry.file_name()))?;
     }
     Ok(())

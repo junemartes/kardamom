@@ -3,12 +3,13 @@
 
 use alloy_primitives::Address;
 use jsonrpsee::server::SubscriptionSink;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use kardamom_types::TxError;
 
 use crate::channels::ReceiptItem;
 use crate::json_rpc::{ReceiptEvent, RpcReceipt};
+use crate::rollback_log::RollbackLog;
 
 /// A sender allow-list for `kardamom_subscribeReceipts`. `None` streams
 /// every sender.
@@ -42,26 +43,46 @@ enum NextEvent {
     RolledBack(u64),
 }
 
-/// Owns one `kardamom_subscribeReceipts` session end to end: the two
-/// upstream feeds, the sender filter, and the sink the events go out on.
+/// The feeds of one session: the deduped receipts with their rollbacks,
+/// the log of the applied rollbacks, and the tx errors.
+pub(crate) struct Feeds {
+    pub(crate) receipts: broadcast::Receiver<ReceiptItem>,
+    pub(crate) rollbacks: watch::Receiver<RollbackLog>,
+    pub(crate) errors: broadcast::Receiver<TxError>,
+}
+
+/// What one session makes of each feed item: the sender filter, and the
+/// rollbacks since the session started.
+struct Rules {
+    filter: SenderFilter,
+    rollbacks: watch::Receiver<RollbackLog>,
+    /// The rollback generation when the session started. A rollback after
+    /// it, that the session missed on a gap of the receipt feed, ends the
+    /// session too.
+    started_at: u64,
+}
+
+/// Owns one `kardamom_subscribeReceipts` session end to end: the
+/// upstream feeds, the rules of the session, and the sink the events go
+/// out on.
 pub(crate) struct ReceiptSubscription {
     receipts: broadcast::Receiver<ReceiptItem>,
     errors: broadcast::Receiver<TxError>,
-    filter: SenderFilter,
+    rules: Rules,
     sink: SubscriptionSink,
 }
 
 impl ReceiptSubscription {
-    pub(crate) fn new(
-        receipts: broadcast::Receiver<ReceiptItem>,
-        errors: broadcast::Receiver<TxError>,
-        filter: SenderFilter,
-        sink: SubscriptionSink,
-    ) -> Self {
+    pub(crate) fn new(feeds: Feeds, filter: SenderFilter, sink: SubscriptionSink) -> Self {
+        let Feeds {
+            receipts,
+            rollbacks,
+            errors,
+        } = feeds;
         Self {
             receipts,
             errors,
-            filter,
+            rules: Rules::new(filter, rollbacks),
             sink,
         }
     }
@@ -108,8 +129,8 @@ impl ReceiptSubscription {
         loop {
             let next = tokio::select! {
                 () = self.sink.closed() => return NextEvent::FeedClosed,
-                r = self.receipts.recv() => self.on_receipt_result(r),
-                e = self.errors.recv() => self.on_error_result(e),
+                r = self.receipts.recv() => self.rules.on_receipt_result(r),
+                e = self.errors.recv() => self.rules.on_error_result(e),
             };
             if !matches!(next, NextEvent::FilteredOut) {
                 return next;
@@ -117,7 +138,27 @@ impl ReceiptSubscription {
         }
     }
 
-    /// One `receipts` feed poll, for [`Self::next_event`]'s `select!` arm.
+    /// Serializes and sends one event to the subscriber. Returns
+    /// `Ok(false)` if the subscriber went away, so the caller ends the
+    /// loop instead of treating a closed sink as an error.
+    async fn send_event(&self, event: &ReceiptEvent) -> Result<bool, String> {
+        let msg = serde_json::value::to_raw_value(event)
+            .map_err(|e| format!("serialize subscription event: {e}"))?;
+        Ok(self.sink.send(msg).await.is_ok())
+    }
+}
+
+impl Rules {
+    fn new(filter: SenderFilter, rollbacks: watch::Receiver<RollbackLog>) -> Self {
+        let started_at = rollbacks.borrow().generation();
+        Self {
+            filter,
+            rollbacks,
+            started_at,
+        }
+    }
+
+    /// One `receipts` feed poll, for [`ReceiptSubscription::next_event`]'s `select!` arm.
     fn on_receipt_result(&self, r: Result<ReceiptItem, broadcast::error::RecvError>) -> NextEvent {
         match r {
             Ok(ReceiptItem::Rollback(rollback)) => NextEvent::RolledBack(rollback.to_block),
@@ -127,14 +168,25 @@ impl ReceiptSubscription {
             Ok(ReceiptItem::Receipt(rcpt)) => NextEvent::Event(ReceiptEvent::Receipt {
                 receipt: Box::new(RpcReceipt::from(&rcpt).0),
             }),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
-            }
+            Err(broadcast::error::RecvError::Lagged(n)) => self.missed_rollback().map_or(
+                NextEvent::Event(ReceiptEvent::Lagged { skipped: n }),
+                NextEvent::RolledBack,
+            ),
             Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
         }
     }
 
-    /// One `errors` feed poll, for [`Self::next_event`]'s `select!` arm.
+    /// The lowest block of a rollback after the start of the session. The
+    /// receipt feed dropped items, and a rollback can be among them.
+    fn missed_rollback(&self) -> Option<u64> {
+        self.rollbacks
+            .borrow()
+            .since(self.started_at)
+            .map(|r| r.to_block)
+            .min()
+    }
+
+    /// One `errors` feed poll, for [`ReceiptSubscription::next_event`]'s `select!` arm.
     fn on_error_result(&self, e: Result<TxError, broadcast::error::RecvError>) -> NextEvent {
         match e {
             Ok(err) if !self.filter.allows(err.sender) => NextEvent::FilteredOut,
@@ -150,13 +202,44 @@ impl ReceiptSubscription {
             Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
         }
     }
+}
 
-    /// Serializes and sends one event to the subscriber. Returns
-    /// `Ok(false)` if the subscriber went away, so the caller ends the
-    /// loop instead of treating a closed sink as an error.
-    async fn send_event(&self, event: &ReceiptEvent) -> Result<bool, String> {
-        let msg = serde_json::value::to_raw_value(event)
-            .map_err(|e| format!("serialize subscription event: {e}"))?;
-        Ok(self.sink.send(msg).await.is_ok())
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::B256;
+    use kardamom_types::ReceiptRollback;
+
+    use super::*;
+
+    fn rollback(to_block: u64, id: u8) -> ReceiptRollback {
+        ReceiptRollback {
+            to_block,
+            id: B256::repeat_byte(id),
+        }
+    }
+
+    /// A gap on the receipt feed ends the session when a rollback came
+    /// after the start of the session, also one that the gap dropped. A
+    /// rollback from before the start does not end it.
+    #[test]
+    fn a_rollback_missed_on_a_gap_ends_the_session() {
+        let (log, rollbacks) = watch::channel(RollbackLog::default());
+        log.send_modify(|l| {
+            l.push(rollback(2, 1));
+        });
+        let rules = Rules::new(SenderFilter::new(None), rollbacks);
+        let lagged = || Err(broadcast::error::RecvError::Lagged(9));
+        assert!(matches!(
+            rules.on_receipt_result(lagged()),
+            NextEvent::Event(ReceiptEvent::Lagged { skipped: 9 })
+        ));
+        log.send_modify(|l| {
+            l.push(rollback(6, 2));
+            l.push(rollback(4, 3));
+        });
+        assert!(matches!(
+            rules.on_receipt_result(lagged()),
+            NextEvent::RolledBack(4)
+        ));
     }
 }

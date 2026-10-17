@@ -326,6 +326,7 @@ These counters need an alert of your own. No rule in `deploy/alerts.yml` watches
   - `no-checkpoint`: no checkpoint below the divergence exists. The executor stops and waits for an operator.
   - See "A power loss on a majority of the sealers rolls the paired executors back" in [failure-modes.md](failure-modes.md).
 - `kardamom_sequencer_receipt_floors_forgotten_total` counts the nonce floors that a rollback of an executor reset to unknown.
+- `validator_replica_results_unchecked_total{reason="withdrawn"}` counts the buffered receipts, rows and BALs that a rollback of an executor withdrew.
 - `kardamom_checkpoint_unreadable_schema_skips_total` counts the checkpoints an executor, a validator or a state mirror skipped because the image holds a state schema the release does not read.
   - An increment after a rollback is expected: the newest checkpoint comes from the newer release.
   - Growth on a steady fleet means a node runs a release of another schema.

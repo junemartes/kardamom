@@ -879,42 +879,51 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - The validator, the batcher and an executor that reads the cluster egress stop. The executor and the validator exit with status 1.
   - The orchestrator restarts each one. Each restart stops at the same refusal until the sealer serves the stream again.
   - The sealer serves it again after a seeded start from a state rebuilt from L1 (see "Data-availability recovery").
-- An executor that reads the member feed (`--carry-bytes`) does not stop. It waits for the head and compares the stream with its committed history (next section). A divergence rolls it back to a checkpoint below the divergence. With no such checkpoint, it stops as above.
+- An executor that reads the member feed (`--carry-bytes`) does not stop. It waits for the head and compares the stream with its committed history (next section). A divergence rolls it back to a checkpoint below the divergence. With no such checkpoint, it stops as above. The deployed executors read the cluster egress until the cut-over to carried transactions.
 
 **A power loss on a majority of the sealers rolls the paired executors back.**
 
+- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). The sealer change to sync level 0 with a 1 s scheduled sync (#645) must not reach a cluster before that cut-over: until then, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above.
 - The cause. A member forces its log on a schedule, not on each append. A power loss on the hosts of a majority loses, on each of them, the entries after its last forced position. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
-- A paired executor runs an entry in about 5 ms, before the entry is durable. So it can hold committed blocks that the new stream does not have.
+- A paired executor runs an entry in about 5 ms, before the entry is durable. So it can hold committed blocks that the new stream does not have, and it can have published receipts of lost entries.
 - **The comparison.** At each start, before it executes a frame, the executor that reads the member feed asks its member for a replay from a floor below its cursor. It compares each frame up to its last committed block with its state DB:
   - the transaction hash of each receipt, by canonical index;
   - the end index, the timestamp and the L1 origin of each header.
-- The floor is `--rollback-compare-blocks` committed blocks (default 32) below the cursor.
-  - A floor below the retention of the member moves up to the first block that the member holds.
-  - A floor that the member refuses inside its retention names no point of the new stream. The divergence is then at or below the floor.
-- The first difference is the divergence point `d`. With no difference, the executor delivers from its cursor as before.
+- The floor is `--rollback-compare-blocks` committed blocks (default 32) below the cursor. A floor below the retention of the member moves up to the first block that the member holds.
 - A head below the floor (`REPLAY_AHEAD`) is no fault. The executor asks again every 2 s. The sealer closes a block on each tick, so the head passes the floor, and the comparison runs.
-- **A new connection.** A new image of the member feed after the comparison ends the run (`SourceRestarted`). The entries in flight above the committed block are not in the state DB, so the process starts the pipeline again from the state DB, and the comparison runs again. A head below the delivery cursor ends the run the same way. A reader with no history (a genesis start) that delivered nothing yet continues.
-- **The checkpoint.** The run ends with `StreamDiverged { block, index }`. Between two runs, in the same process, the executor:
-  1. removes its local checkpoints at and above the divergence block: they hold lost entries, so no restore and no peer may take them;
-  2. takes the newest local checkpoint below the block, else fetches the newest peer checkpoint below it (the request `GET /checkpoint/latest?max_block=<block - 1>`);
-  3. parks the diverged state DB in `<state-dir>/stale/`.
-- The next run restores a checkpoint below the block, compares again from it, and executes the new stream.
-- **The signal.** Before its first receipt, the next run publishes `ReceiptRollback { to_block }` on the receipt stream of `tx_receipts`, with `to_block = d - 1`. The blocks up to `to_block` are equal on both streams, so their receipts stay valid.
-  - The ingress drops its cached receipts above `to_block`, forgets their hashes in its first-wins set, empties its local account layer, lowers its head and its fee history to `to_block`, and closes each `kardamom_subscribeReceipts` subscription with an error that names the rollback.
+- **The divergence point.** The first difference after a block that compared equal is the divergence point `d`. With no difference, the executor delivers from its cursor as before.
+- **A difference at the floor.** A difference in the first compared block, or a floor that the member refuses inside its retention, does not show where the divergence is: it can be below the window. The executor then compares again with a window 4 times wider, up to 4096 blocks. It stops with `DivergedBelowWindow` for the operator when the window is at its widest, the floor is block 1, or the floor is the retention of the member. So the executor never publishes a `to_block` from a guess at the floor.
+- **A new connection.** A new image of the member feed after the comparison ends the run (`SourceRestarted`). The entries in flight above the committed block are not in the state DB, so the process starts the pipeline again from the state DB, and the comparison runs again. A head below the delivery cursor ends the run the same way. A reader with no history (a genesis start) that delivered nothing yet continues. The process waits before the next run: 1 s, then twice as long after each restart in a row, up to 30 s. A run of 60 s ends the series.
+- **The checkpoint.** The run ends with `StreamDiverged { block, index, stream }`. Between two runs, in the same process, the executor:
+  1. waits until its checkpoint task ends, so a late round can neither publish a checkpoint of the diverged state nor prune the chosen checkpoint;
+  2. removes its local checkpoints at and above the divergence block (a rename out of the scan path, then a delete): they hold lost entries, so no restore and no peer may take them;
+  3. takes the newest local checkpoint below the block, else fetches the newest peer checkpoint below it (the request `GET /checkpoint/latest?max_block=<block - 1>`);
+  4. writes the rollback marker `<state-dir>/marker-rollback` with a disk sync;
+  5. parks the diverged state DB in `<state-dir>/stale/`. The park leaves the markers in place.
+- The next run restores only a checkpoint at or below the block of the marker, compares again from it, and executes the new stream.
+- **The signal.** Before its first receipt, a run with a rollback marker publishes `ReceiptRollback { to_block, id }` on the receipt stream of `tx_receipts`. The commit thread removes the marker only after the publish succeeds. So a crash, a shutdown, or a run that fails before the publish leaves the marker, and the next start publishes the same record.
+  - After a divergence, `to_block = d - 1`. The blocks up to `to_block` are equal on both streams, so their receipts stay valid.
+  - A run that published receipts above its last committed block (for example of the open block) leaves a marker with `to_block` = its last committed block. A lost tail only in the open block, or in blocks that did not commit, is then voided too. The comparison cannot see such a tail: it is not in the state DB.
+  - A start with no clean marker (`<state-dir>/marker-clean`) follows a crash, so it publishes a rollback to its last committed block for the same reason. The first start of this release has no clean marker either, so it publishes one rollback.
+  - `id` names the event. Every executor that finds one divergence uses the same `id`, from the fingerprint of the new stream at `d`. A consumer acts on each `id` once.
+- **The consumers.**
+  - The ingress drops its cached receipts above `to_block`, forgets their hashes in its first-wins set, empties its local account layer and its cold-account map, lowers its head and its fee history to `to_block`, and closes each `kardamom_subscribeReceipts` subscription with an error that names the rollback. A rollback that the receipt bus drops on lag is still applied from a log that does not drop.
   - The state mirror deletes the `acct:` and `rcpt:` keys of Redis and rebuilds the account rows from a checkpoint.
   - The sequencer resets to unknown each nonce floor that a receipt above `to_block` set, and learns it again by its resync (the local layer, Redis, then the executor).
-  - A consumer of an older release fails to decode the 8-byte frame, logs it, and skips it.
+  - The validator drops the buffered receipts and rows of the publishing executor above `to_block`, and the buffered BALs of every executor above `to_block`. A missing BAL means "unverified", never a divergence.
+  - A consumer of an older release fails to decode the 40-byte frame, logs it, and skips it.
+- **The cost of a rollback.** Each new `id` clears more than the lost blocks: the state mirror rebuilds all its rows, the ingress empties its local layer and cold map, and the validator does not verify the BALs above `to_block`. A late copy of one `id` costs nothing. A restart rollback has an `id` of its own for each executor, so N executors that crash at once cost N clears.
 - **With no checkpoint below `d`**, the executor stops with `StreamDiverged` and exits with status 1, as it stopped with `ClusterBehindCursor` before. The operator restores a checkpoint, or rebuilds the state from L1 (see "Data-availability recovery").
 - **What a client sees.** A receipt of a block above the new head goes away: `eth_getTransactionReceipt` answers `null`, then a new receipt if the transaction is ordered again, or `null` for good. A transaction is confirmed only when the batcher posted its block.
 - Signals:
   - `kardamom_executor_rollback_total{outcome}`: `local-checkpoint`, `peer-checkpoint`, or `no-checkpoint`.
-  - The executor logs `the stream diverges from the committed history`, then `rollback prepared`, then `published the rollback`.
+  - The executor logs `the stream diverges from the committed history`, then `rollback marker written` and `rollback prepared`, then `published the rollback`.
   - `kardamom_sequencer_receipt_floors_forgotten_total` counts the floors that a rollback reset.
 - Limits:
-  - The comparison sees only the window. A divergence below the floor shows as a refused floor or a different first block, and the rollback goes below the floor. The next run compares again from the restored checkpoint.
+  - The comparison sees only the window. A divergence below the window whose first compared block is still equal is not found.
   - A skipped transaction has no receipt, so its index is not compared by hash. The header of its block still is.
-  - The signal is not durable. A consumer that misses it, or an executor that stops between the park and the publish, leaves stale receipts until they expire.
-  - The executors that read the cluster egress, and the validator, do not compare. They stop with `ClusterBehindCursor` as before.
+  - A checkpoint fetch with no cap can take a diverged checkpoint: the replay-window fallback, a fresh restore with no rollback marker, the adoption of the validator, and the rebuild of the state mirror. An executor serves its checkpoints at and above `d` until its own comparison finds the divergence and removes them.
+  - The validator, and an executor that reads the cluster egress, do not compare. They stop with `ClusterBehindCursor` as before.
 
 **A lying or absent L1 endpoint.**
 

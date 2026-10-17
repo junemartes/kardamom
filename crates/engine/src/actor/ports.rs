@@ -50,17 +50,14 @@ pub trait TxReceiptsPublication: Send {
 
     /// Publish the record that voids the receipts above
     /// `rollback.to_block`, before the first receipt of a run that
-    /// restored an older state. A sink with no consumer of the record, the
-    /// default, has nothing to publish.
+    /// restored an older state. A sink with no consumer of the record
+    /// returns `Ok` at once, and a wrapping sink passes the record on.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the transport rejects or cannot deliver the
     /// record.
-    fn publish_rollback(&mut self, rollback: ReceiptRollback) -> Result<(), ExecutorError> {
-        let _ = rollback;
-        Ok(())
-    }
+    fn publish_rollback(&mut self, rollback: ReceiptRollback) -> Result<(), ExecutorError>;
 
     /// Open the publication again, on a new session, after it stayed
     /// unconnected for one stall budget. The live transport opens a new

@@ -164,6 +164,14 @@ impl ColdAccounts {
         (at.elapsed() <= slot.ttl()).then(|| slot.clone())
     }
 
+    /// Forget every answer. After a rollback, an answer can hold the state
+    /// of a block that the chain lost. The next submit of each cold sender
+    /// asks again.
+    pub(crate) fn clear(&self) {
+        self.map.clear();
+        std::iter::from_fn(|| self.order.pop()).for_each(drop);
+    }
+
     /// Keep the slot of `address`. A full ring retires the oldest
     /// address. A retired address that came again since then loses its
     /// newer slot too, which costs one more query and nothing else.
@@ -225,6 +233,16 @@ mod tests {
         });
         assert!(cold.get(first).is_none(), "the oldest address retires");
         assert_eq!(cold.map.len(), CAPACITY.get());
+    }
+
+    #[test]
+    fn a_clear_forgets_every_answer() {
+        let cold = cold();
+        let address = Address::repeat_byte(0x02);
+        cold.insert(address, Slot::Known(view(5)));
+        cold.clear();
+        assert!(cold.get(address).is_none());
+        assert!(cold.order.is_empty());
     }
 
     /// An answer with no position header, an answer before the first

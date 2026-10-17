@@ -260,3 +260,66 @@ fn buffers_block_until_value_arrives() {
     assert_eq!(got.current[0].value.block_number, 7);
     h.join().unwrap();
 }
+
+/// A receipt at `idx` in `block`.
+fn receipt_in(idx: u64, block: u64, wsh: u8) -> Receipt {
+    Receipt {
+        block_number: block,
+        ..receipt(idx, true, 21_000, wsh)
+    }
+}
+
+/// A rollback of one session withdraws its receipts above the block, and
+/// its rows at the positions of those receipts. The other session, and
+/// the receipts and rows at or below the block, stay.
+#[test]
+fn a_rollback_withdraws_one_session_above_its_block() {
+    let buf = ReceiptBuffer::new();
+    let rows = vec![AccountRow::default()];
+    for (replica, wsh) in [(R1, 0xaa), (R2, 0xbb)] {
+        buf.receipts
+            .insert(BPosition::from_index(4), replica, receipt_in(4, 2, wsh));
+        buf.receipts
+            .insert(BPosition::from_index(5), replica, receipt_in(5, 3, wsh));
+        buf.rows
+            .insert(BPosition::from_index(4), replica, rows.clone());
+        buf.rows
+            .insert(BPosition::from_index(5), replica, rows.clone());
+    }
+
+    buf.roll_back(R1, 2);
+
+    let sessions = |taken: &[Distinct<Receipt>]| -> Vec<ReplicaId> {
+        taken.iter().flat_map(|d| d.replicas.clone()).collect()
+    };
+    let wait = Duration::ZERO;
+    let at4 = buf.receipts.take(BPosition::from_index(4), wait);
+    assert_eq!(sessions(&at4.current), [R1, R2], "block 2 stays");
+    let at5 = buf.receipts.take(BPosition::from_index(5), wait);
+    assert_eq!(
+        sessions(&at5.current),
+        [R2],
+        "R1 is withdrawn above block 2"
+    );
+    let rows4 = buf.rows.take(BPosition::from_index(4), wait);
+    assert_eq!(Distinct::results(&rows4.current), 2);
+    let rows5 = buf.rows.take(BPosition::from_index(5), wait);
+    assert_eq!(rows5.current.len(), 1);
+    assert_eq!(rows5.current[0].replicas, [R2]);
+}
+
+/// A rollback withdraws the BALs of every session above its block: a
+/// BAL names no receipt session.
+#[test]
+fn a_rollback_withdraws_every_bal_above_its_block() {
+    let bals = BalBuffer::new();
+    insert(&bals, R1, 2, 10);
+    insert(&bals, R2, 3, 20);
+    insert(&bals, R1, 3, 30);
+    bals.roll_back(2);
+    assert_eq!(
+        balances(&bals.take(2, Duration::ZERO)),
+        [(U256::from(10u64), vec![R1])]
+    );
+    assert_eq!(bals.len(), 0, "block 3 is withdrawn");
+}

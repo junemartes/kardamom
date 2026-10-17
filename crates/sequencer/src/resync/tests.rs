@@ -1,5 +1,6 @@
 use super::*;
 use alloy_primitives::B256;
+use kardamom_types::ReceiptRollback;
 use std::time::Duration;
 
 fn s(byte: u8) -> Address {
@@ -241,7 +242,7 @@ fn a_receipt_maps_to_its_outcome() {
             FloorUpdate {
                 sender: s(1),
                 outcome,
-                block: Some(0),
+                evidence: Evidence::Receipt { block: 0 },
             }
         );
     }
@@ -405,21 +406,19 @@ fn enter_threshold_rejects_a_product_that_rounds_to_zero() {
 #[test]
 fn a_rollback_forgets_only_the_floors_set_above_its_block() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::executed(s(1), 4).in_block(10).into())
-        .unwrap();
-    tx.send(FloorUpdate::executed(s(2), 7).in_block(5).into())
-        .unwrap();
+    tx.send(receipt_floor(1, 4, 10)).unwrap();
+    tx.send(receipt_floor(2, 7, 5)).unwrap();
     tx.send(FloorUpdate::executed(s(3), 9).into()).unwrap();
-    tx.send(FloorEvent::Rollback { to_block: 5 }).unwrap();
-    tx.send(FloorUpdate::executed(s(1), 2).in_block(6).into())
-        .unwrap();
+    tx.send(rollback(5, 0xA1)).unwrap();
+    tx.send(receipt_floor(1, 2, 6)).unwrap();
 
-    let drain = c.drain_floor_updates();
+    let mut drain = c.drain_floor_updates();
     assert_eq!(drain.raised, vec![(s(1), 5), (s(2), 8), (s(3), 10)]);
-    assert_eq!(drain.forgotten, vec![s(1)]);
+    drain.forgotten.sort_unstable();
+    assert_eq!(drain.forgotten, vec![s(1), s(3)]);
     assert_eq!(c.floor(s(1)), None, "a receipt of block 10 is void");
     assert_eq!(c.floor(s(2)), Some(8), "block 5 stays");
-    assert_eq!(c.floor(s(3)), Some(10), "a lookup answer stays");
+    assert_eq!(c.floor(s(3)), None, "a lookup answer from before is void");
 
     let next = c.drain_floor_updates();
     assert_eq!(next.raised, vec![(s(1), 3)], "the new stream sets it again");
@@ -427,16 +426,92 @@ fn a_rollback_forgets_only_the_floors_set_above_its_block() {
     assert_eq!(c.floor(s(1)), Some(3));
 }
 
+/// The floor event of a receipt of `who` at `nonce` in `block`.
+fn receipt_floor(who: u8, nonce: u64, block: u64) -> FloorEvent {
+    FloorUpdate::executed(s(who), nonce)
+        .with_evidence(Evidence::Receipt { block })
+        .into()
+}
+
+/// The floor event of a lookup answer for `who` at `nonce`, to a request
+/// of `generation`.
+fn lookup_floor(who: u8, nonce: u64, generation: u64) -> FloorEvent {
+    FloorUpdate::executed(s(who), nonce)
+        .with_evidence(Evidence::Lookup { generation })
+        .into()
+}
+
+/// A rollback to `to_block` with the id `id`.
+fn rollback(to_block: u64, id: u8) -> FloorEvent {
+    FloorEvent::Rollback(ReceiptRollback {
+        to_block,
+        id: B256::repeat_byte(id),
+    })
+}
+
+/// An answer to a lookup request from before a rollback can come from a
+/// voided state, so it sets no floor and confirms nothing. An answer to a
+/// later request sets the floor, and the next rollback voids it.
+#[test]
+fn a_lookup_answer_to_a_request_from_before_a_rollback_sets_no_floor() {
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(rollback(5, 0xB1)).unwrap();
+    c.drain_floor_updates();
+    assert_eq!(c.generation(), 1);
+
+    tx.send(lookup_floor(1, 9, 0)).unwrap();
+    let stale = c.drain_floor_updates();
+    assert_eq!(stale, ReceiptDrain::default(), "a stale answer is nothing");
+    assert_eq!(c.floor(s(1)), None);
+
+    tx.send(lookup_floor(1, 9, 1)).unwrap();
+    assert_eq!(c.drain_floor_updates().raised, vec![(s(1), 10)]);
+    tx.send(rollback(8, 0xB2)).unwrap();
+    assert_eq!(c.drain_floor_updates().forgotten, vec![s(1)]);
+    assert_eq!(c.floor(s(1)), None, "a later rollback voids the answer");
+}
+
+/// A copy of an applied rollback comes after the receipts of the new
+/// stream: it keeps their floors. It voids the lookup answers from before
+/// it, because its sender rolled back only now.
+#[test]
+fn a_copy_of_an_applied_rollback_keeps_the_receipt_floors() {
+    let (mut c, tx, _w) = mk(ResyncConfig::default());
+    tx.send(rollback(5, 0xC1)).unwrap();
+    c.drain_floor_updates();
+    tx.send(receipt_floor(1, 4, 8)).unwrap();
+    tx.send(lookup_floor(2, 6, 1)).unwrap();
+    tx.send(rollback(5, 0xC1)).unwrap();
+    let drain = c.drain_floor_updates();
+    assert_eq!(drain.raised, vec![(s(1), 5), (s(2), 7)]);
+    assert_eq!(drain.forgotten, vec![s(2)]);
+    assert_eq!(c.floor(s(1)), Some(5), "the new stream stays");
+    assert_eq!(c.floor(s(2)), None);
+    assert_eq!(c.generation(), 2);
+}
+
 /// A floor that a later receipt raised carries the block of that later
 /// receipt: a rollback between the two blocks forgets it.
 #[test]
 fn a_raised_floor_carries_the_block_of_the_receipt_that_raised_it() {
     let (mut c, tx, _w) = mk(ResyncConfig::default());
-    tx.send(FloorUpdate::executed(s(1), 1).in_block(2).into())
-        .unwrap();
-    tx.send(FloorUpdate::executed(s(1), 3).in_block(8).into())
-        .unwrap();
-    tx.send(FloorEvent::Rollback { to_block: 4 }).unwrap();
+    tx.send(
+        FloorUpdate::executed(s(1), 1)
+            .with_evidence(Evidence::Receipt { block: 2 })
+            .into(),
+    )
+    .unwrap();
+    tx.send(
+        FloorUpdate::executed(s(1), 3)
+            .with_evidence(Evidence::Receipt { block: 8 })
+            .into(),
+    )
+    .unwrap();
+    tx.send(FloorEvent::Rollback(ReceiptRollback {
+        to_block: 4,
+        ..Default::default()
+    }))
+    .unwrap();
     let drain = c.drain_floor_updates();
     assert_eq!(drain.forgotten, vec![s(1)]);
     assert_eq!(c.floor(s(1)), None);

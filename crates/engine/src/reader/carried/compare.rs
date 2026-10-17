@@ -15,16 +15,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, keccak256};
 use kardamom_state::{StateError, StateSnapshot};
 use kardamom_types::{BPosition, BlockBoundaryStart, TxOrderingMessage};
 
 use crate::ExecutorError;
 use crate::reader::Ordered;
 use crate::reader::cluster::{BoundaryMetrics, Reorder, ReplayCursor};
-
-/// The first block that the canonical stream carries. Block 0 is genesis.
-const FIRST_BLOCK: u64 = 1;
 
 /// The committed history that the comparison reads: the headers and the
 /// receipt hashes from the floor up to the delivery cursor.
@@ -58,16 +55,22 @@ impl LocalHistory {
         cursor: (u64, u64),
         window: NonZeroU64,
     ) -> Result<Option<Self>, StateError> {
-        let Some(last) = cursor.1.checked_sub(1).filter(|b| *b >= FIRST_BLOCK) else {
+        // Block 0 is genesis: the stream carries blocks from block 1.
+        let Some(last) = cursor.1.checked_sub(1).and_then(NonZeroU64::new) else {
             return Ok(None);
         };
-        // A window longer than the chain starts at the first block.
-        let floor_block = cursor.1.saturating_sub(window.get()).max(FIRST_BLOCK);
-        let headers = (floor_block..=last)
+        // A window longer than the chain starts at the first block of the
+        // chain: the subtraction saturates to that meaning.
+        let floor_block =
+            NonZeroU64::new(cursor.1.saturating_sub(window.get())).unwrap_or(NonZeroU64::MIN);
+        let headers = (floor_block.get()..=last.get())
             .map(|block| Self::header_of(snapshot, block))
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let floor_index = match floor_block.checked_sub(1).filter(|b| *b >= FIRST_BLOCK) {
-            Some(before) => Self::header_of(snapshot, before)?.1.end_tx_idx.as_index(),
+        let floor_index = match floor_block.get().checked_sub(1).and_then(NonZeroU64::new) {
+            Some(before) => Self::header_of(snapshot, before.get())?
+                .1
+                .end_tx_idx
+                .as_index(),
             None => 0,
         };
         let receipts = snapshot
@@ -79,7 +82,7 @@ impl LocalHistory {
             .map(|(pos, hash)| (pos.as_index(), hash))
             .collect();
         Ok(Some(Self {
-            floor: (floor_index, floor_block),
+            floor: (floor_index, floor_block.get()),
             cursor,
             headers,
             receipts,
@@ -132,6 +135,27 @@ impl LocalHistory {
 pub(crate) struct Divergence {
     pub(crate) block: u64,
     pub(crate) index: u64,
+    /// The fingerprint of the frame of the stream at the divergence: the
+    /// canonical id of an entry, or the hash of a boundary. Every reader of
+    /// one stream gets the same fingerprint.
+    pub(crate) stream: B256,
+}
+
+impl Divergence {
+    /// The divergence at the boundary `b` of the stream.
+    fn at_boundary(b: &BlockBoundaryStart) -> Self {
+        let fields = [
+            b.block_number,
+            b.end_tx_idx.as_index(),
+            b.l2_timestamp,
+            b.l1_origin,
+        ];
+        Self {
+            block: b.block_number,
+            index: b.end_tx_idx.as_index(),
+            stream: keccak256(fields.map(u64::to_be_bytes).concat()),
+        }
+    }
 }
 
 impl From<Divergence> for ExecutorError {
@@ -139,6 +163,7 @@ impl From<Divergence> for ExecutorError {
         Self::StreamDiverged {
             block: d.block,
             index: d.index,
+            stream: d.stream,
         }
     }
 }
@@ -150,10 +175,57 @@ pub(crate) enum Progress {
     Pending,
     /// The stream equals the history up to the delivery cursor.
     Equal,
-    /// The source holds no frame of the window that is left: its floor is
-    /// at or above the delivery cursor. Nothing is compared.
+    /// The source retains no frame below the delivery cursor, so nothing is
+    /// compared. The retained log of a member starts at its snapshot, which
+    /// is on its disk, and the frames below a snapshot survive a power
+    /// loss. So the source holds no lost entry below the cursor.
     Skipped,
+    /// The stream differs from a block that equals the history before it.
     Diverged(Divergence),
+    /// The stream differs at the floor of the window: the first compared
+    /// block, or a floor that the source refuses as no point of its
+    /// stream. The divergence can be below the floor. A wider window can
+    /// find it, unless the floor is the first block of the chain or the
+    /// retention of the source.
+    BelowWindow { floor_block: u64, widen: bool },
+}
+
+impl Progress {
+    /// What the reader does with this progress: wait for more frames
+    /// (`None`), deliver from the cursor (`Some`), or end the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns the divergence that ends the run.
+    pub(crate) fn settle(self) -> Result<Option<Settled>, ExecutorError> {
+        match self {
+            Self::Pending => Ok(None),
+            Self::Equal => Ok(Some(Settled::Equal)),
+            Self::Skipped => Ok(Some(Settled::Skipped)),
+            Self::Diverged(d) => Err(d.into()),
+            Self::BelowWindow { floor_block, widen } => {
+                Err(ExecutorError::DivergedBelowWindow { floor_block, widen })
+            }
+        }
+    }
+}
+
+/// How a comparison that lets the reader deliver ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Settled {
+    Equal,
+    Skipped,
+}
+
+impl Settled {
+    pub(crate) fn log(self) {
+        match self {
+            Self::Equal => tracing::info!("the stream equals the committed history"),
+            Self::Skipped => tracing::warn!(
+                "the source retains no frame of the comparison window; delivering without a comparison"
+            ),
+        }
+    }
 }
 
 /// The comparison of one run of the reader.
@@ -162,12 +234,23 @@ pub(crate) struct Compare {
     /// The cursor and the pending set of the compared frames. It starts at
     /// the floor, and it delivers nothing downstream.
     reorder: Reorder,
+    /// A block of the window compared equal. A difference before it is at
+    /// the floor.
+    equal_block: bool,
+    /// The retention of the source moved the floor up, so a wider window
+    /// finds nothing more.
+    raised: bool,
 }
 
 impl Compare {
     pub(crate) fn new(history: LocalHistory) -> Self {
         let reorder = Self::reorder_at(history.floor);
-        Self { history, reorder }
+        Self {
+            history,
+            reorder,
+            equal_block: false,
+            raised: false,
+        }
     }
 
     fn reorder_at((index, block): (u64, u64)) -> Reorder {
@@ -191,37 +274,44 @@ impl Compare {
     /// stream, so the frames compared on the old one prove nothing.
     pub(crate) fn rewind(&mut self) {
         self.reorder = Self::reorder_at(self.history.floor);
+        self.equal_block = false;
+    }
+
+    /// The progress of a difference at the floor.
+    fn below_window(&self) -> Progress {
+        let floor_block = self.history.floor.1;
+        Progress::BelowWindow {
+            floor_block,
+            widen: !self.raised && floor_block > NonZeroU64::MIN.get(),
+        }
     }
 
     /// The source refused the cursor with its retained floor.
     ///
-    /// - A cursor at or above the retained floor on both axes is a cursor
-    ///   that names no point of the stream of the source: the blocks before
-    ///   it differ. The divergence is at the block before the cursor.
+    /// - A cursor at or above the retained floor on both axes names no
+    ///   point of the stream of the source: the blocks before it differ.
+    ///   The comparison ends below the window.
     /// - A cursor below the retained floor moves up to the first committed
     ///   block that starts at or above the floor.
     pub(crate) fn refused(&mut self, oldest_index: u64, oldest_block: u64) -> Progress {
         let (index, block) = self.cursor();
         if oldest_index <= index && oldest_block <= block {
-            // Block 0 is genesis, which no stream changes.
-            return Progress::Diverged(Divergence {
-                block: block.saturating_sub(1),
-                index,
-            });
+            return self.below_window();
         }
+        // A header is below the cursor block, so the next block fits.
         let raised = self
             .history
             .headers
             .range(block..)
-            .find(|(b, h)| {
-                b.saturating_add(1) >= oldest_block && h.end_tx_idx.as_index() >= oldest_index
-            })
-            .map(|(b, h)| (h.end_tx_idx.as_index(), b.saturating_add(1)))
+            .filter_map(|(b, h)| Some((b.checked_add(1)?, h.end_tx_idx.as_index())))
+            .find(|(next, end)| *next >= oldest_block && *end >= oldest_index)
+            .map(|(next, end)| (end, next))
             .filter(|cursor| cursor.1 < self.history.cursor.1);
         let Some(raised) = raised else {
             return Progress::Skipped;
         };
         self.history.floor = raised;
+        self.raised = true;
         self.rewind();
         Progress::Pending
     }
@@ -250,7 +340,15 @@ impl Compare {
         let Some((pos, item)) = self.reorder.try_deliver()? else {
             return Ok(Some(Progress::Pending));
         };
-        Ok(self.check(pos, &item).map(Progress::Diverged))
+        let progress = match (self.check(pos, &item), self.equal_block) {
+            (None, _) => {
+                self.equal_block |= item.is_boundary();
+                None
+            }
+            (Some(d), true) => Some(Progress::Diverged(d)),
+            (Some(_), false) => Some(self.below_window()),
+        };
+        Ok(progress)
     }
 
     /// The divergence at one delivered frame, if any. A record compares its
@@ -265,13 +363,12 @@ impl Compare {
                 (*local != tx.canonical_id).then(|| Divergence {
                     block: self.reorder.next().1,
                     index,
+                    stream: tx.canonical_id,
                 })
             }
             Ordered::Message(TxOrderingMessage::BoundaryStart(b)) => {
-                (self.history.headers.get(&b.block_number) != Some(b)).then_some(Divergence {
-                    block: b.block_number,
-                    index: b.end_tx_idx.as_index(),
-                })
+                (self.history.headers.get(&b.block_number) != Some(b))
+                    .then(|| Divergence::at_boundary(b))
             }
             Ordered::Message(_) => None,
         }

@@ -548,10 +548,23 @@ pub enum ReceiptFrame {
 }
 
 impl ReceiptFrame {
-    /// The length of a rollback frame. A batch frame holds at least one
-    /// receipt, so it is longer.
+    /// The length of a rollback frame: the archive of the record, with no
+    /// data behind a pointer.
     const ROLLBACK_LEN: usize = std::mem::size_of::<rkyv::Archived<ReceiptRollback>>();
+    /// The length of a batch frame with no receipt. The publisher sends no
+    /// such frame. A batch frame with one receipt is longer than this plus
+    /// one archived receipt.
+    const EMPTY_BATCH_LEN: usize = std::mem::size_of::<rkyv::Archived<ReceiptBatch>>();
+    const ONE_RECEIPT_LEN: usize =
+        Self::EMPTY_BATCH_LEN + std::mem::size_of::<rkyv::Archived<Receipt>>();
+}
 
+// The length tells the kinds apart only while no batch frame has the
+// length of a rollback frame.
+const _: () = assert!(ReceiptFrame::ROLLBACK_LEN != ReceiptFrame::EMPTY_BATCH_LEN);
+const _: () = assert!(ReceiptFrame::ROLLBACK_LEN < ReceiptFrame::ONE_RECEIPT_LEN);
+
+impl ReceiptFrame {
     /// Decode one frame. The length tells the kind. A malformed frame logs
     /// and yields `None`, so the caller tries the next frame instead of
     /// ending the subscription.

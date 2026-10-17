@@ -20,6 +20,7 @@ use kardamom_state::StateSnapshot;
 use kardamom_types::VoidRecord;
 
 use crate::args::Args;
+use crate::marker::RunLedger;
 
 /// `tx_receipts` publication: the receipt stream and the boundary
 /// side-stream, opened through the stream plane. With discovery, this
@@ -32,6 +33,7 @@ pub(crate) async fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
     plane: &mut StreamPlane,
     args: &Args,
+    ledger: RunLedger,
 ) -> Result<LiveTxReceiptsPub> {
     let handle = plane
         .tx_receipts_publisher(rt_pub, args.recorder_id)
@@ -49,6 +51,7 @@ pub(crate) async fn open_tx_receipts_pub(
             .context("the tx_receipts reopen")?,
         rt_pub: rt_pub.clone(),
         tokio: tokio::runtime::Handle::current(),
+        ledger,
     })
 }
 
@@ -167,6 +170,8 @@ pub(crate) struct LiveTxReceiptsPub {
     reopen: TxReceiptsReopen,
     rt_pub: AeronRuntime,
     tokio: tokio::runtime::Handle,
+    /// The blocks of the published receipts, and the rollback marker.
+    ledger: RunLedger,
 }
 
 impl LiveTxReceiptsPub {
@@ -230,7 +235,10 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
             .handle
             .publish_receipts(&kardamom_types::ReceiptBatch::merge(items))
         {
-            Ok(_) => (items.len(), None),
+            Ok(_) => {
+                self.ledger.published(items);
+                (items.len(), None)
+            }
             Err(e) => (0, Some(Self::publish_error("publish_receipts", &e))),
         }
     }
@@ -243,17 +251,21 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
     ) -> Result<(), ExecutorError> {
         self.handle
             .publish_rollback(&rollback)
-            .map(|_| ())
-            .map_err(|e| Self::publish_error("publish_rollback", &e))
+            .map_err(|e| Self::publish_error("publish_rollback", &e))?;
+        self.ledger.rollback_published(rollback);
+        Ok(())
     }
 
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
-            CMessage::Receipt(r) => self
-                .handle
-                .publish_receipt(&r)
-                .map(|_| ())
-                .map_err(|e| Self::publish_error("publish_receipt", &e)),
+            CMessage::Receipt(r) => {
+                let rows = [kardamom_types::ReceiptRows::bare(r)];
+                self.handle
+                    .publish_receipt(&rows[0].receipt)
+                    .map_err(|e| Self::publish_error("publish_receipt", &e))?;
+                self.ledger.published(&rows);
+                Ok(())
+            }
             // Best-effort: a block-boundary marker. Ingress acks on the receipt
             // or durable watermark, not on this marker. Blocking the commit
             // thread here (for example, at startup before ingress's MDS

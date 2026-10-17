@@ -664,11 +664,15 @@ impl Sequencer {
             .resync
             .as_ref()
             .is_some_and(|r| r.floor(sender).is_some());
+        let generation = self
+            .resync
+            .as_ref()
+            .map_or(0, crate::resync::ResyncController::generation);
         let Some(lookup) = self.lookup.as_mut().filter(|_| !floor_known) else {
             return;
         };
         self.hot.lookup_requests.increment(1);
-        lookup.request(sender);
+        lookup.request(crate::lookup::LookupRequest { sender, generation });
     }
 
     /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and

@@ -102,10 +102,7 @@ impl ReceiptFloorFeed {
             to_block = rollback.to_block,
             "an executor rolled back; the floors above the block are void"
         );
-        let event = FloorEvent::Rollback {
-            to_block: rollback.to_block,
-        };
-        match self.floor_tx.send(event) {
+        match self.floor_tx.send(FloorEvent::Rollback(rollback)) {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         }
@@ -169,6 +166,7 @@ impl ReceiptFloorFeed {
 mod tests {
     use alloy_primitives::{Address, U256};
     use kardamom_cache::{LiveAccounts, LiveAccountsConfig};
+    use kardamom_sequencer::resync::Evidence;
     use kardamom_types::{BPosition, Receipt};
 
     use super::*;
@@ -200,7 +198,10 @@ mod tests {
         assert_eq!(feed.forward_batch(batch), ControlFlow::Continue(()));
         assert_eq!(live.get(sender).map(|view| view.nonce), Some(5));
 
-        let rollback = ReceiptRollback { to_block: 7 };
+        let rollback = ReceiptRollback {
+            to_block: 7,
+            ..Default::default()
+        };
         assert_eq!(feed.forward_rollback(rollback), ControlFlow::Continue(()));
         assert!(live.is_empty(), "the rows of the void blocks are gone");
 
@@ -209,9 +210,12 @@ mod tests {
             events,
             vec![
                 FloorUpdate::of_receipt(&receipt).into(),
-                FloorEvent::Rollback { to_block: 7 },
+                FloorEvent::Rollback(rollback),
             ]
         );
-        assert_eq!(FloorUpdate::of_receipt(&receipt).block, Some(9));
+        assert_eq!(
+            FloorUpdate::of_receipt(&receipt).evidence,
+            Evidence::Receipt { block: 9 }
+        );
     }
 }

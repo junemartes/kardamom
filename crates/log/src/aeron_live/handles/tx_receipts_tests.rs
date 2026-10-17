@@ -62,7 +62,10 @@ async fn a_rollback_frame_reads_as_a_rollback_and_batch_readers_skip_it() {
         pending: VecDeque::new(),
     };
     let pos = BPosition::from_index(3);
-    let rollback = ReceiptRollback { to_block: 41 };
+    let rollback = ReceiptRollback {
+        to_block: 41,
+        ..Default::default()
+    };
     let batch = ReceiptBatch {
         receipts: vec![Receipt::default()],
         accounts: Vec::new(),

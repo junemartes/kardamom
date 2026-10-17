@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsReceiver, TypedSubscription};
+use kardamom_log::aeron_live::{AeronRuntime, ReceiptFrame, TxReceiptsReceiver, TypedSubscription};
 use kardamom_log::config::ChannelUri;
 use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{SnapshotReceiver, StateSnapshot};
@@ -249,8 +249,15 @@ impl BalPump {
 /// to see the runtime shut down.
 pub(crate) struct ReceiptsPump {
     rx: TxReceiptsReceiver,
-    receipts: Arc<ReceiptBuffer>,
+    sinks: ReceiptsSinks,
     shutdown: CancellationToken,
+}
+
+/// The buffers that the receipts pump fills, and withdraws from when an
+/// executor rolls back.
+pub(crate) struct ReceiptsSinks {
+    pub(crate) receipts: Arc<ReceiptBuffer>,
+    pub(crate) bals: Arc<BalBuffer>,
 }
 
 impl ReceiptsPump {
@@ -263,7 +270,7 @@ impl ReceiptsPump {
         rt: &AeronRuntime,
         plane: &mut StreamPlane,
         executor_count_flag: Option<u32>,
-        receipts: Arc<ReceiptBuffer>,
+        sinks: ReceiptsSinks,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         // The flag, parsed to `NonZeroU32` (an explicit 0 is the same
@@ -280,7 +287,7 @@ impl ReceiptsPump {
             .into_receiver();
         Ok(Self {
             rx,
-            receipts,
+            sinks,
             shutdown,
         })
     }
@@ -302,14 +309,24 @@ impl ReceiptsPump {
         let next = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => return None,
-            r = self.rx.recv_batch() => r,
+            r = self.rx.recv_frame() => r,
         };
-        let (session, batch) = next?;
+        let (session, frame) = next?;
         let replica = ReplicaId::from_session(session);
+        match frame {
+            ReceiptFrame::Batch(batch) => self.sinks.batch(replica, batch),
+            ReceiptFrame::Rollback(rollback) => self.sinks.roll_back(replica, rollback),
+        }
+        Some(())
+    }
+}
+
+impl ReceiptsSinks {
+    /// Buffer one batch of `replica`. The rows go first, so the commit
+    /// thread finds them whenever it finds the batch's end receipt.
+    fn batch(&self, replica: ReplicaId, batch: kardamom_types::ReceiptBatch) {
         let end = batch.end_tx_idx();
         let kardamom_types::ReceiptBatch { receipts, accounts } = batch;
-        // Rows first, so the commit thread finds them whenever it finds
-        // the batch's end receipt.
         if let Some(end) = end
             && !accounts.is_empty()
         {
@@ -318,7 +335,20 @@ impl ReceiptsPump {
         for r in receipts {
             self.receipts.receipts.insert(r.tx_idx, replica, r);
         }
-        Some(())
+    }
+
+    /// `replica` rolled its state back to `rollback.to_block`. Its
+    /// buffered results above the block can be gone from the chain, and
+    /// it publishes them again from the new stream. Withdraw them, so an
+    /// old result does not meet the local result as a divergence.
+    fn roll_back(&self, replica: ReplicaId, rollback: kardamom_types::ReceiptRollback) {
+        tracing::warn!(
+            session = replica.session(),
+            to_block = rollback.to_block,
+            "an executor rolled back: withdrawing its buffered results above the block"
+        );
+        self.receipts.roll_back(replica, rollback.to_block);
+        self.bals.roll_back(rollback.to_block);
     }
 }
 

@@ -20,6 +20,11 @@ pub(crate) struct PreparedState {
     /// and exec threads seed their absolute counters from it (see
     /// `ResumePoint`).
     pub(crate) start: ResumePoint,
+    /// The periodic checkpoint task, when one runs. It ends on the
+    /// shutdown token, and the process joins it before a repair: a late
+    /// round could otherwise publish a checkpoint of a diverged state, or
+    /// prune the checkpoint that a rollback chose.
+    pub(crate) checkpointer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PreparedState {
@@ -62,7 +67,7 @@ pub(crate) fn prepare_state(
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
 
-    spawn_checkpointer(args, &env, shutdown);
+    let checkpointer = spawn_checkpointer(args, &env, shutdown);
 
     // Crash-recovery cursor. A non-genesis cursor means the node restarted
     // mid-chain. A fresh start is just a resume from the genesis cursor.
@@ -75,7 +80,11 @@ pub(crate) fn prepare_state(
         );
     }
 
-    Ok(PreparedState { env, start })
+    Ok(PreparedState {
+        env,
+        start,
+        checkpointer,
+    })
 }
 
 /// Restores from a checkpoint, but only on a fresh state dir. A non-fresh
@@ -127,11 +136,15 @@ fn log_restore_outcome(ckpt_dir: &std::path::Path, restored: Option<(u64, std::p
 /// Start periodic checkpointing, if the args ask for it. It gives fast
 /// recovery for other nodes, and for this node after a future wipe. Call
 /// this inside a tokio runtime.
-fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
+fn spawn_checkpointer(
+    args: &Args,
+    env: &StateEnv,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let (Some(ckpt_dir), Some(interval_secs)) =
         (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
     else {
-        return;
+        return None;
     };
     let round = CheckpointRound {
         env: env.clone(),
@@ -139,7 +152,7 @@ fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) 
         keep: args.checkpoint_keep.get(),
     };
     let interval = std::time::Duration::from_secs(interval_secs.get());
-    Checkpointer::new(round, interval, shutdown).spawn();
+    Some(Checkpointer::new(round, interval, shutdown).spawn())
 }
 
 /// One checkpoint round's fixed inputs: the state env, the checkpoint
@@ -198,8 +211,8 @@ impl Checkpointer {
     }
 
     /// Start the interval task. It stops when `shutdown` is cancelled.
-    fn spawn(self) {
-        tokio::spawn(self.run());
+    fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run())
     }
 
     /// The interval loop. The first tick fires immediately and is

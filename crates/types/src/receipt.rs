@@ -93,22 +93,31 @@ impl ReceiptBatch {
 
 /// The `tx_receipts` record that voids the receipts above `to_block`.
 ///
-/// An executor publishes it on the receipt stream after it restores a
-/// checkpoint below a divergence of the canonical stream, and before its
-/// first new receipt. The blocks up to `to_block` are equal on the old and
-/// the new stream, so their receipts stay valid. A receipt of a higher
-/// block can be gone, or can come again with another block, index, or
-/// status.
+/// An executor publishes it on the receipt stream before its first new
+/// receipt, when receipts that it published can be gone from the chain:
+/// after it restores a checkpoint below a divergence of the canonical
+/// stream, and when it starts again from its state DB after it published
+/// receipts above its last committed block. The blocks up to `to_block`
+/// stay valid. A receipt of a higher block can be gone, or can come again
+/// with another block, index, or status.
 ///
-/// The frame is the 8-byte archive of this record. A [`ReceiptBatch`] frame
-/// always holds at least one receipt, so it is longer. A reader tells the
-/// two kinds apart by the frame length. A reader of an older build fails
-/// to decode this frame as a batch and skips it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+/// `id` names the event. Every executor that finds one divergence names it
+/// with the same `id`, and a republished record keeps its `id`. A consumer
+/// acts on each `id` once, so a late copy does not clear the receipts of
+/// the new stream again.
+///
+/// The frame is the archive of this record, 40 bytes. A [`ReceiptBatch`]
+/// frame is 16 bytes with no receipt, and longer than 256 bytes with one,
+/// so a reader tells the kinds apart by the frame length. A reader of an
+/// older build fails to decode this frame as a batch and skips it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct ReceiptRollback {
     /// The last block whose receipts stay valid.
     pub to_block: u64,
+    /// The identity of the rollback event.
+    #[rkyv(with = wire::B256Bytes)]
+    pub id: B256,
 }
 
 /// EIP-2718 type byte for a legacy (untyped, RLP-list) transaction.

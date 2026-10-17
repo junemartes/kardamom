@@ -36,7 +36,9 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use alloy_primitives::Address;
+use kardamom_cache::AppliedRollbacks;
 use kardamom_cluster_adapter::wire::{NonceRelease, RELEASE_DECISION_VERSION};
+use kardamom_types::ReceiptRollback;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -45,7 +47,7 @@ mod answers;
 mod floor;
 
 pub use answers::{AnswerDrain, SealerAnswer, SealerRefusal};
-pub use floor::{FloorEvent, FloorUpdate, Outcome};
+pub use floor::{Evidence, FloorEvent, FloorUpdate, Outcome};
 
 /// Milliseconds since `since`, saturated to `u64::MAX`. An elapsed time
 /// this large never happens in practice, and saturating keeps a
@@ -281,6 +283,13 @@ pub struct ResyncController {
     partition: u32,
     active: bool,
     floors: HashMap<Address, Floor>,
+    /// The rollback events this controller saw, copies included. A lookup
+    /// request carries it, so an answer to a request from before the
+    /// latest rollback counts for nothing.
+    generation: u64,
+    /// The rollback ids applied. A copy of an applied rollback voids only
+    /// the lookup answers.
+    rollbacks: AppliedRollbacks,
     floor_rx: Receiver<FloorEvent>,
     /// The drain sets this when it sees `Disconnected`. It logs the event
     /// once. It does not treat the channel as "empty forever".
@@ -316,20 +325,31 @@ const FLOOR_DRAIN_PER_ITER: usize = 1024;
 /// The warning of a dead floor channel.
 const FLOOR_RX_DEAD: &str = "floor-update producer disconnected; resync floors are frozen";
 
-/// The executed-truth floor of one sender, and the block of the receipt
-/// that set it.
+/// The executed-truth floor of one sender, and the evidence that set it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Floor {
     nonce: u64,
-    /// `None` when a lookup answer set the floor.
-    block: Option<u64>,
+    evidence: Evidence,
+}
+
+/// What one rollback event voids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cut {
+    /// The last valid block of a new rollback. `None` for a copy of an
+    /// applied one: the receipts after the first copy are valid.
+    to_block: Option<u64>,
+    /// The generation after the event. Every lookup answer of an older
+    /// generation is void.
+    generation: u64,
 }
 
 impl Floor {
-    /// Whether a rollback to `to_block` voids the receipt that set this
-    /// floor.
-    fn voided_by(self, to_block: u64) -> bool {
-        self.block.is_some_and(|block| block > to_block)
+    /// Whether `cut` voids the evidence that set this floor.
+    fn voided_by(self, cut: Cut) -> bool {
+        match self.evidence {
+            Evidence::Receipt { block } => cut.to_block.is_some_and(|to_block| block > to_block),
+            Evidence::Lookup { generation } => generation < cut.generation,
+        }
     }
 }
 
@@ -426,6 +446,8 @@ impl ResyncController {
             partition,
             active: false,
             floors: HashMap::new(),
+            generation: 0,
+            rollbacks: AppliedRollbacks::default(),
             floor_rx,
             floor_rx_dead: false,
             answer_rx,
@@ -453,6 +475,12 @@ impl ResyncController {
     #[must_use]
     pub fn sealer_takes_releases(&self) -> bool {
         self.watermark.sealer_takes_releases()
+    }
+
+    /// The rollback events seen so far. A lookup request carries it.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[must_use]
@@ -491,7 +519,7 @@ impl ResyncController {
                 .into_iter()
                 .fold(ReceiptDrain::default(), |drain, event| match event {
                     FloorEvent::Update(u) => self.fold_floor_update(drain, u),
-                    FloorEvent::Rollback { to_block } => self.forget_above(drain, to_block),
+                    FloorEvent::Rollback(rollback) => self.roll_back(drain, &rollback),
                 });
         if !drain.raised.is_empty() || !drain.forgotten.is_empty() {
             metrics::record_floor_senders(self.partition, self.floors.len());
@@ -503,36 +531,65 @@ impl ResyncController {
     /// rollback, so the updates after it go into the next drain, after the
     /// lists of this one apply.
     fn take_floor_events(&mut self) -> Vec<FloorEvent> {
-        let (rx, dead, partition) = (&self.floor_rx, &mut self.floor_rx_dead, self.partition);
-        let mut ended = false;
-        std::iter::from_fn(|| {
-            if ended {
-                return None;
-            }
-            let event = drain_bounded_step(rx, dead, partition, FLOOR_RX_DEAD).continue_value()?;
-            ended = matches!(event, FloorEvent::Rollback { .. });
-            Some(event)
-        })
-        .take(FLOOR_DRAIN_PER_ITER)
-        .collect()
+        let mut events = Vec::new();
+        while events.len() < FLOOR_DRAIN_PER_ITER
+            && self.take_floor_event(&mut events).is_continue()
+        {}
+        events
     }
 
-    /// Forget each floor that a receipt above `to_block` set. Such a
-    /// receipt can be gone from the chain, so its floor can be above the
-    /// chain. A floor that is too high makes the sequencer skip a publish
-    /// that the chain needs. An unknown floor only costs a lookup.
-    fn forget_above(&mut self, mut drain: ReceiptDrain, to_block: u64) -> ReceiptDrain {
+    /// Take one floor event into `events`. `Break` when the channel is
+    /// empty, or when the event is a rollback: the drain ends after it.
+    fn take_floor_event(&mut self, events: &mut Vec<FloorEvent>) -> ControlFlow<()> {
+        let ControlFlow::Continue(event) = drain_bounded_step(
+            &self.floor_rx,
+            &mut self.floor_rx_dead,
+            self.partition,
+            FLOOR_RX_DEAD,
+        ) else {
+            return ControlFlow::Break(());
+        };
+        let ended = matches!(event, FloorEvent::Rollback(_));
+        events.push(event);
+        if ended {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// Forget each floor that the rollback voids. A receipt above
+    /// `to_block` can be gone from the chain, so its floor can be above
+    /// the chain. A lookup answer can come from a source that held such a
+    /// receipt. A floor that is too high makes the sequencer skip a
+    /// publish that the chain needs. An unknown floor only costs a lookup.
+    ///
+    /// A copy of an applied rollback comes after receipts of the new
+    /// stream, so it keeps the receipt floors. It still voids the lookup
+    /// answers: the executor that sends the copy rolled back only now, so
+    /// an answer from it before the copy can be void.
+    fn roll_back(&mut self, mut drain: ReceiptDrain, rollback: &ReceiptRollback) -> ReceiptDrain {
+        // A count of rollback events never reaches the end of u64.
+        self.generation = self.generation.saturating_add(1);
+        let cut = Cut {
+            to_block: self
+                .rollbacks
+                .first_time(rollback)
+                .then_some(rollback.to_block),
+            generation: self.generation,
+        };
         let before = drain.forgotten.len();
         drain.forgotten.extend(
             self.floors
-                .extract_if(|_, floor| floor.voided_by(to_block))
+                .extract_if(|_, floor| floor.voided_by(cut))
                 .map(|(sender, _)| sender),
         );
         tracing::info!(
             partition = self.partition,
-            to_block,
+            to_block = rollback.to_block,
+            copy = cut.to_block.is_none(),
             forgotten = drain.forgotten.len().saturating_sub(before),
-            "sequencer ROLLBACK: floors above the block are unknown again"
+            "sequencer ROLLBACK: the voided floors are unknown again"
         );
         drain
     }
@@ -541,7 +598,9 @@ impl ResyncController {
     /// [`Self::drain_floor_updates`]. See [`Outcome`] for what each case
     /// proves.
     fn fold_floor_update(&mut self, mut drain: ReceiptDrain, u: FloorUpdate) -> ReceiptDrain {
-        let Some(nonce) = u.outcome.confirmed() else {
+        let stale =
+            matches!(u.evidence, Evidence::Lookup { generation } if generation < self.generation);
+        let Some(nonce) = u.outcome.confirmed().filter(|_| !stale) else {
             return drain;
         };
         drain.confirmations.push((u.sender, nonce));
@@ -557,12 +616,12 @@ impl ResyncController {
         };
         let e = self.floors.entry(u.sender).or_insert(Floor {
             nonce: 0,
-            block: u.block,
+            evidence: u.evidence,
         });
         if floor > e.nonce {
             *e = Floor {
                 nonce: floor,
-                block: u.block,
+                evidence: u.evidence,
             };
             drain.raised.push((u.sender, floor));
         }

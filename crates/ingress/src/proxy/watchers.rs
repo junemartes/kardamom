@@ -6,14 +6,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
-use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxError};
+use kardamom_types::{
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError,
+};
 
 use crate::channels::{IngressPublication, IngressSubscription, ReceiptItem};
+use crate::cold_accounts::ColdAccounts;
 use crate::fee_history::FeeHistory;
 use crate::pending::PendingReceipts;
 use crate::receipt_cache::ReceiptCache;
+use crate::rollback_log::RollbackLog;
 use crate::seen_receipts::SeenReceipts;
 use crate::tx_error_dedup::TxErrorDedup;
 
@@ -44,7 +48,9 @@ where
         .spawn();
     }
 
-    pub(super) fn spawn_tx_receipts_watcher(&self) {
+    /// Spawn the receipt watcher. It owns `applied`, the log of the
+    /// rollbacks that it applied.
+    pub(super) fn spawn_tx_receipts_watcher(&self, applied: watch::Sender<RollbackLog>) {
         BroadcastWatcher::new(
             self.subscription.subscribe_receipts(),
             TxReceiptsWatcher {
@@ -55,6 +61,9 @@ where
                 feed: self.receipt_feed.clone(),
                 fee_history: self.fee_history.clone(),
                 latest: self.latest_block_number.clone(),
+                cold: self.cold.clone(),
+                rollbacks: self.subscription.rollbacks(),
+                applied,
             },
         )
         .spawn();
@@ -178,6 +187,10 @@ impl Watch<TxError> for TxErrorsWatcher {
 /// redundant work. It is a no-op on the single-executor IPC path. Only
 /// this task ever touches `seen`, so it owns the set by value, with no
 /// `Arc` or lock.
+///
+/// A rollback applies once for each event. It comes on the bus in stream
+/// order. When the bus drops items, the watcher reads the rollbacks that it
+/// missed from the rollback log of the subscription.
 struct TxReceiptsWatcher {
     pending: Arc<PendingReceipts>,
     cache: Arc<ReceiptCache>,
@@ -187,6 +200,13 @@ struct TxReceiptsWatcher {
     fee_history: Arc<FeeHistory>,
     /// The head that `eth_blockNumber` reads. A rollback lowers it.
     latest: Arc<AtomicU64>,
+    /// The executor answers of the cold senders. A rollback empties them.
+    cold: Arc<ColdAccounts>,
+    /// The recent rollbacks of the subscription, for a gap on the bus.
+    rollbacks: watch::Receiver<RollbackLog>,
+    /// The rollbacks that this watcher applied. The receipt subscriptions
+    /// read it.
+    applied: watch::Sender<RollbackLog>,
 }
 
 impl TxReceiptsWatcher {
@@ -194,7 +214,7 @@ impl TxReceiptsWatcher {
         // First-wins: `insert` returns false if the hash was already
         // present. That means this is a duplicate replica copy, so drop
         // it.
-        if !self.seen.insert(receipt.tx_hash) {
+        if !self.seen.insert(receipt.tx_hash, receipt.block_number) {
             metrics::counter!(crate::metrics::RECEIPT_DUPLICATE_TOTAL).increment(1);
             return;
         }
@@ -214,19 +234,28 @@ impl TxReceiptsWatcher {
     }
 
     /// An executor voided the receipts above `to_block`. Drop them from
-    /// the cache, the fee history and the head. Forget the seen hashes, so
-    /// a transaction that comes again with its old hash passes. The feed
+    /// the cache, the fee history and the head, and forget their seen
+    /// hashes, so a transaction that comes again with its old hash passes.
+    /// Forget the cold answers too: one can hold a lost state. The feed
     /// carries the rollback on, and each receipt subscription ends on it.
-    fn on_rollback(&mut self, rollback: kardamom_types::ReceiptRollback) {
+    /// A rollback of an event that this watcher applied already is a late
+    /// copy: it changes nothing, so the receipts of the new stream stay.
+    fn on_rollback(&mut self, rollback: ReceiptRollback) {
+        if !self.applied.send_if_modified(|log| log.push(rollback)) {
+            tracing::debug!(to_block = rollback.to_block, id = %rollback.id, "a rollback applied already");
+            return;
+        }
         let to_block = rollback.to_block;
         tracing::warn!(
             to_block,
+            id = %rollback.id,
             "an executor rolled back: dropping the receipts above the block"
         );
         self.cache.roll_back(to_block);
-        self.seen.clear();
+        self.seen.forget_above(to_block);
         self.fee_history.roll_back(to_block);
         self.latest.fetch_min(to_block, Ordering::AcqRel);
+        self.cold.clear();
         let _ = self.feed.send(ReceiptItem::Rollback(rollback));
     }
 }
@@ -236,6 +265,21 @@ impl Watch<ReceiptItem> for TxReceiptsWatcher {
         match item {
             ReceiptItem::Receipt(receipt) => self.on_receipt(receipt).await,
             ReceiptItem::Rollback(rollback) => self.on_rollback(rollback),
+        }
+    }
+
+    /// The bus dropped items, and a rollback can be among them. Apply each
+    /// recent rollback of the log: the ones that this watcher applied
+    /// already change nothing.
+    fn on_lagged(&mut self) {
+        let recent: Vec<ReceiptRollback> = self
+            .rollbacks
+            .borrow_and_update()
+            .since(0)
+            .copied()
+            .collect();
+        for rollback in recent {
+            self.on_rollback(rollback);
         }
     }
 }

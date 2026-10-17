@@ -78,10 +78,26 @@ pub enum ExecutorError {
     /// consumer. `block` and `index` name the first difference: the
     /// divergence point. Every block below `block` is equal on both sides,
     /// so a checkpoint below `block` is a valid restart point.
+    /// `stream` is the fingerprint of the frame of the stream at the
+    /// divergence, the same for every consumer of that stream.
     #[error(
         "the canonical stream diverges from the committed history at block {block} (index {index})"
     )]
-    StreamDiverged { block: u64, index: u64 },
+    StreamDiverged {
+        block: u64,
+        index: u64,
+        stream: B256,
+    },
+
+    /// The canonical stream differs from the committed history at the
+    /// floor of the compared window, so the divergence can be below the
+    /// window. With `widen`, a wider window can find it. Without it, the
+    /// floor is the first block of the chain or the retention of the
+    /// source, and the operator restores the consumer.
+    #[error(
+        "the canonical stream diverges from the committed history at or below block {floor_block}, the floor of the compared window (a wider window can find it: {widen})"
+    )]
+    DivergedBelowWindow { floor_block: u64, widen: bool },
 
     /// The source of the canonical stream has a new connection, or its head
     /// went below the delivery cursor, while this consumer has entries in

@@ -22,7 +22,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use crate::channels::{IngressPublication, IngressSubscription, ProxyBackend};
 use crate::error::IngressError;
 use crate::proxy::{AccountField, IngressProxy};
-use crate::receipt_subscription::{ReceiptSubscription, SenderFilter};
+use crate::receipt_subscription::{Feeds, ReceiptSubscription, SenderFilter};
 
 tokio::task_local! {
     /// Set by the HTTP middleware for the lifetime of each request.
@@ -277,10 +277,13 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
     ) -> SubscriptionResult {
         // This taps the feeds before accepting, so nothing published in
         // between is missed.
-        let receipts = self.proxy.subscribe_receipt_feed();
-        let errors = self.proxy.subscribe_tx_error_feed();
+        let feeds = Feeds {
+            receipts: self.proxy.subscribe_receipt_feed(),
+            rollbacks: self.proxy.subscribe_rollbacks(),
+            errors: self.proxy.subscribe_tx_error_feed(),
+        };
         let sink = pending.accept().await?;
-        ReceiptSubscription::new(receipts, errors, SenderFilter::new(senders), sink)
+        ReceiptSubscription::new(feeds, SenderFilter::new(senders), sink)
             .run()
             .await?;
         Ok(())
