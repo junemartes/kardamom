@@ -141,6 +141,22 @@ final class DurableSync implements AutoCloseable {
         void force(FileChannel channel, boolean metadata) throws IOException;
     }
 
+    /**
+     * What a force writes back.
+     *
+     * <p>{@link #DATA} is {@code fdatasync}: the data, and only the
+     * metadata that a read of the data needs. The archive creates each
+     * segment file at its full length, so an append never changes the
+     * size. The force still writes the block allocation of a range that
+     * the append filled, but it skips the times of the file. The log
+     * segments take this path.</p>
+     *
+     * <p>{@link #DATA_AND_METADATA} is {@code fsync}. The catalog, the
+     * recording log and the snapshot recordings take it: they are small,
+     * and a restart reads them before it reads the log.</p>
+     */
+    enum Sync { DATA, DATA_AND_METADATA }
+
     /** A force that failed: the disk did not take a write. */
     private static final class ForceFailed extends RuntimeException {
         ForceFailed(final IOException cause) {
@@ -280,8 +296,8 @@ final class DurableSync implements AutoCloseable {
         if (seen.isPresent()) {
             forceSnapshots(seen.get());
         }
-        force(dirs.archive().resolve(CATALOG));
-        force(dirs.cluster().resolve(RecordingLog.RECORDING_LOG_FILE_NAME));
+        force(dirs.archive().resolve(CATALOG), Sync.DATA_AND_METADATA);
+        force(dirs.cluster().resolve(RecordingLog.RECORDING_LOG_FILE_NAME), Sync.DATA_AND_METADATA);
         final Optional<View> after = view.get();
         if (after.isPresent()) {
             forceSnapshots(after.get());
@@ -301,7 +317,7 @@ final class DurableSync implements AutoCloseable {
     private void forceSnapshots(final View seen) throws IOException {
         final List<Long> fresh = seen.snapshots().stream().filter(id -> !forcedSnapshots.contains(id)).toList();
         for (final Path segment : segments(Set.copyOf(fresh))) {
-            force(segment);
+            force(segment, Sync.DATA_AND_METADATA);
         }
         forcedSnapshots.addAll(fresh);
     }
@@ -313,7 +329,7 @@ final class DurableSync implements AutoCloseable {
         }
         final TreeMap<Long, Path> segments = logSegments();
         for (final Path segment : segments.tailMap(forcedBase, true).values()) {
-            force(segment);
+            force(segment, Sync.DATA);
         }
         seen.position().ifPresent(position -> Optional.ofNullable(segments.floorKey(position))
             .ifPresent(base -> forcedBase = base));
@@ -345,10 +361,10 @@ final class DurableSync implements AutoCloseable {
         }
     }
 
-    /** Force the data of one file. A file that the purge removed has nothing to force. */
-    private void force(final Path path) throws IOException {
+    /** Force one file with {@code sync}. A file that the purge removed has nothing to force. */
+    private void force(final Path path, final Sync sync) throws IOException {
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
-            forceOpen(channel, false);
+            forceOpen(channel, sync == Sync.DATA_AND_METADATA);
         } catch (final NoSuchFileException e) {
             // The purge removed the file between the listing and the open.
         }

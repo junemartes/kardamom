@@ -526,8 +526,10 @@ The archive and the consensus module run at `fileSyncLevel` 0, so a commit waits
   1. reads the position of the log recording from the archive counter in shared memory;
   2. forces the segment files of each snapshot recording that the recording log names and no earlier round forced;
   3. forces the archive catalog and the recording log, and then the snapshot recordings that the recording log named in the meantime;
-  4. forces the log segment files from the segment of the last synced position up, and the archive directory;
+  4. forces the log segment files from the segment of the last synced position up, and then the archive directory;
   5. publishes the position from step 1 as the synced position.
+- The log segment files take `fdatasync` (`FileChannel.force(false)`). The archive creates each segment file at its full length (`setLength`), so an append never changes the size. The force still writes the block allocation of the range that an append filled: the file is sparse. It skips the times of the file.
+- The catalog, the recording log, the snapshot recordings and the archive directory take `fsync` (`FileChannel.force(true)`). They are small, and a restart reads them before the log. The directory sync makes the name of a new segment file durable.
 - The thread opens its own file channels. Linux keeps the dirty pages in the page cache of the inode, and a force through any descriptor writes them back. So the force covers the pages that the archive wrote through its own channel. The archive moves the position counter only after its write returns.
 - The thread never waits on the service thread, the consensus module or the archive conductor.
 - The admin endpoint reports, on `/status` and `/metrics`:

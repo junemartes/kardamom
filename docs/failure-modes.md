@@ -404,7 +404,7 @@ The kill-based cases prove the restart logic. They do not prove durability again
   - Aeron has no time-based sync.
 - One thread of each member syncs the log on a schedule (`kardamom.cluster.durableSyncMs`, default 1000, 0 turns it off). Each round:
   - reads the log position from the archive counter;
-  - forces the new snapshot recordings, the archive catalog, the recording log, and the log segment files from the last synced segment up;
+  - forces the new snapshot recordings, the archive catalog and the recording log with `fsync`, and the log segment files from the last synced segment up with `fdatasync`, and then the archive directory;
   - then publishes the position that it read as the synced position.
 - The admin endpoint reports three positions on `/status` and `/metrics`:
   - `syncedPosition` (`kardamom_sealer_synced_position`): every log byte below it is on the disk of the member.
