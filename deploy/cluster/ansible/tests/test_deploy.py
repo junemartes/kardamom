@@ -1093,6 +1093,20 @@ class RecordTest(Deploys):
         calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
         self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
 
+    def test_a_retired_unshared_format_rolls(self):
+        self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1, 'shared': False}])
+        output = self.run_deploy()
+        self.assertIn('The release retires notifier-outbox.', output)
+        self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
+        self.assertEqual(self.record()['accepted']['floor'], {})
+
+    def test_a_retired_shared_format_refuses_the_rolling_path(self):
+        self.gate_formats([{'rule': 'retired', 'id': 'aeron-stream-records', 'head': 1, 'base': 1, 'shared': True},
+                           {'rule': 'retired', 'id': 'old-spool', 'head': 2, 'base': 2}])
+        output = self.run_deploy(success=False)
+        self.assertIn('coordinated format change: aeron-stream-records, old-spool.', output)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_a_one_way_format_change_needs_the_allowance(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
         output = self.run_deploy(success=False)

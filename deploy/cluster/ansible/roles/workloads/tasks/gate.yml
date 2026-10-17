@@ -250,12 +250,28 @@
   check_mode: false
   when: workloads_gate_has_base | bool
 
+# A retired format that is not shared rolls: only the service that wrote
+# it reads it, so a mixed fleet and a rollback each read their own file. A
+# finding without the `shared` field stays coordinated.
 - name: Sort the format findings
   ansible.builtin.set_fact:
     workloads_one_way: "{{ workloads_gate_findings | selectattr('rule', 'equalto', 'rollback') | list }}"
-    workloads_coordinated: "{{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback') | list }}"
+    workloads_retired_unshared: "{{ workloads_gate_retired_unshared }}"
+    workloads_coordinated: >-
+      {{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback')
+         | reject('in', workloads_gate_retired_unshared) | list }}
   vars:
     workloads_gate_findings: "{{ workloads_gate_formats.stdout | from_json if workloads_gate_has_base | bool else [] }}"
+    workloads_gate_retired_unshared: >-
+      {{ workloads_gate_findings | selectattr('rule', 'equalto', 'retired')
+         | selectattr('shared', 'defined') | rejectattr('shared') | list }}
+
+- name: Report the retired formats that roll
+  ansible.builtin.debug:
+    msg: >-
+      The release retires {{ workloads_retired_unshared | map(attribute='id') | join(', ') }}. No other service
+      reads these formats, so the rolling deploy carries the change.
+  when: workloads_retired_unshared | length > 0
 
 - name: Refuse a coordinated format change in the rolling path
   ansible.builtin.assert:

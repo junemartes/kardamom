@@ -136,6 +136,14 @@ finding at deploy time, because the waiver was given against a pull
 request base, not against the release that runs. The gate rules are in
 "The release gate" of `deploy/cluster/README.md`.
 
+Each finding carries the `shared` flag of the format. The gate treats a
+`rollback` finding as one-way. It treats a `rolling` or `mixed_fleet`
+finding, and a `retired` finding of a shared format, as coordinated. A
+retired format that is not shared passes the rolling deploy: only the
+service that wrote it reads it, so a mixed fleet and a rollback each read
+their own file. The pull request check still needs the `[retired.<id>]`
+waiver.
+
 ## Rules for a format change
 
 1. Add a field only at the tail. Make the reader accept a record that is longer than it knows.
