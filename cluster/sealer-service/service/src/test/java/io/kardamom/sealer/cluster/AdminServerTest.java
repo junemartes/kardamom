@@ -100,7 +100,7 @@ final class AdminServerTest {
         final MemberStatus unknown = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, OptionalLong.empty());
         assertEquals(200, serve(() -> unknown, "/ready").statusCode());
         assertTrue(serve(() -> unknown, "/status").body().contains("\"diskFreeBytes\":null"));
-        assertTrue(serve(() -> unknown, "/metrics").body().endsWith("} NaN\n"));
+        assertTrue(serve(() -> unknown, "/metrics").body().contains("kardamom_sealer_disk_free_bytes{member_id=\"0\"} NaN\n"));
     }
 
     @Test

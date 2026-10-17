@@ -377,6 +377,7 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 | `kardamom.cluster.joinWatchdogS` | `60` | no | The member exits with code 3 if its election stays in `INIT` for this long. It exits with code 6 when the completion of its leader election failed: the control toggle is active, but the election state is not `CLOSED`, for longer than the archive message timeout plus the driver timeout. It exits with code 7 or 8 when an election stalls for the stall limit (see [Election stalls](#election-stalls)). `0` turns the join watchdog off, and with it the exit on a closed component and the stall rules. |
 | `kardamom.cluster.catchupStallS` | `300` | no | A member that tried a catch-up, and makes no progress for this long, drops its recording log and exits with code 4, unless every peer answers with an open election. The relaunch seeds the member from a peer. `0` turns the seed off: the member then never drops its log. |
 | `kardamom.cluster.fileSyncLevel` | `0` | no | The sync level of the Raft log and the archive. Values: `0`, `1`, `2`. Any other value stops the start. |
+| `kardamom.cluster.durableSyncMs` | `1000` | no | The interval of the disk sync of the Raft log, in milliseconds. `0` turns it off. A negative value or other text stops the start. |
 | `kardamom.cluster.bootstrap` | off | no | `true` starts a blank member at log position 0. The file `bootstrap` in `$NOMAD_TASK_DIR` has the same effect. See [Start modes](#start-modes). |
 | `kardamom.cluster.seedSnapshot` | none | yes, on a new seeded cluster | The path of the seed file. A cluster with no snapshot starts after the head of the seed, not at genesis. See [Seeded start](#seeded-start). |
 
@@ -386,8 +387,16 @@ The service reads these JVM system properties. The deploy passes them in `JAVA_T
 - `voidVoters`: the deploy sets the list to `0` to `executor_count + 1`. Executor `i` has voter id `i`. The validator has `executor_count`. The batcher has `executor_count + 1`.
 - `remoteOrigins`, `voidVoters` and `voidWindow` are not in the snapshot. A different value on one member makes it decide differently from the others.
 - `fileSyncLevel`: `0` leaves a write in the page cache. `1` syncs the data of each write batch. `2` syncs the data and the file metadata.
-  - At level 0 an entry that a quorum acknowledged can exist only in page caches. A power loss that takes the members together drops it.
-  - The deploy passes `1` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+  - The level sets the archive (the log and snapshot recordings, the catalog) and the consensus module (the recording log, the node state file).
+  - At level 1 or 2 each commit waits for a disk sync on a quorum of members. At level 0 it waits for none.
+  - Aeron has no time-based sync setting. There is no level between "each block" and "never".
+  - The level is local to a member, so members can differ during a rolling deploy.
+  - The deploy passes `0` (variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+- `durableSyncMs`: one thread of the member syncs the Raft log to disk at this interval. See [Durable sync](#durable-sync).
+  - At level 0 with the sync on, a committed entry is lost only when a majority of members lose power or their kernels within about one interval. With the sync off, the kernel writeback sets the window: about 30 s by default.
+  - So each member runs on its own dedicated machine: no two members share a machine, a power feed or a hypervisor. The local profile cannot meet this rule.
+  - The value is local to a member. The deploy uses the default.
+  - See [the durability of the Raft log](../../docs/failure-modes.md#durability-of-the-raft-log).
 - `retention` is a minimum window. A frame past the window leaves only when its block is at or below the posted head.
   - The batcher can always replay from its cursor, because the sealer keeps each frame that is not posted.
   - The stretch has a bound: the budget plus one flush of blocks, in heap.
@@ -509,6 +518,35 @@ A new version needs the coordinated restart of the sealer, not a rolling deploy:
 | 1 | The first rules. |
 | 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
 
+## Durable sync
+
+The archive and the consensus module run at `fileSyncLevel` 0, so a commit waits for no disk sync. One daemon thread of each member, `kardamom-durable-sync`, syncs the Raft log every `durableSyncMs` (default 1000 ms).
+
+- Each round:
+  1. reads the position of the log recording from the archive counter in shared memory;
+  2. forces the segment files of each snapshot recording that the recording log names and no earlier round forced;
+  3. forces the archive catalog and the recording log, and then the snapshot recordings that the recording log named in the meantime;
+  4. forces the log segment files from the segment of the last synced position up, and then the archive directory;
+  5. publishes the position from step 1 as the synced position.
+- The log segment files take `fdatasync` (`FileChannel.force(false)`). The archive creates each segment file at its full length (`setLength`), so an append never changes the size. The force still writes the block allocation of the range that an append filled: the file is sparse. It skips the times of the file.
+- The catalog, the recording log, the snapshot recordings and the archive directory take `fsync` (`FileChannel.force(true)`). They are small, and a restart reads them before the log. The directory sync makes the name of a new segment file durable.
+- The thread opens its own file channels. Linux keeps the dirty pages in the page cache of the inode, and a force through any descriptor writes them back. So the force covers the pages that the archive wrote through its own channel. The archive moves the position counter only after its write returns.
+- The thread never waits on the service thread, the consensus module or the archive conductor.
+- The admin endpoint reports, on `/status` and `/metrics`:
+  - `syncedPosition`: every log byte below it is on the disk of the member. `-1` before the first round with an active log recording.
+  - `commitPosition`: the commit position that the member knows.
+  - `durablePosition`: the lower of the two, or `-1`. A follower syncs entries that it appended but that are not committed yet, so its synced position can pass its commit position.
+  - The median `durablePosition` over the members is the position that a majority holds on disk. A reader that polls each member once for each interval can take the median.
+- The log segments come after the catalog. So a stop position in the catalog that a round forces points no further than the log bytes that the same round forces. The kernel's own write-back has no order: it can write a newer catalog page first.
+- The rule for a failed round:
+  - A failed force deletes the recording log and halts the member with exit code 9 (`cluster DISK SYNC FAILED`). The relaunch finds no recording log, so it seeds the member from a peer, as after exit code 4. Linux keeps the pages of a failed write-back in the page cache and marks them clean. A relaunch on the same kernel would read them, find the log whole, and publish positions above a hole that the disk does not hold.
+  - If the delete fails too, the line says so. Wipe the cluster and archive directories of the member before it starts.
+  - Any other failure is counted, and the next round tries again: a listing or an open that fails (for example with too many open files), or a read of the recording log while the consensus module writes it. The synced position does not move until a round completes. `cluster DURABLE SYNC round failed` prints at powers of two of the count.
+  - A throwable that escapes the thread halts the member with exit code 10 (`cluster DURABLE SYNC DIED`). The relaunch keeps the log.
+  - A file that the purge removed is not a failure.
+- Prometheus scrapes `/metrics` as the job `kardamom-sealer`. The alerts `KardamomSealerSyncStalled`, `KardamomSealerSyncedPositionStalled` and `KardamomSealerSyncErrors` watch the rounds (`deploy/alerts.yml`).
+- With `durableSyncMs=0` the kernel writes the log back on its own schedule, and the positions stay at `-1`.
+
 ## Admin server
 
 The admin server reports the member status over HTTP. It is off when `adminPort` is `0`. The deploy uses port `40205`.
@@ -517,7 +555,7 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 |---|---|
 | `GET /status` | Always 200 with the status JSON. |
 | `GET /ready` | 200 when the member is ready. 503 when it is not. The body is the status JSON. |
-| `GET /metrics` | 200 with the gauge `kardamom_sealer_disk_free_bytes{member_id}` in the Prometheus text format. |
+| `GET /metrics` | 200 with the gauges and counters of the member in the Prometheus text format: `kardamom_sealer_disk_free_bytes`, the positions `kardamom_sealer_commit_position`, `kardamom_sealer_synced_position` and `kardamom_sealer_durable_position`, and the sync rounds `kardamom_sealer_durable_syncs_total`, `kardamom_sealer_durable_sync_errors_total`, `kardamom_sealer_durable_sync_seconds` and `kardamom_sealer_durable_sync_max_seconds`. Each has the label `member_id`. |
 | `GET /retained` | With `carryBytes`: 200 with one `<name> <size>` line for each segment below the published head. `size` counts only the bytes below that head. 403 without the token. Else 404. |
 | `GET /retained/<name>` | With `carryBytes`: 200 with the bytes of one segment below the published head. 403 without the token. 404 for a name that is not a served segment, or a segment that the purge deleted. |
 | any other path | 404 |
@@ -527,7 +565,8 @@ The admin server reports the member status over HTTP. It is off when `adminPort`
 - The retained file holds the bytes of every transaction above the posted head, and the server listens on all addresses. So each request under `/retained` must carry `Authorization: Bearer <KARDAMOM_RETAINED_TOKEN>`. The job passes the same token to every member.
   - The token and the segment bytes travel in cleartext HTTP on the node network. The token keeps out a client that does not have it. It does not hide the bytes from a host that reads the network.
 - `diskFreeBytes` is `null`, and the gauge is `NaN`, when the disk cannot be read. The member stays ready.
-- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `diskFreeBytes` and `ready`.
+- The status JSON has `memberId`, `role`, `election`, `commitPosition`, `servicePosition`, `snapshotWrites`, `snapshotReadsMin`, `snapshotReadsMax`, `snapshotLatest`, `diskFreeBytes`, `syncedPosition`, `durablePosition`, `durableSyncs`, `durableSyncErrors`, `durableSyncLastUs`, `durableSyncMaxUs` and `ready`.
+  - `syncedPosition`, `durablePosition` and the sync fields: see [Durable sync](#durable-sync).
   - `diskFreeBytes` is the free space of the disk of the cluster directory: the Raft log and the retained file. `/metrics` exports the same value.
   - `snapshotWrites`, `snapshotReadsMin` and `snapshotReadsMax` are the snapshot versions of this release, as `formats.toml` lists them.
   - `snapshotLatest` is the version of the newest snapshot this member restored or took. It is 0 before either.
@@ -628,9 +667,12 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster CATCHUP STALL` | The member tried a catch-up and made no progress for `catchupStallS`, and not every peer answered with an open election. The member drops its recording log, and the process halts with exit code 4. The relaunch seeds from a peer. |
 | `cluster ERROR LOG` | Before each exit of the join watchdog, the member prints the error logs of its consensus module, its media driver and its service container, one line each. |
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
+| `cluster DISK SYNC FAILED` | A force of the disk sync failed: the disk lost a write of the Raft log. The member deletes its recording log, and the process halts with exit code 9. The relaunch seeds from a peer. If the line says that the recording log did not go, wipe the member before it starts. See [Durable sync](#durable-sync). |
+| `cluster DURABLE SYNC round failed` | A sync round failed for a cause other than a force, for example too many open files. The next round tries again. It prints at powers of two of the count (`errors`). |
+| `cluster DURABLE SYNC DIED` | A throwable escaped the sync thread. The process halts with exit code 10, and the relaunch keeps the recording log. |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
-| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+| `cluster node up`, `cluster admin endpoint`, `cluster durable sync`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.
@@ -660,7 +702,7 @@ The chaos suite and operators read these lines. The admin server also exports on
   - A member with `carryBytes` stops on a snapshot before version 12. A member without it stops on version 12.
 - A snapshot that was taken with another `orderingWindow` does not load. The member halts.
 - The Raft snapshot interval is `snapshotIntervalS`. The service asks for the snapshot on a boundary tick whose block number is a multiple of the interval in blocks. Only the leader's control toggle takes the request. The action is a log entry, so all members snapshot at the same position.
-- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s.
+- A snapshot stops the cluster. The consensus module appends no timer and no ingress until the service and the module record their snapshots in the archive. With `fileSyncLevel` above `0`, each recording is a chain of disk syncs (the catalog, the directory, each write, the recording log). On a loaded disk this took 11 s. The deploy uses level `0`, so the snapshot waits for none of these syncs. The retained file still forces its mapped segments before the snapshot.
   - So the status of the due tick carries the snapshot notice (`snapshot_follows`). The notice leaves before the leader sets its toggle.
   - After the notice, the ingress, the sequencer and the session watchdog of each client wait 60 s (`SNAPSHOT_SILENCE`), not 10 s, for the next frame. A stall past 60 s is still a lost quorum.
   - A snapshot that an operator asks for with `ClusterTool` carries no notice.

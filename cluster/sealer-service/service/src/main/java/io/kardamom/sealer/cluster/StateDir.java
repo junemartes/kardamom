@@ -79,6 +79,26 @@ record StateDir(Path root) {
         }
     }
 
+    /** The log recording and the snapshot recordings that a recording log names. */
+    record Recordings(long log, List<Long> snapshots) {
+    }
+
+    /**
+     * The recordings that the recording log names, or empty when the read
+     * meets an entry that the running consensus module is writing.
+     */
+    Optional<Recordings> recordings() {
+        try {
+            return Optional.of(withRecordingLog(log -> new Recordings(log.findLastTermRecordingId(),
+                    log.entries().stream()
+                            .filter(entry -> entry.isValid && entry.type == RecordingLog.ENTRY_TYPE_SNAPSHOT)
+                            .map(entry -> entry.recordingId)
+                            .toList())));
+        } catch (final ClusterException e) {
+            return Optional.empty();
+        }
+    }
+
     /** The archive recording id of the Raft log. */
     long logRecordingId() {
         return withRecordingLog(RecordingLog::findLastTermRecordingId);

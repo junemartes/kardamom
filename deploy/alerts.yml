@@ -418,3 +418,41 @@ groups:
         annotations:
           summary: "{{ $labels.service }} {{ $labels.topic }} publication has no subscriber ({{ $labels.host_id }})"
           description: "The must-deliver {{ $labels.topic }} publication of {{ $labels.service }} has had no connected subscriber for {{ $value }} s (kardamom_publication_not_connected_seconds). The publisher holds its receipts and retries. While discovery lists a subscriber of the topic, it reopens the publication after one stall budget and exits with code 3 after five. Check the subscribers of the topic (the ingress and the state mirror for tx_receipts) and the image lines of their logs (`aeron: image available`)."
+
+  # The durable sync of the Raft log. A commit waits for no disk sync, so
+  # the sync thread of each sealer member is the only thing that puts the
+  # log on disk within a second. A thread that stops, or rounds that keep
+  # failing, widen the loss window of a majority power loss to the kernel
+  # write-back, and nothing else shows it. A member with the sync off
+  # reports a synced position of -1 and gets no alert.
+  - name: kardamom-sealer-durability
+    rules:
+      - alert: KardamomSealerSyncStalled
+        expr: increase(kardamom_sealer_durable_syncs_total[1m]) == 0 and kardamom_sealer_synced_position >= 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sealer member {{ $labels.member_id }} runs no durable sync round"
+          description: "The sync thread of sealer member {{ $labels.member_id }} completed no round in two minutes: a force hangs on the disk. The Raft log of the member is not on disk past its synced position. Check the disk of the node (iostat, the kernel log) and the round time kardamom_sealer_durable_sync_seconds. Detail: docs/failure-modes.md, Durability of the Raft log."
+          runbook: "docs/failure-modes.md"
+
+      - alert: KardamomSealerSyncedPositionStalled
+        expr: changes(kardamom_sealer_synced_position[2m]) == 0 and changes(kardamom_sealer_commit_position[2m]) > 0 and kardamom_sealer_synced_position >= 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "sealer member {{ $labels.member_id }} commits, but its synced position does not move"
+          description: "The commit position of sealer member {{ $labels.member_id }} moves, and its synced position has not moved for three minutes. Its sync rounds fail (kardamom_sealer_durable_sync_errors_total), or its log recording is not active. The member log has `cluster DURABLE SYNC round failed` lines with the cause. Detail: docs/failure-modes.md, Durability of the Raft log."
+          runbook: "docs/failure-modes.md"
+
+      - alert: KardamomSealerSyncErrors
+        expr: increase(kardamom_sealer_durable_sync_errors_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "sealer member {{ $labels.member_id }} had {{ $value }} failed durable sync rounds"
+          description: "A sync round of sealer member {{ $labels.member_id }} failed in the last five minutes, and the next round tried again. A failed force halts the member instead (exit code 9). The member log has `cluster DURABLE SYNC round failed` lines with the cause, for example too many open files. Detail: docs/failure-modes.md, Durability of the Raft log."
+          runbook: "docs/failure-modes.md"

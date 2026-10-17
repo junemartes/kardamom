@@ -579,7 +579,7 @@ class DeployTest(Deploys):
             'workloads_cluster_retention': '8192',
             'workloads_cluster_snapshot_s': '60',
             'workloads_cluster_log_purge_keep': '5',
-            'workloads_cluster_file_sync_level': '2',
+            'workloads_cluster_file_sync_level': '1',
             'workloads_archive_file_sync_level': '0',
             'workloads_remote_origins': '412399',
             'workloads_priority_fees': 'on',
@@ -606,7 +606,7 @@ class DeployTest(Deploys):
         self.assertNotIn('--beacon-api', follower)
         self.assertIn('http://kardamom-l1-indexer.service.dc1.consul:8549', json.dumps(plans['batcher']))
         self.assertIn('8192', json.dumps(plans['cluster']))
-        self.assertIn('-Dkardamom.cluster.fileSyncLevel=2', json.dumps(plans['cluster']))
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=1', json.dumps(plans['cluster']))
         self.assertIn('-Dkardamom.cluster.logPurgeKeepSnapshots=5', json.dumps(plans['cluster']))
         self.assertIn('-Daeron.archive.file.sync.level=0', json.dumps(plans['aeron']))
         self.assertIn('-Daeron.archive.catalog.file.sync.level=0', json.dumps(plans['aeron']))
@@ -796,10 +796,12 @@ class DeployTest(Deploys):
                 else:
                     self.assertEqual(result.stdout, f'started {root}/local/sentinel.conf\n')
 
-    def test_priority_fees_default_off_on_every_role(self):
+    def test_the_default_plans_turn_priority_fees_off_and_skip_the_append_sync(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
         self.assertIn('-Dkardamom.cluster.orderingWindow=0', json.dumps(plans['cluster']))
+        # A sealer commit waits for no disk sync; the member syncs its log on a schedule.
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=0', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)

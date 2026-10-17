@@ -326,7 +326,7 @@ The sealer is the ordering authority. Three members form an Aeron Cluster. The c
 - **Torn archive fragment at launch**
   - Trigger: a hard kill leaves a torn last fragment in the archive. The launch then fails with `incomplete last fragment straddling page boundary`.
   - Effect: the launch attempt fails.
-  - Recovery: the sealer runs `ArchiveTool.verify` with truncation on the archive directory. It then launches again, within the attempt bound. The log line is `cluster LAUNCH REPAIR`. The truncated bytes are the unacknowledged tail of the member. The leader fills the gap when the member rejoins.
+  - Recovery: the sealer runs `ArchiveTool.verify` with truncation on the archive directory. It then launches again, within the attempt bound. The log line is `cluster LAUNCH REPAIR`. After a process kill, the truncated bytes are the unacknowledged tail of the member. After a power loss at sync level 0, they can be acknowledged entries (see **Durability of the Raft log**). In both cases the leader fills the gap when the member rejoins.
 - **Back-pressured client session**
   - Trigger: a client session does not take its egress frames. A wedged client is the usual cause.
   - Effect: the service thread must not wait. It also runs the boundary tick and relays records for every session.
@@ -398,11 +398,74 @@ The voter list must equal the set of consumers that execute.
 
 The kill-based cases prove the restart logic. They do not prove durability against a power loss. A process kill or a container kill leaves the host kernel and its page cache alive. Every member finds its whole log again.
 
-- The sealer syncs the Raft log and the archive to disk with `kardamom.cluster.fileSyncLevel`.
-- Level 0 does not sync. Level 1 syncs the data of every write batch. Level 2 is also valid. Any other value refuses to start.
-- The code default is 0. The deploy sets 1 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
-- At level 0, an entry that a quorum acknowledged can exist only in the page caches of its members. A rack-level power loss would drop it. `pipeline-blackout-recover` stands for that event.
-- Only a test that cuts the power of a VM can prove this end to end.
+- The archive and the consensus module run at `kardamom.cluster.fileSyncLevel` 0. A commit waits for no disk sync. Each member acknowledges a log position when the write is in its page cache.
+  - Level 1 syncs the data of every write batch. Level 2 also syncs the file metadata. At level 1 or 2 each commit waits for a sync on a quorum. Any other value refuses to start.
+  - The code default is 0. The deploy also sets 0 (Nomad variable `cluster_file_sync_level`, env `KARDAMOM_CLUSTER_FILE_SYNC_LEVEL`).
+  - Aeron has no time-based sync.
+- One thread of each member syncs the log on a schedule (`kardamom.cluster.durableSyncMs`, default 1000, 0 turns it off). Each round:
+  - reads the log position from the archive counter;
+  - forces the new snapshot recordings, the archive catalog and the recording log with `fsync`, and the log segment files from the last synced segment up with `fdatasync`, and then the archive directory;
+  - then publishes the position that it read as the synced position.
+- The admin endpoint reports three positions on `/status` and `/metrics`:
+  - `syncedPosition` (`kardamom_sealer_synced_position`): every log byte below it is on the disk of the member.
+  - `commitPosition` (`kardamom_sealer_commit_position`): the commit position that the member knows.
+  - `durablePosition` (`kardamom_sealer_durable_position`): the lower of the two. The median over the members is the position that a majority holds on disk.
+  - The rounds, the failed rounds and the round time are `kardamom_sealer_durable_syncs_total`, `kardamom_sealer_durable_sync_errors_total`, `kardamom_sealer_durable_sync_seconds` and `kardamom_sealer_durable_sync_max_seconds`.
+- The rule for a failed round:
+  - A failed force stops the member. The member deletes its recording log, logs `cluster DISK SYNC FAILED`, and halts with exit code 9. The relaunch finds no recording log, so it seeds the member from a peer, as after exit code 4.
+  - Why the seed: after a failed write-back, Linux keeps the pages in the page cache and marks them clean. A relaunch on the same kernel reads them, so the log looks whole, and later rounds would publish positions above a hole that the disk does not hold. The seed replaces the whole log.
+  - If the delete fails too, the line says so. Wipe the cluster and archive directories of the member before it starts.
+  - Any other failure is counted in `kardamom_sealer_durable_sync_errors_total`, and the next round tries again: for example a listing or an open that runs out of file descriptors, or a read of the recording log while the consensus module writes it. The synced position does not move until a round completes. The line `cluster DURABLE SYNC round failed` prints at powers of two of the count.
+  - A throwable that escapes the thread halts the member with exit code 10 (`cluster DURABLE SYNC DIED`). The relaunch keeps the log.
+  - A file that the purge removed is not a failure.
+- Alerts (`deploy/alerts.yml`, group `kardamom-sealer-durability`; Prometheus scrapes the admin endpoint as job `kardamom-sealer`):
+  - `KardamomSealerSyncStalled`: no round completes for two minutes. A force hangs on the disk.
+  - `KardamomSealerSyncedPositionStalled`: the commit position moves, and the synced position does not move for three minutes. The rounds fail, or the log recording is not active.
+  - `KardamomSealerSyncErrors`: a round failed in the last five minutes.
+- The loss window is one interval plus one round: about 1 s.
+  - A committed entry is lost only when every member that holds it loses power or its kernel within the window, or is out of the next quorum. With all members in step, that is a power loss or a kernel crash on a majority of members at the same time.
+  - An entry below the median `durablePosition` of the members is on the disk of a majority. A majority power loss cannot lose it.
+  - With the sync off, the kernel writeback sets the window: `vm.dirty_expire_centisecs` (default 30 s) plus `vm.dirty_writeback_centisecs` (default 5 s). This repository does not set these values. The host setup is in the `kardamom-infra` repository.
+  - A process kill, an OOM kill, a container restart or a Nomad restart loses nothing: the host kernel keeps the page cache.
+- **Requirement:** each sealer member runs on its own dedicated machine.
+  - Two members on one machine, one power feed or one hypervisor make one event a majority loss.
+  - The deploy places member `i` on the node `sealer-<i>` (`meta.role` is `sealer`). The operator keeps those nodes on separate machines.
+  - The local profile cannot meet this rule: all its node containers run on one host. A power loss of that host is a loss of every member. The local profile is for tests only.
+- One member that loses power can come back with a torn log tail or a torn newest snapshot.
+  - The launch truncates a torn last fragment of the archive (`cluster LAUNCH REPAIR`). The member then catches up from the leader.
+  - A member whose newest snapshot does not load follows the steps below.
+- The log purge cuts the log only below a snapshot that is older than the `logPurgeKeepSnapshots` newest snapshots (3 x 300 s in the deploy). That snapshot and its log are on disk long before the purge.
+- The retained file of the sealer forces its mapped segments before a snapshot. That force does not depend on the level.
+- `pipeline-blackout-recover` stands for a correlated power loss. It kills the processes, so the page cache stays. Only a test that cuts the power of a VM can prove the window end to end.
+
+#### Majority power loss
+
+- Trigger: a majority of members lose power or their kernels within one sync interval.
+- Effect:
+  - The members restart with the log up to their synced position, or more. Committed entries above the median `durablePosition` can be gone. The new leader commits new entries at those positions at once: a boundary tick is a new entry.
+  - An executor that applied a lost entry holds state that the new log does not have. It does not detect this by itself. So the executor rollback is a precondition of sync level 0.
+  - Until the readers of the stream gate on the median `durablePosition`, the batcher reads committed entries. It can post a block to L1 that the members then lose.
+  - A snapshot that completed less than one round before the power loss can be incomplete: the kernel wrote back the recording log entry, but not the snapshot recording. The member then stops at start, because the snapshot does not load.
+- Operator steps:
+  1. Read the head of each executor while the sealer has no quorum: `kardamom_executor_block_number` on its `/metrics`. An executor restores its head from its state database at start, and it cannot move without the sealer. Take the highest: `OLD_HEAD`. Then stop the executor, validator and batcher jobs, so that no reader takes the new log before the check.
+  2. Read the posted head `H` from L1: the `l2BlockEnd` of the last batch (`lastBatchIndex` and `batches` on the settlement contract, as in [`runbooks/sealer-fleet-rebuild.md`](runbooks/sealer-fleet-rebuild.md), step 1).
+  3. Start the members. Each launch repairs its torn last fragment (`cluster LAUNCH REPAIR`).
+  4. A member that stops at start on its newest snapshot: stop its job, and run `ClusterTool <cluster dir> invalidate-latest-snapshot` on its cluster directory. The command marks the newest snapshot invalid in the recording log. Start the member again. It loads the previous snapshot and replays the log after it. The purge keeps that log.
+  5. Find the recovered head `R`: the `block=` field of the `cluster TERM` line with the highest `leadershipTermId` after the restart. Every member prints the line when it applies the first entry of the new term, after every entry of the earlier terms. So `R` is the last block of the recovered log, before the new leader commits anything.
+  6. Decide:
+     - `H > R`: L1 holds a block that the members lost. The posted chain and the recovered log disagree. Wipe the cluster and archive directories of every member, and rebuild the fleet from L1: [`runbooks/sealer-fleet-rebuild.md`](runbooks/sealer-fleet-rebuild.md).
+     - `H <= R < OLD_HEAD`: the members lost the blocks `R + 1` to `OLD_HEAD`. Roll back each executor and the validator to block `R`. Then start the executor, validator and batcher jobs. The receipts of the transactions in the lost blocks are void. Tell their senders.
+     - `OLD_HEAD <= R`: no reader applied a lost block. Start the executor, validator and batcher jobs.
+- Proof: none in CI. The chaos suite kills processes, and the page cache survives a kill.
+
+#### A member that kept more log than the new quorum
+
+- Trigger: after a majority power loss, a member comes back with a longer log than the members that elected the new leader. Its disk kept entries that theirs lost, and it was not in the first quorum.
+- Effect:
+  - The election truncates the log of the member to the end of the leader's earlier terms (`Truncating Cluster Log - ... oldPosition=.. newPosition=..` in the error log).
+  - Its service already applied entries above the cut, or its newest snapshot is above the cut. The service container then refuses the log with `Cluster log must be contiguous for joining image` or `... for active log event`. The member logs `cluster COMPONENT CLOSED` and halts with exit code 5. Each relaunch loads the same snapshot and fails the same way.
+- Operator step: stop the member, wipe its cluster and archive directories, and start it. It seeds from a peer. Its executor follows the steps of **Majority power loss**.
+- Proof: none in CI.
 
 ## Executor
 
