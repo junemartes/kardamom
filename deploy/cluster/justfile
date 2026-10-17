@@ -21,8 +21,11 @@ export RUN_SHARDS := env('RUN_SHARDS', if KARDAMOM_STAGED != '' { '../../target/
 # container recipes set it; `deploy` keeps the 10 s production default.
 container_stall_ms := env('AERON_STALL_TOLERANCE_MS', '30000')
 # The idle cap of a container cluster, in microseconds: Aeron's own 1 ms
-# park, not the 50 µs default of `deploy`. At 50 µs an idle media driver,
-# sealer member or Rust Aeron thread uses about a fifth of a core or more.
+# park, not the 50 µs default of `deploy`. A cap at or above the own cap of
+# a thread leaves the thread as it is, so at 1000 µs every thread keeps its
+# old waits and the default timer slack. At 50 µs an idle media driver,
+# sealer member or Rust Aeron thread uses about a fifth of a core or more,
+# and a Rust Aeron thread under traffic uses about three times its old CPU.
 # A container cluster runs about 20 of them on one shared CI or developer
 # host, far above their Nomad cpu reservations.
 container_idle_cap_us := env('KARDAMOM_IDLE_CAP_US', '1000')

@@ -120,13 +120,18 @@ impl IdleBackoff {
 
     /// This backoff under the deploy cap `cap`: the base `capped_base` and
     /// the cap of `cap`, with the same grace. A `capped_base` above the cap
-    /// starts at the cap. With no deploy cap, the backoff stays as it is.
+    /// starts at the cap.
     ///
-    /// Call it on the thread that waits: with a cap, it also sets the
-    /// timer slack of that thread to 1 µs.
+    /// The deploy cap only lowers the waits of a loop. With no deploy cap,
+    /// or a deploy cap at or above the cap of this backoff, the backoff
+    /// stays as it is, with its own base and the default timer slack. A
+    /// shorter base polls more often under traffic, and that costs CPU.
+    ///
+    /// Call it on the thread that waits: with a lower cap, it also sets
+    /// the timer slack of that thread to 1 µs.
     #[must_use]
     pub fn under(self, cap: IdleCap, capped_base: Duration) -> Self {
-        let Some(cap) = cap.duration() else {
+        let Some(cap) = cap.duration().filter(|cap| *cap < self.cap) else {
             return self;
         };
         IdleCap::tighten_timer_slack();
@@ -248,9 +253,20 @@ mod tests {
     #[test]
     fn no_cap_keeps_the_backoff_and_a_cap_replaces_base_and_cap() {
         let old = || IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 1);
-        let mut kept = old().under(IdleCap::default(), Duration::from_micros(10));
-        assert_eq!(kept.idle_wait(), Duration::from_micros(100));
-        assert_eq!(kept.idle_wait(), Duration::from_micros(200));
+        let kept_by = |cap: IdleCap| {
+            let mut kept = old().under(cap, Duration::from_micros(10));
+            assert_eq!(kept.idle_wait(), Duration::from_micros(100), "{cap:?}");
+            assert_eq!(kept.idle_wait(), Duration::from_micros(200), "{cap:?}");
+            assert_eq!(
+                (0..10).map(|_| kept.idle_wait()).last(),
+                Some(Duration::from_millis(1)),
+                "{cap:?}"
+            );
+        };
+        // No cap, a cap equal to the own cap, and a cap above it.
+        kept_by(IdleCap::default());
+        kept_by(IdleCap::parse(Some("1000")).unwrap());
+        kept_by(IdleCap::parse(Some("5000")).unwrap());
 
         let cap = IdleCap::parse(Some("50")).unwrap();
         let mut capped = old().under(cap, Duration::from_micros(10));

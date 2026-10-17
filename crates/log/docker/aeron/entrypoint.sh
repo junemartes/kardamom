@@ -49,11 +49,14 @@ AERON_ARCHIVE_REPLICATION_PORT="${AERON_ARCHIVE_REPLICATION_PORT:-8021}"
 
 # Timer slack: Linux ends a park up to the timer slack of the thread after
 # its deadline, 50 µs by default, so a 50 µs park can take 100 µs. With a
-# cap set, this shell sets its own slack to 1 µs. The JVM and each of its
+# cap below Aeron's own 1000 µs, this shell sets its own slack to 1 µs. At
+# 1000 µs or unset, the driver keeps Aeron's waits and the default slack,
+# because a 1 µs slack makes every short park of the JVM a wake-up of its
+# own. The JVM and each of its
 # threads take the slack of the thread that starts them. A kernel that
 # refuses the write keeps the default slack. The line after it prints the
 # slack that the JVM gets.
-if [[ -n "${KARDAMOM_IDLE_CAP_US:-}" ]]; then
+if [[ "${KARDAMOM_IDLE_CAP_US:-}" =~ ^[0-9]+$ ]] && (( 10#${KARDAMOM_IDLE_CAP_US} < 1000 )); then
     echo 1000 > /proc/self/timerslack_ns || echo "could not set the timer slack" >&2
 fi
 echo "idle cap: KARDAMOM_IDLE_CAP_US=${KARDAMOM_IDLE_CAP_US:-<unset>} timerslack_ns=$(cat /proc/self/timerslack_ns 2>&1)"

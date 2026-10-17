@@ -1403,6 +1403,7 @@ A deploy replaces service instances one at a time under readiness checks. The ch
   - The value is a whole number of µs from 1 to 1,000,000. The Nomad jobs, the Rust parser and the Java parser refuse any other value, and the deploy or the process start fails. One case file (`crates/log/docker/aeron/idle-cap-cases.txt`) tests both parsers.
   - A thread that polls a source with no wake-up (an Aeron subscription, an Aeron log, a ring) sees new data only when its wait ends. So the first message after a quiet spell waits up to the cap at each such thread. A transaction crosses about 15 to 18 such threads between the ingress and the receipt.
   - Only the hot-path jobs get the value: `aeron`, `cluster`, `ingress`, `sequencer` and `executor`. A process without the variable keeps the old waits.
+  - The cap only lowers the waits of a thread. A cap at or above the own cap of a thread (1000 µs for the Java agents and the Rust Aeron thread, 100 µs for the sequencer core loop) leaves the thread as it is: its old base, its old cap and the default timer slack. So the container recipes, at 1000 µs, run the old waits.
   - The value reaches these threads:
     - the media driver and the archive of the `aeron` job: `CappedBackoffIdleStrategy` in the image, for every driver and archive agent. Unset, its cap is Aeron's own 1 ms;
     - each sealer member: the embedded driver, the archive, the consensus module, the service container and the member feed. `-Dkardamom.cluster.idleCapUs` wins over the variable. Unset, the cap is 1 ms;
@@ -1413,10 +1414,11 @@ A deploy replaces service instances one at a time under readiness checks. The ch
     - the cluster session thread of a Rust cluster client: 1 ms, up to 5 ms. It waits on channels, and its timer duties run on scales of 100 ms and more;
     - the engine readers. They wait on channels. The join wait of the `tx_ordering` reader polls every 50 µs (`join_poll_interval`).
   - Linux ends a timed wait up to the timer slack of the thread after its deadline. The default slack is 50 µs, so a 50 µs wait can take about 100 µs.
-    - With a cap set, the Rust threads above set their own timer slack to 1 µs (`prctl(PR_SET_TIMERSLACK)`).
-    - With a cap set, the entrypoints of the `aeron` image and of the sealer image set the timer slack of the JVM to 1 µs. Each JVM thread takes it from the thread that starts it. The entrypoint prints the slack that the JVM gets (`idle cap: ... timerslack_ns=...`).
+    - With a cap below their own cap, the Rust threads above set their own timer slack to 1 µs (`prctl(PR_SET_TIMERSLACK)`).
+    - With a cap below 1000 µs, the entrypoints of the `aeron` image and of the sealer image set the timer slack of the JVM to 1 µs. Each JVM thread takes it from the thread that starts it. The entrypoint prints the slack that the JVM gets (`idle cap: ... timerslack_ns=...`).
     - A kernel that refuses the write keeps the default slack. A wait then ends at most 50 µs late.
   - An idle thread at the cap wakes about once per cap: about 20,000 times a second at 50 µs. Each wake costs CPU. A higher cap costs less idle CPU and adds latency after a quiet spell.
+  - Under traffic, a Rust Aeron thread under a cap waits 10 µs after each pass with work, in place of 100 µs. Two such threads at 2000 messages a second used about 52 % of one core at 50 µs and about 15 % with the old waits.
   - No thread busy-spins. A busy-spin needs a pinned, dedicated core.
 - **Start-up open of a stream**
   - Trigger: a service opens its streams through the discovery plane (`StreamPlane`) at start-up. A loaded host or a stalled media driver delays the answer of the driver to an add (`add_publication`, `add_subscription`). Or the local Consul agent does not answer the registration of a record (no connection, no answer within `request_timeout_ms`, or a 5xx status).

@@ -16,8 +16,9 @@ import org.agrona.concurrent.IdleStrategy;
  * Unset, the cap is 1 ms, the cap of Aeron's own backoff.</p>
  *
  * <p>Linux ends a park up to the timer slack of the thread after its
- * deadline. The default slack is 50 µs. When the deploy sets the cap, the
- * image entrypoint sets the slack of the JVM to 1 µs.</p>
+ * deadline. The default slack is 50 µs. With a cap below 1 ms, the image
+ * entrypoint sets the slack of the JVM to 1 µs. At 1 ms or unset, the member
+ * keeps Aeron's own waits and the default slack.</p>
  *
  * @param maxParkNs the longest park, in nanoseconds, as
  *     {@link CappedBackoffIdleStrategy#capNs} makes it
