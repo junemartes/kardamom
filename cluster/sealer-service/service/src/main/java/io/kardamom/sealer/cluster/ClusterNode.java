@@ -180,6 +180,13 @@ public final class ClusterNode {
                 + " intervalBlocks=" + schedule.intervalBlocks())
             .orElse("cluster snapshot scheduler DISABLED memberId=" + memberId));
 
+        // The disk sync of the Raft log. Parsed before the launch, so a bad
+        // value never starts a member.
+        final Optional<Interval> durableSync = DurableSync.fromSetting(System.getProperty(DurableSync.SETTING));
+        System.out.println("cluster durable sync memberId=" + memberId + durableSync
+            .map(interval -> " intervalMs=" + interval.ms())
+            .orElse(" <off: the kernel writes the log back>"));
+
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
         // The driver keeps the last address of each member name, so a short
         // outage of the node's DNS agent does not fail an add in an election.
@@ -207,10 +214,11 @@ public final class ClusterNode {
         // in the middle of a fragment write that crosses a page, and the
         // catalog refresh refuses the torn last fragment of the log
         // recording ("incomplete last fragment straddling page boundary").
-        // Aeron asks for `ArchiveTool verify` here. The bytes past the last
-        // whole fragment are this member's own unacknowledged tail; the
-        // leader's log fills the gap on rejoin, as on any intact-directory
-        // restart. So the repair runs in-process, then the launch retries.
+        // Aeron asks for `ArchiveTool verify` here. The repair drops the
+        // bytes past the last whole fragment. They are above the synced
+        // position of the member (see DurableSync), and the leader's log
+        // fills the gap on rejoin. So the repair runs in-process, then the
+        // launch retries.
         final StopRequest stop = new StopRequest();
         ClusteredMediaDriver driver = null;
         ClusteredServiceContainer container = null;
@@ -260,11 +268,16 @@ public final class ClusterNode {
 
         final ConsensusModule.Context consensus = driver.consensusModule().context();
         final SealerClusteredService launched = service;
+        final DurableSync sync = new DurableSync(
+            new DurableSync.Dirs(Path.of(archiveDir), Path.of(clusterDir)),
+            DurableSync.memberView(contexts.clusterState(), consensus.aeron().countersReader()),
+            DurableSync.haltMember(memberId));
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container;
-             AdminServer ignored3 = startAdminServer(consensus, service, memberId, Path.of(clusterDir),
-                 carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
+             AdminServer ignored3 = startAdminServer(new AdminSources(consensus, service, sync), memberId,
+                 Path.of(clusterDir), carryBytes.map(c -> c.endpoint(launched::retainedHead)))) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
+            durableSync.ifPresent(sync::start);
             startLogPurger(purgePlanner, new LogPurger.Member(memberId, contexts, service), consensus);
             // The watchdog starts last. A start-up step that throws before it
             // closes the components through this block, and the watchdog must
@@ -312,8 +325,7 @@ public final class ClusterNode {
      * peer seeds.</p>
      */
     private static AdminServer startAdminServer(
-            final ConsensusModule.Context consensus,
-            final SealerClusteredService service,
+            final AdminSources sources,
             final int memberId,
             final Path stateDir,
             final Optional<RetainedEndpoint> retained) {
@@ -325,10 +337,10 @@ public final class ClusterNode {
         final long lagBytes = Long.getLong("kardamom.cluster.readyLagBytes", DEFAULT_READY_LAG_BYTES);
         final MemberStatusSource source = new MemberStatusSource(
             memberId,
-            consensus.clusterNodeRoleCounter(),
-            consensus.electionStateCounter(),
-            consensus.commitPositionCounter(),
-            service,
+            sources.consensus().clusterNodeRoleCounter(),
+            sources.consensus().electionStateCounter(),
+            sources.consensus().commitPositionCounter(),
+            sources,
             stateDir);
         final AdminServer admin;
         try {
@@ -345,6 +357,11 @@ public final class ClusterNode {
         return Integer.getInteger("kardamom.cluster.adminPort", DEFAULT_ADMIN_PORT);
     }
 
+    /** The parts of a running member that its status reads. */
+    private record AdminSources(
+            ConsensusModule.Context consensus, SealerClusteredService service, DurableSync sync) {
+    }
+
     /**
      * Reads one {@link MemberStatus} from the live counters. A closed
      * counter reads as {@code CLOSED}: the member is shutting down.
@@ -355,6 +372,7 @@ public final class ClusterNode {
         private final AtomicCounter election;
         private final AtomicCounter commitPosition;
         private final SealerClusteredService service;
+        private final DurableSync sync;
         /** A directory on the disk of the member state: the log and the retained file. */
         private final Path stateDir;
 
@@ -363,13 +381,14 @@ public final class ClusterNode {
                 final AtomicCounter role,
                 final AtomicCounter election,
                 final AtomicCounter commitPosition,
-                final SealerClusteredService service,
+                final AdminSources sources,
                 final Path stateDir) {
             this.memberId = memberId;
             this.role = role;
             this.election = election;
             this.commitPosition = commitPosition;
-            this.service = service;
+            this.service = sources.service();
+            this.sync = sources.sync();
             this.stateDir = stateDir;
         }
 
@@ -380,7 +399,8 @@ public final class ClusterNode {
                 ? MemberStatus.ELECTION_CLOSED : String.valueOf(ElectionState.get(election));
             final long commit = commitPosition.isClosed() ? 0L : commitPosition.get();
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
-                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()), diskFreeBytes());
+                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion()), diskFreeBytes())
+                .withDurability(sync.durability());
         }
 
         /**

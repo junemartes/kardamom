@@ -98,10 +98,11 @@ variable "priority_fees" {
 # File sync level of the Raft log and the archive
 # (-Dkardamom.cluster.fileSyncLevel): 0 leaves a write in the page cache,
 # 1 syncs the data of every write batch, 2 syncs data and metadata. At 0 a
-# commit waits for no disk sync, and the kernel writes the log back within
-# about 30 s (vm.dirty_expire_centisecs). An entry that a quorum
+# commit waits for no disk sync, and the member syncs the log every
+# kardamom.cluster.durableSyncMs (default 1000). An entry that a quorum
 # acknowledged is lost only when a majority of members lose power or their
-# kernels in that window. So each member runs on its own dedicated machine.
+# kernels within about one interval. So each member runs on its own
+# dedicated machine.
 # The level is local to a member and can differ during a rolling deploy.
 # Ansible deployment passes -var from KARDAMOM_CLUSTER_FILE_SYNC_LEVEL.
 variable "cluster_file_sync_level" {

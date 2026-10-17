@@ -796,10 +796,12 @@ class DeployTest(Deploys):
                 else:
                     self.assertEqual(result.stdout, f'started {root}/local/sentinel.conf\n')
 
-    def test_priority_fees_default_off_on_every_role(self):
+    def test_the_default_plans_turn_priority_fees_off_and_skip_the_append_sync(self):
         self.run_deploy(check=True)
         plans = self.api.state['plans']
         self.assertIn('-Dkardamom.cluster.orderingWindow=0', json.dumps(plans['cluster']))
+        # A sealer commit waits for no disk sync; the member syncs its log on a schedule.
+        self.assertIn('-Dkardamom.cluster.fileSyncLevel=0', json.dumps(plans['cluster']))
         self.assertEqual(self.sequencer_env(plans)['KARDAMOM_PRIORITY_FEES'], 'false')
         for name in ('executor', 'validator'):
             self.assertNotIn('base_fee_initial', self.genesis_template(plans[name]), name)
@@ -807,12 +809,6 @@ class DeployTest(Deploys):
             # is: a live chain refuses a changed genesis.
             template = self.genesis_template(plans[name]).encode()
             self.assertEqual(hashlib.sha256(template).hexdigest(), STAGING_GENESIS_SHA256, name)
-
-    def test_the_sealer_log_append_waits_for_no_disk_sync_by_default(self):
-        # The kernel writes the Raft log back. Each member runs on its own
-        # machine, so only a power loss of a majority loses an entry.
-        self.run_deploy(check=True)
-        self.assertIn('-Dkardamom.cluster.fileSyncLevel=0', json.dumps(self.api.state['plans']['cluster']))
 
     def test_the_exec_cursor_switch_defaults_off_and_reaches_the_executor(self):
         for switch, expected in (('', 'false'), ('on', 'true')):

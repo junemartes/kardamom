@@ -188,6 +188,11 @@ final class LogCluster implements AutoCloseable {
         return follower.index();
     }
 
+    /** The archive directory of a member. */
+    Path archiveDir(final int memberId) {
+        return nodeDir(memberId).resolve("archive");
+    }
+
     /** The consensus module directory of a member. */
     StateDir clusterState(final int memberId) {
         return new StateDir(nodeDir(memberId).resolve("consensus-module"));
