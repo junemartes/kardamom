@@ -31,14 +31,11 @@ use kardamom_cluster_adapter::{
 /// Shared delivery cursor: the next canonical record index and boundary
 /// block number this consumer expects. The subscription writes it on every
 /// delivery. The live session thread reads it to build the `REPLAY_FROM`
-/// request it sends on every connect or reconnect. The session thread also
-/// counts each session start in `session_starts`, so the subscription
-/// knows when a new session begins.
+/// request it sends on every connect or reconnect.
 #[derive(Clone)]
 pub struct ReplayCursor {
     pub(crate) next_index: Arc<AtomicU64>,
     pub(crate) next_block: Arc<AtomicU64>,
-    pub(crate) session_starts: Arc<AtomicU64>,
 }
 
 impl ReplayCursor {
@@ -47,7 +44,6 @@ impl ReplayCursor {
         Self {
             next_index: Arc::new(AtomicU64::new(next_index)),
             next_block: Arc::new(AtomicU64::new(next_block)),
-            session_starts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -85,7 +81,7 @@ pub struct ClusterTxOrderingSubscription<E: ClusterEgress, I: ClusterIngress = N
     /// service's replay interleaves with live broadcasts.
     pending_records: BTreeMap<u64, TxOrderingMessage>,
     pending_boundaries: BTreeMap<u64, BlockBoundaryStart>,
-    /// True while a replay is outstanding: after a new session starts, or
+    /// True while a replay is outstanding: after a session-start marker, or
     /// after a key gap. In this mode, a record may be delivered only once
     /// the boundary at `next_block` proves it comes before it
     /// (`end_tx_idx > index`). Only `REPLAY_DONE` ends the mode. In live
@@ -99,9 +95,6 @@ pub struct ClusterTxOrderingSubscription<E: ClusterEgress, I: ClusterIngress = N
     /// in the open block, and the executor would execute it, and stream its
     /// receipt, with the wrong block number.
     catching_up: bool,
-    /// The last value of `cursor.session_starts` that this subscription
-    /// saw. A higher value means a new session started.
-    seen_session_starts: u64,
     /// Whether deliveries re-export the sealer's boundary stream as
     /// `kardamom_sealer_*` metrics. Only one role per host should emit them:
     /// the executor, the chosen point probes and dashboards scrape. The
@@ -124,7 +117,6 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             pending_records: BTreeMap::new(),
             pending_boundaries: BTreeMap::new(),
             catching_up: false,
-            seen_session_starts: 0,
             emit_sealer_metrics: true,
         }
     }
@@ -142,7 +134,6 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             pending_records: self.pending_records,
             pending_boundaries: self.pending_boundaries,
             catching_up: self.catching_up,
-            seen_session_starts: self.seen_session_starts,
             emit_sealer_metrics: self.emit_sealer_metrics,
         }
     }
@@ -302,6 +293,11 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             } => {
                 self.end_replay(up_to_index, up_to_block)?;
             }
+            // A new session starts. Every later frame belongs to it, and
+            // its replay is outstanding. A `REPLAY_DONE` of an earlier
+            // session comes before this marker, so it cannot end this
+            // catch-up.
+            EgressItem::SessionStart => self.catching_up = true,
             EgressItem::ReplayAhead {
                 head_index,
                 head_block,
@@ -416,8 +412,8 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         // resumes from the persisted cursor, and the REPLAY_FROM on
         // connect re-delivers the whole window in order.
         //
-        // The catch-up on each session start (`follow_session_start`)
-        // prevents this order on a reconnect. A stream with no session
+        // The catch-up at each session-start marker prevents this order
+        // on a reconnect. A stream with no session
         // count, or a sealer fault, can still give it. Frames within one
         // Aeron session are ordered, so this condition has no false
         // positives.
@@ -467,7 +463,6 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
         let Some(bytes) = self.egress.recv() else {
             return Err(ExecutorError::TxOrderingClosed);
         };
-        self.follow_session_start();
         match EgressItem::decode(&bytes) {
             Ok(item) => self.ingest(item),
             Err(e) => {
@@ -475,20 +470,6 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
                 Ok(())
             }
         }
-    }
-}
-
-impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
-    /// Enter catch-up when a new session started since the last frame.
-    /// The session thread counts the start before it forwards a frame of
-    /// the new session, so this check runs before the frame is ingested.
-    fn follow_session_start(&mut self) {
-        let starts = self.cursor.session_starts.load(Ordering::Acquire);
-        if starts == self.seen_session_starts {
-            return;
-        }
-        self.seen_session_starts = starts;
-        self.catching_up = true;
     }
 }
 
@@ -551,7 +532,6 @@ pub fn cluster_tx_ordering_subscription(
             replay: Some(live::ReplayOnConnect {
                 next_index: cursor.next_index.clone(),
                 next_block: cursor.next_block.clone(),
-                session_starts: cursor.session_starts.clone(),
             }),
             subscribe: true,
             ..Default::default()

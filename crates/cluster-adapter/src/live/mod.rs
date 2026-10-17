@@ -188,16 +188,14 @@ impl ClusterEgress for LiveEgress {
 /// Without it, frames committed between session death and reconnect are
 /// lost forever.
 ///
-/// `session_starts` counts the established sessions. The session thread
-/// increments it, with `Release`, when a session opens and before it
-/// forwards any frame of that session. A consumer that loads it, with
-/// `Acquire`, after it receives a frame thus sees every session start
-/// that precedes the frame.
+/// A replay consumer also gets a session-start marker
+/// ([`EgressItem::SessionStart`](crate::wire::EgressItem::SessionStart))
+/// on its channel when each session opens, before any frame of that
+/// session.
 #[derive(Clone)]
 pub struct ReplayOnConnect {
     pub next_index: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub next_block: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub session_starts: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What a session announces or replays on establishment: [`connect_with`]'s

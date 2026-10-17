@@ -255,8 +255,9 @@ impl<W: ExecPorts> ExecState<W> {
         // a value from the boundary. So a re-published receipt is identical
         // to the first copy only when every record arrives in canonical
         // order, after the boundaries that precede it. The reader
-        // guarantees this order: it holds records after a session start
-        // until the replay is done, and it fail-stops on a boundary that
+        // guarantees this order per cluster session: after the session's
+        // start marker, it holds the session's records until that
+        // session's replay is done, and it fail-stops on a boundary that
         // seals below its delivery cursor.
         let pending = std::mem::take(&mut self.block.delta);
         self.block.run.seal(block_number);

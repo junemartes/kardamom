@@ -407,7 +407,7 @@ impl SessionLoop {
                 // delivery cursor on every establishment. Force an
                 // immediate (re)send below.
                 self.replay_ask.rearm();
-                self.count_session_start();
+                self.mark_session_start();
                 self.subscribe_resend.rearm();
                 self.subscribe_confirmed = false;
                 self.egress_watch.on_connect(now_ms());
@@ -419,12 +419,24 @@ impl SessionLoop {
         }
     }
 
-    /// Tell the consumer that a new session starts. The count moves before
-    /// this thread forwards any frame of the new session, so the consumer
-    /// holds the session's live frames until its replay is done.
-    fn count_session_start(&self) {
-        if let Some(r) = &self.replay {
-            r.session_starts.fetch_add(1, Ordering::Release);
+    /// Tell a replay consumer that a new session starts. The marker goes on
+    /// the consumer channel before any frame of the new session, and after
+    /// every frame of the old one. So the consumer holds the new session's
+    /// live frames until the new session's replay is done. The marker
+    /// passes the kind filter: the consumer needs it whatever kinds it
+    /// reads.
+    fn mark_session_start(&mut self) {
+        if self.replay.is_none() {
+            return;
+        }
+        self.forward(crate::wire::encode_session_start());
+    }
+
+    /// Send one payload to the consumer. A closed consumer channel ends the
+    /// egress direction.
+    fn forward(&mut self, payload: Vec<u8>) {
+        if self.egress_alive && self.out_tx.send(payload).is_err() {
+            self.egress_alive = false;
         }
     }
 
@@ -444,8 +456,8 @@ impl SessionLoop {
             .egress_kind_filter
             .as_ref()
             .is_none_or(|ks| payload.first().is_some_and(|k| ks.contains(k)));
-        if wanted && self.egress_alive && self.out_tx.send(payload).is_err() {
-            self.egress_alive = false;
+        if wanted {
+            self.forward(payload);
         }
     }
 
