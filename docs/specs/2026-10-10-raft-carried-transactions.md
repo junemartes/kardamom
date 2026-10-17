@@ -22,7 +22,7 @@
   - A member feeds only its own executor, over IPC. A separate service serves the validator,
     the batcher and external nodes (section 8.1, out of scope).
   - The boundary stream digest is a later follow-up.
-- Decided by the user on 2026-10-17 (decisions 10 to 17):
+- Decided by the user on 2026-10-17 (decisions 10 to 18):
   - The sealer keeps no retained file. Its Raft log and its snapshots are its only record.
   - The serving service tails the sealer members (a follower first) for the transactions, and
     reads the receipts from the executors. It keeps the append-only log of the transactions above
@@ -1909,7 +1909,11 @@ writes v12 before PR 13, so they need no waiver of their own:
 **Decisions 15 and 16 add PR 19 and PR 20** (section 11.1). PR 18 (#642, the sequencer
 retention) is dropped. PR 19 (#643, the executor rollback) needs the `output_floor_block` of the
 receipt buffer. PR 20 (#644, the recovery from the surviving log) needs the scheduled sync and the
-durable position (#645). Open question 16.1-14 asks if sync level 0 waits for them.
+durable position (#645).
+
+**The order of sync level 0 (decision 18).** #645 sets sync level 0 and adds the 1 s scheduled sync
+and the durable report itself. #645 does not merge before #643 (the executor rollback). So no
+release runs at sync level 0 without the scheduled sync, or without the executor rollback.
 
 ### 12.5 Rollback (production)
 
@@ -2294,7 +2298,7 @@ body).
 
 ## 16. Decisions of the user
 
-Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 17 are of 2026-10-17. Decision 16 replaces parts
+Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 18 are of 2026-10-17. Decision 16 replaces parts
 of decisions 10, 11 and 15; each replaced part says so.
 
 
@@ -2429,6 +2433,13 @@ of decisions 10, 11 and 15; each replaced part says so.
     - With a member that does not answer, the writer takes the lower of the two values that it
       has. With only one answer, it holds the exposure.
     - Only the writer polls: the replicas follow it.
+18. **The answers of 2026-10-17 to two points of decisions 16 and 17.**
+    - **The import.** The receipt history import at the cut-over stays (decision 14, section
+      12.3). Only the frame restore into the sealer goes (decision 16).
+    - **The order of sync level 0 (16.1-14).** #645 adds the 1 s scheduled sync and the durable
+      report itself, beside sync level 0. #645 does not merge before the executor rollback
+      (#643). So sync level 0 never runs without the scheduled sync or the rollback (section
+      12.4).
 
 ### 16.1 Still open
 
@@ -2456,10 +2467,8 @@ Questions 7 to 10 are answered (decision 14).
     surviving log and serve it. #644 must prove it with `sealer-tail-loss`.
 12. **Answered by decision 16.** There is no hold.
 13. **Answered by decision 16.** The sequencer keeps its rule of today.
-14. **The order of deployment.** Does sync level 0 (#645) deploy before the scheduled sync and the
-    rollback of the executors (#643)? Until the rollback runs, a power loss on a majority stops
-    the paired executors that ran past the surviving log, as in #615. Until the scheduled sync
-    runs, the loss window is the kernel writeback, about 30 s.
+14. **Answered by decision 18.** #645 adds the scheduled sync and the durable report with sync
+    level 0, and it does not merge before #643.
 15. **Answered by decision 16.** Confirmation is the post to the DA layer.
 16. **Answered by decision 17.** The serving service uses the majority durable position.
 17. **How a follower member sends its stream to the serving service (section 8.1).** Aeron Cluster
