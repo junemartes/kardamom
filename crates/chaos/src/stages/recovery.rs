@@ -91,6 +91,14 @@ impl Step {
         Self::Rises(Counter::ExecutorHead),
     ];
 
+    /// The counter of a `Rises` step.
+    fn counter(self) -> Option<Counter> {
+        match self {
+            Self::Rises(counter) => Some(counter),
+            Self::IngressesOpen => None,
+        }
+    }
+
     /// What did not happen when the step fails.
     fn failure(self) -> &'static str {
         match self {
@@ -138,21 +146,103 @@ impl Rise {
     }
 }
 
-/// The wait of one step: its base, and its last reading for the failure
-/// message.
-struct StepWait<'a> {
+/// The rise of each counter. The waiter takes every base before the
+/// first step, so a counter that rises during an earlier step holds at
+/// the first reading of its own step.
+#[derive(Debug, Default)]
+struct Rises {
+    leader_ticks: Rise,
+    batcher_posts: Rise,
+    executor_head: Rise,
+}
+
+impl Rises {
+    fn of(&self, counter: Counter) -> &Rise {
+        match counter {
+            Counter::LeaderTicks => &self.leader_ticks,
+            Counter::BatcherPosts => &self.batcher_posts,
+            Counter::ExecutorHead => &self.executor_head,
+        }
+    }
+}
+
+/// The recovery after the audit: one budget from `started` for all the
+/// steps, and the counters' bases.
+struct Recovery<'a> {
     harness: &'a Harness,
+    started: Instant,
+    rises: Rises,
+}
+
+impl<'a> Recovery<'a> {
+    /// Start the clock and read the base of every counter. A counter
+    /// that does not answer here takes its base at its first answer.
+    async fn start(harness: &'a Harness) -> anyhow::Result<Self> {
+        let recovery = Self {
+            harness,
+            started: Instant::now(),
+            rises: Rises::default(),
+        };
+        for counter in Step::ORDER.into_iter().filter_map(Step::counter) {
+            recovery.take_base(counter).await?;
+        }
+        Ok(recovery)
+    }
+
+    async fn take_base(&self, counter: Counter) -> anyhow::Result<()> {
+        self.rises
+            .of(counter)
+            .observe(counter.read(self.harness).await?);
+        Ok(())
+    }
+
+    async fn run(&self) -> anyhow::Result<()> {
+        for step in Step::ORDER {
+            self.await_step(step).await?;
+        }
+        crate::log(format!(
+            "the chain recovered after the persisted-state audit in {}s",
+            self.started.elapsed().as_secs()
+        ));
+        Ok(())
+    }
+
+    async fn await_step(&self, step: Step) -> anyhow::Result<()> {
+        let wait = StepWait::new(self, step);
+        let wait = &wait;
+        let budget = Budget::new(RECOVERY_BUDGET.saturating_sub(self.started.elapsed()), POLL);
+        poll::until(budget, |_| async move { wait.observe().await })
+            .await?
+            .or_fail(|_| {
+                crate::chaos_fail!(
+                    "the chain did not recover after the persisted-state audit: {} after {} s ({})",
+                    step.failure(),
+                    self.started.elapsed().as_secs(),
+                    wait.last.borrow()
+                )
+            })?;
+        crate::log(format!(
+            "persisted-state recovery: {} ({}s, {})",
+            step.success(),
+            self.started.elapsed().as_secs(),
+            wait.last.borrow()
+        ));
+        Ok(())
+    }
+}
+
+/// The wait of one step, and its last reading for the failure message.
+struct StepWait<'a> {
+    recovery: &'a Recovery<'a>,
     step: Step,
-    rise: Rise,
     last: RefCell<String>,
 }
 
 impl<'a> StepWait<'a> {
-    fn new(harness: &'a Harness, step: Step) -> Self {
+    fn new(recovery: &'a Recovery<'a>, step: Step) -> Self {
         Self {
-            harness,
+            recovery,
             step,
-            rise: Rise::default(),
             last: RefCell::new("no reading".to_string()),
         }
     }
@@ -166,15 +256,16 @@ impl<'a> StepWait<'a> {
     }
 
     async fn rose(&self, counter: Counter) -> anyhow::Result<Option<()>> {
-        let now = counter.read(self.harness).await?;
-        let rose = self.rise.observe(now);
-        *self.last.borrow_mut() = self.rise.describe(counter, now);
+        let now = counter.read(self.recovery.harness).await?;
+        let tracked = self.recovery.rises.of(counter);
+        let rose = tracked.observe(now);
+        *self.last.borrow_mut() = tracked.describe(counter, now);
         Ok(rose.then_some(()))
     }
 
     async fn ingresses_open(&self) -> Option<()> {
         let mut refusals = Vec::new();
-        for node in &self.harness.probes.ingresses {
+        for node in &self.recovery.harness.probes.ingresses {
             refusals.extend(self.refusal_of(node).await);
         }
         *self.last.borrow_mut() = refusals.join("; ");
@@ -183,7 +274,8 @@ impl<'a> StepWait<'a> {
 
     /// Why the ingress on `node` refuses a submit.
     async fn refusal_of(&self, node: &Probed) -> Option<String> {
-        let why = ChainView::refusal_at(&node.rpc_url(), self.harness.knobs.chain_id).await;
+        let chain_id = self.recovery.harness.knobs.chain_id;
+        let why = ChainView::refusal_at(&node.rpc_url(), chain_id).await;
         why.map(|why| format!("{}: {why}", node.container))
     }
 }
@@ -192,51 +284,22 @@ impl Harness {
     /// Wait until the chain runs again after the persisted-state audit:
     /// a sealer leader ticks the boundary clock, every ingress takes
     /// submits, the batcher confirms a new post, and the executors
-    /// advance. The steps run in this order and share one budget.
+    /// advance. The steps run in this order and share one budget. Every
+    /// counter takes its base before the first step, so a rise during an
+    /// earlier step counts.
     ///
     /// # Errors
     ///
     /// Returns an error that names the first step that did not hold
     /// within the budget, with its last reading.
     pub async fn await_chain_recovered(&self) -> anyhow::Result<()> {
-        let started = Instant::now();
-        for step in Step::ORDER {
-            self.await_recovery_step(step, started).await?;
-        }
-        crate::log(format!(
-            "the chain recovered after the persisted-state audit in {}s",
-            started.elapsed().as_secs()
-        ));
-        Ok(())
-    }
-
-    async fn await_recovery_step(&self, step: Step, started: Instant) -> anyhow::Result<()> {
-        let wait = StepWait::new(self, step);
-        let wait = &wait;
-        let budget = Budget::new(RECOVERY_BUDGET.saturating_sub(started.elapsed()), POLL);
-        poll::until(budget, |_| async move { wait.observe().await })
-            .await?
-            .or_fail(|_| {
-                crate::chaos_fail!(
-                    "the chain did not recover after the persisted-state audit: {} after {} s ({})",
-                    step.failure(),
-                    started.elapsed().as_secs(),
-                    wait.last.borrow()
-                )
-            })?;
-        crate::log(format!(
-            "persisted-state recovery: {} ({}s, {})",
-            step.success(),
-            started.elapsed().as_secs(),
-            wait.last.borrow()
-        ));
-        Ok(())
+        Recovery::start(self).await?.run().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Counter, Rise};
+    use super::{Counter, Rise, Rises, Step};
 
     #[test]
     fn only_the_heartbeat_lines_of_a_leader_count() {
@@ -259,6 +322,25 @@ mod tests {
         assert_eq!(
             rise.describe(Counter::BatcherPosts, Some(8)),
             "batcher posts 7 -> 8"
+        );
+    }
+
+    #[test]
+    fn a_counter_that_rose_during_an_earlier_step_holds_at_its_first_reading() {
+        let rises = Rises::default();
+        Step::ORDER
+            .into_iter()
+            .filter_map(Step::counter)
+            .for_each(|counter| assert!(!rises.of(counter).observe(Some(559))));
+        let executor = rises.of(Counter::ExecutorHead);
+        assert!(executor.observe(Some(578)), "the base is the early reading");
+        assert_eq!(
+            executor.describe(Counter::ExecutorHead, Some(578)),
+            "executor head 559 -> 578"
+        );
+        assert!(
+            !rises.of(Counter::BatcherPosts).observe(Some(559)),
+            "each counter keeps its own base"
         );
     }
 }
