@@ -149,6 +149,8 @@ class NomadAPI(BaseHTTPRequestHandler):
         path = self.path.split('?')[0].removeprefix('/v1/var/')
         assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
             and body['Path'] == path, (self.path, body)
+        # Nomad refuses a variable over 64 KiB.
+        assert len(json.dumps(body['Items'])) <= 64 * 1024, (path, len(json.dumps(body['Items'])))
         if path.startswith('kardamom/deploys/'):
             # The deploy record: two JSON documents in one variable, written
             # with a check-and-set on the modify index. A test clobbers the
@@ -350,17 +352,42 @@ class Deploys(unittest.TestCase):
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
-        # One stub for both operator binaries: the smoke of the cluster
-        # binary, and the format findings of the deploy binary for the
-        # release gate, which a test scripts in `smoke.sh.findings`.
+        # The target tree: a git checkout with the formats.toml of this
+        # repository. A deploy records its HEAD as the revision, which must
+        # be a commit of the checkout.
+        self.repo = Path(self.tmp.name) / 'repo'
+        self.repo.mkdir()
+        self.git('init', '-q')
+        (self.repo / 'formats.toml').write_text(FORMATS)
+        self.revision = self.commit('the release')
+        # One stub for each operator binary. The cluster binary smokes a
+        # canary and fails a `formats` call. The deploy binary prints the
+        # format findings of the release gate, which a test scripts in
+        # `deploy.sh.findings`. Each stub logs its calls in `<stub>.calls`.
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
         self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                              'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+                              'if [ "$1" = formats ]; then exit 1; fi\n')
         self.smoke.chmod(0o755)
+        self.deploy_bin = Path(self.tmp.name) / 'deploy.sh'
+        self.deploy_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
+                                   'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+        self.deploy_bin.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.api.server_close)
         self.addCleanup(self.api.shutdown)
+
+    def git(self, *args):
+        # A fixed date gives each commit the same hash in every test.
+        date = {'GIT_AUTHOR_DATE': '2026-01-01T00:00:00Z', 'GIT_COMMITTER_DATE': '2026-01-01T00:00:00Z'}
+        return subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               *args], check=True, capture_output=True, text=True, env=os.environ | date).stdout.strip()
+
+    def commit(self, message):
+        """Commit the target tree and return the new revision."""
+        self.git('add', '-A')
+        self.git('commit', '-q', '--allow-empty', '-m', message)
+        return self.git('rev-parse', 'HEAD')
 
     def run_deploy(self, extra=None, check=False, success=True, playbook="deploy.yml", environ=None):
         variables = {
@@ -376,12 +403,13 @@ class Deploys(unittest.TestCase):
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
-            'workloads_deploy_binary': str(self.smoke),
+            'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
             'workloads_registry_url': f'http://127.0.0.1:{self.api.server_port}',
-            'workloads_revision': 'rev-test',
+            'workloads_repo_root': str(self.repo),
+            'workloads_revision': '',
             'workloads_operator': 'tester',
         } | (extra or {})
         env = {k: v for k, v in os.environ.items() if not k.startswith(('ANSIBLE_', 'NOMAD_'))}
@@ -414,34 +442,40 @@ class Deploys(unittest.TestCase):
         return self.run_deploy(playbook='rollback.yml', success=success, environ=environ)
 
     # The result of a default deploy on a fresh fixture, kept per test class:
-    # the state of the fake API, and a copy of the record directory.
+    # the state of the fake API, and a directory with a copy of the record
+    # directory.
     deployed = None
-    deployed_state = None
 
     def deploy(self):
         """Run a default deploy on the fresh fixture of this test.
 
-        A deploy of the whole pipeline takes minutes on a loaded runner, and
-        its result is the same for every test. The first test of a class runs
-        it. Every later test restores the state and the files that it left.
+        A deploy of the whole pipeline takes minutes on a loaded runner. The
+        first test of a class runs it. Every later test restores the state
+        and the files that it left. The copy is valid only while the first
+        deploy gives the same result in every test: the same fixtures, the
+        same revision, and no `.calls` file of a stub.
         """
         cls = type(self)
         if cls.deployed is None:
             self.run_deploy()
-            cls.deployed = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
-            cls.addClassCleanup(cls.deployed.cleanup)
-            shutil.copytree(self.record_dir, Path(cls.deployed.name) / 'deployed')
-            cls.deployed_state = copy.deepcopy(self.api.state)
+            files = tempfile.TemporaryDirectory(prefix='kardamom-deploy-snapshot-')
+            cls.addClassCleanup(files.cleanup)
+            shutil.copytree(self.record_dir, Path(files.name) / 'deployed')
+            cls.deployed = (copy.deepcopy(self.api.state), files)
             return
-        self.api.state = copy.deepcopy(cls.deployed_state)
-        shutil.copytree(Path(cls.deployed.name) / 'deployed', self.record_dir)
+        state, files = cls.deployed
+        self.api.state = copy.deepcopy(state)
+        shutil.copytree(Path(files.name) / 'deployed', self.record_dir)
 
     def gate_formats(self, findings):
-        """Deploy once, then script the format findings of the next deploy."""
+        """Deploy once, give the accepted release the formats text that the
+        gate compares with, then script the format findings of the next
+        deploy."""
         self.deploy()
+        self.record()['accepted']['target']['formats'] = FORMATS
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
-        Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
+        Path(str(self.deploy_bin) + '.findings').write_text(json.dumps(findings))
         self.repin('b')
 
 
@@ -986,8 +1020,8 @@ class RecordTest(Deploys):
         attempt = self.record()['attempt']
         self.assertEqual(self.record()['accepted'], attempt)
         self.assertEqual(attempt['status'], 'accepted')
-        self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', 'rev-test'))
-        self.assertEqual(attempt['target']['formats'], FORMATS)
+        self.assertEqual((attempt['env'], attempt['operator'], attempt['target']['revision']), ('local', 'tester', self.revision))
+        self.assertNotIn('formats', attempt['target'])
         self.assertEqual(attempt['target']['manifest']['ingress'], f'registry.example:5000/kardamom-ingress:test@sha256:{"a" * 64}')
         self.assertEqual(attempt['changed'], self.api.state['writes'])
         # Every job was new: no version before, version 0 after.
@@ -998,7 +1032,8 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['record_writes'], ['started'] * (2 * len(self.api.state['writes']) + 1) + ['accepted'])
         self.assertEqual(json.loads((self.record_dir / 'attempt.json').read_text()), attempt)
         self.assertEqual(json.loads((self.record_dir / 'accepted.json').read_text()), attempt)
-        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+        # The record holds no formats text, so the mirror writes no registry.
+        self.assertFalse((self.record_dir / 'accepted.formats.toml').exists())
         # A new release records the versions before it, and only the jobs it changed.
         self.repin('b')
         self.api.state['writes'] = []
@@ -1096,7 +1131,7 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('does not hold the image of executor', output)
         self.assertEqual(self.api.state['writes'], [])
-        self.assertFalse(Path(str(self.smoke) + '.calls').exists(), 'the gate reads the registry before the formats')
+        self.assertFalse(Path(str(self.deploy_bin) + '.calls').exists(), 'the gate reads the registry before the formats')
         # Only the local profile skips the check.
         output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
         self.assertIn('the production profile does not allow that', output)
@@ -1119,9 +1154,41 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('coordinated format change: sealer-snapshot', output)
         self.assertEqual(self.api.state['writes'], [])
-        # The comparison ran the library against the accepted registry and this tree.
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
-        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+        # The deploy binary ran the comparison against the accepted registry
+        # and this tree. The cluster binary did not run.
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
+        self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
+        self.assertFalse(Path(str(self.smoke) + '.calls').exists())
+
+    def test_a_retired_format_needs_the_allowance(self):
+        self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1,
+                            'shared': False, 'permanent': False}])
+        output = self.run_deploy(success=False)
+        self.assertIn('coordinated format change: notifier-outbox.', output)
+        self.assertIn('set KARDAMOM_ALLOW_RETIRED=notifier-outbox', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy(success=False, environ={'KARDAMOM_ALLOW_RETIRED': 'notifier-outbox,state-db'})
+        self.assertIn('KARDAMOM_ALLOW_RETIRED names state-db, and the release retires no format', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy(environ={'KARDAMOM_ALLOW_RETIRED': 'notifier-outbox'})
+        self.assertIn('KARDAMOM_ALLOW_RETIRED accepts the retirement of notifier-outbox.', output)
+        self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
+        self.assertEqual(self.record()['accepted']['floor'], {})
+        self.assertEqual(self.record()['accepted']['retired'], ['notifier-outbox'])
+
+    def test_a_retired_shared_or_permanent_format_refuses_the_rolling_path(self):
+        # Shared, permanent, and a finding without the flags: the allowance
+        # covers none of them.
+        self.gate_formats([{'rule': 'retired', 'id': 'aeron-stream-records', 'head': 1, 'base': 1,
+                            'shared': True, 'permanent': False},
+                           {'rule': 'retired', 'id': 'kar1-batch', 'head': 1, 'base': 1,
+                            'shared': False, 'permanent': True},
+                           {'rule': 'retired', 'id': 'old-spool', 'head': 2, 'base': 2}])
+        output = self.run_deploy(success=False, environ={
+            'KARDAMOM_ALLOW_RETIRED': 'aeron-stream-records,kar1-batch,old-spool'})
+        self.assertIn('coordinated format change: aeron-stream-records, kar1-batch, old-spool.', output)
+        self.assertNotIn('set KARDAMOM_ALLOW_RETIRED', output)
+        self.assertEqual(self.api.state['writes'], [])
 
     def test_a_one_way_format_change_needs_the_allowance(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
@@ -1133,7 +1200,7 @@ class RecordTest(Deploys):
         self.assertEqual(self.api.state['writes'], [])
         self.run_deploy(environ={'KARDAMOM_ALLOW_ONE_WAY': 'state-db'})
         self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
-        self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': 'rev-test'})
+        self.assertEqual(self.record()['accepted']['floor'], {'formats': {'state-db': 4}, 'revision': self.revision})
 
     def test_a_must_match_sealer_setting_refuses_the_rolling_path(self):
         self.deploy()
@@ -1243,6 +1310,56 @@ class RecordTest(Deploys):
 
 
 
+class RecordFormatsTest(Deploys):
+    """The revision and the formats text in the deploy record: a deploy
+    records a commit of its checkout and no formats text; the gate compares
+    with the text of an accepted release that holds it."""
+
+    CLUSTER_ROLES = {'node-cluster-0': 'FOLLOWER', 'node-cluster-1': 'LEADER', 'node-cluster-2': 'FOLLOWER'}
+
+    def formats_calls(self):
+        calls = Path(str(self.deploy_bin) + '.calls')
+        return calls.read_text().splitlines() if calls.exists() else []
+
+    def next_release(self):
+        self.repin('b')
+        self.api.state['roles'] = self.CLUSTER_ROLES
+
+    def test_a_record_with_the_text_gates_and_rolls_back_to_it(self):
+        # The accepted release holds the formats text in target and before,
+        # as the record of staging does.
+        self.run_deploy()
+        for document in self.record().values():
+            document['target']['formats'] = FORMATS
+            document['before']['formats'] = FORMATS
+        self.next_release()
+        self.run_deploy()
+        self.assertEqual(self.formats_calls(),
+                         [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
+        attempt = self.record()['attempt']
+        self.assertNotIn('formats', attempt['target'])
+        self.assertEqual(attempt['before']['formats'], FORMATS)
+        self.api.state['roll_marker'] = 'a' * 64
+        (self.record_dir / 'accepted.formats.toml').unlink()
+        self.run_rollback()
+        self.assertEqual(self.record()['accepted']['target']['formats'], FORMATS)
+        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+
+    def test_a_record_without_the_text_has_no_base(self):
+        self.run_deploy()
+        self.next_release()
+        self.run_deploy()
+        self.assertEqual(self.formats_calls(), [])
+        attempt = self.record()['attempt']
+        self.assertEqual((attempt['status'], attempt['before']['revision']), ('accepted', self.revision))
+        self.assertNotIn('formats', attempt['before'])
+
+    def test_a_target_revision_outside_the_checkout_stops_the_gate(self):
+        output = self.run_deploy({'workloads_revision': 'd' * 40}, success=False)
+        self.assertIn(f'the target revision {"d" * 40} is not a commit of the checkout', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+
 class RollbackTest(Deploys):
     """`just rollback`: the targets, the floor, the re-render, the resume."""
 
@@ -1267,7 +1384,8 @@ class RollbackTest(Deploys):
         self.assertEqual(record['attempt']['status'], 'rolled_back')
         self.assertEqual(record['accepted']['restored_from'], record['attempt']['started_at'])
         self.assertEqual(record['accepted']['target']['manifest'], record['attempt']['before']['manifest'])
-        self.assertEqual(record['accepted']['target']['formats'], FORMATS)
+        self.assertEqual(record['accepted']['target']['revision'], self.revision)
+        self.assertNotIn('formats', record['accepted']['target'])
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
 

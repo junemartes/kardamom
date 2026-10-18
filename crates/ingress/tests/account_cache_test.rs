@@ -164,7 +164,7 @@ async fn the_receipt_cache_answers_a_retry_before_the_nonce_check() {
     // live pump's order.
     let _ = mock.apply_rows(BPosition::from_index(1), &[row(signer.address(), 1, 0)]);
     mock.receipt_bus
-        .send(receipt(signer.address(), 0, tx_hash, 1))
+        .send(receipt(signer.address(), 0, tx_hash, 1).into())
         .unwrap();
     // The receipt watcher runs on its own task.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -198,7 +198,7 @@ async fn a_skip_receipt_leaves_its_nonce_open() {
         skip_reason: Some(kardamom_types::SkipReason::InsufficientFunds),
         ..receipt(signer.address(), 0, tx_hash, 1)
     };
-    mock.receipt_bus.send(skip).unwrap();
+    mock.receipt_bus.send(skip.into()).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let got = p
         .submit_raw_async(IP, raw)

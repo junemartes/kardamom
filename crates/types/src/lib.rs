@@ -73,7 +73,7 @@ pub use prover::{
     BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
     PublicOutputs, batch_records_commitment,
 };
-pub use receipt::{AccountRow, ReceiptBatch, ReceiptRows};
+pub use receipt::{AccountRow, ReceiptBatch, ReceiptRollback, ReceiptRows};
 pub use receipt::{
     Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN, WireLog, tx_type_of,
 };

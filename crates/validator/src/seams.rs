@@ -299,6 +299,15 @@ impl ValidatorReceiptSink {
 }
 
 impl TxReceiptsPublication for ValidatorReceiptSink {
+    /// The validator publishes no receipt stream, so it has no rollback
+    /// record to send.
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
             CMessage::Receipt(local) => self.check_item(&ReceiptRows::bare(local)),
@@ -469,6 +478,9 @@ impl ValidatorReceiptSink {
     }
 }
 
+#[cfg(test)]
+#[path = "seams_rollback_tests.rs"]
+mod rollback_tests;
 #[cfg(test)]
 #[path = "seams_tests.rs"]
 mod tests;

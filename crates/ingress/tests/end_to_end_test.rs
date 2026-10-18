@@ -175,7 +175,7 @@ async fn proxy_parks_until_watermark_advances() {
                 nonce,
                 ..Default::default()
             };
-            let _ = receipt_bus.send(receipt);
+            let _ = receipt_bus.send(receipt.into());
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = watermark_bus.send(QuorumWatermark { position: pos });
         }
@@ -212,7 +212,7 @@ async fn proxy_parks_until_watermark_advances() {
 fn fan_out_replica_receipt(
     envelope: &kardamom_types::TxEnvelope,
     pos: BPosition,
-    receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+    receipt_bus: &tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
     replicas: usize,
 ) {
     let nonce = nonce_of(&envelope.raw_tx);
@@ -228,7 +228,7 @@ fn fan_out_replica_receipt(
         ..Default::default()
     };
     (0..replicas).for_each(|_| {
-        let _ = receipt_bus.send(receipt.clone());
+        let _ = receipt_bus.send(receipt.clone().into());
     });
 }
 
@@ -315,7 +315,7 @@ async fn race_rejection_then_receipt(
     envelope: &kardamom_types::TxEnvelope,
     pos: BPosition,
     error_bus: &tokio::sync::broadcast::Sender<kardamom_types::TxError>,
-    receipt_bus: &tokio::sync::broadcast::Sender<Receipt>,
+    receipt_bus: &tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
 ) {
     let nonce = nonce_of(&envelope.raw_tx);
     (0..2).for_each(|_| {
@@ -328,17 +328,20 @@ async fn race_rejection_then_receipt(
         });
     });
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let _ = receipt_bus.send(Receipt {
-        tx_idx: pos,
-        tx_hash: envelope.tx_hash,
-        status: true,
-        gas_used: 21_000,
-        logs: Vec::new(),
-        write_set_hash: B256::ZERO,
-        from: envelope.sender,
-        nonce,
-        ..Default::default()
-    });
+    let _ = receipt_bus.send(
+        Receipt {
+            tx_idx: pos,
+            tx_hash: envelope.tx_hash,
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            from: envelope.sender,
+            nonce,
+            ..Default::default()
+        }
+        .into(),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

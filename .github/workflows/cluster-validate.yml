@@ -65,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [specs, DeployTest, SealerTest, RecordTest, RollbackTest, others]
+        part: [specs, DeployTest, SealerTest, RecordTest, RecordFormatsTest, RollbackTest, others]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

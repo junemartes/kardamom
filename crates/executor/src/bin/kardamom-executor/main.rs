@@ -25,7 +25,11 @@
 //! tear down.
 
 mod args;
+mod ledger;
+mod marker;
+mod rollback;
 mod state;
+mod turns;
 mod wiring;
 
 use std::process::ExitCode;
@@ -44,6 +48,8 @@ use kardamom_log::discovery::StreamPlane;
 use kardamom_state::{StateWriter, seed_genesis};
 
 use args::Args;
+use ledger::ReceiptLedger;
+use turns::{RunEnd, Turns, Verdict};
 use wiring::{ExecutorOrdering, ExecutorWiring};
 
 /// The state writer and the adapters built from its handle, plus the
@@ -224,16 +230,17 @@ async fn connect_cluster(
     args: &Args,
     file_cfg: &ExecutorFileConfig,
     plane: &StreamPlane,
-    start: &kardamom_engine::ResumePoint,
+    state: &state::PreparedState,
+    history: Option<kardamom_engine::reader::carried::LocalHistory>,
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<(
     Option<kardamom_cluster_adapter::LiveCluster>,
     ExecutorOrdering,
 )> {
-    let cursor = bin_support::cluster_replay_cursor(start);
+    let cursor = bin_support::cluster_replay_cursor(&state.start);
     let aeron_dir = args.aeron_dir.as_deref();
     if args.carry_bytes {
-        let sub = bin_support::open_member_feed(aeron_dir, cursor, stop.clone())?;
+        let sub = bin_support::open_member_feed(aeron_dir, cursor, history, stop.clone())?;
         tracing::info!("kardamom-executor: canonical entries via the member feed");
         return Ok((None, ExecutorOrdering::Carried(Box::new(sub))));
     }
@@ -287,6 +294,7 @@ struct OutputsConfig<'a> {
     plane: &'a mut StreamPlane,
     aeron_cfg: &'a kardamom_log::config::AeronConfig,
     stop: tokio_util::sync::CancellationToken,
+    ledger: Option<ReceiptLedger>,
 }
 
 impl Outputs {
@@ -300,8 +308,9 @@ impl Outputs {
             plane,
             aeron_cfg,
             stop,
+            ledger,
         } = cfg;
-        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args).await?;
+        let tx_receipts_pub = wiring::open_tx_receipts_pub(rt_pub, plane, args, ledger).await?;
         // This replica's lifecycle on the `events` stream: the ingress pauses
         // submits once every executor is halted.
         plane
@@ -420,17 +429,6 @@ impl Boot {
     }
 }
 
-/// What the process does after one revolution of the pipeline.
-enum Verdict {
-    /// The engine returned cleanly: the operator asked for shutdown.
-    Done,
-    /// A peer checkpoint is staged and the stale state parked: run the
-    /// pipeline again, which restores it.
-    Revolve,
-    /// The pipeline failed and the process cannot repair it.
-    Failed(ExecutorError),
-}
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> ExitCode {
     match run().await {
@@ -456,45 +454,20 @@ fn exit_code(e: &anyhow::Error) -> ExitCode {
 async fn run() -> Result<()> {
     let boot = Boot::init(Args::parse()).await?;
     // Each turn runs the whole pipeline once. A refused replay stages a
-    // peer checkpoint and comes back here for the next turn, which
-    // restores it in-process, with no orchestrator restart in between
-    // (issue #298); every other end leaves the loop.
-    let mut revolutions = 0u32;
-    while turn(&boot, &mut revolutions).await?.is_continue() {}
+    // peer checkpoint, and a divergence stages a rollback. Both come back
+    // here for the next turn, which restores the checkpoint in-process,
+    // with no orchestrator restart in between; every other end leaves the
+    // loop.
+    let mut turns = Turns::new(boot.args.rollback_compare_blocks);
+    while turns.turn(&boot).await?.is_continue() {}
     Ok(())
-}
-
-/// One turn of the process loop: a revolution, then its verdict.
-/// `Continue` means run again; `Break` means the process is done. A
-/// failure the process cannot repair returns `Err`, so the process exits
-/// non-zero: the orchestrator tells a dead pipeline from a clean shutdown
-/// by the exit status, which the whole "fail loudly, resume from the
-/// cursor" loop relies on.
-async fn turn(boot: &Boot, revolutions: &mut u32) -> Result<std::ops::ControlFlow<()>> {
-    match Box::pin(run_once(boot)).await? {
-        Verdict::Done => return Ok(std::ops::ControlFlow::Break(())),
-        Verdict::Failed(e) => {
-            return Err(anyhow::Error::new(e).context("executor pipeline failed"));
-        }
-        Verdict::Revolve => (),
-    }
-    if boot.stop.is_cancelled() {
-        tracing::info!("shutdown signal received during the resync repair; not revolving");
-        return Ok(std::ops::ControlFlow::Break(()));
-    }
-    *revolutions += 1;
-    tracing::info!(
-        revolutions,
-        "resync: the pipeline starts again in-process and restores the staged peer checkpoint"
-    );
-    Ok(std::ops::ControlFlow::Continue(()))
 }
 
 /// One revolution: open the transport and the state, run the engine to
 /// its end, repair a refused replay, and return the verdict. Every
 /// handle, the nonce query server's clone of the state env included, is
 /// gone before the repair parks the state.
-async fn run_once(boot: &Boot) -> Result<Verdict> {
+async fn run_once(boot: &Boot, window: std::num::NonZeroU64) -> Result<Verdict> {
     let args = &boot.args;
     let file_cfg = &boot.file_cfg;
     let Transport {
@@ -515,8 +488,12 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // The guard in `LiveStreams` cancels this token on the way out; that
     // stops the periodic checkpointer task.
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let state::PreparedState { env, start } =
-        state::prepare_state(args, expected_genesis, shutdown.clone())?;
+    let turns::RunStart {
+        prepared,
+        rollback,
+        ledger,
+        history,
+    } = boot.start_run(window, expected_genesis, shutdown.clone())?;
 
     // M tx_data subscriptions, plus tx_deposits, bridged from async to
     // sync (shared with the validator binary; see `bin_support`). These
@@ -531,12 +508,18 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
         plane: &mut plane,
         aeron_cfg: &aeron_cfg,
         stop: shutdown.clone(),
+        ledger: ledger.clone(),
     })
     .await?;
     let exec_stream_threads = outputs.exec_stream.threads;
 
     let (cluster_guard, tx_ordering_sub) =
-        connect_cluster(args, file_cfg, &plane, &start, &shutdown).await?;
+        connect_cluster(args, file_cfg, &plane, &prepared, history, &shutdown).await?;
+    let state::PreparedState {
+        env,
+        start,
+        checkpointer,
+    } = prepared;
     outputs.exec_stream.cursor.start(
         boot.cursor_id
             .and_then(|id| tx_ordering_sub.recorded_cursor_publisher(id)),
@@ -557,6 +540,7 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // The must-deliver escalation of the commit thread follows the stall
     // budget of the publication runtime.
     cfg.stall_budget = rt_pub.stall_budget();
+    cfg.rollback = rollback;
 
     let block_exec = wiring::build_block_exec(args);
 
@@ -624,34 +608,13 @@ async fn run_once(boot: &Boot) -> Result<Verdict> {
     // End the nonce query server before the repair: it holds a clone of
     // the state env, and the repair parks that env.
     stop_nonce_query(nonce_query).await;
-    // Replay-window overrun: repair between revolutions, so the next one
-    // restores a fetched peer checkpoint instead of re-requesting the
-    // same refused `REPLAY_FROM`. See
-    // `bin_support::replay_unavailable_fallback`.
-    let repaired = bin_support::replay_unavailable_fallback(
-        engine_error.as_ref(),
-        args.checkpoint_dir.as_deref(),
-        &args.checkpoint_peers,
-        &args.state_dir,
+    boot.finish(RunEnd {
+        engine_error,
+        ledger,
+        checkpointer,
         expected_genesis,
-        false,
-    )?;
-    if let Some(outcome) = repaired {
-        metrics::counter!(kardamom_engine::metrics::RESYNC_TOTAL, "outcome" => outcome)
-            .increment(1);
-    }
-    Ok(verdict(engine_error, repaired))
-}
-
-/// The verdict for one engine result and the repair's result. `repaired`
-/// is the resync outcome label the fallback returned, or `None` when the
-/// error was not a refused replay, or the fallback is not configured.
-fn verdict(engine_error: Option<ExecutorError>, repaired: Option<&str>) -> Verdict {
-    match (engine_error, repaired) {
-        (None, _) => Verdict::Done,
-        (Some(_), Some("peer-checkpoint")) => Verdict::Revolve,
-        (Some(e), _) => Verdict::Failed(e),
-    }
+    })
+    .await
 }
 
 /// End the nonce query server, when one runs, and wait until its task is
@@ -705,44 +668,5 @@ async fn wait_for_engine(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verdict_revolves_only_on_a_staged_checkpoint() {
-        let refused = || ExecutorError::ClusterReplayUnavailable {
-            from_index: 10,
-            oldest_index: 500,
-            oldest_block: 7,
-        };
-        assert!(matches!(
-            verdict(Some(refused()), Some("peer-checkpoint")),
-            Verdict::Revolve
-        ));
-        assert!(matches!(
-            verdict(Some(refused()), Some("unrecoverable")),
-            Verdict::Failed(_)
-        ));
-        assert!(matches!(verdict(Some(refused()), None), Verdict::Failed(_)));
-        assert!(matches!(verdict(None, None), Verdict::Done));
-    }
-
-    /// A dead publication exits with its own code, also behind a context;
-    /// every other failure exits with 1.
-    #[test]
-    fn a_dead_publication_has_its_own_exit_code() {
-        let dead = anyhow::Error::new(ExecutorError::PublicationDead {
-            topic: "tx_receipts".into(),
-            unconnected_s: 140,
-            reopen_after_s: 35,
-        })
-        .context("executor pipeline failed");
-        assert_eq!(exit_code(&dead), ExitCode::from(3));
-        let other = anyhow::Error::new(ExecutorError::TxOrderingClosed);
-        assert_eq!(exit_code(&other), ExitCode::FAILURE);
-        assert_eq!(
-            exit_code(&anyhow::anyhow!("bind failed")),
-            ExitCode::FAILURE
-        );
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;

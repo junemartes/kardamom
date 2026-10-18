@@ -17,6 +17,19 @@ use crate::reader::Ordered;
 /// without limit.
 const MAX_PENDING: usize = 1 << 20;
 
+/// Which gauge a delivered boundary sets. Only one role per host emits
+/// the `kardamom_sealer_*` series: the executor, the chosen point that
+/// probes and dashboards scrape. The validator exports the head under its
+/// own name, so its exporter publishes no second, lagging copy of the
+/// series (see `crate::metrics`). A reorder that only checks frames, and
+/// delivers nothing downstream, sets no gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundaryMetrics {
+    Sealer,
+    Validator,
+    Off,
+}
+
 /// The delivery cursor and the pending set of one canonical stream.
 pub(crate) struct Reorder {
     pub(crate) cursor: ReplayCursor,
@@ -39,12 +52,8 @@ pub(crate) struct Reorder {
     /// in the open block, and the executor would execute it, and stream its
     /// receipt, with the wrong block number.
     catching_up: bool,
-    /// Whether deliveries re-export the sealer's boundary stream as
-    /// `kardamom_sealer_*` metrics. Only one role per host emits them: the
-    /// executor, the chosen point that probes and dashboards scrape. The
-    /// validator suppresses the emission, so its exporter publishes no
-    /// second, lagging copy of the series (see `crate::metrics`).
-    pub(crate) emit_sealer_metrics: bool,
+    /// The gauge that each delivered boundary sets.
+    pub(crate) metrics: BoundaryMetrics,
 }
 
 impl Reorder {
@@ -54,16 +63,13 @@ impl Reorder {
             pending_records: BTreeMap::new(),
             pending_boundaries: BTreeMap::new(),
             catching_up: false,
-            emit_sealer_metrics: true,
+            metrics: BoundaryMetrics::Sealer,
         }
     }
 
     /// The next canonical index and the next block number to deliver.
     pub(crate) fn next(&self) -> (u64, u64) {
-        (
-            self.cursor.next_index.load(Ordering::Relaxed),
-            self.cursor.next_block.load(Ordering::Relaxed),
-        )
+        self.cursor.position()
     }
 
     /// Hold the records until the replay of a new session is done. The
@@ -92,11 +98,15 @@ impl Reorder {
             reason = "block numbers stay far below 2^52"
         )]
         let head = block_number as f64;
-        if self.emit_sealer_metrics {
-            metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
-            metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(head);
-        } else {
-            metrics::gauge!(crate::metrics::VALIDATOR_SEALER_BLOCK_NUMBER).set(head);
+        match self.metrics {
+            BoundaryMetrics::Sealer => {
+                metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
+                metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(head);
+            }
+            BoundaryMetrics::Validator => {
+                metrics::gauge!(crate::metrics::VALIDATOR_SEALER_BLOCK_NUMBER).set(head);
+            }
+            BoundaryMetrics::Off => {}
         }
     }
 

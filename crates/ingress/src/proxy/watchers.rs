@@ -3,17 +3,23 @@
 //! boundaries. Each watcher is a struct that holds the proxy state it
 //! folds items into; [`BroadcastWatcher`] drains the stream into it.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::{broadcast, watch};
 
-use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxError};
+use kardamom_types::{
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, ReceiptRollback, TxError,
+};
 
-use crate::channels::{IngressPublication, IngressSubscription};
+use crate::channels::{IngressPublication, IngressSubscription, ReceiptItem};
+use crate::cold_accounts::ColdAccounts;
 use crate::fee_history::FeeHistory;
 use crate::pending::PendingReceipts;
 use crate::receipt_cache::ReceiptCache;
+use crate::rollback_log::RollbackLog;
 use crate::seen_receipts::SeenReceipts;
 use crate::tx_error_dedup::TxErrorDedup;
 
@@ -44,16 +50,23 @@ where
         .spawn();
     }
 
-    pub(super) fn spawn_tx_receipts_watcher(&self) {
+    /// Spawn the receipt watcher. It owns `applied`, the log of the
+    /// rollbacks that it applied.
+    pub(super) fn spawn_tx_receipts_watcher(&self, applied: watch::Sender<RollbackLog>) {
         BroadcastWatcher::new(
             self.subscription.subscribe_receipts(),
-            TxReceiptsWatcher::new(
-                self.pending.clone(),
-                self.cache.clone(),
-                self.tx_error_dedup.clone(),
-                self.receipt_feed.clone(),
-                self.fee_history.clone(),
-            ),
+            TxReceiptsWatcher {
+                pending: self.pending.clone(),
+                cache: self.cache.clone(),
+                seen: SeenReceipts::default(),
+                error_dedup: self.tx_error_dedup.clone(),
+                feed: self.receipt_feed.clone(),
+                fee_history: self.fee_history.clone(),
+                latest: self.latest_block_number.clone(),
+                cold: self.cold.clone(),
+                rollbacks: self.subscription.rollbacks(),
+                applied,
+            },
         )
         .spawn();
     }
@@ -176,40 +189,34 @@ impl Watch<TxError> for TxErrorsWatcher {
 /// redundant work. It is a no-op on the single-executor IPC path. Only
 /// this task ever touches `seen`, so it owns the set by value, with no
 /// `Arc` or lock.
+///
+/// A rollback applies once for each event, in the order of the bus. When
+/// the bus drops items, the watcher reads the rollbacks that it missed
+/// from the rollback log of the subscription. See [`Self::catch_up`].
 struct TxReceiptsWatcher {
     pending: Arc<PendingReceipts>,
     cache: Arc<ReceiptCache>,
     seen: SeenReceipts,
     error_dedup: Arc<TxErrorDedup>,
-    feed: broadcast::Sender<Receipt>,
+    feed: broadcast::Sender<ReceiptItem>,
     fee_history: Arc<FeeHistory>,
+    /// The head that `eth_blockNumber` reads. A rollback lowers it.
+    latest: Arc<AtomicU64>,
+    /// The executor answers of the cold senders. A rollback empties them.
+    cold: Arc<ColdAccounts>,
+    /// The recent rollbacks of the subscription, for a gap on the bus.
+    rollbacks: watch::Receiver<RollbackLog>,
+    /// The rollbacks that this watcher applied. The receipt subscriptions
+    /// read it.
+    applied: watch::Sender<RollbackLog>,
 }
 
 impl TxReceiptsWatcher {
-    fn new(
-        pending: Arc<PendingReceipts>,
-        cache: Arc<ReceiptCache>,
-        error_dedup: Arc<TxErrorDedup>,
-        feed: broadcast::Sender<Receipt>,
-        fee_history: Arc<FeeHistory>,
-    ) -> Self {
-        Self {
-            pending,
-            cache,
-            seen: SeenReceipts::default(),
-            error_dedup,
-            feed,
-            fee_history,
-        }
-    }
-}
-
-impl Watch<Receipt> for TxReceiptsWatcher {
-    async fn on_item(&mut self, receipt: Receipt) {
+    async fn on_receipt(&mut self, receipt: Receipt) {
         // First-wins: `insert` returns false if the hash was already
         // present. That means this is a duplicate replica copy, so drop
         // it.
-        if !self.seen.insert(receipt.tx_hash) {
+        if !self.seen.insert(receipt.tx_hash, receipt.block_number) {
             metrics::counter!(crate::metrics::RECEIPT_DUPLICATE_TOTAL).increment(1);
             return;
         }
@@ -224,8 +231,153 @@ impl Watch<Receipt> for TxReceiptsWatcher {
         // This re-broadcasts the deduped event to subscription-mode
         // clients. `send` errors only when no subscriber exists, which is
         // fine.
-        let _ = self.feed.send(receipt.clone());
+        let _ = self.feed.send(receipt.clone().into());
         self.pending.on_receipt(sender, nonce, receipt).await;
+    }
+
+    /// An executor voided the receipts above `to_block`. Drop them from
+    /// the cache, the fee history and the head, and forget their seen
+    /// hashes, so a transaction that comes again with its old hash passes.
+    /// Forget the cold answers too: one can hold a lost state. The feed
+    /// carries the rollback on, and each receipt subscription ends on it.
+    /// A rollback of an event that this watcher applied already is a late
+    /// copy: it changes nothing, so the receipts of the new stream stay.
+    fn on_rollback(&mut self, rollback: ReceiptRollback) {
+        if !self.applied.send_if_modified(|log| log.push(rollback)) {
+            tracing::debug!(to_block = rollback.to_block, id = %rollback.id, "a rollback applied already");
+            return;
+        }
+        let to_block = rollback.to_block;
+        tracing::warn!(
+            to_block,
+            id = %rollback.id,
+            "an executor rolled back: dropping the receipts above the block"
+        );
+        self.cache.roll_back(to_block);
+        self.seen.forget_above(to_block);
+        self.fee_history.roll_back(to_block);
+        self.latest.fetch_min(to_block, Ordering::AcqRel);
+        self.cold.clear();
+        let _ = self.feed.send(ReceiptItem::Rollback(rollback));
+    }
+}
+
+impl Watch<ReceiptItem> for TxReceiptsWatcher {
+    async fn on_item(&mut self, item: ReceiptItem) {
+        match item {
+            ReceiptItem::Receipt(receipt) => self.on_receipt(receipt).await,
+            ReceiptItem::Rollback(rollback) => self.on_rollback(rollback),
+        }
+    }
+
+    /// The bus dropped items, and a rollback can be among them. Read on
+    /// until a read of the queue sees no new gap.
+    async fn on_lagged(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) {
+        while self.catch_up(rx).await.is_continue() {}
+    }
+}
+
+impl TxReceiptsWatcher {
+    /// One read of the queue after a gap. The pump puts a rollback on the
+    /// bus before it puts it in the log. So each rollback of the log that
+    /// this watcher did not apply is in the queue, or the bus dropped it.
+    ///
+    /// - A rollback in the queue applies in bus order. The receipts before
+    ///   it on the bus can be above its block, and it must drop them.
+    /// - A rollback that the bus dropped came before the whole queue. It
+    ///   applies first.
+    ///
+    /// When the bus drops items again during the read, a missing rollback
+    /// can still come after the new gap. None then applies from the log,
+    /// and the next read decides. A late rollback only drops valid
+    /// receipts, which the receipt lookup serves again. An early one keeps
+    /// void receipts. `Continue` means a new gap.
+    async fn catch_up(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) -> ControlFlow<()> {
+        let missed = self.unapplied();
+        let queue = LagQueue::read(rx);
+        queue
+            .dropped(missed)
+            .into_iter()
+            .for_each(|rollback| self.on_rollback(rollback));
+        let next = queue.next();
+        for item in queue.items {
+            self.on_item(item).await;
+        }
+        next
+    }
+
+    /// The rollbacks of the subscription log that this watcher did not
+    /// apply, oldest first.
+    fn unapplied(&mut self) -> Vec<ReceiptRollback> {
+        let applied = self.applied.borrow();
+        self.rollbacks
+            .borrow_and_update()
+            .since(0)
+            .filter(|rollback| !applied.contains(rollback.id))
+            .copied()
+            .collect()
+    }
+}
+
+/// The items that the receipt bus holds after a gap, oldest first.
+struct LagQueue {
+    items: Vec<ReceiptItem>,
+    /// False when the bus dropped items again during the read.
+    complete: bool,
+}
+
+impl LagQueue {
+    /// Read the items that `rx` holds now. The read stops at the count of
+    /// its start, so a fast pump does not keep it going.
+    fn read(rx: &mut broadcast::Receiver<ReceiptItem>) -> Self {
+        let held = rx.len();
+        let mut queue = Self {
+            items: Vec::with_capacity(held),
+            complete: true,
+        };
+        while queue.items.len() < held && queue.take(rx).is_continue() {}
+        queue
+    }
+
+    /// Take one item of `rx`. `Break` when the bus is empty, or when it
+    /// dropped items again.
+    fn take(&mut self, rx: &mut broadcast::Receiver<ReceiptItem>) -> ControlFlow<()> {
+        match rx.try_recv() {
+            Ok(item) => {
+                self.items.push(item);
+                ControlFlow::Continue(())
+            }
+            Err(TryRecvError::Lagged(_)) => {
+                self.complete = false;
+                ControlFlow::Break(())
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => ControlFlow::Break(()),
+        }
+    }
+
+    /// The rollbacks of `missed` that the bus dropped: after a complete
+    /// read, the ones that are not in the queue.
+    fn dropped(&self, missed: Vec<ReceiptRollback>) -> Vec<ReceiptRollback> {
+        missed
+            .into_iter()
+            .filter(|rollback| self.complete && !self.holds(rollback))
+            .collect()
+    }
+
+    /// Whether the queue holds a rollback of the event of `rollback`.
+    fn holds(&self, rollback: &ReceiptRollback) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, ReceiptItem::Rollback(r) if r.id == rollback.id))
+    }
+
+    /// `Continue` when the bus dropped items again during the read.
+    fn next(&self) -> ControlFlow<()> {
+        if self.complete {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 }
 

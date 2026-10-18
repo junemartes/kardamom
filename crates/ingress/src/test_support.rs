@@ -299,7 +299,7 @@ pub fn spawn_fake_executor(
 /// counter shared across every shard, so positions never go backward.
 async fn relay_fake_receipts(
     mut rx: UnboundedReceiver<TxEnvelope>,
-    receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    receipt_bus: tokio::sync::broadcast::Sender<crate::ReceiptItem>,
     watermark_bus: tokio::sync::broadcast::Sender<QuorumWatermark>,
     next_pos: Arc<AtomicI32>,
 ) {
@@ -310,7 +310,7 @@ async fn relay_fake_receipts(
             .expect("fixture positions fit i32");
         let position = pos(offset);
         let receipt = receipt_for(&envelope, position);
-        let _ = receipt_bus.send(receipt);
+        let _ = receipt_bus.send(receipt.into());
         let _ = watermark_bus.send(QuorumWatermark { position });
     }
 }

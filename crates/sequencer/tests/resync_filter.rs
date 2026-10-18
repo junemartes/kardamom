@@ -6,18 +6,22 @@
 
 use kardamom_types::TxDataLoc;
 
-use kardamom_sequencer::resync::{FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer};
+use kardamom_sequencer::lookup::{LookupRequest, LookupRequester};
+use kardamom_sequencer::resync::{
+    Evidence, FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer,
+};
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{
     Rig, one_partition_cfg, pos, signed_envelope as signed_tx_envelope, signer,
 };
+use kardamom_types::ReceiptRollback;
 
 /// A sequencer with resync enabled. Returns the floor-update sender.
 /// The controller starts in resync mode (the startup trigger), which is
 /// exactly the state these tests exercise.
 type ResyncTestRig = (
     Sequencer,
-    crossbeam_channel::Sender<FloorUpdate>,
+    crossbeam_channel::Sender<FloorEvent>,
     crossbeam_channel::Sender<SealerAnswer>,
 );
 
@@ -33,7 +37,7 @@ fn resync_sequencer_with_rejects() -> ResyncTestRig {
     (seq, floor_tx, answer_tx)
 }
 
-fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorUpdate>) {
+fn resync_sequencer() -> (Sequencer, crossbeam_channel::Sender<FloorEvent>) {
     let (seq, floor_tx, _answer_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
@@ -55,7 +59,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     // notice. The transaction executed, so reporting it as a duplicate
     // to ingress would be spurious.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 1))
+        .send(FloorUpdate::executed(s.address(), 1).into())
         .unwrap();
 
     rig.step(&mut seq).unwrap();
@@ -110,7 +114,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
 
     // Execution evidence arrives. Nonce 4 is receipted, so the floor becomes 5.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 4))
+        .send(FloorUpdate::executed(s.address(), 4).into())
         .unwrap();
 
     // On the next iteration, the floor advances the state machine. The
@@ -141,7 +145,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     // Confirm nonce 1. This is cumulative per sender, and retires both
     // (0 and 1).
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 1))
+        .send(FloorUpdate::executed(s.address(), 1).into())
         .unwrap();
     rig.step(&mut seq).unwrap();
 
@@ -161,7 +165,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
 
     // Confirming it stops the churn.
     floor_tx
-        .send(FloorUpdate::executed(s.address(), 2))
+        .send(FloorUpdate::executed(s.address(), 2).into())
         .unwrap();
     rig.step(&mut seq).unwrap();
     let stable = rig.refs().len();
@@ -209,4 +213,94 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
         stable,
         "committed-proof reject must stop the republish loop"
     );
+}
+
+/// A rollback voids the floor that a receipt above its block set. The
+/// lost nonce is then not a proven duplicate: the sender's resubmit waits
+/// for the floor, and a new proof drains it.
+#[test]
+fn a_rollback_voids_the_floor_and_the_lost_nonce_publishes_again() {
+    let s = signer(5);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 1, 60));
+    rig.push(TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 2, 61));
+    let (mut seq, floor_tx) = resync_sequencer();
+
+    // The receipt of nonce 1 in block 10 raised the floor to 2. The
+    // executor then rolled back to block 5: that receipt is gone.
+    floor_tx
+        .send(
+            FloorUpdate::executed(s.address(), 1)
+                .with_evidence(Evidence::Receipt { block: 10 })
+                .into(),
+        )
+        .unwrap();
+    floor_tx
+        .send(FloorEvent::Rollback(ReceiptRollback {
+            to_block: 5,
+            ..Default::default()
+        }))
+        .unwrap();
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().is_empty(), "nonce 1 waits for an unknown floor");
+    assert!(rig.errors().is_empty(), "nonce 1 is not a duplicate now");
+
+    // The new stream proves nonce 0 in block 3: the floor is 1.
+    floor_tx
+        .send(
+            FloorUpdate::executed(s.address(), 0)
+                .with_evidence(Evidence::Receipt { block: 3 })
+                .into(),
+        )
+        .unwrap();
+    rig.step(&mut seq).unwrap();
+    rig.step(&mut seq).unwrap();
+    let published: Vec<_> = rig.refs().iter().map(|r| r.tx_data_position).collect();
+    assert_eq!(published, vec![pos(0), pos(64)], "nonces 1 and 2 publish");
+}
+
+/// A rollback voids the lookup answer to a request from before it. The
+/// sequencer then asks again at the new generation, and the answer to that
+/// request drains the parked transaction of the cold sender.
+#[test]
+fn a_stale_lookup_answer_asks_the_lookup_again() {
+    let s = signer(6);
+    let mut rig = Rig::default();
+    rig.push(TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 5, 70));
+    let (mut seq, floor_tx) = resync_sequencer();
+    let (requester, mut requests) = LookupRequester::channel();
+    seq.enable_nonce_lookup(requester);
+    let asked = |generation| LookupRequest {
+        sender: s.address(),
+        generation,
+    };
+    let answer = |generation| {
+        FloorEvent::from(
+            FloorUpdate::executed(s.address(), 4).with_evidence(Evidence::Lookup { generation }),
+        )
+    };
+
+    rig.step(&mut seq).unwrap();
+    assert_eq!(requests.try_recv().ok(), Some(asked(0)), "the park asks");
+
+    floor_tx
+        .send(FloorEvent::Rollback(ReceiptRollback {
+            to_block: 5,
+            ..Default::default()
+        }))
+        .unwrap();
+    rig.step(&mut seq).unwrap();
+    floor_tx.send(answer(0)).unwrap();
+    rig.step(&mut seq).unwrap();
+    assert!(rig.refs().is_empty(), "the stale answer sets no floor");
+    assert_eq!(
+        requests.try_recv().ok(),
+        Some(asked(1)),
+        "the sequencer asks again at the new generation"
+    );
+
+    floor_tx.send(answer(1)).unwrap();
+    rig.step(&mut seq).unwrap();
+    let published: Vec<_> = rig.refs().iter().map(|r| r.tx_data_position).collect();
+    assert_eq!(published, vec![pos(0)], "the new answer drains nonce 5");
 }

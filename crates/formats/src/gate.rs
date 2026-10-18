@@ -20,7 +20,8 @@ pub struct FormatGate {
 impl FormatGate {
     /// Every rule that the target breaks against the accepted release.
     /// Each finding serializes with `rule` (`rollback`, `rolling`,
-    /// `mixed_fleet` or `retired`), `id`, `head` and `base`.
+    /// `mixed_fleet` or `retired`), `id`, `head`, `base`, `shared` and
+    /// `permanent`.
     ///
     /// # Errors
     ///

@@ -20,7 +20,8 @@ use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal, SharedWatermark,
+    FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal,
+    SharedWatermark,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
@@ -45,7 +46,7 @@ const LATE: TxErrorReason = TxErrorReason::PastDeadline {
 struct Sealed {
     seq: Sequencer,
     rig: Rig,
-    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
+    floor_tx: crossbeam_channel::Sender<FloorEvent>,
     answer_tx: crossbeam_channel::Sender<SealerAnswer>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
     /// The feed's view of the sealer: here, the rules it reported.
@@ -167,13 +168,15 @@ impl Sealed {
 
     /// The receipt of the executed tx of `s` at `nonce` arrives.
     fn execute(&self, s: Address, nonce: u64) {
-        self.floor_tx.send(FloorUpdate::executed(s, nonce)).unwrap();
+        self.floor_tx
+            .send(FloorUpdate::executed(s, nonce).into())
+            .unwrap();
     }
 
     /// The skip receipt of the tx of `s` at `nonce` arrives.
     fn skip(&self, s: Address, nonce: u64, reason: SkipReason) {
         self.floor_tx
-            .send(FloorUpdate::skip(s, nonce, reason, skipped_hash(s, nonce)))
+            .send(FloorUpdate::skip(s, nonce, reason, skipped_hash(s, nonce)).into())
             .unwrap();
     }
 

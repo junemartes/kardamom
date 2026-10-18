@@ -112,6 +112,13 @@ impl crate::TxOrderingSubscription for ChanTxOrderingSub {
 pub struct ChanReceiptsPub(pub Sender<crate::CMessage>);
 
 impl crate::TxReceiptsPublication for ChanReceiptsPub {
+    fn publish_rollback(
+        &mut self,
+        _rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), crate::ExecutorError> {
+        Ok(())
+    }
+
     fn publish(&mut self, m: crate::CMessage) -> Result<(), crate::ExecutorError> {
         self.0
             .send(m)

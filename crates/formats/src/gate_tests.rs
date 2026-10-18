@@ -31,7 +31,7 @@ fn findings_json(base: [u32; 3], head: [u32; 3], shared: bool) -> serde_json::Va
 fn a_one_way_release_has_a_rollback_finding() {
     assert_eq!(
         findings_json([1, 1, 1], [2, 1, 2], false),
-        serde_json::json!([{"rule": "rollback", "id": "spool", "head": 2, "base": 1}])
+        serde_json::json!([{"rule": "rollback", "id": "spool", "head": 2, "base": 1, "shared": false, "permanent": false}])
     );
 }
 
@@ -45,6 +45,30 @@ fn a_shared_one_way_release_is_also_a_mixed_fleet_finding() {
         .map(|finding| finding["rule"].as_str().unwrap())
         .collect();
     assert_eq!(rules, ["rollback", "mixed_fleet"]);
+}
+
+#[test]
+fn a_retired_format_carries_its_shared_and_permanent_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let findings = |shared: bool, permanent: bool| {
+        let base = registry(dir.path(), "accepted.toml", [1, 1, 1], shared);
+        let text = std::fs::read_to_string(&base).unwrap();
+        std::fs::write(&base, format!("{text}permanent = {permanent}\n")).unwrap();
+        std::fs::write(
+            dir.path().join("formats.toml"),
+            text.replace("spool", "other"),
+        )
+        .unwrap();
+        let gate = FormatGate {
+            base,
+            root: dir.path().to_path_buf(),
+        };
+        serde_json::to_value(gate.findings().unwrap()).unwrap()
+    };
+    let retired = |shared: bool, permanent: bool| serde_json::json!([{"rule": "retired", "id": "spool", "head": 1, "base": 1, "shared": shared, "permanent": permanent}]);
+    for (shared, permanent) in [(false, false), (true, false), (false, true)] {
+        assert_eq!(findings(shared, permanent), retired(shared, permanent));
+    }
 }
 
 #[test]
