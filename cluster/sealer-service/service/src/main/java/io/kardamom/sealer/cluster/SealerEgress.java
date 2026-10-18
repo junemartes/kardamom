@@ -552,9 +552,14 @@ final class SealerEgress {
         firstRetainedBlock = floors.block();
     }
 
-    /** Offer the sealer's rules to a session that opened. */
-    void offerSealerInfo(final ClientSession session) {
-        offerToSession(session, frames.sealerInfo(CanonicalSealerState.DECISION_VERSION, session.id()));
+    /** Offer the sealer's rules, decision version {@code version}, to {@code session}. */
+    void offerSealerInfo(final ClientSession session, final int version) {
+        offerToSession(session, frames.sealerInfo(version, session.id()));
+    }
+
+    /** Offer the sealer's rules, decision version {@code version}, to every open session. */
+    void offerSealerInfoToAll(final int version) {
+        cluster.clientSessions().forEach(session -> offerSealerInfo(session, version));
     }
 
     /** Open an empty retention: a start at genesis or from a seed. */

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.DecisionRules;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.VoidLedger;
 import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
@@ -89,8 +90,7 @@ class SealerRecordPathTest {
 
     /** The nonce release of the skipped entry {@code n}: the chain expects {@code nonce}. */
     private static byte[] release(final int n, final long nonce) {
-        return ByteBuffer.allocate(SealerWire.NONCE_RELEASE_LEN).order(ByteOrder.LITTLE_ENDIAN)
-            .put(SealerWire.KIND_NONCE_RELEASE).put(SENDER).putLong(nonce).put(id(n)).array();
+        return IngressFrames.nonceReleaseFrame(SENDER, nonce, id(n));
     }
 
     /** The canonical entry that the file retains for entry {@code n} at {@code index}. */
@@ -295,6 +295,7 @@ class SealerRecordPathTest {
     void the_member_counts_the_releases_since_its_snapshot() {
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = member(Optional.empty(), Optional.empty());
+        deliver(svc, sequencer, IngressFrames.featureActivationFrame(1, DecisionRules.FEATURE_SEALER_V3, 0));
         sameLog(svc, sequencer);
         assertEquals(2L, svc.releasesSinceSnapshot(), "the release and its twin copy");
         final SealerClusteredService restored = member(Optional.empty(), Optional.of(svc.snapshot()));

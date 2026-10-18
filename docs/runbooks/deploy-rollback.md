@@ -109,7 +109,7 @@ deploy succeeded and the release degrades the chain after it.
 
 ### Rollback across a decision version
 
-A release that raises the sealer decision version (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. Do not run `just rollback` for it:
+A release that changes the start version in the sealer job spec (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. A switch of the rules by an upgrade transaction is not a deploy, and a rollback of the sealer to an older release is not possible after it: the members write snapshot version 13. Do not run `just rollback` for a change of the start version:
 
 - Its record holds no sealer version before it, so `just rollback` stops the sealer job and does not start the release before.
 - `just rollback` reverts the jobs in reverse deploy order. The ingress restarts before the sealer stops, and a restart drops an operator pause. Submits then reach the sealer of the new rules after the snapshot check.

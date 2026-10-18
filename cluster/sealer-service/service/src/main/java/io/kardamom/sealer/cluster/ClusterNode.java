@@ -8,6 +8,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.DecisionRules;
 import io.kardamom.sealer.LagBudgets;
 import io.kardamom.sealer.SealerSeed;
 import io.kardamom.sealer.VoidLedger;
@@ -102,9 +103,10 @@ public final class ClusterNode {
             CanonicalSealerState.snapshotKeepsRecordedCursors());
         System.out.println("cluster record-lag budget memberId=" + memberId
             + " records=" + (recordLagBudget == 0 ? "0 <guard off>" : Long.toString(recordLagBudget)));
-        // The decision version: a job that names another version than the
-        // image runs stops the start, so the setting that the release gate
-        // compares always names the rules that the member runs.
+        // The decision version: a job that names another start version than
+        // the image stops the start, so the setting that the release gate
+        // compares always names the rules that a state with no activation
+        // runs.
         final int decisionVersion = requireDecisionVersion(System.getProperty(DECISION_VERSION_SETTING));
         System.out.println("cluster decision version memberId=" + memberId + " version=" + decisionVersion);
         // The ordering window: 20 with priority fees on, 0 for first come,
@@ -380,7 +382,8 @@ public final class ClusterNode {
                 ? MemberStatus.ELECTION_CLOSED : String.valueOf(ElectionState.get(election));
             final long commit = commitPosition.isClosed() ? 0L : commitPosition.get();
             return new MemberStatus(memberId, roleName, electionName, commit, service.servicePosition(),
-                MemberStatus.SnapshotVersions.of(service.latestSnapshotVersion(), service.releasesSinceSnapshot()),
+                MemberStatus.SnapshotVersions.of(
+                    service.latestSnapshotVersion(), service.releasesSinceSnapshot(), service.decisionVersion()),
                 diskFreeBytes());
         }
 
@@ -690,16 +693,18 @@ public final class ClusterNode {
     }
 
     /**
-     * The decision version of the job. An absent setting is the version of
-     * this image. A value that is not a number, or another version, stops
-     * the start.
+     * The decision version of the job: the rules of a state that holds no
+     * activation. An absent setting is that version of this image. A value
+     * that is not a number, or another version, stops the start. Version 3
+     * comes from an upgrade transaction in the log, never from the job.
      */
     static int requireDecisionVersion(final String value) {
-        final int version = value == null ? CanonicalSealerState.DECISION_VERSION : Integer.parseInt(value.trim());
-        if (version != CanonicalSealerState.DECISION_VERSION) {
+        final int version = value == null ? DecisionRules.START_VERSION : Integer.parseInt(value.trim());
+        if (version != DecisionRules.START_VERSION) {
             throw new IllegalStateException(DECISION_VERSION_SETTING + ": the job names version " + version
-                + ", and this image runs version " + CanonicalSealerState.DECISION_VERSION
-                + ". Deploy the job and the image of one release.");
+                + ", and this image starts on version " + DecisionRules.START_VERSION
+                + ". Version " + DecisionRules.NEWEST_VERSION + " comes from the upgrade transaction of feature "
+                + DecisionRules.FEATURE_SEALER_V3 + ". Deploy the job and the image of one release.");
         }
         return version;
     }

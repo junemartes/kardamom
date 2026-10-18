@@ -242,7 +242,7 @@ class NomadAPI(BaseHTTPRequestHandler):
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'decisionVersion': state.get('decision_version', 3),
+                          'decisionVersion': state.get('decision_version', 2),
                           'releasesSinceSnapshot': state.get('releases', {}).get(node, 0)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
@@ -1131,7 +1131,7 @@ class RecordTest(Deploys):
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
-            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=3', '')
+            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=2', '')
         output = self.run_deploy(success=False)
         self.assertIn('every member must match: decisionVersion.', output)
         self.assertEqual(self.api.state['writes'], [])
@@ -1146,31 +1146,31 @@ class RecordTest(Deploys):
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def to_version_two(self):
-        """Deploy, then stand for an accepted release of decision version 2."""
+    def to_version_three(self):
+        """Deploy, then stand for an accepted release whose job names decision version 3."""
         self.run_deploy()
-        del self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version']
-        self.api.state['decision_version'] = 2
+        self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version'] = '3'
+        self.api.state['decision_version'] = 3
 
     def coordinated_restart(self, success):
-        """Stop the sealer, and deploy the release of decision version 3."""
+        """Stop the sealer, and deploy the release whose job names decision version 2."""
         del self.api.state['jobs']['cluster']
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.api.state['writes'] = []
         return self.run_deploy(success=success)
 
     def test_a_quiesce_check_refuses_a_release_after_a_snapshot(self):
-        self.to_version_two()
+        self.to_version_three()
         del self.api.state['jobs']['sequencer']
         self.api.state['releases'] = {'node-cluster-1': 1}
         output = self.run_deploy(playbook='quiesce.yml', success=False)
         self.assertIn('a member applied a nonce release after its last snapshot', output)
         output = self.coordinated_restart(success=False)
-        self.assertIn('changes the sealer decision version from 2 to 3', output)
+        self.assertIn('changes the sealer decision version from 3 to 2', output)
         self.assertEqual(self.api.state['writes'], [])
 
     def test_a_quiesce_check_refuses_a_running_sequencer_and_a_member_that_is_down(self):
-        self.to_version_two()
+        self.to_version_three()
         output = self.run_deploy(playbook='quiesce.yml', success=False)
         self.assertIn('a sequencer allocation still runs', output)
         del self.api.state['jobs']['sequencer']
@@ -1179,7 +1179,7 @@ class RecordTest(Deploys):
         self.assertIn('the sealer members cluster-2 do not run', output)
 
     def test_a_stale_quiesce_check_is_refused(self):
-        self.to_version_two()
+        self.to_version_three()
         del self.api.state['jobs']['sequencer']
         self.run_deploy(playbook='quiesce.yml')
         check = self.api.state['variables']['kardamom/quiesce/local']
@@ -1188,7 +1188,7 @@ class RecordTest(Deploys):
         self.assertIn('within the last 600 s', output)
 
     def test_the_age_of_a_quiesce_check_is_capped_at_an_hour(self):
-        self.to_version_two()
+        self.to_version_three()
         del self.api.state['jobs']['sequencer']
         self.run_deploy(playbook='quiesce.yml')
         check = self.api.state['variables']['kardamom/quiesce/local']
@@ -1199,13 +1199,13 @@ class RecordTest(Deploys):
         self.assertIn('within the last 3600 s', output)
 
     def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
-        self.to_version_two()
+        self.to_version_three()
         del self.api.state['jobs']['sequencer']
         self.run_deploy(playbook='quiesce.yml')
         check = self.api.state['variables']['kardamom/quiesce/local']
-        self.assertEqual((check['decision_version'], check['sequencers_stopped']), ('2', 'true'))
+        self.assertEqual((check['decision_version'], check['sequencers_stopped']), ('3', 'true'))
         self.coordinated_restart(success=True)
-        self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
+        self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '2')
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()

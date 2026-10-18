@@ -177,25 +177,28 @@ final class ClusterNodeTest {
     }
 
     @Test
-    void theDecisionVersionMustBeTheVersionOfTheImage() {
-        final int image = io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION;
-        assertEquals(image, ClusterNode.requireDecisionVersion(null), "an absent setting is the image version");
-        assertEquals(image, ClusterNode.requireDecisionVersion(Integer.toString(image)));
+    void theDecisionVersionMustBeTheStartVersionOfTheImage() {
+        final int start = io.kardamom.sealer.DecisionRules.START_VERSION;
+        assertEquals(start, ClusterNode.requireDecisionVersion(null), "an absent setting is the start version");
+        assertEquals(start, ClusterNode.requireDecisionVersion(Integer.toString(start)));
         assertThrows(IllegalStateException.class,
-            () -> ClusterNode.requireDecisionVersion(Integer.toString(image - 1)));
+            () -> ClusterNode.requireDecisionVersion(Integer.toString(start - 1)));
         assertThrows(NumberFormatException.class, () -> ClusterNode.requireDecisionVersion(""));
     }
 
     /**
-     * The move to version 3 is a coordinated restart: a member of this image
-     * stops at start under a job of version 2, so no member of version 3
-     * runs beside one of version 2. The restart restores the version-10
-     * snapshot of the old members (see {@link SealerRecordPathTest}).
+     * The image with no feature flag runs version 2, so it takes the job of
+     * the release before version 3: the deploy is a rolling one. Version 3
+     * comes only from the upgrade transaction in the log
+     * ({@link SealerDecisionRulesTest}), so a job of version 3 stops the
+     * start.
      */
     @Test
-    void thisImageRunsVersionThreeAndRefusesAJobOfVersionTwo() {
-        assertEquals(3, io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION);
-        assertThrows(IllegalStateException.class, () -> ClusterNode.requireDecisionVersion("2"));
+    void thisImageStartsOnVersionTwoAndRefusesAJobOfVersionThree() {
+        assertEquals(2, io.kardamom.sealer.DecisionRules.START_VERSION);
+        assertEquals(3, io.kardamom.sealer.DecisionRules.NEWEST_VERSION);
+        assertEquals(2, ClusterNode.requireDecisionVersion("2"));
+        assertThrows(IllegalStateException.class, () -> ClusterNode.requireDecisionVersion("3"));
     }
 
     @Test
@@ -204,7 +207,7 @@ final class ClusterNodeTest {
         final Matcher setting =
             Pattern.compile("-D" + Pattern.quote(ClusterNode.DECISION_VERSION_SETTING) + "=(\\d+)").matcher(job);
         assertTrue(setting.find(), "the sealer job passes the decision version");
-        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, Integer.parseInt(setting.group(1)));
+        assertEquals(io.kardamom.sealer.DecisionRules.START_VERSION, Integer.parseInt(setting.group(1)));
         assertFalse(setting.find(), "the sealer job passes the decision version once");
     }
 

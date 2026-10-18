@@ -195,8 +195,9 @@ public final class SealerWire {
      * ({@link #NONCE_RELEASE_LEN} bytes). An executor skipped the ordered
      * entry {@code canonical_id} of {@code sender}, and the chain expects
      * {@code nonce} of the sender next. See
-     * {@link CanonicalSealerState#onRelease}. A member that does not know
-     * the kind drops the frame. Matches Rust {@code KIND_NONCE_RELEASE}.
+     * {@link CanonicalSealerState#onRelease}. A member under decision
+     * version 2, and a member that does not know the kind, drops the frame
+     * as an unknown kind. Matches Rust {@code KIND_NONCE_RELEASE}.
      */
     public static final byte KIND_NONCE_RELEASE = 10;
     /** Offset of the 20-byte sender within a {@link #KIND_NONCE_RELEASE} frame. */
@@ -207,6 +208,27 @@ public final class SealerWire {
     static final int RELEASE_ID_OFFSET = RELEASE_NONCE_OFFSET + Long.BYTES;
     /** Exact length of a {@link #KIND_NONCE_RELEASE} frame. */
     static final int NONCE_RELEASE_LEN = RELEASE_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+
+    /**
+     * Feature activation, a sequencer's system record:
+     * {@code [kind:11][l1_origin:u64 LE][feature_id:u64 LE][activation_ms:u64 LE]}
+     * ({@link #FEATURE_ACTIVATION_LEN} bytes). The upgrade transaction of the
+     * epoch at {@code l1_origin} schedules {@code feature_id} at
+     * {@code activation_ms}. The sequencer sends it in front of that epoch,
+     * on the same session, and again each time it offers the epoch again.
+     * See {@link io.kardamom.sealer.DecisionRules}. A member that does not
+     * know the kind drops the frame. Matches Rust
+     * {@code KIND_FEATURE_ACTIVATION}.
+     */
+    public static final byte KIND_FEATURE_ACTIVATION = 11;
+    /** Offset of the u64 LE L1 origin within a {@link #KIND_FEATURE_ACTIVATION} frame. */
+    static final int ACTIVATION_ORIGIN_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE feature id within a {@link #KIND_FEATURE_ACTIVATION} frame. */
+    static final int ACTIVATION_FEATURE_OFFSET = ACTIVATION_ORIGIN_OFFSET + Long.BYTES;
+    /** Offset of the u64 LE activation time within a {@link #KIND_FEATURE_ACTIVATION} frame. */
+    static final int ACTIVATION_MS_OFFSET = ACTIVATION_FEATURE_OFFSET + Long.BYTES;
+    /** Exact length of a {@link #KIND_FEATURE_ACTIVATION} frame. */
+    static final int FEATURE_ACTIVATION_LEN = ACTIVATION_MS_OFFSET + Long.BYTES;
 
     /** Offset of the u8 voter id within a {@link #KIND_VOID_REQUEST} frame. */
     static final int VOID_VOTER_OFFSET = KIND_OFFSET + Byte.BYTES;
@@ -405,13 +427,14 @@ public final class SealerWire {
     /**
      * The sealer's rules:
      * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
-     * ({@link #SEALER_INFO_LEN} bytes). The service sends it to each session
-     * when the session opens, with the id of that session, so a client ties
-     * it to its session whatever the order of its own session events. A member sends it again after a restart into
-     * another decision version, because every session opens again. A
-     * sequencer sends a nonce release only after it got version 3 or above
-     * on its current session. A reader that does not know the kind drops
-     * it. Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it only under
+     * decision version 3: to every open session at the switch, and then to
+     * each session when the session opens. It carries the id of that
+     * session, so a client ties it to its session whatever the order of its
+     * own session events. Under version 2 the service sends no frame of this
+     * kind. A sequencer sends a nonce release only after it got version 3 or
+     * above on its current session. A reader that does not know the kind
+     * drops it. Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */

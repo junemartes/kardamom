@@ -102,6 +102,21 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
     }
 
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
+        // The feature activation of the sealer rules goes in front of its
+        // epoch, on this session. The pump offers the same epoch again
+        // after back pressure, a gap or a restart, so the activation goes
+        // out again with it, and the sealer ignores a copy. An epoch that
+        // the sealer ordered is never offered again, so the activation
+        // must not come after it.
+        if let Some(activation) = wire::FeatureActivation::sealer_rules_of(e) {
+            self.offer(&activation.encode())?;
+            tracing::info!(
+                l1_origin = activation.l1_origin,
+                feature_id = activation.feature_id,
+                activation_ms = activation.activation_ms,
+                "sealer feature activation offered"
+            );
+        }
         // This uses KIND_ORIGIN_RECORD, not a plain record. The sealer
         // must close the open block and adopt this epoch's L1 number
         // before it relays the record. Epochs are never batched: there is
@@ -280,6 +295,46 @@ mod tests {
         );
         // Marker plus 1 deposit.
         assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
+    }
+
+    /// The upgrade of the sealer rules goes out in front of its epoch, and
+    /// again with each new offer of the epoch.
+    #[test]
+    fn publishes_the_feature_activation_in_front_of_its_epoch() {
+        use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
+        use kardamom_types::upgrades::FEATURE_SEALER_V3;
+
+        let block = B256::repeat_byte(0x22);
+        let upgrade = LockboxLog::Upgrade(UpgradeLog {
+            block_number: 4_242,
+            block_hash: block,
+            log_index: 0,
+            feature_id: alloy_primitives::U256::from(FEATURE_SEALER_V3),
+            activation_timestamp: 9_000,
+        });
+        let e = derive_epoch(4_242, block, &[upgrade]).unwrap();
+        let ingress = FakeIngress::new();
+        let mut pubr = ClusterRefPublisher::new(ingress.clone());
+        pubr.try_publish_epoch(&e).unwrap();
+        pubr.try_publish_epoch(&e).unwrap();
+
+        let activation = wire::FeatureActivation {
+            l1_origin: 4_242,
+            feature_id: FEATURE_SEALER_V3,
+            activation_ms: 9_000,
+        }
+        .encode();
+        let kinds: Vec<u8> = ingress.accepted().iter().map(|frame| frame[0]).collect();
+        assert_eq!(
+            kinds,
+            [
+                wire::KIND_FEATURE_ACTIVATION,
+                wire::KIND_ORIGIN_RECORD,
+                wire::KIND_FEATURE_ACTIVATION,
+                wire::KIND_ORIGIN_RECORD
+            ]
+        );
+        assert_eq!(ingress.accepted()[0], activation);
     }
 
     /// A remote epoch must go out as `KIND_REMOTE_ORIGIN_RECORD`, carrying the

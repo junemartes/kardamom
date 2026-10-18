@@ -11,7 +11,7 @@ final class MemberStatusTest {
     private static final long LAG = 1024;
 
     private static final MemberStatus.SnapshotVersions SNAPSHOT =
-        new MemberStatus.SnapshotVersions(10, 1, 11, 9, 0);
+        new MemberStatus.SnapshotVersions(10, 1, 11, 9, 0, 2);
 
     private static MemberStatus sample(
             final String role, final String election, final long commit, final long applied) {
@@ -54,7 +54,7 @@ final class MemberStatusTest {
             "{\"memberId\":1,\"role\":\"LEADER\",\"election\":\"CLOSED\","
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
-                + "\"snapshotLatest\":9,\"releasesSinceSnapshot\":0,\"decisionVersion\":3,\"diskFreeBytes\":0,\"ready\":true}",
+                + "\"snapshotLatest\":9,\"releasesSinceSnapshot\":0,\"decisionVersion\":2,\"diskFreeBytes\":0,\"ready\":true}",
             sample("LEADER", "CLOSED", 5000, 4000).toJson(LAG));
     }
 

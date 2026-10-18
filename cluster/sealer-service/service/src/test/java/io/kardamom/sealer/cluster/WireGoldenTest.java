@@ -115,7 +115,7 @@ final class WireGoldenTest {
     @Test
     void theSealerInfoNamesTheDecisionVersion() {
         assertArrayEquals(golden.get("sealer_info"), frames.copy(frames.sealerInfo(3, 0x0102)));
-        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, 3);
+        assertEquals(3, io.kardamom.sealer.DecisionRules.NEWEST_VERSION);
     }
 
     @Test
@@ -127,6 +127,19 @@ final class WireGoldenTest {
         assertEquals(7, release.getLong(SealerWire.RELEASE_NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN));
         assertEquals((byte) 0xAB, release.getByte(SealerWire.RELEASE_ID_OFFSET));
         assertEquals((byte) 0xAB, release.getByte(SealerWire.NONCE_RELEASE_LEN - 1));
+    }
+
+    @Test
+    void theFeatureActivationHasItsFieldsAtTheServiceOffsets() {
+        final byte[] frame = golden.get("feature_activation");
+        final UnsafeBuffer activation = new UnsafeBuffer(frame);
+        assertEquals(SealerWire.FEATURE_ACTIVATION_LEN, activation.capacity());
+        assertEquals(SealerWire.KIND_FEATURE_ACTIVATION, activation.getByte(SealerWire.KIND_OFFSET));
+        assertEquals(5, activation.getLong(SealerWire.ACTIVATION_ORIGIN_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertEquals(io.kardamom.sealer.DecisionRules.FEATURE_SEALER_V3,
+            activation.getLong(SealerWire.ACTIVATION_FEATURE_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertEquals(1_700_000_000_250L, activation.getLong(SealerWire.ACTIVATION_MS_OFFSET, ByteOrder.LITTLE_ENDIAN));
+        assertArrayEquals(frame, IngressFrames.featureActivationFrame(5, 2, 1_700_000_000_250L));
     }
 
     @Test
