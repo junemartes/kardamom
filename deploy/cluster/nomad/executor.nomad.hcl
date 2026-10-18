@@ -122,6 +122,14 @@ variable "executor_query_port" {
 }
 
 job "executor" {
+  # The executor of this release uses the nonce of a skipped transaction
+  # once FEATURE_SEALER_V3 is active. An older executor does not, and its
+  # state forks at the first such skip. The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads this meta.
+  meta {
+    nonce_burn = "true"
+  }
+
   datacenters = [var.datacenter]
   type        = "service"
 

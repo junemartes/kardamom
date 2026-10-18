@@ -113,3 +113,44 @@ fn with_the_flag_off_a_skip_burns_nothing_and_the_next_nonce_skips() {
     assert!(!receipts[2].burns_nonce());
     assert_eq!(receipts[4].skip_reason, Some(SkipReason::NonceTooHigh));
 }
+
+/// An earlier transaction of the block funds the poor sender, and its
+/// spend comes later. A worker that runs the spend first reads too little
+/// and skips. The skip result carries its reads, so the validation finds
+/// the stale balance and the spend runs again: every worker count gives
+/// the sequential bytes, with the spend executed.
+#[test]
+fn a_skip_that_an_earlier_transaction_undoes_runs_again() {
+    let rich = signers(2);
+    let poor = seeded_signer(78);
+    let database = chain(&rich, &poor, 1);
+    let recs = records(vec![
+        tx(
+            &rich[0],
+            0,
+            TxKind::Call(poor.address()),
+            1_000_000_000_000_000,
+            &[],
+        ),
+        tx(&poor, 0, TxKind::Call(rich[1].address()), POOR_FUNDS, &[]),
+    ]);
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    assert!(seq.0[1].status, "the funded spend executes: {:?}", seq.0[1]);
+    for (workers, rep) in shard_worker_pairs([1, 2, 4, 8], [0, 1, 2, 3]) {
+        let out = execute_block_stm(
+            &database,
+            None,
+            env(),
+            &recs,
+            &Stats::default(),
+            nz(workers),
+        )
+        .unwrap();
+        assert_identical(
+            &seq,
+            &out.receipts,
+            &out.delta,
+            &format!("w={workers} rep={rep}"),
+        );
+    }
+}

@@ -42,11 +42,10 @@ mod tx_env;
 mod write_set;
 mod xchain;
 
-pub use burn::NonceBurn;
 pub use db::{SnapshotDb, SnapshotRef, StateRefError, account_info};
 pub use deposit::execute_deposit_tx;
 pub use scope::{Executor, TouchSet};
-pub use skip::{Skip, skip_reason_of_tx};
+pub use skip::{Skip, SkippedRecord, skip_reason_of_tx};
 pub use tx_env::DecodedTx;
 pub use xchain::{XChainDelivery, execute_xchain_tx, xchain_gas_budget};
 

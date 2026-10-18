@@ -116,6 +116,14 @@ The upgrade transaction of `FEATURE_SEALER_V3` switches the sealer to decision v
   - A forward `just deploy` from the checkout of a release that names `decisionVersion` in its sealer job (`eebd7aa7a` and the releases before it) gets the must-match refusal of its own gate: the registered job names no `decisionVersion`. Pass `KARDAMOM_ALLOW_MUST_MATCH=decisionVersion` for that deploy. Use it only when the job of that release names `decisionVersion=2`, and only before the activation. Never deploy a build whose job names `decisionVersion=3`: it applies the releases of the log with other rules.
 - After it, the members write snapshot version 13, and a release that reads only up to version 12 stops on it. Do not roll the sealer back to such a release. Fix forward.
 
+### Rollback after the activation of the nonce burn
+
+From the activation time of `FEATURE_SEALER_V3`, a skipped transaction at the chain nonce of its sender uses that nonce ("A skipped transaction and its nonce" in `docs/failure-modes.md`). The executor, the validator and the zk guest of the prover run the rule; the ingress and the sequencer read it. A release before this one does not run it.
+
+- After the activation, do not roll an executor, a validator, an ingress or a sequencer back to a release without the job meta `nonce_burn = "true"`. An older executor or validator does not use the nonce of a skip, so its state forks from the chain at the first such skip. An older ingress or sequencer takes such a skip as a skip that used no nonce. Fix forward.
+- `just sealer-upgrade-check <env>` refuses the upgrade transaction until every live allocation of the executor, validator, ingress and sequencer jobs runs a job version with the meta `nonce_burn`.
+- The prover's zk guest links the same rule, so a guest of this release has a new verifying key. Roll the prover and its verifying key before the activation. A guest of an older release cannot prove a block with a skip after the activation.
+
 ## Clear
 
 The rollback writes the record: the attempt gets `status: rolled_back`, and

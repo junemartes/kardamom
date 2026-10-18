@@ -4,7 +4,7 @@
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
-use kardamom_types::{Receipt, SkipReason, StateDatabase, TxEnvelope};
+use kardamom_types::{Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
@@ -18,7 +18,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxSlot};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::skip::Skip;
+use super::skip::{Skip, SkippedRecord};
 use super::tx_env::DecodedTx;
 
 /// Per-tx read-touch capture for the footprint shadow scheduler. The
@@ -174,19 +174,10 @@ impl<S: StateDatabase> Executor<S> {
         let alloy_env = match DecodedTx::decode(&inbound_envelope.raw_tx, slot.tx_idx) {
             Ok(env_) => env_,
             Err(e) => {
-                return self.skip(
-                    Skip {
-                        reason: SkipReason::Undecodable,
-                        detail: &format!("undecodable raw_tx: {e}"),
-                        slot,
-                        inbound_envelope,
-                        nonce: 0,
-                        to: None,
-                        block_number: self.env.block_number,
-                    },
-                    bal,
-                    touches,
-                );
+                let skip = self
+                    .skipped(slot, inbound_envelope)
+                    .undecodable(format!("undecodable raw_tx: {e}"));
+                return self.skip(skip, bal, touches);
             }
         };
         self.execute_tx_decoded(slot, inbound_envelope, &alloy_env, bal, touches)
@@ -226,21 +217,10 @@ impl<S: StateDatabase> Executor<S> {
             // Deterministic input invalidity: every replica computes the
             // same rejection from the same state and tx. Skip, never halt.
             Err(e) => {
-                let (reason, detail) = Skip::rejection(e, slot.tx_idx)?;
-                let block_number = self.env.block_number;
-                return self.skip(
-                    Skip {
-                        reason,
-                        detail: &detail,
-                        slot,
-                        inbound_envelope,
-                        nonce,
-                        to,
-                        block_number,
-                    },
-                    bal,
-                    touches,
-                );
+                let skip = self
+                    .skipped(slot, inbound_envelope)
+                    .rejected(e, nonce, to)?;
+                return self.skip(skip, bal, touches);
             }
         };
 
@@ -280,8 +260,17 @@ impl<S: StateDatabase> Executor<S> {
         Ok((receipt, ws))
     }
 
+    /// The record at `slot` as a skip of this block.
+    fn skipped<'a>(&self, slot: TxSlot, inbound_envelope: &'a TxEnvelope) -> SkippedRecord<'a> {
+        SkippedRecord {
+            slot,
+            inbound_envelope,
+            block_number: self.env.block_number,
+        }
+    }
+
     /// The receipt of a skipped record, and its nonce burn
-    /// ([`super::NonceBurn`]) when it makes one. A burn goes through the
+    /// ([`Skip::burn_state`]) when it makes one. A burn goes through the
     /// same steps as an executed transaction's state: the write set, the
     /// EIP-7928 claim, the touch capture, and the commit into the block
     /// cache, so a later transaction of the sender reads the new nonce.

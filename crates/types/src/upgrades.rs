@@ -53,7 +53,7 @@ pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
 /// Decision rules version 3 of the sealer, and the nonce burn of a skipped
 /// transaction. The sealer reads this feature from the feature activation
 /// record that the sequencer sends in front of the epoch. The executor
-/// reads it at each skip (`kardamom_exec_core::executor::NonceBurn`): a
+/// reads it at each skip (`kardamom_exec_core::executor::Skip::burn_state`): a
 /// skip at the chain nonce of its sender then uses that nonce.
 /// It must match Java `DecisionRules.FEATURE_SEALER_V3`.
 pub const FEATURE_SEALER_V3: u64 = 2;

@@ -124,6 +124,13 @@ variable "canary" {
 }
 
 job "ingress" {
+  # The ingress of this release takes a skip that used its nonce as a used
+  # nonce once FEATURE_SEALER_V3 is active. The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads this meta.
+  meta {
+    nonce_burn = "true"
+  }
+
   datacenters = [var.datacenter]
   type        = "service"
   node_pool   = var.node_pool

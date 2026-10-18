@@ -71,12 +71,12 @@ pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
 pub(crate) const SEALER_RULES_MISSING: &str = "kardamom_sequencer_sealer_rules_missing_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce
 /// plus the refs in flight for the settle time: the sealer's nonce guard
-/// is ahead of the chain after a skip that used no nonce. A skip burns
-/// its nonce only after the activation of `FEATURE_SEALER_V3`, so the
-/// count rises only before it. A client that keeps resubmitting counts
-/// once per try,
-/// so alert on a rate that stays above zero over some minutes, not on
-/// one increase.
+/// is ahead of the chain after a skip that used no nonce. While
+/// `FEATURE_SEALER_V3` is active, a skip at the chain nonce uses it, so
+/// the count rises for a skip off the chain nonce, for a sender that a
+/// skip left stuck while the feature was off, and while it is off. A
+/// client that keeps resubmitting counts once per try, so alert on a rate
+/// that stays above zero over some minutes, not on one increase.
 pub(crate) const SEALER_NONCE_AHEAD: &str = "kardamom_sequencer_sealer_nonce_ahead_total";
 /// The unix time of the last boundary frame the cluster egress delivered.
 /// The readiness rule requires one within the boundary-silence window:

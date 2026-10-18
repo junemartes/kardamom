@@ -7,6 +7,7 @@ use alloy_primitives::{B256, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use kardamom_test_support::LegacyTx;
+use kardamom_types::SkipReason;
 use kardamom_types::TxEnvelope as KtTxEnvelope;
 use revm::primitives::KECCAK_EMPTY;
 

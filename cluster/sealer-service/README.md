@@ -519,11 +519,12 @@ Every member applies the same log. Two members on two rule versions can decide o
 
 The procedure of the upgrade:
 
-1. Deploy the release that reads snapshot version 13 to every sealer member and every sequencer.
+1. Deploy the release that reads snapshot version 13 to every sealer member and every sequencer, and the release that uses the nonce of a skipped transaction to every executor, validator, ingress and sequencer. Roll the prover's zk guest and its verifying key too.
 2. Run `just sealer-upgrade-check <env>`. It must pass before the Safe signs the upgrade transaction.
    - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 13 or more. A member of an older release drops kind 11 and keeps version 2, so the state forks at the first entry that the two versions decide differently.
    - It refuses while a configured member is down.
    - It refuses unless the sequencer job has the meta `sealer_feature_activation = "true"` and every live sequencer allocation runs that job version. An older sequencer sends no kind 11.
+   - It refuses unless the executor, validator, ingress and sequencer jobs have the meta `nonce_burn = "true"` and every live allocation of them runs that job version. An older executor or validator does not use the nonce of a skip and forks the state at the first one.
 3. The Safe signs `ETHLockbox.initiateUpgrade(2, activation_ms)`.
 4. Check the switch: `decisionVersion` 3 on admin `/status` of every member, and `kardamom_sequencer_sealer_version` 3 on every sequencer. A sequencer that gets no kind 17 within 60 s after the activation time logs a warning and counts `kardamom_sequencer_sealer_rules_missing_total`.
 

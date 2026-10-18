@@ -14,7 +14,6 @@
 //! worker, or a witness), so every driver decides alike.
 
 use alloy_primitives::{Address, U256};
-use kardamom_types::SkipReason;
 use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 use revm::state::{Account, EvmState};
 
@@ -23,26 +22,16 @@ use alloc::format;
 use crate::error::ExecutorError;
 use crate::features::{activation_slot, is_active};
 
-/// A skipped transaction that can burn its nonce: a decoded transaction
-/// of `sender` at `nonce`.
+/// A skipped transaction whose rejection can use its nonce (see
+/// [`super::SkippedRecord::rejected`]): a decoded transaction of `sender`
+/// at `nonce`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonceBurn {
-    pub sender: Address,
-    pub nonce: u64,
+pub(super) struct NonceBurn {
+    pub(super) sender: Address,
+    pub(super) nonce: u64,
 }
 
 impl NonceBurn {
-    /// The burn candidate of a skip for `reason`. A nonce skip never
-    /// burns: the nonce of the transaction is not the chain nonce.
-    /// Undecodable bytes carry no nonce.
-    #[must_use]
-    pub fn of_skip(reason: SkipReason, sender: Address, nonce: u64) -> Option<Self> {
-        match reason {
-            SkipReason::Undecodable | SkipReason::NonceTooLow | SkipReason::NonceTooHigh => None,
-            _ => Some(Self { sender, nonce }),
-        }
-    }
-
     /// The state change of the burn, read through `db` at the block
     /// timestamp `timestamp_ms`: the sender's account with the nonce one
     /// higher, marked touched. `None` when the feature is not active, when
@@ -52,7 +41,7 @@ impl NonceBurn {
     /// # Errors
     ///
     /// Returns [`ExecutorError::State`] when a read of `db` fails.
-    pub fn state<DB: revm::Database>(
+    pub(super) fn state<DB: revm::Database>(
         self,
         db: &mut DB,
         timestamp_ms: u64,

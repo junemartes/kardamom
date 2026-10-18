@@ -10,8 +10,8 @@ use revm::primitives::KECCAK_EMPTY;
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
-use crate::executor::Executor;
 use crate::executor::test_support::{boundary, slot};
+use crate::executor::{Executor, SkippedRecord, SnapshotDb, StateRefError};
 use crate::features::activation_slot;
 use crate::state::MockStateDatabase;
 
@@ -225,4 +225,57 @@ fn execute_once_burns_alike() {
     .unwrap();
     assert!(skip.burns_nonce());
     assert_eq!(chain.sender_nonce(&ws), Some(4));
+}
+
+/// A transaction for another chain never uses a nonce of this chain, even
+/// at the chain nonce of its sender.
+#[test]
+fn a_chain_id_rejection_burns_nothing() {
+    let chain = Chain::new(3, 1);
+    let other_chain = LegacyTx {
+        chain_id: 2,
+        to: PAYEE,
+        nonce: 3,
+        gas_price: GAS_PRICE,
+        ..LegacyTx::default()
+    }
+    .sign(&chain.signer);
+    let (skip, ws) = chain
+        .scope()
+        .execute_tx(slot(0, 0, 0, 0), &other_chain, None, None)
+        .unwrap();
+    assert_eq!(skip.skip_reason, Some(SkipReason::OtherTransaction));
+    assert!(!skip.burns_nonce() && ws.accounts.is_empty(), "{skip:?}");
+}
+
+/// A header rejection comes from the block environment, not from the
+/// transaction: it burns nothing. A rejection of the transaction at the
+/// chain nonce, for the gas, does.
+#[test]
+fn a_header_rejection_burns_nothing() {
+    use revm::context::result::{EVMError, InvalidHeader, InvalidTransaction};
+    let chain = Chain::new(3, 1);
+    let tx = chain.transfer(3, 1);
+    let record = SkippedRecord {
+        slot: slot(0, 0, 0, 0),
+        inbound_envelope: &tx,
+        block_number: 1,
+    };
+    let mut db = revm::database::CacheDB::new(SnapshotDb { inner: &chain.snap });
+    let header = record
+        .rejected(
+            EVMError::<StateRefError>::Header(InvalidHeader::PrevrandaoNotSet),
+            3,
+            Some(PAYEE),
+        )
+        .unwrap();
+    assert!(header.burn_state(&mut db, NOW_MS).unwrap().is_none());
+    let gas = record
+        .rejected(
+            EVMError::<StateRefError>::Transaction(InvalidTransaction::CallerGasLimitMoreThanBlock),
+            3,
+            Some(PAYEE),
+        )
+        .unwrap();
+    assert!(gas.burn_state(&mut db, NOW_MS).unwrap().is_some());
 }

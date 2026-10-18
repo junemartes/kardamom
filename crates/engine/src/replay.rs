@@ -437,6 +437,11 @@ struct Replay<'a> {
     /// so this starts at the schedule's first values and advances with
     /// each block's gas used, as the live exec thread's cursor does.
     fees: BlockFees,
+    /// The header timestamp of the last replayed block, 0 at genesis. Block
+    /// N's records execute with block N-1's timestamp, as on the live exec
+    /// thread. Block N's own timestamp is its header time: the block-close
+    /// actions and the boundary read it.
+    exec_ts: u64,
     counters: Counters,
 }
 
@@ -453,6 +458,7 @@ impl<'a> Replay<'a> {
             source,
             chain_id: genesis.chain_id,
             fees: BlockFees::genesis(genesis.fees),
+            exec_ts: 0,
             counters: Counters::default(),
         }
     }
@@ -498,6 +504,7 @@ impl<'a> Replay<'a> {
             gas_used,
         };
         self.fees = self.fees.next(gas_used);
+        self.exec_ts = block.l2_timestamp;
         self.queue.submit_rebuilt(boundary, block_delta)?;
         self.signal.wait_committed(block.block_number)?;
         self.counters.head = block.block_number;
@@ -520,7 +527,7 @@ impl<'a> Replay<'a> {
         let exec_env = ExecEnv {
             chain_id: self.chain_id,
             block_number: block.block_number,
-            l2_timestamp: block.l2_timestamp,
+            l2_timestamp: self.exec_ts,
             fees: self.fees,
         };
 

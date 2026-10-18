@@ -37,7 +37,7 @@ fn a_new_session_forgets_the_version_and_an_old_report_never_counts() {
     r.on_sealer_info(7, 3);
     assert!(!shared.sealer_runs_v3(), "a report of session 7");
     r.on_sealer_info(8, 2);
-    assert!(!shared.sealer_runs_v3(), "version 2 takes no release");
+    assert!(!shared.sealer_runs_v3(), "a report of version 2");
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn an_early_report_of_another_session_does_not_count() {
 /// A sealer under version 2 sends no report. Its switch to version 3
 /// sends one in the middle of the session.
 #[test]
-fn a_session_with_no_report_takes_no_release_until_the_switch() {
+fn a_session_with_no_report_runs_version_two_until_the_switch() {
     let (mut r, shared) = rules();
     r.on_session_start(7);
     assert!(!shared.sealer_runs_v3());

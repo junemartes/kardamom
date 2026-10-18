@@ -221,6 +221,22 @@ impl SkipReason {
             SkipReason::Header => "header",
         }
     }
+
+    /// Whether a skip for this reason can leave the chain nonce of the
+    /// sender at the nonce of the transaction, so that the skip can use
+    /// it. Undecodable bytes carry no nonce. A nonce skip is off the chain
+    /// nonce by its reason. A header skip comes from the block
+    /// environment, not from the transaction.
+    #[must_use]
+    pub fn can_use_nonce(self) -> bool {
+        !matches!(
+            self,
+            SkipReason::Undecodable
+                | SkipReason::NonceTooLow
+                | SkipReason::NonceTooHigh
+                | SkipReason::Header
+        )
+    }
 }
 
 /// Per-transaction execution receipt. Executor replicas publish this on
@@ -356,11 +372,15 @@ impl Receipt {
     /// used its nonce. With `FEATURE_SEALER_V3` active, a skip of a
     /// transaction at the nonce of its sender sets that nonce one higher,
     /// and changes nothing else. So the write set of the skip is not
-    /// empty. A skip that uses no nonce writes nothing, also on a chain
-    /// where the feature is not active.
+    /// empty, and its reason is one that can use a nonce
+    /// ([`SkipReason::can_use_nonce`]). A skip that uses no nonce writes
+    /// nothing, also on a chain where the feature is not active.
     #[must_use]
     pub fn burns_nonce(&self) -> bool {
-        self.is_invalid_skip() && !self.is_deposit() && self.write_set_hash != EMPTY_WRITE_SET_HASH
+        self.is_invalid_skip()
+            && !self.is_deposit()
+            && self.skip_reason.is_some_and(SkipReason::can_use_nonce)
+            && self.write_set_hash != EMPTY_WRITE_SET_HASH
     }
 
     /// Returns true if this receipt is for an L1-originated deposit. A
@@ -447,15 +467,33 @@ mod tests {
     }
 
     /// A skip with a write set used its nonce. A skip with the empty
-    /// write set, and a failed deposit with its mint, used none.
+    /// write set, a skip for a reason that uses no nonce, and a failed
+    /// deposit with its mint, used none.
     #[test]
     fn a_skip_with_a_write_set_burns_its_nonce() {
         let skip = Receipt {
             status: false,
             gas_used: 0,
             write_set_hash: EMPTY_WRITE_SET_HASH,
+            skip_reason: Some(SkipReason::InsufficientFunds),
             ..Receipt::default()
         };
+        for reason in [
+            SkipReason::Undecodable,
+            SkipReason::NonceTooLow,
+            SkipReason::NonceTooHigh,
+            SkipReason::Header,
+        ] {
+            let written = Receipt {
+                skip_reason: Some(reason),
+                write_set_hash: B256::repeat_byte(0x11),
+                ..skip.clone()
+            };
+            assert!(
+                !written.burns_nonce() && !written.uses_nonce(),
+                "{reason:?}"
+            );
+        }
         assert!(!skip.burns_nonce() && !skip.uses_nonce());
         let burn = Receipt {
             write_set_hash: B256::repeat_byte(0x11),

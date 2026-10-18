@@ -1,0 +1,40 @@
+---
+# One service of the upgrade check: the registered job
+# workloads_upgrade_job.name must carry every job meta of
+# workloads_upgrade_job.metas, and every live allocation must run that job
+# version. upgrade_check.yml loops over workloads_upgrade_jobs.
+- name: Read the registered {{ workloads_upgrade_job.name }}
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: "{{ workloads_upgrade_job.name }}"
+
+- name: Read the {{ workloads_upgrade_job.name }} allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_upgrade_job.name }}/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    status_code: [200, 404]
+  register: workloads_upgrade_allocations
+
+- name: Keep the live {{ workloads_upgrade_job.name }} allocations and the missing metas
+  ansible.builtin.set_fact:
+    workloads_upgrade_live: >-
+      {{ (workloads_upgrade_allocations.json | default([], true))
+         | selectattr('ClientStatus', 'in', ['running', 'pending']) | list }}
+    workloads_upgrade_missing: >-
+      {{ workloads_upgrade_job.metas | reject('in', (workloads_registered_job.json | default({}, true)).Meta
+         | default({}, true) | dict2items | selectattr('value', 'equalto', 'true') | map(attribute='key') | list)
+         | list }}
+
+- name: Refuse a {{ workloads_upgrade_job.name }} of an older release
+  ansible.builtin.assert:
+    that:
+      - workloads_registered_job.status == 200
+      - workloads_upgrade_missing | length == 0
+      - workloads_upgrade_live | length > 0
+      - workloads_upgrade_live | map(attribute='JobVersion') | unique | list == [workloads_registered_job.json.Version]
+    fail_msg: >-
+      Refused: the {{ workloads_upgrade_job.name }} job does not {{ workloads_upgrade_job.does }} (job meta
+      {{ workloads_upgrade_missing | join(', ') }}), no {{ workloads_upgrade_job.name }} runs, or an allocation of
+      an older job version still runs ({{ workloads_upgrade_live | map(attribute='JobVersion') | unique | list }}).
+      Deploy the release to every {{ workloads_upgrade_job.name }}, then run the check again.

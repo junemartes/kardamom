@@ -115,6 +115,14 @@ variable "executor_count" {
 }
 
 job "validator" {
+  # The validator of this release re-executes the nonce of a skipped
+  # transaction as the executor does once FEATURE_SEALER_V3 is active. An
+  # older validator finds a divergence at the first such skip. The upgrade
+  # check (`just sealer-upgrade-check <env>`) reads this meta.
+  meta {
+    nonce_burn = "true"
+  }
+
   datacenters = [var.datacenter]
   type        = "service"
 

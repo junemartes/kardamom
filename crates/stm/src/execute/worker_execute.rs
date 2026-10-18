@@ -18,7 +18,7 @@ use kardamom_exec_core::exec_types::ReceiptStatus;
 use kardamom_exec_core::exec_types::{TxIndex, TxSlot};
 use kardamom_exec_core::executor::DecodedTx;
 use kardamom_exec_core::executor::Executor;
-use kardamom_exec_core::executor::Skip;
+use kardamom_exec_core::executor::{Skip, SkippedRecord};
 use kardamom_types::BPosition;
 use kardamom_types::Receipt;
 use kardamom_types::StateDatabase;
@@ -81,24 +81,30 @@ pub(super) struct ExecCtx<'a> {
 }
 
 impl TxJob<'_> {
-    /// The block slot of this transaction. The commit pass sets the
-    /// cumulative gas.
-    fn slot(&self) -> TxSlot {
-        TxSlot {
-            tx_idx: self.tx_idx,
-            tx_position: self.position,
-            tx_index_in_block: u64::from(self.local_idx),
-            cumulative_gas_used_before: 0,
+    /// This transaction as a skip of block `block_number`. Its slot has
+    /// no cumulative gas: the commit pass sets it.
+    fn skipped(&self, block_number: u64) -> SkippedRecord<'_> {
+        SkippedRecord {
+            slot: TxSlot {
+                tx_idx: self.tx_idx,
+                tx_position: self.position,
+                tx_index_in_block: u64::from(self.local_idx),
+                cumulative_gas_used_before: 0,
+            },
+            inbound_envelope: self.envelope,
+            block_number,
         }
     }
 
     /// Build the skip-path result, for every reason a transaction never
     /// really ran (undecodable, or an `EVMError` the executor treats as a
-    /// skip rather than a hard failure). A skip with no nonce burn
-    /// records no reads, credits no fee and writes nothing. A burn
-    /// ([`kardamom_exec_core::executor::NonceBurn`]) publishes its state
-    /// as an executed transaction does, with its reads, so the
-    /// validation of the block covers the feature flag and the nonce
+    /// skip rather than a hard failure). Every skip result carries the
+    /// reads of the transaction through the view, so the validation of
+    /// the block covers what the rejection read: a nonce or a balance
+    /// that an earlier transaction of the block changes. A skip with no
+    /// nonce burn credits no fee and writes nothing. A burn
+    /// ([`Skip::burn_state`]) publishes its state as an executed
+    /// transaction does, so the validation also covers the feature flag
     /// that it read.
     fn skip<S: StateDatabase>(
         &self,
@@ -109,11 +115,12 @@ impl TxJob<'_> {
     ) -> Result<TxResult, ExecutorError> {
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
         let Some(state) = skip.burn_state(db, ctx.env.l2_timestamp)? else {
+            let reads = std::mem::replace(&mut db.reads, fresh_reads());
             let (receipt, ws) = Executor::<S>::skip_receipt(skip, WriteSet::default());
             return Ok(TxResult {
                 receipt,
                 ws,
-                reads: Vec::new(),
+                reads,
                 sink_fee_delta: None,
                 bal_frag: None,
             });
@@ -143,15 +150,10 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
 ) -> Result<TxResult, ExecutorError> {
     use alloy_consensus::Transaction;
     let Some(alloy_env) = job.decoded else {
-        let skip = Skip {
-            reason: kardamom_types::SkipReason::Undecodable,
-            detail: "undecodable raw_tx",
-            slot: job.slot(),
-            inbound_envelope: job.envelope,
-            nonce: 0,
-            to: None,
-            block_number: ctx.env.block_number,
-        };
+        reaim(evm, job.local_idx);
+        let skip = job
+            .skipped(ctx.env.block_number)
+            .undecodable("undecodable raw_tx".into());
         return job.skip(evm, ctx, skip, fresh_reads);
     };
     let (signer, nonce, to) = (job.envelope.sender, alloy_env.nonce(), alloy_env.to());
@@ -161,16 +163,7 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
     let outcome = match evm.transact(tx_env) {
         Ok(o) => o,
         Err(e) => {
-            let (reason, detail) = Skip::rejection(e, job.tx_idx)?;
-            let skip = Skip {
-                reason,
-                detail: &detail,
-                slot: job.slot(),
-                inbound_envelope: job.envelope,
-                nonce,
-                to,
-                block_number: ctx.env.block_number,
-            };
+            let skip = job.skipped(ctx.env.block_number).rejected(e, nonce, to)?;
             return job.skip(evm, ctx, skip, fresh_reads);
         }
     };
@@ -395,10 +388,16 @@ fn reaim_and_build_tx_env<S: StateDatabase>(
     alloy_env: &DecodedTx,
     signer: alloy_primitives::Address,
 ) -> revm::context::TxEnv {
+    reaim(evm, local_idx);
+    alloy_env.tx_env(signer)
+}
+
+/// Re-aim the worker's view at the transaction `local_idx`: its index,
+/// and an empty read log.
+fn reaim<S: StateDatabase>(evm: &mut WorkerEvm<'_, S>, local_idx: u32) {
     let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
     db.idx = local_idx;
     db.reads.clear();
-    alloy_env.tx_env(signer)
 }
 
 /// Classify one EVM outcome into a wire status and wire logs, built

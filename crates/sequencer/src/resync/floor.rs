@@ -101,9 +101,10 @@ impl Outcome {
         }
     }
 
-    /// The nonce the chain expects next after a skip, as far as the
-    /// receipt floor `floor` of the sender shows it. A skip uses no
-    /// nonce, so a nonce floor above this value is above the chain.
+    /// The nonce the chain expects next after a skip that used no nonce,
+    /// as far as the receipt floor `floor` of the sender shows it. A nonce
+    /// floor above this value is above the chain. A skip that used its
+    /// nonce is [`Outcome::Executed`], not a skip here.
     ///
     /// - A skip below `floor` is late: a lagging executor sent it after
     ///   later receipts raised the floor. It proves nothing new, and a
@@ -113,7 +114,10 @@ impl Outcome {
     ///   nonce. `None`.
     /// - A nonce-too-high skip proves only that the chain is below its
     ///   nonce. The receipt floor is the best bound.
-    /// - Every other skip leaves the chain at its nonce.
+    /// - Any other skip that used no nonce shows that the chain expected
+    ///   its nonce: the skip names it. A rejection before the nonce check
+    ///   (a fee, the gas, the code, another chain id) proves less, and a
+    ///   receipt that comes later in the stream raises the floor again.
     ///
     /// `None` for an executed tx and for a deposit.
     #[must_use]

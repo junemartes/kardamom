@@ -9,12 +9,12 @@ use kardamom_types::{BPosition, Deposit, Receipt, SkipReason, StateDatabase, TxE
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use revm::context::result::EVMError;
+use revm::context::result::{EVMError, InvalidTransaction};
 use revm::state::EvmState;
 
 use crate::delta::WriteSet;
 use crate::error::ExecutorError;
-use crate::exec_types::{TxIndex, TxSlot};
+use crate::exec_types::TxSlot;
 
 use super::burn::NonceBurn;
 use super::scope::Executor;
@@ -187,44 +187,94 @@ pub fn skip_reason_of_tx(err: &revm::context::result::InvalidTransaction) -> Ski
     }
 }
 
-/// A canonical record that execution skips: what its skip receipt states,
-/// and what its error log names.
+/// A canonical record that execution skips: its block slot, its envelope,
+/// and the block it runs in. [`Self::undecodable`] and [`Self::rejected`]
+/// build its [`Skip`].
 #[derive(Clone, Copy)]
-pub struct Skip<'a> {
-    pub reason: SkipReason,
-    pub detail: &'a str,
+pub struct SkippedRecord<'a> {
     pub slot: TxSlot,
     pub inbound_envelope: &'a TxEnvelope,
-    /// The nonce of the transaction, 0 for undecodable bytes.
-    pub nonce: u64,
-    pub to: Option<Address>,
     pub block_number: u64,
 }
 
-impl Skip<'_> {
-    /// The skip reason and the log detail of a failed `transact`. A
-    /// validation rejection is deterministic: every replica computes the
-    /// same one from the same state and transaction, so the record skips.
+impl<'a> SkippedRecord<'a> {
+    /// The skip of a record whose bytes do not decode. It carries no
+    /// nonce, so it uses none.
+    #[must_use]
+    pub fn undecodable(self, detail: String) -> Skip<'a> {
+        Skip {
+            reason: SkipReason::Undecodable,
+            detail,
+            burnable: false,
+            record: self,
+            nonce: 0,
+            to: None,
+        }
+    }
+
+    /// The skip of a decoded transaction at `nonce` to `to` that
+    /// `transact` refused with `e`. A validation rejection is
+    /// deterministic: every replica computes the same one from the same
+    /// state and transaction, so the record skips.
+    ///
+    /// The skip can use its nonce only when the rejection comes from the
+    /// transaction against the chain state, and leaves the chain nonce of
+    /// the sender possibly at `nonce`. A reason that cannot use a nonce
+    /// ([`SkipReason::can_use_nonce`]) and a chain-id rejection (a
+    /// transaction for another chain) never do.
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::Execution`] for a database or a custom
     /// failure. It is local, not derivable from the input, so execution
     /// halts, and crash recovery replays cleanly.
-    pub fn rejection<E: core::fmt::Debug>(
+    pub fn rejected<E: core::fmt::Debug>(
+        self,
         e: EVMError<E>,
-        idx: TxIndex,
-    ) -> Result<(SkipReason, String), ExecutorError> {
-        match e {
-            EVMError::Transaction(e) => Ok((skip_reason_of_tx(&e), format!("{e:?}"))),
-            EVMError::Header(e) => Ok((SkipReason::Header, format!("{e:?}"))),
-            e => Err(ExecutorError::Execution {
-                idx,
-                detail: format!("{e:?}"),
-            }),
-        }
+        nonce: u64,
+        to: Option<Address>,
+    ) -> Result<Skip<'a>, ExecutorError> {
+        let (reason, detail, other_chain) = match e {
+            EVMError::Transaction(e) => (
+                skip_reason_of_tx(&e),
+                format!("{e:?}"),
+                matches!(
+                    e,
+                    InvalidTransaction::InvalidChainId | InvalidTransaction::MissingChainId
+                ),
+            ),
+            EVMError::Header(e) => (SkipReason::Header, format!("{e:?}"), false),
+            e => {
+                return Err(ExecutorError::Execution {
+                    idx: self.slot.tx_idx,
+                    detail: format!("{e:?}"),
+                });
+            }
+        };
+        Ok(Skip {
+            reason,
+            detail,
+            burnable: reason.can_use_nonce() && !other_chain,
+            record: self,
+            nonce,
+            to,
+        })
     }
+}
 
+/// A skipped canonical record: what its skip receipt states, what its
+/// error log names, and whether its rejection can use the nonce.
+pub struct Skip<'a> {
+    reason: SkipReason,
+    detail: String,
+    burnable: bool,
+    record: SkippedRecord<'a>,
+    /// The nonce of the transaction, 0 for undecodable bytes.
+    nonce: u64,
+    to: Option<Address>,
+}
+
+impl Skip<'_> {
     /// The state change of the nonce burn of this skip, read through `db`
     /// at the block timestamp `timestamp_ms`. `None` when the skip uses
     /// no nonce. See [`NonceBurn`].
@@ -240,8 +290,14 @@ impl Skip<'_> {
     where
         DB::Error: core::fmt::Debug,
     {
-        NonceBurn::of_skip(self.reason, self.inbound_envelope.sender, self.nonce)
-            .map_or(Ok(None), |burn| burn.state(db, timestamp_ms))
+        if !self.burnable {
+            return Ok(None);
+        }
+        NonceBurn {
+            sender: self.record.inbound_envelope.sender,
+            nonce: self.nonce,
+        }
+        .state(db, timestamp_ms)
     }
 }
 
@@ -260,27 +316,40 @@ impl<S: StateDatabase> Executor<S> {
     /// all means an upstream guard (sequencer nonce fence, cluster dedup,
     /// or resync floor) let an invalid record reach the canonical log.
     pub fn skip_receipt(skip: Skip<'_>, ws: WriteSet) -> (Receipt, WriteSet) {
+        let Skip {
+            reason,
+            detail,
+            record:
+                SkippedRecord {
+                    slot,
+                    inbound_envelope,
+                    block_number,
+                },
+            nonce,
+            to,
+            ..
+        } = skip;
         log_invalid(
-            skip.reason,
-            skip.detail,
-            skip.block_number,
+            reason,
+            &detail,
+            block_number,
             InvalidTx::CanonicalSkip {
-                inbound_envelope: skip.inbound_envelope,
-                nonce: skip.nonce,
+                inbound_envelope,
+                nonce,
             },
         );
         Self::failed_derived_receipt(
             DerivedTxIdentity {
-                tx_hash: skip.inbound_envelope.tx_hash,
-                tx_type: kardamom_types::tx_type_of(&skip.inbound_envelope.raw_tx),
-                from: skip.inbound_envelope.sender,
-                to: skip.to,
-                nonce: skip.nonce,
+                tx_hash: inbound_envelope.tx_hash,
+                tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
+                from: inbound_envelope.sender,
+                to,
+                nonce,
             },
-            SkipContext::new(skip.slot, skip.block_number),
+            SkipContext::new(slot, block_number),
             ws,
             None,
-            skip.reason,
+            reason,
         )
     }
 
