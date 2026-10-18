@@ -142,10 +142,16 @@ public final class ClusterNode {
         System.out.println("cluster carry bytes memberId=" + memberId + carryBytes
             .map(c -> " dir=" + c.file().dir() + " segmentBytes=" + c.file().segmentBytes())
             .orElse(" <off: retained frames on the heap>"));
+        // The longest idle park of every hot-path thread of the member.
+        // -Dkardamom.cluster.idleCapUs wins over the KARDAMOM_IDLE_CAP_US
+        // env var. Unset, the cap is 1 ms, the cap of Aeron's own backoff.
+        final IdleCap idleCap = IdleCap.fromSettings();
+        System.out.println("cluster idle cap memberId=" + memberId + " maxParkNs=" + idleCap.maxParkNs());
         final Optional<FeedConfig> feed = FeedConfig.parse(
             System.getProperty(FeedConfig.DIR_SETTING),
             System.getProperty(FeedConfig.RING_SETTING),
-            carryBytes.isPresent());
+            carryBytes.isPresent(),
+            idleCap);
         System.out.println("cluster feed memberId=" + memberId + feed
             .map(f -> " aeronDir=" + f.aeronDir() + " ringBytes=" + f.ringBytes() + " termBytes=" + f.termBytes())
             .orElse(" <off: no paired executor>"));
@@ -177,8 +183,9 @@ public final class ClusterNode {
         // The driver keeps the last address of each member name, so a short
         // outage of the node's DNS agent does not fail an add in an election.
         // The member's own name resolves to the node address with no lookup.
-        final MemberContexts contexts =
-            new MemberContexts(aeronDir, clusterDir, archiveDir, me).withPeerNames(memberId, nodeIp);
+        final MemberContexts contexts = new MemberContexts(aeronDir, clusterDir, archiveDir, me)
+            .withPeerNames(memberId, nodeIp)
+            .withIdleCap(idleCap);
         prepareState(contexts, memberId, peerConsensusEndpoints(clusterMembers, memberId), carryBytes
             .map(c -> c.copy(new ClusterMembers(clusterMembers).peerAdminEndpoints(memberId, adminPort), memberId)));
 
@@ -213,7 +220,8 @@ public final class ClusterNode {
                 driver = ClusteredMediaDriver.launch(
                     contexts.driver(),
                     contexts.archive(),
-                    consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, stop));
+                    consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, stop)
+                        .idleStrategySupplier(idleCap::strategy));
                 // Aeron contexts are single-use, and so is the service they
                 // launch: a retry gets a fresh instance.
                 service = new SealerClusteredService(
@@ -225,7 +233,8 @@ public final class ClusterNode {
                 carryBytes.map(CarryBytes::file).ifPresent(file -> built.carryingBytes(file, feed));
                 snapshotSchedule.ifPresent(service::snapshotEvery);
                 container = ClusteredServiceContainer.launch(
-                    serviceContext(aeronDir, clusterDir, memberId, service, stop));
+                    serviceContext(aeronDir, clusterDir, memberId, service, stop)
+                        .idleStrategySupplier(idleCap::strategy));
                 break;
             } catch (final RuntimeException e) {
                 org.agrona.CloseHelper.quietClose(driver);

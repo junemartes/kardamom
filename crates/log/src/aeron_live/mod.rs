@@ -56,8 +56,10 @@
 //!   publication/subscription tables.
 //! - `bound`: the read of the control address the driver bound for a
 //!   dynamic MDC publication on port 0.
-//! - `pending`: the parked-publish retry scheduler ([`IdleBackoff`],
-//!   `drain_pending`) and its unit tests.
+//! - `pending`: the parked-publish retry scheduler (`drain_pending`) and
+//!   its unit tests.
+//! - `idle`: the idle wait of a hot-path poll loop ([`IdleCap`],
+//!   [`IdleBackoff`]).
 //! - `handles`: the typed per-channel publisher/subscriber handle pairs.
 //!
 //! Everything public is re-exported here. Downstream imports are always
@@ -67,6 +69,7 @@ mod add_wait;
 mod bound;
 mod destination;
 mod handles;
+mod idle;
 mod image_log;
 mod pending;
 mod runtime;
@@ -87,7 +90,8 @@ pub use handles::tx_receipts::{
     ReceiptFrame, TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle,
     TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
-pub use pending::{BEST_EFFORT_DROPPED_TOTAL, IdleBackoff};
+pub use idle::{IdleBackoff, IdleCap};
+pub use pending::BEST_EFFORT_DROPPED_TOTAL;
 pub use runtime::{
     AeronRuntime, Destinations, PollRecv, PubHandle, TxDataSubscription, TypedSubscription,
 };

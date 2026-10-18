@@ -37,6 +37,8 @@ final class MemberContexts {
     private final String[] endpoints;
     /** The driver's host name resolver. Null selects the Aeron default. */
     private final NameResolver nameResolver;
+    /** The longest idle park of the driver and the archive. */
+    private final IdleCap idleCap;
 
     MemberContexts(
             final String aeronDir, final String clusterDir, final String archiveDir, final String[] endpoints) {
@@ -49,11 +51,22 @@ final class MemberContexts {
             final String archiveDir,
             final String[] endpoints,
             final NameResolver nameResolver) {
+        this(aeronDir, clusterDir, archiveDir, endpoints, nameResolver, IdleCap.DEFAULT);
+    }
+
+    private MemberContexts(
+            final String aeronDir,
+            final String clusterDir,
+            final String archiveDir,
+            final String[] endpoints,
+            final NameResolver nameResolver,
+            final IdleCap idleCap) {
         this.aeronDir = aeronDir;
         this.clusterDir = clusterDir;
         this.archiveDir = archiveDir;
         this.endpoints = endpoints;
         this.nameResolver = nameResolver;
+        this.idleCap = idleCap;
     }
 
     /**
@@ -63,7 +76,12 @@ final class MemberContexts {
      */
     MemberContexts withPeerNames(final int memberId, final String nodeIp) {
         return new MemberContexts(
-            aeronDir, clusterDir, archiveDir, endpoints, new PeerNameResolver(memberId, ownAddress(nodeIp)));
+            aeronDir, clusterDir, archiveDir, endpoints, new PeerNameResolver(memberId, ownAddress(nodeIp)), idleCap);
+    }
+
+    /** These contexts with the idle cap {@code cap} for the driver and the archive. */
+    MemberContexts withIdleCap(final IdleCap cap) {
+        return new MemberContexts(aeronDir, clusterDir, archiveDir, endpoints, nameResolver, cap);
     }
 
     private Map<String, InetAddress> ownAddress(final String nodeIp) {
@@ -100,6 +118,7 @@ final class MemberContexts {
         return new MediaDriver.Context()
             .aeronDirectoryName(aeronDir)
             .threadingMode(ThreadingMode.SHARED)
+            .sharedIdleStrategy(idleCap.strategy())
             .nameResolver(nameResolver)
             .dirDeleteOnStart(true)
             .dirDeleteOnShutdown(false);
@@ -122,7 +141,8 @@ final class MemberContexts {
             .fileSyncLevel(ClusterNode.fileSyncLevel())
             .catalogFileSyncLevel(ClusterNode.fileSyncLevel())
             .recordingEventsEnabled(false)
-            .threadingMode(ArchiveThreadingMode.SHARED);
+            .threadingMode(ArchiveThreadingMode.SHARED)
+            .idleStrategySupplier(idleCap::strategy);
     }
 
     /**

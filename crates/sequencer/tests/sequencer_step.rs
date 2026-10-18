@@ -3,6 +3,7 @@
 use kardamom_types::{BlockBoundary, TxDataLoc, TxStage};
 use std::num::NonZeroU32;
 
+use kardamom_log::aeron_live::IdleCap;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::partition::PartitionCount;
@@ -216,7 +217,7 @@ fn run_loops_until_shutdown_signaled() {
     let mut rig = Rig::default();
     let shutdown = Shutdown::new();
     shutdown.signal();
-    let result = seq.run(&mut rig.ports(), &shutdown);
+    let result = seq.run(&mut rig.ports(), &shutdown, IdleCap::default());
     assert!(result.is_ok(), "{result:?}");
 }
 
@@ -227,7 +228,7 @@ fn run_returns_when_channel_a_disconnected() {
     let mut rig = Rig::default();
     rig.tx_data.disconnected = true;
     let shutdown = Shutdown::new();
-    let result = seq.run(&mut rig.ports(), &shutdown);
+    let result = seq.run(&mut rig.ports(), &shutdown, IdleCap::default());
     assert!(result.is_ok(), "{result:?}");
 }
 

@@ -13,8 +13,9 @@ import java.util.Optional;
  * @param aeronDir  the directory of the media driver that the member shares with its executor
  * @param ringBytes the capacity of the frame ring, a power of two
  * @param termBytes the term length of the feed publication
+ * @param idleCap   the longest idle park of the feeder thread
  */
-record FeedConfig(String aeronDir, int ringBytes, int termBytes) {
+record FeedConfig(String aeronDir, int ringBytes, int termBytes, IdleCap idleCap) {
 
     /** The directory of the shared media driver. Unset or empty: no feed. */
     static final String DIR_SETTING = "kardamom.cluster.feedAeronDir";
@@ -31,15 +32,17 @@ record FeedConfig(String aeronDir, int ringBytes, int termBytes) {
      * {@code aeronDir} is unset or empty.
      *
      * @param carryBytes whether the member keeps its retained frames in a file
+     * @param idleCap    the longest idle park of the feeder thread
      * @throws IllegalArgumentException when the feed is on without the retained file, or the ring does not parse
      */
-    static Optional<FeedConfig> parse(final String aeronDir, final String ringBytes, final boolean carryBytes) {
+    static Optional<FeedConfig> parse(
+            final String aeronDir, final String ringBytes, final boolean carryBytes, final IdleCap idleCap) {
         final Optional<String> dir = Optional.ofNullable(aeronDir).map(String::trim).filter(s -> !s.isEmpty());
         if (dir.isPresent() && !carryBytes) {
             throw new IllegalArgumentException(DIR_SETTING + " needs " + RetainedFile.Config.SETTING
                 + "=true: the feed replays from the retained file");
         }
-        return dir.map(d -> new FeedConfig(d, ring(ringBytes), TERM_BYTES));
+        return dir.map(d -> new FeedConfig(d, ring(ringBytes), TERM_BYTES, idleCap));
     }
 
     private static int ring(final String ringBytes) {

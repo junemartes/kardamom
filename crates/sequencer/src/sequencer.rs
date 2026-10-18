@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::GuardHeader;
+use kardamom_log::aeron_live::{IdleBackoff, IdleCap};
 use kardamom_types::num::usize_to_u64;
 use kardamom_types::shard_map::{VslotSet, vslot_for};
 use kardamom_types::{BPosition, TxError, TxErrorReason, TxStatus};
@@ -1037,7 +1038,8 @@ impl Sequencer {
     }
 
     /// Pin this thread to the configured core (if any) and loop until
-    /// shutdown.
+    /// shutdown. `idle_cap` is the idle cap of the process (see
+    /// [`IdleCap`]).
     ///
     /// # Errors
     ///
@@ -1048,6 +1050,7 @@ impl Sequencer {
         &mut self,
         ports: &mut P,
         shutdown: &Shutdown,
+        idle_cap: IdleCap,
     ) -> Result<(), SequencerError> {
         if let Some(core) = self.cfg.core_id {
             let id = core_affinity::CoreId { id: core };
@@ -1055,14 +1058,12 @@ impl Sequencer {
                 tracing::warn!(core, "failed to pin sequencer thread to core");
             }
         }
-        // Same escalation as the deposit pump: 1µs base, x2 per idle
-        // iteration, 100µs cap, snap back on work. IdleBackoff with
-        // grace 1 gives the exact old sleep sequence (1, 2, 4, ... 100).
-        let mut backoff = kardamom_log::aeron_live::IdleBackoff::new(
-            Duration::from_micros(1),
-            Duration::from_micros(100),
-            1,
-        );
+        // 1µs base, x2 per idle iteration, snap back on work. The cap is
+        // 100µs, or the idle cap when the deploy sets one. The poll reads
+        // `tx_data` with no wake-up, so a quiet spell delays the next
+        // envelope by up to the cap.
+        let mut backoff = IdleBackoff::new(Duration::from_micros(1), Duration::from_micros(100), 1)
+            .under(idle_cap, Duration::from_micros(1));
         while !shutdown.is_signaled() && self.run_tick(ports, &mut backoff)? {}
         Ok(())
     }
@@ -1074,7 +1075,7 @@ impl Sequencer {
     fn run_tick<P: SequencerPorts>(
         &mut self,
         ports: &mut P,
-        backoff: &mut kardamom_log::aeron_live::IdleBackoff,
+        backoff: &mut IdleBackoff,
     ) -> Result<bool, SequencerError> {
         match self.run_once(ports) {
             Ok(true) => {
