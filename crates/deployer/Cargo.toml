@@ -34,6 +34,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+# The format gate of a deploy (`kardamom-deploy formats`).
+kardamom-formats = { path = "../formats" }
 alloy-node-bindings = { workspace = true, optional = true }
 # Only for `mnemonic`/`signers`, behind `test-support`.
 alloy-eips = { workspace = true, optional = true }

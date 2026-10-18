@@ -236,10 +236,12 @@
   ansible.builtin.set_fact:
     workloads_gate_has_base: "{{ workloads_accepted.target.formats | default('') | length > 0 }}"
 
+# The deploy binary of the release holds the comparison: every release
+# ships it, signed, so the gate needs no other binary.
 - name: Compare the formats of the target with the accepted release
   ansible.builtin.command:
     argv:
-      - "{{ workloads_cluster_binary }}"
+      - "{{ workloads_deploy_binary }}"
       - formats
       - --base
       - "{{ workloads_record_dir }}/accepted.formats.toml"
@@ -250,12 +252,35 @@
   check_mode: false
   when: workloads_gate_has_base | bool
 
+# A retired format is coordinated, unless KARDAMOM_ALLOW_RETIRED names it
+# and the format is neither shared nor permanent. The operator names it
+# only when the release removes the service that owned the format: a
+# running service that renames a format stops updating the old file, and
+# a rollback reads that stale file. A finding without the `shared` or the
+# `permanent` field stays coordinated.
 - name: Sort the format findings
   ansible.builtin.set_fact:
     workloads_one_way: "{{ workloads_gate_findings | selectattr('rule', 'equalto', 'rollback') | list }}"
-    workloads_coordinated: "{{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback') | list }}"
+    workloads_retirable: "{{ workloads_gate_retirable }}"
+    workloads_retired_allowed: "{{ workloads_gate_retired_allowed }}"
+    workloads_coordinated: >-
+      {{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback')
+         | reject('in', workloads_gate_retired_allowed) | list }}
   vars:
     workloads_gate_findings: "{{ workloads_gate_formats.stdout | from_json if workloads_gate_has_base | bool else [] }}"
+    workloads_gate_retirable: >-
+      {{ workloads_gate_findings | selectattr('rule', 'equalto', 'retired')
+         | selectattr('shared', 'defined') | rejectattr('shared')
+         | selectattr('permanent', 'defined') | rejectattr('permanent') | list }}
+    workloads_gate_retired_allowed: >-
+      {{ workloads_gate_retirable | selectattr('id', 'in', workloads_allow_retired) | list }}
+
+- name: Report the retired formats that KARDAMOM_ALLOW_RETIRED names
+  ansible.builtin.debug:
+    msg: >-
+      KARDAMOM_ALLOW_RETIRED accepts the retirement of {{ workloads_retired_allowed | map(attribute='id') | join(', ') }}.
+      The release removes the service that owned each one.
+  when: workloads_retired_allowed | length > 0
 
 - name: Refuse a coordinated format change in the rolling path
   ansible.builtin.assert:
@@ -265,6 +290,12 @@
       {{ workloads_coordinated | map(attribute='id') | unique | join(', ') }}.
       A mixed fleet of the accepted release and this one cannot run. Stop the writers, or follow the
       runbook of the format (docs/formats.md), then deploy.
+      {{ ('When the release removes the service that owned ' ~ (workloads_gate_unallowed | join(', '))
+          ~ ', set KARDAMOM_ALLOW_RETIRED=' ~ (workloads_gate_unallowed | join(',')) ~ '.')
+         if workloads_gate_unallowed | length > 0 else '' }}
+  vars:
+    workloads_gate_unallowed: >-
+      {{ workloads_retirable | map(attribute='id') | difference(workloads_allow_retired) }}
 
 - name: Refuse a one-way format change that KARDAMOM_ALLOW_ONE_WAY does not name
   ansible.builtin.assert:
@@ -281,6 +312,13 @@
     fail_msg: >-
       Refused: KARDAMOM_ALLOW_ONE_WAY names {{ workloads_allow_one_way | difference(workloads_one_way | map(attribute='id')) | join(', ') }},
       and the release has no one-way change of it. Unset it.
+
+- name: Refuse an allowance that covers no retired format
+  ansible.builtin.assert:
+    that: workloads_allow_retired | difference(workloads_retirable | map(attribute='id')) | length == 0
+    fail_msg: >-
+      Refused: KARDAMOM_ALLOW_RETIRED names {{ workloads_allow_retired | difference(workloads_retirable | map(attribute='id')) | join(', ') }},
+      and the release retires no format of that id that is neither shared nor permanent. Unset it.
 
 # The floor: the versions this release writes that the accepted release
 # cannot read. The rollback does not cross it.
@@ -322,6 +360,54 @@
       Members on two values decide differently and fork the replicated state.
       Change it through a coordinated restart of the sealer. A documented procedure names the settings in
       KARDAMOM_ALLOW_MUST_MATCH={{ workloads_gate_sealer_changed | join(',') }}.
+
+# 5a. A change of the decision version. Each member replays the log
+# after its snapshot with the rules of its code, so the coordinated
+# restart needs a log with no nonce release after the last snapshot. The
+# quiesce check (`just sealer-quiesce-check <env>`) proves it on the
+# members of the accepted release, before the stop.
+- name: Keep the decision versions of the accepted release and the target
+  ansible.builtin.set_fact:
+    workloads_gate_decision_version: >-
+      {{ workloads_job_definition.TaskGroups[0].Tasks[0].Env.JAVA_TOOL_OPTIONS
+         | regex_findall(workloads_gate_version_pattern) | first | int }}
+    workloads_gate_accepted_decision_version: >-
+      {{ (workloads_accepted.target.decision_version | default(2, true)) | int
+         if workloads_accepted | length > 0 else -1 }}
+  vars:
+    workloads_gate_version_pattern: '-Dkardamom\.cluster\.decisionVersion=(\d+)'
+
+- name: Read the quiesce check
+  ansible.builtin.uri:
+    url: "{{ workloads_quiesce_url }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    status_code: [200, 404]
+  register: workloads_gate_quiesce
+  check_mode: false
+  when:
+    - workloads_gate_accepted_decision_version | int >= 0
+    - workloads_gate_accepted_decision_version | int != workloads_gate_decision_version | int
+
+- name: Refuse a change of the decision version without a passing quiesce check
+  ansible.builtin.assert:
+    that:
+      - workloads_gate_quiesce.status == 200
+      - workloads_gate_quiesce.json.Items.decision_version | int == workloads_gate_accepted_decision_version | int
+      - workloads_gate_quiesce.json.Items.checked_at >= workloads_accepted.accepted_at | default('')
+      - workloads_gate_quiesce.json.Items.sequencers_stopped | default('') == 'true'
+      - (now().timestamp() | int) - (workloads_gate_quiesce.json.Items.checked_unix | default(0) | int)
+        <= [workloads_quiesce_max_age_s | int, 3600] | min
+    fail_msg: >-
+      Refused: the release changes the sealer decision version from
+      {{ workloads_gate_accepted_decision_version }} to {{ workloads_gate_decision_version }}, and no
+      quiesce check of the members of version {{ workloads_gate_accepted_decision_version }} passed after the
+      accepted release, with the sequencers stopped, within the last {{ [workloads_quiesce_max_age_s | int, 3600] | min }} s.
+      Follow "Decision version" in cluster/sealer-service/README.md: pause, stop the
+      sequencers, wait for a snapshot, run `just sealer-quiesce-check {{ workloads_env }}`, then stop the sealer.
+  when:
+    - workloads_gate_accepted_decision_version | int >= 0
+    - workloads_gate_accepted_decision_version | int != workloads_gate_decision_version | int
 
 - name: Refuse an allowance that covers no sealer setting change
   ansible.builtin.assert:

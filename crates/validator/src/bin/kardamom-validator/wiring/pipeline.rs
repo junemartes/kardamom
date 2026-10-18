@@ -36,7 +36,10 @@ impl Streamed {
             &self.opened.base.rt,
             &mut self.opened.base.plane,
             self.opened.base.args.executor_count,
-            self.streams.receipts.clone(),
+            crate::pumps::ReceiptsSinks {
+                receipts: self.streams.receipts.clone(),
+                bals: self.streams.bals.clone(),
+            },
             self.streams.pump_shutdown.clone(),
         )?
         .spawn();

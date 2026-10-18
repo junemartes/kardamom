@@ -302,6 +302,10 @@ pub fn expected_genesis_digest(
 /// `REPLAY_FROM(genesis)` would be refused once lifetime traffic exceeds
 /// it.
 ///
+/// Only a checkpoint whose block is in `range` qualifies: a rollback
+/// restores a checkpoint below its divergence point. A peer checkpoint at
+/// block 0 is never fetched: genesis needs no transfer.
+///
 /// This returns the restored `(block, checkpoint_path)`, or `None` for a
 /// genesis start. Role-specific follow-up, such as the validator's
 /// adoption marker and log wording, stays at the call site.
@@ -314,13 +318,15 @@ pub fn restore_or_fetch_checkpoint(
     ckpt_dir: &Path,
     state_dir: &Path,
     peers: &[String],
+    range: kardamom_state::BlockRange,
     expected_genesis: Option<alloy_primitives::B256>,
 ) -> Result<Option<(u64, std::path::PathBuf)>> {
-    let restore = || kardamom_state::restore_best_checkpoint(ckpt_dir, state_dir, expected_genesis);
+    let restore =
+        || kardamom_state::restore_best_checkpoint(ckpt_dir, state_dir, range, expected_genesis);
     let mut restored = restore().context("restore local checkpoint")?;
     if restored.is_none()
         && !peers.is_empty()
-        && kardamom_state::fetch_best_checkpoint(peers, ckpt_dir, 1, expected_genesis).is_some()
+        && kardamom_state::fetch_best_checkpoint(peers, ckpt_dir, range, expected_genesis).is_some()
     {
         restored = restore().context("restore fetched checkpoint")?;
     }
@@ -359,7 +365,9 @@ pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
 
 /// Open the member feed on a dedicated Aeron runtime on `aeron_dir`, the
 /// media driver that the executor shares with its member, and read it from
-/// `cursor`. The feed reads as closed once `stop` is cancelled.
+/// `cursor`. With a committed `history`, the reader first compares the
+/// stream with it, from the floor of the history to `cursor`. The feed
+/// reads as closed once `stop` is cancelled.
 ///
 /// # Errors
 ///
@@ -368,15 +376,16 @@ pub type LiveCarriedSub = crate::reader::carried::CarriedSubscription<
 pub fn open_member_feed(
     aeron_dir: Option<&Path>,
     cursor: crate::reader::cluster::ReplayCursor,
+    history: Option<crate::reader::carried::LocalHistory>,
     stop: tokio_util::sync::CancellationToken,
 ) -> Result<LiveCarriedSub> {
+    use crate::reader::carried::{AeronFeed, CarriedSubscription, NoSource};
     let rt = AeronRuntime::spawn(aeron_dir).context("spawn the member feed AeronRuntime")?;
-    let feed = crate::reader::carried::AeronFeed::open(rt, stop).context("open the member feed")?;
-    Ok(crate::reader::carried::CarriedSubscription::new(
-        feed,
-        crate::reader::carried::NoSource,
-        cursor,
-    ))
+    let feed = AeronFeed::open(rt, stop).context("open the member feed")?;
+    Ok(match history {
+        Some(history) => CarriedSubscription::compared(feed, NoSource, history),
+        None => CarriedSubscription::new(feed, NoSource, cursor),
+    })
 }
 
 /// The batcher's posted-cursor publisher over the live cluster session,
@@ -501,7 +510,10 @@ impl ResyncFallback<'_> {
         let Some(ckpt) = kardamom_state::fetch_best_checkpoint(
             self.checkpoint_peers,
             ckpt_dir,
-            oldest_block,
+            kardamom_state::BlockRange {
+                min: oldest_block,
+                ..kardamom_state::BlockRange::ANY
+            },
             self.expected_genesis,
         ) else {
             return Ok(None);

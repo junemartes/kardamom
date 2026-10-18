@@ -44,6 +44,26 @@ async fn connect_within(
         .map_err(|_| CacheError::Timeout)?
 }
 
+/// The keys one `SCAN` page asks for. Redis may return more or fewer.
+const SCAN_PAGE: u64 = 1_000;
+
+/// The state of one key sweep: the next `SCAN` cursor, `None` once the
+/// scan is done, and the keys deleted so far.
+struct Sweep {
+    next: Option<u64>,
+    deleted: u64,
+}
+
+impl Default for Sweep {
+    /// A sweep that starts at the first cursor.
+    fn default() -> Self {
+        Self {
+            next: Some(0),
+            deleted: 0,
+        }
+    }
+}
+
 /// One account as the cache holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountView {
@@ -403,6 +423,62 @@ impl AccountCache {
                     .map_err(|e| CacheError::Codec(e.to_string()))
             })
             .transpose()
+    }
+
+    /// Delete the account projection and the receipt index: every
+    /// `acct:` and `rcpt:` key. The heads and the pending floors stay.
+    /// The mirror calls this after an executor rolls back: the rows of the
+    /// lost blocks carry positions above the new stream, so the monotone
+    /// rule would keep them. Returns how many keys it deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Redis error or [`CacheError::Timeout`]. The keys
+    /// deleted before the failure stay deleted; the caller runs the whole
+    /// clear again.
+    pub async fn clear_projection(&self) -> Result<u64, CacheError> {
+        let mut deleted = 0u64;
+        for pattern in [keys::ACCOUNT_PATTERN, keys::RECEIPT_PATTERN] {
+            deleted = deleted.saturating_add(self.delete_matching(pattern).await?);
+        }
+        Ok(deleted)
+    }
+
+    /// Delete every key that matches `pattern`, one `SCAN` page at a time.
+    async fn delete_matching(&self, pattern: &str) -> Result<u64, CacheError> {
+        let mut sweep = Sweep::default();
+        while let Some(cursor) = sweep.next {
+            sweep = self.sweep_page(pattern, cursor, sweep.deleted).await?;
+        }
+        Ok(sweep.deleted)
+    }
+
+    /// One `SCAN` page from `cursor`, and an `UNLINK` of its keys.
+    async fn sweep_page(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        deleted: u64,
+    ) -> Result<Sweep, CacheError> {
+        let (next, found): (u64, Vec<String>) = self
+            .run(
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(pattern)
+                    .arg("COUNT")
+                    .arg(SCAN_PAGE),
+            )
+            .await?;
+        let unlinked: u64 = if found.is_empty() {
+            0
+        } else {
+            self.run(redis::cmd("UNLINK").arg(&found)).await?
+        };
+        Ok(Sweep {
+            next: (next != 0).then_some(next),
+            deleted: deleted.saturating_add(unlinked),
+        })
     }
 
     /// The heads of the mirrors `ids`, as canonical indexes. A dead

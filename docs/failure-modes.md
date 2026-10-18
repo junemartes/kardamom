@@ -166,6 +166,8 @@ The sealer refuses user records when the batcher falls too far behind on L1. The
   - The retained frames are in the snapshot. A restored member keeps the floor at the posted head.
 - **Retained file.** With `kardamom.cluster.carryBytes=true`, the retained frames are in an append-only file on the disk of each member, not on the heap. The default is off.
   - The heap keeps only an index: the end index and the file position of each retained boundary. The heap does not grow with the retained bytes.
+  - The member orders a full entry (record type 5) and retains it as a canonical entry with its envelope (record type 6). Each egress session gets the relayed reference (egress kind 15), live and in a replay, never the envelope. The twin copy drops at the dedup, and each refusal is the same as without the file.
+  - The member takes no void request and no recorded cursor: it drops kinds 6 and 9 as unknown kinds. Its snapshot (version 12) holds no void ledger. Every member must run the same value; the release gate refuses a rolling change.
   - The file is a function of the log. Every member holds the same bytes at the same position.
   - The snapshot holds the floors, the front and head positions, and the index. It does not hold the frames. The member syncs the file to disk up to the head before it writes the snapshot.
   - The snapshot is version 12. The switch turns on only with a new chain or a coordinated cut-over: a member with the file stops on an older snapshot, and a member without it stops on version 12.
@@ -602,7 +604,24 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
   - A skip that arrives while the sender has later refs in flight (for example, a resubmit at the skipped nonce is already published) still moves the floor back. Nothing is lost or ordered twice: the refs in the ledger republish after the confirm timeout, and the sealer drops the copies it ordered. A new submit of the sender waits on the gap until then, and it can expire.
   - The floor only goes down. The parked refs stay. The next nonce of the sender then waits on the gap and expires after `tx_ttl` (`Expired`). It does not publish into the gap and skip too. The counter is `kardamom_sequencer_skip_releases_total{partition}`.
   - On the ingress, a skip receipt does not prove a used nonce. Another transaction at that nonce publishes. It does not get `Duplicate`. The same transaction gets its skip receipt.
-  - **The sealer guard stays ahead.** The contiguity guard of the sealer counts every ordered record, skipped or not. It has no input from the executors. After a skip, it expects a nonce above the chain, and it rejects every lower nonce of the sender with `CONTIGUITY-REJECT`.
+  - **The nonce release brings the sealer guard back.** The contiguity guard of the sealer counts every ordered record, skipped or not. After a skip, it expects a nonce above the chain, and it rejects every lower nonce of the sender with `CONTIGUITY-REJECT`.
+    - The sequencer sends a nonce release to the sealer for a skip that proves the chain nonce: ingress kind 10, `[sender][nonce][tx_hash]`, with the skipped nonce and the hash of the skipped entry. Both twins send it. The counter is `kardamom_sequencer_nonce_releases_total{partition,outcome}`.
+      - The executor (revm) checks the code of the sender, then the nonce, then the balance. So an `insufficient_funds` skip proves that the chain was at its nonce, also with no receipt floor: the first transaction of a new key.
+      - A gas, fee, init-code, header, undecodable or sender-has-code skip comes from a check before the nonce check. It releases only exactly at a known receipt floor. Above the floor it can be a later entry of a run whose first skip releases, and its late release would set the guard below the chain.
+      - A `nonce_too_high` or `nonce_too_low` skip never releases. A run of `nonce_too_high` skips follows the skip at the chain nonce, whose release reopens the run.
+      - The sequencer sends a release only after the sealer reported decision version 3 on the current session (egress kind 17).
+    - The sealer applies it in log order, so every member decides alike: the expected nonce goes down to the released nonce. It applies only while the skipped id is in its dedup window, only once (a release mark in the window drops the twin copy), and only when the expected nonce is above the released nonce. A release that comes after the deadline of the skipped entry changes nothing.
+    - The skipped id stays in the window, so the same signed bytes stay a duplicate until their deadline, and one hash never has two canonical entries. The ingress answers a resubmit of the same bytes with the skip receipt. The sender signs a new transaction at the released nonce.
+    - Bounds: the sequencer sends one release for each skipped entry (it remembers the 4,096 newest), and at most 1,024 releases wait for a blocked transport. A full queue drops the oldest release; the twin sends the same release.
+    - A release does not set the guard below the chain. It proves that the chain was at the released nonce. Each entry of the sender ordered after the skipped one has a higher nonce, above the chain and the receipt floor, and skips as `nonce_too_high` or for a check before the nonce check, with no release. The guard orders nothing at the released nonce until the release applies, and the mark drops a repeat.
+    - The one exception: the guard evicts the sender while the skipped id is in the window, the sender seeds again at the skipped nonce, and that entry executes before the release applies. The eviction needs `kardamom.cluster.dedupCapacity` (131,072) other senders within the inclusion horizon of the entry. The guard is then below the chain until the next eviction of the sender.
+    - Decision version 3 of the sealer applies the release. A sealer of an older version drops kind 10 as an unknown kind.
+    - The cluster network is the trust boundary. The session sends no identity, so any cluster client can send kind 0 with any guard header, kind 7, and kind 10. The cluster network must admit only the services of the chain.
+    - Residual risks of the release and of the change of the decision version:
+      - The release gate reads the quiesce check, not the sequencers again. An operator who starts the sequencers in the window between the check and the deploy (`KARDAMOM_QUIESCE_MAX_AGE_S`, 600 s, at most 3600 s) can put a release in the log after the last snapshot. Keep the sequencers stopped until the sealer runs the new version.
+      - A rollback from version 3 to 2 has no gate. Only the required runbook step (`just sealer-quiesce-check <env>`) guards it.
+      - A receipt floor that froze (the receipts stream disconnected) can equal the nonce of an old entry. A fee or gas skip of that old entry then releases the guard to a stale nonce. The risk is low: the ingress refuses a past nonce, so such an entry rarely reaches the sealer.
+    - The rest of this item covers a guard that stays ahead: the release did not reach the sealer in time, or the skipped entry left the dedup window first.
     - A copy or a republish of an ordered ref has the same id, so the sealer answers it with a duplicate or past its deadline before the guard. So a ref that the guard rejects below `E` is another transaction at a nonce in flight (for example a speed-up), or the guard is ahead of the chain.
     - If the publish ledger no longer holds the ref, a receipt or an earlier answer settled it, and the client hears nothing.
     - Let `C` be the receipt floor of the sender and `F` the number of refs of the sender at `C` or above in the publish ledger. A reject with `E <= C + F` is another transaction at a nonce in flight. The client gets the retryable `TxErrorReason::NonceInFlight`, so it does not wait for a receipt that never comes.
@@ -612,11 +631,8 @@ Two active/active replicas serve each shard. They run on different nodes (Nomad 
     - Both refusals take the ref out of the ledger and mark the nonce, so a resubmit is offered again.
     - If every executor is down for longer than the settle time, no receipt comes, and a resubmit of an ordered nonce also gets `SealerNonceAhead`. Check the executors before you act on the error.
     - The counter is `kardamom_sequencer_sealer_nonce_ahead_total{partition}`. A client that resubmits counts once for each try. Alert on a rate that stays above zero for some minutes, not on one increase. The sequencer logs `the sealer refused the ref; reporting it to the client` with the reason.
-    - The sender stays stuck until the guard forgets it. The sealer has no command that resets the expected nonce of one sender. Until the sealer gets a release record for a skip, the operator fix is one of these:
-      1. Move the account to a new key. For the transaction canary, give it a new key and fund the key. This is the normal fix.
-      2. Wait until the guard evicts the sender. The guard is an LRU map with `kardamom.cluster.dedupCapacity` entries (default 131,072). After that many other senders, the sender seeds again at the nonce that it sends.
-      3. Rebuild the sealer fleet from a seed (`docs/runbooks/sealer-fleet-rebuild.md`). The seed takes the next nonce of each sender from the chain. Use this only when other reasons also need a rebuild.
-  - Proof: `crates/sequencer/tests/refusal_rewind.rs` (`a_skip_receipt_reopens_the_skipped_nonce`, `a_guard_ahead_of_the_chain_answers_the_client`, `another_tx_at_a_nonce_in_flight_hears_of_it`, `a_stale_reject_of_a_settled_copy_is_silent`, `an_ordered_ref_that_did_not_execute_is_not_stuck`), and `crates/ingress/tests/account_cache_test.rs` (`a_skip_receipt_leaves_its_nonce_open`).
+    - A sender stays stuck only when no release applied: the counter shows `dropped`, or the skip receipt came after the deadline of the entry. The guard forgets the sender when the LRU map (`kardamom.cluster.dedupCapacity` entries, default 131,072) evicts it, and the sender then seeds again at the nonce that it sends.
+  - Proof: `NonceReleaseTest`, `SealerRecordPathTest.a_release_after_a_skip_lets_a_new_transaction_in_at_the_lower_nonce`, `crates/sequencer/src/release_tests.rs`, `crates/sequencer/tests/refusal_rewind.rs` (`a_skip_receipt_sends_one_nonce_release`, `a_release_names_the_nonce_that_the_chain_expects`, `a_release_waits_out_a_blocked_transport`, `a_skip_receipt_reopens_the_skipped_nonce`, `a_guard_ahead_of_the_chain_answers_the_client`, `another_tx_at_a_nonce_in_flight_hears_of_it`, `a_stale_reject_of_a_settled_copy_is_silent`, `an_ordered_ref_that_did_not_execute_is_not_stuck`), and `crates/ingress/tests/account_cache_test.rs` (`a_skip_receipt_leaves_its_nonce_open`).
 - **Nonce lookup path**
   - A parked sender needs its committed nonce. The sequencer asks the local layer first (outcome `local`). Then it asks Redis (outcome `redis`). Then it asks the executors.
   - A lookup that misses Redis, or finds Redis degraded, goes to the executors.
@@ -858,11 +874,71 @@ A batcher crash costs **DA freshness only**. L2 keeps sequencing and executing.
 - The sealer answers `REPLAY_AHEAD` (egress kind 11) with its head. It logs `cluster REPLAY ... AHEAD head=(index,block)`.
 - A `REPLAY_DONE` would let the consumer drop each new record below its cursor as a duplicate. The consumer would diverge with no signal.
 - The consumer checks the same rule on its side. A `REPLAY_DONE` whose head is below the delivery cursor also stops it.
-- Both cases give the error `ClusterBehindCursor`. No repair path takes this error.
+- On the cluster egress, both cases give the error `ClusterBehindCursor`. No repair path takes this error.
   - The replay-unavailable repair fetches a peer checkpoint. After a sealer wipe every peer is ahead of the head too, so a repair would only park the local state and loop.
-- The executor, the validator and the batcher stop. The executor and the validator exit with status 1.
+- The validator, the batcher and an executor that reads the cluster egress stop. The executor and the validator exit with status 1.
   - The orchestrator restarts each one. Each restart stops at the same refusal until the sealer serves the stream again.
   - The sealer serves it again after a seeded start from a state rebuilt from L1 (see "Data-availability recovery").
+- An executor that reads the member feed (`--carry-bytes`) does not stop. It waits for the head and compares the stream with its committed history (next section). A divergence rolls it back to a checkpoint below the divergence. With no such checkpoint, it stops as above. The deployed executors read the cluster egress until the cut-over to carried transactions.
+
+**A power loss on a majority of the sealers rolls the paired executors back.**
+
+- **Release gate.** The automatic rollback runs only in an executor that reads the member feed (`--carry-bytes`). The deployed executors read the cluster egress, and they do not compare. So the automatic rollback is live only after the cut-over to carried transactions (#598). An executor that reads the cluster egress keeps no rollback marker and no receipt ledger, and it publishes no rollback. The sealer change to sync level 0 with a 1 s scheduled sync (#645) must not reach a cluster before that cut-over: until then, a power loss on a majority stops the executors with `ClusterBehindCursor`, as described above.
+- The cause. A member forces its log on a schedule, not on each append. A power loss on the hosts of a majority loses, on each of them, the entries after its last forced position. Raft elects the most complete surviving log, and the cluster continues from it. The next entries take the lost indexes.
+- A paired executor runs an entry in about 5 ms, before the entry is durable. So it can hold committed blocks that the new stream does not have, and it can have published receipts of lost entries.
+- **The comparison.** At each start, before it executes a frame, the executor that reads the member feed asks its member for a replay from a floor below its cursor. It compares each frame up to its last committed block with its state DB:
+  - the transaction hash of each receipt, by canonical index;
+  - the end index, the timestamp and the L1 origin of each header.
+- **The published receipts.** The commit thread publishes the receipts of a block before the state writer commits the block. So it first writes each receipt to the receipt ledger `<state-dir>/marker-receipts`: the canonical index, the block and the transaction hash. The comparison reads on above the cursor, through the last block with a receipt in the ledger:
+  - each slot of a frame at the index of a published receipt must have the same block and the same hash. A deposit or a cross-chain message in an epoch has the slot after the epoch marker, and its source hash. A slot with no receipt, such as an epoch marker or a void, differs from a published receipt;
+  - a boundary must not seal its block before a published receipt of that block.
+- The ledger is a ring of 65536 slots of 64 bytes. A slot never crosses a page, so a kill during a write leaves each slot old or new. The open allocates the whole file. A batch is one write, plus one at the end of the ring and one for each gap of more than 64 slots with no receipt. A failed write is fatal: the run ends with `LocalWrite`, and the process exits, so no receipt goes out that is not in the ledger.
+- The ledger writes go to the page cache with no disk sync, so they survive a crash or a kill of the process. At its end, a run first syncs the ledger and removes the running marker, then waits for its checkpoint task. The Nomad job gives the executor 30 s to stop. The running marker `<state-dir>/marker-running` holds the boot id of the host while a run is live:
+  - no running marker: the last run ended through its bookkeeping, so the ledger is on disk. A fresh state directory and the first start of this release have no ledger, so nothing is compared above the cursor;
+  - a running marker of this boot: the process crashed or was killed, and the page cache holds the ledger;
+  - a running marker of another boot: the host restarted during a run, so the ledger can be short. Every receipt above the committed block can be void, and the first frame above the cursor is a difference;
+  - a running marker, and a boot id that does not read: the start counts it as a restart of the host, with a warning.
+  - In a sandbox runtime, such as gVisor or Kata Containers, the boot id is the one of the sandbox. A restart of the sandbox drops its page cache too, so the same rule holds.
+- The floor is `--rollback-compare-blocks` committed blocks (default 32) below the cursor. A floor below the retention of the member moves up to the first block that the member holds.
+- A head below the floor (`REPLAY_AHEAD`) is no fault. The executor asks again every 2 s. The sealer closes a block on each tick, so the head passes the floor, and the comparison runs.
+- **The divergence point.** The first difference after a block that compared equal is the divergence point `d`. With no difference, the executor delivers from its cursor as before. A difference above the committed history ends the run with `PublishedDiverged`: the state stays, and only the published receipts of `d` and above are void.
+- **A difference at the floor.** A difference in the first compared block, or a floor that the member refuses inside its retention, does not show where the divergence is: it can be below the window. The executor then compares again with a window 4 times wider, up to 4096 blocks. The run after a run that did not end below the window compares the configured window again. It stops with `DivergedBelowWindow` for the operator when the window is at its widest, the floor is block 1, or the floor is the retention of the member. So the executor never publishes a `to_block` from a guess at the floor.
+- **A new connection.** A new image of the member feed after the comparison ends the run (`SourceRestarted`). The stream of the new image can differ from the entries in flight above the committed block, so the process starts the pipeline again from the state DB, and the comparison runs again, with the receipts of the ledger. A head below the delivery cursor ends the run the same way. A reader with no history (a genesis start) that delivered nothing yet continues. The process waits before the next run: 1 s, then twice as long after each restart in a row, up to 30 s. A run of 60 s ends the series.
+- **The checkpoint.** The run ends with `StreamDiverged { block, index, stream }`. Between two runs, in the same process, the executor:
+  1. waits until its checkpoint task ends, so a late round can neither publish a checkpoint of the diverged state nor prune the chosen checkpoint;
+  2. removes its local checkpoints at and above the divergence block (a rename out of the scan path, then a delete): they hold lost entries, so no restore and no peer may take them;
+  3. takes the newest local checkpoint below the block, else fetches the newest peer checkpoint below it (the request `GET /checkpoint/latest?max_block=<block - 1>`);
+  4. writes the rollback marker `<state-dir>/marker-rollback` with a disk sync;
+  5. parks the diverged state DB in `<state-dir>/stale/`. The park leaves the markers in place.
+- After `StreamDiverged`, the executor also clears the whole ledger: the restore lowers the cursor, and the receipts of the diverged state could span more than the ring above it.
+- After `PublishedDiverged`, the executor writes the rollback marker, removes the receipts of `d` and above from the ledger, and keeps its state and its checkpoints. After an unknown ledger, `d` is the first block above the committed block, so every receipt above the cursor goes.
+- The next run restores only a checkpoint at or below the block of the marker, compares again from it, and executes the new stream.
+- **The signal.** Before its first receipt, a run with a rollback marker publishes `ReceiptRollback { to_block, id }` on the receipt stream of `tx_receipts`. The commit thread removes the marker only after the publish succeeds. So a crash, a shutdown, or a run that fails before the publish leaves the marker, and the next start publishes the same record.
+  - `to_block = d - 1`. The blocks up to `to_block` are equal on both streams, so their receipts stay valid.
+  - `id` names the event: a hash of `to_block` and the first frame of `d` in the new stream. Every executor that finds one divergence has that frame, also an executor that finds the difference at a later frame of `d`, and an executor that only published the receipts of `d`. So they use the same `id`. A consumer acts on each `id` once.
+  - A restart of the host during a run sets `d` to the first block above the committed block. An executor whose committed block differs from the others then has an `id` of its own.
+  - A restart of an executor with an equal stream publishes no rollback.
+- **The consumers.**
+  - The ingress drops its cached receipts above `to_block`, forgets their hashes in its first-wins set, empties its local account layer and its cold-account map, lowers its head and its fee history to `to_block`, and closes each `kardamom_subscribeReceipts` subscription with an error that names the rollback. A rollback that the receipt bus drops on lag is still applied from a log that does not drop. A rollback that the bus still holds after a gap applies in its bus position, so a void receipt behind it on the bus is not cached after it.
+  - The state mirror deletes the `acct:` and `rcpt:` keys of Redis and rebuilds the account rows from a checkpoint.
+  - The sequencer resets to unknown each nonce floor that a receipt above `to_block` set, and learns it again by its resync (the local layer, Redis, then the executor). A lookup answer to a request from before the rollback sets no floor, and the sequencer asks that lookup again.
+  - The validator drops the buffered receipts, rows and BALs of every executor above `to_block`. Each run of an executor publishes on a new session, so the session of the rollback does not name the stale receipts. A missing receipt or BAL means "unverified", never a divergence.
+  - A consumer of an older release fails to decode the 40-byte frame, logs it, and skips it.
+- **The cost of a rollback.** Each new `id` clears more than the lost blocks: the state mirror rebuilds all its rows, the ingress empties its local layer and cold map, and the validator does not verify the receipts and BALs above `to_block` that it holds. A late copy of one `id` costs the ingress and the state mirror nothing. The validator applies each copy, so a late copy leaves the receipts that it holds above `to_block` unverified. A host restart during a run costs one clear for each `id`.
+- **With no checkpoint below `d`**, the executor stops with `StreamDiverged` and exits with status 1, as it stopped with `ClusterBehindCursor` before. The operator restores a checkpoint, or rebuilds the state from L1 (see "Data-availability recovery").
+- **What a client sees.** A receipt of a block above the new head goes away: `eth_getTransactionReceipt` answers `null`, then a new receipt if the transaction is ordered again, or `null` for good. A transaction is confirmed only when the batcher posted its block.
+- Signals:
+  - `kardamom_executor_rollback_total{outcome}`: `local-checkpoint`, `peer-checkpoint`, `no-checkpoint`, or `receipts-only` (a `PublishedDiverged` that keeps the state).
+  - The executor logs `the stream diverges from the committed history`, then `rollback marker written` and `rollback prepared`, then `published the rollback`.
+  - `kardamom_sequencer_receipt_floors_forgotten_total` counts the floors that a rollback reset.
+- Limits:
+  - The comparison sees only the window. A divergence below the window whose first compared block is still equal is not found.
+  - A skipped transaction has no receipt, so its index is not compared by hash. The header of its block still is.
+  - At genesis there is no history, so a start in block 1 compares nothing, also not the published receipts of block 1.
+  - The ledger holds 65536 receipts. Receipts above the committed block that span more than that count as a short ledger.
+  - A comparison that the member skips (it retains no frame below the cursor) also skips the published receipts.
+  - A checkpoint fetch with no cap can take a diverged checkpoint: the replay-window fallback, a fresh restore with no rollback marker, the adoption of the validator, and the rebuild of the state mirror. An executor serves its checkpoints at and above `d` until its own comparison finds the divergence and removes them.
+  - The validator, and an executor that reads the cluster egress, do not compare. They stop with `ClusterBehindCursor` as before.
 
 **A lying or absent L1 endpoint.**
 
@@ -1000,7 +1076,7 @@ Remove every copy of the reverted chain. Each copy that stays resumes or publish
 
 | Copy | What it does if it stays |
 |---|---|
-| The state DB of an executor or of the validator | Its cursor lies past the new head. The sealer answers `REPLAY_AHEAD`, and the consumer stops (`ClusterBehindCursor`). |
+| The state DB of an executor or of the validator | Its cursor lies past the new head. The sealer answers `REPLAY_AHEAD`, and the consumer stops (`ClusterBehindCursor`). An executor that reads the member feed waits, finds the divergence, and rolls back to a checkpoint below it, if one is left. |
 | A checkpoint (executors, validator) | A later restore or peer fetch adopts a state of the reverted chain. |
 | The spool of the batcher | It continues the confirmed cursor, so the batcher posts reverted blocks. |
 | The account cache (Redis) | A row applies only above its stored position, and the new positions start lower. The rows stay stale. |

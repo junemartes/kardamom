@@ -3,16 +3,12 @@
 //! Each helper is one step of a loop, or one `select!` branch, on the
 //! struct that owns it.
 
-use alloy_primitives::Address;
-use std::ops::ControlFlow;
-
-use kardamom_cache::QueryError;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_sequencer::epoch::OriginSignal;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::resync::{SealerAnswer, SealerRefusal};
 
-use super::{EgressWatermarkFeed, NonceLookupFeed};
+use super::EgressWatermarkFeed;
 
 impl EgressWatermarkFeed {
     /// Handle one origin-gap frame. Returns `true` when `frame` was one,
@@ -140,24 +136,6 @@ impl EgressWatermarkFeed {
                 );
             }
         }
-    }
-}
-
-impl NonceLookupFeed {
-    /// Handle one lookup request from the core, for [`Self::tick`]'s
-    /// `select!`. Always continues: a request never ends the drain.
-    pub(super) fn on_lookup_request(&mut self, sender: Address) -> ControlFlow<()> {
-        self.on_request(sender);
-        ControlFlow::Continue(())
-    }
-
-    /// Record and log a failed lookup, for [`Self::on_done`]'s error arm.
-    /// Always continues: a failed lookup does not end the drain.
-    pub(super) fn record_lookup_error(&self, sender: Address, e: &QueryError) -> ControlFlow<()> {
-        let outcome = if e.is_timeout() { "timeout" } else { "error" };
-        seq_metrics::record_nonce_lookup(self.partition, outcome);
-        tracing::warn!(sender = ?sender, error = %e, "nonce lookup failed");
-        ControlFlow::Continue(())
     }
 }
 

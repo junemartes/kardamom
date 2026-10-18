@@ -65,6 +65,7 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
+use crate::release::ReleaseSender;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
@@ -233,6 +234,8 @@ pub struct Sequencer {
     unconfirmed: UnconfirmedLedger<RefMetadata>,
     /// The senders that the sealer's nonce guard rejects above the chain.
     nonce_ahead: NonceAheadWatch,
+    /// The nonce releases for the sealer, one for each skip receipt.
+    releases: ReleaseSender,
     /// The nonce lookup seam. `None` when the binary has no executor
     /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
     lookup: Option<LookupRequester>,
@@ -274,6 +277,7 @@ impl Sequencer {
         let depth = DepthReport::new(now, cfg.partition_index);
         let nonce_ahead =
             NonceAheadWatch::new(Duration::from_millis(cfg.resync.nonce_ahead_settle_ms));
+        let cfg_partition = cfg.partition_index;
         Ok(Self {
             state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
@@ -281,6 +285,7 @@ impl Sequencer {
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
             nonce_ahead,
+            releases: ReleaseSender::new(cfg_partition),
             lookup: None,
             vslots,
             shadow,
@@ -587,7 +592,7 @@ impl Sequencer {
         let Some(mut r) = self.resync.take() else {
             return;
         };
-        self.apply_receipt_drain(&mut r);
+        let lookups = self.apply_receipt_drain(&mut r);
         // The refusals go before the contiguity rejects, so a refused ref
         // and the rejects of the later refs settle in one iteration. The
         // two arrive on different channels, so the order is not certain,
@@ -597,7 +602,17 @@ impl Sequencer {
         // contiguity reject finds no ref at the expected nonce.
         self.apply_deadline_rejects(&mut r, ports);
         self.apply_sealer_answers(&mut r, ports);
+        let releases = r.sealer_takes_releases();
         self.resync = Some(r);
+        // A lookup request reads the rollback generation from
+        // `self.resync`, so the requests go after the controller is back.
+        for sender in lookups {
+            self.request_lookup(sender);
+        }
+        if releases {
+            let (_, refs, _) = ports.split();
+            self.releases.flush(refs);
+        }
         self.sweep_confirm_timeouts();
     }
 
@@ -654,11 +669,15 @@ impl Sequencer {
             .resync
             .as_ref()
             .is_some_and(|r| r.floor(sender).is_some());
+        let generation = self
+            .resync
+            .as_ref()
+            .map_or(0, crate::resync::ResyncController::generation);
         let Some(lookup) = self.lookup.as_mut().filter(|_| !floor_known) else {
             return;
         };
         self.hot.lookup_requests.increment(1);
-        lookup.request(sender);
+        lookup.request(crate::lookup::LookupRequest { sender, generation });
     }
 
     /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and

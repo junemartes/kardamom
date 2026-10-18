@@ -18,7 +18,7 @@
 //! code:
 //!
 //! ```text
-//! GET /checkpoint/latest HTTP/1.0
+//! GET /checkpoint/latest[?max_block=<u64>] HTTP/1.0
 //!
 //! HTTP/1.0 200 OK
 //! x-checkpoint-block: <u64>
@@ -30,7 +30,11 @@
 //! <mdbx image>
 //! ```
 //!
-//! The server returns `404` when it has no checkpoint yet. Only complete
+//! The server serves its newest checkpoint, or with `max_block` its newest
+//! checkpoint at or below that block. A server of an older release ignores
+//! the query and serves its newest one, so the client checks the advertised
+//! block against its range before the download. The server returns `404`
+//! when it has no checkpoint in the range. Only complete
 //! checkpoints are visible under `checkpoint-*` names, because each one is
 //! built in a temp directory and then renamed into place. So a served image
 //! is always a full, consistent snapshot.
@@ -48,7 +52,8 @@ use tracing::{info, warn};
 use alloy_primitives::B256;
 
 use crate::checkpoint::{
-    CheckpointInfo, ImageSchema, checkpoint_data_file, checkpoint_name, latest_checkpoint,
+    BlockRange, CheckpointInfo, ImageSchema, checkpoint_data_file, checkpoint_name,
+    latest_checkpoint,
 };
 use crate::error::StateError;
 
@@ -72,6 +77,49 @@ mod framing {
     /// The state schema of the image. A peer of an older release sends
     /// no such header.
     pub(super) const HDR_SCHEMA: &str = "x-checkpoint-schema";
+    /// The request path. The optional query caps the served block.
+    pub(super) const PATH: &str = "GET /checkpoint/latest";
+    pub(super) const MAX_BLOCK_QUERY: &str = "?max_block=";
+}
+
+/// The checkpoints that one fetch request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetchRequest {
+    range: BlockRange,
+}
+
+impl FetchRequest {
+    /// The request line. A range with no cap sends no query, so a server of
+    /// any release reads it.
+    fn line(self) -> String {
+        if self.range.is_capped() {
+            format!(
+                "{}{}{} HTTP/1.0\r\n\r\n",
+                framing::PATH,
+                framing::MAX_BLOCK_QUERY,
+                self.range.max
+            )
+        } else {
+            format!("{} HTTP/1.0\r\n\r\n", framing::PATH)
+        }
+    }
+
+    /// Parse a request line. `None` for a request of another path. A query
+    /// that does not parse caps nothing.
+    fn parse(line: &str) -> Option<Self> {
+        let rest = line.strip_prefix(framing::PATH)?;
+        let max = rest
+            .strip_prefix(framing::MAX_BLOCK_QUERY)
+            .and_then(|q| q.split_whitespace().next())
+            .and_then(|block| block.parse().ok())
+            .unwrap_or(u64::MAX);
+        Some(Self {
+            range: BlockRange {
+                max,
+                ..BlockRange::ANY
+            },
+        })
+    }
 }
 
 /// Removes the wrapped temp directory on drop. Set the field to `None`
@@ -153,15 +201,16 @@ fn spawn_serve(stream: tokio::net::TcpStream, dir: PathBuf) {
     });
 }
 
-/// Response head + open image file for the newest checkpoint, or the error
-/// response to send instead. Blocking (directory scan, manifest read, file
-/// open): runs on `spawn_blocking`.
+/// Response head + open image file for the newest checkpoint in the range
+/// of `request`, or the error response to send instead. Blocking
+/// (directory scan, manifest read, file open): runs on `spawn_blocking`.
 fn prepare_response(
     checkpoints_dir: &Path,
+    request: FetchRequest,
 ) -> Result<(String, std::fs::File, u64, u64), &'static [u8]> {
     const NOT_FOUND: &[u8] = b"HTTP/1.0 404 Not Found\r\n\r\n";
     const SERVER_ERROR: &[u8] = b"HTTP/1.0 500 Internal Server Error\r\n\r\n";
-    let ckpt = match latest_checkpoint(checkpoints_dir) {
+    let ckpt = match latest_checkpoint(checkpoints_dir, request.range) {
         Ok(Some(c)) => c,
         Ok(None) => return Err(NOT_FOUND),
         Err(e) => {
@@ -218,12 +267,12 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
     let mut reader = tokio::io::BufReader::new(rd).take(MAX_HEAD as u64);
     let mut request_line = String::new();
     timeout(IO_TIMEOUT, reader.read_line(&mut request_line)).await??;
-    if !request_line.starts_with("GET /checkpoint/latest") {
+    let Some(request) = FetchRequest::parse(&request_line) else {
         timeout(IO_TIMEOUT, wr.write_all(b"HTTP/1.0 404 Not Found\r\n\r\n")).await??;
         return Ok(());
-    }
+    };
     let dir = checkpoints_dir.to_path_buf();
-    let prepared = tokio::task::spawn_blocking(move || prepare_response(&dir))
+    let prepared = tokio::task::spawn_blocking(move || prepare_response(&dir, request))
         .await
         .map_err(std::io::Error::other)?;
     let (head, file, len, block) = match prepared {
@@ -246,12 +295,12 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
     Ok(())
 }
 
-/// Fetch the newest checkpoint from `peer` (`host:port`) into
+/// Fetch the newest checkpoint in `range` from `peer` (`host:port`) into
 /// `checkpoints_dir`, and return its info.
 ///
-/// Returns `Ok(None)` when the peer has no checkpoint, or its newest
-/// checkpoint is below `min_block`. The advertised block is in the
-/// response head, so this function never downloads a useless image. If a
+/// Returns `Ok(None)` when the peer has no checkpoint in `range`. The
+/// advertised block is in the response head, so this function never
+/// downloads a useless image. If a
 /// checkpoint for the same block already exists locally, this function
 /// returns it without a transfer.
 ///
@@ -262,17 +311,18 @@ async fn serve_one(stream: tokio::net::TcpStream, checkpoints_dir: &Path) -> std
 pub(crate) fn fetch_latest_checkpoint(
     peer: &str,
     checkpoints_dir: &Path,
-    min_block: u64,
+    range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Result<Option<CheckpointInfo>, StateError> {
-    let mut fetch = CheckpointFetch::connect(peer, expected_genesis)?;
+    let mut fetch = CheckpointFetch::connect(peer, FetchRequest { range }, expected_genesis)?;
     let head = match fetch.response()? {
         PeerResponse::NotFound => return Ok(None),
         PeerResponse::Image(head) => head,
     };
-    if head.block < min_block {
+    if !range.contains(head.block) {
         // Too old to be useful, for example below the cluster's retention
-        // floor. Do not download the body.
+        // floor, or above the cap from a server that ignores it. Do not
+        // download the body.
         return Ok(None);
     }
     // An image this release cannot open is refused before the download.
@@ -327,8 +377,8 @@ pub(crate) fn fetch_latest_checkpoint(
     }))
 }
 
-/// Fetch from each peer in turn, and keep the newest checkpoint at or
-/// above `min_block`.
+/// Fetch from each peer in turn, and keep the newest checkpoint in
+/// `range`.
 ///
 /// This function logs and skips individual peer failures; one live peer
 /// is enough. As the best-so-far block rises, later peers with nothing
@@ -337,16 +387,17 @@ pub(crate) fn fetch_latest_checkpoint(
 pub fn fetch_best_checkpoint(
     peers: &[String],
     checkpoints_dir: &Path,
-    min_block: u64,
+    range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
     peers.iter().fold(None, |best, peer| {
         // A peer advertising `u64::MAX` must not wrap the floor back to 0
         // and disable the "newer only" filter for every later peer.
-        let floor = best
+        let min = best
             .as_ref()
-            .map_or(min_block, |b: &CheckpointInfo| b.block.saturating_add(1));
-        fetch_one_peer(peer, checkpoints_dir, floor, expected_genesis).or(best)
+            .map_or(range.min, |b: &CheckpointInfo| b.block.saturating_add(1));
+        let rest = BlockRange { min, ..range };
+        fetch_one_peer(peer, checkpoints_dir, rest, expected_genesis).or(best)
     })
 }
 
@@ -355,10 +406,10 @@ pub fn fetch_best_checkpoint(
 fn fetch_one_peer(
     peer: &str,
     checkpoints_dir: &Path,
-    floor: u64,
+    range: BlockRange,
     expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
-    match fetch_latest_checkpoint(peer, checkpoints_dir, floor, expected_genesis) {
+    match fetch_latest_checkpoint(peer, checkpoints_dir, range, expected_genesis) {
         Ok(c) => c,
         Err(e) => {
             warn!(peer, error = %e, "checkpoint fetch from peer failed");
@@ -388,11 +439,15 @@ struct CheckpointFetch<'a> {
 impl<'a> CheckpointFetch<'a> {
     /// Connect to `peer` (`host:port`) and send the checkpoint-fetch
     /// request.
-    fn connect(peer: &'a str, expected_genesis: Option<B256>) -> Result<Self, StateError> {
+    fn connect(
+        peer: &'a str,
+        request: FetchRequest,
+        expected_genesis: Option<B256>,
+    ) -> Result<Self, StateError> {
         let mut stream = Self::open(peer)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
+        stream.write_all(request.line().as_bytes())?;
         Ok(Self {
             peer,
             reader: BufReader::new(stream),

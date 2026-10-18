@@ -29,7 +29,7 @@ use kardamom_cluster_adapter::{
 
 mod reorder;
 
-pub(crate) use reorder::Reorder;
+pub(crate) use reorder::{BoundaryMetrics, Reorder};
 
 /// Shared delivery cursor: the next canonical record index and boundary
 /// block number this consumer expects. The subscription writes it on every
@@ -48,6 +48,15 @@ impl ReplayCursor {
             next_index: Arc::new(AtomicU64::new(next_index)),
             next_block: Arc::new(AtomicU64::new(next_block)),
         }
+    }
+
+    /// The next canonical index and the next block number.
+    #[must_use]
+    pub fn position(&self) -> (u64, u64) {
+        (
+            self.next_index.load(std::sync::atomic::Ordering::Relaxed),
+            self.next_block.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Fresh consumer at genesis: no records seen, first boundary is block 1
@@ -182,7 +191,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
     /// Disable the `kardamom_sealer_*` re-export (validator role).
     #[must_use]
     pub fn suppress_sealer_metrics(mut self) -> Self {
-        self.reorder.emit_sealer_metrics = false;
+        self.reorder.metrics = reorder::BoundaryMetrics::Validator;
         self
     }
 
@@ -200,7 +209,7 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             // its replay is outstanding. A `REPLAY_DONE` of an earlier
             // session comes before this marker, so it cannot end this
             // catch-up.
-            EgressItem::SessionStart => {
+            EgressItem::SessionStart { .. } => {
                 self.reorder.catch_up();
                 Ok(())
             }
@@ -215,8 +224,10 @@ impl<E: ClusterEgress, I: ClusterIngress> ClusterTxOrderingSubscription<E, I> {
             // ingress reads it, a consumer of the ordering does not. A
             // relayed reference repeats an entry without its bytes, and a
             // feed gap comes only on the member feed: both carry nothing
-            // for this reader.
+            // for this reader. The sealer's rules matter to a sequencer
+            // only.
             EgressItem::ContiguityReject { .. }
+            | EgressItem::SealerInfo { .. }
             | EgressItem::RemoteOriginReject { .. }
             | EgressItem::PastDeadline { .. }
             | EgressItem::WindowFull { .. }

@@ -70,7 +70,7 @@ type Proxy = IngressProxy<MockChannels, MockChannels>;
 /// the monotone `tx_ordering` position counter shared across shards.
 #[derive(Clone)]
 struct PumpPorts {
-    receipt_bus: tokio::sync::broadcast::Sender<Receipt>,
+    receipt_bus: tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
     nonces: Arc<HashMap<B256, u64>>,
     position: Arc<AtomicI32>,
 }
@@ -136,7 +136,7 @@ fn reflect_one(ports: &PumpPorts, envelope: &kardamom_types::TxEnvelope) {
         nonce,
         ..Default::default()
     };
-    let _ = ports.receipt_bus.send(receipt);
+    let _ = ports.receipt_bus.send(receipt.into());
 }
 
 /// A production quorum watermark is a periodic egress-progress
@@ -222,9 +222,12 @@ fn ingress_submission_allocation_profile() {
         let cfg = IngressConfig {
             // All traffic comes from one IP here. The limiter must never be
             // the thing this profile measures; production spreads clients
-            // across IPs.
+            // across IPs. The bucket is a GCRA: at 1e9 tokens a second a
+            // burst holds `burst` nanoseconds of slack. The largest burst
+            // gives about 4 s, so a clock read of a starved core that lags
+            // the bucket's last update never refuses a submission.
             rate_limit_per_ip_per_sec: NonZeroU32::new(1_000_000_000).unwrap(),
-            rate_limit_burst: NonZeroU32::new(1_000_000).unwrap(),
+            rate_limit_burst: NonZeroU32::MAX,
             pending_receipt_timeout: Duration::from_secs(10),
             ..IngressConfig::default()
         };

@@ -2,7 +2,11 @@
 
 - Status: approved by the user on 2026-10-11. Amended for the user decision of 2026-10-17
   (decision 10, section 16): the sealer keeps no retained file, and the serving service keeps
-  the transactions for the batcher and the attester. Partly implemented (section 13).
+  the transactions for the batcher and the attester. Amended for the owner's upgrade rule of
+  2026-10-18 (decisions 19 and 20, #661): every deploy is backwards compatible, and an upgrade
+  transaction turns on each breaking change. The cut-over and decision version 3 activate by an
+  upgrade transaction, not by a chain reset or a coordinated restart (sections 5.4 and 12).
+  Partly implemented (section 13).
 - Issue: refs #582.
 - Reviewed by dev-32 (the batcher resume and DA side) and kardamom-3-00 (the executor side). Their points are in this version.
 - Decided by the user:
@@ -14,7 +18,8 @@
 - Decided by the user on 2026-10-11 (section 16):
   - The design target is up to 5,000 tx/s with mixed sizes.
   - The feed from member `i` to executor `i` is IPC through one shared media driver.
-  - Staging moves by a chain reset. Production uses the drained cut-over.
+  - Staging moves by a chain reset. Production uses the drained cut-over. (Replaced by decision
+    20: both networks move by an upgrade transaction, section 12.)
   - The starting limits of decision 4 are accepted. The benchmark tunes them.
   - No byte budget halts the chain. The serving service keeps every unposted entry on disk
     (decision 10).
@@ -48,6 +53,17 @@
     cluster continues from its surviving log, and the executors that ran past it roll back by
     themselves. A transaction is confirmed when the batcher posted it to the DA layer (decisions
     15 and 16, sections 5.5 and 11.1).
+- Decided by the owner on 2026-10-18 (decisions 19 and 20, #661):
+  - Every deploy is backwards compatible. A breaking change ships behind a chain feature flag
+    that is off. An L1 upgrade transaction turns the flag on. After the activation on every
+    network, a later release removes the old logic.
+  - The cut-over to carried transactions is the activation of one chain flag, the carry flag. It
+    replaces `kardamom.cluster.carryBytes` and `--carry-bytes`. The old path stays until the
+    activation on every network (section 12).
+  - Decision version 3 of the sealer also activates by an upgrade transaction (#662, PR #666).
+  - No coordinated restart, quiesce check, cluster purge, waiver or format gate is a deploy path.
+    Compatibility fixtures and a mixed-version shard (#663), and a gate check of the active flags
+    of the chain (#664), replace the format gate.
 - Scope: the ingress size cap, the sequencer offer with bytes, the `tx_heads` stream, the sealer
   state machine and its snapshot, the input of the executors, and the removal of the void path.
   The service that serves the canonical stream to the validator, the batcher and external nodes
@@ -194,7 +210,7 @@
             │ receipts (8.3)          a follower member: frames; every member: its durable report
             ▼                                                   ▼
         serving service (separate design, 8.1) ──── stored head ──> executor receipt prune,
-                                                                    sealer purge floor (kind 11)
+                                                                    sealer purge floor (kind 12)
             │
             ▼
  validator (attester), batcher, unpaired executors, external nodes
@@ -255,13 +271,16 @@ payload:       [canonical_id:32][record_type=6][lane:u8][envelope]
 |---|---|
 | Ingress kind 2 (subscribe) | Unchanged. The egress sends a subscriber kind 15, not kind 1, for each record type 6 entry. No egress session gets the bytes. |
 | Egress kind 15 `RELAYED_REF` (new) | `[kind=15][index:u64][canonical_id:32][record_type:u8]`, 42 bytes. Every egress subscriber gets it for each record type 6 entry. Other record types stay kind 1. |
-| Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). |
+| Ingress kind 6 (void request), kind 9 (recorded cursor) | Retired. A member drops them as unknown kinds (`SealerClusteredService.java:547-551`). A member drops them already after the activation of the carry flag (section 5.4). |
+| Ingress kind 10 `NONCE_RELEASE` (new, #627) | `[kind=10][sender:20][nonce:u64][canonical_id:32]`, 61 bytes. The sequencer sends it for a skip receipt that proves the chain nonce (section 5.4). A member under version 2 drops it as an unknown kind. |
+| Ingress kind 11 `FEATURE_ACTIVATION` (new, #662, PR #666) | `[kind=11][l1_origin:u64][feature_id:u64][activation_ms:u64]`, 25 bytes. The sequencer sends it in front of the epoch that holds the upgrade transaction, on the same session. It has no guard header. It switches the decision version (section 5.4). |
+| Egress kind 17 `SEALER_INFO` (new) | `[kind=17][decision_version:u8][cluster_session_id:i64]`, 10 bytes. Under version 3 the sealer sends it to every open session at the switch, and then to each session when it opens. Under version 2 it sends none (#666). The sequencer sends kind 10 only after version 3 or above for its current session; the id ties the frame to the session whatever the order of the client's own session-start marker. |
 | Egress kind 13 (record-lag reject) | Retired. |
 | Egress kind 14 | Not used. An earlier draft used it for `ENVELOPE_FULL` (section 15, option A). |
-| Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). There is no byte tail: a member retains no bytes (section 5.5). The frame stays 68 bytes, as with `carryBytes` off. The 76-byte frame with `[retained_bytes:u64]` of #608 goes with the retained file. A reader still accepts a longer frame and ignores the tail. |
-| Ingress kind 11 `STORED_CURSOR` (new) | `[kind=11][stored_head:u64]`, 9 bytes. The serving service sends it, as the batcher sends kind 7. It has no guard header. The sealer keeps the highest value (section 5.5). |
+| Egress kind 9 (status) | The 17-byte record-lag tail stays as a fixed field with the "no cursor" values (`best_recorded = u64::MAX`, budget 0, not halted). There is no byte tail: a member retains no bytes (section 5.5). The frame stays 68 bytes, as before the activation of the carry flag. The 76-byte frame with `[retained_bytes:u64]` of #608 goes with the retained file. A reader still accepts a longer frame and ignores the tail. |
+| Ingress kind 12 `STORED_CURSOR` (new, #639) | `[kind=12][stored_head:u64]`, 9 bytes. The serving service sends it, as the batcher sends kind 7. It has no guard header. The sealer keeps the highest value (section 5.5). Kind 11 is the feature activation, so the stored cursor takes kind 12. |
 | Egress kind 16 `FEED_GAP` (new, feed only) | `[kind=16][next_index:u64][next_block:u64]`, 17 bytes (section 7.2). |
-| Record types 0 (`TxRef`) and 4 (void) | Retired after the cut-over (section 12). |
+| Record types 0 (`TxRef`) and 4 (void) | Not written after the activation of the carry flag (section 12). A later release removes them (PR 14). |
 
 ### 4.4 Fragmented session messages
 
@@ -343,26 +362,122 @@ envelope, and the void goes:
 ### 5.4 Decision version 3
 
 - The change decides an ordered entry differently: the record carries its bytes, and no void
-  exists. So `DECISION_VERSION` goes to 3 (`CanonicalSealerState.java:111`), with the
-  coordinated restart of `cluster/sealer-service/README.md:396-422`.
+  exists. So the rules go to version 3 (#634).
 - The decision version stays as a mechanism (#568). Version 2's rule (the lower nonce after a
   void) has no input after version 3, because no void exists.
+- **The switch to version 3 is an upgrade transaction (decision 19, #662, PR #666).** The version
+  is replicated state. It changes only at one log entry, the same entry on every member:
+  - A member starts on version 2. The job spec names this start version
+    (`kardamom.cluster.decisionVersion=2`). The image reads the rules of both versions.
+  - `ETHLockbox.initiateUpgrade` on L1 schedules `FEATURE_SEALER_V3` (feature id 2) with an
+    activation time in ms. It reaches L2 as a system deposit that calls
+    `KardamomChainState.setFeature`.
+  - The origin record (ingress kind 4) cannot carry the feature: a new field in its rkyv payload
+    breaks an older sealer and an older executor. So the sequencer sends a new system record, the
+    feature activation (ingress kind 11, section 4.3), in front of the epoch that holds the
+    deposit, on the same session. It sends it again each time it offers the epoch again. It takes
+    the last schedule of the feature in the epoch, because the last `setFeature` wins on L2.
+  - Kind 11 applies only for feature 2, only under version 2, and only when `l1_origin` is at or
+    above the L1 origin of the state and above the origin of the pending activation. So the twin
+    copy, a repeat and a record of an older epoch change nothing.
+  - The switch is at the first log entry (an ingress frame or a timer) whose cluster time is at
+    or above `activation_ms`. An activation time at or below the time of the record switches at
+    the record. The switch is one way.
+  - Before the switch, the version 2 rules apply: kind 10 drops as an unknown kind, and no egress
+    kind 17 goes out. At the switch, every open session gets kind 17 (version 3).
+  - Before the activation record, the snapshot is version 10, byte for byte the snapshot of the
+    release before. After it, the snapshot is version 13: version 10, then
+    `[decision_version:u8][activation_origin:u64][activation_ms:u64]`. A replay from any snapshot
+    switches at the same entry.
+  - The operator sends the upgrade transaction only after every sealer member and every
+    sequencer runs the release (#664 adds the gate check). A member of an older release drops
+    kind 11 and refuses version 13. A sealer that starts from a seed file starts on version 2,
+    so the operator sends the upgrade transaction again.
+- **Version 3 and the carry flag.** `kardamom.cluster.carryBytes` becomes the carry flag of the
+  chain (decision 20, section 12). Version 3 activates before the carry flag:
+  - Before the activation of the carry flag: the record path of today. The void stays in use,
+    and the snapshot is version 10 or 13 with the void ledger.
+  - After it: the record path of section 5.1. The member drops the void request and the recorded
+    cursor as unknown kinds, and the snapshot is version 12 with no void ledger. A version 12
+    snapshot implies version 3.
+  - Today the release gate refuses a rolling change of `carryBytes` (the must-match list), and a
+    member stops on a snapshot of the other layout (`sealer RETAINED-FILE FATAL`). As a chain
+    flag, it changes at one log entry, as version 3 does. The details are open question 16.1-18.
+- **The nonce release (#627).** Version 3 also applies the nonce release, before and after the
+  activation of the carry flag. The sealer's guard counts every ordered entry, and a skip uses no
+  nonce on the chain, so after a skip the guard expects a nonce above the chain.
+  - The sequencer sends ingress kind 10, with the skipped nonce and the hash of the skipped
+    entry, only for a skip that proves that the chain was at that nonce. The executor (revm)
+    checks the code of the sender, then the nonce, then the balance:
+    - an `insufficient_funds` skip proves it, with or without a receipt floor;
+    - a gas, fee, init-code, header, undecodable or sender-has-code skip comes from a check
+      before the nonce check, so it releases only exactly at a known receipt floor;
+    - a `nonce_too_high` or `nonce_too_low` skip never releases.
+  - Both twins send it. The sequencer sends one release for each skipped entry, and at most
+    1,024 releases wait for a blocked transport. It sends a release only after the sealer
+    reported decision version 3 on the current session (egress kind 17), so a sealer of an older
+    version never gets one, and its log holds none.
+  - The sealer applies it in log order, only when the guard tracks the sender and expects a
+    nonce above the released one: the expected nonce goes down to the released nonce. An
+    unknown or evicted sender needs no change.
+  - **Why a release never sets the guard below the chain.** The release of entry X at nonce `n`
+    proves that the chain was at `n` when X executed. The guard orders the entries of a sender
+    with contiguous nonces, so each entry ordered after X and before the release has a nonce
+    above `n`. The chain stays at `n`, so each of them skips: as `nonce_too_high`, or for a check
+    before the nonce check (`fee`, `gas_limit`, `sender_has_code`, and so on). Its nonce is above
+    the chain, and so above the receipt floor, so it sends no release. (A release for such a skip
+    above the floor would be late: after `n'` and `n+1'` are ordered, it would set the guard below
+    the chain.) The guard orders nothing at `n` until the release applies, and after that the mark
+    drops a repeat. So the run `n` (skip), `n + 1` (skip) recovers with the release of `n`, and
+    no second lowering follows.
+  - The one exception: an LRU eviction of the sender while X is in the window, a re-seed at `n`,
+    and the execution of that entry before the release applies. The eviction needs
+    `dedupCapacity` other senders ordered within the inclusion horizon of X. The guard is then
+    below the chain until the next eviction of the sender.
+  - The cluster network is the trust boundary. A session sends no identity, so any cluster
+    client can send kind 0 with any guard header, kind 7, and kind 10. The sealer does not tie
+    the id of a release to its sender, and does not tell a marker id from a user id.
+  - It applies only while the skipped id is in the dedup window, and only once. It adds a
+    release mark to the window: the id with its first byte inverted, held to the deadline of the
+    id. The twin copy finds the mark and drops. A release after the deadline drops.
+  - The mark cannot stand for a real id. A real id is a keccak hash, and the mark is a fixed
+    transform of an id that the window holds, so a real id equal to a mark is a hash collision.
+  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark
+    for each ordered entry, and the mark leaves with its entry at the deadline. So a snapshot
+    holds at most `2 * (dedupCapacity + 4096)` ids: each mark is the transform of an id in the window.
+  - The skipped id stays in the window, so the same signed bytes stay a duplicate until their
+    deadline, and one hash never has two canonical entries. No receipt store has to choose
+    between a skip receipt and a later success for one hash. The sender signs a new
+    transaction at the released nonce.
+  - The marks are ids of the dedup window, so the snapshots of version 12 and 13 carry them with
+    no change of layout. Version 10 holds no mark, because version 2 applies no release.
+- **No coordinated restart (decision 19).** Versions 2 and 3 decide a release differently. A
+  member replays the log after its snapshot with the rules of its state, and the switch is in
+  the log. So a replay switches at the same entry, and the log needs no quiesce. The pause, the
+  stop of the sequencers, the quiesce check and the purge of the sealer job are not a deploy
+  path. #666 keeps the coordinated restart only for a cluster that ran the version-3 job spec of
+  an older build.
+- **A rollback after the switch.** A member of an older release refuses snapshot version 13. So
+  after the activation record is in the log, the gate of #664 refuses a rollback of the sealer
+  past the release that brought the flag. A later release removes the version 2 rules, after the
+  activation on every network.
 
 ### 5.5 Retention, the snapshot, the purge and the floor
 
-**No retained frames (decision 10).** With `carryBytes` on, a member keeps no canonical frame. Its
-Raft log and its snapshots are its only record of the stream.
+**No retained frames (decision 10).** After the activation of the carry flag, a member keeps no
+canonical frame. Its Raft log and its snapshots are its only record of the stream.
 
 - The retained file of #608 goes: the segment files, the helper thread, the index, the copy with
   a peer seed, the admin endpoint `/retained` and its token.
 - The egress retains no frame. It sends each live frame as today: kind 15 for a record of type 6,
   kind 1 for the other record types, kind 2 for a boundary. An egress replay request (ingress
-  kind 1) gets `REPLAY_UNAVAILABLE` with the head as its floor. After the cut-over no production
+  kind 1) gets `REPLAY_UNAVAILABLE` with the head as its floor. After the activation no production
   consumer sends one: the ingress observer never replays (`crates/ingress/src/cluster.rs:113-123`),
   the executors read their feed, and the validator and the batcher read the serving service.
 - The feed replays from the Raft log (section 7.3).
-- With `carryBytes` off, the heap store of today stays: the `TxRef` frames, the `retention`
-  window and the posted-head floor (`SealerEgress.java:420-449`).
+- Before the activation, the heap store of today stays: the `TxRef` frames, the `retention`
+  window and the posted-head floor (`SealerEgress.java:420-449`). How a consumer that lags
+  behind the switch reads the `TxRef` frames below it is open question 16.1-18.
 - The status frame has no byte tail (section 4.3).
 - **The earlier rule moves.** The rule "keep the data until L1 holds it, do not halt" now applies
   to the serving service (section 8.1). The DA-lag guard in blocks stays as today
@@ -404,10 +519,10 @@ purge keeps the newest snapshots and their log, as today (`PurgePlanner.java:65-
 - **The margin.** The purge point is a snapshot older than the `keepSnapshots` newest
   (`kardamom.cluster.logPurgeKeepSnapshots`, default 3). At a 300 s interval the log keeps at
   least 15 minutes.
-- **The floor (decision 16).** Today the purge point must be at or below the posted head. With
-  `carryBytes` on, it must be at or below the stored head of the serving service instead. The
-  stored head is the newest block `S` such that the serving service holds every frame and every
-  receipt of each block up to `S` on its own durable store (section 8.3).
+- **The floor (decision 16).** Today the purge point must be at or below the posted head. After
+  the activation of the carry flag, it must be at or below the stored head of the serving service
+  instead. The stored head is the newest block `S` such that the serving service holds every frame
+  and every receipt of each block up to `S` on its own durable store (section 8.3).
 
 | Log on each member | Transfer | 2 KB | 8 KB |
 |---|---|---|---|
@@ -430,14 +545,16 @@ purge keeps the newest snapshots and their log, as today (`PurgePlanner.java:65-
   the service exposes is already durable in the sealer. A stored head that does not move only
   keeps more log: it costs disk, and at a full disk the liveness of the member. It never changes
   a decision of the sealer.
-- **The start.** Before the serving service sends its first kind 11, the stored head is 0, and
-  the member purges nothing. The serving service runs before the cut-over (section 12.3), so this
-  lasts seconds.
-- **The input.** The serving service sends ingress kind 11 `STORED_CURSOR` (section 4.3) through
+- **The start.** Before the serving service sends its first kind 12, the stored head is 0, and
+  the member purges nothing. The serving service runs before the activation (section 12.2), so
+  this lasts seconds.
+- **The input.** The serving service sends ingress kind 12 `STORED_CURSOR` (section 4.3) through
   a publisher-only cluster session, as the batcher sends kind 7. The sealer keeps the highest
-  value, and replicates it, so every member plans the purge from the same value. Kind 11 changes
-  the decision of no record, so it needs no new decision version. The snapshot carries it
-  (below).
+  value, and replicates it, so every member plans the purge from the same value. Kind 12 changes
+  the decision of no record, so it needs no new decision version. The v12 snapshot carries it
+  (below). Before the activation of the carry flag, a member drops kind 12, as a member of the
+  base drops an unknown kind. So the snapshot before the activation keeps the bytes of the base
+  (#663).
 
 **Disk full.** The Raft log cannot write. The member logs a fatal error and stops, as Aeron does
 today. Section 11 gives the effect and the alert. `kardamom_sealer_disk_free_bytes` (#608) stays:
@@ -455,19 +572,21 @@ field. The sealer logs `cluster STORED-CURSOR` when the stored head moves up.
 |---|---|---|
 | Dedup window, sender map, origins, remote peers | unchanged | unchanged |
 | Void ledger (v6) | present | gone |
+| Release marks (decision version 3) | ids in the dedup window | ids in the dedup window |
 | Ordering window, posted head, seed (v8 to v10) | unchanged | unchanged |
-| Stored head (new, kind 11) | absent | after the posted head |
+| Stored head (new, kind 12) | absent | after the posted head |
 | Recorded cursors (v11, never written) | absent | absent |
 | Retained frames | `TxRef` frames, 59 B | none. The retained-file section of #608 goes. |
 
-- **v12 is not released.** `formats.toml` still writes 10 for `sealer-snapshot`, and v12 is
-  written only under the activation flag `kardamom.cluster.carryBytes`. No deployed release turns
-  that flag on. So v12 changes in place: no version 13 is needed. The flag turns on only at the
-  cut-over (PR 13, section 12).
-- **Restore.** A member with `carryBytes` on restores v12, and also v10: it drops the retained
-  `TxRef` frames of v10 and starts with no retained frame. Every member drops the same frames, so
-  the restore is deterministic. A member with `carryBytes` off still refuses v12, because v12 has
-  no void ledger. So the drained cut-over (section 12.3) needs no import of the v10 frames.
+- **v12 is not released.** A member writes v12 only after the activation of the carry flag. No
+  network has activated it, so v12 changes in place. Version 13 is the snapshot of #666 (version
+  10 with the decision rules, section 5.4). v12 is frozen at the first activation of the carry
+  flag on a network.
+- **Restore.** A member of the new release restores v10, v12 and v13. A v10 or v13 snapshot from
+  before the switch holds retained `TxRef` frames. Every member drops them alike, at a point that
+  open question 16.1-18 sets. A member of an older
+  release refuses v12, because v12 has no void ledger. So the gate of #664 refuses a rollback past
+  the release that brought the carry flag, after its activation.
 - There is no envelope store and no waiting-reference section (section 5.2). The ordering
   window holds at most 20 records with their envelopes.
 - The snapshot size is the state of today, minus the void ledger and the retained frames, plus
@@ -975,7 +1094,7 @@ This spec states only what it needs from that service:
   - **The receipts from the executors.** It reads the receipts of a block from one executor, only
     for a block that is durable in the sealer (section 8.3).
   - It opens one publisher-only cluster session, as the sequencer and the batcher do, only to send
-    its stored head (ingress kind 11, section 5.5). It reads no cluster egress.
+    its stored head (ingress kind 12, section 5.5). It reads no cluster egress.
 - **What it exposes.** It serves a block to a reader only when the block is at or below the
   majority durable position. So every byte that it exposes is durable on a majority of the
   members (R8). The batcher reads it, so the batcher posts only data that is durable in the
@@ -1041,8 +1160,8 @@ This spec states only what it needs from that service:
   replicas of one append-only log, with one writer that tails the sealer and reads the receipts
   from the executors. It also answers the receipt lookup of the ingress for a receipt that the
   executors pruned.
-- **The order of work.** The validator and the batcher read it after the cut-over, so the service
-  runs before PR 13 deploys.
+- **The order of work.** The validator and the batcher read it after the activation of the carry
+  flag, so the service runs before the upgrade transaction (section 12.2).
 
 #### The transport contract
 
@@ -1186,7 +1305,7 @@ answers `eth_getTransactionReceipt` (`crates/state/src/nonce_query.rs:197-209`):
 - **The prune.** After each block commit, the executor deletes the `receipts` and `tx_hash_index`
   rows of the blocks at or below `min(stored_head, last_committed_block)`, in one write
   transaction, and sets `output_floor_block`.
-- **How the sealer learns it.** The serving service sends ingress kind 11 with the same value
+- **How the sealer learns it.** The serving service sends ingress kind 12 with the same value
   (section 5.5). The link is one-way: it moves only the purge floor.
 
 **When the serving service is down.** The stored head stops. The executor keeps its receipts
@@ -1290,7 +1409,7 @@ former open questions 16.1-4 to 16.1-6 move to it):
 - **One writer.** One writer node tails a sealer member for the frames (section 8.1), reads the
   receipts from the executors (section 8.3), and appends each block to the log: the frames of the
   block and its receipts, in block order. It is the only node that reads the sealer and the
-  executors, sends the stored head and sends ingress kind 11.
+  executors, sends the stored head and sends ingress kind 12.
 - **The replicas follow the writer.** Each replica copies the log of the writer in order and
   builds its own indexes (the canonical index, the block, the transaction hash). A replica serves
   a block only after it holds the whole block. Each replica serves the replay of section 8.1 and
@@ -1345,10 +1464,10 @@ former open questions 16.1-4 to 16.1-6 move to it):
 | #519 (P3) | Recorded cursor, record-lag guard (off), the void on configured voters, the v11 reader | Retired. The v11 reader goes when `reads_min` rises to 12 (section 12). The rule "read N+1 one release before writing it" stays the method. |
 | #540 (P4) | The executor sends its cursor | Retired. |
 | #534 (P8) | The reject path, the halt, the runbook, the alert | Retired. The enum variants stay reserved (section 9.1). |
-| #568 | Decision version | Kept as a mechanism. This change raises it to 3. |
+| #568 | Decision version | Kept as a mechanism. An upgrade transaction raises it to 3 (#666, section 5.4). |
 | #561 | The sequencer frees a refused nonce | Kept. Each refusal of a full entry uses it. |
 | #552 | Readers hardened for a rollback; unknown kinds drop | Kept. It makes the retired kinds safe. |
-| #482, #501 | Posted-head floor, log purge | The posted-head floor of the heap retention stays while `carryBytes` is off. With it on, a member retains no frame, and the log purge floor is the stored head of the serving service (section 5.5). |
+| #482, #501 | Posted-head floor, log purge | The posted-head floor of the heap retention stays until the activation of the carry flag. After it, a member retains no frame, and the log purge floor is the stored head of the serving service (section 5.5). |
 | #608 (PR 5) | The retained file | Removed by decision 10 (PR 15). Kept: the disk-free gauge and the periodic snapshot of #611. |
 | #632 (PR 7) | The member feed | Kept: the ring, the feeder, the control stream, the states, `FEED_GAP`. Its replay walk changes source: the Raft log, not the file (section 7.3, PR 16). |
 | #481 | `kardamom_getBlockRefs` and the archive rebuild | The archive rebuild retires. The method stays for the fleet-rebuild runbook. |
@@ -1365,7 +1484,7 @@ Open work that this design supersedes, once the user confirms:
 | #542 (PR) | batcher: read the executor stream behind `--tx-source` | Close as superseded. |
 | #554 (PR) | validator: read the executor stream behind `--tx-source` | Close as superseded. |
 | #570 (issue) | a run of lost entries makes every executor exit on each join timeout | Close as superseded: no entry is lost (R2). |
-| #537 (issue) | `archive-tx-data-wipe`: a frame in flight at the driver kill is in no archive | The cut-over release (PR 13) closes it: no executor joins `tx_data`. |
+| #537 (issue) | `archive-tx-data-wipe`: a frame in flight at the driver kill is in no archive | The activation of the carry flag closes it: no executor joins `tx_data` after it. |
 
 **Ownership.** kardamom-3-00 co-owns the executor side once the user confirms: the feed reader,
 the source switching, and the removal of the join, the refetch and the void in the engine (PR 10
@@ -1690,45 +1809,101 @@ and Raft elects the most complete log among the voters, so the new head `H'` is 
 The batcher posts only exposed blocks, so the posted head is at or below that position too. The
 posted head is the confirmation bound for a client (below).
 
-**The automatic rollback of an executor (#643; replaces the operator path of #615).** A paired
-executor runs entries in about 5 ms, before they are durable, so it can be ahead of `H'`. Today it
-stops with `ClusterBehindCursor`, and an operator acts (`docs/failure-modes.md:854-866`).
+**The automatic rollback of an executor (#643, merged as #655; replaces the operator path of
+#615).** A paired executor runs entries in about 5 ms, before they are durable. So it can hold
+committed blocks, and published receipts, that the new stream does not have. Before #655 it stops
+with `ClusterBehindCursor`, and an operator acts (`docs/failure-modes.md`).
 
-1. **Compare on each start and each new connection.** Before it applies a frame, the reader asks
-   its source for a replay from its output floor (the stored head that it knows, section 8.3). It
-   compares the stream with its own history up to its last committed block: the `tx_hash` of
-   each receipt by index, and the `end_tx_idx`, the timestamp and the L1 origin of each header.
-   The first difference is the divergence point `d`. With no difference, it resumes as today.
-   - On `REPLAY_AHEAD` (its cursor is above the head), it drops what it executed above its last
-     committed block (it restarts from its state DB), and asks again every 2 s. The sealer closes
-     a block on each tick, so the head passes the cursor within seconds, and the comparison runs.
-   - The window of the comparison is short: the stored head trails the head by about 1 s of sync
-     plus the read of the serving service.
-2. **Choose a checkpoint.** The newest checkpoint whose block is below the block of `d`: first its
-   own local checkpoints (every 20 s, 3 kept, `deploy/cluster/nomad/executor.nomad.hcl:268`),
-   then a peer checkpoint with a new `max_block` beside `min_block`
-   (`crates/state/src/checkpoint_transfer.rs:253-273`). With no such checkpoint, it stops as
-   today.
-3. **Roll back.** Park the diverged state DB, restore the checkpoint, and execute the new stream
-   from its cursor.
-4. **Signal.** Publish `Rollback { to_block }` on `tx_receipts` before the first new receipt. The
-   record goes at the end of the stream enum (`aeron-stream-records`).
+- **The release gate.** The rollback runs only in an executor that reads the member feed: the
+  carried path, after the activation of the carry flag (section 12). An executor that reads the
+  cluster egress does not compare, keeps no marker and no receipt ledger, and publishes no
+  rollback. So the rollback is live only after the activation. #645 (sync level 0) must not
+  reach a cluster before the activation of the carry flag on that cluster. Until then, a power
+  loss on a majority stops the executors with `ClusterBehindCursor`, as today (section 12.4).
 
-- `d` is above the stored head, so the rollback never needs a pruned receipt.
+1. **Compare on each start and each new connection**
+   (`crates/engine/src/reader/carried/compare.rs`).
+   - The reader reads its local history from the state DB: the headers and the receipt hashes of
+     the last `--rollback-compare-blocks` committed blocks (default 32).
+   - It asks its feed for a replay from the floor of that window. A floor below the retention of
+     the member moves up to the first block that the member holds. When the receipt buffer of
+     section 8.3 lands, the floor becomes `output_floor_block`.
+   - Below its cursor, it compares each frame with that history: the `tx_hash` of the receipt at
+     each index, and the end index, the timestamp and the L1 origin of each header.
+   - Above its cursor, it compares the receipts that it already published, from its receipt
+     ledger (below). Each slot at the index of a published receipt must have the same block and
+     the same hash. A boundary must not seal its block before a published receipt of that block.
+   - `REPLAY_AHEAD` during the comparison is no fault. The reader asks again every 2 s, until the
+     head passes the floor.
+   - The first difference after a block that compared equal is the divergence point `d`. A
+     difference below the cursor ends the run with `StreamDiverged`. A difference only above it
+     ends the run with `PublishedDiverged`: the state stays, and only the published receipts of
+     `d` and above are void.
+   - With no difference, the reader resumes from its cursor and publishes nothing. So a clean
+     restart sends no rollback.
+2. **A divergence below the window.** A difference in the first compared block, or a floor that
+   the member refuses inside its retention, does not show where the divergence is. The process
+   compares again with a window 4 times wider, up to 4096 blocks. It stops with
+   `DivergedBelowWindow` for the operator when the window is at its widest, the floor is block 1,
+   or the floor is the retention of the member. So the executor never publishes a `to_block` from
+   a guess at the floor.
+3. **The receipt ledger and the running marker.** The commit thread publishes the receipts of a
+   block before the state writer commits the block. So it first writes each receipt to the
+   receipt ledger (`<state-dir>/marker-receipts`): a ring of 65,536 slots of 64 bytes with the
+   canonical index, the block and the transaction hash. The writes go to the page cache with no
+   disk sync. A failed write ends the process (`LocalWrite`), so no published receipt is missing
+   from the ledger. The running marker (`<state-dir>/marker-running`) holds the boot id of the
+   host while a run is live:
+   - no marker: the last run ended cleanly, so the ledger is on disk;
+   - a marker of this boot: the process crashed, and the page cache holds the ledger;
+   - a marker of another boot, or a boot id that does not read: the host restarted, the ledger can
+     be short, and the first frame above the cursor counts as a difference.
+4. **Choose a checkpoint** (on `StreamDiverged`). The process waits for its checkpoint task, and
+   removes its local checkpoints at and above `d`. It takes the newest local checkpoint below `d`.
+   With none, it fetches the newest peer checkpoint below `d` (`GET
+   /checkpoint/latest?max_block=<d - 1>`). With no checkpoint below `d`, it stops with
+   `StreamDiverged`, and the operator path of #401 stays.
+5. **The durable rollback marker.** The process writes the rollback marker
+   (`<state-dir>/marker-rollback`) with a disk sync, clears the ledger, and parks the diverged
+   state DB. On `PublishedDiverged`, it writes the marker and removes the receipts of `d` and
+   above from the ledger, and the state and the checkpoints stay. The next run restores only a
+   checkpoint at or below the block of the marker, and executes the new stream from its cursor.
+6. **The signal.** Before the first receipt of the run, the commit thread publishes the record
+   `ReceiptRollback { to_block, id }`, with the must-deliver retry. It removes the rollback marker
+   only after the publish succeeds. So the signal survives a crash: a crash, a shutdown or a
+   failed publish leaves the marker, and the next start publishes the same record.
+   - `to_block = d - 1`. The blocks up to `to_block` are equal on both streams.
+   - `id` is a hash of `to_block` and the first frame of block `d` in the new stream. Every
+     executor that finds one divergence has that frame: an executor that committed `d`, and an
+     executor that only published the receipts of `d`. So one divergence has one `id`.
+   - **The frame.** The record is its own `receipt-rollback` frame on `tx_receipts`: the 40-byte
+     rkyv archive of `to_block` and a 32-byte `id`. It is not a variant of the stream enum. A
+     receipt batch frame has another length, so a consumer of an older release fails to decode
+     it as a batch, logs it, and skips it.
+
 - The unpaired executors and the validator read the serving service. It exposes only durable
-  blocks, so they do not roll back after a power loss.
+  blocks, so they do not roll back their state after a power loss. The validator is a consumer
+  of the record (below).
 
-**The receipts that clients already got.**
+**The receipts that clients already got.** The ingress, the state mirror and the sequencer apply
+each `id` once (`kardamom_cache::AppliedRollbacks`, a bounded set of 64 ids). A copy of an applied
+`id` changes nothing for them. The validator applies each copy: a late copy only leaves the
+receipts that it holds above `to_block` unverified.
 
 - **What a client sees.** A receipt from the executor comes in about 5 ms, before its entry is
   durable. After a loss, a receipt of a block above `H'` goes away:
   `eth_getTransactionReceipt` answers `null`, and then a new receipt if the transaction is ordered
   again (a new block, a new index, maybe another status), or `null` for good.
-- **The ingress.** On `Rollback { to_block }`, it drops every cached receipt above `to_block`,
-  closes each `kardamom_subscribeReceipts` subscription with an error that names the rollback,
-  and drops its fee history and its head above `to_block`.
-- **Redis.** On `Rollback`, the state mirror deletes the `rcpt:` keys (600 s, no block index) and
-  rebuilds its account rows from the rolled-back executor (`crates/state-mirror/src/rebuild.rs`).
+- **The ingress.** On a new `id`, it drops every cached receipt above `to_block` and only their
+  hashes from its first-wins set. It empties its local account layer and its cold-account map,
+  lowers its head and its fee history to `to_block`, and closes each `kardamom_subscribeReceipts`
+  subscription with an error that names the rollback.
+- **Redis.** On a new `id`, the state mirror deletes the `acct:` and `rcpt:` keys and rebuilds
+  its account rows.
+- **The validator.** It withdraws the buffered receipts and rows of every session above
+  `to_block`, and the BALs of every session above it. Each run of an executor publishes on a new
+  session, so the session of the record does not name the stale receipts. A missing receipt or
+  BAL means "unverified", never a divergence.
 - **The serving service.** It exposed nothing above the majority durable position, so it needs no
   correction.
 - **The notifier** no longer exists (decision 12). There is no status feed to correct.
@@ -1742,10 +1917,11 @@ stops with `ClusterBehindCursor`, and an operator acts (`docs/failure-modes.md:8
 - **The sealer guard.** Its expected nonces are replicated state at `H'`, so they match the chain.
   A re-offer that leaves a gap gets `CONTIGUITY_REJECT`, and the sequencer frees the nonce as
   today (#561).
-- **The sequencer floors.** A floor learned from a receipt above `to_block` is wrong. On
-  `Rollback { to_block }`, the sequencer resets that floor to unknown and learns it again by the
-  resync of today (Redis, then the executor). It keeps the block of the receipt that set each
-  floor for this (#643).
+- **The sequencer floors.** A floor learned from a receipt above `to_block` is wrong. On a new
+  `id`, the sequencer resets that floor to unknown and learns it again by the resync of today
+  (the local layer, Redis, then the executor). Each floor keeps its evidence: the block of its
+  receipt, or the rollback generation of its lookup. A lookup answer to a request from before the
+  rollback sets no floor, and the sequencer asks that lookup again.
 
 **Who detects the loss.**
 
@@ -1753,183 +1929,180 @@ stops with `ClusterBehindCursor`, and an operator acts (`docs/failure-modes.md:8
 |---|---|---|
 | Raft | The election after the restart | The most complete surviving log wins. The cluster continues. |
 | A paired executor | The comparison at its start or new connection finds `d` | The rollback above |
-| The consumers of `tx_receipts` | `Rollback { to_block }` | The ingress, the state mirror and the sequencers drop what is above `to_block` |
+| The consumers of `tx_receipts` | The `receipt-rollback` frame, once for each `id` | The ingress, the state mirror, the sequencers and the validator drop what is above `to_block` |
 | The serving service | Its member's stream goes below a block that it exposed (only after a coordinated disk failure) | It drops those blocks and alerts |
 
 **Proof.** A chaos case `sealer-tail-loss` (section 13.1). A process kill keeps the page cache,
 so the case puts the cluster directories of two members on a device that drops unsynced writes
 (device-mapper `dm-flakey` with `drop_writes`), and stops both under load. It checks that the
 loss is at most about 1 s, that no block that the serving service exposed changes, that the
-paired executors roll back by themselves, and that their roots match the validator's.
+paired executors roll back by themselves, and that their roots match the validator's. The case
+runs after the activation of the carry flag, because the rollback runs only on the carried path.
 
 ## 12. Migration
 
-### 12.1 Formats (`docs/formats.md`, `formats.toml`)
+### 12.1 Formats
 
-| Format | Today | After the cut-over |
+Every deploy is backwards compatible (decision 19). So a member, a client or a consumer writes
+each new format below only after the activation of its flag, and the release reads the old and
+the new layout. Today `formats.toml` and the format gate (`just check-formats`) check the formats.
+#664 removes both after #663 runs in CI. Then the compatibility fixtures of #663 check each
+format: the new release reads the samples of the last release, and with every new flag off it
+writes the same bytes. A mixed-version shard runs the last release and the new one side by side.
+
+| Format | Today | After the activation |
 |---|---|---|
-| `sealer-ingress-kinds` | writes 8, reads 0..9 | writes 8, reads 0..8. No new ingress kind: record type 5 rides kinds 0 and 3. Kinds 6 and 9 drop as unknown. |
-| `sealer-egress-kinds` | writes 12, reads 1..13 | writes 16, reads 1..16. Kind 13 is never sent. Kind 14 is not used. Kind 16 is sent on the feed only. The status frame stays 68 bytes: the 76-byte frame of the retained file goes (decision 10). |
-| `sealer-record-types` | writes 4, reads 0..4 | writes 6, reads 1..6. Types 0 and 4 are never written. |
-| `sealer-snapshot` | writes 10, reads 1..11 | writes 12, reads 10..12. A later release sets `reads_min = 12`. v12 has no retention section and carries the stored head (section 5.5). It changes in place, because no release wrote it. |
+| `sealer-ingress-kinds` | kinds 0 to 9 | With no activation, the clients write kinds up to 8 (#666). Kind 11, the feature activation (#666), switches the version (section 5.4). Version 3: kind 10, the nonce release. Kind 12 `STORED_CURSOR` (#639): a member applies it only after the activation of the carry flag (section 5.5). Record type 5 rides kinds 0 and 3. After the activation of the carry flag, kinds 6 and 9 drop as unknown. A member of an older release drops kinds 10 to 12 as unknown kinds. |
+| `sealer-egress-kinds` | kinds 1 to 13 | Kind 17 under version 3 (#666). After the activation of the carry flag: kinds 15 and 16 (16 on the feed only). Kind 13 is never sent. Kind 14 is not used. The status frame stays 68 bytes: the 76-byte frame of the retained file goes (decision 10). |
+| `sealer-record-types` | types 0 to 4 | After the activation of the carry flag: types 5 and 6. Types 0 and 4 are not written. |
+| `sealer-snapshot` | v10 | v10 before any activation. v13 after the activation record of version 3 (#666). v12 after the activation of the carry flag. v12 has no retention section and carries the stored head (section 5.5). It changes in place until the first activation of the carry flag on a network. A later release stops the restore of v10 and v13 (PR 14). |
 | `aeron-stream-records` | `TxEnvelope` frozen | Unchanged. The envelope travels in its frozen layout. |
 | `discovery-record` | `Topic::ExecTxs` | `Topic::SealerFeed` added. `ExecTxs` is removed only after no node advertises it (`crates/log/src/discovery/record.rs:279-296`). |
 | `sealer-feed` (new) | none | The feed frames are the egress kinds. The feed control request is the kind-1 layout. |
 | `tx-heads` (new, PR 11) | none | Frozen layout of `TxHeader`. |
 | `state-db` | 11 tables | The meta key `output_floor_block` (section 8.3). A reader of the base ignores an unknown key, so the change is forward-compatible. |
 | `executor-output` (new) | none | The receipt read of section 8.3: the request and the binary answer. Frozen at its first release. Its transport follows the design of #585. |
+| `receipt-rollback` (new, #655) | none | The 40-byte frame `ReceiptRollback { to_block, id }` on `tx_receipts` (section 11.1). Only an executor on the carried path sends it. A consumer of an older release fails to decode it as a batch, and skips it. |
+| `executor-markers`, `receipt-ledger` (new, #655) | none | The rollback marker, the running marker and the receipt ledger in the state directory of an executor on the carried path (section 11.1). |
 | `batcher-spool`, `batcher-cursor` | unchanged | Unchanged. |
 
-- Each change that the base cannot read gets a `[one_way.<id>]` and a `[coordinated.<id>]`
-  waiver with its reason.
-- `sealer-ingress-kinds` also gets kind 11 `STORED_CURSOR` (section 4.3), above kind 10 of the
-  nonce release (#634). A member of the base drops kind 11 as an unknown kind, so the serving
-  service can send it before the sealer reads it.
-- Decisions 15 and 16 add `aeron-stream-records`: the record `Rollback { to_block }` on
-  `tx_receipts`, added at the end of the stream enum (section 11.1). They add no sealer kind and
-  no decision version: the scheduled sync and the durable position change no decision.
-- **The P3 snapshot rule.** Today the writer stays one version behind the reader: reads 11,
-  writes 10 (`CanonicalSealerState.java:164`, `:181`). The removal of the cursor and the void
-  sections does not get its own two-release step. It rides the coordinated cut-over: the release
-  is one-way and coordinated already (decision version 3, new kinds that change the state), so a
-  mixed fleet never runs. The new release reads v10, the snapshot that the drained old release
-  wrote, and writes v12 at once.
+- **No waiver.** Until #664 removes the format gate, a format that the base cannot read names its
+  flag in `formats.toml` (`activation = { flag = ... }`), as #666 does for kinds 11 and 17. No
+  format of this program gets a `[one_way]` or a `[coordinated]` waiver.
+- The scheduled sync and the durable position (#645) change no format and no decision. Whether
+  #645 needs a flag is a check of #665 (section 12.4).
+- **The snapshot rule.** Before the activation, the new release writes the snapshot of the base
+  (v10, or v13 after the activation record of version 3). So a mixed fleet runs, and a rollback
+  is free (#663). The removal of the cursor and the void sections rides the activation of the
+  carry flag: after it, every member writes v12. The gate of #664 then refuses a rollback past
+  the release that brought the flag.
 
-### 12.2 Staging: a chain reset
+### 12.2 The cut-over: an upgrade transaction (decision 20)
 
-The user chose a chain reset for staging.
+The owner replaced the chain reset of staging and the drained cut-over of production with the
+protocol upgrade process (#661, the decision of 2026-10-18 on #598). Staging and production take
+the same path. So staging also tests a network upgrade.
 
-1. Merge PR 13. Its images carry the new formats with the flags on.
-2. Tear down the staging chain and launch a new one from genesis: `just teardown`, then
-   `just launch` in `kardamom-infra` (`docs/staging-launch.md:120-123`). The launch deploys the
-   new chain contracts, so the old bridge state, the canary history and the L1 record stay
-   behind with the old contracts.
-3. The node_containers role creates the pair mounts of section 7.6 before the node containers
-   start.
-4. Check: `just smoke`, the canary, and one chaos shard against staging.
+**The carry flag.**
 
-- No v10 snapshot is read, and no drain is needed. The waivers of section 12.1 still apply,
-  because the release gate compares the registry of the deployed release with the target.
-- dev-32 recommended the drained cut-over on staging as a rehearsal of production. The user chose
-  the reset. The drained cut-over gets its rehearsal in the container cluster instead: PR 13
-  adds a test that runs section 12.3 there under load.
+- One chain feature flag in `KardamomChainState`, with an optional activation time. #598 sets
+  its feature id. It replaces `kardamom.cluster.carryBytes` and `--carry-bytes`: they are no
+  longer operator settings.
+- Every component switches at the same point. The sealer switches at the first log entry after
+  the activation in its Raft log, through a feature activation record (ingress kind 11, section
+  5.4). The executors switch at the same block. Each block driver reads the flag
+  (`crates/exec-core/src/features.rs`).
+- Before the switch, the old path runs: the `TxRef` frames, the void, the join and the archives.
+  After it, the carried path runs. The old path stays in the code until the activation on every
+  network. A later release removes it (PR 14, #599).
+- The switch of each component is open question 16.1-18.
 
-### 12.3 Production: the drained cut-over
+**Before the upgrade transaction.**
 
-Production keeps its chain. The cut-over reuses the coordinated restart of the decision version
-(`cluster/sealer-service/README.md:405-416`).
+- Every service runs the release of PR 13. #664 adds the gate check.
+- Version 3 is active on the network (section 5.4).
+- The serving service runs (section 8.1). Its receipt import can start (section 12.3).
+- The pair mounts of section 7.6 exist. The node_containers role (`kardamom-infra`) creates them
+  before the node containers start.
+- `recordLagBudget` stays 0, as deployed. An executor on the carried path sends no recorded
+  cursor (the review of #635 on #598).
+- The host memory and the disk meet the preconditions of section 5.5.
 
-1. Deploy every reader first, behind the flags of section 13 (off): the ingress, the sequencers,
-   the executors, the validator and the batcher read the new kinds but do not write them.
-2. Pause the submits on every ingress (`POST /pause?note=cut-over`, `crates/obs/src/serve.rs:57-59`).
-   Wait until the sealer's canonical count stops. The boundary tick still closes empty blocks.
-   Call `D` the block that holds the last ordered transaction.
-3. Flush the batcher: `POST /flush` on the batcher (new, PR 13). It is an admin route of the
-   service server, loopback only, like `/pause`. It makes the open group due at once, so the
-   batcher posts every block up to the newest block that it consumed.
-   - A submit pause alone does not close the group today: the group closes on its count, its
-     bytes, its timer or the DA-lag rule (`crates/batcher/src/live/feed.rs:85-102`). On staging
-     the idle timer can be hours.
-   - The batcher could instead flush on `Paused{Operator}` of the ingresses on the `events`
-     stream. That makes the batcher infer the operator's intent from other services. An explicit
-     route is simpler to test and to script.
-4. Wait until all of these hold:
-   - the posted head is at or above `D` (`kardamom_ingress_cluster_posted_head`);
-   - when the attester runs: the attested head is at or above `D`. The attester keeps its leaves
-     in memory only (`crates/validator/src/attester/state.rs:44-63`), and it does not read the
-     receipts that the serving service imports at step 8 (that read is a follow-up, section
-     16.3). So an output root that does not cover `D` before the cut strands the withdrawals of
-     the blocks above it. The attester posts on its interval
-     (`--attester-post-interval`); the operator waits for it, or lowers the interval;
-   - the cursor of every consumer equals the sealer's canonical count and the open block: each
-     executor (feed or egress), the validator and the batcher. Then no consumer holds a `TxRef`
-     past the cut that it cannot resolve after the floor moves. The block cursors count too, not
-     only the record cursors (#598);
-   - no void vote is open (`cluster VOID-VOTE` lines all have `result=DECIDED`).
-5. Take a sealer snapshot (v10). Copy it, and take a checkpoint of each executor and of the
-   validator, to the backup volume. Keep these copies until the first v12 snapshot is one day
-   old. They are the input of the rollback of section 12.5.
-6. Stop the writers: the ingresses and the sequencers.
-7. Purge the sealer job. Start the new sealer release (decision version 3). It restores the v10
-   snapshot:
-   - it drops the void ledger, which holds no open vote;
-   - it drops every retained `TxRef` frame and keeps no frame (section 5.5). A drained v10
-     snapshot still holds frames: the last `retention` frames (65,536) stay even when all are
-     posted, and the boundaries of the empty blocks after `D`. No consumer reads them after step 8,
-     because every consumer resumes at the head. Every member drops the same frames, so no import
-     of the v10 frames is needed (#598);
-   - the sealer setting `recordLagBudget` is 0, or the guard is gone. The executors with
-     `--carry-bytes` send no recorded cursor (#635).
-8. Turn the flags on. Start the executors, the validator and the batcher; they resume at the head
-   with no `TxRef` frame to resolve. The validator and the batcher now read the serving service
-   (section 8.1), so it runs before this step. Then the sequencers, then the ingresses. Unpause.
-   - **The receipt import (decision 14).** The serving service starts at the cut. Before it sends
-     its first stored head, it imports the existing receipts from one executor: the `receipts`
-     and `tx_hash_index` rows of every block at or below `D`, through the receipt read of section
-     8.3. It has no frames of these blocks: the sealer of the new release starts at the cut, and
-     L1 holds the bytes. So the service answers a receipt lookup for them, and a replay below `D`
-     gets `REPLAY_UNAVAILABLE`.
-   - The service sends its first stored head, `D`, only when the import is done. An executor
-     prunes nothing before its first stored head, so the import does not race a prune. Until then
-     the sealer purges nothing (section 5.5).
-   - The output roots of the day before the cut are still in their challenge window. The service
-     holds their receipts from the import. Their transaction bytes are on L1.
-   - The import size is the receipt history of the chain: about 0.3 KB for each transaction
-     without logs, more with logs. The operator states it, and the disk of the service, before
-     the cut-over. The import can run while the old release still runs, from a checkpoint copy,
-     and catch up to `D` at step 8.
-   - Staging takes the chain reset of section 12.2, so it imports nothing.
+**The steps.** Staging first, then production.
 
-- A consumer that restores a checkpoint older than the cut-over cannot replay the old range: the
-  floor is at the cut. It takes a newer checkpoint, or the replay answers `REPLAY_UNAVAILABLE`
-  and it fetches a peer checkpoint. The deploy takes a checkpoint of each executor after step 8.
+1. Deploy PR 13 as a rolling release, with the carry flag off. With the flag off, it writes the
+   formats of the release before (#663).
+2. Check: `just smoke`, the canary and one chaos shard. The old path runs unchanged.
+3. Send the upgrade transaction: `ETHLockbox.initiateUpgrade` with the carry flag and an
+   activation time.
+4. Check again: `just smoke`, the canary and one chaos shard. Each paired executor reads its
+   member feed (`kardamom_executor_input_source{source="feed"}`). The validator and the batcher
+   read the serving service. The executor roots equal the validator's.
+
+- The chaos case `cutover-rehearsal` runs the same steps in the container cluster, under load
+  (section 13.1).
+- No step pauses the submits, flushes the batcher, purges the sealer job, or restores a drained
+  snapshot. The chain keeps its history on both networks.
+- Call `D` the last block before the switch.
+
+### 12.3 The receipt import (decision 14)
+
+- **The import.** Before the serving service sends its first stored head, it imports the existing
+  receipts from one executor: the `receipts` and `tx_hash_index` rows of every block at or below
+  `D`, through the receipt read of section 8.3. It has no frames of these blocks: their frames
+  carry no bytes, and L1 holds the bytes. So the service answers a receipt lookup for them, and a
+  replay below `D` gets `REPLAY_UNAVAILABLE`.
+- **No race.** The service sends its first stored head, `D` or above, only when the import is
+  done. An executor prunes nothing before its first stored head, so the import does not race a
+  prune. Until then the sealer purges nothing (section 5.5).
+- **The challenge window.** The output roots of the day before `D` are still in their challenge
+  window. The service holds their receipts from the import. Their transaction bytes are on L1.
+- **The size.** The import size is the receipt history of the chain: about 0.3 KB for each
+  transaction without logs, more with logs. The operator states it, and the disk of the service,
+  before the upgrade transaction. The import can start from a checkpoint copy before the upgrade
+  transaction, and catch up to `D` after the switch.
+- Staging keeps its chain now, so it imports too.
+
 ### 12.4 Deploy order
 
 1. PR 1 to PR 11 merge with the flags off. Each deploys as a normal rolling release. They change
    no format that the base cannot read.
 2. PR 12 (benchmark) runs on the flagged build in a container cluster and on staging
    (section 10.6).
-3. PR 13 is the cut-over release: the waivers, the flags on by default, the runbook of 12.3.
-   Staging takes it by the reset of 12.2. Production takes it by the cut-over of 12.3.
-4. PR 14 removes the dead code. It is a normal release, because the cut-over already stopped every
-   writer of the removed kinds.
+3. PR 13 ships the carried path behind the carry flag, off. It deploys as a rolling release.
+   Then each network sends the upgrade transaction (section 12.2): staging first, then
+   production.
+4. PR 14 (#599) removes the old path. It merges only after the activation of the carry flag on
+   every network.
 
-**Decision 10 adds PR 15 to PR 17.** PR 15, 16 and 17 change the sealer and v12. No release
-writes v12 before PR 13, so they need no waiver of their own:
+**Decision 10 adds PR 15 to PR 17.** PR 15, 16 and 17 change the sealer and v12. No network
+writes v12 before the activation of the carry flag, so they change v12 in place:
 
-1. #634 (PR 6, with the retained-file section in v12) merges as it is. It has passed three review
-   rounds, and the removal touches the same classes. One removal after it is less work than a
-   rework of #634.
+1. #634 (PR 6, with the retained-file section in v12) merged as it was. The removal touches the
+   same classes. One removal after it is less work than a rework of #634.
 2. PR 16 (#638, the feed walk of the Raft log) merges next. The feed then no longer reads the file.
 3. PR 15 (#637, the removal of the file and its v12 section) merges after PR 16, and before
    PR 13.
-4. PR 17 (#639, the stored cursor) merges after #634, and before PR 13.
-5. PR 13 sets `writes = 12` and turns `carryBytes` on. From then v12 is frozen.
+4. PR 17 (#639, the stored cursor, ingress kind 12) merges after #634, and before PR 13.
+5. v12 is frozen at the first activation of the carry flag on a network.
+
+**Decision 19 adds #666, #663 and #664.**
+
+- #666 (#662, decision version 3 by an upgrade transaction) merges before PR 13. Version 3
+  activates on a network before the carry flag.
+- PR 13 passes the compatibility fixtures and the mixed-version shard of #663.
+- #664 adds the gate check of the active flags of the chain, and removes the format gate after
+  #663 runs in CI.
 
 **Decisions 15 and 16 add PR 19 and PR 20** (section 11.1). PR 18 (#642, the sequencer
-retention) is dropped. PR 19 (#643, the executor rollback) needs the `output_floor_block` of the
-receipt buffer. PR 20 (#644, the recovery from the surviving log) needs the scheduled sync and the
-durable position (#645).
+retention) is dropped. PR 19 (#643) merged as #655. Its floor becomes the `output_floor_block` of
+the receipt buffer when that buffer lands. PR 20 (#644, the recovery from the surviving log) needs
+the scheduled sync and the durable position (#645).
 
 **The order of sync level 0 (decision 18).** #645 sets sync level 0 and adds the 1 s scheduled sync
-and the durable report itself. #645 does not merge before #643 (the executor rollback). So no
-release runs at sync level 0 without the scheduled sync, or without the executor rollback.
+and the durable report itself. #645 does not merge before #643 (the executor rollback, merged as
+#655). So no release runs at sync level 0 without the scheduled sync, or without the executor
+rollback.
 
-### 12.5 Rollback (production)
+- The rollback of #655 runs only on the carried path (section 11.1). So #645 must not reach a
+  cluster before the activation of the carry flag on that cluster.
+- How #645 waits for the activation is open: a release after the activation on every network, or
+  sync level 0 behind the carry flag. #665 checks #645 against the upgrade rule.
 
-This section applies to production. Staging has no rollback across the reset: a failed staging
-release is fixed forward, or the reset runs again with the release before.
+### 12.5 Rollback
 
-- Before the first v12 snapshot, a rollback is the coordinated restart into the old release: it
-  restores the v10 snapshot of step 5, and the executors and the validator restore their step-5
-  checkpoints. Every envelope ordered after it is lost, so do it only with the
-  submits still paused.
-- After the first v12 snapshot, the old release cannot read the snapshot. The rollback is:
-  pause, drain until `posted_head == sealed_head`, then the fleet rebuild from L1 at the posted
-  head into the old release (`docs/runbooks/sealer-fleet-rebuild.md`). Nothing is lost, because
-  L1 holds every block.
-- The deploy record gets a rollback floor at the cut-over release (`docs/formats.md:155-171`).
-  `just rollback` does not cross it. The floor applies to staging too. `docs/runbooks/deploy-rollback.md` gets the path above.
+This section applies to staging and production alike.
+
+- **Before the activation, a rollback is free.** With the carry flag off, the release writes the
+  formats of the release before (#663). So `just rollback` returns to it as a normal rolling
+  release.
+- **After the activation.** The gate of #664 refuses a rollback past the release that brought the
+  carry flag. A sealer of an older release refuses v12, and an older executor does not read the
+  carried frames. A fault after the activation is fixed forward.
+- The step-5 backups of the drained cut-over, the coordinated restart into the old release, and
+  the rollback floor of the formats (`docs/formats.md`) go.
+- The fleet rebuild from L1 at the posted head (`docs/runbooks/sealer-fleet-rebuild.md`) stays the
+  path after the loss of every member (section 11). It is not a rollback path.
 
 ## 13. Implementation plan
 
@@ -1963,18 +2136,23 @@ Each item is one pull request and one issue. Each passes `just style` and CI alo
 | 10 | engine: read `RT_TX` from the feed or the serving service | 4, 7 |
 | 11 | ingress: publish `tx_heads` | none |
 | 12 | bench: run the matrix and gate on the target | 2, 3, 6, 7, 8, 9, 10, 15, 16, 17 |
-| 13 | release: cut-over to bytes in the Raft log | 12, 15, 16, 17, the serving service and the executor handoff |
-| 14 | cleanup: remove the void, the join and the archives | 13 |
+| 13 | release: cut-over to bytes in the Raft log, behind the carry flag | 12, 15, 16, 17, 19, 21, #663, #664, the serving service and the executor handoff |
+| 14 | cleanup: remove the void, the join and the archives (#599) | 13, and the activation of the carry flag on every network |
 | 15 | sealer: remove the retained file and its v12 section (#637) | 6, 16 |
 | 16 | sealer: the member feed replays from the Raft log (#638) | 7 |
-| 17 | sealer: the stored cursor (ingress kind 11) and the purge floor (#639) | 6 |
+| 17 | sealer: the stored cursor (ingress kind 12) and the purge floor (#639) | 6 |
 | 18 | (dropped: #642 closed by decision 16, section 11.1) | none |
-| 19 | executor: roll back by itself after a power loss (#643) | the receipt buffer (section 8.3) |
+| 19 | executor: roll back by itself after a power loss (#643, merged as #655) | none; its floor moves to the receipt buffer of section 8.3 when it lands |
+| 21 | sealer: activate decision version 3 by an upgrade transaction (#662, PR #666) | 6 |
 | 20 | sealer: recovery from the surviving log after a power loss (#644) | 17, #645 (the scheduled sync and the durable position) |
 
 The executor side of the handoff (section 8.3: the receipt read, the prune, the alerts) and the
 ingress fallback to the serving service (section 8.4) are issues that the design of #585 opens,
 because their transport follows that design (decision 14).
+
+The PRs that put a change behind `--carry-bytes` or `kardamom.cluster.carryBytes` keep that setting
+until PR 13. PR 13 replaces each one with the carry flag of the chain (decision 20). PR 21 and
+#663, #664 and #665 come from the upgrade rule (decision 19, #661).
 
 **PR 1. cluster: fragmented session messages up to 1 MiB.**
 
@@ -2024,6 +2202,8 @@ because their transport follows that design (decision 14).
 - Acceptance: Java state tests: the second twin copy drops at the dedup; each refusal is the same
   as today; equal snapshot bytes on every member; a v10 restore; the coordinated restart to
   version 3.
+- Status: merged as #634. PR 21 (#666) replaces its coordinated restart to version 3 with an
+  upgrade transaction (section 5.4).
 
 **PR 7. sealer: the member feed over IPC.**
 
@@ -2074,37 +2254,49 @@ because their transport follows that design (decision 14).
 - Acceptance: section 17 answers whether one Raft group carries 5,000 tx/s with the mix and with
   8 KB only, gives the tuned values, and says if the hedge of section 6.3 is needed.
 
-**PR 13. release: cut-over to bytes in the Raft log.**
+**PR 13 (#598). release: cut-over to bytes in the Raft log, behind the carry flag.**
 
-- Scope: the flags on by default, the waivers of section 12.1, the pair mount and
-  `feedAeronDir` in the Nomad jobs and in `terraform/containers`, `POST /flush` on the batcher, the
-  runbook of 12.3 and its rehearsal case, the rollback floor, `KardamomSealerDiskLow`,
-  `KardamomExecutorOutputUnstored`, `KardamomExecutorDiskLow`, `recordLagBudget=0`, the chaos
-  cases of 13.1. The pair mount of the staging hosts is a `kardamom-infra` change to the
-  node_containers role, merged before the reset of 12.2. No import of the v10 frames: a member
-  with `carryBytes` drops them (section 5.5).
-- Depends on: PR 12, PR 15, PR 16, PR 17, the serving service of section 8.1 and the executor
-  handoff of section 8.3 in place.
-- Acceptance: `cutover-rehearsal` passes in the container cluster. The staging reset passes
-  `just smoke`, the canary and one chaos shard.
+- Scope (section 12.2):
+  - the carry flag of the chain, off, in place of `kardamom.cluster.carryBytes` and
+    `--carry-bytes`;
+  - the switch of each component at the activation (open question 16.1-18): the sealer at a log
+    entry through the feature activation record, the executors at the same block;
+  - the pair mount and `feedAeronDir` in the Nomad jobs and in `terraform/containers`;
+  - the runbook of the upgrade step and its rehearsal case;
+  - `KardamomSealerDiskLow`, `KardamomExecutorOutputUnstored`, `KardamomExecutorDiskLow`;
+  - `recordLagBudget=0`, and the chaos cases of 13.1.
+- The pair mount of the staging hosts is a `kardamom-infra` change to the node_containers role,
+  merged before the upgrade transaction on staging.
+- Not in scope: the waivers, the rollback floor, `POST /flush` on the batcher, the drain and the
+  chain reset. No import of the v10 frames: the switch drops them (section 5.5).
+- Depends on: PR 12, PR 15, PR 16, PR 17, PR 21, #663 and #664, the serving service of section
+  8.1 and the executor handoff of section 8.3 in place.
+- Acceptance:
+  - `cutover-rehearsal` passes in the container cluster: deploy, check, the upgrade transaction,
+    check.
+  - The compatibility fixtures and the mixed-version shard of #663 pass with the carry flag off.
+  - On staging: the rolling deploy passes `just smoke`, the canary and one chaos shard. After the
+    upgrade transaction they pass again.
 
 **PR 14. cleanup: remove the void, the join and the archives.**
 
-- Scope: everything in section 9.1. `reads_min` of the snapshot goes to 12 in the release after.
+- Scope: everything in section 9.1: the old path. It merges only after the activation of the
+  carry flag on every network (decision 19). The restore of v10 and v13 goes in the release after.
 - Acceptance: no reference to the removed items is left. The chaos shards pass.
 
 **PR 15 (#637). sealer: remove the retained file and its v12 section.**
 
 - Scope: sections 5.5 and 9.1 (decision 10). Remove the retained file of #608 and every class
   that only it uses, the `/retained` endpoint and its token, the retained-file copy of the peer
-  seed, the 76-byte status, and the retention section of v12. With `carryBytes` on, the egress
-  retains no frame and answers an egress replay with `REPLAY_UNAVAILABLE`. A member with
-  `carryBytes` on restores v10 and drops its frames. Keep `kardamom_sealer_disk_free_bytes`.
+  seed, the 76-byte status, and the retention section of v12. After the activation of the carry
+  flag, the egress retains no frame and answers an egress replay with `REPLAY_UNAVAILABLE`, and
+  the member drops its `TxRef` frames. Keep `kardamom_sealer_disk_free_bytes`.
 - Depends on: #634 merged, PR 16 merged. Before PR 13.
 - Acceptance: no reference to the removed classes is left. A `TestCluster` with `carryBytes` on
   has equal v12 snapshot bytes on every member, with no retention section. A member with
   `carryBytes` on restores a v10 snapshot with retained frames, and every member then holds the
-  same state. A member with `carryBytes` off refuses v12. The status frame is 68 bytes.
+  same state. A member with `carryBytes` off refuses v12. The status frame is 68 bytes. (PR 13
+  turns `carryBytes` into the carry flag.)
 
 **PR 16 (#638). sealer: the member feed replays from the Raft log.**
 
@@ -2121,31 +2313,41 @@ because their transport follows that design (decision 14).
 
 **PR 17 (#639). sealer: the stored cursor and the purge floor.**
 
-- Scope: section 5.5. Ingress kind 11 `STORED_CURSOR`, the replicated stored head, its place in
+- Scope: section 5.5. Ingress kind 12 `STORED_CURSOR`, the replicated stored head, its place in
   v12, the purge floor at the stored head (one-way), `storedHead` on `/status`, the log line
-  `cluster STORED-CURSOR`. The Rust encoder of kind 11 in `crates/cluster-adapter`.
-  `sealer-ingress-kinds` writes 11.
+  `cluster STORED-CURSOR`. The Rust encoder of kind 12 in `crates/cluster-adapter`.
 - Depends on: #634 merged. Before PR 13.
-- Acceptance: a `PurgePlanner` test: with `carryBytes` on, the purge point never passes the stored
-  head, whatever the posted head; with no kind 11, the member purges nothing. A `TestCluster` test:
-  every member restores the same stored head from v12. A member of the base drops kind 11.
+- Acceptance: a `PurgePlanner` test: after the activation of the carry flag, the purge point never
+  passes the stored head, whatever the posted head; with no kind 12, the member purges nothing. A
+  `TestCluster` test: every member restores the same stored head from v12. A member of the base
+  drops kind 12, and so does a member before the activation of the carry flag.
 
 **PR 18 (#642).** Dropped by decision 16. The sequencer keeps its rule of today (section 11.1).
 
 **PR 19 (#643). executor: roll back by itself after a power loss.**
 
-- Scope: section 11.1, the automatic rollback. The comparison at each start and new connection,
-  from the output floor, with the receipts (`tx_hash` by index) and the headers; the wait on
-  `REPLAY_AHEAD`; the choice of the newest checkpoint below the divergence (local, then a peer
-  with `max_block`); the park and the restore; the `Rollback { to_block }` record. The reactions:
-  the ingress (the cache, the subscriptions, the fee history), the state mirror (the `rcpt:` keys,
-  the account rebuild) and the sequencer (the floors learned above `to_block`).
-  `docs/failure-modes.md`: the refusal of a cursor ahead of the head becomes this path when a
-  divergence is found.
-- Acceptance: an executor with equal history resumes with no rollback; a diverged executor
-  restores the newest checkpoint below `d` and reaches the root of the new stream; with no
-  checkpoint below `d` it stops as today; the ingress drops the receipts above `to_block`; the
-  sequencer resets the floors above `to_block`.
+- Status: merged as #655.
+- Scope: section 11.1, the automatic rollback, on the carried path only.
+  - The comparison at each start and new connection, over a window of committed blocks, with the
+    receipts (`tx_hash` by index), the headers, and the published receipts of the receipt ledger.
+  - The wait on `REPLAY_AHEAD`, and the wider window below the floor (up to 4096 blocks, then a
+    stop for the operator).
+  - The choice of the newest checkpoint below the divergence (local, then a peer with
+    `max_block`), the park and the restore.
+  - The receipt ledger, the running marker with the boot id, and the durable rollback marker.
+  - The `receipt-rollback` frame `ReceiptRollback { to_block, id }`, one `id` for each
+    divergence.
+  - The reactions, once for each `id`: the ingress (the cache, the first-wins set, the account
+    layer, the subscriptions, the fee history), the state mirror (the `acct:` and `rcpt:` keys,
+    the account rebuild) and the sequencer (the floors learned above `to_block`). The validator
+    withdraws the receipts, rows and BALs of every session above `to_block`.
+- Acceptance: an executor with equal history resumes with no rollback, and a clean restart
+  publishes nothing; a diverged executor restores the newest checkpoint below `d` and reaches the
+  root of the new stream; with no checkpoint below `d` it stops; the consumers drop the receipts
+  above `to_block`, once for each `id`.
+- Follow-ups: the floor moves to `output_floor_block` when the receipt buffer of section 8.3
+  lands. A consumer that is down while the record goes out still misses it (#655, an open design
+  question).
 
 **PR 20 (#644). sealer: recovery from the surviving log after a power loss.**
 
@@ -2159,6 +2361,19 @@ because their transport follows that design (decision 14).
 - Acceptance: a `TestCluster` test: two members restart with logs cut back to their durable
   positions; the elected head is at or above the majority durable position that the serving
   service last computed; every member then holds the same stream. `sealer-tail-loss` passes.
+
+**PR 21 (#662, PR #666). sealer: activate decision version 3 by an upgrade transaction.**
+
+- Scope: section 5.4. The sealer starts on version 2 and switches to version 3 at one log entry,
+  through the feature activation record (ingress kind 11) that the sequencer sends in front of
+  the epoch of the upgrade transaction. Snapshot v10 before the activation record, v13 after it.
+  The sequencer sends a nonce release only after kind 17 of version 3. The `[one_way]` and
+  `[coordinated]` waivers of #634 go.
+- Depends on: #634 merged. Before PR 13.
+- Acceptance: a golden stream with the activation in the middle gives the version 2 outcomes
+  before it and the version 3 outcomes after it; a replay from a snapshot before the activation,
+  with a pending activation, and after the switch gives the same outcomes; the e2e case sends the
+  upgrade transaction and sees a nonce release take effect only after it.
 
 Rules to check in each pull request: R1 (comments carry no phase or spec names), R5 (the feeder, the
 ring and the walk thread each have one owner, and the feed ring has one writer at a time), R6 (the
@@ -2182,14 +2397,14 @@ body).
 | `leader-kill` (new) | Kill the leader under `on-quorum` load with 8 KB transactions. | The sequencers re-offer from their unconfirmed ledgers. Every acknowledged transaction has a receipt. No transaction is ordered twice. |
 | `sequencer-byte-cap` (new, small `--parked-bytes`) | Flood lane 0 with large future-nonce transactions from new keys. | The parked bound of lane 0 holds and evicts. No flood transaction enters the Raft log. The commit latency of lane 1 does not rise. |
 | `sequencer-twin-kill` (new) | Kill one twin of lane 0 under load with 8 KB transactions. | No gap and no loss. Every acknowledged transaction has a receipt. |
-| `cutover-rehearsal` (new, container cluster only) | Run the drained cut-over of section 12.3 under load, from the release before PR 13. | The posted head reaches `D`; every consumer cursor equals the canonical count; the new members restore the v10 snapshot; the chain continues; root parity holds. The serving service imports the receipts at or below `D` before its first stored head, and the ingress answers a receipt of a block before the cut after the executors prune. |
+| `cutover-rehearsal` (new, container cluster only) | Under load, from the release before PR 13: deploy PR 13 as a rolling release with the carry flag off, check, send the upgrade transaction of the carry flag, check (section 12.2). | Before the activation, the old path runs, and the chain does not pause during the deploy. At the activation, every member switches at the same log entry, and the executors switch at the same block. After it, each paired executor reads its feed, and the chain continues with no pause; root parity holds. The serving service imports the receipts at or below `D` before its first stored head, and the ingress answers a receipt of a block before the switch after the executors prune. |
 | `feed-driver-restart` (new) | Restart the aeron system job on executor node 1 under load. | Member 1's commit latency does not rise. The feeder reconnects. Executor 1 returns to its feed with no gap. |
 | `sealer-disk-full` (new, container cluster only) | Fill the disk of member 2 while the serving service is stopped. | `KardamomSealerDiskLow` fires before the disk is full. Member 2 stops with a fatal error. Quorum holds on members 0 and 1. After the operator frees space, member 2 restarts and catches up. |
 | `feed-log-walk` (new) | Stop executor 2 for longer than the ring holds and less than the feed floor, then for longer than the feed floor. | First: executor 2 catches up through a walk of its member's log, with `input_source="feed"`, and the walk frames equal the live frames. Second: the feed answers `REPLAY_UNAVAILABLE`, and executor 2 catches up from the serving service. |
 | `egress-member-fallback` (new) | Stop the follower member that the serving service tails, then a second member. | The writer falls back to another member, the leader last. With two answers it exposes up to the lower durable position; with one, it holds the exposure. The exposed position never moves down. |
 | `serving-service-outage` (new) | Stop the serving service under load for 15 minutes, then start it. | The chain goes on. `KardamomExecutorOutputUnstored` fires. The stored head stops, and the members keep their log above it. After the start the writer reads the missed frames from a sealer member and their receipts from an executor, the stored head reaches the majority durable position, and the members and the executors prune. Every receipt is in at least one tier during the run. |
 | `receipt-tier-fallback` (new) | Ask the ingress for a receipt below the stored head, after a restart of the ingress. | The receipt comes from the serving service, with the same bytes as the executor gave before its prune. |
-| `sealer-tail-loss` (new) | Put the cluster directories of two members on a device that drops unsynced writes (`dm-flakey` with `drop_writes`), and stop both under load with sync level 0 and the 1 s scheduled sync. | The members restart with logs cut back to their durable positions. The cluster continues from the surviving log, with a loss of at most about 1 s. No block that the serving service exposed changes. The paired executors roll back by themselves and match the validator's root. No `ClusterBehindCursor` stop. |
+| `sealer-tail-loss` (new) | After the activation of the carry flag, put the cluster directories of two members on a device that drops unsynced writes (`dm-flakey` with `drop_writes`), and stop both under load with sync level 0 and the 1 s scheduled sync. | The members restart with logs cut back to their durable positions. The cluster continues from the surviving log, with a loss of at most about 1 s. No block that the serving service exposed changes. The paired executors roll back by themselves, publish one `receipt-rollback` frame for each divergence, and match the validator's root. No `ClusterBehindCursor` stop. |
 | Planned and dropped | `exec-peer-fetch`, `record-lag-halt`, `validator-exec-archive-catchup`, `exec-archive-prune` of the archived-data spec | Not built. |
 
 ## 14. Docs that change with the code
@@ -2202,9 +2417,12 @@ body).
   fallback to the serving service), the batcher resume sources, the recovery after a power loss
   on a majority (section 11.1), which replaces the refusal of a cursor ahead of the head
   (`docs/failure-modes.md:854-866`).
-- `cluster/sealer-service/README.md`: kinds (kind 11), record types, settings, snapshot v12 with
-  no retention section, the feed and its walk of the log, the purge floor, the decision version
-  table (version 3). The "Retained file" section goes (PR 15).
+- `cluster/sealer-service/README.md`: kinds (kind 11 by #666, kind 12), record types, settings,
+  snapshot v12 with no retention section, the feed and its walk of the log, the purge floor, the
+  decision version (version 3 by an upgrade transaction, #666). The "Retained file" section goes
+  (PR 15).
+- `docs/runbooks/`: the upgrade step of section 12.2 for the carry flag. `deploy-rollback.md`
+  states the rollback rule of section 12.5.
 - `docs/aeron-discovery.md`: the `sealer_feed` topic and streams; `exec_txs` and the `tx_data`
   archive topics go.
 - `docs/observability.md`: the new metrics of sections 5.5, 6.2, 6.6, 7.5 and 10.6.
@@ -2215,6 +2433,15 @@ body).
 - `docs/json-rpc.md`: the error for a transaction above the size cap (section 6.6).
 
 ## 15. Considered and not chosen
+
+- **A chain reset for staging and a drained cut-over for production (decision 3).** The first
+  versions of this spec reset the staging chain and drained production through a coordinated
+  restart: a pause of the submits, a batcher flush, a v10 snapshot, a purge of the sealer job and
+  a start of the new release. The owner replaced both on 2026-10-18 (decision 20): a deploy is
+  always backwards compatible, and an upgrade transaction turns the carry flag on (section 12.2).
+- **A coordinated restart for decision version 3.** #634 shipped version 3 with a quiesce check
+  and a purge of the cluster job. The owner's rule forbids it (decision 19). An upgrade
+  transaction switches the version at one log entry (section 5.4, #666).
 
 - **Option A: references, with an ingress envelope session.** This was the first choice. The
   ingress offers each envelope into the cluster through its own session (ingress kind 10). The
@@ -2298,8 +2525,9 @@ body).
 
 ## 16. Decisions of the user
 
-Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 18 are of 2026-10-17. Decision 16 replaces parts
-of decisions 10, 11 and 15; each replaced part says so.
+Decisions 1 to 9 are of 2026-10-11. Decisions 10 to 18 are of 2026-10-17. Decisions 19 and 20 are of
+2026-10-18. Decision 16 replaces parts of decisions 10, 11 and 15, and decision 20 replaces
+decision 3; each replaced part says so.
 
 
 1. **Target rate and size.** Up to 5,000 tx/s with mixed sizes. Section 10.0 states it as the
@@ -2309,8 +2537,10 @@ of decisions 10, 11 and 15; each replaced part says so.
 2. **Placement and the feed.** Sealer member `i` and executor `i` run on one host and share one
    media driver; the feed is IPC (section 7.6). Decision 7 removes the UDP feed and the egress
    fallback. An executor without a local member reads the serving service.
-3. **Staging migration.** A chain reset (section 12.2). Production uses the drained cut-over
-   (section 12.3), and the backups and the rollback of section 12.5 apply to production.
+3. **Staging migration.** A chain reset (the former section 12.2). Production uses the drained
+   cut-over (the former section 12.3), and the backups and the rollback of the former section 12.5
+   apply to production.
+   (Replaced by decision 20: both networks take a rolling deploy and an upgrade transaction.)
 4. **Starting limits.** Accepted: a 2 GiB sealer heap and `readyLagBytes` at 64 MiB. The
    benchmark tunes them. Decision 5 removes the byte DA-lag budget. Decision 9 removes the limits
    of the envelope store and the waiting references (64 MiB for each lane, 16,384), because
@@ -2440,6 +2670,37 @@ of decisions 10, 11 and 15; each replaced part says so.
       report itself, beside sync level 0. #645 does not merge before the executor rollback
       (#643). So sync level 0 never runs without the scheduled sync or the rollback (section
       12.4).
+    - (Amended on 2026-10-18 from #655.) The rollback runs only on the carried path. So #645 must
+      also not reach a cluster before the activation of the carry flag on that cluster (section
+      12.4).
+
+19. **The upgrade rule (the owner, 2026-10-18, #661).**
+    - A deploy is always backwards compatible.
+    - A breaking change ships behind a chain feature flag that is off. After the release runs
+      everywhere, an L1 upgrade transaction turns the flag on: `ETHLockbox.initiateUpgrade`, then
+      `UpgradeInitiated`, then a system deposit, then the flag in `KardamomChainState`, with an
+      optional activation time.
+    - After the activation on every network, a later release removes the old logic.
+    - No coordinated restart, quiesce check, cluster purge, `KARDAMOM_ALLOW_ONE_WAY` or
+      `[coordinated]` waiver is a deploy path. #664 removes `formats.toml` and the format gate.
+      The compatibility fixtures and the mixed-version shard of #663, and a gate check of the
+      active flags of the chain, replace them.
+    - Decision version 3 activates by an upgrade transaction (#662, PR #666, section 5.4). The
+      feature activation is ingress kind 11, so the stored cursor is ingress kind 12.
+20. **The cut-over by an upgrade transaction (2026-10-18, on #598).** This replaces the chain reset
+    of decision 3 and the drained cut-over.
+    - PR 13 ships the carried path with the carry flag off, as a rolling, backwards compatible
+      release.
+    - An upgrade transaction turns on one chain flag. Every component switches at the same point:
+      the sealer at the first log entry after the activation in its Raft log, and the executors at
+      the same block.
+    - `kardamom.cluster.carryBytes` and `--carry-bytes` become this chain flag. They are no longer
+      operator settings.
+    - The release does not wipe the chain. The old path stays until the activation on every
+      network. A later release removes the void, the join and the archives (PR 14, #599).
+    - The staging step: deploy, check, send the upgrade transaction, check again. The chaos case
+      `cutover-rehearsal` does the same (section 12.2).
+    - The receipt import of decision 14 stays, on both networks (section 12.3).
 
 ### 16.1 Still open
 
@@ -2481,7 +2742,24 @@ Questions 7 to 10 are answered (decision 14).
       needs the sealer code in the serving service;
     - (c) the walk of section 7.3 on the follower, published to the serving service.
     - The durable position does not ride on this channel: the writer polls the admin endpoints
-      (decision 17). Proposal: (a).
+      (decision 17). Proposal: (a). Still open: the user has not chosen.
+18. **The switch of each component at the activation of the carry flag (section 12.2, #598).**
+    Decision 20 sets the switch point. These details are still open:
+    - the feature id and the name of the carry flag;
+    - how the switch entry of the sealer maps to the switch block of the executors. An executor
+      reads a flag at the header timestamp of the block that it closes
+      (`crates/exec-core/src/features.rs`), and the sealer switches at a log entry inside a block;
+    - when the sequencers offer full entries, and what the sealer does with a `TxRef` offer after
+      the switch and with a full entry before it;
+    - how a consumer that lags behind the switch reads the `TxRef` frames below it, and when the
+      member drops its retained `TxRef` frames (section 5.5);
+    - whether the activation of the carry flag needs version 3 to be active, or turns both on;
+    - how a sealer that starts from a seed file after the activation learns the flag. For version
+      3, #666 says to send the upgrade transaction again;
+    - whether the validator keeps its attester leaves across the switch. The drained cut-over
+      checked that the attested head was at or above `D`, because the attester keeps its leaves in
+      memory only (`crates/validator/src/attester/state.rs:44-63`);
+    - how #645 waits for the activation (section 12.4, #665).
 
 ### 16.2 Closed in review
 

@@ -17,24 +17,20 @@
 //! Async-capable work, such as the receipts fan-in on an existing tokio
 //! channel, is a plain task. It uses `select!` on `Shutdown::cancelled`.
 
+mod lookup;
 mod origin_pump;
+mod receipts;
 mod steps;
 
-use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Address;
-use kardamom_cache::{
-    CacheReader, ExecutorQuery, ExecutorQueryConfig, LiveAccounts, LiveAccountsWriter, QueryError,
-};
 use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
     TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
-    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
+    TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::process;
@@ -43,19 +39,19 @@ use kardamom_sequencer::epoch::{EpochPump, OriginSignalTx};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::fees::{FeeGate, LatestBaseFee};
 use kardamom_sequencer::inbound::{Inbound, TxDataSubscriber};
-use kardamom_sequencer::lookup::{LookupConfig, LookupRequester};
+use kardamom_sequencer::lookup::LookupRequester;
 use kardamom_sequencer::metrics as seq_metrics;
 use kardamom_sequencer::outbound::{SideChannels, TxOrderingRefPublisher};
 use kardamom_sequencer::pump::Pump;
 use kardamom_sequencer::resync::{
-    FloorUpdate, ResyncController, SealerAnswer, SealerRefusal, SharedWatermark,
-    elapsed_ms_saturating,
+    ResyncController, SealerAnswer, SealerRefusal, SharedWatermark, elapsed_ms_saturating,
 };
+use kardamom_sequencer::sealer_rules::SealerRules;
 use kardamom_sequencer::sequencer::{Ports, Sequencer, Shutdown};
 use kardamom_types::cluster_status::SilenceDeadline;
-use kardamom_types::shard_map::{VslotSet, vslot_for};
-use kardamom_types::{AccountRow, ReceiptBatch};
+pub(crate) use lookup::NonceLookupFeed;
 use origin_pump::OriginPump;
+pub(crate) use receipts::ReceiptFloorFeed;
 
 /// One `tx_data` lane subscription: the lane index the sequencer stamps
 /// into every ref off it, and the handle that reads it.
@@ -145,6 +141,8 @@ pub(crate) struct EgressWatermarkFeed {
     /// snapshot budget: the leader sends no boundary until the snapshot
     /// is complete, so that gap is neither a lag nor a lost quorum.
     silence: SilenceDeadline,
+    /// The sealer's decision version for the current session.
+    rules: SealerRules,
 }
 
 impl EgressWatermarkFeed {
@@ -156,7 +154,9 @@ impl EgressWatermarkFeed {
         deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
         origins: OriginSignalTx,
     ) -> Self {
+        let rules = SealerRules::new(partition, watermark.clone(), Instant::now());
         Self {
+            rules,
             silence_ms,
             partition,
             watermark,
@@ -197,6 +197,7 @@ impl EgressWatermarkFeed {
     /// clock. Either way, the response is the same.
     fn on_idle(&mut self) {
         let now = Instant::now();
+        self.rules.check(now);
         if self.silence.in_snapshot(now) {
             return;
         }
@@ -214,6 +215,10 @@ impl EgressWatermarkFeed {
     }
 
     fn on_frame(&mut self, frame: &[u8]) {
+        self.rules.check(Instant::now());
+        if self.on_rules_frame(frame) {
+            return;
+        }
         if self.on_reject_frame(frame) {
             return;
         }
@@ -242,6 +247,34 @@ impl EgressWatermarkFeed {
             return;
         }
         self.on_boundary_frame(frame);
+    }
+
+    /// Handle the sealer's rules and the start of a session. Returns `true`
+    /// when `frame` was either. The publish loop sends a nonce release only
+    /// while the sealer of the current session reported decision version 3
+    /// or above: a sealer of an older version drops the frame, and its log
+    /// would replay the frame under the new rules after a restart.
+    fn on_rules_frame(&mut self, frame: &[u8]) -> bool {
+        if !matches!(
+            frame.first(),
+            Some(&(wire::EGRESS_KIND_SESSION_START | wire::EGRESS_KIND_SEALER_INFO))
+        ) {
+            return false;
+        }
+        let now = Instant::now();
+        match EgressItem::decode(frame) {
+            Ok(EgressItem::SessionStart { session_id }) => {
+                self.rules.on_session_start(session_id, now);
+            }
+            Ok(EgressItem::SealerInfo {
+                decision_version,
+                session_id,
+            }) => {
+                self.rules.on_sealer_info(session_id, decision_version, now);
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Handle one contiguity-reject frame. Returns `true` when `frame`
@@ -474,330 +507,6 @@ impl EgressWatermarkFeed {
             self.last_boundary_at = Some(now);
         }
     }
-}
-
-/// The `tx_receipts`-to-per-sender executed-truth floor feed. Only the
-/// senders of this replica's vslots reach the floor channel. The set is
-/// the replica's whole set, shadow slots included: floors must advance
-/// for the incoming senders during the warm-up too. The batch frame's
-/// account rows of the same vslots go into the local account layer,
-/// before the receipts forward.
-///
-/// The receipts handle already fans in over a tokio unbounded channel. The
-/// Aeron poll thread is the producer. So this is a plain async task. It
-/// awaits `recv_batch()` and `Shutdown::cancelled`, with no idle-sleep
-/// polling. `floor_tx` stays a std channel, because its consumer is the
-/// sync `ResyncController` in the publish loop.
-pub(crate) struct ReceiptFloorFeed {
-    vslots: VslotSet,
-    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    /// The local account layer's one writer.
-    writer: LiveAccountsWriter,
-}
-
-impl ReceiptFloorFeed {
-    pub(crate) fn new(
-        vslots: VslotSet,
-        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-        writer: LiveAccountsWriter,
-    ) -> Self {
-        Self {
-            vslots,
-            floor_tx,
-            writer,
-        }
-    }
-
-    /// Spawn as a plain async task. The handle reduces to its receiver
-    /// (`into_receiver`), so the task holds no `AeronRuntime` clone.
-    /// `floor_tx` is bounded by `resync::ResyncChannel::open` to the
-    /// cluster's dedup capacity, the resync window this feed exists to
-    /// cover.
-    pub(crate) fn spawn(
-        self,
-        sub: TxReceiptsSubscriberHandle,
-        shutdown: Shutdown,
-    ) -> tokio::task::JoinHandle<()> {
-        let rx = sub.into_receiver();
-        tokio::spawn(self.run(rx, shutdown))
-    }
-
-    async fn run(
-        mut self,
-        mut rx: kardamom_log::aeron_live::TxReceiptsReceiver,
-        shutdown: Shutdown,
-    ) {
-        loop {
-            match self.tick(&mut rx, &shutdown).await {
-                ControlFlow::Break(()) => return,
-                ControlFlow::Continue(()) => (),
-            }
-        }
-    }
-
-    /// One [`Self::run`] pass: wait for the next batch or shutdown,
-    /// then apply its rows and forward its receipts. `Break` means the
-    /// task should stop: shutdown, the subscription closed, or the
-    /// publish loop is gone.
-    async fn tick(
-        &mut self,
-        rx: &mut kardamom_log::aeron_live::TxReceiptsReceiver,
-        shutdown: &Shutdown,
-    ) -> ControlFlow<()> {
-        let batch = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return ControlFlow::Break(()),
-            msg = rx.recv_batch() => match msg {
-                Some((_, batch)) => batch,
-                // The subscription closed. The runtime shut down.
-                // Nothing more to feed.
-                None => return ControlFlow::Break(()),
-            },
-        };
-        self.forward_batch(batch)
-    }
-
-    /// The rows of this replica's vslots into the local layer at the
-    /// batch's end position, then every receipt through the floor
-    /// filter. The rows go first, so a lookup request the receipt's
-    /// park raises finds the entry.
-    fn forward_batch(&mut self, batch: ReceiptBatch) -> ControlFlow<()> {
-        if let Some(end) = batch.end_tx_idx() {
-            let rows: Vec<AccountRow> = batch
-                .accounts
-                .into_iter()
-                .filter(|row| self.vslots.contains(vslot_for(row.address)))
-                .collect();
-            self.writer.apply(end, &rows);
-        }
-        for receipt in &batch.receipts {
-            self.forward_one_receipt(receipt)?;
-        }
-        ControlFlow::Continue(())
-    }
-
-    /// Filter, build, and forward one receipt, for [`Self::tick`].
-    /// `Break` means the publish loop is gone and the task should stop.
-    fn forward_one_receipt(&self, receipt: &kardamom_types::Receipt) -> ControlFlow<()> {
-        // Forward every receipt of this replica's vslots, nonce 0
-        // included. A deposit receipt carries `Receipt::tx_type ==
-        // TX_TYPE_DEPOSIT`, so the controller tells it apart from a
-        // genuine nonce-0 transaction receipt. It excludes deposits and
-        // skip receipts from floor evidence (they consume no L2 nonce),
-        // and counts skip receipts as publish confirmations (ordering is
-        // the claim). See `ResyncController::drain_floor_updates`.
-        //
-        // Only this replica's senders can appear in its publish stream,
-        // so the floor map stays bounded to them.
-        if !self.vslots.contains(vslot_for(receipt.from)) {
-            return ControlFlow::Continue(());
-        }
-        match self.floor_tx.try_send(FloorUpdate::of_receipt(receipt)) {
-            Ok(()) => ControlFlow::Continue(()),
-            // The publish loop is stalled past the resync window already.
-            // Dropping is safe: an unproven skip just falls through to
-            // publish, the side every degraded mode already degrades
-            // toward (see the module doc on `crate::resync`).
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                tracing::warn!("receipt-floor channel full; dropping");
-                ControlFlow::Continue(())
-            }
-            // The publish loop is gone. Exit.
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => ControlFlow::Break(()),
-        }
-    }
-}
-
-/// One lookup result, from a query task back to the drain.
-struct LookupDone {
-    sender: Address,
-    result: Result<u64, QueryError>,
-}
-
-/// The nonce lookup task. It drains the core's requests, answers a
-/// resident sender from the local account layer, dedups the senders in
-/// flight, bounds the concurrency and the per-sender retry rate, asks
-/// Redis when `[cache]` is on, then the executors, and delivers each
-/// answer as a `FloorUpdate`. See `kardamom_sequencer::lookup`.
-///
-/// One query runs on its own task, so a slow executor never blocks the
-/// drain. The endpoints rotate per query, and a query walks the list until
-/// one endpoint answers within the timeout. A Redis nonce needs no
-/// freshness gate: like the executor's answer, it is a lower bound.
-pub(crate) struct NonceLookupFeed {
-    cfg: LookupConfig,
-    partition: u32,
-    /// The core's lookup requests.
-    rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-    shutdown: Shutdown,
-    floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-    /// The local account layer. A resident sender is answered from it.
-    live: Arc<LiveAccounts>,
-    /// The Redis layer. `None` with `[cache]` off.
-    redis: Option<Arc<CacheReader>>,
-    query: ExecutorQuery,
-    done_tx: tokio::sync::mpsc::UnboundedSender<LookupDone>,
-    done_rx: tokio::sync::mpsc::UnboundedReceiver<LookupDone>,
-    in_flight: HashSet<Address>,
-    /// The last request time per sender. It bounds the retry rate to one
-    /// lookup per timeout per sender.
-    recent: HashMap<Address, Instant>,
-}
-
-impl NonceLookupFeed {
-    /// The `recent` map is pruned once it holds this many senders.
-    const RECENT_CAP: usize = 4096;
-
-    /// Build the feed over the core's request channel. `None` when the
-    /// config names no executor endpoint.
-    pub(crate) fn new(
-        cfg: LookupConfig,
-        partition: u32,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Address>,
-        shutdown: Shutdown,
-        floor_tx: crossbeam_channel::Sender<FloorUpdate>,
-        live: Arc<LiveAccounts>,
-        redis: Option<Arc<CacheReader>>,
-    ) -> Option<Self> {
-        let query = ExecutorQuery::new(&ExecutorQueryConfig {
-            endpoints: cfg.executor_endpoints.clone(),
-            timeout_ms: cfg.timeout_ms,
-            max_in_flight: cfg.max_in_flight,
-        })?;
-        let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
-        Some(Self {
-            cfg,
-            partition,
-            rx,
-            shutdown,
-            floor_tx,
-            live,
-            redis,
-            query,
-            done_tx,
-            done_rx,
-            in_flight: HashSet::new(),
-            recent: HashMap::new(),
-        })
-    }
-
-    /// Spawn the drain as a plain async task over the core's requests.
-    pub(crate) fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run())
-    }
-
-    async fn run(mut self) {
-        while self.tick().await.is_continue() {}
-    }
-
-    /// One [`Self::run`] pass: wait for a finished query, a new request,
-    /// or shutdown. `Break` means the task should stop: shutdown, a
-    /// closed channel, or the publish loop is gone.
-    async fn tick(&mut self) -> ControlFlow<()> {
-        tokio::select! {
-            biased;
-            () = self.shutdown.cancelled() => ControlFlow::Break(()),
-            done = self.done_rx.recv() => match done {
-                Some(done) => self.on_done(done),
-                None => ControlFlow::Break(()),
-            },
-            req = self.rx.recv() => match req {
-                Some(sender) => self.on_lookup_request(sender),
-                None => ControlFlow::Break(()),
-            },
-        }
-    }
-
-    /// One finished query: count it, and forward an answer above nonce 0
-    /// as floor evidence. `Break` means the publish loop is gone.
-    fn on_done(&mut self, done: LookupDone) -> ControlFlow<()> {
-        self.in_flight.remove(&done.sender);
-        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
-        let nonce = match done.result {
-            Ok(nonce) => nonce,
-            Err(e) => return self.record_lookup_error(done.sender, &e),
-        };
-        seq_metrics::record_nonce_lookup(self.partition, "ok");
-        tracing::debug!(sender = ?done.sender, nonce, "nonce lookup answered");
-        self.floor_from_committed(done.sender, nonce)
-    }
-
-    /// A committed nonce `c` proves every nonce below it executed, so it
-    /// is floor evidence of the same kind as a receipt. Nonce 0 proves
-    /// nothing. `Break` means the publish loop is gone.
-    fn floor_from_committed(&self, sender: Address, nonce: u64) -> ControlFlow<()> {
-        let Some(executed_nonce) = nonce.checked_sub(1) else {
-            return ControlFlow::Continue(());
-        };
-        match self
-            .floor_tx
-            .send(FloorUpdate::executed(sender, executed_nonce))
-        {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
-    }
-
-    /// One request from the core: answer it from the local layer when
-    /// the sender is resident, else drop it if the sender is in flight
-    /// or asked within the last timeout, shed it at the concurrency
-    /// bound, else start a query task.
-    fn on_request(&mut self, sender: Address) {
-        if let Some(view) = self.live.get(sender) {
-            seq_metrics::record_nonce_lookup(self.partition, "local");
-            // A gone publish loop ends the drain on its next tick.
-            let _ = self.floor_from_committed(sender, view.nonce);
-            return;
-        }
-        let now = Instant::now();
-        let timeout = self.cfg.timeout();
-        let asked_recently = self
-            .recent
-            .get(&sender)
-            .is_some_and(|t| now.duration_since(*t) < timeout);
-        if self.in_flight.contains(&sender) || asked_recently {
-            return;
-        }
-        if self.in_flight.len() >= self.cfg.max_in_flight.get() {
-            seq_metrics::record_nonce_lookup(self.partition, "shed");
-            return;
-        }
-        if self.recent.len() >= Self::RECENT_CAP {
-            self.recent.retain(|_, t| now.duration_since(*t) < timeout);
-        }
-        self.recent.insert(sender, now);
-        self.in_flight.insert(sender);
-        seq_metrics::record_nonce_lookups_in_flight(self.partition, self.in_flight.len());
-        self.spawn_query(sender);
-    }
-
-    /// Start one query task for `sender`: Redis first when it is on, then
-    /// the executors.
-    fn spawn_query(&self, sender: Address) {
-        let query = self.query.clone();
-        let redis = self.redis.clone();
-        let done_tx = self.done_tx.clone();
-        let partition = self.partition;
-        tokio::spawn(async move {
-            let result = match redis_nonce(redis.as_deref(), sender).await {
-                Some(nonce) => {
-                    seq_metrics::record_nonce_lookup(partition, "redis");
-                    Ok(nonce)
-                }
-                None => query.nonce(sender).await.and_then(|answer| {
-                    u64::try_from(answer.value)
-                        .map_err(|e| QueryError::new(format!("nonce out of range: {e}"), false))
-                }),
-            };
-            let _ = done_tx.send(LookupDone { sender, result });
-        });
-    }
-}
-
-/// The sender's nonce from the Redis projection. `None` with the layer
-/// off, on a miss, and on every degraded read, which the reader counts.
-async fn redis_nonce(redis: Option<&CacheReader>, sender: Address) -> Option<u64> {
-    redis?.account(sender).await.map(|view| view.nonce)
 }
 
 /// The executor-boundary feed into the base fee view: every closed

@@ -1,7 +1,10 @@
 //! The executed-truth observations the receipts stream gives the
-//! sequencer, and what each one proves about the nonce of its sender.
+//! sequencer, what each one proves about the nonce of its sender, and the
+//! rollback that voids the observations above a block.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
+use kardamom_cluster_adapter::wire::NonceRelease;
+use kardamom_types::ReceiptRollback;
 
 /// One executed-truth observation. Two sources produce it:
 ///
@@ -17,6 +20,46 @@ use alloy_primitives::Address;
 pub struct FloorUpdate {
     pub sender: Address,
     pub outcome: Outcome,
+    pub evidence: Evidence,
+}
+
+/// Where the evidence of a [`FloorUpdate`] comes from. A rollback voids it
+/// by its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A receipt of `block`. A rollback below `block` voids it.
+    Receipt { block: u64 },
+    /// A lookup answer, asked while the controller had seen `generation`
+    /// rollbacks. The committed state of a source has no single block of
+    /// evidence, and a source can answer from a state that a rollback
+    /// voids. So every later rollback voids the answer, and an answer to a
+    /// request from before the latest rollback counts for nothing.
+    Lookup { generation: u64 },
+}
+
+impl Evidence {
+    /// Whether a rollback voids this evidence when the controller has
+    /// seen `generation` rollbacks: a lookup answer to a request from
+    /// before the latest of them.
+    pub(crate) fn stale_at(self, generation: u64) -> bool {
+        matches!(self, Self::Lookup { generation: asked } if asked < generation)
+    }
+}
+
+/// One item of the floor channel, in the order of the receipt stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorEvent {
+    /// One executed-truth observation.
+    Update(FloorUpdate),
+    /// An executor rolled its state back: the receipts above `to_block`
+    /// are void, and so is each floor that one of them set.
+    Rollback(ReceiptRollback),
+}
+
+impl From<FloorUpdate> for FloorEvent {
+    fn from(update: FloorUpdate) -> Self {
+        Self::Update(update)
+    }
 }
 
 /// What one [`FloorUpdate`] proves about its sender.
@@ -28,9 +71,12 @@ pub enum Outcome {
     /// A marker receipt: the tx at `nonce` was ordered, but it consumed no
     /// nonce. Ordering in the canonical log confirms the publish. The
     /// floor does not rise. The floor logic does not read `reason`.
+    /// `tx_hash` names the skipped entry in the nonce release to the
+    /// sealer.
     Skipped {
         nonce: u64,
         reason: kardamom_types::SkipReason,
+        tx_hash: B256,
     },
     /// An L1-originated deposit. It has no L2 nonce, so it is neither a
     /// publish confirmation nor floor evidence. `Receipt::tx_type` marks
@@ -101,6 +147,7 @@ impl FloorUpdate {
             (false, Some(reason)) => Outcome::Skipped {
                 nonce: receipt.nonce,
                 reason,
+                tx_hash: receipt.tx_hash,
             },
             (false, None) => Outcome::Executed {
                 nonce: receipt.nonce,
@@ -109,6 +156,9 @@ impl FloorUpdate {
         Self {
             sender: receipt.from,
             outcome,
+            evidence: Evidence::Receipt {
+                block: receipt.block_number,
+            },
         }
     }
 
@@ -118,16 +168,75 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Executed { nonce },
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 
-    /// A skipped tx of `sender` at `nonce`.
+    /// The skipped tx `tx_hash` of `sender` at `nonce`.
     #[must_use]
-    pub fn skip(sender: Address, nonce: u64, reason: kardamom_types::SkipReason) -> Self {
+    pub fn skip(
+        sender: Address,
+        nonce: u64,
+        reason: kardamom_types::SkipReason,
+        tx_hash: B256,
+    ) -> Self {
         Self {
             sender,
-            outcome: Outcome::Skipped { nonce, reason },
+            outcome: Outcome::Skipped {
+                nonce,
+                reason,
+                tx_hash,
+            },
+            evidence: Evidence::Lookup { generation: 0 },
         }
+    }
+
+    /// The same update, with the evidence `evidence`.
+    #[must_use]
+    pub fn with_evidence(self, evidence: Evidence) -> Self {
+        Self { evidence, ..self }
+    }
+
+    /// The nonce release for the sealer's guard that this update proves,
+    /// for a sender whose receipt floor is `floor` (`None` when no receipt
+    /// gave a floor yet). The release names the skipped nonce, and the
+    /// sealer lowers its guard to it, so the skip must prove that the chain
+    /// was at that nonce:
+    ///
+    /// - The executor (revm) checks the code of the sender, then the nonce,
+    ///   then the balance. So an insufficient-funds skip proves that the
+    ///   nonce matched the chain, with or without a floor. A late one
+    ///   below a known floor proves nothing new.
+    /// - A gas, fee, init-code, header or undecodable skip comes from a
+    ///   check before the nonce check, and so does a sender-has-code skip.
+    ///   It proves nothing about the nonce. It releases only at the known
+    ///   floor: the floor proves that the chain reached the nonce, and the
+    ///   skip used none. Above the floor, the entry can be a later entry of
+    ///   a run whose first skip already releases, and a late release of it
+    ///   would set the guard below the chain.
+    /// - A nonce skip never releases. A nonce-too-high skip follows a skip
+    ///   at the chain nonce, whose release already reopens the run.
+    #[must_use]
+    pub(crate) fn sealer_release(self, floor: Option<u64>) -> Option<NonceRelease> {
+        use kardamom_types::SkipReason;
+        let Outcome::Skipped {
+            nonce,
+            reason,
+            tx_hash,
+        } = self.outcome
+        else {
+            return None;
+        };
+        let proven = match reason {
+            SkipReason::NonceTooLow | SkipReason::NonceTooHigh => false,
+            SkipReason::InsufficientFunds => floor.is_none_or(|f| nonce >= f),
+            _ => floor == Some(nonce),
+        };
+        proven.then_some(NonceRelease {
+            sender: self.sender,
+            nonce,
+            tx_hash,
+        })
     }
 
     /// A deposit to `sender`.
@@ -136,6 +245,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Deposit,
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 }

@@ -146,7 +146,8 @@ class NomadAPI(BaseHTTPRequestHandler):
         # of a job.
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         path = self.path.split('?')[0].removeprefix('/v1/var/')
-        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/')) and body['Path'] == path, (self.path, body)
+        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
+            and body['Path'] == path, (self.path, body)
         if path.startswith('kardamom/deploys/'):
             # The deploy record: two JSON documents in one variable, written
             # with a check-and-set on the modify index. A test clobbers the
@@ -240,7 +241,9 @@ class NomadAPI(BaseHTTPRequestHandler):
             octet = int(self.headers['Host'].split(':')[0].rsplit('.', 1)[1])
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
-            self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED'})
+            self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
+                          'decisionVersion': state.get('decision_version', 3),
+                          'releasesSinceSnapshot': state.get('releases', {}).get(node, 0)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -279,7 +282,8 @@ class NomadAPI(BaseHTTPRequestHandler):
                 # Historical/stopping allocations must not satisfy readiness.
                 stale = state.get('missing_replica') == name and i > 0
                 # A job the test names has no running allocation: a crash loop.
-                running = name not in state.get('not_running', ())
+                running = name not in state.get('not_running', ()) \
+                    and group['Name'] not in state.get('down_groups', ())
                 allocs.append({'TaskGroup': group['Name'], 'JobVersion': self.version(name) - int(stale),
                                'DesiredStatus': 'run', 'ClientStatus': 'running' if running else 'pending',
                                'NodeID': f'node-{group["Name"]}',
@@ -345,12 +349,18 @@ class Deploys(unittest.TestCase):
                           'variables': {}, 'variable_writes': [], 'records': {}, 'record_index': {},
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
-        # The operator binary: the smoke, and the format findings of the
-        # release gate, which a test scripts in `smoke.sh.findings`.
+        # One stub for each operator binary. The cluster binary smokes a
+        # canary and fails a `formats` call. The deploy binary prints the
+        # format findings of the release gate, which a test scripts in
+        # `deploy.sh.findings`. Each stub logs its calls in `<stub>.calls`.
         self.smoke = Path(self.tmp.name) / 'smoke.sh'
         self.smoke.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
-                              'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+                              'if [ "$1" = formats ]; then exit 1; fi\n')
         self.smoke.chmod(0o755)
+        self.deploy_bin = Path(self.tmp.name) / 'deploy.sh'
+        self.deploy_bin.write_text('#!/bin/sh\necho "$@" >> "$0.calls"\n'
+                                   'if [ "$1" = formats ]; then cat "$0.findings" 2>/dev/null || echo "[]"; fi\n')
+        self.deploy_bin.chmod(0o755)
         self.thread = threading.Thread(target=self.api.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.api.server_close)
@@ -370,6 +380,7 @@ class Deploys(unittest.TestCase):
             'workloads_deployment_retries': 3,
             'workloads_record_dir': str(self.record_dir),
             'workloads_cluster_binary': str(self.smoke),
+            'workloads_deploy_binary': str(self.deploy_bin),
             'workloads_sealer_admin_port': self.api.server_port,
             'workloads_cluster_bootstrap': False,
             'workloads_ingress_rpc_port': self.api.server_port,
@@ -411,7 +422,7 @@ class Deploys(unittest.TestCase):
         self.run_deploy()
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
-        Path(str(self.smoke) + '.findings').write_text(json.dumps(findings))
+        Path(str(self.deploy_bin) + '.findings').write_text(json.dumps(findings))
         self.repin('b')
 
 
@@ -1066,7 +1077,7 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('does not hold the image of executor', output)
         self.assertEqual(self.api.state['writes'], [])
-        self.assertFalse(Path(str(self.smoke) + '.calls').exists(), 'the gate reads the registry before the formats')
+        self.assertFalse(Path(str(self.deploy_bin) + '.calls').exists(), 'the gate reads the registry before the formats')
         # Only the local profile skips the check.
         output = self.run_deploy({'workloads_registry_url': 'off', 'deployment_profile': 'production'}, success=False)
         self.assertIn('the production profile does not allow that', output)
@@ -1089,9 +1100,41 @@ class RecordTest(Deploys):
         output = self.run_deploy(success=False)
         self.assertIn('coordinated format change: sealer-snapshot', output)
         self.assertEqual(self.api.state['writes'], [])
-        # The comparison ran the library against the accepted registry and this tree.
-        calls = Path(str(self.smoke) + '.calls').read_text().splitlines()
+        # The deploy binary ran the comparison against the accepted registry
+        # and this tree. The cluster binary did not run.
+        calls = Path(str(self.deploy_bin) + '.calls').read_text().splitlines()
         self.assertEqual(calls, [f'formats --base {self.record_dir}/accepted.formats.toml --root {ANSIBLE.parent}/../..'])
+        self.assertFalse(Path(str(self.smoke) + '.calls').exists())
+
+    def test_a_retired_format_needs_the_allowance(self):
+        self.gate_formats([{'rule': 'retired', 'id': 'notifier-outbox', 'head': 1, 'base': 1,
+                            'shared': False, 'permanent': False}])
+        output = self.run_deploy(success=False)
+        self.assertIn('coordinated format change: notifier-outbox.', output)
+        self.assertIn('set KARDAMOM_ALLOW_RETIRED=notifier-outbox', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy(success=False, environ={'KARDAMOM_ALLOW_RETIRED': 'notifier-outbox,state-db'})
+        self.assertIn('KARDAMOM_ALLOW_RETIRED names state-db, and the release retires no format', output)
+        self.assertEqual(self.api.state['writes'], [])
+        output = self.run_deploy(environ={'KARDAMOM_ALLOW_RETIRED': 'notifier-outbox'})
+        self.assertIn('KARDAMOM_ALLOW_RETIRED accepts the retirement of notifier-outbox.', output)
+        self.assertEqual(sorted(set(self.api.state['writes'])), sorted(self.REPINNED))
+        self.assertEqual(self.record()['accepted']['floor'], {})
+        self.assertEqual(self.record()['accepted']['retired'], ['notifier-outbox'])
+
+    def test_a_retired_shared_or_permanent_format_refuses_the_rolling_path(self):
+        # Shared, permanent, and a finding without the flags: the allowance
+        # covers none of them.
+        self.gate_formats([{'rule': 'retired', 'id': 'aeron-stream-records', 'head': 1, 'base': 1,
+                            'shared': True, 'permanent': False},
+                           {'rule': 'retired', 'id': 'kar1-batch', 'head': 1, 'base': 1,
+                            'shared': False, 'permanent': True},
+                           {'rule': 'retired', 'id': 'old-spool', 'head': 2, 'base': 2}])
+        output = self.run_deploy(success=False, environ={
+            'KARDAMOM_ALLOW_RETIRED': 'aeron-stream-records,kar1-batch,old-spool'})
+        self.assertIn('coordinated format change: aeron-stream-records, kar1-batch, old-spool.', output)
+        self.assertNotIn('set KARDAMOM_ALLOW_RETIRED', output)
+        self.assertEqual(self.api.state['writes'], [])
 
     def test_a_one_way_format_change_needs_the_allowance(self):
         self.gate_formats([{'rule': 'rollback', 'id': 'state-db', 'head': 4, 'base': 3}])
@@ -1125,10 +1168,81 @@ class RecordTest(Deploys):
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
-            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=2', '')
+            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=3', '')
         output = self.run_deploy(success=False)
         self.assertIn('every member must match: decisionVersion.', output)
         self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_carry_bytes_flip_refuses_the_rolling_path(self):
+        self.run_deploy()
+        self.api.state['writes'] = []
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] += ' -Dkardamom.cluster.carryBytes=true'
+        output = self.run_deploy(success=False)
+        self.assertIn('every member must match: carryBytes.', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def to_version_two(self):
+        """Deploy, then stand for an accepted release of decision version 2."""
+        self.run_deploy()
+        del self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version']
+        self.api.state['decision_version'] = 2
+
+    def coordinated_restart(self, success):
+        """Stop the sealer, and deploy the release of decision version 3."""
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        self.api.state['writes'] = []
+        return self.run_deploy(success=success)
+
+    def test_a_quiesce_check_refuses_a_release_after_a_snapshot(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.api.state['releases'] = {'node-cluster-1': 1}
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('a member applied a nonce release after its last snapshot', output)
+        output = self.coordinated_restart(success=False)
+        self.assertIn('changes the sealer decision version from 2 to 3', output)
+        self.assertEqual(self.api.state['writes'], [])
+
+    def test_a_quiesce_check_refuses_a_running_sequencer_and_a_member_that_is_down(self):
+        self.to_version_two()
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('a sequencer allocation still runs', output)
+        del self.api.state['jobs']['sequencer']
+        self.api.state['down_groups'] = ['cluster-2']
+        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        self.assertIn('the sealer members cluster-2 do not run', output)
+
+    def test_a_stale_quiesce_check_is_refused(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.run_deploy(playbook='quiesce.yml')
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        check['checked_unix'] = str(int(check['checked_unix']) - 601)
+        output = self.coordinated_restart(success=False)
+        self.assertIn('within the last 600 s', output)
+
+    def test_the_age_of_a_quiesce_check_is_capped_at_an_hour(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.run_deploy(playbook='quiesce.yml')
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        check['checked_unix'] = str(int(check['checked_unix']) - 3700)
+        del self.api.state['jobs']['cluster']
+        self.api.state['chain_status'] = NO_QUORUM_CHAIN
+        output = self.run_deploy(success=False, environ={'KARDAMOM_QUIESCE_MAX_AGE_S': '86400'})
+        self.assertIn('within the last 3600 s', output)
+
+    def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
+        self.to_version_two()
+        del self.api.state['jobs']['sequencer']
+        self.run_deploy(playbook='quiesce.yml')
+        check = self.api.state['variables']['kardamom/quiesce/local']
+        self.assertEqual((check['decision_version'], check['sequencers_stopped']), ('2', 'true'))
+        self.coordinated_restart(success=True)
+        self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.run_deploy()
