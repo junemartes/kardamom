@@ -4,7 +4,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, b256};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize, with::Map};
 
@@ -120,6 +120,13 @@ pub struct ReceiptRollback {
     pub id: B256,
 }
 
+/// The `write_set_hash` of a receipt whose transaction wrote no state:
+/// the keccak256 hash of the empty write-set encoding `[0x02, 0, 0, 0]`
+/// (the encoding version, then no account, no slot and no code). The
+/// executor's write-set hash pins this value in a test.
+pub const EMPTY_WRITE_SET_HASH: B256 =
+    b256!("0x2b97a4b75a93aa1ac8581fac0f7d4ab42406569409a737bdf9de584903b372c5");
+
 /// EIP-2718 type byte for a legacy (untyped, RLP-list) transaction.
 pub const TX_TYPE_LEGACY: u8 = 0x00;
 /// EIP-2718 type byte for an L1-originated deposit. This is the OP-stack value.
@@ -214,6 +221,22 @@ impl SkipReason {
             SkipReason::Header => "header",
         }
     }
+
+    /// Whether a skip for this reason can leave the chain nonce of the
+    /// sender at the nonce of the transaction, so that the skip can use
+    /// it. Undecodable bytes carry no nonce. A nonce skip is off the chain
+    /// nonce by its reason. A header skip comes from the block
+    /// environment, not from the transaction.
+    #[must_use]
+    pub fn can_use_nonce(self) -> bool {
+        !matches!(
+            self,
+            SkipReason::Undecodable
+                | SkipReason::NonceTooLow
+                | SkipReason::NonceTooHigh
+                | SkipReason::Header
+        )
+    }
 }
 
 /// Per-transaction execution receipt. Executor replicas publish this on
@@ -228,7 +251,7 @@ impl SkipReason {
 /// This struct does not carry `block_hash` in v0. The slim `BlockBoundary`
 /// has no state commitment, so no meaningful hash exists yet. The ingress
 /// returns `null` for `block_hash` to RPC clients; JSON-RPC allows this.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct Receipt {
     pub tx_idx: BPosition,
@@ -291,6 +314,33 @@ pub struct Receipt {
     pub skip_reason: Option<SkipReason>,
 }
 
+/// A receipt that wrote no state: every field is zero, false or empty,
+/// and `write_set_hash` is [`EMPTY_WRITE_SET_HASH`].
+impl Default for Receipt {
+    fn default() -> Self {
+        Self {
+            tx_idx: BPosition::default(),
+            tx_type: TX_TYPE_LEGACY,
+            tx_hash: B256::ZERO,
+            status: false,
+            gas_used: 0,
+            logs: Vec::new(),
+            write_set_hash: EMPTY_WRITE_SET_HASH,
+            nonce: 0,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+            effective_gas_price: 0,
+            priority_fee_per_gas: 0,
+            priority_fee_paid: 0,
+            block_number: 0,
+            transaction_index: 0,
+            cumulative_gas_used: 0,
+            skip_reason: None,
+        }
+    }
+}
+
 impl Receipt {
     /// Returns true if this receipt marks a canonical transaction that
     /// execution skipped as deterministically invalid, instead of applying
@@ -303,17 +353,34 @@ impl Receipt {
     /// succeeds, reverts, or halts, charges at least the intrinsic gas.
     ///
     /// Invariant: a consumer of the receipts stream must treat a skip as
-    /// "this transaction did not happen". A skip consumes no nonce (the
-    /// sequencer's receipt floors must ignore it), and it writes no state
-    /// (its `write_set_hash` is the empty-set hash).
+    /// "this transaction did not run". A skip charges no fee and runs no
+    /// code. It writes no state (its `write_set_hash` is
+    /// [`EMPTY_WRITE_SET_HASH`]), with two exceptions:
     ///
-    /// One exception: a deposit ([`Receipt::is_deposit`]) that fails
-    /// validation keeps its mint pre-credit. The mint is committed before
-    /// the inner call and is durable no matter the outcome. Such a
-    /// receipt carries the mint in its write set, and nothing else.
+    /// - A deposit ([`Receipt::is_deposit`]) that fails validation keeps
+    ///   its mint pre-credit. The mint is committed before the inner call
+    ///   and is durable no matter the outcome. Such a receipt carries the
+    ///   mint in its write set, and nothing else.
+    /// - A skip that uses its nonce ([`Receipt::burns_nonce`]) carries the
+    ///   new nonce of the sender in its write set, and nothing else.
     #[must_use]
     pub fn is_invalid_skip(&self) -> bool {
         !self.status && self.gas_used == 0
+    }
+
+    /// Returns true if this receipt is a skip of an L2 transaction that
+    /// used its nonce. With `FEATURE_SEALER_V3` active, a skip of a
+    /// transaction at the nonce of its sender sets that nonce one higher,
+    /// and changes nothing else. So the write set of the skip is not
+    /// empty, and its reason is one that can use a nonce
+    /// ([`SkipReason::can_use_nonce`]). A skip that uses no nonce writes
+    /// nothing, also on a chain where the feature is not active.
+    #[must_use]
+    pub fn burns_nonce(&self) -> bool {
+        self.is_invalid_skip()
+            && !self.is_deposit()
+            && self.skip_reason.is_some_and(SkipReason::can_use_nonce)
+            && self.write_set_hash != EMPTY_WRITE_SET_HASH
     }
 
     /// Returns true if this receipt is for an L1-originated deposit. A
@@ -324,12 +391,13 @@ impl Receipt {
     }
 
     /// Returns true if this receipt proves that its sender used its
-    /// nonce on the chain: an executed L2 transaction. A skip uses no
+    /// nonce on the chain: an executed L2 transaction, or a skip that
+    /// burns its nonce ([`Receipt::burns_nonce`]). Any other skip uses no
     /// nonce ([`Receipt::is_invalid_skip`]), and a deposit has no L2
     /// nonce ([`Receipt::is_deposit`]).
     #[must_use]
     pub fn uses_nonce(&self) -> bool {
-        !self.is_invalid_skip() && !self.is_deposit()
+        (!self.is_invalid_skip() && !self.is_deposit()) || self.burns_nonce()
     }
 }
 
@@ -396,6 +464,52 @@ mod tests {
             ..executed
         };
         assert!(!deposit.uses_nonce());
+    }
+
+    /// A skip with a write set used its nonce. A skip with the empty
+    /// write set, a skip for a reason that uses no nonce, and a failed
+    /// deposit with its mint, used none.
+    #[test]
+    fn a_skip_with_a_write_set_burns_its_nonce() {
+        let skip = Receipt {
+            status: false,
+            gas_used: 0,
+            write_set_hash: EMPTY_WRITE_SET_HASH,
+            skip_reason: Some(SkipReason::InsufficientFunds),
+            ..Receipt::default()
+        };
+        for reason in [
+            SkipReason::Undecodable,
+            SkipReason::NonceTooLow,
+            SkipReason::NonceTooHigh,
+            SkipReason::Header,
+        ] {
+            let written = Receipt {
+                skip_reason: Some(reason),
+                write_set_hash: B256::repeat_byte(0x11),
+                ..skip.clone()
+            };
+            assert!(
+                !written.burns_nonce() && !written.uses_nonce(),
+                "{reason:?}"
+            );
+        }
+        assert!(!skip.burns_nonce() && !skip.uses_nonce());
+        let burn = Receipt {
+            write_set_hash: B256::repeat_byte(0x11),
+            ..skip.clone()
+        };
+        assert!(burn.burns_nonce() && burn.uses_nonce());
+        let mint = Receipt {
+            tx_type: TX_TYPE_DEPOSIT,
+            ..burn.clone()
+        };
+        assert!(!mint.burns_nonce() && !mint.uses_nonce());
+        let executed = Receipt {
+            gas_used: 21_000,
+            ..burn
+        };
+        assert!(!executed.burns_nonce() && executed.uses_nonce());
     }
 
     #[test]

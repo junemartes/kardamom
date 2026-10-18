@@ -480,8 +480,8 @@ impl<S: StateDatabase + Sync> Tail<S> {
         layered.apply(ws.clone());
         self.delta.apply(ws);
         self.receipts.push(receipt);
-        // A repaired skip captures nothing, the same hole a skipped
-        // transaction leaves on the streaming path.
+        // A repaired skip with no nonce burn captures nothing, the same
+        // hole a skipped transaction leaves on the streaming path.
         self.out_frags
             .extend(repair_frag.filter(|f| !f.accounts.is_empty()));
         Ok(())

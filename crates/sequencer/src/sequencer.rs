@@ -66,7 +66,6 @@ use crate::lookup::LookupRequester;
 use crate::metrics;
 use crate::nonce_ahead::NonceAheadWatch;
 use crate::outbound::{RefOffer, SideChannelPublisher, TxOrderingRefPublisher};
-use crate::release::ReleaseSender;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
 use crate::tx_decode::decode_fields;
@@ -235,8 +234,6 @@ pub struct Sequencer {
     unconfirmed: UnconfirmedLedger<RefMetadata>,
     /// The senders that the sealer's nonce guard rejects above the chain.
     nonce_ahead: NonceAheadWatch,
-    /// The nonce releases for the sealer, one for each skip receipt.
-    releases: ReleaseSender,
     /// The nonce lookup seam. `None` when the binary has no executor
     /// endpoints (tests, IPC dev runs). See [`crate::lookup`].
     lookup: Option<LookupRequester>,
@@ -278,7 +275,6 @@ impl Sequencer {
         let depth = DepthReport::new(now, cfg.partition_index);
         let nonce_ahead =
             NonceAheadWatch::new(Duration::from_millis(cfg.resync.nonce_ahead_settle_ms));
-        let cfg_partition = cfg.partition_index;
         Ok(Self {
             state: PartitionState::new(cap, cfg.tx_ttl()),
             cfg,
@@ -286,7 +282,6 @@ impl Sequencer {
             resync: None,
             unconfirmed: UnconfirmedLedger::new(),
             nonce_ahead,
-            releases: ReleaseSender::new(cfg_partition),
             lookup: None,
             vslots,
             shadow,
@@ -603,16 +598,11 @@ impl Sequencer {
         // contiguity reject finds no ref at the expected nonce.
         self.apply_deadline_rejects(&mut r, ports);
         self.apply_sealer_answers(&mut r, ports);
-        let releases = r.sealer_takes_releases();
         self.resync = Some(r);
         // A lookup request reads the rollback generation from
         // `self.resync`, so the requests go after the controller is back.
         for sender in lookups {
             self.request_lookup(sender);
-        }
-        if releases {
-            let (_, refs, _) = ports.split();
-            self.releases.flush(refs);
         }
         self.sweep_confirm_timeouts();
     }

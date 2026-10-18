@@ -40,14 +40,15 @@ where
     scenario(&t, l1, &exec_dir, &val_dir).await.expect(what);
 }
 
-/// S13d: the sealer starts on decision version 2, and a nonce release
-/// takes effect only after the upgrade transaction of the sealer rules.
+/// S13d: before the upgrade transaction of the sealer rules, a skipped
+/// sender stays stuck at its nonce. After it, a skip uses its nonce, and
+/// the next nonce lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
-async fn s13d_a_nonce_release_takes_effect_only_after_the_sealer_upgrade() {
+async fn s13d_a_skip_uses_its_nonce_only_after_the_upgrade() {
     upgrade_case(
         async |t, l1, _exec_dir, _val_dir| {
-            sealer_upgrade::release_takes_effect_only_after_the_upgrade(
+            sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
                 t,
                 l1,
                 sealer_upgrade::Params::default(),

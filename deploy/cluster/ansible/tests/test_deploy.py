@@ -1280,6 +1280,7 @@ class RecordTest(Deploys):
         self.deploy()
         output = self.run_deploy(playbook='upgrade-check.yml')
         self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 13', output)
+        self.assertIn('the live allocations of sequencer, executor, validator, ingress run this release', output)
 
     def test_the_upgrade_check_refuses_a_member_of_an_older_release(self):
         self.deploy()
@@ -1298,10 +1299,26 @@ class RecordTest(Deploys):
         meta = self.api.state['jobs']['sequencer'].pop('Meta')
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('the sequencer job does not send the feature activation', output)
+        self.assertIn('sealer_feature_activation, nonce_burn', output)
         self.api.state['jobs']['sequencer']['Meta'] = meta
         self.api.state['missing_replica'] = 'sequencer'
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('an allocation of an older job version still runs', output)
+
+    def test_the_upgrade_check_refuses_an_executor_or_validator_that_does_not_burn(self):
+        """An older executor or validator does not use the nonce of a skip, and forks at the first one."""
+        self.deploy()
+        meta = self.api.state['jobs']['executor'].pop('Meta')
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('the executor job does not use the nonce of a skipped transaction (job meta nonce_burn)', output)
+        self.api.state['jobs']['executor']['Meta'] = meta
+        self.api.state['jobs']['validator'].pop('Meta')
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('Deploy the release to every validator', output)
+        self.api.state['jobs']['validator']['Meta'] = meta
+        self.api.state['jobs']['ingress']['Meta'] = {'nonce_burn': 'false'}
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('the ingress job does not take a skip that uses its nonce', output)
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.deploy()

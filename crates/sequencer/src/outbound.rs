@@ -29,7 +29,7 @@
 
 pub mod cluster;
 
-use kardamom_cluster_adapter::wire::{GuardHeader, NonceRelease};
+use kardamom_cluster_adapter::wire::GuardHeader;
 use kardamom_log::aeron_live::{TxErrorsPublisherHandle, TxStatusPublisherHandle};
 use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef, TxStatus};
@@ -110,18 +110,6 @@ pub trait TxOrderingRefPublisher: Send {
     /// Returns `Err(SequencerError::Backpressure)` if the transport is
     /// blocked.
     fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
-
-    /// Publish a nonce release: an executor skipped the entry
-    /// `r.tx_hash`, and the chain expects `r.nonce` of `r.sender` next. The
-    /// sealer lowers its expected nonce of the sender, once for each
-    /// skipped entry. Nothing rewinds on `Backpressure`: the caller keeps
-    /// the release and offers it again.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(SequencerError::Backpressure)` if the transport is
-    /// blocked.
-    fn try_publish_release(&mut self, r: &NonceRelease) -> Result<(), SequencerError>;
 }
 
 /// The side channels: `tx_errors` and `tx_status`. Both are best effort.
@@ -169,10 +157,7 @@ pub mod fakes {
     use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef, TxStatus};
 
-    use super::{
-        NonceRelease, RefOffer, SequencerError, SideChannelPublisher, TxError,
-        TxOrderingRefPublisher,
-    };
+    use super::{RefOffer, SequencerError, SideChannelPublisher, TxError, TxOrderingRefPublisher};
 
     /// In-memory `tx_ordering` publisher. Records every published offer,
     /// `EpochRecord`, and `RemoteEpochRecord` in arrival order, so tests
@@ -185,7 +170,6 @@ pub mod fakes {
         pub offers: Arc<Mutex<Vec<RefOffer>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
-        pub releases: Arc<Mutex<Vec<NonceRelease>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
@@ -214,14 +198,6 @@ pub mod fakes {
                 return Err(SequencerError::Backpressure);
             }
             self.remote_epochs.lock().unwrap().push(r.clone());
-            Ok(())
-        }
-
-        fn try_publish_release(&mut self, r: &NonceRelease) -> Result<(), SequencerError> {
-            if *self.fail_with_backpressure.lock().unwrap() {
-                return Err(SequencerError::Backpressure);
-            }
-            self.releases.lock().unwrap().push(*r);
             Ok(())
         }
     }

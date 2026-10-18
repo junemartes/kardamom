@@ -2,10 +2,13 @@
 # The check before the upgrade transaction of FEATURE_SEALER_V3: the
 # decision rules version 3 of the sealer. A sealer member of an older
 # release drops the feature activation (ingress kind 11) and keeps
-# version 2, so the replicated state forks at the first nonce release.
+# version 2, so the replicated state forks at the first frame that the two
+# versions decide differently: a frame that ends at its record type.
 # So every configured member must run a release that reads snapshot
 # version 13, the layout that carries the rules. Every sequencer must
-# run a release that sends the activation, or no member gets it.
+# run a release that sends the activation, or no member gets it. Every
+# executor, validator, ingress and sequencer must run a release that uses
+# the nonce of a skipped transaction (job meta nonce_burn).
 # cluster/sealer-service/README.md ("Decision version") is the procedure.
 - name: Read the registered sealer
   ansible.builtin.include_tasks: read_job.yml
@@ -79,44 +82,21 @@
       ({{ workloads_upgrade_reads_max }}). A member of an older release drops the feature activation and forks
       the state. Deploy the release that reads version 13 to every member, then run the check again.
 
-- name: Read the registered sequencer
-  ansible.builtin.include_tasks: read_job.yml
-  vars:
-    workloads_read_job: sequencer
-
-- name: Read the sequencer allocations
-  ansible.builtin.uri:
-    url: "{{ workloads_nomad_addr }}/v1/job/sequencer/allocations?namespace={{ workloads_namespace | urlencode }}"
-    headers:
-      X-Nomad-Token: "{{ workloads_nomad_token }}"
-    status_code: [200, 404]
-  register: workloads_upgrade_sequencers
-
-# The job meta sealer_feature_activation comes with the release whose
-# sequencer sends the activation. A live allocation of an older job version
-# can run an older sequencer.
-- name: Keep the live sequencer allocations
-  ansible.builtin.set_fact:
-    workloads_upgrade_live: >-
-      {{ (workloads_upgrade_sequencers.json | default([], true))
-         | selectattr('ClientStatus', 'in', ['running', 'pending']) | list }}
-
-- name: Refuse a sequencer of an older release
-  ansible.builtin.assert:
-    that:
-      - workloads_registered_job.status == 200
-      - (workloads_registered_job.json.Meta | default({}, true)).sealer_feature_activation | default('') == 'true'
-      - workloads_upgrade_live | length > 0
-      - workloads_upgrade_live | map(attribute='JobVersion') | unique | list == [workloads_registered_job.json.Version]
-    fail_msg: >-
-      Refused: no sequencer runs, the sequencer job does not send the feature activation (job meta
-      sealer_feature_activation), or an allocation of an older job version still runs
-      ({{ workloads_upgrade_live | map(attribute='JobVersion') | unique | list }}). Deploy the release to every
-      sequencer, then run the check again.
+# Each service that executes or reads a skip must run this release: an
+# older executor or validator does not use the nonce of a skipped
+# transaction, and forks the state at the first such skip. The job meta of
+# each names what its release does. A live allocation of an older job
+# version can run an older release.
+- name: Check the services of the release
+  ansible.builtin.include_tasks: upgrade_check_job.yml
+  loop: "{{ workloads_upgrade_jobs }}"
+  loop_control:
+    loop_var: workloads_upgrade_job
+    label: "{{ workloads_upgrade_job.name }}"
 
 - name: Report the passing check
   ansible.builtin.debug:
     msg: >-
       The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version 13,
-      and {{ workloads_upgrade_live | length }} sequencer allocations send the feature activation. The upgrade
-      transaction of FEATURE_SEALER_V3 may go to the Safe.
+      and the live allocations of {{ workloads_upgrade_jobs | map(attribute='name') | join(', ') }} run this
+      release. The upgrade transaction of FEATURE_SEALER_V3 may go to the Safe.

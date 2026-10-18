@@ -55,11 +55,9 @@ code = [
 # kind 9 (the recorded cursor) only with KARDAMOM_EXEC_CURSOR on
 # (--exec-cursor); the default is off. The sequencer sends kind 11 (the
 # feature activation) in front of an epoch that holds the upgrade
-# transaction of FEATURE_SEALER_V3, and kind 10 (the nonce release) only
-# after the sealer reported decision version 3 (egress kind 17). Every
-# member drops a frame of a kind it does not know, counts it, and never
-# orders it. A member under decision version 2 drops kind 10 the same way.
-# Kind 11 switches the rules of a member that reads it, so send the
+# transaction of FEATURE_SEALER_V3. No writer sends kind 10. Every member
+# drops a frame of a kind it does not know, counts it, and never orders
+# it. Kind 11 switches the rules of a member that reads it, so send the
 # upgrade transaction only after every member runs this release.
 [format.sealer-ingress-kinds]
 writes = 8
@@ -70,7 +68,6 @@ activation = { flag = "FEATURE_SEALER_V3", writes = 11 }
 code = [
     "cluster/sealer-service/service/src/main/java/io/kardamom/sealer/cluster/SealerWire.java#KIND_FEATURE_ACTIVATION",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_FEATURE_ACTIVATION",
-    "crates/cluster-adapter/src/wire/mod.rs#KIND_NONCE_RELEASE",
     "crates/cluster-adapter/src/wire/mod.rs#KIND_RECORDED_CURSOR",
     "crates/executor/src/bin/kardamom-executor/args.rs#KARDAMOM_EXEC_CURSOR",
 ]

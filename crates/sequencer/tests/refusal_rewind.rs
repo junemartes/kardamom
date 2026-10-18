@@ -15,24 +15,14 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_cluster_adapter::wire::NonceRelease;
-use kardamom_types::{SkipReason, TxDataLoc, TxErrorReason};
+use kardamom_types::{Receipt, SkipReason, TxDataLoc, TxErrorReason};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::resync::{
     FloorEvent, FloorUpdate, ResyncChannel, ResyncConfig, SealerAnswer, SealerRefusal,
-    SharedWatermark,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testkit::{Rig, one_partition_cfg, pos, signed_envelope, signer};
-
-/// The hash of the skipped tx of `s` at `nonce` in these tests.
-fn skipped_hash(s: Address, nonce: u64) -> B256 {
-    let mut hash = [0_u8; 32];
-    hash[..20].copy_from_slice(s.as_slice());
-    hash[24..].copy_from_slice(&nonce.to_le_bytes());
-    B256::from(hash)
-}
 
 /// The reason every refusal in these tests carries. It names the
 /// deadline of the test envelopes, so it names their copies.
@@ -49,8 +39,6 @@ struct Sealed {
     floor_tx: crossbeam_channel::Sender<FloorEvent>,
     answer_tx: crossbeam_channel::Sender<SealerAnswer>,
     deadline_tx: crossbeam_channel::Sender<SealerRefusal>,
-    /// The feed's view of the sealer: here, the rules it reported.
-    watermark: SharedWatermark,
     /// The next free `tx_data` offset.
     offset: i32,
 }
@@ -63,18 +51,15 @@ impl Sealed {
             floor_tx,
             answer_tx,
             deadline_tx,
-            watermark,
             ..
         } = ResyncChannel::open(ResyncConfig::default(), 0).unwrap();
         seq.enable_resync(controller);
-        watermark.set_sealer_version(3);
         Self {
             seq,
             rig: Rig::default(),
             floor_tx,
             answer_tx,
             deadline_tx,
-            watermark,
             offset: 0,
         }
     }
@@ -176,7 +161,22 @@ impl Sealed {
     /// The skip receipt of the tx of `s` at `nonce` arrives.
     fn skip(&self, s: Address, nonce: u64, reason: SkipReason) {
         self.floor_tx
-            .send(FloorUpdate::skip(s, nonce, reason, skipped_hash(s, nonce)).into())
+            .send(FloorUpdate::skip(s, nonce, reason).into())
+            .unwrap();
+    }
+
+    /// The skip receipt of the tx of `s` at `nonce` arrives, and its
+    /// write set holds the burn of the nonce.
+    fn burn(&self, s: Address, nonce: u64) {
+        let receipt = Receipt {
+            from: s,
+            nonce,
+            skip_reason: Some(SkipReason::InsufficientFunds),
+            write_set_hash: B256::repeat_byte(0xB0),
+            ..Receipt::default()
+        };
+        self.floor_tx
+            .send(FloorUpdate::of_receipt(&receipt).into())
             .unwrap();
     }
 
@@ -530,6 +530,22 @@ fn a_skip_receipt_reopens_the_skipped_nonce() {
     assert_eq!(sealed.errors_of(0), Vec::<TxErrorReason>::new());
 }
 
+/// The executors skip nonce 0 for lack of funds, and the skip burns the
+/// nonce. The floor rises to 1, as for an executed transaction: nonce 1
+/// publishes at once, and a resubmit at 0 is a past nonce.
+#[test]
+fn a_burning_skip_receipt_raises_the_floor() {
+    let s = signer(46);
+    let mut sealed = Sealed::new(one_partition_cfg());
+    sealed.submit(&s, 0);
+    sealed.burn(s.address(), 0);
+    sealed.step();
+    sealed.submit(&s, 1);
+    assert_eq!(sealed.offered_nonces(1), vec![1], "1 publishes");
+    sealed.submit(&s, 0);
+    assert_eq!(sealed.offered_nonces(1), vec![1], "0 is used");
+}
+
 /// A sequencer whose nonce-guard settle time is 20 ms.
 fn short_settle() -> Sealed {
     let mut cfg = one_partition_cfg();
@@ -632,81 +648,4 @@ fn an_ordered_ref_that_did_not_execute_is_not_stuck() {
         sealed.errors_of(1),
         vec![TxErrorReason::NonceInFlight { chain_nonce: 1 }]
     );
-}
-
-/// A skip receipt sends one nonce release to the sealer: the chain
-/// expects the skipped nonce again. A second copy of the receipt, for
-/// example after a resubscribe, sends nothing.
-#[test]
-fn a_skip_receipt_sends_one_nonce_release() {
-    let s = signer(51);
-    let mut sealed = Sealed::new(one_partition_cfg());
-    sealed.submit(&s, 0);
-    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
-    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
-    sealed.step();
-    assert_eq!(
-        sealed.rig.releases(),
-        vec![NonceRelease {
-            sender: s.address(),
-            nonce: 0,
-            tx_hash: skipped_hash(s.address(), 0),
-        }]
-    );
-}
-
-/// A nonce skip sends no release: the run of skips after the skip at
-/// the chain nonce reopens with the release of that first skip.
-#[test]
-fn a_nonce_skip_sends_no_release() {
-    let s = signer(52);
-    let mut sealed = Sealed::new(one_partition_cfg());
-    (0..3).for_each(|n| sealed.submit(&s, n));
-    sealed.execute(s.address(), 0);
-    sealed.skip(s.address(), 1, SkipReason::InsufficientFunds);
-    sealed.skip(s.address(), 2, SkipReason::NonceTooHigh);
-    sealed.skip(s.address(), 0, SkipReason::NonceTooLow);
-    sealed.step();
-    assert_eq!(
-        sealed.rig.releases(),
-        vec![NonceRelease {
-            sender: s.address(),
-            nonce: 1,
-            tx_hash: skipped_hash(s.address(), 1),
-        }]
-    );
-}
-
-/// A sealer that has not reported decision version 3 on the session gets
-/// no release. The release waits, and leaves after the report.
-#[test]
-fn a_release_waits_for_a_sealer_of_version_three() {
-    let s = signer(54);
-    let mut sealed = Sealed::new(one_partition_cfg());
-    sealed.watermark.set_sealer_version(0);
-    sealed.submit(&s, 0);
-    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
-    sealed.step();
-    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
-    sealed.watermark.set_sealer_version(2);
-    sealed.step();
-    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
-    sealed.watermark.set_sealer_version(3);
-    sealed.step();
-    assert_eq!(sealed.rig.releases().len(), 1);
-}
-
-/// A blocked transport keeps the release, and the next step sends it.
-#[test]
-fn a_release_waits_out_a_blocked_transport() {
-    let s = signer(53);
-    let mut sealed = Sealed::new(one_partition_cfg());
-    sealed.submit(&s, 0);
-    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = true;
-    sealed.skip(s.address(), 0, SkipReason::InsufficientFunds);
-    sealed.step();
-    assert_eq!(sealed.rig.releases(), Vec::<NonceRelease>::new());
-    *sealed.rig.refs.fail_with_backpressure.lock().unwrap() = false;
-    sealed.step();
-    assert_eq!(sealed.rig.releases().len(), 1);
 }

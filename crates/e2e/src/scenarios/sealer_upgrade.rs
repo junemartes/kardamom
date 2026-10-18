@@ -1,23 +1,22 @@
-//! S13d — the sealer's decision rules switch by an upgrade transaction.
+//! S13d — a skipped transaction uses its nonce after the upgrade
+//! transaction of [`FEATURE_SEALER_V3`].
 //!
-//! The sealer starts on decision version 2: it drops a nonce release, and
-//! it sends no rules frame. The upgrade transaction of
-//! [`FEATURE_SEALER_V3`] reaches the sealer as a feature activation that
-//! the sequencer sends in front of the epoch. From that record on, the
-//! sealer runs version 3: it tells each session, and it applies a release.
+//! The sealer's contiguity guard counts every ordered entry, skipped or
+//! not. Before the upgrade, a skip uses no nonce on the chain, so the
+//! chain and the guard disagree, and the sender is stuck. The upgrade
+//! transaction switches the sealer to decision version 3, and from its
+//! activation on, a skip at the chain nonce uses that nonce.
 //!
 //! One probe runs before the upgrade and one after it, each on a fresh
-//! sender with a small balance:
+//! sender with a small balance. The sender sends transfers at nonces 0
+//! and 1. Each one fits the balance, and the two together do not, so
+//! nonce 1 skips with insufficient funds.
 //!
-//! 1. The sender sends transfers at nonces 0 and 1. Each one fits the
-//!    balance, and the two together do not, so nonce 1 skips with
-//!    insufficient funds. A skip uses no nonce: the chain expects nonce 1
-//!    next, and the sealer's guard expects nonce 2.
-//! 2. The sender sends a new transfer at nonce 1 until it lands.
-//!
-//! Before the upgrade, no release reaches the sealer, so the new transfer
-//! does not land. After it, the release of the skip brings the guard back
-//! to nonce 1, and the new transfer lands.
+//! - Before the upgrade, the chain expects nonce 1 next, and the guard
+//!   expects nonce 2. A new transfer at nonce 1 does not land.
+//! - After the upgrade, the skip uses nonce 1. The chain expects nonce 2,
+//!   a new transfer at nonce 1 is refused, and a transfer at nonce 2
+//!   lands. The validator agrees with the executor.
 
 use std::time::Duration;
 
@@ -41,11 +40,8 @@ const SPEND_WEI: u64 = 50_000_000_000_000;
 const PAYEE: Address = Address::repeat_byte(0x5E);
 /// How long the probe before the upgrade tries to land the new transfer.
 const REFUSED_FOR: Duration = Duration::from_secs(10);
-/// How long the probe after the upgrade may take to land the new transfer.
-const LANDS_WITHIN: Duration = Duration::from_mins(1);
 
 const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
-const NONCE_RELEASES: &str = "kardamom_sequencer_nonce_releases_total";
 
 /// The default funder is account 0: the upgrade genesis funds only it.
 #[derive(Default)]
@@ -54,13 +50,12 @@ pub struct Params {
     pub funder: usize,
 }
 
-/// A fresh sender that skips nonce 1, then sends a new transfer at it.
-struct ReleaseProbe {
+/// A fresh sender that skips nonce 1.
+struct SkipProbe {
     sender: DerivedSigner,
-    retry: SignedTransfer,
 }
 
-impl ReleaseProbe {
+impl SkipProbe {
     /// A probe on the fixed key `seed`, funded by `funder`.
     async fn funded(t: &Target, funder: &DerivedSigner, seed: u8) -> Result<Self> {
         let key = PrivateKeySigner::from_bytes(&B256::repeat_byte(seed)).context("probe key")?;
@@ -71,8 +66,7 @@ impl ReleaseProbe {
         let nonce = Self::chain_nonce(t, funder.address).await?;
         let funding = l2::sign_transfer(funder, t.chain_id, nonce, sender.address, FUNDING_WEI)?;
         Self::lands(t, &funding, "the funding of a probe").await?;
-        let retry = l2::sign_transfer(&sender, t.chain_id, 1, PAYEE, 1)?;
-        Ok(Self { sender, retry })
+        Ok(Self { sender })
     }
 
     /// The nonce that the chain expects next from `who`.
@@ -96,12 +90,18 @@ impl ReleaseProbe {
         assert_receipt_ok(&await_l2_receipt(t, tx.hash, what).await?, what)
     }
 
-    /// Send nonces 0 and 1, and wait for the skip of nonce 1. Nonce 1 goes
-    /// first, so the ingress checks it against the whole balance, before
-    /// nonce 0 executes. The sequencer holds it until nonce 0 arrives.
-    async fn skip_nonce_one(&self, t: &Target) -> Result<()> {
-        let first = l2::sign_transfer(&self.sender, t.chain_id, 0, PAYEE, SPEND_WEI)?;
-        let second = l2::sign_transfer(&self.sender, t.chain_id, 1, PAYEE, SPEND_WEI)?;
+    /// A transfer of `value` from the probe at `nonce`.
+    fn transfer(&self, t: &Target, nonce: u64, value: u64) -> Result<SignedTransfer> {
+        l2::sign_transfer(&self.sender, t.chain_id, nonce, PAYEE, value)
+    }
+
+    /// Send nonces 0 and 1, wait for the skip of nonce 1, and return the
+    /// nonce that the chain expects after it. Nonce 1 goes first, so the
+    /// ingress checks it against the whole balance, before nonce 0
+    /// executes. The sequencer holds it until nonce 0 arrives.
+    async fn skip_nonce_one(&self, t: &Target) -> Result<u64> {
+        let first = self.transfer(t, 0, SPEND_WEI)?;
+        let second = self.transfer(t, 1, SPEND_WEI)?;
         let (late, early) = tokio::join!(t.rpc.send_raw(&second.raw), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Self::lands(t, &first, "the spend at nonce 0").await
@@ -116,22 +116,18 @@ impl ReleaseProbe {
                 && receipt_field(&skip, "gasUsed") == Some("0x0"),
             "the spend at nonce 1 must skip with insufficient funds: {skip}"
         );
-        anyhow::ensure!(
-            Self::chain_nonce(t, self.sender.address).await? == 1,
-            "a skip uses no nonce"
-        );
-        Ok(())
+        Self::chain_nonce(t, self.sender.address).await
     }
 
-    /// One try of the new transfer at nonce 1: `Some` when it has a
-    /// receipt. The sealer refuses the transfer while its guard is ahead
-    /// of the chain, so the client sends it again.
-    async fn try_retry(&self, t: &Target) -> Result<Option<()>> {
+    /// One try of `tx`: `Some` when it has a receipt. The sealer refuses
+    /// the transfer while its guard is ahead of the chain, so the client
+    /// sends it again.
+    async fn try_send(t: &Target, tx: &SignedTransfer) -> Result<Option<()>> {
         // The answer does not matter: a refusal and an accepted offer both
         // lead to the next look at the receipt.
-        let _answer = t.rpc.send_raw(&self.retry.raw).await;
+        let _answer = t.rpc.send_raw(&tx.raw).await;
         Ok(t.rpc
-            .receipt(self.retry.hash)
+            .receipt(tx.hash)
             .await
             .result
             .ok()
@@ -139,57 +135,55 @@ impl ReleaseProbe {
             .map(|_| ()))
     }
 
-    /// The new transfer does not land within `within`.
-    async fn stays_refused(&self, t: &Target, within: Duration) -> Result<()> {
+    /// A new transfer at nonce 1 does not land within `within`.
+    async fn stays_stuck(&self, t: &Target, within: Duration) -> Result<()> {
+        let retry = self.transfer(t, 1, 1)?;
         let landed = poll_until(
             "the new transfer at nonce 1 (it must not land)",
             within,
             Duration::from_millis(500),
-            || self.try_retry(t),
+            || Self::try_send(t, &retry),
         )
         .await;
         anyhow::ensure!(
             landed.is_err()
                 && t.rpc
-                    .receipt(self.retry.hash)
+                    .receipt(retry.hash)
                     .await
                     .result
                     .ok()
                     .flatten()
                     .is_none(),
-            "a transfer at the skipped nonce landed under decision version 2"
+            "a transfer at the skipped nonce landed before the upgrade"
+        );
+        anyhow::ensure!(
+            Self::chain_nonce(t, self.sender.address).await? == 1,
+            "the chain still expects the skipped nonce"
         );
         Ok(())
     }
 
-    /// The nonce releases that the sequencers sent.
-    async fn releases_sent(t: &Target) -> Result<f64> {
-        t.sequencer_metric_sum_where(NONCE_RELEASES, "outcome=\"sent\"")
-            .await
-    }
-
-    /// The new transfer lands within `within`, with a successful receipt.
-    async fn lands_after_release(&self, t: &Target, within: Duration) -> Result<()> {
-        poll_until(
-            "the new transfer at nonce 1 lands",
-            within,
-            Duration::from_millis(500),
-            || self.try_retry(t),
-        )
-        .await?;
-        let receipt = await_l2_receipt(t, self.retry.hash, "the new transfer at nonce 1").await?;
-        assert_receipt_ok(&receipt, "the new transfer at nonce 1")
+    /// After a skip that used nonce 1: a new transfer at nonce 1 is
+    /// refused, and a transfer at nonce 2 lands.
+    async fn moves_on(&self, t: &Target) -> Result<()> {
+        let reuse = self.transfer(t, 1, 1)?;
+        anyhow::ensure!(
+            t.rpc.send_raw(&reuse.raw).await.result.is_err(),
+            "the ingress must refuse a new transfer at the used nonce 1"
+        );
+        Self::lands(t, &self.transfer(t, 2, 1)?, "the transfer at nonce 2").await
     }
 }
 
-/// A nonce release takes effect only after the upgrade transaction of
-/// [`FEATURE_SEALER_V3`].
+/// A skipped transaction uses its nonce only after the upgrade
+/// transaction of [`FEATURE_SEALER_V3`].
 ///
 /// # Errors
 /// Returns an error when the sealer reports version 3 before the upgrade,
-/// when a release goes out or takes effect before it, when the upgrade
-/// transaction fails, or when no release takes effect after it.
-pub async fn release_takes_effect_only_after_the_upgrade(
+/// when a skip uses its nonce before it, when the upgrade transaction
+/// fails, when a skip uses no nonce after it, when the next nonce does not
+/// land, or when the validator disagrees.
+pub async fn skip_uses_its_nonce_only_after_the_upgrade(
     t: &Target,
     l1: &L1,
     p: Params,
@@ -197,18 +191,17 @@ pub async fn release_takes_effect_only_after_the_upgrade(
     let signers = l2::dev_signers_through(p.funder)?;
     let funder = &signers[p.funder];
 
-    // --- Version 2: the release does not reach the sealer. -----------------
+    // --- Before the upgrade: the skip uses no nonce. ------------------------
     anyhow::ensure!(
         t.sequencer_metric_sum(SEALER_VERSION).await? == 0.0,
         "the sealer must start on decision version 2, with no rules frame"
     );
-    let before = ReleaseProbe::funded(t, funder, 0x71).await?;
-    before.skip_nonce_one(t).await?;
-    before.stays_refused(t, REFUSED_FOR).await?;
+    let before = SkipProbe::funded(t, funder, 0x71).await?;
     anyhow::ensure!(
-        ReleaseProbe::releases_sent(t).await? == 0.0,
-        "a sequencer sent a nonce release to a sealer of version 2"
+        before.skip_nonce_one(t).await? == 1,
+        "a skip before the upgrade uses no nonce"
     );
+    before.stays_stuck(t, REFUSED_FOR).await?;
 
     // --- The upgrade transaction, active at once. ---------------------------
     upgrade_and_await(t, l1, FEATURE_SEALER_V3, 0).await?;
@@ -220,13 +213,12 @@ pub async fn release_takes_effect_only_after_the_upgrade(
     )
     .await?;
 
-    // --- Version 3: the release takes effect. -------------------------------
-    let after = ReleaseProbe::funded(t, funder, 0x72).await?;
-    after.skip_nonce_one(t).await?;
-    after.lands_after_release(t, LANDS_WITHIN).await?;
+    // --- After the upgrade: the skip uses its nonce. ------------------------
+    let after = SkipProbe::funded(t, funder, 0x72).await?;
     anyhow::ensure!(
-        ReleaseProbe::releases_sent(t).await? > 0.0,
-        "the new transfer landed with no nonce release sent"
+        after.skip_nonce_one(t).await? == 2,
+        "a skip after the upgrade uses its nonce"
     );
-    Ok(())
+    after.moves_on(t).await?;
+    t.assert_validator_verdict("S13d").await
 }

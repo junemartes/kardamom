@@ -952,83 +952,6 @@ public final class CanonicalSealerState {
         return voids;
     }
 
-    /**
-     * Apply a nonce release: an executor skipped the ordered entry
-     * {@code canonicalId32} of {@code sender20}, and the chain expects
-     * {@code nonce} of the sender next. A skip uses no nonce on the chain,
-     * so the expected nonce of the sender goes down to {@code nonce}.
-     *
-     * <p>The release applies only when all of these hold. Every check reads
-     * only replicated state, so every member decides alike.</p>
-     * <ul>
-     *   <li>The window holds the id, and holds no release mark of it. The
-     *       release then adds the mark: the id with its first byte inverted
-     *       ({@link #releaseMark}), held to the deadline of the id. Both
-     *       twins of a lane send each release, so the second copy finds the
-     *       mark and changes nothing. A release whose id left the window
-     *       changes nothing.</li>
-     *   <li>The guard tracks the sender, and expects a nonce above
-     *       {@code nonce}. An unknown or evicted sender re-seeds on its next
-     *       record, so it needs no change.</li>
-     * </ul>
-     *
-     * <p>Why a release never sets the guard below the chain. The sequencer
-     * sends a release only for a skip that proves that the chain was at
-     * {@code nonce} when the entry executed (an insufficient-funds skip:
-     * the executor checks the nonce before the balance), or for a skip
-     * exactly at a known receipt floor. It sends none for a nonce skip. So:</p>
-     * <ul>
-     *   <li>The guard orders the entries of a sender with contiguous
-     *       nonces. Each entry ordered after the skipped one and before the
-     *       release has a nonce above {@code nonce}, and the chain stays at
-     *       {@code nonce}, so each of them skips: as a nonce too high, or for
-     *       a check before the nonce check (a fee, the gas, the code). Its
-     *       nonce is above the chain, and so above the receipt floor, so it
-     *       sends no release.</li>
-     *   <li>The guard orders nothing at {@code nonce} until the release
-     *       applies. After it applies, the mark drops a repeat.</li>
-     *   <li>The one exception is an eviction of the sender from the guard
-     *       while the id is in the window, and a re-seed at {@code nonce}
-     *       that executes before the release. The eviction needs
-     *       {@code dedupCapacity} other senders ordered within the inclusion
-     *       horizon of the id. The cost is the state of a guard below the
-     *       chain, which the next eviction of the sender ends.</li>
-     * </ul>
-     *
-     * <p>The skipped id stays in the window, so the same signed bytes stay
-     * a duplicate until their deadline, and one hash never has two
-     * canonical entries. The sender signs a new transaction at the released
-     * nonce.</p>
-     *
-     * <p>The mark cannot stand for a real id: a real id is a keccak hash, and
-     * the mark is a fixed transform of an id that the window holds, so a
-     * real id equal to a mark is a hash collision. The mark skips the
-     * capacity check, as an epoch marker does. The window holds at most one
-     * mark for each ordered entry, and the mark leaves with its entry.</p>
-     *
-     * @return whether the release applied
-     */
-    public boolean onRelease(byte[] sender20, long nonce, byte[] canonicalId32) {
-        if (rules.version() != DecisionRules.NEWEST_VERSION) {
-            // Version 2 takes no release.
-            return false;
-        }
-        ByteBuffer key = idKey(canonicalId32);
-        Long held = dedup.get(key);
-        ByteBuffer mark = releaseMark(canonicalId32);
-        if (held == null || dedup.containsKey(mark)) {
-            return false;
-        }
-        ByteBuffer senderKey = ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer();
-        Long expected = expectedNonce.get(senderKey);
-        if (expected == null || expected <= nonce) {
-            return false;
-        }
-        insertFresh(mark, held);
-        expectedNonce.put(senderKey, nonce);
-        return true;
-    }
-
     /** The version of the decision rules: see {@link DecisionRules}. */
     public int decisionVersion() {
         return rules.version();
@@ -1066,13 +989,6 @@ public final class CanonicalSealerState {
      */
     public boolean switchRulesAt(final long nowMs) {
         return rules.switchAt(nowMs);
-    }
-
-    /** The release mark of an id: the id with its first byte inverted. */
-    private static ByteBuffer releaseMark(byte[] canonicalId32) {
-        byte[] mark = canonicalId32.clone();
-        mark[0] = (byte) (mark[0] ^ 0xFF);
-        return ByteBuffer.wrap(mark).asReadOnlyBuffer();
     }
 
     /**
@@ -1815,18 +1731,16 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
-        if (idCount < 0 || idCount > 2L * (dedupCapacity + MARKER_SLACK)) {
+        if (idCount < 0 || idCount > (long) dedupCapacity + MARKER_SLACK) {
             // A snapshot taken with a larger configured window than this
             // member's would rebuild an oversized window, and members that
             // disagree on the capacity would decide differently. Fail
             // loudly. Markers do not meet the cap, so a window can hold
-            // MARKER_SLACK epoch ids above it. A release mark is the
-            // transform of an id that the window holds, at most one for
-            // each, so the marks at most double the count. Shrinking the
-            // window across a restart needs an explicit migration.
+            // MARKER_SLACK epoch ids above it. Shrinking the window across a
+            // restart needs an explicit migration.
             throw new IllegalArgumentException(
-                    "snapshot idCount " + idCount + " outside [0, 2 * (dedupCapacity="
-                            + dedupCapacity + " + " + MARKER_SLACK + ")"
+                    "snapshot idCount " + idCount + " outside [0, dedupCapacity="
+                            + dedupCapacity + " + " + MARKER_SLACK
                             + "] — members must agree on the configured window");
         }
         int idEntryLen = version >= 7 ? CANONICAL_ID_LEN + 8 : CANONICAL_ID_LEN;

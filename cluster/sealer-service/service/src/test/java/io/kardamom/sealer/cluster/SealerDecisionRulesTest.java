@@ -70,10 +70,6 @@ class SealerDecisionRulesTest {
         return IngressFrames.recordFrame(n, SENDER, nonce);
     }
 
-    private static byte[] release(final int n, final long nonce) {
-        return IngressFrames.nonceReleaseFrame(SENDER, nonce, IngressFrames.recordId(n));
-    }
-
     private static byte[] epoch(final long origin) {
         return IngressFrames.originRecordFrame(
             IngressFrames.canonicalId(1000 + (int) origin), origin, 1, new byte[] {0x01});
@@ -84,12 +80,12 @@ class SealerDecisionRulesTest {
     }
 
     /**
-     * The golden stream. The sender orders nonces 0 and 1, and the executor
-     * skips nonce 1. Before the activation is due, the release drops as an
-     * unknown kind, and a new transaction at nonce 1 gets a contiguity
-     * reject. The activation of epoch 2 comes in front of the epoch, and
-     * the first tick at its time switches the rules. After it, the release
-     * applies, and a new transaction at nonce 1 gets in.
+     * The golden stream. The sender orders nonces 0 and 1, and a new
+     * transaction at nonce 1 gets a contiguity reject. The activation of
+     * epoch 2 comes in front of the epoch. Nonce 2 comes before the
+     * activation is due, and the first tick at its time switches the rules.
+     * After it, the guard decides as before: a new transaction at nonce 1
+     * gets a contiguity reject, and nonce 3 gets in.
      */
     private static List<Entry> goldenStream(final boolean withActivation) {
         final List<Entry> log = new ArrayList<>(List.of(
@@ -97,18 +93,16 @@ class SealerDecisionRulesTest {
             Entry.frame("nonce-0", offer(1, 0), 1_100L),
             Entry.frame("nonce-1", offer(2, 1), 1_200L),
             Entry.tick("tick-1", 1_250L),
-            Entry.frame("release-v2", release(2, 1), 1_300L),
             Entry.frame("retry-v2", offer(3, 1), 1_400L)));
         if (withActivation) {
             log.add(Entry.frame("activation", activation(2, ACTIVATION_MS), 1_500L));
         }
         log.addAll(List.of(
             Entry.frame("epoch-2", epoch(2), 1_600L),
-            Entry.frame("release-early", release(2, 1), 5_000L),
+            Entry.frame("nonce-2-early", offer(4, 2), 5_000L),
             Entry.tick("tick-at-activation", ACTIVATION_MS),
-            Entry.frame("release-v3", release(2, 1), 10_100L),
-            Entry.frame("release-twin", release(2, 1), 10_150L),
-            Entry.frame("retry-v3", offer(4, 1), 10_200L),
+            Entry.frame("retry-v3", offer(5, 1), 10_100L),
+            Entry.frame("nonce-3", offer(6, 3), 10_200L),
             Entry.tick("tick-2", 10_250L)));
         return log;
     }
@@ -171,15 +165,13 @@ class SealerDecisionRulesTest {
             outcome("nonce-0", List.of(RELAYED), 2),
             outcome("nonce-1", List.of(RELAYED), 2),
             outcome("tick-1", List.of(BOUNDARY), 2),
-            outcome("release-v2", List.of(), 2),
             outcome("retry-v2", List.of(REJECT), 2),
             outcome("activation", List.of(), 2),
             outcome("epoch-2", List.of(RELAYED), 2),
-            outcome("release-early", List.of(), 2),
+            outcome("nonce-2-early", List.of(RELAYED), 2),
             outcome("tick-at-activation", List.of(RULES, BOUNDARY), 3),
-            outcome("release-v3", List.of(), 3),
-            outcome("release-twin", List.of(), 3),
-            outcome("retry-v3", List.of(RELAYED), 3),
+            outcome("retry-v3", List.of(REJECT), 3),
+            outcome("nonce-3", List.of(RELAYED), 3),
             outcome("tick-2", List.of(BOUNDARY), 3)), outcomes);
     }
 
@@ -194,17 +186,21 @@ class SealerDecisionRulesTest {
         assertEquals(plain.applyAll(without.subList(0, cut)), activated.applyAll(withActivation.subList(0, cut)));
         final byte[] snapshot = activated.svc().snapshot();
         assertEquals(CanonicalSealerState.snapshotWriteVersion(), ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
-        assertArrayEquals(plain.svc().snapshot(), snapshot, "a kind-10 frame under version 2 changes no state");
+        assertArrayEquals(plain.svc().snapshot(), snapshot, "the same log writes the same snapshot");
         assertTrue(activated.sequencer().offered.stream().noneMatch(f -> f[0] == RULES),
             "no rules frame under version 2");
     }
 
+    /** The guard decides alike on both versions: only the rules frame differs. */
     @Test
     void a_member_of_version_two_never_switches_without_the_activation() {
         final List<Outcome> outcomes = member(Optional.empty()).applyAll(goldenStream(false));
         assertTrue(outcomes.stream().allMatch(o -> o.decisionVersion() == 2));
-        assertEquals(List.of(REJECT), outcomes.stream()
-            .filter(o -> o.name().equals("retry-v3")).findFirst().orElseThrow().kinds());
+        final List<Outcome> switched = member(Optional.empty()).applyAll(goldenStream(true));
+        assertEquals(
+            switched.stream().filter(o -> !o.name().equals("activation"))
+                .map(o -> o.kinds().stream().filter(kind -> kind != RULES).toList()).toList(),
+            outcomes.stream().map(Outcome::kinds).toList());
     }
 
     /**
@@ -227,17 +223,17 @@ class SealerDecisionRulesTest {
 
     @Test
     void a_replay_from_a_snapshot_before_the_activation_switches_at_the_same_entry() {
-        replayFrom(6, CanonicalSealerState.snapshotWriteVersion());
+        replayFrom(5, CanonicalSealerState.snapshotWriteVersion());
     }
 
     @Test
     void a_replay_from_a_snapshot_with_a_pending_activation_switches_at_the_same_entry() {
-        replayFrom(8, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(7, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
     }
 
     @Test
     void a_replay_from_a_snapshot_after_the_switch_keeps_version_three() {
-        replayFrom(10, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(9, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
     }
 
     @Test

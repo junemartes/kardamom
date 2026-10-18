@@ -73,7 +73,7 @@ pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    FeatureActivation, GuardHeader, NonceRelease, encode_ingress_batch, encode_ingress_epoch,
+    FeatureActivation, GuardHeader, encode_ingress_batch, encode_ingress_epoch,
     encode_ingress_posted_cursor, encode_ingress_recorded_cursor, encode_ingress_remote_epoch,
     encode_ingress_txref, encode_replay_request, encode_subscribe, encode_void_request,
     ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
@@ -188,14 +188,6 @@ pub const KIND_POSTED_CURSOR: u8 = 7;
 /// sealer's own seed record, which no Rust producer sends. Matches Java
 /// `KIND_RECORDED_CURSOR`.
 pub const KIND_RECORDED_CURSOR: u8 = 9;
-/// Ingress kind: a sequencer's nonce release, a system record:
-/// `[kind:u8 = 10][sender:20][nonce:u64][tx_hash:32]`, 61 bytes. An executor
-/// skipped the ordered entry `tx_hash` of `sender`, and the chain expects
-/// `nonce` of the sender next. The sealer lowers the expected nonce of its
-/// contiguity guard to `nonce`, once for each skipped entry. A sealer that
-/// does not know the kind drops the frame. Matches Java
-/// `KIND_NONCE_RELEASE`.
-pub const KIND_NONCE_RELEASE: u8 = 10;
 /// Ingress kind: a sequencer's feature activation, a system record:
 /// `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`, 25
 /// bytes. The upgrade transaction of the epoch at `l1_origin` schedules
@@ -358,16 +350,15 @@ pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 /// ([`SEALER_INFO_LEN`] bytes). The sealer sends it only under decision
 /// version 3: to each open session at the switch, and then to each session
 /// when the session opens, with the id of that session. Under version 2 it
-/// sends none. A sequencer sends a nonce release ([`KIND_NONCE_RELEASE`])
-/// only after it got version 3 or above for its current session. The id
-/// ties the frame to its session, so a frame that arrives before the
+/// sends none. The id ties the frame to its session, so a frame that arrives before the
 /// client's session-start marker still counts. Matches Java
 /// `EGRESS_KIND_SEALER_INFO`.
 pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
 /// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
 pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
-/// The first decision version of the sealer that applies a nonce release.
-pub const RELEASE_DECISION_VERSION: u8 = 3;
+/// The decision version of the sealer after the activation of
+/// [`kardamom_types::upgrades::FEATURE_SEALER_V3`].
+pub const SEALER_V3_DECISION_VERSION: u8 = 3;
 
 /// Client-local kind: a new session starts:
 /// `[kind:u8 = 255][cluster_session_id:i64]`. The

@@ -41,7 +41,6 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
 | 7 | Posted cursor | `[kind=7][posted_head:u64]` |
 | 8 | Seed record | `[kind=8][digest:32]` |
 | 9 | Recorded cursor | `[kind=9][executor_id:u8][recorded_through:u64]` (10 bytes) |
-| 10 | Nonce release | `[kind=10][sender:20][nonce:u64][canonical_id:32]` (61 bytes) |
 | 11 | Feature activation | `[kind=11][l1_origin:u64][feature_id:u64][activation_ms:u64]` (25 bytes) |
 
 - Kind 0: the guard header is `sender`, `nonce`, `deadline` and `tip`.
@@ -90,27 +89,12 @@ same layouts. All integers are little-endian. A frame starts with a one-byte kin
   - When the best cursor moves up, the sealer sends an egress kind 9 to every session. It prints `cluster RECORDED-CURSOR` at power-of-two counts of these moves.
   - The frame is shorter than a kind-0 frame. A sealer that does not know kind 9 drops it as malformed.
 - With `carryBytes`, a member drops kinds 6 and 9 as unknown kinds. Its snapshot holds no void ledger and no recorded cursor.
-- Kind 10: the nonce release is a system record of a sequencer. It has no guard header. Decision version 3 brings it: under version 2 the state takes none.
-  - An executor skipped the ordered entry `canonical_id` of `sender`, and the chain expects `nonce` of the sender next. A skip uses no nonce on the chain.
-  - The sequencer sends one release for each skip receipt of its senders. Both twins of a lane send it.
-  - The sealer applies it only while `canonical_id` is in the dedup window, and only once:
-    - It sets the expected nonce of the sender to the lower of the expected nonce and `nonce`. An unknown or evicted sender needs no change.
-    - It adds a release mark to the dedup window: the id with its first byte inverted, held to the deadline of the id. The second copy of the release finds the mark and changes nothing.
-    - A release whose id has left the window changes nothing.
-  - The id stays in the window, so the same signed bytes stay a duplicate until their deadline. One hash never has two canonical entries. The sender signs a new transaction at the released nonce.
-  - The mark cannot stand for a real id: a real id is a keccak hash, and the mark is a fixed transform of an id in the window.
-  - The mark skips the capacity check, like an epoch marker. The window holds at most one mark for each ordered entry, and the mark leaves with its entry. The window holds at most `dedupCapacity` user ids and 4,096 epoch ids, and at most one mark for each, so a snapshot holds at most `2 * (dedupCapacity + 4096)` ids. The loader refuses more.
-  - A frame that is not 61 bytes is malformed. A release that applies prints `cluster NONCE-RELEASE` at power-of-two counts.
-  - A sealer that does not know kind 10 drops it as an unknown kind. The sequencer sends it only to a sealer that reported decision version 3 (egress kind 17), so a sealer under version 2 gets none, and its log holds none.
-  - The guard goes down only when the expected nonce of the sender is above `nonce`. Every release proves that the chain was at `nonce` when the skipped entry executed, so a release never sets the guard below the chain. The spec (section 5.4) gives the proof, and its one exception: an LRU eviction of the sender while the id is in the window.
-  - The session sends no identity, so the sealer cannot tell a sequencer session from another client. The cluster network is the trust boundary: any cluster client can already send kind 0 with any guard header and kind 7, and now kind 10. The cluster network must admit only the services of the chain.
-  - The sealer does not tie the id to the sender, and cannot tell a marker id (an epoch) from a user id. A release that names a marker id adds one harmless mark. A release that names the id of another sender's entry is a forged frame: see the trust boundary above.
 - Kind 11: the feature activation is a system record of a sequencer. It has no guard header. See [Decision version](#decision-version).
   - The upgrade transaction of the epoch at `l1_origin` schedules `feature_id` at `activation_ms`. The sequencer sends it in front of that epoch, on the same session, and again each time it offers the epoch again. An epoch that the sealer ordered is never offered again, so the record must not come after it.
   - It applies only for `FEATURE_SEALER_V3` (2), only under version 2, only when `l1_origin` is the L1 origin of the state or that origin plus 1 (the epoch that it fronts), and only when `l1_origin` is above the origin of the pending activation. The origins compare unsigned. So the copy of the twin, a record that comes again with its epoch, and the record of another epoch change nothing. The copy of the twin still applies after its epoch, so one lost record does not lose the activation. A later upgrade before the switch replaces the activation time, as `KardamomChainState.setFeature` does.
   - A frame that is not 25 bytes is malformed. With `carryBytes`, a member drops kind 11 as an unknown kind.
   - An activation that applies asks for a snapshot (version 13).
-  - The trust boundary is the one of kind 10: the cluster network admits only the services of the chain. The sealer does not check the record against L1; admin `/status` publishes the activation origin for a check outside the cluster.
+  - The session sends no identity, so the sealer cannot tell a sequencer session from another client. Any cluster client can already send kind 0 with any guard header, and kind 7. The cluster network is the trust boundary: it must admit only the services of the chain. The sealer does not check the record against L1; admin `/status` publishes the activation origin for a check outside the cluster.
 
 ### Relayed record types
 
@@ -153,7 +137,7 @@ The relayed payload is `[canonical_id:32][record_type:u8][fields…]`.
 | 15 | Relayed reference | `[kind=15][index:u64][canonical_id:32][record_type:u8]` (42 bytes) | consumers, with `carryBytes` |
 | 17 | Sealer info | `[kind=17][decision_version:u8][cluster_session_id:i64]` (10 bytes) | under version 3: every session at the switch, then each session when it opens |
 
-- Kind 17: a sequencer sends a nonce release (ingress kind 10) only after it got version 3 or above on its current session. A member under version 2 sends no kind 17. A reader that does not know kind 17 drops it.
+- Kind 17: a sequencer reports the version that it got for its current session (`kardamom_sequencer_sealer_version`). A member under version 2 sends no kind 17. A reader that does not know kind 17 drops it.
 
 - `index` is the 0-based canonical record index.
 - Consumers are the sessions that sent a kind 2 or a kind 1. While no consumer is known, the service sends relayed records to all sessions.
@@ -527,31 +511,32 @@ Every member applies the same log. Two members on two rule versions can decide o
   - An activation record that applies asks for a snapshot. Each member writes its own snapshot: a member of this release writes version 13. So a member that ran this release at the activation and later rolls back to a release that reads only up to version 12 stops on its own snapshot, and does not replay the log with the rules of version 2.
   - A member that runs an older release through the activation drops the record, writes version 10 and stays forked. No snapshot stops it. Only the upgrade check (`just sealer-upgrade-check`, below) guards that case.
   - The switch is one way.
-- Under version 2, the state takes no nonce release (ingress kind 10), and the member sends no sealer info (egress kind 17). A sequencer sends no nonce release meanwhile. It holds them in its queue, and sends them after the switch.
-- Under version 3, the state applies a nonce release. At the switch the member sends kind 17 to every open session. Then it sends kind 17 to each session when it opens, and to every open session at each new leadership term: a leader change can lose a frame of the old leader.
+- Under version 2, the member sends no sealer info (egress kind 17), and it relays a frame of kinds 0, 3, 4 and 5 that ends at the record type.
+- Under version 3, a relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. At the switch the member sends kind 17 to every open session. Then it sends kind 17 to each session when it opens, and to every open session at each new leadership term: a leader change can lose a frame of the old leader.
 - A member writes snapshot version 10 while its state holds no activation. After the activation record it writes version 13, which carries the rules. See [Snapshot](#snapshot).
 - A member with `carryBytes` runs version 3 from its start, and it drops kind 11. `carryBytes` comes with version 3, and every member must match it.
 - Admin `/status` reports `decisionVersion`, `decisionActivationOrigin` and `decisionActivationMs` (both 0 while the state holds no activation). A check outside the cluster can compare the origin with the `setFeature` deposit of that epoch on L1.
 
 The procedure of the upgrade:
 
-1. Deploy the release that reads snapshot version 13 to every sealer member and every sequencer.
+1. Deploy the release that reads snapshot version 13 to every sealer member and every sequencer, and the release that uses the nonce of a skipped transaction to every executor, validator, ingress and sequencer. Roll the prover's zk guest and its verifying key too.
 2. Run `just sealer-upgrade-check <env>`. It must pass before the Safe signs the upgrade transaction.
-   - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 13 or more. A member of an older release drops kind 11 and keeps version 2, so the state forks at the first nonce release.
+   - It reads admin `/status` of every configured member and refuses unless each one reports `snapshotReadsMax` of 13 or more. A member of an older release drops kind 11 and keeps version 2, so the state forks at the first entry that the two versions decide differently.
    - It refuses while a configured member is down.
    - It refuses unless the sequencer job has the meta `sealer_feature_activation = "true"` and every live sequencer allocation runs that job version. An older sequencer sends no kind 11.
+   - It refuses unless the executor, validator, ingress and sequencer jobs have the meta `nonce_burn = "true"` and every live allocation of them runs that job version. An older executor or validator does not use the nonce of a skip and forks the state at the first one.
 3. The Safe signs `ETHLockbox.initiateUpgrade(2, activation_ms)`.
 4. Check the switch: `decisionVersion` 3 on admin `/status` of every member, and `kardamom_sequencer_sealer_version` 3 on every sequencer. A sequencer that gets no kind 17 within 60 s after the activation time logs a warning and counts `kardamom_sequencer_sealer_rules_missing_total`.
 
 - After the activation record is in the log, a rollback of the sealer to an older release is not possible: its loader refuses snapshot version 13.
 - A sealer that starts from a seed file starts on version 2: the seed does not carry the rules. Send the upgrade transaction again.
-- The trust: any client of the cluster can send kind 11, as it can send kind 0, kind 7 and kind 10. The sealer does not check the record against L1. The rule of the fronted epoch bounds when a record can apply, and the published origin lets a later check compare it with L1. The cluster network must admit only the services of the chain.
+- The trust: any client of the cluster can send kind 11, as it can send kind 0 and kind 7. The sealer does not check the record against L1. The rule of the fronted epoch bounds when a record can apply, and the published origin lets a later check compare it with L1. The cluster network must admit only the services of the chain.
 
 | Version | Rule change |
 |---|---|
 | 1 | The first rules. |
 | 2 | A void sets the expected nonce of the sender to the lower of the expected nonce and the voided nonce. |
-| 3 | A nonce release (ingress kind 10) sets the expected nonce of the sender to the lower of the expected nonce and the released nonce, once for each skipped entry. With `carryBytes`, a member orders full entries, relays them as canonical entries, and takes no void request. |
+| 3 | The member sends its rules (egress kind 17) to each session. A relayed frame of kinds 0, 3, 4 and 5 needs its record-type byte. With `carryBytes`, a member orders full entries, relays them as canonical entries, and takes no void request. The contiguity guard does not change. |
 
 - `carryBytes` is a setting that every member must match, and the release gate refuses a rolling change of it. The snapshot layout carries it: a member with `carryBytes` stops on a snapshot that is not version 12, and a member without it stops on version 12.
 
@@ -638,7 +623,6 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster DA-LAG-REJECT` | The DA-lag guard refused a record (`nonce`, `sealedHead`, `postedHead`, `budget`, `totalDaLagRejected`). |
 | `cluster RECORD-LAG-REJECT` | The record-lag guard refused a record (`nonce`, `sealedIndex`, `bestRecorded`, `budget`, `totalRecordLagRejected`). |
 | `cluster POSTED-CURSOR` | The posted head moved up (`postedHead`, `sealedHead`, `retained`, `halted`). |
-| `cluster NONCE-RELEASE` | A nonce release applied (`nonce`, `totalReleased`). It prints at power-of-two counts. A twin copy or a stale release prints nothing. |
 | `cluster RECORDED-CURSOR` | The best recorded cursor moved up (`executorId`, `through`, `best`, `halted`, `totalAdvances`). It prints at power-of-two counts of the moves, because the best cursor moves at the cadence of the executors. `halted` is the record-lag flag. |
 | `cluster WINDOW-FULL` | The dedup window is at capacity. The line shows the size and the capacity. |
 | `cluster REMOTE-ORIGIN-REJECT` | The sealer refused a remote-origin record. The line shows the reason code. |
@@ -680,7 +664,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
 | `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
-- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT`, `NONCE-RELEASE` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
+- The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.
 
 ## Snapshot
@@ -688,7 +672,6 @@ The chaos suite and operators read these lines. The admin server also exports on
 - The member reads snapshot versions 1 to 13. It writes version 10, version 13 after a feature activation is in the log, or version 12 with `carryBytes`.
   - Version 13 is version 10, then the decision rules after the seed digest: `[decision_version:u8][activation_origin:u64][activation_ms:u64]`. A member of an older release refuses it. See [Decision version](#decision-version).
   - Version 12 is the state section of version 10 without the void ledger, then the retention section of the retained file. A member with `carryBytes` takes no void request and no recorded cursor, so it holds neither.
-  - Each snapshot version carries the release marks of the nonce release in the dedup window, as ids.
   - The writer stays one version behind the reader. A member of the previous release reads up to version 10, so it can restore every snapshot that this release writes. A rollback does not stop the old members.
   - A version-10 snapshot holds no recorded cursor. A member that restores one has no cursor until the next cursor record. With the record-lag budget at `0` this changes no decision.
   - The release that turns on the cursor publisher and the record-lag guard writes version 11. Before that release, a `recordLagBudget` above `0` stops the start.

@@ -4,7 +4,10 @@
 //! ([`kardamom_types::upgrades::CHAIN_STATE`]), as
 //! `featureId => activation timestamp (ms)`. Only a system deposit, derived
 //! from an L1 upgrade transaction, writes it. The protocol reads the flag at
-//! every block boundary, and acts on it.
+//! every block boundary, and acts on it. One action is per transaction: the
+//! nonce burn of a skipped transaction ([`crate::executor::Skip::burn_state`])
+//! reads `FEATURE_SEALER_V3` at the skip, with [`activation_slot`] and
+//! [`is_active`].
 //!
 //! Every function here is pure. Given the same stored activation word and
 //! the same block header fields, every role computes the same actions. This

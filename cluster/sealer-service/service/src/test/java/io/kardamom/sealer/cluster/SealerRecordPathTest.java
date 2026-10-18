@@ -30,8 +30,8 @@ import org.junit.jupiter.api.io.TempDir;
  * The record path with bytes, on driverless members: a member with the
  * retained file orders a full entry, retains the canonical entry, and
  * sends each egress session the relayed reference. The refusals are the
- * same as on a member without the file, every member writes the same
- * snapshot bytes, and the nonce release applies once for each skip.
+ * same as on a member without the file, and every member writes the same
+ * snapshot bytes.
  */
 class SealerRecordPathTest {
 
@@ -64,7 +64,7 @@ class SealerRecordPathTest {
         return out;
     }
 
-    /** The id of entry {@code n}: not a keccak hash, but distinct from every mark of another entry. */
+    /** The id of entry {@code n}: not a keccak hash, but distinct from the id of every other entry. */
     private static byte[] id(final int n) {
         return IngressFrames.canonicalId(n);
     }
@@ -86,11 +86,6 @@ class SealerRecordPathTest {
 
     private static byte[] offer(final int n, final long nonce) {
         return offer(n, nonce, Long.MAX_VALUE);
-    }
-
-    /** The nonce release of the skipped entry {@code n}: the chain expects {@code nonce}. */
-    private static byte[] release(final int n, final long nonce) {
-        return IngressFrames.nonceReleaseFrame(SENDER, nonce, id(n));
     }
 
     /** The canonical entry that the file retains for entry {@code n} at {@code index}. */
@@ -209,11 +204,9 @@ class SealerRecordPathTest {
         assertSameFrames(heap, file);
     }
 
-    /** The same log on a member: entries, a skip release and its twin copy, and a boundary. */
+    /** The same log on a member: entries and a boundary. */
     private static void sameLog(final SealerClusteredService svc, final StubSession sequencer) {
         IntStream.range(1, 4).forEach(n -> deliver(svc, sequencer, offer(n, n - 1)));
-        deliver(svc, sequencer, release(2, 1));
-        deliver(svc, sequencer, release(2, 1));
         tick(svc);
     }
 
@@ -230,20 +223,29 @@ class SealerRecordPathTest {
         snapshots.forEach(s -> assertArrayEquals(snapshots.get(0), s));
     }
 
+    /**
+     * The guard counts every ordered entry: after nonces 0 to 2, it refuses
+     * nonce 1 and orders nonce 3. A frame of kind 10, which no release
+     * defines, drops as an unknown kind and changes no guard.
+     */
     @Test
-    void a_release_after_a_skip_lets_a_new_transaction_in_at_the_lower_nonce() {
+    void the_guard_expects_the_nonce_after_the_last_ordered_entry() {
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = fileMember("a");
         sameLog(svc, sequencer);
-        // Nonce 1 (entry 2) skipped; the guard expected 3, and now expects 1.
+        final byte[] unknown = new byte[1 + CanonicalSealerState.SENDER_LEN + Long.BYTES
+            + CanonicalSealerState.CANONICAL_ID_LEN];
+        unknown[0] = 10;
+        deliver(svc, sequencer, unknown);
+        assertEquals(1L, svc.droppedUnknownKindCount());
         deliver(svc, sequencer, offer(9, 1));
-        deliver(svc, sequencer, offer(2, 1));
+        deliver(svc, sequencer, offer(4, 3));
         final StubSession observer = cluster.addSession(3);
         deliver(svc, observer, IngressFrames.replayRequestFrame(3, 2));
-        assertSameFrames(List.of(referenceFrame(9, 3)), observer.offered.stream()
+        assertSameFrames(List.of(referenceFrame(4, 3)), observer.offered.stream()
             .filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED_REF).toList());
-        assertTrue(withoutStatus(sequencer).stream().noneMatch(f -> f[0] == SealerWire.EGRESS_KIND_CONTIGUITY_REJECT),
-            "the new transaction gets in, and the same signed bytes drop as a duplicate");
+        assertTrue(withoutStatus(sequencer).stream().anyMatch(f -> f[0] == SealerWire.EGRESS_KIND_CONTIGUITY_REJECT),
+            "the guard refuses nonce 1");
     }
 
     @Test
@@ -258,8 +260,8 @@ class SealerRecordPathTest {
         final SealerClusteredService restored = member(Optional.empty(), Optional.of(snapshot));
         assertEquals(10, restored.latestSnapshotVersion());
         List.of(original, restored).forEach(svc -> {
-            deliver(svc, sequencer, release(2, 1));
             deliver(svc, sequencer, offer(9, 1));
+            deliver(svc, sequencer, offer(4, 3));
         });
         assertArrayEquals(original.snapshot(), restored.snapshot());
     }

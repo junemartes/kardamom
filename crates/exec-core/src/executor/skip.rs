@@ -6,12 +6,17 @@ use alloy_primitives::{Address, B256};
 use kardamom_types::xchain::XChainMessage;
 use kardamom_types::{BPosition, Deposit, Receipt, SkipReason, StateDatabase, TxEnvelope};
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use revm::context::result::{EVMError, InvalidTransaction};
+use revm::state::EvmState;
 
 use crate::delta::WriteSet;
+use crate::error::ExecutorError;
 use crate::exec_types::TxSlot;
 
+use super::burn::NonceBurn;
 use super::scope::Executor;
 
 /// A transaction's receipt identity: the fields a [`Receipt`] states
@@ -182,6 +187,120 @@ pub fn skip_reason_of_tx(err: &revm::context::result::InvalidTransaction) -> Ski
     }
 }
 
+/// A canonical record that execution skips: its block slot, its envelope,
+/// and the block it runs in. [`Self::undecodable`] and [`Self::rejected`]
+/// build its [`Skip`].
+#[derive(Clone, Copy)]
+pub struct SkippedRecord<'a> {
+    pub slot: TxSlot,
+    pub inbound_envelope: &'a TxEnvelope,
+    pub block_number: u64,
+}
+
+impl<'a> SkippedRecord<'a> {
+    /// The skip of a record whose bytes do not decode. It carries no
+    /// nonce, so it uses none.
+    #[must_use]
+    pub fn undecodable(self, detail: String) -> Skip<'a> {
+        Skip {
+            reason: SkipReason::Undecodable,
+            detail,
+            burnable: false,
+            record: self,
+            nonce: 0,
+            to: None,
+        }
+    }
+
+    /// The skip of a decoded transaction at `nonce` to `to` that
+    /// `transact` refused with `e`. A validation rejection is
+    /// deterministic: every replica computes the same one from the same
+    /// state and transaction, so the record skips.
+    ///
+    /// The skip can use its nonce only when the rejection comes from the
+    /// transaction against the chain state, and leaves the chain nonce of
+    /// the sender possibly at `nonce`. A reason that cannot use a nonce
+    /// ([`SkipReason::can_use_nonce`]) and a chain-id rejection (a
+    /// transaction for another chain) never do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Execution`] for a database or a custom
+    /// failure. It is local, not derivable from the input, so execution
+    /// halts, and crash recovery replays cleanly.
+    pub fn rejected<E: core::fmt::Debug>(
+        self,
+        e: EVMError<E>,
+        nonce: u64,
+        to: Option<Address>,
+    ) -> Result<Skip<'a>, ExecutorError> {
+        let (reason, detail, other_chain) = match e {
+            EVMError::Transaction(e) => (
+                skip_reason_of_tx(&e),
+                format!("{e:?}"),
+                matches!(
+                    e,
+                    InvalidTransaction::InvalidChainId | InvalidTransaction::MissingChainId
+                ),
+            ),
+            EVMError::Header(e) => (SkipReason::Header, format!("{e:?}"), false),
+            e => {
+                return Err(ExecutorError::Execution {
+                    idx: self.slot.tx_idx,
+                    detail: format!("{e:?}"),
+                });
+            }
+        };
+        Ok(Skip {
+            reason,
+            detail,
+            burnable: reason.can_use_nonce() && !other_chain,
+            record: self,
+            nonce,
+            to,
+        })
+    }
+}
+
+/// A skipped canonical record: what its skip receipt states, what its
+/// error log names, and whether its rejection can use the nonce.
+pub struct Skip<'a> {
+    reason: SkipReason,
+    detail: String,
+    burnable: bool,
+    record: SkippedRecord<'a>,
+    /// The nonce of the transaction, 0 for undecodable bytes.
+    nonce: u64,
+    to: Option<Address>,
+}
+
+impl Skip<'_> {
+    /// The state change of the nonce burn of this skip, read through `db`
+    /// at the block timestamp `timestamp_ms`. `None` when the skip uses
+    /// no nonce. See [`NonceBurn`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::State`] when a read of `db` fails.
+    pub fn burn_state<DB: revm::Database>(
+        &self,
+        db: &mut DB,
+        timestamp_ms: u64,
+    ) -> Result<Option<EvmState>, ExecutorError>
+    where
+        DB::Error: core::fmt::Debug,
+    {
+        if !self.burnable {
+            return Ok(None);
+        }
+        NonceBurn {
+            sender: self.record.inbound_envelope.sender,
+            nonce: self.nonce,
+        }
+        .state(db, timestamp_ms)
+    }
+}
+
 /// The deterministic skip receipt, as an associated constructor. It
 /// needs no state access. The Block-STM engine builds skip receipts
 /// inside its own worker EVM, and both paths must keep one definition
@@ -190,23 +309,29 @@ impl<S: StateDatabase> Executor<S> {
     /// Build the deterministic skip receipt for a canonical record that is
     /// invalid at execution: `status=false, gas_used=0` (the wire-visible
     /// marker, since real execution always charges intrinsic gas), empty
-    /// logs, an empty write set (`WriteSet::default().hash()` on both the
-    /// live and re-exec sides), and unchanged gas accounting. This is loud
-    /// by design: a log plus a counter. A skip existing at all means an
-    /// upstream guard (sequencer nonce fence, cluster dedup, or resync
-    /// floor) let an invalid record reach the canonical log.
-    pub fn skip_receipt(
-        reason: SkipReason,
-        detail: &str,
-        slot: TxSlot,
-        inbound_envelope: &TxEnvelope,
-        nonce: u64,
-        to: Option<Address>,
-        block_number: u64,
-    ) -> (Receipt, WriteSet) {
-        log_invalid(
+    /// logs, and unchanged gas accounting. `ws` is the empty write set,
+    /// or the nonce burn of the sender ([`NonceBurn::state`]). Its hash is
+    /// the receipt's `write_set_hash` on the live and the re-exec sides.
+    /// This is loud by design: a log plus a counter. A skip existing at
+    /// all means an upstream guard (sequencer nonce fence, cluster dedup,
+    /// or resync floor) let an invalid record reach the canonical log.
+    pub fn skip_receipt(skip: Skip<'_>, ws: WriteSet) -> (Receipt, WriteSet) {
+        let Skip {
             reason,
             detail,
+            record:
+                SkippedRecord {
+                    slot,
+                    inbound_envelope,
+                    block_number,
+                },
+            nonce,
+            to,
+            ..
+        } = skip;
+        log_invalid(
+            reason,
+            &detail,
             block_number,
             InvalidTx::CanonicalSkip {
                 inbound_envelope,
@@ -222,7 +347,7 @@ impl<S: StateDatabase> Executor<S> {
                 nonce,
             },
             SkipContext::new(slot, block_number),
-            WriteSet::default(),
+            ws,
             None,
             reason,
         )

@@ -6,6 +6,7 @@
 mod bal_shadow;
 mod block_close;
 mod interop;
+mod replay_burn_parity;
 mod replay_parity;
 mod streaming;
 mod tx_hook;

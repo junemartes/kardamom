@@ -10,8 +10,9 @@ import java.nio.ByteBuffer;
  * index on every member, and the snapshot carries it.
  *
  * <p>Version 2 is the rules of a state that holds no activation. Version 3
- * adds the nonce release ({@link CanonicalSealerState#onRelease}) and the
- * rules frame to each session. An upgrade transaction on L1 schedules
+ * sends the rules frame to each session, and relays a frame of kinds 0, 3,
+ * 4 and 5 only when it carries the record-type byte. A state that holds an
+ * activation writes snapshot version 13. An upgrade transaction on L1 schedules
  * {@link #FEATURE_SEALER_V3} at an activation time. The sequencer sends the
  * schedule as a feature activation record in front of the epoch that holds
  * the upgrade. The rules switch to version 3 at the first log entry whose
@@ -35,7 +36,10 @@ public final class DecisionRules {
     /** The rules of a state that holds no activation. Every member starts on it. */
     public static final int START_VERSION = 2;
 
-    /** The newest rules: the nonce release applies. */
+    /**
+     * The newest rules: the rules frame goes to each session, and a relayed
+     * frame needs its record type.
+     */
     public static final int NEWEST_VERSION = 3;
 
     /**

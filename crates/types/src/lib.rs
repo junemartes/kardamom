@@ -75,7 +75,8 @@ pub use prover::{
 };
 pub use receipt::{AccountRow, ReceiptBatch, ReceiptRollback, ReceiptRows};
 pub use receipt::{
-    Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN, WireLog, tx_type_of,
+    EMPTY_WRITE_SET_HASH, Receipt, SkipReason, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN,
+    WireLog, tx_type_of,
 };
 pub use shard_map::{ShardMap, ShardMapError, vslot_for};
 pub use state::{SnapshotSource, StateDatabase, StateError};

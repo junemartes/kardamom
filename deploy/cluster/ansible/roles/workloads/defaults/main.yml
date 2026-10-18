@@ -345,3 +345,19 @@ workloads_registry_url: >-
 workloads_gate_manifest_types: >-
   application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json,
   application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json
+
+# The services the upgrade check of FEATURE_SEALER_V3 reads: each job must
+# carry the job metas, and each live allocation must run that job version.
+workloads_upgrade_jobs:
+  - name: sequencer
+    metas: [sealer_feature_activation, nonce_burn]
+    does: send the feature activation and take a skip that uses its nonce
+  - name: executor
+    metas: [nonce_burn]
+    does: use the nonce of a skipped transaction
+  - name: validator
+    metas: [nonce_burn]
+    does: use the nonce of a skipped transaction
+  - name: ingress
+    metas: [nonce_burn]
+    does: take a skip that uses its nonce

@@ -19,7 +19,7 @@ A transaction goes through up to three stages. Or it ends at `rejected`.
 | `rejected` | The sequencer | The sequencer, or the sealer through the sequencer, did not order the transaction. It never gets a receipt. |
 
 - The order for one transaction is `offered`, `sealed`, `executed`. Events can arrive in another order. Sort by stage, not by arrival.
-- `executed` with `status` `0` is a revert, a halt, or a skipped transaction. A skipped transaction has `gasUsed` `0` in its receipt, and it did not happen.
+- `executed` with `status` `0` is a revert, a halt, or a skipped transaction. A skipped transaction has `gasUsed` `0` in its receipt, and it did not run. After the activation of `FEATURE_SEALER_V3`, a skip at the chain nonce uses its nonce.
 - A transaction that the ingress refuses (rate limit, bad signature, and so on) never enters the pipeline. It has no event.
 - The stream is `tx_status` (stream id 1018). It is RAM only. It has no archive.
 - Each executor publishes its own copy of a receipt, and each ingress replica publishes a `sealed`. The notifier keeps each stage of a transaction once.

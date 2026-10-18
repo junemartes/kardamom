@@ -18,6 +18,7 @@ use kardamom_exec_core::exec_types::ReceiptStatus;
 use kardamom_exec_core::exec_types::{TxIndex, TxSlot};
 use kardamom_exec_core::executor::DecodedTx;
 use kardamom_exec_core::executor::Executor;
+use kardamom_exec_core::executor::{Skip, SkippedRecord};
 use kardamom_types::BPosition;
 use kardamom_types::Receipt;
 use kardamom_types::StateDatabase;
@@ -80,44 +81,59 @@ pub(super) struct ExecCtx<'a> {
 }
 
 impl TxJob<'_> {
-    /// Build the skip-path result: a receipt and empty write set, no
-    /// reads recorded, no fee credited. Used for every reason a
-    /// transaction never really ran (undecodable, or an `EVMError` the
-    /// executor treats as a skip rather than a hard failure). `self`'s
-    /// own `position`, `envelope`, and `local_idx` fill in three of the
-    /// skip receipt's fields, so the caller supplies only what is
-    /// specific to the failure (the reason, the detail text, the
-    /// resolved nonce and recipient, and the block number).
+    /// This transaction as a skip of block `block_number`. Its slot has
+    /// no cumulative gas: the commit pass sets it.
+    fn skipped(&self, block_number: u64) -> SkippedRecord<'_> {
+        SkippedRecord {
+            slot: TxSlot {
+                tx_idx: self.tx_idx,
+                tx_position: self.position,
+                tx_index_in_block: u64::from(self.local_idx),
+                cumulative_gas_used_before: 0,
+            },
+            inbound_envelope: self.envelope,
+            block_number,
+        }
+    }
+
+    /// Build the skip-path result, for every reason a transaction never
+    /// really ran (undecodable, or an `EVMError` the executor treats as a
+    /// skip rather than a hard failure). Every skip result carries the
+    /// reads of the transaction through the view, so the validation of
+    /// the block covers what the rejection read: a nonce or a balance
+    /// that an earlier transaction of the block changes. A skip with no
+    /// nonce burn credits no fee and writes nothing. A burn
+    /// ([`Skip::burn_state`]) publishes its state as an executed
+    /// transaction does, so the validation also covers the feature flag
+    /// that it read.
     fn skip<S: StateDatabase>(
         &self,
-        reason: kardamom_types::SkipReason,
-        detail: &str,
-        nonce: u64,
-        to: Option<alloy_primitives::Address>,
-        block_number: u64,
-    ) -> TxResult {
-        let slot = TxSlot {
-            tx_idx: self.tx_idx,
-            tx_position: self.position,
-            tx_index_in_block: u64::from(self.local_idx),
-            cumulative_gas_used_before: 0,
+        evm: &mut WorkerEvm<'_, S>,
+        ctx: ExecCtx<'_>,
+        skip: Skip<'_>,
+        fresh_reads: &mut impl FnMut() -> Vec<ReadRecord>,
+    ) -> Result<TxResult, ExecutorError> {
+        let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
+        let Some(state) = skip.burn_state(db, ctx.env.l2_timestamp)? else {
+            let reads = std::mem::replace(&mut db.reads, fresh_reads());
+            let (receipt, ws) = Executor::<S>::skip_receipt(skip, WriteSet::default());
+            return Ok(TxResult {
+                receipt,
+                ws,
+                reads,
+                sink_fee_delta: None,
+                bal_frag: None,
+            });
         };
-        let (receipt, ws) = Executor::<S>::skip_receipt(
-            reason,
-            detail,
-            slot,
-            self.envelope,
-            nonce,
-            to,
-            block_number,
-        );
-        TxResult {
+        let published = Published::of_state(evm, *self, ctx, &state, fresh_reads)?;
+        let (receipt, ws) = Executor::<S>::skip_receipt(skip, published.ws);
+        Ok(TxResult {
             receipt,
             ws,
-            reads: Vec::new(),
-            sink_fee_delta: None,
-            bal_frag: None,
-        }
+            reads: published.reads,
+            sink_fee_delta: published.sink_fee_delta,
+            bal_frag: published.bal_frag,
+        })
     }
 }
 
@@ -134,13 +150,11 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
 ) -> Result<TxResult, ExecutorError> {
     use alloy_consensus::Transaction;
     let Some(alloy_env) = job.decoded else {
-        return Ok(job.skip::<S>(
-            kardamom_types::SkipReason::Undecodable,
-            "undecodable raw_tx",
-            0,
-            None,
-            ctx.env.block_number,
-        ));
+        reaim(evm, job.local_idx);
+        let skip = job
+            .skipped(ctx.env.block_number)
+            .undecodable("undecodable raw_tx".into());
+        return job.skip(evm, ctx, skip, fresh_reads);
     };
     let (signer, nonce, to) = (job.envelope.sender, alloy_env.nonce(), alloy_env.to());
     let fees = alloy_env.fees();
@@ -148,29 +162,9 @@ pub(super) fn execute_one<S: StateDatabase, F: FnMut() -> Vec<ReadRecord>>(
     let t_evm = std::time::Instant::now();
     let outcome = match evm.transact(tx_env) {
         Ok(o) => o,
-        Err(revm::context::result::EVMError::Transaction(e)) => {
-            return Ok(job.skip::<S>(
-                kardamom_exec_core::executor::skip_reason_of_tx(&e),
-                &format!("{e:?}"),
-                nonce,
-                to,
-                ctx.env.block_number,
-            ));
-        }
-        Err(revm::context::result::EVMError::Header(e)) => {
-            return Ok(job.skip::<S>(
-                kardamom_types::SkipReason::Header,
-                &format!("{e:?}"),
-                nonce,
-                to,
-                ctx.env.block_number,
-            ));
-        }
         Err(e) => {
-            return Err(ExecutorError::Execution {
-                idx: job.tx_idx,
-                detail: format!("{e:?}"),
-            });
+            let skip = job.skipped(ctx.env.block_number).rejected(e, nonce, to)?;
+            return job.skip(evm, ctx, skip, fresh_reads);
         }
     };
     build_tx_result(
@@ -213,13 +207,7 @@ fn build_tx_result<S: StateDatabase>(
     ran: Ran,
     fresh_reads: &mut impl FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
-    let ExecCtx {
-        mv,
-        metrics,
-        env,
-        sink_start_balance,
-        bal_base,
-    } = ctx;
+    let ExecCtx { metrics, env, .. } = ctx;
     let Ran {
         mut outcome,
         evm_ns,
@@ -234,42 +222,19 @@ fn build_tx_result<S: StateDatabase>(
     // path applies it: the tip in full, the base fee as the price.
     let price =
         kardamom_exec_core::settle::settle(&fees, env.fees, gas_used, &mut outcome.state, signer)?;
-    let sink = env.fees.beneficiary;
     // Build wire logs straight from the borrowed result: no
     // intermediate `logs.clone()` (topic Vecs and data Bytes per log).
     let (status, wire_logs) = status_and_wire_logs(&outcome.result);
 
-    let ws = WriteSet::from_evm_state(&outcome.state);
-    // EIP-7928 capture: this transaction's fragment at its block-global
-    // index, through the same update_account the streaming path uses on
-    // the same `outcome.state`. Everything the mv cache tracks reads
-    // canonically here (a wound would replace this fragment). The fee
-    // sink is the one untracked account: the commit pass rewrites its
-    // balance write to the computed prefix, exactly as it rewrites the
-    // WriteSet's.
-    let bal_frag = capture_bal(bal_base, job.local_idx, env.block_number, &outcome.state)?;
+    let Published {
+        ws,
+        bal_frag,
+        sink_fee_delta,
+        reads,
+    } = Published::of_state(evm, job, ctx, &outcome.state, fresh_reads)?;
     // Pooled journal: hand the spent state map back so the next
     // transaction does not regrow it (see `recycle_journal`).
     recycle_journal(evm, &mut outcome.state);
-    // Publish in the ordered helper's sequence (code and storage, then
-    // accounts; see `MvCache::publish_write_set`), skipping the fee
-    // sink (Accumulator: all workers see block-start; the commit pass
-    // computes the prefixes).
-    let t_pub = std::time::Instant::now();
-    mv.publish_write_set(job.local_idx, &ws, sink);
-    let pub_ns = nanos(t_pub.elapsed());
-    metrics.publish_ns.fetch_add(pub_ns, Ordering::Relaxed);
-    let sink_fee_delta =
-        sink_fee_delta(&ws, sink, sink_start_balance, env.block_number, job.tx_idx)?;
-    let reads = {
-        // Take this transaction's read log back out of the worker's
-        // view. The replacement comes from the recycle pool (cleared,
-        // with capacity intact from a previous block's transaction).
-        // The fresh per-transaction Vec and its growth reallocations
-        // were the largest STM-specific allocation.
-        let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
-        std::mem::replace(&mut db.reads, fresh_reads())
-    };
     // Hashing now is pure waste when the commit pass must re-hash after
     // patching the accumulator's absolute balance.
     let write_set_hash = if sink_fee_delta.is_some() {
@@ -298,6 +263,69 @@ fn build_tx_result<S: StateDatabase>(
         bal_frag,
         sink_fee_delta,
     })
+}
+
+/// What one transaction's post-state publishes: its write set, its BAL
+/// fragment, its fee-sink credit, and the reads it made through the view.
+struct Published {
+    ws: WriteSet,
+    bal_frag: Option<revm::state::bal::Bal>,
+    sink_fee_delta: Option<U256>,
+    reads: Vec<ReadRecord>,
+}
+
+impl Published {
+    /// Build the write set of `state`, capture its BAL fragment, publish
+    /// it into the multi-version cache, compute the fee-sink credit, and
+    /// take the read log of the transaction out of the worker's view.
+    fn of_state<S: StateDatabase>(
+        evm: &mut WorkerEvm<'_, S>,
+        job: TxJob<'_>,
+        ctx: ExecCtx<'_>,
+        state: &revm::state::EvmState,
+        fresh_reads: &mut impl FnMut() -> Vec<ReadRecord>,
+    ) -> Result<Self, ExecutorError> {
+        let ExecCtx {
+            mv,
+            metrics,
+            env,
+            sink_start_balance,
+            bal_base,
+        } = ctx;
+        let sink = env.fees.beneficiary;
+        let ws = WriteSet::from_evm_state(state);
+        // EIP-7928 capture: this transaction's fragment at its
+        // block-global index, through the same update_account the
+        // streaming path uses on the same state. Everything the mv cache
+        // tracks reads canonically here (a wound would replace this
+        // fragment). The fee sink is the one untracked account: the
+        // commit pass rewrites its balance write to the computed prefix,
+        // exactly as it rewrites the WriteSet's.
+        let bal_frag = capture_bal(bal_base, job.local_idx, env.block_number, state)?;
+        // Publish in the ordered helper's sequence (code and storage, then
+        // accounts; see `MvCache::publish_write_set`), skipping the fee
+        // sink (Accumulator: all workers see block-start; the commit pass
+        // computes the prefixes).
+        let t_pub = std::time::Instant::now();
+        mv.publish_write_set(job.local_idx, &ws, sink);
+        let pub_ns = nanos(t_pub.elapsed());
+        metrics.publish_ns.fetch_add(pub_ns, Ordering::Relaxed);
+        let sink_fee_delta =
+            sink_fee_delta(&ws, sink, sink_start_balance, env.block_number, job.tx_idx)?;
+        // Take this transaction's read log back out of the worker's
+        // view. The replacement comes from the recycle pool (cleared,
+        // with capacity intact from a previous block's transaction).
+        // The fresh per-transaction Vec and its growth reallocations
+        // were the largest STM-specific allocation.
+        let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
+        let reads = std::mem::replace(&mut db.reads, fresh_reads());
+        Ok(Self {
+            ws,
+            bal_frag,
+            sink_fee_delta,
+            reads,
+        })
+    }
 }
 
 /// One scan answers both sink questions: whether this transaction
@@ -360,10 +388,16 @@ fn reaim_and_build_tx_env<S: StateDatabase>(
     alloy_env: &DecodedTx,
     signer: alloy_primitives::Address,
 ) -> revm::context::TxEnv {
+    reaim(evm, local_idx);
+    alloy_env.tx_env(signer)
+}
+
+/// Re-aim the worker's view at the transaction `local_idx`: its index,
+/// and an empty read log.
+fn reaim<S: StateDatabase>(evm: &mut WorkerEvm<'_, S>, local_idx: u32) {
     let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
     db.idx = local_idx;
     db.reads.clear();
-    alloy_env.tx_env(signer)
 }
 
 /// Classify one EVM outcome into a wire status and wire logs, built

@@ -126,10 +126,12 @@ locals {
 
 job "sequencer" {
   # The sequencer of this release sends the feature activation (ingress
-  # kind 11) in front of the epoch of an upgrade transaction. The upgrade
-  # check (`just sealer-upgrade-check <env>`) reads this meta.
+  # kind 11) in front of the epoch of an upgrade transaction, and moves the
+  # nonce floor past a skip that used its nonce. The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads these metas.
   meta {
     sealer_feature_activation = "true"
+    nonce_burn                = "true"
   }
 
   datacenters = [var.datacenter]

@@ -4,7 +4,7 @@
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
-use kardamom_types::{Receipt, SkipReason, StateDatabase, TxEnvelope};
+use kardamom_types::{Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
@@ -18,7 +18,7 @@ use crate::error::ExecutorError;
 use crate::exec_types::{ReceiptStatus, TxSlot};
 
 use super::db::{SnapshotDb, seed_cache_layer};
-use super::skip::skip_reason_of_tx;
+use super::skip::{Skip, SkippedRecord};
 use super::tx_env::DecodedTx;
 
 /// Per-tx read-touch capture for the footprint shadow scheduler. The
@@ -174,15 +174,10 @@ impl<S: StateDatabase> Executor<S> {
         let alloy_env = match DecodedTx::decode(&inbound_envelope.raw_tx, slot.tx_idx) {
             Ok(env_) => env_,
             Err(e) => {
-                return Ok(Self::skip_receipt(
-                    SkipReason::Undecodable,
-                    &format!("undecodable raw_tx: {e}"),
-                    slot,
-                    inbound_envelope,
-                    0,
-                    None,
-                    self.env.block_number,
-                ));
+                let skip = self
+                    .skipped(slot, inbound_envelope)
+                    .undecodable(format!("undecodable raw_tx: {e}"));
+                return self.skip(skip, bal, touches);
             }
         };
         self.execute_tx_decoded(slot, inbound_envelope, &alloy_env, bal, touches)
@@ -221,36 +216,11 @@ impl<S: StateDatabase> Executor<S> {
             Ok(o) => o,
             // Deterministic input invalidity: every replica computes the
             // same rejection from the same state and tx. Skip, never halt.
-            Err(revm::context::result::EVMError::Transaction(e)) => {
-                return Ok(Self::skip_receipt(
-                    skip_reason_of_tx(&e),
-                    &format!("{e:?}"),
-                    slot,
-                    inbound_envelope,
-                    nonce,
-                    to,
-                    self.env.block_number,
-                ));
-            }
-            Err(revm::context::result::EVMError::Header(e)) => {
-                return Ok(Self::skip_receipt(
-                    SkipReason::Header,
-                    &format!("{e:?}"),
-                    slot,
-                    inbound_envelope,
-                    nonce,
-                    to,
-                    self.env.block_number,
-                ));
-            }
-            // Database or custom failures are local, not derivable from
-            // the input. Halting here is correct; crash recovery replays
-            // cleanly.
             Err(e) => {
-                return Err(ExecutorError::Execution {
-                    idx: slot.tx_idx,
-                    detail: format!("{e:?}"),
-                });
+                let skip = self
+                    .skipped(slot, inbound_envelope)
+                    .rejected(e, nonce, to)?;
+                return self.skip(skip, bal, touches);
             }
         };
 
@@ -288,6 +258,43 @@ impl<S: StateDatabase> Executor<S> {
             write_set_hash,
         })?;
         Ok((receipt, ws))
+    }
+
+    /// The record at `slot` as a skip of this block.
+    fn skipped<'a>(&self, slot: TxSlot, inbound_envelope: &'a TxEnvelope) -> SkippedRecord<'a> {
+        SkippedRecord {
+            slot,
+            inbound_envelope,
+            block_number: self.env.block_number,
+        }
+    }
+
+    /// The receipt of a skipped record, and its nonce burn
+    /// ([`Skip::burn_state`]) when it makes one. A burn goes through the
+    /// same steps as an executed transaction's state: the write set, the
+    /// EIP-7928 claim, the touch capture, and the commit into the block
+    /// cache, so a later transaction of the sender reads the new nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::State`] when a read of the burn fails.
+    fn skip(
+        &mut self,
+        skip: Skip<'_>,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+        touches: Option<&mut TouchSet>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        let db = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+        let Some(state) = skip.burn_state(db, self.env.l2_timestamp)? else {
+            return Ok(Self::skip_receipt(skip, WriteSet::default()));
+        };
+        let ws = WriteSet::from_evm_state(&state);
+        if let Some((bal, bal_index)) = bal {
+            Self::record_bal_writes(&state, bal, bal_index);
+        }
+        Self::capture_touches(&state, touches);
+        revm::DatabaseCommit::commit(db, state);
+        Ok(Self::skip_receipt(skip, ws))
     }
 
     /// Record every touched account's EIP-7928 claim at `bal_index`. The

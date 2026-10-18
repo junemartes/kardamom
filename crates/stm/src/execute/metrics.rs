@@ -30,8 +30,9 @@ pub(super) struct TxResult {
     /// EIP-7928 capture fragment: this transaction's BAL updates at its
     /// block-global index (`bal_base + local_idx + 1`), recorded through
     /// the same `Bal::update_account` the streaming path uses. `None`
-    /// when capture is off, or the transaction was an invalid skip (a
-    /// skip carries no fragment in either mode). The commit pass rewrites
+    /// when capture is off, or the transaction was an invalid skip with
+    /// no nonce burn (such a skip carries no fragment in either mode). A
+    /// burn carries the fragment of its nonce write. The commit pass rewrites
     /// the fee-sink balance write to the computed prefix value (workers
     /// see the block-start sink, not the canonical running sum) and
     /// folds the fragments in canonical order.

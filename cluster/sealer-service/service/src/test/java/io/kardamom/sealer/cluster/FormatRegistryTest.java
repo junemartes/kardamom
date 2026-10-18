@@ -86,10 +86,9 @@ final class FormatRegistryTest {
     void ingressKindsMatchTheRegistry() {
         // The sealer reads the recorded cursor, but no service sends it yet.
         // The sequencer sends the feature activation only for an upgrade
-        // transaction, and the nonce release only under decision version 3:
-        // the activation of the format in formats.toml.
+        // transaction: the activation of the format in formats.toml.
         assertKinds("sealer-ingress-kinds", "KIND_",
-            Set.of("KIND_RECORDED_CURSOR", "KIND_NONCE_RELEASE", "KIND_FEATURE_ACTIVATION"));
+            Set.of("KIND_RECORDED_CURSOR", "KIND_FEATURE_ACTIVATION"));
     }
 
     @Test
