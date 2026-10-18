@@ -194,6 +194,12 @@ job "executor" {
     task "executor" {
       driver = "docker"
 
+      # The graceful stop. The run first syncs the receipt ledger and
+      # removes the running marker, then it waits for the checkpoint task.
+      # So a kill after the first step costs no rollback. This gives the
+      # checkpoint round in progress time to end.
+      kill_timeout = "30s"
+
       # BAL granularity measurement (spec phase 1). This logs
       # per-block encoded sizes at each K, so the batch size can be
       # chosen from data. This stays unset in normal operation, and is

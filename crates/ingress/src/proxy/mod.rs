@@ -8,6 +8,8 @@
 //! background stream watchers that [`IngressProxy::new`] spawns.
 
 mod accounts;
+#[cfg(test)]
+mod rollback_tests;
 mod submit;
 mod watchers;
 
@@ -43,11 +45,19 @@ use crate::tx_error_dedup::TxErrorDedup;
 /// its own state and folds one item into it here.
 pub(crate) trait Watch<T> {
     fn on_item(&mut self, item: T) -> impl Future<Output = ()> + Send;
+
+    /// The stream dropped items that this watcher did not read. `rx`
+    /// reads the items after the gap. The default skips the gap: a watcher
+    /// whose stream carries no state to recover reads on.
+    fn on_lagged(&mut self, rx: &mut broadcast::Receiver<T>) -> impl Future<Output = ()> + Send {
+        let _ = rx;
+        std::future::ready(())
+    }
 }
 
 /// Owns a `broadcast::Receiver<T>` and the watcher it feeds. Drains the
-/// receiver into the watcher, skipping `Lagged`, until the sender side
-/// closes. The proxy's watcher tasks spawn [`Self::run`].
+/// receiver into the watcher, and tells it of each `Lagged` gap, until the
+/// sender side closes. The proxy's watcher tasks spawn [`Self::run`].
 pub(crate) struct BroadcastWatcher<T, W> {
     rx: broadcast::Receiver<T>,
     watcher: W,
@@ -73,7 +83,9 @@ where
             match self.rx.recv().await {
                 Ok(item) => self.watcher.on_item(item).await,
                 Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => (),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    self.watcher.on_lagged(&mut self.rx).await;
+                }
             }
         }
     }
@@ -166,8 +178,9 @@ where
     pub(crate) cold: Arc<ColdAccounts>,
     /// The highest `BlockBoundary.block_number` observed on `tx_receipts`.
     /// `eth_blockNumber` reads this. `AtomicU64` is enough here: the
-    /// value only increases, one writer, the `BlockBoundary` watcher, sets
-    /// it, and many readers read it.
+    /// `BlockBoundary` watcher raises it with `fetch_max`, the receipt
+    /// watcher lowers it with `fetch_min` on a rollback, and many readers
+    /// read it.
     pub(crate) latest_block_number: Arc<AtomicU64>,
     /// The fee history of recent blocks: the boundary and receipt
     /// watchers write it, the fee RPCs read it.
@@ -176,7 +189,11 @@ where
     /// each first-seen receipt here, so `kardamom_subscribeReceipts`
     /// sessions see exactly one copy per tx, instead of the raw
     /// N-replica MDS fan-in.
-    pub(crate) receipt_feed: broadcast::Sender<Receipt>,
+    pub(crate) receipt_feed: broadcast::Sender<crate::channels::ReceiptItem>,
+    /// The rollbacks that the receipt watcher applied. A receipt
+    /// subscription that lags on `receipt_feed` reads here whether it
+    /// missed one.
+    pub(crate) applied_rollbacks: watch::Receiver<crate::rollback_log::RollbackLog>,
     /// Post-dedup tx-error re-broadcast, the same pattern as
     /// `receipt_feed`.
     pub(crate) tx_error_feed: broadcast::Sender<TxError>,
@@ -226,6 +243,7 @@ where
             latest_block_number: self.latest_block_number.clone(),
             fee_history: self.fee_history.clone(),
             receipt_feed: self.receipt_feed.clone(),
+            applied_rollbacks: self.applied_rollbacks.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
             draining: self.draining.clone(),
             cluster_status: self.cluster_status.clone(),
@@ -267,6 +285,8 @@ where
             cfg.cache.max_stale_txs,
             live.clone(),
         ));
+        let (applied_tx, applied_rollbacks) =
+            watch::channel(crate::rollback_log::RollbackLog::default());
         let me = Self {
             cfg,
             partition_count_m,
@@ -285,12 +305,13 @@ where
             latest_block_number: Arc::new(AtomicU64::new(0)),
             fee_history: Arc::new(crate::fee_history::FeeHistory::default()),
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
+            applied_rollbacks,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cluster_status,
             sealer: Arc::new(Lifecycle::new(Some(crate::chain::SEALER))),
         };
-        me.spawn_tx_receipts_watcher();
+        me.spawn_tx_receipts_watcher(applied_tx);
         me.spawn_tx_errors_watcher();
         me.spawn_chain_watch();
         // Subscribe only to the watermark streams the configured policy needs.
@@ -475,9 +496,17 @@ where
     }
 
     /// Live feed of deduped receipts, one copy per tx, after MDS fan-in
-    /// dedup. Backs `kardamom_subscribeReceipts`.
-    pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<Receipt> {
+    /// dedup, with the rollbacks in stream order. Backs
+    /// `kardamom_subscribeReceipts`.
+    pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<crate::channels::ReceiptItem> {
         self.receipt_feed.subscribe()
+    }
+
+    /// The rollbacks that this ingress applied. A subscriber that lags on
+    /// [`Self::subscribe_receipt_feed`] reads here whether it missed one.
+    #[must_use]
+    pub fn subscribe_rollbacks(&self) -> watch::Receiver<crate::rollback_log::RollbackLog> {
+        self.applied_rollbacks.clone()
     }
 
     /// Live feed of deduped sequencer tx rejections. Backs the error

@@ -80,6 +80,13 @@ pub(crate) const TX_DATA_QUEUE_DEPTH: &str = "kardamom_executor_tx_data_queue_de
 // node fell behind the retention window.
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
 
+// The automatic rollback. The executor binary bumps this when the canonical
+// stream diverges from its committed history: the cluster continued from a
+// shorter log after a power loss on a majority of the members. The label is
+// `outcome=local-checkpoint`, `outcome=peer-checkpoint`, or
+// `outcome=no-checkpoint`. The last one stops the executor for the operator.
+pub const ROLLBACK_TOTAL: &str = "kardamom_executor_rollback_total";
+
 /// Whether the must-deliver publication of `topic` has a connected
 /// subscriber: 1 while its publishes land, 0 while they fail with
 /// `NOT_CONNECTED`. The commit thread writes it on each change.
@@ -140,6 +147,10 @@ pub fn describe() {
         RESYNC_TOTAL,
         "full-resync fallbacks after a cluster replay-window overrun, by outcome"
     );
+    metrics::describe_counter!(
+        ROLLBACK_TOTAL,
+        "rollbacks to a checkpoint below a divergence of the canonical stream, by outcome"
+    );
     metrics::describe_gauge!(
         PUBLICATION_CONNECTED,
         "1 while the must-deliver publication of the topic has a connected subscriber"
@@ -148,6 +159,11 @@ pub fn describe() {
         PUBLICATION_NOT_CONNECTED_SECONDS,
         "seconds the current unconnected period of the topic has lasted; 0 while connected"
     );
+    describe_footprint();
+}
+
+/// The descriptions of the footprint-shadow series.
+fn describe_footprint() {
     metrics::describe_counter!(
         FOOTPRINT_BLOCKS_TOTAL,
         "footprint-shadow blocks, labelled by outcome (graded|dropped)"

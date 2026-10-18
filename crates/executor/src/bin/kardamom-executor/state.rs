@@ -5,8 +5,9 @@ use std::ops::ControlFlow;
 
 use anyhow::{Context, Result};
 use kardamom_engine::ResumePoint;
+use kardamom_engine::reader::carried::LocalHistory;
 use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
-use kardamom_state::{StateEnv, StateEnvBuilder, read_recovery_point};
+use kardamom_state::{BlockRange, StateEnv, StateEnvBuilder, StateSnapshot, read_recovery_point};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::Args;
@@ -19,21 +20,44 @@ pub(crate) struct PreparedState {
     /// and exec threads seed their absolute counters from it (see
     /// `ResumePoint`).
     pub(crate) start: ResumePoint,
+    /// The periodic checkpoint task, when one runs. It ends on the
+    /// shutdown token, and the process joins it before a repair: a late
+    /// round could otherwise publish a checkpoint of a diverged state, or
+    /// prune the checkpoint that a rollback chose.
+    pub(crate) checkpointer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PreparedState {
+    /// The committed history of the last `window` blocks, which the reader
+    /// of the member feed compares with the stream before it delivers.
+    /// `None` at genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a read of the state DB fails.
+    pub(crate) fn history(&self, window: std::num::NonZeroU64) -> Result<Option<LocalHistory>> {
+        let cursor = kardamom_engine::bin_support::cluster_replay_cursor(&self.start);
+        let snapshot = StateSnapshot::open(&self.env).context("open a snapshot for the history")?;
+        LocalHistory::read(&snapshot, cursor.position(), window)
+            .context("read the committed history")
+    }
 }
 
 /// Fast cold-start recovery, env open, cursor read, checkpointer spawn.
 ///
 /// Restore runs before the env opens. If the state dir is empty (a fresh
-/// or wiped node) and a checkpoint is available locally or from a peer,
-/// startup then sees a populated DB. It replays only the tail, instead of
-/// re-syncing from genesis.
+/// or wiped node) and a checkpoint in `restore` is available locally or
+/// from a peer, startup then sees a populated DB. It replays only the
+/// tail, instead of re-syncing from genesis. A rollback limits `restore`
+/// to the blocks below its divergence point.
 pub(crate) fn prepare_state(
     args: &Args,
     expected_genesis: Option<alloy_primitives::B256>,
+    restore: BlockRange,
     shutdown: CancellationToken,
 ) -> Result<PreparedState> {
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
-        restore_if_fresh(args, ckpt_dir, expected_genesis)?;
+        restore_if_fresh(args, ckpt_dir, restore, expected_genesis)?;
     }
 
     // Open the libmdbx state env and read the durable cursor.
@@ -43,7 +67,7 @@ pub(crate) fn prepare_state(
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
 
-    spawn_checkpointer(args, &env, shutdown);
+    let checkpointer = spawn_checkpointer(args, &env, shutdown);
 
     // Crash-recovery cursor. A non-genesis cursor means the node restarted
     // mid-chain. A fresh start is just a resume from the genesis cursor.
@@ -56,7 +80,11 @@ pub(crate) fn prepare_state(
         );
     }
 
-    Ok(PreparedState { env, start })
+    Ok(PreparedState {
+        env,
+        start,
+        checkpointer,
+    })
 }
 
 /// Restores from a checkpoint, but only on a fresh state dir. A non-fresh
@@ -65,6 +93,7 @@ pub(crate) fn prepare_state(
 fn restore_if_fresh(
     args: &Args,
     ckpt_dir: &std::path::Path,
+    restore: BlockRange,
     expected_genesis: Option<alloy_primitives::B256>,
 ) -> Result<()> {
     // The state dir is fresh only if it has no mdbx data file. Check this
@@ -79,6 +108,7 @@ fn restore_if_fresh(
         ckpt_dir,
         &args.state_dir,
         &args.checkpoint_peers,
+        restore,
         expected_genesis,
     )?;
     log_restore_outcome(ckpt_dir, restored);
@@ -106,49 +136,49 @@ fn log_restore_outcome(ckpt_dir: &std::path::Path, restored: Option<(u64, std::p
 /// Start periodic checkpointing, if the args ask for it. It gives fast
 /// recovery for other nodes, and for this node after a future wipe. Call
 /// this inside a tokio runtime.
-fn spawn_checkpointer(args: &Args, env: &StateEnv, shutdown: CancellationToken) {
+fn spawn_checkpointer(
+    args: &Args,
+    env: &StateEnv,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let (Some(ckpt_dir), Some(interval_secs)) =
         (args.checkpoint_dir.clone(), args.checkpoint_interval_secs.0)
     else {
-        return;
+        return None;
     };
     let round = CheckpointRound {
         env: env.clone(),
         dir: ckpt_dir,
-        keep: args.checkpoint_keep.get(),
+        keep: args.checkpoint_keep,
     };
     let interval = std::time::Duration::from_secs(interval_secs.get());
-    Checkpointer::new(round, interval, shutdown).spawn();
+    Some(Checkpointer::new(round, interval, shutdown).spawn())
 }
 
 /// One checkpoint round's fixed inputs: the state env, the checkpoint
-/// directory, and how many past checkpoints to retain. Cloned into each
+/// directory, and how many of the newest checkpoints to keep. Cloned into each
 /// round's blocking task, so the mdbx transaction stays on one thread for
 /// the whole call.
 #[derive(Clone)]
 struct CheckpointRound {
     env: StateEnv,
     dir: std::path::PathBuf,
-    keep: u64,
+    keep: std::num::NonZeroUsize,
 }
 
 impl CheckpointRound {
     /// One checkpoint + prune round; failures are logged, never fatal.
     fn once(&self) {
         match create_checkpoint(&self.env, &self.dir) {
-            Ok(info) => self.prune_stale(info.block),
+            Ok(_) => self.prune_stale(),
             Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
         }
     }
 
-    /// Prunes checkpoints that fall outside the retention window behind
-    /// `block`. Does nothing until the chain has produced more than
-    /// `self.keep` checkpoints. Failures are logged, never fatal.
-    fn prune_stale(&self, block: u64) {
-        if block <= self.keep {
-            return;
-        }
-        if let Err(e) = prune_checkpoints(&self.dir, block - self.keep + 1) {
+    /// Prunes all checkpoints except the newest `self.keep`, whatever
+    /// their block spacing. Failures are logged, never fatal.
+    fn prune_stale(&self) {
+        if let Err(e) = prune_checkpoints(&self.dir, self.keep) {
             tracing::warn!(error = %e, "checkpoint prune failed");
         }
     }
@@ -177,8 +207,8 @@ impl Checkpointer {
     }
 
     /// Start the interval task. It stops when `shutdown` is cancelled.
-    fn spawn(self) {
-        tokio::spawn(self.run());
+    fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run())
     }
 
     /// The interval loop. The first tick fires immediately and is

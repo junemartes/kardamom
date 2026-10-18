@@ -593,7 +593,7 @@ impl Sequencer {
         let Some(mut r) = self.resync.take() else {
             return;
         };
-        self.apply_receipt_drain(&mut r);
+        let lookups = self.apply_receipt_drain(&mut r);
         // The refusals go before the contiguity rejects, so a refused ref
         // and the rejects of the later refs settle in one iteration. The
         // two arrive on different channels, so the order is not certain,
@@ -605,6 +605,11 @@ impl Sequencer {
         self.apply_sealer_answers(&mut r, ports);
         let releases = r.sealer_takes_releases();
         self.resync = Some(r);
+        // A lookup request reads the rollback generation from
+        // `self.resync`, so the requests go after the controller is back.
+        for sender in lookups {
+            self.request_lookup(sender);
+        }
         if releases {
             let (_, refs, _) = ports.split();
             self.releases.flush(refs);
@@ -665,11 +670,15 @@ impl Sequencer {
             .resync
             .as_ref()
             .is_some_and(|r| r.floor(sender).is_some());
+        let generation = self
+            .resync
+            .as_ref()
+            .map_or(0, crate::resync::ResyncController::generation);
         let Some(lookup) = self.lookup.as_mut().filter(|_| !floor_known) else {
             return;
         };
         self.hot.lookup_requests.increment(1);
-        lookup.request(sender);
+        lookup.request(crate::lookup::LookupRequest { sender, generation });
     }
 
     /// Expire the parked entries whose lifetime (`tx_ttl`) has passed, and

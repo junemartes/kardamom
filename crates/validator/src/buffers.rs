@@ -28,8 +28,8 @@
 //! - `Condvar::wait_timeout` gives the deadline semantics `take` depends on
 //!   (see the comment in [`KeyedBuffer::take`]) with one primitive.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -133,6 +133,20 @@ impl<V: PartialEq> Slot for Results<V> {
     }
     fn results(&self) -> usize {
         Distinct::results(&self.0)
+    }
+}
+
+impl<V> Results<V> {
+    /// Remove from each result the sessions that `void` names, and drop a
+    /// result that names no session any more. Returns how many sessions
+    /// it removed.
+    fn withdraw(&mut self, void: impl Fn(ReplicaId, &V) -> bool) -> usize {
+        let before = Distinct::results(&self.0);
+        self.0.iter_mut().for_each(|Distinct { value, replicas }| {
+            replicas.retain(|replica| !void(*replica, value));
+        });
+        self.0.retain(|d| !d.replicas.is_empty());
+        before.saturating_sub(Distinct::results(&self.0))
     }
 }
 
@@ -249,6 +263,16 @@ impl<K: BufKey, S: Slot> KeyedBuffer<K, S> {
             .flatten()
             .map_or(0, |(_, slot)| slot.results());
         Inserted { refused, evicted }
+    }
+
+    /// Call `keep` on each slot under the lock, and drop each slot for
+    /// which it returns `false`.
+    fn retain(&self, keep: impl FnMut(&K, &mut S) -> bool) {
+        self.inner
+            .lock()
+            .expect("verification buffer lock poisoned")
+            .map
+            .retain(keep);
     }
 
     /// Why `key` is outside the window around `cursor`, if it is.
@@ -394,6 +418,24 @@ impl<K: BufKey, V: PartialEq> ReplicaBuffer<K, V> {
         }
     }
 
+    /// Withdraw every buffered result that `void` names, by key, session
+    /// and value. A replica that rolls its state back publishes its
+    /// results of the higher keys again, maybe with other values. Its old
+    /// results must not meet the local result. Returns the keys that lost
+    /// a result.
+    pub fn withdraw(&self, void: impl Fn(K, ReplicaId, &V) -> bool) -> BTreeSet<K> {
+        let mut keys = BTreeSet::new();
+        let mut withdrawn = 0usize;
+        self.core.retain(|key, slot| {
+            let n = slot.withdraw(|replica, value| void(*key, replica, value));
+            withdrawn = withdrawn.saturating_add(n);
+            keys.extend((n > 0).then_some(*key));
+            !slot.0.is_empty()
+        });
+        metrics::counter_replica_unchecked(self.check, Skip::Withdrawn, withdrawn);
+        keys
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.core.len()
@@ -441,6 +483,16 @@ impl BalBuffer {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::with(Check::Bal, Self::BOUNDS))
+    }
+
+    /// Withdraw the BALs of every replica above `to_block`. A BAL rides
+    /// `tx_bal`, on a session that no receipt names, so the buffer cannot
+    /// tell which replica rolled back. A BAL of a replica that did not roll
+    /// back is still valid: its block then goes unverified by that replica,
+    /// and the replica that rolled back publishes its BAL of the block
+    /// again.
+    pub fn roll_back(&self, to_block: u64) {
+        self.withdraw(|block, _, _| block > to_block);
     }
 
     #[cfg(test)]
@@ -498,6 +550,25 @@ impl ReceiptBuffer {
         late_window: Self::CHECK_WINDOW,
         reach: Self::REACH,
     };
+
+    /// Withdraw the receipts of every session above `to_block`, and the
+    /// rows at the positions of those receipts. Each run of an executor
+    /// publishes on a new session, so the session of the rollback does not
+    /// name the session of the stale receipts. A rows entry sits at the
+    /// position of the last receipt of its batch, which the same frame
+    /// carried.
+    ///
+    /// The withdrawal also removes valid receipts above `to_block`: those
+    /// of the executors that did not roll back, and those that a late copy
+    /// of the rollback finds already published again. Their positions go
+    /// unverified, never to a divergence. The withdrawal acts only on what
+    /// the buffer holds when the rollback arrives.
+    pub fn roll_back(&self, to_block: u64) {
+        let voided = self
+            .receipts
+            .withdraw(|_, _, receipt| receipt.block_number > to_block);
+        self.rows.withdraw(|pos, _, _| voided.contains(&pos));
+    }
 
     #[must_use]
     pub fn new() -> Arc<Self> {

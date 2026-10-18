@@ -128,6 +128,14 @@ impl<P: TxReceiptsPublication> AttestingReceiptSink<P> {
 }
 
 impl<P: TxReceiptsPublication> TxReceiptsPublication for AttestingReceiptSink<P> {
+    /// The rollback record carries no withdrawal: pass it on.
+    fn publish_rollback(
+        &mut self,
+        rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        self.inner.publish_rollback(rollback)
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match &msg {
             CMessage::Receipt(r) => self.buffer_withdrawals(r),

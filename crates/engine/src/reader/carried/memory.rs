@@ -69,6 +69,13 @@ impl MemoryRemote {
         }
     }
 
+    /// Connect the source again on its last connection: the same image
+    /// after a short loss of sight.
+    pub(crate) fn resume(&self) {
+        self.connection
+            .store(self.last.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
     /// Replace the connection with a new one at once, with no disconnect
     /// between: a publisher that restarts within one poll.
     pub(crate) fn reconnect(&self) {

@@ -549,4 +549,8 @@ fn stream_record_layouts_match_the_registry() {
     Registry::assert_rkyv_layout::<kardamom_types::tx_status::TxStatus>(id, "TxStatus");
     Registry::assert_rkyv_layout::<kardamom_types::tx_error::TxError>(id, "TxError");
     Registry::assert_rkyv_layout::<kardamom_types::envelope::TxEnvelope>(id, "TxEnvelope");
+    Registry::assert_rkyv_layout::<kardamom_types::receipt::ReceiptRollback>(
+        "receipt-rollback",
+        "ReceiptRollback",
+    );
 }

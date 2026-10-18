@@ -16,14 +16,13 @@ use alloy_primitives::{Address, B256, Bytes, Log, LogData, U64, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, FeeHistory, TransactionReceipt};
 use jsonrpsee::core::{RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle, SubscriptionSink};
+use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
-use tokio::sync::broadcast;
 
 use crate::channels::{IngressPublication, IngressSubscription, ProxyBackend};
 use crate::error::IngressError;
 use crate::proxy::{AccountField, IngressProxy};
-use kardamom_types::{Receipt, TxError};
+use crate::receipt_subscription::{Feeds, ReceiptSubscription, SenderFilter};
 
 tokio::task_local! {
     /// Set by the HTTP middleware for the lifetime of each request.
@@ -278,132 +277,16 @@ impl<Backend: ProxyBackend> IngressKardamomApiServer for IngressHandlers<Backend
     ) -> SubscriptionResult {
         // This taps the feeds before accepting, so nothing published in
         // between is missed.
-        let receipts = self.proxy.subscribe_receipt_feed();
-        let errors = self.proxy.subscribe_tx_error_feed();
+        let feeds = Feeds {
+            receipts: self.proxy.subscribe_receipt_feed(),
+            rollbacks: self.proxy.subscribe_rollbacks(),
+            errors: self.proxy.subscribe_tx_error_feed(),
+        };
         let sink = pending.accept().await?;
-        let filter = SenderFilter(
-            senders
-                .filter(|s| !s.is_empty())
-                .map(|s| s.into_iter().collect()),
-        );
-        ReceiptSubscription::new(receipts, errors, filter, sink)
+        ReceiptSubscription::new(feeds, SenderFilter::new(senders), sink)
             .run()
             .await?;
         Ok(())
-    }
-}
-
-/// A sender allow-list for `kardamom_subscribeReceipts`. `None` streams
-/// every sender.
-struct SenderFilter(Option<std::collections::HashSet<Address>>);
-
-impl SenderFilter {
-    fn allows(&self, addr: Address) -> bool {
-        self.0.as_ref().is_none_or(|f| f.contains(&addr))
-    }
-}
-
-/// One feed poll's outcome, for [`ReceiptSubscription::next_event`]'s
-/// `select!` arms: an event to send, a filtered-out item to skip, or the
-/// feed closing, which ends the subscription.
-enum NextEvent {
-    Event(ReceiptEvent),
-    FilteredOut,
-    FeedClosed,
-}
-
-/// Owns one `kardamom_subscribeReceipts` session end to end: the two
-/// upstream feeds, the sender filter, and the sink the events go out on.
-struct ReceiptSubscription {
-    receipts: broadcast::Receiver<Receipt>,
-    errors: broadcast::Receiver<TxError>,
-    filter: SenderFilter,
-    sink: SubscriptionSink,
-}
-
-impl ReceiptSubscription {
-    fn new(
-        receipts: broadcast::Receiver<Receipt>,
-        errors: broadcast::Receiver<TxError>,
-        filter: SenderFilter,
-        sink: SubscriptionSink,
-    ) -> Self {
-        Self {
-            receipts,
-            errors,
-            filter,
-            sink,
-        }
-    }
-
-    /// Forwards events to the sink until the sink closes, a feed
-    /// disconnects, or the subscriber goes away.
-    async fn run(mut self) -> Result<(), String> {
-        while let Some(event) = self.next_event().await {
-            if !self.send_event(&event).await? {
-                break; // The subscriber went away.
-            }
-        }
-        Ok(())
-    }
-
-    /// Waits for the next receipt or tx-error frame, applying the
-    /// filter, or a lag marker if either feed fell behind. Returns
-    /// `None` once the sink closes or a feed disconnects, which ends the
-    /// subscription.
-    async fn next_event(&mut self) -> Option<ReceiptEvent> {
-        loop {
-            let next = tokio::select! {
-                () = self.sink.closed() => return None,
-                r = self.receipts.recv() => self.on_receipt_result(r),
-                e = self.errors.recv() => self.on_error_result(e),
-            };
-            match next {
-                NextEvent::Event(event) => return Some(event),
-                NextEvent::FilteredOut => (),
-                NextEvent::FeedClosed => return None,
-            }
-        }
-    }
-
-    /// One `receipts` feed poll, for [`Self::next_event`]'s `select!` arm.
-    fn on_receipt_result(&self, r: Result<Receipt, broadcast::error::RecvError>) -> NextEvent {
-        match r {
-            Ok(rcpt) if !self.filter.allows(rcpt.from) => NextEvent::FilteredOut,
-            Ok(rcpt) => NextEvent::Event(ReceiptEvent::Receipt {
-                receipt: Box::new(RpcReceipt::from(&rcpt).0),
-            }),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
-            }
-            Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
-        }
-    }
-
-    /// One `errors` feed poll, for [`Self::next_event`]'s `select!` arm.
-    fn on_error_result(&self, e: Result<TxError, broadcast::error::RecvError>) -> NextEvent {
-        match e {
-            Ok(err) if !self.filter.allows(err.sender) => NextEvent::FilteredOut,
-            Ok(err) => NextEvent::Event(ReceiptEvent::TxError {
-                sender: err.sender,
-                nonce: err.nonce,
-                reason: err.reason.word().to_string(),
-                expected_nonce: err.reason.expected_nonce(),
-            }),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                NextEvent::Event(ReceiptEvent::Lagged { skipped: n })
-            }
-            Err(broadcast::error::RecvError::Closed) => NextEvent::FeedClosed,
-        }
-    }
-
-    /// Serializes and sends one event to the subscriber. Returns
-    /// `Ok(false)` if the subscriber went away, so the caller ends the
-    /// loop instead of treating a closed sink as an error.
-    async fn send_event(&self, event: &ReceiptEvent) -> Result<bool, String> {
-        let msg = serde_json::value::to_raw_value(event)
-            .map_err(|e| format!("serialize subscription event: {e}"))?;
-        Ok(self.sink.send(msg).await.is_ok())
     }
 }
 
@@ -421,7 +304,7 @@ impl ReceiptSubscription {
 /// are both foreign to this crate: the orphan rule blocks `impl
 /// From<&Receipt> for TransactionReceipt` directly, but allows it for a
 /// local wrapper type.
-struct RpcReceipt(KardamomReceipt);
+pub(crate) struct RpcReceipt(pub(crate) KardamomReceipt);
 
 impl From<&kardamom_types::Receipt> for RpcReceipt {
     fn from(r: &kardamom_types::Receipt) -> Self {
