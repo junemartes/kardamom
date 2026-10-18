@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 
 use kardamom_engine::MockStateDatabase;
 use kardamom_engine::actor::BlockExecStrategy;
+use kardamom_engine::actor::fixtures::ChainStateGenesis;
 use kardamom_engine::actor::flag_switches::FlagSwitches;
 use kardamom_executor::parallel::{StmBlockExec, StmExecConfig};
 use kardamom_types::Receipt;
@@ -31,10 +32,14 @@ fn run(chain: &FlagSwitches, workers: usize) -> Vec<Vec<Receipt>> {
     })
 }
 
+/// On a genesis with the chain-state predeploy, and on one without it,
+/// where the first `setFeature` deposit installs the code.
 #[test]
 fn the_stm_strategy_switches_flags_at_the_same_block() {
-    let chain = FlagSwitches::new();
-    for workers in [1, 4] {
-        FlagSwitches::assert_burns(&run(&chain, workers));
+    for genesis in ChainStateGenesis::ALL {
+        let chain = FlagSwitches::new(genesis);
+        for workers in [1, 4] {
+            FlagSwitches::assert_burns(&run(&chain, workers));
+        }
     }
 }

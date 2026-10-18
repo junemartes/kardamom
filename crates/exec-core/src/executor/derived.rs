@@ -7,13 +7,13 @@
 //! `to`); [`DerivedCall`] and [`DerivedCall::derived_receipt`] name that
 //! shared shape once, instead of writing it out four times.
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use kardamom_types::Receipt;
 use kardamom_types::{Deposit, WireLog};
 use revm::context::TxEnv;
 use revm::context::result::{EVMError, ExecResultAndState, ExecutionResult};
 use revm::primitives::Log;
-use revm::state::EvmState;
+use revm::state::{AccountInfo, EvmState};
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
 use alloc::format;
@@ -99,12 +99,7 @@ where
     /// Returns [`ExecutorError::Execution`] when the account read fails,
     /// or when crediting the mint would overflow `U256`.
     pub(super) fn credit_mint(&mut self, deposit: &Deposit) -> Result<(), ExecutorError> {
-        let mut info = revm::Database::basic(self.cache, deposit.from)
-            .map_err(|e| ExecutorError::Execution {
-                idx: self.slot.tx_idx,
-                detail: format!("basic({:?}): {e:?}", deposit.from),
-            })?
-            .unwrap_or_default();
+        let mut info = self.account(deposit.from)?;
         info.balance = info
             .balance
             .checked_add(U256::from(deposit.mint))
@@ -115,14 +110,34 @@ where
                     deposit.from, deposit.mint
                 ),
             })?;
+        self.commit_account(deposit.from, info);
+        Ok(())
+    }
+
+    /// The account at `address` in the cache, or the empty account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::Execution`] when the account read fails.
+    pub(super) fn account(&mut self, address: Address) -> Result<AccountInfo, ExecutorError> {
+        revm::Database::basic(self.cache, address)
+            .map(Option::unwrap_or_default)
+            .map_err(|e| ExecutorError::Execution {
+                idx: self.slot.tx_idx,
+                detail: format!("basic({address:?}): {e:?}"),
+            })
+    }
+
+    /// Commit `info` at `address` into the cache, before the inner call.
+    /// A revert of the call does not roll it back.
+    pub(super) fn commit_account(&mut self, address: Address, info: AccountInfo) {
         let mut acct = revm::state::Account::from(info);
         acct.mark_touch();
         // A single-entry commit, built with `once(...).collect()` instead
         // of a std `HashMap`. The exec core is `no_std` and must not
         // depend on `RandomState`.
         self.cache
-            .commit(core::iter::once((deposit.from, acct)).collect());
-        Ok(())
+            .commit(core::iter::once((address, acct)).collect());
     }
 
     /// Run one fee-free, nonce-check-off inner call: build a fresh EVM

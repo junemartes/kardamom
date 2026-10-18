@@ -1371,6 +1371,16 @@ An **upgrade transaction** turns on a feature flag.
 - The sealer cannot read the chain state. To switch at the same block, it must apply this rule from the activation value that kind 11 stores in its log and from the header times that it assigns.
 - `KardamomChainState.isActive` is a view for contracts. It reads the state at the transaction, so in the block of a `setFeature` it can answer differently from the frozen set. No protocol rule reads it.
 
+**A genesis without the chain-state code.** A genesis can lack the `KardamomChainState` code at `CHAIN_STATE` (`0x4200…0017`). The staging genesis (`deploy/cluster/config/genesis/dev.toml`) has none.
+
+- Before a `setFeature` system deposit (from `SYSTEM_UPGRADER`, to `CHAIN_STATE`) calls, the executor reads the account. When the account has no code, the executor installs the canonical runtime code (`CHAIN_STATE_CODE` in `crates/types/src/upgrades.rs`, the code of `chains/dev-withdrawals.toml`). Then the call runs and writes the flag word. The flag switches by the rule above: from the next block.
+- The install keeps the nonce, the balance and the storage of the account. A revert of the call keeps the install, as it keeps a mint. On a genesis with the code, the install does nothing.
+- The install is a write of its deposit. The write set, the block delta and the BAL claims of the deposit hold the account and the code.
+- Every block driver runs the install from `exec-core` (`crates/exec-core/src/executor/install.rs`), on both deposit paths: the live engine (streaming and whole-block), the Block-STM strategy (deposits run there as serial singletons, so no worker reads or writes the code), the validator's parallel path, replay and `kardamom-reconstruct`, and the zk guest. The witness holds the account, so the guest proves that it had no code.
+- No past block changes: a block without a system deposit never runs the rule.
+- An older executor or validator runs the deposit as a call to an empty account. Its state forks at that deposit. The job meta `chain_state_install = "true"` marks the executor and validator jobs of this release, and `just sealer-upgrade-check <env>` requires it. The zk guest links the install, so roll the prover's guest and its verifying key before the first upgrade transaction.
+- Proof: `crates/exec-core/src/executor/install_tests.rs`, `crates/engine/src/actor/exec_tests/flag_freeze.rs` (`every_driver_switches_at_the_same_block`), `crates/executor/tests/flag_freeze.rs`, `crates/validator/src/parallel/engine_tests/flag_freeze.rs`, `crates/validator/tests/witness_anchoring.rs` (`the_guest_installs_the_chain_state_code_with_the_first_upgrade`), `crates/deployer/tests/chainstate_genesis_predeploy.rs`, and the S13d cases of the chain-semantics suite on both geneses.
+
 **Mixed-version fleets fail-stop rather than fork.** This happens in two places.
 
 - An **old validator** halts at the epoch that contains the upgrade.

@@ -10,9 +10,13 @@
 //! must give the same receipts and writes in every block. Each on-phase
 //! has a burning skip, and the expected burns are
 //! [`FlagSwitches::EXPECTED_BURNS`].
+//!
+//! The genesis holds the chain-state predeploy or not
+//! ([`ChainStateGenesis`]). Without it, the first `setFeature` deposit
+//! installs the code, and the chain switches at the same blocks.
 
-use alloy_primitives::{Address, U256, address};
-use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
+use alloy_primitives::{Address, U256, address, keccak256};
+use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FEATURE_SEALER_V3};
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, Receipt};
 use revm::primitives::KECCAK_EMPTY;
 
@@ -23,7 +27,7 @@ use crate::features::BlockFeatures;
 use crate::state::MockStateDatabase;
 use crate::stateless::{BlockExecOutput, BufferedRecord, execute_block};
 
-use super::fixtures::{ChainStatePredeploy, LegacyTx, seeded_signer};
+use super::fixtures::{ChainStateGenesis, ChainStatePredeploy, LegacyTx, seeded_signer};
 
 const PAYEE: Address = address!("00000000000000000000000000000000000E0003");
 /// One transfer costs at most 2.1e15 wei at this gas price.
@@ -82,13 +86,14 @@ const BLOCKS: [&[Item]; 4] = [
 
 /// The chain state before block 1, and the records of each block.
 pub struct FlagSwitches {
+    genesis: ChainStateGenesis,
     snap: MockStateDatabase,
     blocks: Vec<Vec<BufferedRecord>>,
 }
 
 impl Default for FlagSwitches {
     fn default() -> Self {
-        Self::new()
+        Self::new(ChainStateGenesis::Predeploy)
     }
 }
 
@@ -101,28 +106,31 @@ impl FlagSwitches {
         &[true, false, false],
     ];
 
-    /// The genesis state: the chain-state predeploy of the dev genesis,
-    /// a poor sender and a rich sender.
+    /// The genesis state: a poor sender, a rich sender, and the
+    /// chain-state predeploy of the dev genesis when `genesis` holds it.
     ///
     /// # Panics
     ///
     /// Panics if the dev genesis does not parse or has no predeploy.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(genesis: ChainStateGenesis) -> Self {
         let poor = seeded_signer(0x683);
         let rich = seeded_signer(0x684);
-        let predeploy = ChainStatePredeploy::dev();
-        let snap = MockStateDatabase::builder()
+        let funded = MockStateDatabase::builder()
             .account(poor.address(), U256::from(POOR_FUNDS), 0, KECCAK_EMPTY)
-            .account(rich.address(), U256::from(10u128.pow(20)), 0, KECCAK_EMPTY)
-            .account(
-                CHAIN_STATE,
-                U256::ZERO,
-                predeploy.account.nonce,
-                predeploy.account.code_hash,
-            )
-            .code(predeploy.code.code_hash, predeploy.code.code)
-            .build();
+            .account(rich.address(), U256::from(10u128.pow(20)), 0, KECCAK_EMPTY);
+        let snap = match genesis.predeploy() {
+            Some(p) => funded
+                .account(
+                    CHAIN_STATE,
+                    U256::ZERO,
+                    p.account.nonce,
+                    p.account.code_hash,
+                )
+                .code(p.code.code_hash, p.code.code),
+            None => funded,
+        }
+        .build();
         // The canonical record of an item at block index `i`. A deposit
         // takes L1 block `40 + i`, so each one in a block has its own
         // source hash.
@@ -166,7 +174,11 @@ impl FlagSwitches {
                     .collect()
             })
             .collect();
-        Self { snap, blocks }
+        Self {
+            genesis,
+            snap,
+            blocks,
+        }
     }
 
     /// The state before block 1.
@@ -183,14 +195,16 @@ impl FlagSwitches {
     ///
     /// # Panics
     ///
-    /// Panics if the sequential driver fails, or if `driver` gives other
-    /// receipts or writes than the sequential driver in a block.
+    /// Panics if the sequential driver fails, if `driver` gives other
+    /// receipts or writes than the sequential driver in a block, or if
+    /// the chain does not end with the code at [`CHAIN_STATE`].
     pub fn run(
         &self,
         mut driver: impl FnMut(&PendingDelta, &[BufferedRecord], ExecEnv) -> BlockExecOutput,
     ) -> Vec<Vec<Receipt>> {
         let mut parent = PendingDelta::new();
-        self.blocks
+        let receipts = self
+            .blocks
             .iter()
             .zip(1u64..)
             .map(|(records, number)| {
@@ -201,10 +215,33 @@ impl FlagSwitches {
                 assert_eq!(out.receipts, seq.receipts, "receipts of block {number}");
                 assert_eq!(out.delta.accounts, seq.delta.accounts, "block {number}");
                 assert_eq!(out.delta.storage, seq.delta.storage, "block {number}");
+                assert_eq!(out.delta.code, seq.delta.code, "block {number}");
                 parent.merge_from(&seq.delta);
                 seq.receipts
             })
-            .collect()
+            .collect();
+        self.assert_chain_state_code(&parent);
+        receipts
+    }
+
+    /// The writes of the chain (`parent`) install the code at
+    /// [`CHAIN_STATE`] only on a genesis without it.
+    fn assert_chain_state_code(&self, parent: &PendingDelta) {
+        let hash = keccak256(CHAIN_STATE_CODE);
+        let installed = parent
+            .accounts
+            .get(&CHAIN_STATE)
+            .is_some_and(|a| a.code_hash == hash)
+            && parent
+                .code
+                .get(&hash)
+                .is_some_and(|c| c.as_ref() == CHAIN_STATE_CODE);
+        assert_eq!(
+            installed,
+            self.genesis == ChainStateGenesis::Empty,
+            "{:?} genesis: the install of the chain-state code",
+            self.genesis
+        );
     }
 
     /// Check the burns of `receipts`, the output of [`Self::run`].

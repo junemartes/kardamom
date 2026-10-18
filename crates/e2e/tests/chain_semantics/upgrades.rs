@@ -8,22 +8,23 @@
 // validator agrees, on its own, about which block that was.
 
 /// The stack these scenarios need: an L1 to send upgrade transactions
-/// to, a validator to prove activation parity, and a genesis that
-/// carries the `KardamomChainState` predeploy.
-fn upgrade_stack_config() -> StackConfig {
+/// to, a validator to prove activation parity, and `genesis`.
+/// `Genesis::DevWithdrawals` carries the `KardamomChainState` predeploy;
+/// `Genesis::ClusterDev`, the staging genesis, does not.
+fn upgrade_stack_config(genesis: e2e::harness::Genesis) -> StackConfig {
     StackConfig {
         l1: true,
         validator: true,
-        genesis: e2e::harness::Genesis::DevWithdrawals,
+        genesis,
         ..StackConfig::default()
     }
 }
 
-/// The tests below differ only in the scenario they drive. They share
-/// the same L1-backed, validator-carrying stack and the same `(target,
-/// l1, executor state dir, validator state dir)` hand-off. This skips
-/// the test with an early return when anvil is absent.
-async fn upgrade_case<F>(scenario: F, what: &str)
+/// The tests below differ only in the genesis and the scenario they
+/// drive. They share the same L1-backed, validator-carrying stack and the
+/// same `(target, l1, executor state dir, validator state dir)` hand-off.
+/// This skips the test with an early return when anvil is absent.
+async fn upgrade_case<F>(genesis: e2e::harness::Genesis, scenario: F, what: &str)
 where
     F: AsyncFn(
         &e2e::scenarios::Target,
@@ -32,12 +33,31 @@ where
         &std::path::Path,
     ) -> anyhow::Result<()>,
 {
-    let stack = launch_l1_or_skip!(upgrade_stack_config());
+    let stack = launch_l1_or_skip!(upgrade_stack_config(genesis));
     let t = target(&stack);
     let l1 = stack.l1().expect("l1");
     let exec_dir = stack.executor_state_dir().expect("executor state dir");
     let val_dir = stack.validator_state_dir().expect("validator state dir");
     scenario(&t, l1, &exec_dir, &val_dir).await.expect(what);
+}
+
+/// S13d on `genesis`, then the canonical chain-state code on the executor
+/// and the validator.
+async fn s13d_on(genesis: e2e::harness::Genesis) {
+    upgrade_case(
+        genesis,
+        async |t, l1, exec_dir, val_dir| {
+            sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
+                t,
+                l1,
+                sealer_upgrade::Params::default(),
+            )
+            .await?;
+            upgrade::assert_chain_state_code(exec_dir, val_dir).await
+        },
+        "S13d",
+    )
+    .await;
 }
 
 /// S13d: before the upgrade transaction of the sealer rules, a skipped
@@ -46,18 +66,16 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13d_a_skip_uses_its_nonce_only_after_the_upgrade() {
-    upgrade_case(
-        async |t, l1, _exec_dir, _val_dir| {
-            sealer_upgrade::skip_uses_its_nonce_only_after_the_upgrade(
-                t,
-                l1,
-                sealer_upgrade::Params::default(),
-            )
-            .await
-        },
-        "S13d",
-    )
-    .await;
+    s13d_on(e2e::harness::Genesis::DevWithdrawals).await;
+}
+
+/// S13d on the staging genesis, which has no chain-state predeploy. The
+/// upgrade deposit installs the code, writes the flag word, and the chain
+/// switches as on a genesis with the predeploy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13d_the_first_upgrade_installs_the_chain_state() {
+    s13d_on(e2e::harness::Genesis::ClusterDev).await;
 }
 
 /// S13a: an upgrade transaction with no activation timestamp turns the
@@ -68,6 +86,7 @@ async fn s13d_a_skip_uses_its_nonce_only_after_the_upgrade() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13a_health_check_activates_immediately() {
     upgrade_case(
+        e2e::harness::Genesis::DevWithdrawals,
         async |t, l1, exec_dir, val_dir| {
             upgrade::activates_immediately(t, l1, exec_dir, val_dir).await
         },
@@ -88,6 +107,7 @@ async fn s13a_health_check_activates_immediately() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13b_health_check_activates_at_timestamp() {
     upgrade_case(
+        e2e::harness::Genesis::DevWithdrawals,
         async |t, l1, exec_dir, val_dir| {
             upgrade::activates_at_timestamp(t, l1, exec_dir, val_dir).await
         },
@@ -105,6 +125,7 @@ async fn s13b_health_check_activates_at_timestamp() {
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13c_upgrade_authority_is_enforced() {
     upgrade_case(
+        e2e::harness::Genesis::DevWithdrawals,
         async |t, l1, exec_dir, _val_dir| {
             upgrade::authority_is_enforced(t, l1, exec_dir, upgrade::Params::default()).await
         },

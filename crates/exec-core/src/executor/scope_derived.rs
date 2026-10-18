@@ -5,8 +5,6 @@
 use kardamom_types::xchain;
 use kardamom_types::{Receipt, StateDatabase};
 
-use alloc::format;
-
 use revm::database::CacheDB;
 
 use crate::delta::WriteSet;
@@ -63,8 +61,10 @@ impl<S: StateDatabase> Executor<S> {
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         // (1) Mint pre-credit, committed unconditionally — the mint is
-        // durable regardless of inner-call outcome.
+        // durable regardless of inner-call outcome. The install of the
+        // chain state code follows the same rule.
         self.derived_call(slot).credit_mint(deposit)?;
+        let install = self.derived_call(slot).install_chain_state(deposit)?;
 
         // (2) Inner call with the nonce check off.
         let tx_env = tx_env_from_deposit(deposit);
@@ -72,15 +72,12 @@ impl<S: StateDatabase> Executor<S> {
             DerivedOutcome::Ran(o) => o,
             // Deterministic input invalidity: the mint stays, the inner
             // call never ran. Same artifact as the free function.
-            DerivedOutcome::Rejected(Rejection { reason, detail }) => {
-                let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+            DerivedOutcome::Rejected(rejection) => {
                 return DepositFailure::from_validation::<S, _>(
-                    cache,
+                    &mut self.derived_call(slot),
                     deposit,
-                    slot,
-                    self.env.block_number,
-                    reason,
-                    &detail,
+                    &rejection,
+                    install.as_ref(),
                     bal,
                 );
             }
@@ -94,7 +91,13 @@ impl<S: StateDatabase> Executor<S> {
             revm::context_interface::ContextTr::db_mut(&mut *self.evm),
             outcome.state,
         );
-        self.ensure_sender_in_write_set(&mut ws, slot.tx_idx, deposit.from)?;
+        // The sender always carries the mint in the artifact, even when
+        // the inner call never touched it.
+        let sender = self.derived_call(slot).account(deposit.from)?;
+        ws.ensure_account(deposit.from, &sender);
+        if let Some(install) = install {
+            install.add_to(&mut ws, &mut self.derived_call(slot))?;
+        }
         if let Some((bal, bal_index)) = bal {
             ws.record_into_bal(bal, bal_index);
         }
@@ -111,35 +114,6 @@ impl<S: StateDatabase> Executor<S> {
             ws.hash(),
         )?;
         Ok((receipt, ws))
-    }
-
-    /// The sender always carries the mint in the artifact, even when the
-    /// inner call never touched it.
-    fn ensure_sender_in_write_set(
-        &mut self,
-        ws: &mut WriteSet,
-        tx_idx: crate::exec_types::TxIndex,
-        sender: alloy_primitives::Address,
-    ) -> Result<(), ExecutorError> {
-        if !ws.accounts.iter().any(|(a, _)| *a == sender) {
-            let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
-            let info = revm::Database::basic(cache, sender)
-                .map_err(|e| ExecutorError::Execution {
-                    idx: tx_idx,
-                    detail: format!("basic({sender:?}): {e:?}"),
-                })?
-                .unwrap_or_default();
-            ws.accounts.push((
-                sender,
-                crate::delta::AccountFields {
-                    nonce: info.nonce,
-                    balance: info.balance,
-                    code_hash: info.code_hash,
-                },
-            ));
-            ws.finish();
-        }
-        Ok(())
     }
 
     /// Execute one cross-chain delivery (a 0x7D message) on this block
