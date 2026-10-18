@@ -14,6 +14,7 @@ use crate::exec_types::TxSlot;
 use super::db::SnapshotDb;
 use super::deposit::DepositFailure;
 use super::derived::{CallOutcome, DerivedCall, DerivedOutcome};
+use super::install::ChainStateInstall;
 use super::scope::Executor;
 use super::skip::{DerivedTxIdentity, Rejection, SkipContext};
 use super::tx_env::{tx_env_from_deposit, tx_env_from_xchain};
@@ -64,7 +65,7 @@ impl<S: StateDatabase> Executor<S> {
         // durable regardless of inner-call outcome. The install of the
         // chain state code follows the same rule.
         self.derived_call(slot).credit_mint(deposit)?;
-        let install = self.derived_call(slot).install_chain_state(deposit)?;
+        let installed = self.derived_call(slot).install_chain_state(deposit)?;
 
         // (2) Inner call with the nonce check off.
         let tx_env = tx_env_from_deposit(deposit);
@@ -77,7 +78,7 @@ impl<S: StateDatabase> Executor<S> {
                     &mut self.derived_call(slot),
                     deposit,
                     &rejection,
-                    install.as_ref(),
+                    installed,
                     bal,
                 );
             }
@@ -95,8 +96,8 @@ impl<S: StateDatabase> Executor<S> {
         // the inner call never touched it.
         let sender = self.derived_call(slot).account(deposit.from)?;
         ws.ensure_account(deposit.from, &sender);
-        if let Some(install) = install {
-            install.add_to(&mut ws, &mut self.derived_call(slot))?;
+        if installed {
+            ChainStateInstall::add_to(&mut ws, &mut self.derived_call(slot))?;
         }
         if let Some((bal, bal_index)) = bal {
             ws.record_into_bal(bal, bal_index);
