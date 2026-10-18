@@ -46,6 +46,11 @@ NO_QUORUM_CHAIN = HEALTHY_CHAIN | {'roots': [NO_QUORUM_ROOT],
                                    'ingress': {'pause': {'reason': 'upstream', 'root': NO_QUORUM_ROOT}}}
 # The format registry of the repository: the formats of every target.
 FORMATS = (ANSIBLE.parents[2] / 'formats.toml').read_text()
+# The formats text that an accepted release holds in the record. The deploy
+# binary of the tests scripts its findings, so the text is a small fixed
+# registry: a record holds it up to four times within Nomad's 64 KiB limit.
+RECORD_FORMATS = ('[format.spool]\nwrites = 1\nreads_min = 1\nreads_max = 1\n'
+                  'shared = false\ncode = ["a.rs#A"]\n')
 
 
 class NomadAPI(BaseHTTPRequestHandler):
@@ -473,7 +478,7 @@ class Deploys(unittest.TestCase):
         gate compares with, then script the format findings of the next
         deploy."""
         self.deploy()
-        self.record()['accepted']['target']['formats'] = FORMATS
+        self.record()['accepted']['target']['formats'] = RECORD_FORMATS
         self.api.state['writes'] = []
         self.api.state['record_writes'] = []
         Path(str(self.deploy_bin) + '.findings').write_text(json.dumps(findings))
@@ -1354,20 +1359,20 @@ class RecordFormatsTest(Deploys):
         # as the record of staging does.
         self.run_deploy()
         for document in self.record().values():
-            document['target']['formats'] = FORMATS
-            document['before']['formats'] = FORMATS
+            document['target']['formats'] = RECORD_FORMATS
+            document['before']['formats'] = RECORD_FORMATS
         self.next_release()
         self.run_deploy()
         self.assertEqual(self.formats_calls(),
                          [f'formats --base {self.record_dir}/accepted.formats.toml --root {self.repo}'])
         attempt = self.record()['attempt']
         self.assertNotIn('formats', attempt['target'])
-        self.assertEqual(attempt['before']['formats'], FORMATS)
+        self.assertEqual(attempt['before']['formats'], RECORD_FORMATS)
         self.api.state['roll_marker'] = 'a' * 64
         (self.record_dir / 'accepted.formats.toml').unlink()
         self.run_rollback()
-        self.assertEqual(self.record()['accepted']['target']['formats'], FORMATS)
-        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), FORMATS)
+        self.assertEqual(self.record()['accepted']['target']['formats'], RECORD_FORMATS)
+        self.assertEqual((self.record_dir / 'accepted.formats.toml').read_text(), RECORD_FORMATS)
 
     def test_a_record_without_the_text_has_no_base(self):
         self.run_deploy()
