@@ -1,9 +1,10 @@
 ---
 # The attempt record, before the first registration. It holds the target
-# (the manifest, the formats, the revision), the version of every job
-# Nomad knows (the release that runs), the rollback floor of the gate,
-# and the retired formats that KARDAMOM_ALLOW_RETIRED accepted. Each registration adds the job to `changed`; the acceptance
-# copies the attempt to `accepted`; a rollback fills `rolled_back`.
+# (the manifest and the revision), the version of every job Nomad knows
+# (the release that runs), the rollback floor of the gate, and the retired
+# formats that KARDAMOM_ALLOW_RETIRED accepted. Each registration adds the
+# job to `changed`; the acceptance copies the attempt to `accepted`; a
+# rollback fills `rolled_back`.
 # README.md documents the schema.
 # The job list gives only stubs, without the version. Each job's own
 # record has it.
@@ -34,15 +35,19 @@
       target:
         revision: "{{ workloads_target_revision }}"
         manifest: "{{ workloads_image_refs }}"
-        formats: "{{ lookup('file', workloads_formats_file, rstrip=false) }}"
-      before:
-        revision: "{{ workloads_accepted.target.revision | default('') }}"
-        manifest: "{{ workloads_accepted.target.manifest | default({}) }}"
-        formats: "{{ workloads_accepted.target.formats | default('') }}"
-        jobs: >-
-          {{ workloads_record_versions.results | map(attribute='json.ID')
-             | zip(workloads_record_versions.results | map(attribute='json.Version') | map('community.general.dict_kv', 'before'))
-             | community.general.dict }}
+      # A new record holds no formats text: Nomad limits the variable to
+      # 64 KiB. A before written while the accepted release held the text
+      # carries it, so a rollback restores a release that the gate can
+      # compare with.
+      before: >-
+        {{ {'revision': workloads_accepted.target.revision | default(''),
+            'manifest': workloads_accepted.target.manifest | default({}),
+            'jobs': workloads_record_versions.results | map(attribute='json.ID')
+                    | zip(workloads_record_versions.results | map(attribute='json.Version')
+                          | map('community.general.dict_kv', 'before'))
+                    | community.general.dict}
+           | combine({'formats': workloads_accepted.target.formats}
+                     if workloads_accepted.target.formats | default('') | length > 0 else {}) }}
       changed: []
       rolled_back: []
       floor: "{{ workloads_floor }}"
