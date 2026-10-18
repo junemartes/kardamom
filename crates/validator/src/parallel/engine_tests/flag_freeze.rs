@@ -2,10 +2,12 @@
 //! sequential driver: the seeded parallel batches, and the stateless
 //! re-execution over a captured witness (the zk guest shape). The chain
 //! turns `FEATURE_SEALER_V3` on, off and on again with `setFeature`
-//! deposits in the middle of blocks.
+//! deposits in the middle of blocks, on a genesis with the chain-state
+//! predeploy and on one without it.
 
 use alloy_primitives::{B256, U256};
 use alloy_signer_local::PrivateKeySigner;
+use kardamom_engine::actor::fixtures::ChainStateGenesis;
 use kardamom_engine::actor::fixtures::LegacyTx;
 use kardamom_engine::actor::flag_switches::FlagSwitches;
 use kardamom_engine::actor::{BlockExecOutput, BufferedRecord};
@@ -77,20 +79,31 @@ fn run_parallel(chain: &FlagSwitches, batch_size: usize) -> Vec<Vec<Receipt>> {
     })
 }
 
+/// On a genesis with the chain-state predeploy, and on one without it,
+/// where the first `setFeature` deposit installs the code.
 #[test]
 fn the_parallel_batches_switch_flags_at_the_same_block() {
-    let chain = FlagSwitches::new();
-    for batch_size in [1, 2, 4] {
-        FlagSwitches::assert_burns(&run_parallel(&chain, batch_size));
+    for genesis in ChainStateGenesis::ALL {
+        let chain = FlagSwitches::new(genesis);
+        for batch_size in [1, 2, 4] {
+            FlagSwitches::assert_burns(&run_parallel(&chain, batch_size));
+        }
     }
 }
 
+/// The zk guest shape on both kinds of genesis. Without the predeploy,
+/// the witness of block 1 proves that [`CHAIN_STATE`] has no code, and
+/// the stateless run installs the code as the capture did.
 #[test]
 fn the_stateless_run_switches_flags_at_the_same_block() {
-    let chain = FlagSwitches::new();
-    FlagSwitches::assert_burns(
-        &chain.run(|parent, records, env| stateless(chain.snapshot(), Some(parent), records, env)),
-    );
+    for genesis in ChainStateGenesis::ALL {
+        let chain = FlagSwitches::new(genesis);
+        FlagSwitches::assert_burns(
+            &chain.run(|parent, records, env| {
+                stateless(chain.snapshot(), Some(parent), records, env)
+            }),
+        );
+    }
 }
 
 /// The guest shape: no parent layer, and the flag word in the snapshot.

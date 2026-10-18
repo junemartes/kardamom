@@ -117,10 +117,14 @@ variable "executor_count" {
 job "validator" {
   # The validator of this release re-executes the nonce of a skipped
   # transaction as the executor does once FEATURE_SEALER_V3 is active. An
-  # older validator finds a divergence at the first such skip. The upgrade
-  # check (`just sealer-upgrade-check <env>`) reads this meta.
+  # older validator finds a divergence at the first such skip. The
+  # validator of this release also installs the KardamomChainState code
+  # with the first setFeature system deposit on a genesis without it. An
+  # older validator finds a divergence at that deposit. The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads these metas.
   meta {
-    nonce_burn = "true"
+    nonce_burn          = "true"
+    chain_state_install = "true"
   }
 
   datacenters = [var.datacenter]

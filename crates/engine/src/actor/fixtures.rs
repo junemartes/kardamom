@@ -82,6 +82,34 @@ impl ChainStatePredeploy {
     }
 }
 
+/// Whether the genesis of a test chain holds the chain-state predeploy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainStateGenesis {
+    /// The predeploy of `chains/dev-withdrawals.toml`.
+    Predeploy,
+    /// No account at the chain-state address, as the staging genesis. The
+    /// first `setFeature` deposit installs the code.
+    Empty,
+}
+
+impl ChainStateGenesis {
+    /// Both kinds of genesis.
+    pub const ALL: [Self; 2] = [Self::Predeploy, Self::Empty];
+
+    /// The predeploy that this genesis holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the dev genesis does not parse or has no predeploy.
+    #[must_use]
+    pub fn predeploy(self) -> Option<ChainStatePredeploy> {
+        match self {
+            Self::Predeploy => Some(ChainStatePredeploy::dev()),
+            Self::Empty => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Channel-backed engine harness.
 // ---------------------------------------------------------------------------

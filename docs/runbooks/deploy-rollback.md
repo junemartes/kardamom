@@ -124,6 +124,14 @@ From the first block that executes at or after the activation time of `FEATURE_S
 - `just sealer-upgrade-check <env>` refuses the upgrade transaction until every live allocation of the executor, validator, ingress and sequencer jobs runs a job version with the meta `nonce_burn`.
 - The prover's zk guest links the same rule, so a guest of this release has a new verifying key. Roll the prover and its verifying key before the activation. A guest of an older release cannot prove a block with a skip after the activation.
 
+### Rollback after the install of the chain state code
+
+On a genesis without the `KardamomChainState` code (the staging genesis), the first `setFeature` system deposit installs the code before its call ("A genesis without the chain-state code" in `docs/failure-modes.md`). A release before this one runs that deposit as a call to an empty account.
+
+- Do not roll an executor or a validator back to a release without the job meta `chain_state_install = "true"` while it can execute the block of that deposit: before the deposit, or in a replay or a rebuild from L1 that crosses it. Its state forks at that deposit. A node that starts after that block reads the code from its state, so the rule does not touch it.
+- `just sealer-upgrade-check <env>` refuses the upgrade transaction until every live allocation of the executor and validator jobs runs a job version with the meta `chain_state_install`.
+- The prover's zk guest links the install too. Roll the prover and its verifying key before the first upgrade transaction.
+
 ## Clear
 
 The rollback writes the record: the attempt gets `status: rolled_back`, and

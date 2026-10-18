@@ -15,20 +15,33 @@
 //! `contracts/src/L2/KardamomChainState.sol` and
 //! `contracts/src/L1/ETHLockbox.sol`.
 //! `crates/deployer/tests/chainstate_genesis_predeploy.rs` enforces the
-//! tie: it cross-checks the address, bytecode, `SYSTEM_UPGRADER`, and the
-//! `setFeature` selector against the compiled artifacts. The end-to-end
-//! test scenarios enforce it too, through the live chain.
+//! tie: it cross-checks the address, [`CHAIN_STATE_CODE`],
+//! `SYSTEM_UPGRADER`, and the `setFeature` selector against the compiled
+//! artifacts. The end-to-end test scenarios enforce it too, through the
+//! live chain.
 
 use alloc::vec::Vec;
 
-use alloy_primitives::{Address, U256, address};
+use alloy_primitives::{Address, U256, address, hex};
 use bytes::Bytes;
 
 use crate::deposit::Deposit;
 
 /// Canonical L2 address of the `KardamomChainState` predeploy. This is the
-/// feature-flag store. It is seeded into genesis; see `chains/dev-withdrawals.toml`.
+/// feature-flag store. A genesis can hold its code
+/// (`chains/dev-withdrawals.toml`). On a genesis without the code, the
+/// first `setFeature` system deposit installs [`CHAIN_STATE_CODE`] here
+/// before its call (`kardamom_exec_core`, the deposit path).
 pub const CHAIN_STATE: Address = address!("0x4200000000000000000000000000000000000017");
+
+/// The runtime code of `KardamomChainState`: the code that [`CHAIN_STATE`]
+/// holds. It is the code of the predeploy in
+/// `chains/dev-withdrawals.toml` and the `deployedBytecode` of the compiled
+/// contract. `crates/deployer/tests/chainstate_genesis_predeploy.rs` checks
+/// both.
+pub const CHAIN_STATE_CODE: &[u8] = &hex!(
+    "6080806040526004361015610012575f80fd5b5f3560e01c9081630d5ea2131461020d575080635a5aa5b0146101df57806371b00f82146101c25780637633a22c1461018557806382afd23b146101445780638afdb854146100885763f5d8ea2214610069575f80fd5b34610084575f36600319011261008457602060405160018152f35b5f80fd5b346100845760403660031901126100845760043560243567ffffffffffffffff81168091036100845773454156dab0518b9244cc7ff1b0ffff6c7e031b6d3303610135578061010c57507f01759fab5a8f86a3d979de3aa967615a8a4044efe11641ec2140223227cbf9d96020425b835f525f82528060405f2055604051908152a2005b60207f01759fab5a8f86a3d979de3aa967615a8a4044efe11641ec2140223227cbf9d9916100f7565b63c54dbc7560e01b5f5260045ffd5b34610084576020366003190112610084576004355f525f602052602060405f2054801515908161017a575b506040519015158152f35b90504210158261016f565b34610084575f36600319011261008457606060015467ffffffffffffffff604051918181168352818160401c16602084015260801c166040820152f35b34610084575f366003190112610084576020600154604051908152f35b34610084575f36600319011261008457602060405173454156dab0518b9244cc7ff1b0ffff6c7e031b6d8152f35b34610084576020366003190112610084576020906004355f525f825260405f20548152f3fea164736f6c634300081a000a"
+);
 
 /// Synthetic L2 sender for system upgrade deposits. This is the last 20
 /// bytes of `keccak256("kardamom.upgrades.system-sender.v1")`.

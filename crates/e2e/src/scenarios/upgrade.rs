@@ -169,6 +169,35 @@ async fn assert_validator_agrees(
     Ok(())
 }
 
+/// The executor and the validator hold the canonical code at the
+/// chain-state address: the genesis held it, or the first upgrade deposit
+/// installed it.
+///
+/// # Errors
+/// Returns an error when a state directory cannot be read, when the
+/// validator does not reach the head of the executor, or when a role holds
+/// other code.
+pub async fn assert_chain_state_code(
+    executor_state_dir: &Path,
+    validator_state_dir: &Path,
+) -> Result<()> {
+    use kardamom_types::upgrades::CHAIN_STATE_CODE;
+    let executor = read_chain_state(executor_state_dir)?;
+    let validator =
+        state_at_or_past(validator_state_dir, executor.block_number, "validator").await?;
+    let canonical = Some(alloy_primitives::keccak256(CHAIN_STATE_CODE));
+    [("executor", executor), ("validator", validator)]
+        .into_iter()
+        .try_for_each(|(role, v)| {
+            anyhow::ensure!(
+                v.code_hash == canonical,
+                "{role}: the chain-state address holds {:?}, not the canonical code",
+                v.code_hash
+            );
+            Ok(())
+        })
+}
+
 /// Send an upgrade transaction and wait for its system deposit to execute on
 /// L2. Returns the block the `setFeature` landed in.
 pub(super) async fn upgrade_and_await(

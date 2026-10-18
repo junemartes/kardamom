@@ -12,7 +12,10 @@
 # that sends the activation, or no member gets it, and that watches the
 # rules switch on and off (job meta sealer_feature_off). Every executor,
 # validator, ingress and sequencer must run a release that uses the nonce
-# of a skipped transaction (job meta nonce_burn).
+# of a skipped transaction (job meta nonce_burn). Every executor and
+# validator must run a release that installs the KardamomChainState code
+# with the first setFeature system deposit, and reads the flags once per
+# block, frozen at its start (job meta chain_state_install).
 # cluster/sealer-service/README.md ("Decision version") is the procedure.
 - name: Read the registered sealer
   ansible.builtin.include_tasks: read_job.yml
@@ -90,7 +93,9 @@
 
 # Each service that executes or reads a skip must run this release: an
 # older executor or validator does not use the nonce of a skipped
-# transaction, and forks the state at the first such skip. The job meta of
+# transaction, and forks the state at the first such skip. On a genesis
+# without the chain state code, an older executor or validator runs the
+# upgrade deposit as a call to an empty account, and forks at once. The job meta of
 # each names what its release does. A live allocation of an older job
 # version can run an older release.
 - name: Check the services of the release

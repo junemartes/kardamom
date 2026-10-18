@@ -1320,7 +1320,11 @@ class RecordTest(Deploys):
         self.deploy()
         meta = self.api.state['jobs']['executor'].pop('Meta')
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
-        self.assertIn('the executor job does not use the nonce of a skipped transaction (job meta nonce_burn)', output)
+        self.assertIn(
+            'the executor job does not use the nonce of a skipped transaction and install the chain state code'
+            ' (job meta nonce_burn, chain_state_install)',
+            output,
+        )
         self.api.state['jobs']['executor']['Meta'] = meta
         self.api.state['jobs']['validator'].pop('Meta')
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
@@ -1329,6 +1333,19 @@ class RecordTest(Deploys):
         self.api.state['jobs']['ingress']['Meta'] = {'nonce_burn': 'false'}
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('the ingress job does not take a skip that uses its nonce', output)
+
+    def test_the_upgrade_check_refuses_an_executor_or_validator_that_does_not_install_the_chain_state(self):
+        """An older executor or validator runs the first upgrade deposit as a call to an empty account."""
+        self.deploy()
+        for job in ('executor', 'validator'):
+            meta = self.api.state['jobs'][job]['Meta']
+            self.api.state['jobs'][job]['Meta'] = {'nonce_burn': 'true'}
+            output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+            self.assertIn(f'the {job} job does not', output)
+            self.assertIn('(job meta chain_state_install)', output)
+            self.api.state['jobs'][job]['Meta'] = meta
+        output = self.run_deploy(playbook='upgrade-check.yml')
+        self.assertIn('The upgrade check passed', output)
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.deploy()

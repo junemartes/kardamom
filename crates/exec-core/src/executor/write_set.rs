@@ -159,6 +159,34 @@ impl WriteSet {
     }
 }
 
+impl WriteSet {
+    /// Add `address` with the fields of `info` when the set does not hold
+    /// it. A deposit commits its mint and its install of the chain state
+    /// code before its call, and the call can leave such an account
+    /// unchanged. The set must still name it, because the cache keeps it.
+    pub(super) fn ensure_account(&mut self, address: Address, info: &revm::state::AccountInfo) {
+        if self.account(&address).is_none() {
+            self.accounts.push((
+                address,
+                AccountFields {
+                    nonce: info.nonce,
+                    balance: info.balance,
+                    code_hash: info.code_hash,
+                },
+            ));
+            self.finish();
+        }
+    }
+
+    /// Add the code `code` under `code_hash` when the set does not hold it.
+    pub(super) fn ensure_code(&mut self, code_hash: B256, code: Bytes) {
+        if !self.code.iter().any(|(h, _)| *h == code_hash) {
+            self.code.push((code_hash, code));
+            self.finish();
+        }
+    }
+}
+
 /// A batch of BAL entries, built up from a `WriteSet`'s accounts and
 /// storage writes with fabricated `original_info`/`original_value`
 /// fields (see the module docs above [`WriteSet::record_into_bal`] for

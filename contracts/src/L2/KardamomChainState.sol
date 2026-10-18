@@ -13,10 +13,13 @@ pragma solidity ^0.8.26;
 ///         path. See
 ///         `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md` §7.
 ///
-///         This is a genesis predeploy: its runtime bytecode is seeded at a
-///         fixed address. It is intentionally not upgradeable and has no
-///         constructor-time state. Upgrading it needs a coordinated genesis
-///         change, the same as `L2ToL1MessagePasser`.
+///         Its runtime bytecode sits at a fixed address, with no
+///         constructor-time state. A genesis can hold it. On a genesis
+///         without it, the execution layer installs this runtime bytecode
+///         at the address with the first `setFeature` system deposit,
+///         before the call (`kardamom_types::upgrades::CHAIN_STATE_CODE`).
+///         It is intentionally not upgradeable. A change of the code needs
+///         a coordinated chain upgrade.
 ///
 ///         All timestamps here use milliseconds. `block.timestamp` on this
 ///         chain is epoch milliseconds: the sealer stamps its leader clock

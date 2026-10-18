@@ -124,10 +124,14 @@ variable "executor_query_port" {
 job "executor" {
   # The executor of this release uses the nonce of a skipped transaction
   # once FEATURE_SEALER_V3 is active. An older executor does not, and its
-  # state forks at the first such skip. The upgrade check
-  # (`just sealer-upgrade-check <env>`) reads this meta.
+  # state forks at the first such skip. On a genesis without the
+  # KardamomChainState code, the executor of this release installs the code
+  # with the first setFeature system deposit. An older executor runs that
+  # deposit as a call to an empty account and forks. The upgrade check
+  # (`just sealer-upgrade-check <env>`) reads these metas.
   meta {
-    nonce_burn = "true"
+    nonce_burn          = "true"
+    chain_state_install = "true"
   }
 
   datacenters = [var.datacenter]
