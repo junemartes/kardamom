@@ -352,8 +352,8 @@ class Deploys(unittest.TestCase):
                           'record_writes': []}
         self.record_dir = Path(self.tmp.name) / 'deployed'
         # The target tree: a git checkout with the formats.toml of this
-        # repository. A deploy records its HEAD, and a later gate reads
-        # formats.toml from git at the recorded revision.
+        # repository. A deploy records its HEAD as the revision, which must
+        # be a commit of the checkout.
         self.repo = Path(self.tmp.name) / 'repo'
         self.repo.mkdir()
         self.git('init', '-q')
