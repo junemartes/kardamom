@@ -414,6 +414,7 @@ class Deploys(unittest.TestCase):
                    ANSIBLE_LOCAL_TEMP=self.tmp.name + '/ansible',
                    OBJC_DISABLE_INITIALIZE_FORK_SAFETY='YES')
         env.pop('AERON_STALL_TOLERANCE_MS', None)
+        env.pop('KARDAMOM_IDLE_CAP_US', None)
         env.update(environ or {})
         cmd = ['ansible-playbook', '-i', 'localhost,', str(ANSIBLE / playbook),
                '-e', json.dumps(variables)] + (['--check'] if check else [])
@@ -850,12 +851,36 @@ class DeployTest(Deploys):
                 env = self.api.state['plans']['executor']['TaskGroups'][0]['Tasks'][0]['Env']
                 self.assertEqual(env['KARDAMOM_EXEC_CURSOR'], expected)
 
-    def test_every_aeron_party_takes_the_stall_tolerance(self):
-        for tolerance in (10000, 30000):
-            with self.subTest(tolerance=tolerance):
-                environ = {} if tolerance == 10000 else {'AERON_STALL_TOLERANCE_MS': str(tolerance)}
-                self.run_deploy(check=True, environ=environ)
-                self.assert_aeron_parties(self.api.state['plans'], tolerance)
+    def test_every_aeron_party_takes_the_deploy_values(self):
+        """Each Aeron deploy value: its environment variable, its default,
+        a second value, and the check of the plans."""
+        cases = (('AERON_STALL_TOLERANCE_MS', 10000, 30000, self.assert_aeron_parties),
+                 ('KARDAMOM_IDLE_CAP_US', 50, 200, self.assert_idle_cap))
+        for variable, default, other, check in cases:
+            for value in (default, other):
+                with self.subTest(variable=variable, value=value):
+                    environ = {} if value == default else {variable: str(value)}
+                    self.run_deploy(check=True, environ=environ)
+                    check(self.api.state['plans'], value)
+
+    def test_a_bad_idle_cap_fails_the_deploy(self):
+        for value in ('0', 'abc', '1000001'):
+            with self.subTest(value=value):
+                self.run_deploy(check=True, success=False, environ={'KARDAMOM_IDLE_CAP_US': value})
+
+    @staticmethod
+    def aeron_tasks(plans):
+        """Every task that maps the Aeron directory, by job name."""
+        return [(name, task) for name, job in plans.items() for group in job['TaskGroups']
+                for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
+
+    def assert_idle_cap(self, plans, cap):
+        """The hot-path jobs carry the idle cap. The other Aeron parties
+        do not, so they keep the waits of the code."""
+        hot = {'aeron', 'cluster', 'sequencer', 'ingress', 'executor'}
+        for name, task in self.aeron_tasks(plans):
+            expected = str(cap) if name in hot else None
+            self.assertEqual(task['Env'].get('KARDAMOM_IDLE_CAP_US'), expected, name)
 
     def assert_aeron_parties(self, plans, tolerance):
         """Every task that maps the Aeron directory carries the tolerance:
@@ -863,8 +888,7 @@ class DeployTest(Deploys):
         its driver timeout, client liveness, and a publication unblock
         timeout above the liveness."""
         jvm_options = {'aeron': '_JAVA_OPTIONS', 'cluster': 'JAVA_TOOL_OPTIONS'}
-        parties = [(name, task) for name, job in plans.items() for group in job['TaskGroups']
-                   for task in group['Tasks'] if 'aeron-mount' in json.dumps(task['Config'].get('volumes', []))]
+        parties = self.aeron_tasks(plans)
         self.assertEqual({name for name, _ in parties}, {
             'aeron', 'cluster', 'sequencer', 'ingress', 'executor', 'validator', 'da-watcher', 'batcher',
             'state-mirror', 'notifier', 'l1-indexer'})

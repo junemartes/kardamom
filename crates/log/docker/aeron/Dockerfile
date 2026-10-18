@@ -28,6 +28,18 @@ RUN apt-get update && \
 COPY aeron-jar.sh aeron-all.ja[r] /opt/aeron/
 RUN sh /opt/aeron/aeron-jar.sh "${AERON_VERSION}" "${AERON_JAR_SHA256}" /opt/aeron/aeron-all.jar
 
+# The capped backoff idle strategy (CappedBackoffIdleStrategy.java),
+# compiled against the jar above. The runtime image has no compiler.
+FROM eclipse-temurin:21-jdk-jammy AS idle
+COPY --from=base /opt/aeron/aeron-all.jar /build/aeron-all.jar
+COPY CappedBackoffIdleStrategy.java /build/src/io/kardamom/aeron/
+RUN javac --release 21 -cp /build/aeron-all.jar -d /build/classes \
+        /build/src/io/kardamom/aeron/CappedBackoffIdleStrategy.java && \
+    jar --create --file /build/kardamom-idle.jar -C /build/classes .
+
+FROM base
+COPY --from=idle /build/kardamom-idle.jar /opt/aeron/kardamom-idle.jar
+
 # `aeron.dir` lives in a subdir of a bind-mount root so Aeron can freely
 # rmdir + recreate `aeron.dir` on every start without touching the
 # mountpoint itself (which can't be `rmdir`'d). The host bind-mounts

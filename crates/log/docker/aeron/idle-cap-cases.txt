@@ -1,0 +1,24 @@
+# The values of KARDAMOM_IDLE_CAP_US and how every parser of it reads them:
+# CappedBackoffIdleStrategy.capNs (Java: the Aeron image and the sealer) and
+# IdleCap::parse (Rust, crates/log/src/aeron_live/idle.rs). A test on each
+# side reads this file.
+#
+# One case per line: the raw value, a "|", then the cap in µs, "unset", or
+# "refuse". "<unset>" stands for a variable that is not set. "unset" means
+# the default of the parser: 1000 µs in Java, the old waits of each loop in
+# Rust.
+<unset>|unset
+|unset
+   |unset
+50|50
+ 200 |200
++50|50
+1|1
+1000000|1000000
+1000001|refuse
+0|refuse
+-5|refuse
+1.5|refuse
+50us|refuse
+abc|refuse
+4294967296|refuse
