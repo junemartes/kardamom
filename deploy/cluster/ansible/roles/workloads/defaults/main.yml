@@ -302,12 +302,12 @@ workloads_quiesce_url: "{{ workloads_nomad_addr }}/v1/var/{{ workloads_quiesce_p
 # stop; the deploy follows within this window. The gate caps it at
 # 3600 s.
 workloads_quiesce_max_age_s: "{{ lookup('env', 'KARDAMOM_QUIESCE_MAX_AGE_S') | default('600', true) }}"
-# The repository root and its format registry: the formats of the target.
+# The repository root: the git checkout of the target.
 workloads_repo_root: "{{ workloads_cluster_dir ~ '/../..' }}"
-workloads_formats_file: "{{ workloads_repo_root }}/formats.toml"
-# The revision of the target tree, for the record. Empty: the gate reads
-# it from git or jj.
-workloads_revision: "{{ lookup('env', 'KARDAMOM_REVISION') | default(lookup('env', 'GITHUB_SHA'), true) }}"
+# The revision of the target tree, for the record (KARDAMOM_REVISION).
+# Empty: the gate reads it from the git checkout, else GITHUB_SHA, else jj.
+# In a git checkout it must be a commit of the checkout.
+workloads_revision: "{{ lookup('env', 'KARDAMOM_REVISION') }}"
 workloads_operator: >-
   {{ lookup('env', 'KARDAMOM_OPERATOR') | default(lookup('env', 'GITHUB_ACTOR'), true)
      | default(lookup('env', 'USER'), true) }}
