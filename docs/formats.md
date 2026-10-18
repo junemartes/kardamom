@@ -131,13 +131,33 @@ The deploy preflight is the release gate of the workloads role
 (`deploy/cluster/ansible/roles/workloads/tasks/gate.yml`). It reads the
 registry of the accepted release from the deploy record, runs
 `kardamom-deploy formats --base <that registry> --root <target tree>` for
-the findings, and decides by the findings alone: a
-waiver in `formats.toml` does not cover a finding at deploy time, because
-the waiver was given against a pull request base, not against the release
-that runs. The gate rules are in
+the findings, and decides by the findings alone: a waiver in `formats.toml`
+does not cover a finding at deploy time, because the waiver was given against a pull
+request base, not against the release that runs. The gate rules are in
 "The release gate" of `deploy/cluster/README.md`. Every release ships
 `kardamom-deploy`, signed, so the gate runs the binary of the release that
 it deploys.
+
+Each finding carries the `shared` and `permanent` flags of the format.
+The gate treats a `rollback` finding as one-way, and a `rolling`,
+`mixed_fleet` or `retired` finding as coordinated. One exception applies
+to a retired format:
+
+- The operator names it in `KARDAMOM_ALLOW_RETIRED`, and the format is
+  neither shared nor permanent. The rolling deploy then carries the
+  change, with no rollback floor. The deploy record keeps the list.
+- Give the allowance only when the release removes the service that
+  owned the format, as the removal of the notifier did for
+  `notifier-outbox`. A rollback then starts the old service on its own
+  file, which no release changed in the meantime.
+- Do not give it for a format that a running service renames, for
+  example a new layout of a frozen format under a new id (rule 6). The
+  new release stops updating the old file, and a rollback starts the old
+  service on stale data. Take the coordinated path, or keep the new
+  release writing the old file through one release.
+- The gate refuses an allowance that covers no such finding.
+
+The pull request check still needs the `[retired.<id>]` waiver.
 
 ## Rules for a format change
 

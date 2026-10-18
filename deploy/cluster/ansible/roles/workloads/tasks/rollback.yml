@@ -116,6 +116,7 @@
       changed: []
       rolled_back: []
       floor: {}
+      retired: []
   vars:
     workloads_rollback_now: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
 

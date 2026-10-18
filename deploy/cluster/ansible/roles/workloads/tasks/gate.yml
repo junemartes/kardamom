@@ -275,12 +275,35 @@
   check_mode: false
   when: workloads_gate_has_base | bool
 
+# A retired format is coordinated, unless KARDAMOM_ALLOW_RETIRED names it
+# and the format is neither shared nor permanent. The operator names it
+# only when the release removes the service that owned the format: a
+# running service that renames a format stops updating the old file, and
+# a rollback reads that stale file. A finding without the `shared` or the
+# `permanent` field stays coordinated.
 - name: Sort the format findings
   ansible.builtin.set_fact:
     workloads_one_way: "{{ workloads_gate_findings | selectattr('rule', 'equalto', 'rollback') | list }}"
-    workloads_coordinated: "{{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback') | list }}"
+    workloads_retirable: "{{ workloads_gate_retirable }}"
+    workloads_retired_allowed: "{{ workloads_gate_retired_allowed }}"
+    workloads_coordinated: >-
+      {{ workloads_gate_findings | rejectattr('rule', 'equalto', 'rollback')
+         | reject('in', workloads_gate_retired_allowed) | list }}
   vars:
     workloads_gate_findings: "{{ workloads_gate_formats.stdout | from_json if workloads_gate_has_base | bool else [] }}"
+    workloads_gate_retirable: >-
+      {{ workloads_gate_findings | selectattr('rule', 'equalto', 'retired')
+         | selectattr('shared', 'defined') | rejectattr('shared')
+         | selectattr('permanent', 'defined') | rejectattr('permanent') | list }}
+    workloads_gate_retired_allowed: >-
+      {{ workloads_gate_retirable | selectattr('id', 'in', workloads_allow_retired) | list }}
+
+- name: Report the retired formats that KARDAMOM_ALLOW_RETIRED names
+  ansible.builtin.debug:
+    msg: >-
+      KARDAMOM_ALLOW_RETIRED accepts the retirement of {{ workloads_retired_allowed | map(attribute='id') | join(', ') }}.
+      The release removes the service that owned each one.
+  when: workloads_retired_allowed | length > 0
 
 - name: Refuse a coordinated format change in the rolling path
   ansible.builtin.assert:
@@ -290,6 +313,12 @@
       {{ workloads_coordinated | map(attribute='id') | unique | join(', ') }}.
       A mixed fleet of the accepted release and this one cannot run. Stop the writers, or follow the
       runbook of the format (docs/formats.md), then deploy.
+      {{ ('When the release removes the service that owned ' ~ (workloads_gate_unallowed | join(', '))
+          ~ ', set KARDAMOM_ALLOW_RETIRED=' ~ (workloads_gate_unallowed | join(',')) ~ '.')
+         if workloads_gate_unallowed | length > 0 else '' }}
+  vars:
+    workloads_gate_unallowed: >-
+      {{ workloads_retirable | map(attribute='id') | difference(workloads_allow_retired) }}
 
 - name: Refuse a one-way format change that KARDAMOM_ALLOW_ONE_WAY does not name
   ansible.builtin.assert:
@@ -306,6 +335,13 @@
     fail_msg: >-
       Refused: KARDAMOM_ALLOW_ONE_WAY names {{ workloads_allow_one_way | difference(workloads_one_way | map(attribute='id')) | join(', ') }},
       and the release has no one-way change of it. Unset it.
+
+- name: Refuse an allowance that covers no retired format
+  ansible.builtin.assert:
+    that: workloads_allow_retired | difference(workloads_retirable | map(attribute='id')) | length == 0
+    fail_msg: >-
+      Refused: KARDAMOM_ALLOW_RETIRED names {{ workloads_allow_retired | difference(workloads_retirable | map(attribute='id')) | join(', ') }},
+      and the release retires no format of that id that is neither shared nor permanent. Unset it.
 
 # The floor: the versions this release writes that the accepted release
 # cannot read. The rollback does not cross it.

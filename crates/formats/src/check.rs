@@ -52,6 +52,12 @@ pub struct Finding {
     pub head: u32,
     /// The base version that the rule compares with.
     pub base: u32,
+    /// The `shared` flag of the format: of the head or the base entry,
+    /// and of the base entry for [`Rule::Retired`].
+    pub shared: bool,
+    /// The `permanent` flag of the format: of the head or the base entry,
+    /// and of the base entry for [`Rule::Retired`].
+    pub permanent: bool,
 }
 
 impl fmt::Display for Finding {
@@ -90,17 +96,21 @@ impl Format {
 
     /// The rules that this head entry breaks against the `base` entry.
     fn findings_against(&self, id: &str, base: &Format) -> impl Iterator<Item = Finding> {
+        let shared = self.shared || base.shared;
+        let permanent = self.permanent || base.permanent;
         let finding = |rule, head, base| Finding {
             rule,
             id: id.to_owned(),
             head,
             base,
+            shared,
+            permanent,
         };
         let one_way = !base.reads(self.writes);
         let base_boundary = base.read_boundary(self.writes);
         let rollback = one_way.then(|| finding(Rule::Rollback, self.writes, base_boundary));
-        let mixed = (one_way && (self.shared || base.shared))
-            .then(|| finding(Rule::MixedFleet, self.writes, base_boundary));
+        let mixed =
+            (one_way && shared).then(|| finding(Rule::MixedFleet, self.writes, base_boundary));
         let rolling = (!self.reads(base.writes))
             .then(|| finding(Rule::Rolling, self.read_boundary(base.writes), base.writes));
         rollback.into_iter().chain(mixed).chain(rolling)
@@ -175,6 +185,8 @@ impl<'a> Comparison<'a> {
                 id: id.clone(),
                 head: base.writes,
                 base: base.writes,
+                shared: base.shared,
+                permanent: base.permanent,
             });
         self.pairs()
             .flat_map(|(id, head, base)| head.findings_against(id, base))

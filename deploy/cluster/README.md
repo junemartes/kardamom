@@ -238,6 +238,7 @@ The deploy record of an environment lives in the Nomad variable `kardamom/deploy
 | `changed` | The jobs the attempt registered, in registration order. A job joins before its registration. The rollback reverts them in reverse order. |
 | `rolled_back` | The jobs a rollback reverted so far, in that order. A rollback that stops resumes after them. |
 | `floor` | `{}`, or `{"formats": {"<id>": <version>}, "revision": "..."}` when `KARDAMOM_ALLOW_ONE_WAY` accepted a one-way format change. `just rollback` does not cross a floor. |
+| `retired` | The retired format ids that `KARDAMOM_ALLOW_RETIRED` accepted, or `[]`. |
 | `restored_from` | On an `accepted` record that a rollback restored: the `started_at` of the rolled-back release. |
 
 - `attempt` is always the last attempt. `accepted` is the last release that a deploy completed, or that a rollback restored. A failed attempt never becomes `accepted`.
@@ -302,10 +303,11 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Controller | `NOMAD_TOKEN` | empty | The Nomad ACL token. |
 | Controller | `NOMAD_NAMESPACE` | `default` | The Nomad namespace. |
 | Controller | `KARDAMOM_ENV` | `local` | The environment name. It selects `deployed/<env>/`. |
-| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary and compares the format registries. |
+| Controller | `KARDAMOM_CLUSTER_BIN` | `target/release/kardamom-cluster` | The operator binary that smokes a canary. |
 | Controller | `KARDAMOM_OPERATOR`, `KARDAMOM_REVISION` | `GITHUB_ACTOR` or `USER`; `GITHUB_SHA` or the git or jj revision | The operator and the revision of the deploy record. |
 | Controller | `KARDAMOM_REGISTRY_URL` | the Nomad API host on the registry port | The registry API that holds the images of the manifest, as the controller reaches it. `off` skips the image check, in the local profile only. A registry that answers 401, such as `https://ghcr.io`, gets an anonymous pull token from the realm of its challenge. |
 | Controller | `KARDAMOM_ALLOW_ONE_WAY` | empty | The format ids whose one-way change the operator accepts, comma-separated. The record then carries a rollback floor. |
+| Controller | `KARDAMOM_ALLOW_RETIRED` | empty | The retired format ids that the operator accepts in the rolling path, comma-separated. Each must be neither shared nor permanent, and the release must remove the service that owned it. The record keeps the list in `retired`. No floor follows. |
 | Controller | `KARDAMOM_ALLOW_MUST_MATCH` | empty | The sealer settings of a documented procedure that change in the rolling path, comma-separated. |
 | Controller | `KARDAMOM_REPLACE_ATTEMPT` | `0` | `1` deploys over an attempt that is still `started`, when it died. |
 | Controller | `KARDAMOM_ROLLBACK_BELOW_FLOOR` | empty | The format ids of a floor that `just rollback` crosses on purpose, after a check that no writer wrote the new version. |
@@ -315,7 +317,7 @@ For the behavior of the L1 switches, see [`../../docs/l1-data-path.md`](../../do
 | Signing | `KARDAMOM_CERT_OIDC_ISSUER` | `https://token.actions.githubusercontent.com` | The OIDC issuer of the signer. |
 | Signing | `KARDAMOM_COSIGN_CACHE`, `KARDAMOM_COSIGN_VERSION` | the user cache, the pinned version | Where the controller finds a cosign that is not on `PATH`. |
 | Settlement | `SETTLEMENT_ADDRESS` | empty | An existing settlement address. Empty: deploy one with `kardamom-deploy`. |
-| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. |
+| Settlement | `DEPLOY_BIN` | `target/release/kardamom-deploy` | The settlement deployer. The release gate also runs its `formats` command. |
 | Settlement | `L1_OWNER`, `L1_OWNER_KEY` | the Anvil dev account 0 | The owner address and key that the deployer uses. |
 | Settlement | `BATCHER_EOA` | the Anvil dev account 2 | The batcher address that the deployer registers. |
 | Settlement | `L2_CHAIN_ID` | `chain_id` of `all.yml` (412346) | The L2 chain id. |
@@ -372,7 +374,8 @@ The release gate (`roles/workloads/tasks/gate.yml`) refuses a release before it 
 | The last attempt is still started | The record's `attempt.status`. | Let it finish. If it died, `just rollback <env>`, or `KARDAMOM_REPLACE_ATTEMPT=1`. |
 | The chain stands on a halt or a pause | `kardamom_chainStatus` on a running ingress: `roots` is empty, and no `pause` stands on the sealer, the ingress or a service. A cluster without the ingress job has no chain to check; an ingress job without a running allocation is refused. When Nomad does not know the sealer job, the gate excuses `sealer_no_quorum` and the upstream pauses on it: the coordinated restart of the sealer purges the job, and the deploy brings it back. | Clear the halt (`docs/runbooks/`). A deploy cannot tell a failed release from a halted environment. |
 | An image is not in the registry | `HEAD /v2/<name>/manifests/<digest>` for every manifest record, at `KARDAMOM_REGISTRY_URL`. `off` skips it in the local profile only. | Push the images, or fix the manifest. |
-| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. The comparison needs the formats text in the accepted release. A deploy does not write the text into the record, so after the first deploy of this release there is no base and no comparison, until compatibility fixtures and a mixed-version chaos shard replace the format gate. Do not rely on this check in that window. | Stop the writers, or follow the runbook of the format. |
+| A coordinated format change | `kardamom-deploy formats` compares the `formats.toml` of the accepted release with the target's, with the rules of [`docs/formats.md`](../../docs/formats.md). A `rolling`, `mixed_fleet` or `retired` finding is coordinated. A `retired` finding that `KARDAMOM_ALLOW_RETIRED` names rolls, when the format is neither shared nor permanent. The comparison needs the formats text in the accepted release. A deploy does not write the text into the record, so after the first deploy of this release there is no base and no comparison, until compatibility fixtures and a mixed-version chaos shard replace the format gate. Do not rely on this check in that window. | Stop the writers, or follow the runbook of the format. When the release removes the service that owned a retired format, set `KARDAMOM_ALLOW_RETIRED=<ids>`. |
+| A stale retired allowance | `KARDAMOM_ALLOW_RETIRED` names a format that the release does not retire, or one that is shared or permanent. | Unset it, or remove the id. |
 | A one-way format change | A `rollback` finding that `KARDAMOM_ALLOW_ONE_WAY` does not name. An allowance that covers no finding is refused too. | Set `KARDAMOM_ALLOW_ONE_WAY=<ids>`. The record then carries a rollback floor. |
 | A sealer setting that every member must match | The settings of `workloads_sealer_must_match` in the compiled sealer job against the registered cluster. | Change it through a coordinated restart of the sealer. `decisionVersion` comes with the sealer image: follow "Decision version" in [`cluster/sealer-service/README.md`](../../cluster/sealer-service/README.md#decision-version). A documented procedure names the settings in `KARDAMOM_ALLOW_MUST_MATCH`. |
 | A shard map change | `config/shard-map.toml` against the map of the registered ingress. | Use the resize controller (`kardamom-cluster scale-sequencers`). |
@@ -636,7 +639,8 @@ KARDAMOM_CHAOS_CASES="graceful-executor" just shard chaos-executor   # narrow to
 - The gates are the `kardamom-chaos` crate: one `#[ignore]` test per shard in `crates/chaos/tests/shards.rs`.
 - A shard test brings the cluster up itself. `container-test` runs it with `KARDAMOM_CHAOS_REUSE=1` against the cluster that `container-up` made.
 - The knobs (`CHAOS_TPS`, `LOAD_DURATION_S` and others) are the environment variables that `crates/chaos/src/knobs.rs` reads.
-- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers | formats` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`). `formats` prints the format findings of this tree against a `--base` registry as JSON; the release gate reads them.
+- The operator commands are `kardamom-cluster smoke | diagnostics | scale-sequencers` (`cargo run -p kardamom-chaos --bin kardamom-cluster -- ...`).
+- `kardamom-deploy formats --base <registry> --root <tree>` prints the format findings of the tree against the registry as JSON. The release gate reads them.
 
 The shards, their cases, the gates, the load verdict, the L1 fault proxy and the knobs are in [`../../docs/chaos-suite.md`](../../docs/chaos-suite.md).
 
