@@ -28,6 +28,18 @@ final class SealerStateFixtures {
     }
 
     /**
+     * Build a 20-byte sender id that is distinct for each {@code s} in
+     * [0, 65 536): the last two bytes hold {@code s}.
+     */
+    static byte[] distinctSender(int s) {
+        byte[] out = new byte[CanonicalSealerState.SENDER_LEN];
+        out[0] = (byte) 0x7a;
+        out[18] = (byte) (s >>> 8);
+        out[19] = (byte) s;
+        return out;
+    }
+
+    /**
      * A deadline no block can pass, for tests about everything except the
      * inclusion check. The sealer clamps what it stores to its own horizon,
      * so this does not pin an id in the window.

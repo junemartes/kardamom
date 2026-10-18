@@ -142,13 +142,15 @@ jobs:
           java-version: "17"
       - name: Run sealer JUnit suite
         working-directory: cluster/sealer-service
-        run: ./gradlew :service:test --no-daemon
+        run: ./gradlew :core:test :core:allocationGate :service:test --no-daemon
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: sealer-test-reports
-          path: cluster/sealer-service/service/build/reports/tests/test
+          path: |
+            cluster/sealer-service/core/build/reports/tests
+            cluster/sealer-service/service/build/reports/tests/test
 
   # EEST state-test conformance against the pinned fixture release
   # (docs/agents/l1-client-suite-port-spec.md, W1). Latest fork only; the
