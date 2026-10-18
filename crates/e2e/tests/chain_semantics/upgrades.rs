@@ -61,9 +61,9 @@ async fn s13d_a_skip_uses_its_nonce_only_after_the_upgrade() {
 }
 
 /// S13a: an upgrade transaction with no activation timestamp turns the
-/// feature on immediately, starting with the block that carried it. It
-/// keeps firing in every later block, on both the executor and the
-/// validator.
+/// feature on immediately, starting with the block after the one that
+/// carried it. It keeps firing in every later block, on both the executor
+/// and the validator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s13a_health_check_activates_immediately() {
@@ -79,7 +79,7 @@ async fn s13a_health_check_activates_immediately() {
 /// S13b: an upgrade transaction carrying a future activation timestamp
 /// is scheduled, not applied. The feature stays dormant until the
 /// chain's own clock reaches that time, then fires from the first block
-/// at or after it.
+/// that executes at or after it.
 ///
 /// This also guards a units trap: `l2_timestamp` is epoch milliseconds.
 /// So the scenario anchors its schedule to the chain's own head

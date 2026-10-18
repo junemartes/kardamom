@@ -18,6 +18,8 @@ use revm::primitives::eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE;
 use revm::primitives::eip7825;
 use revm::primitives::hardfork::SpecId;
 
+use crate::features::BlockFeatures;
+
 /// The one hardfork kardamom executes. There is no fork schedule. The chain
 /// is born at genesis on the latest mainnet fork and stays there. A fork
 /// upgrade is a single PR that bumps this constant and the EEST fixture tag
@@ -40,9 +42,9 @@ pub const SPEC_ID: SpecId = SpecId::OSAKA;
 /// Fixed per-block gas limit. Version 0 has no dynamic adjustment.
 pub use kardamom_types::limits::BLOCK_GAS_LIMIT;
 
-/// Per-block execution context, built from the sealer's `BlockBoundaryStart`
-/// and the block's fees. It stays the same for every tx in the block, and
-/// is rebuilt at each boundary.
+/// Per-block execution context, built from the sealer's `BlockBoundaryStart`,
+/// the block's fees and the block's feature flags. It stays the same for
+/// every tx in the block, and is rebuilt at each boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct ExecEnv {
     pub chain_id: u64,
@@ -53,6 +55,11 @@ pub struct ExecEnv {
     /// `kardamom_types::fees`); [`BlockFees::NONE`] is the no-schedule
     /// chain.
     pub fees: BlockFees,
+    /// The block's feature flags. The driver reads them with
+    /// [`BlockFeatures::read`] before the first record of the block (see
+    /// [`crate::features`] for the rule); [`BlockFeatures::NONE`] is a
+    /// chain with no active feature.
+    pub features: BlockFeatures,
 }
 
 impl ExecEnv {
@@ -65,12 +72,18 @@ impl ExecEnv {
             block_number: boundary.block_number,
             l2_timestamp: boundary.l2_timestamp,
             fees: BlockFees::NONE,
+            features: BlockFeatures::NONE,
         }
     }
 
     #[must_use]
     pub fn with_fees(self, fees: BlockFees) -> Self {
         Self { fees, ..self }
+    }
+
+    #[must_use]
+    pub fn with_features(self, features: BlockFeatures) -> Self {
+        Self { features, ..self }
     }
 
     #[must_use]

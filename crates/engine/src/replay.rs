@@ -41,6 +41,7 @@ use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
 use crate::executor::{Executor, execute_deposit_tx, execute_xchain_tx};
+use crate::features::{BlockClose, BlockFeatures};
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 use kardamom_exec_core::exec_types::TxSlot;
 use kardamom_exec_core::executor::XChainDelivery;
@@ -438,9 +439,9 @@ struct Replay<'a> {
     /// each block's gas used, as the live exec thread's cursor does.
     fees: BlockFees,
     /// The header timestamp of the last replayed block, 0 at genesis. Block
-    /// N's records execute with block N-1's timestamp, as on the live exec
-    /// thread. Block N's own timestamp is its header time: the block-close
-    /// actions and the boundary read it.
+    /// N's records execute with block N-1's timestamp, and its flags are
+    /// read at it, as on the live exec thread. Block N's own timestamp is
+    /// its header time: the beacon and the boundary record it.
     exec_ts: u64,
     counters: Counters,
 }
@@ -464,8 +465,8 @@ impl<'a> Replay<'a> {
     }
 
     /// Finalize `acc`'s delta and receipts into a boundary, run the
-    /// block-close protocol actions, then submit the block and wait for
-    /// the durable commit.
+    /// block-close protocol actions with the block's frozen flags, then
+    /// submit the block and wait for the durable commit.
     ///
     /// Same block-close protocol actions the live engine runs, through the
     /// same shared implementation — a reconstructor that skipped them
@@ -477,17 +478,15 @@ impl<'a> Replay<'a> {
         &mut self,
         snapshot: &StateSnapshot,
         block: &ReplayBlock,
+        features: BlockFeatures,
         mut acc: BlockAcc,
     ) -> Result<(), ReplayError> {
-        // Offline replay commits one block at a time with no pipelined
-        // layer, so this reads only `acc.delta` then the snapshot.
-        kardamom_exec_core::features::apply_block_close_actions(
-            &mut acc.delta,
-            block.block_number,
-            block.l2_timestamp,
-            None,
-            snapshot,
-        )?;
+        BlockClose {
+            block_number: block.block_number,
+            header_ts_ms: block.l2_timestamp,
+            features,
+        }
+        .apply(&mut acc.delta, None, snapshot)?;
 
         let gas_used = acc.receipts.last().map_or(0, |r| r.cumulative_gas_used);
         let block_delta = acc.delta.finalize(block.block_number, acc.receipts);
@@ -529,6 +528,7 @@ impl<'a> Replay<'a> {
             block_number: block.block_number,
             l2_timestamp: self.exec_ts,
             fees: self.fees,
+            features: BlockFeatures::read(&snapshot, None, self.exec_ts)?,
         };
 
         let mut acc = BlockAcc::new(block.txs.len());
@@ -536,7 +536,7 @@ impl<'a> Replay<'a> {
             .items()
             .try_for_each(|item| acc.apply_one(&snapshot, exec_env, &mut self.counters, item))?;
 
-        self.seal_block(&snapshot, block, acc)
+        self.seal_block(&snapshot, block, exec_env.features, acc)
     }
 }
 

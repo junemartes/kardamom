@@ -31,7 +31,9 @@ use kardamom_engine::actor::BufferedRecord;
 /// Re-execute a block sequentially. Capture the pre-state witness and the
 /// block's raw (granularity-1) access list. Returns the execution output,
 /// the canonical witness (keyed by `env.block_number`), and the BAL: the
-/// full prover input set for one block.
+/// full prover input set for one block. The flags of the block come from
+/// the recorder ([`ExecEnv::with_features_from`]), so the witness holds
+/// the words that the stateless run reads.
 ///
 /// # Errors
 ///
@@ -50,6 +52,7 @@ pub fn capture_block_witness<S: StateDatabase>(
     EngineError,
 > {
     let recorder = WitnessRecorder::new(snapshot);
+    let env = env.with_features_from(&recorder, parent)?;
     let (out, bal) =
         kardamom_engine::stateless::execute_block_with_bal(&recorder, parent, records, env)?;
     Ok((out, recorder.into_witness(env.block_number), bal))

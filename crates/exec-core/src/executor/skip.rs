@@ -15,6 +15,7 @@ use revm::state::EvmState;
 use crate::delta::WriteSet;
 use crate::error::ExecutorError;
 use crate::exec_types::TxSlot;
+use crate::features::BlockFeatures;
 
 use super::burn::NonceBurn;
 use super::scope::Executor;
@@ -275,8 +276,8 @@ pub struct Skip<'a> {
 }
 
 impl Skip<'_> {
-    /// The state change of the nonce burn of this skip, read through `db`
-    /// at the block timestamp `timestamp_ms`. `None` when the skip uses
+    /// The state change of the nonce burn of this skip in a block with
+    /// the flags `features`, read through `db`. `None` when the skip uses
     /// no nonce. See [`NonceBurn`].
     ///
     /// # Errors
@@ -285,7 +286,7 @@ impl Skip<'_> {
     pub fn burn_state<DB: revm::Database>(
         &self,
         db: &mut DB,
-        timestamp_ms: u64,
+        features: BlockFeatures,
     ) -> Result<Option<EvmState>, ExecutorError>
     where
         DB::Error: core::fmt::Debug,
@@ -297,7 +298,7 @@ impl Skip<'_> {
             sender: self.record.inbound_envelope.sender,
             nonce: self.nonce,
         }
-        .state(db, timestamp_ms)
+        .state(db, features)
     }
 }
 

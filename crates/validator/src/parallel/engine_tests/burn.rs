@@ -11,7 +11,7 @@ use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 
 use crate::parallel::{BlockInputs, execute_block_parallel};
 
-use super::fixtures::{env, fund, honest_claims, nz, nz16, seq_delta, test_pool, tx};
+use super::fixtures::{env_of, fund, honest_claims, nz, nz16, seq_delta, test_pool, tx};
 
 #[test]
 fn parallel_batches_equal_sequential_on_a_block_with_a_burn() {
@@ -50,7 +50,7 @@ fn parallel_batches_equal_sequential_on_a_block_with_a_burn() {
                 parent: None,
                 txs: &txs,
                 claims: &claims,
-                env: env(),
+                env: env_of(&snap, None),
                 granularity: nz16(1),
             },
             nz(batch_size),

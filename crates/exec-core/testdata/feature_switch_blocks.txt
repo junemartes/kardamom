@@ -1,0 +1,39 @@
+# The blocks of one chain, and whether FEATURE_SEALER_V3 is on in each.
+# The Rust test crates/exec-core/tests/feature_switch_blocks.rs runs the
+# executor rule over these blocks, and the Java test
+# FeatureSwitchBlocksTest runs the sealer over them. Both must give the v3
+# column, so the executor and the sealer switch at the same block.
+#
+# Columns:
+#   block        the block number, from 1
+#   ts           the header time of the block in ms: the boundary that
+#                closes it. The next block executes with this time.
+#   origin       the L1 origin of the block. A block whose origin is above
+#                the origin of the block before is the first block of its
+#                epoch, and runs the deposits of the epoch.
+#   set_feature  the activation time of a setFeature deposit of the feature
+#                in the block, or "-". Only the first block of an epoch
+#                holds one. 0 means at once.
+#   v3           1 when the block runs with the feature on, else 0
+#
+# block ts origin set_feature v3
+1 1000 1 - 0
+2 1250 1 - 0
+3 1500 2 0 0
+4 1750 2 - 1
+5 2000 2 - 1
+6 2250 3 5000 1
+7 2500 3 - 0
+8 4750 3 - 0
+9 5000 3 - 0
+10 5250 3 - 1
+11 5500 4 18446744073709551615 1
+12 5750 4 - 0
+13 100000 4 - 0
+14 100250 5 0 0
+15 100500 5 - 1
+16 100750 6 1000 1
+17 101000 6 - 1
+18 101250 7 200000 1
+19 101500 8 0 0
+20 101750 8 - 1

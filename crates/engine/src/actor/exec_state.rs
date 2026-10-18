@@ -7,7 +7,9 @@ use crossbeam_channel::{Receiver, Sender};
 use kardamom_types::{BlockBoundary, BlockFees, SnapshotSource};
 
 use crate::delta::PendingDelta;
+use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
+use crate::features::BlockFeatures;
 use crate::reader::ReaderToExec;
 
 use super::exec_block::{BalCapture, BlockRun, BlockState};
@@ -120,6 +122,11 @@ pub(super) struct Cursor {
     /// Advanced at each boundary from the block's gas used, and seeded
     /// from the resume cursor and the chain's schedule.
     pub(super) fees: BlockFees,
+    /// The feature flags of the block in flight. Read at each boundary
+    /// from the state after the sealed block, and at the start from the
+    /// resume snapshot, both at [`Self::l2_ts`]. See
+    /// [`kardamom_exec_core::features`] for the rule.
+    pub(super) features: BlockFeatures,
     /// The next absolute record index, which is also the cumulative count
     /// of canonical records this exec thread has consumed.
     ///
@@ -170,7 +177,11 @@ impl<W: ExecPorts> ExecState<W> {
     /// absolute counters here, instead of replaying from record 0 and
     /// counting through them. A fresh start uses [`ResumePoint::GENESIS`],
     /// the same seeding with all-zero values.
-    pub(super) fn new(inputs: ExecInputs<W>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the read of the feature flags fails.
+    pub(super) fn new(inputs: ExecInputs<W>) -> Result<Self, ExecutorError> {
         let ExecInputs {
             cfg,
             rx,
@@ -191,7 +202,8 @@ impl<W: ExecPorts> ExecState<W> {
         } = inputs;
         let snapshot = snapshots.snapshot_after(start.block);
         let fees = start.block_fees(cfg.fees);
-        Self {
+        let features = BlockFeatures::read(&snapshot, None, start.l2_timestamp)?;
+        Ok(Self {
             cfg,
             io: ExecIo {
                 rx,
@@ -221,12 +233,13 @@ impl<W: ExecPorts> ExecState<W> {
                 block: start.block.saturating_add(1),
                 l2_ts: start.l2_timestamp,
                 fees,
+                features,
                 next_tx_idx: TxIndex(start.record_count),
             },
             metrics: ExecMetrics {
                 applied_ok: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok"),
                 applied_error: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error"),
             },
-        }
+        })
     }
 }

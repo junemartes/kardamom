@@ -104,8 +104,8 @@ impl TxJob<'_> {
     /// that an earlier transaction of the block changes. A skip with no
     /// nonce burn credits no fee and writes nothing. A burn
     /// ([`Skip::burn_state`]) publishes its state as an executed
-    /// transaction does, so the validation also covers the feature flag
-    /// that it read.
+    /// transaction does. The feature flag of the burn is part of the block
+    /// environment, not a read of the transaction.
     fn skip<S: StateDatabase>(
         &self,
         evm: &mut WorkerEvm<'_, S>,
@@ -114,7 +114,7 @@ impl TxJob<'_> {
         fresh_reads: &mut impl FnMut() -> Vec<ReadRecord>,
     ) -> Result<TxResult, ExecutorError> {
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
-        let Some(state) = skip.burn_state(db, ctx.env.l2_timestamp)? else {
+        let Some(state) = skip.burn_state(db, ctx.env.features)? else {
             let reads = std::mem::replace(&mut db.reads, fresh_reads());
             let (receipt, ws) = Executor::<S>::skip_receipt(skip, WriteSet::default());
             return Ok(TxResult {

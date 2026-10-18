@@ -31,6 +31,7 @@ use alloc::vec::Vec;
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::keccak256;
+use kardamom_types::upgrades::CHAIN_STATE;
 use kardamom_types::{BPosition, ExecutionWitness, Receipt, StateDatabase, TxEnvelope};
 
 use crate::block_env::ExecEnv;
@@ -38,6 +39,7 @@ use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::{TxIndex, TxSlot};
 use crate::executor::{DecodedTx, Executor};
+use crate::features::BlockFeatures;
 use crate::witness::WitnessDb;
 
 /// One canonical record of a block, in execution order. Clone is cheap.
@@ -282,6 +284,10 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
 /// public output. The recomputed list is structurally equal, so the
 /// commitment attests to the published artifact.
 ///
+/// The flags of the block come from the witness
+/// ([`ExecEnv::with_features_from`]), not from `env.features`: a proof
+/// takes no flag on trust from its host.
+///
 /// # Errors
 ///
 /// This fails closed in three ways: identity forgery
@@ -307,6 +313,7 @@ pub fn execute_block_stateless(
         })
         .try_for_each(verify_record_identity)?;
     let db = WitnessDb::from_witness(witness);
+    let env = env.with_features_from(&db, parent)?;
     let (out, raw_bal) = execute_block_with_bal(&db, parent, records, env)?;
     let recomputed = crate::bal_ladder::quantize(raw_bal, granularity.get());
     if &recomputed != expected_bal {
@@ -321,6 +328,29 @@ pub fn execute_block_stateless(
         )));
     }
     Ok(out)
+}
+
+impl ExecEnv {
+    /// This env with the flags of its block read from `db`, the state
+    /// before the block ([`BlockFeatures::read`] at `self.l2_timestamp`).
+    /// The read also takes the account that holds the flag words, because
+    /// the anchor proves a slot only under a witnessed account. The
+    /// witness capture and [`execute_block_stateless`] both call this, so
+    /// a witness holds every word that the stateless run reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorError::State`] when a read of `db` fails.
+    pub fn with_features_from<S: StateDatabase>(
+        self,
+        db: &S,
+        parent: Option<&PendingDelta>,
+    ) -> Result<Self, ExecutorError> {
+        db.basic(CHAIN_STATE)
+            .map_err(|e| ExecutorError::State(format!("flag account read: {e:?}")))?;
+        let features = BlockFeatures::read(db, parent, self.l2_timestamp)?;
+        Ok(self.with_features(features))
+    }
 }
 
 /// A stateless execution anchored to the chain's root history. These

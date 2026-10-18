@@ -12,7 +12,7 @@ use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::executor::test_support::{boundary, slot};
 use crate::executor::{Executor, SkippedRecord, SnapshotDb, StateRefError};
-use crate::features::activation_slot;
+use crate::features::{BlockFeatures, activation_slot};
 use crate::state::MockStateDatabase;
 
 const PAYEE: Address = address!("0000000000000000000000000000000000001234");
@@ -58,13 +58,20 @@ impl Chain {
         .sign(&self.signer)
     }
 
-    /// One block scope that executes at [`NOW_MS`].
-    fn scope(&self) -> Executor<&MockStateDatabase> {
+    /// The env of a block that executes at [`NOW_MS`], with the flags
+    /// that the chain state freezes for it.
+    fn env(&self) -> ExecEnv {
         let start = BlockBoundaryStart {
             l2_timestamp: NOW_MS,
             ..boundary(1)
         };
-        Executor::new(&self.snap, None, ExecEnv::new(1, &start)).expect("scope")
+        let features = BlockFeatures::read(&self.snap, None, NOW_MS).expect("flags");
+        ExecEnv::new(1, &start).with_features(features)
+    }
+
+    /// One block scope that executes at [`NOW_MS`].
+    fn scope(&self) -> Executor<&MockStateDatabase> {
+        Executor::new(&self.snap, None, self.env()).expect("scope")
     }
 
     fn sender_nonce(&self, ws: &WriteSet) -> Option<u64> {
@@ -209,15 +216,11 @@ fn a_burn_of_a_new_account_creates_it() {
 #[test]
 fn execute_once_burns_alike() {
     let chain = Chain::new(3, 1);
-    let start = BlockBoundaryStart {
-        l2_timestamp: NOW_MS,
-        ..boundary(1)
-    };
     let (skip, ws) = Executor::execute_once(
         &chain.snap,
         None,
         &PendingDelta::new(),
-        ExecEnv::new(1, &start),
+        chain.env(),
         slot(0, 0, 0, 0),
         &chain.transfer(3, FUNDS),
         None,
@@ -269,7 +272,8 @@ fn a_header_rejection_burns_nothing() {
             Some(PAYEE),
         )
         .unwrap();
-    assert!(header.burn_state(&mut db, NOW_MS).unwrap().is_none());
+    let features = chain.env().features;
+    assert!(header.burn_state(&mut db, features).unwrap().is_none());
     let gas = record
         .rejected(
             EVMError::<StateRefError>::Transaction(InvalidTransaction::CallerGasLimitMoreThanBlock),
@@ -277,5 +281,39 @@ fn a_header_rejection_burns_nothing() {
             Some(PAYEE),
         )
         .unwrap();
-    assert!(gas.burn_state(&mut db, NOW_MS).unwrap().is_some());
+    assert!(gas.burn_state(&mut db, features).unwrap().is_some());
+}
+
+/// The flags of the block decide, not the state that the transaction
+/// reads: a `setFeature` write earlier in the block (here in the block
+/// delta) burns nothing in this block. The next block reads the new word
+/// and burns.
+#[test]
+fn a_flag_written_in_the_block_burns_from_the_next_block() {
+    let chain = Chain::new(3, 0);
+    let mut written = PendingDelta::new();
+    written.storage.insert(
+        (CHAIN_STATE, activation_slot(FEATURE_SEALER_V3)),
+        U256::from(1u64),
+    );
+    let skip = |env: ExecEnv| {
+        Executor::execute_once(
+            &chain.snap,
+            None,
+            &written,
+            env,
+            slot(0, 0, 0, 0),
+            &chain.transfer(3, FUNDS),
+            None,
+        )
+        .unwrap()
+    };
+    let (this_block, ws) = skip(chain.env());
+    assert_eq!(this_block.skip_reason, Some(SkipReason::InsufficientFunds));
+    assert!(!this_block.burns_nonce() && ws.accounts.is_empty());
+
+    let next = BlockFeatures::read(&chain.snap, Some(&written), NOW_MS).unwrap();
+    let (next_block, ws) = skip(chain.env().with_features(next));
+    assert!(next_block.burns_nonce(), "{next_block:?}");
+    assert_eq!(chain.sender_nonce(&ws), Some(4));
 }

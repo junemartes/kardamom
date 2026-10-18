@@ -128,6 +128,16 @@ pub(crate) fn env() -> ExecEnv {
     )
 }
 
+/// [`env`] with the flags that `snap` under `parent`, the state before the
+/// block, freezes for it: what every block driver passes.
+pub(crate) fn env_of<S: StateDatabase>(snap: &S, parent: Option<&PendingDelta>) -> ExecEnv {
+    let env = env();
+    let features =
+        kardamom_exec_core::features::BlockFeatures::read(snap, parent, env.l2_timestamp)
+            .expect("flags");
+    env.with_features(features)
+}
+
 /// One record through the free executor path, a tx or a deposit, with a
 /// fresh scope per call. This is deliberately not the exec core's
 /// `execute_record_in_scope`, so the parity tests compare the shared
@@ -143,6 +153,7 @@ pub(crate) fn exec_record<S: StateDatabase>(
     bal: Option<&mut revm::state::bal::Bal>,
 ) -> (kardamom_types::Receipt, kardamom_engine::delta::WriteSet) {
     let bal = bal.map(|b| (b, i + 1));
+    let env = env_of(snap, parent);
     let slot = |tx_idx: TxIndex, position: BPosition| TxSlot {
         tx_idx,
         tx_position: position,
@@ -158,7 +169,7 @@ pub(crate) fn exec_record<S: StateDatabase>(
             snap,
             parent,
             delta,
-            env(),
+            env,
             slot(*tx_idx, *position),
             envelope,
             bal,
@@ -172,7 +183,7 @@ pub(crate) fn exec_record<S: StateDatabase>(
             snap,
             parent,
             delta,
-            env(),
+            env,
             slot(*tx_idx, *position),
             deposit,
             bal,
@@ -187,7 +198,7 @@ pub(crate) fn exec_record<S: StateDatabase>(
             snap,
             parent,
             delta,
-            env(),
+            env,
             slot(*tx_idx, *position),
             XChainDelivery {
                 origin_chain_id: *origin_chain_id,

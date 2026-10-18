@@ -133,7 +133,17 @@ pub(crate) fn env() -> ExecEnv {
         block_number: 1,
         l2_timestamp: 1_700_000_000,
         fees: kardamom_types::BlockFees::NONE,
+        features: kardamom_exec_core::features::BlockFeatures::NONE,
     }
+}
+
+/// [`env`] with the flags that `db`, the state before the block, freezes
+/// for it.
+pub(crate) fn env_of(db: &MockStateDatabase) -> ExecEnv {
+    let env = env();
+    let features = kardamom_exec_core::features::BlockFeatures::read(db, None, env.l2_timestamp)
+        .expect("flags");
+    env.with_features(features)
 }
 
 /// [`env`] at a chosen block number, for a multi-block test sequence.

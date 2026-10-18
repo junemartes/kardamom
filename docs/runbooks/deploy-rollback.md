@@ -118,7 +118,7 @@ The upgrade transaction of `FEATURE_SEALER_V3` switches the sealer to decision v
 
 ### Rollback after the activation of the nonce burn
 
-From the activation time of `FEATURE_SEALER_V3`, a skipped transaction at the chain nonce of its sender uses that nonce ("A skipped transaction and its nonce" in `docs/failure-modes.md`). The executor, the validator and the zk guest of the prover run the rule; the ingress and the sequencer read it. A release before this one does not run it.
+From the first block that executes at or after the activation time of `FEATURE_SEALER_V3` ("When a flag switches" in `docs/failure-modes.md`), a skipped transaction at the chain nonce of its sender uses that nonce ("A skipped transaction and its nonce" in `docs/failure-modes.md`). The executor, the validator and the zk guest of the prover run the rule; the ingress and the sequencer read it. A release before this one does not run it.
 
 - After the activation, do not roll an executor, a validator, an ingress or a sequencer back to a release without the job meta `nonce_burn = "true"`. An older executor or validator does not use the nonce of a skip, so its state forks from the chain at the first such skip. An older ingress or sequencer takes such a skip as a skip that used no nonce. Fix forward.
 - `just sealer-upgrade-check <env>` refuses the upgrade transaction until every live allocation of the executor, validator, ingress and sequencer jobs runs a job version with the meta `nonce_burn`.

@@ -7,6 +7,7 @@ use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta};
 use revm::state::bal::Bal;
 
 use crate::error::ExecutorError;
+use crate::features::{BlockClose, BlockFeatures};
 
 use super::exec_block::{BlockRun, BlockState, ExecutedBlock};
 use super::exec_records::{Finished, RecordKind, Writes};
@@ -17,38 +18,37 @@ use super::types::BufferedRecord;
 use super::wiring::ExecPorts;
 
 impl<W: ExecPorts> ExecState<W> {
-    /// Run the block-close protocol actions for the block being sealed.
+    /// Run the block-close protocol actions for the block being sealed,
+    /// with the flags that the block froze at its start.
     ///
     /// This supplies the two state layers that `exec-core` cannot see on its
     /// own: the merged unsettled-parent delta, then the mdbx snapshot. The
     /// composed read checks `delta`, then `parent`, then `snapshot`, in that
     /// order, matching what the EVM sees through `seed_cache_layer`. Reading
     /// the snapshot alone would miss the current block's writes and up to K
-    /// unsettled blocks. For a flag read, that would activate a feature
-    /// late, or never, on a busy chain, while a quieter replica activates
-    /// it on time. This is a divergence.
+    /// unsettled blocks. This is a divergence.
     fn apply_block_close_actions(
         &mut self,
         block_number: u64,
         header_ts_ms: u64,
     ) -> Result<(), ExecutorError> {
         // Destructure by field: `delta` is borrowed mutably, while
-        // `apply_block_close_actions` reads `parent` and `snapshot`.
+        // `BlockClose::apply` reads `parent` and `snapshot`.
         let Self {
             block: BlockState { delta, .. },
             commits: CommitPipeline {
                 parent, snapshot, ..
             },
+            cursor,
             ..
         } = self;
 
-        let outcome = kardamom_exec_core::features::apply_block_close_actions(
-            delta,
+        let outcome = BlockClose {
             block_number,
             header_ts_ms,
-            parent.as_ref(),
-            snapshot,
-        )?;
+            features: cursor.features,
+        }
+        .apply(delta, parent.as_ref(), snapshot)?;
 
         if let Some(beat) = outcome.health_beat {
             metrics::counter!(crate::metrics::HEALTH_BEACON_BEATS_TOTAL).increment(1);
@@ -205,17 +205,16 @@ impl<W: ExecPorts> ExecState<W> {
         // This call must happen here: after every record of the block has
         // landed in `self.block.delta` (through the streaming arms above, or the
         // whole-block strategy's fold above), and before the code takes the
-        // delta for the writer. This order lets an upgrade deposit activate a
-        // feature for the very block that carried it, and puts the actions'
-        // writes in the same delta the validator cross-checks.
+        // delta for the writer. This order puts the actions' writes in the
+        // same delta the validator cross-checks.
         //
         // This code runs for every role: the executor, the streaming
         // validator, and the parallel validator. It is engine code. A role
         // that skipped it would diverge on the first active block.
         //
         // `l2_timestamp` is this boundary's own stamp, the block's own header
-        // time. It is not the previous boundary's time, which is what the
-        // block's txs executed with.
+        // time, which the beacon records. The flags are the ones the block
+        // froze at its start.
         self.apply_block_close_actions(block_number, l2_timestamp)?;
 
         // No state-root computation yet. The sealed BlockBoundary on
@@ -291,6 +290,14 @@ impl<W: ExecPorts> ExecState<W> {
         // purely defensive.
         self.cursor.l2_ts = l2_timestamp;
         self.cursor.fees = self.cursor.fees.next(gas_used);
+        // The flags of the next block: the state after this block (the
+        // parent layer now holds it), at the time the next block executes
+        // with.
+        self.cursor.features = BlockFeatures::read(
+            &self.commits.snapshot,
+            self.commits.parent.as_ref(),
+            l2_timestamp,
+        )?;
         Ok(Flow::Continue)
     }
 }

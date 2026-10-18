@@ -66,12 +66,12 @@ fn run(activation_ms: u64) -> Vec<kardamom_types::Receipt> {
     let poor = seeded_signer(77);
     let database = chain(&rich, &poor, activation_ms);
     let recs = records(block(&rich, &poor));
-    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let seq = execute_block_sequential(&database, None, env_of(&database), &recs).unwrap();
     for workers in [1, 2, 4, 8] {
         let out = execute_block_stm(
             &database,
             None,
-            env(),
+            env_of(&database),
             &recs,
             &Stats::default(),
             nz(workers),
@@ -134,13 +134,13 @@ fn a_skip_that_an_earlier_transaction_undoes_runs_again() {
         ),
         tx(&poor, 0, TxKind::Call(rich[1].address()), POOR_FUNDS, &[]),
     ]);
-    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let seq = execute_block_sequential(&database, None, env_of(&database), &recs).unwrap();
     assert!(seq.0[1].status, "the funded spend executes: {:?}", seq.0[1]);
     for (workers, rep) in shard_worker_pairs([1, 2, 4, 8], [0, 1, 2, 3]) {
         let out = execute_block_stm(
             &database,
             None,
-            env(),
+            env_of(&database),
             &recs,
             &Stats::default(),
             nz(workers),

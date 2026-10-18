@@ -62,7 +62,7 @@ impl<W: ExecPorts + 'static> ExecState<W> {
     pub(crate) fn spawn(inputs: ExecInputs<W>) -> JoinHandle<Result<(), ExecutorError>> {
         thread::Builder::new()
             .name("executor-exec".into())
-            .spawn(move || -> Result<(), ExecutorError> { Self::new(inputs).run() })
+            .spawn(move || -> Result<(), ExecutorError> { Self::new(inputs)?.run() })
             .expect("spawn exec")
     }
 }

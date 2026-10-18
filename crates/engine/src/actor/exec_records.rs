@@ -43,6 +43,7 @@ impl<W: ExecPorts> ExecState<W> {
             block_number,
             l2_timestamp: self.cursor.l2_ts,
             fees: self.cursor.fees,
+            features: self.cursor.features,
         }
     }
 

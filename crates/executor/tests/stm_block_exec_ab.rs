@@ -215,6 +215,7 @@ fn stm_strategy_matches_sequential_capture_byte_for_byte() {
         block_number: 1,
         l2_timestamp: 1_700_000_000,
         fees: kardamom_types::BlockFees::NONE,
+        features: kardamom_engine::features::BlockFeatures::NONE,
     };
 
     // A: the sequential capture driver, the streaming path's semantics.

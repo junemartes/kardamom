@@ -9,12 +9,16 @@
 //!   → derive_epoch mints a SYSTEM deposit (domain-1 source hash)
 //!   → the sealer orders it like any other epoch record
 //!   → the executor runs it: KardamomChainState.setFeature
-//!   → every subsequent block close records a health beacon
+//!   → from the next block on, every block close records a health beacon
 //! ```
 //!
+//! A flag switches only at a block boundary: the flags of block N come from
+//! the state after block N-1, at the time block N executes with (the header
+//! time of block N-1).
+//!
 //! Three scenarios: [`activates_immediately`] (activation 0 — the flag is live
-//! from the block carrying the upgrade), [`activates_at_timestamp`] (scheduled
-//! — nothing happens until the chain's own clock reaches T), and
+//! from the block after the one carrying the upgrade), [`activates_at_timestamp`]
+//! (scheduled — nothing happens until a block executes at or after T), and
 //! [`authority_is_enforced`] (neither an L1 stranger nor an L2 user can reach
 //! the flag store).
 //!
@@ -238,12 +242,15 @@ pub async fn activates_immediately(
         "setFeature did not write an activation timestamp: {v:?}"
     );
 
-    // An immediate upgrade resolves to the executing block's timestamp, which
-    // is strictly below its own boundary's stamp — so the upgrade's OWN block
-    // is the first beating block.
-    assert_beat_every_block(&v, activation_block, "executor")?;
+    // An immediate upgrade resolves to the executing block's timestamp. The
+    // flags of a block are frozen before its first record, so the block
+    // AFTER the upgrade's block is the first beating block.
+    let first_active = activation_block
+        .checked_add(1)
+        .context("activation_block overflows")?;
+    assert_beat_every_block(&v, first_active, "executor")?;
 
-    assert_validator_agrees(t, validator_state_dir, activation_block, v.block_number).await?;
+    assert_validator_agrees(t, validator_state_dir, first_active, v.block_number).await?;
     Ok(())
 }
 
@@ -252,7 +259,8 @@ pub async fn activates_immediately(
 // ---------------------------------------------------------------------------
 
 /// A scheduled upgrade must do nothing until the chain's own clock reaches the
-/// activation time, then fire from the first block at or after it.
+/// activation time, then fire from the first block that executes at or after
+/// it: the block after the first header at or after it.
 ///
 /// # Errors
 /// Returns an error when the feature is not dormant beforehand, when the
@@ -318,7 +326,9 @@ pub async fn activates_at_timestamp(
         "the feature beat before its activation time: {pending:?}"
     );
 
-    // --- Wait past T, then find the first block whose header reached it. --
+    // --- Wait past T, then find the first block that executes at T. -------
+    // Block N executes with the header time of block N-1, so the first
+    // active block follows the first header that reached T.
     let v = poll_until(
         "a block closes at or after the activation time",
         Duration::from_mins(1),
@@ -331,19 +341,20 @@ pub async fn activates_at_timestamp(
     .await?;
 
     let headers = super::derivation::read_block_origins(executor_state_dir)?;
-    let first_active = headers
+    let reached = headers
         .iter()
         .find(|b| b.l2_timestamp >= activation_ts)
         .map(|b| b.block_number)
         .context("no block reached the activation timestamp")?;
+    let first_active = reached.checked_add(1).context("block number overflows")?;
     anyhow::ensure!(
         first_active > scheduled_block,
         "a FUTURE activation must not fire in the block that scheduled it \
          (first active {first_active}, scheduled in {scheduled_block})"
     );
-    // The predecessor must be strictly before T — otherwise `first_active` is
-    // not actually the first.
-    if let Some(prev) = headers.iter().find(|b| b.block_number == first_active - 1) {
+    // The header before `reached` must be strictly before T — otherwise
+    // `first_active` is not actually the first.
+    if let Some(prev) = headers.iter().find(|b| b.block_number == reached - 1) {
         anyhow::ensure!(
             prev.l2_timestamp < activation_ts,
             "block {} already reached the activation time; {first_active} is not the first",
