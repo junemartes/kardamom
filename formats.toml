@@ -290,6 +290,50 @@ TxStatus = "rkyv size 112 align 16"
 TxError = "rkyv size 80 align 16"
 TxEnvelope = "rkyv size 80 align 8"
 
+# Frozen layout. The rollback record on the tx_receipts receipt stream: a
+# 40-byte rkyv ReceiptRollback frame (the last valid block and the identity
+# of the event). A receipt batch frame is 16 bytes with no receipt and more
+# than 256 bytes with one, so a reader tells the two kinds apart by the
+# length. A reader of an older build fails to decode the frame as a batch,
+# logs it, and skips it: it keeps the receipts above the rollback, as before.
+[format.receipt-rollback]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = true
+code = ["crates/types/src/receipt.rs#pub struct ReceiptRollback"]
+[format.receipt-rollback.layout]
+ReceiptRollback = "rkyv size 40 align 8"
+
+# Frozen layout. The markers of an executor in its state directory, as
+# text. The rollback marker holds the block and the id of the rollback
+# record that the next run publishes. The running marker holds the boot id
+# of the host while a run is live. Only an executor with --carry-bytes
+# writes them. A release that does not know a marker ignores it.
+[format.executor-markers]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/executor/src/bin/kardamom-executor/marker.rs#struct Markers"]
+[format.executor-markers.layout]
+RollbackMarker = "7 0x0707070707070707070707070707070707070707070707070707070707070707\n"
+
+# Frozen layout. The receipt ledger of an executor (marker-receipts in the
+# state directory): a ring of 65536 slots of 64 bytes, one for each
+# canonical index modulo 65536. A slot holds the index and the block as
+# little-endian u64, the transaction hash, and 16 zero bytes. A slot
+# never crosses a page. Block 0 marks an empty slot. Only an executor with --carry-bytes writes it. A release that does
+# not know the file ignores it.
+[format.receipt-ledger]
+writes = 1
+reads_min = 1
+reads_max = 1
+shared = false
+code = ["crates/executor/src/bin/kardamom-executor/ledger.rs#struct Slot"]
+[format.receipt-ledger.layout]
+Slot = "slots 65536 01000000000000000200000000000000030303030303030303030303030303030303030303030303030303030303030300000000000000000000000000000000"
+
 # Frozen layout. The notifier outbox: rkyv OutboxRecord frames. An unknown
 # stage code reads as no stage.
 [format.notifier-outbox]

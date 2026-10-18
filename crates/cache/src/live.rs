@@ -105,6 +105,16 @@ impl LiveAccountsWriter {
         applied
     }
 
+    /// Drop every resident entry and set the head to zero. A rollback of
+    /// an executor calls this: the rows of the lost blocks carry positions
+    /// above the new stream, so the monotone rule would keep them. A
+    /// lookup then asks the next layer.
+    pub fn clear(&mut self) {
+        self.shared.map.clear();
+        self.order.clear();
+        self.shared.head.store(0, Ordering::Release);
+    }
+
     /// Insert or update one row. Returns whether it applied.
     fn apply_one(&mut self, row: &AccountRow, tx_idx: u64, now: Instant) -> bool {
         let mut entry = self.shared.map.entry(row.address).or_insert_with(|| Entry {
@@ -199,6 +209,18 @@ mod tests {
         assert!(live.get(Address::repeat_byte(0x02)).is_none(), "oldest out");
         assert_eq!(live.get(Address::repeat_byte(0x01)).unwrap().nonce, 2);
         assert!(live.len() <= 2);
+    }
+
+    #[test]
+    fn a_clear_drops_every_entry_and_a_lower_position_applies_after_it() {
+        let (live, mut writer) = LiveAccounts::new(&cfg(16, 60_000));
+        writer.apply(BPosition::from_index(20), &[row(0xaa, 5)]);
+        writer.clear();
+        assert!(live.is_empty());
+        assert_eq!(live.head(), 0);
+        assert_eq!(writer.apply(BPosition::from_index(12), &[row(0xaa, 3)]), 1);
+        assert_eq!(live.get(Address::repeat_byte(0xaa)).unwrap().nonce, 3);
+        assert_eq!(live.head(), 12);
     }
 
     #[test]

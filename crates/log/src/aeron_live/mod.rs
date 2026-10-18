@@ -84,8 +84,8 @@ pub use handles::simple::{
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle, TxReceiptsReceiver,
-    TxReceiptsSubscriberHandle,
+    ReceiptFrame, TxReceiptsBoundarySubscriberHandle, TxReceiptsPublisherHandle,
+    TxReceiptsReceiver, TxReceiptsSubscriberHandle,
 };
 pub use pending::{BEST_EFFORT_DROPPED_TOTAL, IdleBackoff};
 pub use runtime::{

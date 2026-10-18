@@ -200,6 +200,10 @@ A receipt is an Ethereum receipt with two more fields.
 
 - After a `lagged` frame, the client must poll `eth_getTransactionReceipt` for the transactions it waits for. Then it can continue to read the stream.
 - The subscription ends if the sink closes or a feed closes.
+- The subscription also ends when an executor rolls back its state. The last frame is a subscription error. Its text names the rollback and the last valid block, for example `receipts rolled back: an executor voided the receipts above block 4`.
+  - A receipt of a higher block can be gone, or can come again with another block, index or status.
+  - Read the receipts of the transactions you wait for again with `eth_getTransactionReceipt`. Then subscribe again.
+  - The ingress also drops its cached receipts, its fee history and its head above that block.
 
 Example `txError` frame:
 

@@ -20,6 +20,7 @@ use kardamom_state::StateSnapshot;
 use kardamom_types::VoidRecord;
 
 use crate::args::Args;
+use crate::ledger::ReceiptLedger;
 
 /// `tx_receipts` publication: the receipt stream and the boundary
 /// side-stream, opened through the stream plane. With discovery, this
@@ -32,6 +33,7 @@ pub(crate) async fn open_tx_receipts_pub(
     rt_pub: &AeronRuntime,
     plane: &mut StreamPlane,
     args: &Args,
+    ledger: Option<ReceiptLedger>,
 ) -> Result<LiveTxReceiptsPub> {
     let handle = plane
         .tx_receipts_publisher(rt_pub, args.recorder_id)
@@ -49,6 +51,7 @@ pub(crate) async fn open_tx_receipts_pub(
             .context("the tx_receipts reopen")?,
         rt_pub: rt_pub.clone(),
         tokio: tokio::runtime::Handle::current(),
+        ledger,
     })
 }
 
@@ -167,6 +170,9 @@ pub(crate) struct LiveTxReceiptsPub {
     reopen: TxReceiptsReopen,
     rt_pub: AeronRuntime,
     tokio: tokio::runtime::Handle,
+    /// The receipt ledger and the rollback marker, with `--carry-bytes`
+    /// only.
+    ledger: Option<ReceiptLedger>,
 }
 
 impl LiveTxReceiptsPub {
@@ -185,6 +191,19 @@ impl LiveTxReceiptsPub {
             };
         }
         ExecutorError::State(detail)
+    }
+
+    /// Write the receipts to the ledger before their publish. A failed
+    /// write ends the run: the file is allocated, so a failure is a broken
+    /// or full disk, which a retry does not heal. No receipt that is not in
+    /// the ledger goes out.
+    fn record(&self, items: &[kardamom_types::ReceiptRows]) -> Result<(), ExecutorError> {
+        let Some(ledger) = &self.ledger else {
+            return Ok(());
+        };
+        ledger
+            .record(items)
+            .map_err(|e| ExecutorError::LocalWrite(format!("write the receipt ledger: {e}")))
     }
 }
 
@@ -226,6 +245,9 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         &mut self,
         items: &[kardamom_types::ReceiptRows],
     ) -> (usize, Option<ExecutorError>) {
+        if let Err(e) = self.record(items) {
+            return (0, Some(e));
+        }
         match self
             .handle
             .publish_receipts(&kardamom_types::ReceiptBatch::merge(items))
@@ -235,13 +257,31 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
         }
     }
 
+    /// The rollback record rides the receipt stream, so every subscriber
+    /// reads it before the receipts that follow it.
+    fn publish_rollback(
+        &mut self,
+        rollback: kardamom_types::ReceiptRollback,
+    ) -> Result<(), ExecutorError> {
+        self.handle
+            .publish_rollback(&rollback)
+            .map_err(|e| Self::publish_error("publish_rollback", &e))?;
+        if let Some(ledger) = &self.ledger {
+            ledger.rollback_published(rollback);
+        }
+        Ok(())
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
-            CMessage::Receipt(r) => self
-                .handle
-                .publish_receipt(&r)
-                .map(|_| ())
-                .map_err(|e| Self::publish_error("publish_receipt", &e)),
+            CMessage::Receipt(r) => {
+                let rows = [kardamom_types::ReceiptRows::bare(r)];
+                self.record(&rows)?;
+                self.handle
+                    .publish_receipt(&rows[0].receipt)
+                    .map_err(|e| Self::publish_error("publish_receipt", &e))?;
+                Ok(())
+            }
             // Best-effort: a block-boundary marker. Ingress acks on the receipt
             // or durable watermark, not on this marker. Blocking the commit
             // thread here (for example, at startup before ingress's MDS

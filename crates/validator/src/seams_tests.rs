@@ -4,7 +4,7 @@ use alloy_primitives::{Address, B256, U256};
 use kardamom_types::{AccountChange, BPosition, StorageChange};
 use std::sync::Mutex;
 
-const R1: ReplicaId = ReplicaId::from_session(11);
+pub(super) const R1: ReplicaId = ReplicaId::from_session(11);
 const R2: ReplicaId = ReplicaId::from_session(22);
 const R3: ReplicaId = ReplicaId::from_session(33);
 
@@ -14,7 +14,7 @@ fn bal(bals: &BalBuffer, replica: ReplicaId, block: u64, bal_val: u64) {
 }
 
 /// Publish `replica`'s receipt.
-fn publish(buf: &ReceiptBuffer, replica: ReplicaId, receipt: Receipt) {
+pub(super) fn publish(buf: &ReceiptBuffer, replica: ReplicaId, receipt: Receipt) {
     buf.receipts.insert(receipt.tx_idx, replica, receipt);
 }
 
@@ -48,7 +48,7 @@ fn boundary(block: u64) -> BlockBoundary {
     }
 }
 
-fn receipt(idx: u64, status: bool, gas: u64, wsh: u8) -> Receipt {
+pub(super) fn receipt(idx: u64, status: bool, gas: u64, wsh: u8) -> Receipt {
     Receipt {
         tx_idx: BPosition::from_index(idx),
         status,
