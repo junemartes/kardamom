@@ -66,7 +66,7 @@ impl Chain {
             ..boundary(1)
         };
         let features = BlockFeatures::read(&self.snap, None, NOW_MS).expect("flags");
-        ExecEnv::new(1, &start).with_features(features)
+        ExecEnv::new(1, &start, features)
     }
 
     /// One block scope that executes at [`NOW_MS`].

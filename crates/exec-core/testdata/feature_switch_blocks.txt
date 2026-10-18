@@ -11,9 +11,11 @@
 #   origin       the L1 origin of the block. A block whose origin is above
 #                the origin of the block before is the first block of its
 #                epoch, and runs the deposits of the epoch.
-#   set_feature  the activation time of a setFeature deposit of the feature
-#                in the block, or "-". Only the first block of an epoch
-#                holds one. 0 means at once.
+#   set_feature  the activation times of the setFeature deposits of the
+#                feature in the block, in log order and separated by
+#                commas, or "-". Only the first block of an epoch holds
+#                them. 0 means at once. The last deposit of the block
+#                decides the next block.
 #   v3           1 when the block runs with the feature on, else 0
 #
 # block ts origin set_feature v3
@@ -37,3 +39,7 @@
 18 101250 7 200000 1
 19 101500 8 0 0
 20 101750 8 - 1
+21 102000 9 900000,0 1
+22 102250 9 - 1
+23 102500 10 0,900000 1
+24 102750 10 - 0

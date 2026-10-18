@@ -284,9 +284,10 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
 /// public output. The recomputed list is structurally equal, so the
 /// commitment attests to the published artifact.
 ///
-/// The flags of the block come from the witness
-/// ([`ExecEnv::with_features_from`]), not from `env.features`: a proof
-/// takes no flag on trust from its host.
+/// The flags of the block come from the activation words of the witness
+/// ([`ExecEnv::with_features_from`]), not from `env.features`. The words
+/// are proven against the pre-state root; the compare time is
+/// `env.l2_timestamp`, an input of the host.
 ///
 /// # Errors
 ///

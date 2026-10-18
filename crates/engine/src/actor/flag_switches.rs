@@ -11,8 +11,7 @@
 //! has a burning skip, and the expected burns are
 //! [`FlagSwitches::EXPECTED_BURNS`].
 
-use alloy_primitives::{Address, U256, address, keccak256};
-use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
+use alloy_primitives::{Address, U256, address};
 use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, Receipt};
 use revm::primitives::KECCAK_EMPTY;
@@ -24,7 +23,7 @@ use crate::features::BlockFeatures;
 use crate::state::MockStateDatabase;
 use crate::stateless::{BlockExecOutput, BufferedRecord, execute_block};
 
-use super::fixtures::{LegacyTx, seeded_signer};
+use super::fixtures::{ChainStatePredeploy, LegacyTx, seeded_signer};
 
 const PAYEE: Address = address!("00000000000000000000000000000000000E0003");
 /// One transfer costs at most 2.1e15 wei at this gas price.
@@ -112,28 +111,17 @@ impl FlagSwitches {
     pub fn new() -> Self {
         let poor = seeded_signer(0x683);
         let rich = seeded_signer(0x684);
-        let genesis: kardamom_types::Genesis =
-            toml::from_str(include_str!("../../../../chains/dev-withdrawals.toml"))
-                .expect("parse the genesis");
-        let (alloc, code) = genesis.to_alloc();
-        let predeploy = alloc
-            .iter()
-            .find(|a| a.address == CHAIN_STATE)
-            .expect("the genesis holds the chain-state predeploy");
-        let predeploy_code = code
-            .iter()
-            .find(|c| c.code_hash == predeploy.code_hash)
-            .expect("the predeploy code");
+        let predeploy = ChainStatePredeploy::dev();
         let snap = MockStateDatabase::builder()
             .account(poor.address(), U256::from(POOR_FUNDS), 0, KECCAK_EMPTY)
             .account(rich.address(), U256::from(10u128.pow(20)), 0, KECCAK_EMPTY)
             .account(
                 CHAIN_STATE,
                 U256::ZERO,
-                predeploy.nonce,
-                predeploy.code_hash,
+                predeploy.account.nonce,
+                predeploy.account.code_hash,
             )
-            .code(predeploy.code_hash, predeploy_code.code.clone())
+            .code(predeploy.code.code_hash, predeploy.code.code)
             .build();
         // The canonical record of an item at block index `i`. A deposit
         // takes L1 block `40 + i`, so each one in a block has its own
@@ -246,22 +234,13 @@ impl FlagSwitches {
             l1_origin: 0,
         };
         let features = BlockFeatures::read(&self.snap, Some(parent), exec_ts).expect("flags");
-        ExecEnv::new(1, &start).with_features(features)
+        ExecEnv::new(1, &start, features)
     }
 
     /// The system deposit of an upgrade transaction in L1 block
     /// `l1_number` that schedules `FEATURE_SEALER_V3` at `activation_ms`.
     fn set_feature(l1_number: u64, activation_ms: u64) -> Deposit {
-        let l1_hash = keccak256(l1_number.to_be_bytes());
-        let upgrade = LockboxLog::Upgrade(UpgradeLog {
-            block_number: l1_number,
-            block_hash: l1_hash,
-            log_index: 0,
-            feature_id: U256::from(FEATURE_SEALER_V3),
-            activation_timestamp: activation_ms,
-        });
-        derive_epoch(l1_number, l1_hash, &[upgrade])
-            .expect("one block's logs")
+        ChainStatePredeploy::upgrade_epoch(l1_number, FEATURE_SEALER_V3, &[activation_ms])
             .deposits
             .remove(0)
     }

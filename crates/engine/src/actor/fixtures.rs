@@ -17,6 +17,72 @@ use kardamom_types::TxEnvelope as KtTxEnvelope;
 pub use kardamom_test_support::{LegacyTx, anvil_signer_0, byte_signer, seeded_signer};
 
 // ---------------------------------------------------------------------------
+// The chain-state predeploy and its upgrade transactions.
+// ---------------------------------------------------------------------------
+
+/// The chain-state predeploy of the dev genesis: its account and its code.
+/// A test chain that runs `setFeature` deposits needs both.
+pub struct ChainStatePredeploy {
+    pub account: kardamom_types::AccountChange,
+    pub code: kardamom_types::delta::CodeEntry,
+}
+
+impl ChainStatePredeploy {
+    /// The predeploy of `chains/dev-withdrawals.toml`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the genesis does not parse or has no predeploy.
+    #[must_use]
+    pub fn dev() -> Self {
+        let genesis: kardamom_types::Genesis =
+            toml::from_str(include_str!("../../../../chains/dev-withdrawals.toml"))
+                .expect("parse the genesis");
+        let (alloc, code) = genesis.to_alloc();
+        let account = alloc
+            .into_iter()
+            .find(|a| a.address == kardamom_types::upgrades::CHAIN_STATE)
+            .expect("the genesis holds the chain-state predeploy");
+        let code = code
+            .into_iter()
+            .find(|c| c.code_hash == account.code_hash)
+            .expect("the predeploy code");
+        Self { account, code }
+    }
+
+    /// The epoch of L1 block `l1_number`, whose upgrade transactions
+    /// schedule `feature_id` at each of `activations_ms`, in log order.
+    /// Each one derives into a `setFeature` system deposit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the logs do not derive into an epoch.
+    #[must_use]
+    pub fn upgrade_epoch(
+        l1_number: u64,
+        feature_id: u64,
+        activations_ms: &[u64],
+    ) -> kardamom_types::EpochRecord {
+        use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
+        let l1_hash = alloy_primitives::keccak256(l1_number.to_be_bytes());
+        let logs: Vec<LockboxLog> = activations_ms
+            .iter()
+            .zip(0u64..)
+            .map(|(&activation_timestamp, log_index)| {
+                LockboxLog::Upgrade(UpgradeLog {
+                    block_number: l1_number,
+                    block_hash: l1_hash,
+                    log_index,
+                    feature_id: alloy_primitives::U256::from(feature_id),
+                    activation_timestamp,
+                })
+            })
+            .collect();
+        derive_epoch(l1_number, l1_hash, &logs).expect("one block's logs")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel-backed engine harness.
 // ---------------------------------------------------------------------------
 //

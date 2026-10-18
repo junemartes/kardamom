@@ -28,7 +28,11 @@ fn env() -> ExecEnv {
         l2_timestamp: 1_700_000_000,
         l1_origin: 0,
     };
-    ExecEnv::new(412_346, &b)
+    ExecEnv::new(
+        412_346,
+        &b,
+        kardamom_exec_core::features::BlockFeatures::NONE,
+    )
 }
 
 #[test]

@@ -5,6 +5,7 @@ use alloy_primitives::B256;
 use alloy_rlp::Decodable;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::exec_types::TxIndex;
+use kardamom_exec_core::features::BlockFeatures;
 use kardamom_exec_core::stateless::{execute_block_anchored, AnchoredBlockOutput, BufferedRecord};
 use kardamom_types::{BlockRecordsDigest, ProverInput, ProverRecord};
 
@@ -75,7 +76,10 @@ impl GuestBlock {
     #[must_use]
     pub fn run(input: ProverInput) -> GuestRun {
         let block = Self::from_records(input.boundary.block_number, input.records);
-        let env = ExecEnv::new(input.chain_id, &input.boundary).with_fees(input.fees);
+        // The stateless entry reads the flags of the block from the
+        // witness, so the env starts with none.
+        let env = ExecEnv::new(input.chain_id, &input.boundary, BlockFeatures::NONE)
+            .with_fees(input.fees);
         let granularity = input.granularity;
         let mut bal_slice: &[u8] = &input.bal_rlp;
         let expected_bal = alloy_eip7928::BlockAccessList::decode(&mut bal_slice)

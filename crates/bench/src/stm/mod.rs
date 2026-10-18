@@ -84,7 +84,11 @@ impl BlockAt {
     /// no part in an `ExecEnv`, so this always starts from `0`.
     #[must_use]
     pub fn env(self, chain_id: u64) -> ExecEnv {
-        ExecEnv::new(chain_id, &self.start(0))
+        ExecEnv::new(
+            chain_id,
+            &self.start(0),
+            kardamom_engine::features::BlockFeatures::NONE,
+        )
     }
 }
 

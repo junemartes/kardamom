@@ -57,22 +57,22 @@ pub struct ExecEnv {
     pub fees: BlockFees,
     /// The block's feature flags. The driver reads them with
     /// [`BlockFeatures::read`] before the first record of the block (see
-    /// [`crate::features`] for the rule); [`BlockFeatures::NONE`] is a
-    /// chain with no active feature.
+    /// [`crate::features`] for the rule). Every constructor takes them, so
+    /// a driver cannot run a block with flags it did not read.
     pub features: BlockFeatures,
 }
 
 impl ExecEnv {
-    /// The env of a chain without a fee schedule. [`Self::with_fees`]
-    /// sets the block's fees.
+    /// The env of a block with the flags `features`, on a chain without a
+    /// fee schedule. [`Self::with_fees`] sets the block's fees.
     #[must_use]
-    pub fn new(chain_id: u64, boundary: &BlockBoundaryStart) -> Self {
+    pub fn new(chain_id: u64, boundary: &BlockBoundaryStart, features: BlockFeatures) -> Self {
         Self {
             chain_id,
             block_number: boundary.block_number,
             l2_timestamp: boundary.l2_timestamp,
             fees: BlockFees::NONE,
-            features: BlockFeatures::NONE,
+            features,
         }
     }
 
@@ -175,7 +175,7 @@ mod tests {
             l2_timestamp: 1_700_000_000,
             l1_origin: 0,
         };
-        ExecEnv::new(412_346, &b)
+        ExecEnv::new(412_346, &b, crate::features::BlockFeatures::NONE)
     }
 
     #[test]

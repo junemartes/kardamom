@@ -135,6 +135,7 @@ fn spool_and_guest_reverify(
             l2_timestamp: 1_700_000_002,
             l1_origin: 0,
         },
+        kardamom_engine::features::BlockFeatures::NONE,
     );
     let pinned2 = PinnedPreState::new(snap1.clone(), 2).expect("snap1 pinned at block 1");
     let outputs = BlockSpooler::new(spool.to_path_buf(), CHAIN_ID)
@@ -171,7 +172,11 @@ fn spool_and_guest_reverify(
             },
         })
         .collect();
-    let genv = ExecEnv::new(input.chain_id, &input.boundary);
+    let genv = ExecEnv::new(
+        input.chain_id,
+        &input.boundary,
+        kardamom_engine::features::BlockFeatures::NONE,
+    );
     let mut bal_slice: &[u8] = &input.bal_rlp;
     let expected_bal =
         <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut bal_slice).unwrap();
@@ -229,6 +234,7 @@ fn spool_block_3(
             l2_timestamp: 1_700_000_003,
             l1_origin: 0,
         },
+        kardamom_engine::features::BlockFeatures::NONE,
     );
     let pinned3 = PinnedPreState::new(snap2, 3).expect("snap2 pinned at block 2");
     BlockSpooler::new(spool.to_path_buf(), CHAIN_ID)

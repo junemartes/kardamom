@@ -6,7 +6,7 @@
 
 use alloy_primitives::U256;
 
-use super::flag_chain::{Block, FlagChain, Item, Mode, TOO_MUCH};
+use super::flag_chain::{Block, FlagChain, Item, Mode};
 
 /// The header times of blocks 1, 2 and 3. Block 2 executes with `T1`, and
 /// block 3 with `T2`.
@@ -26,24 +26,15 @@ fn a_replay_burns_only_where_the_live_chain_burns() {
     let chain = FlagChain::new(vec![
         Block {
             ts: T1,
-            items: vec![Item::Schedule(ACTIVATION)],
+            items: vec![Item::Schedule(vec![ACTIVATION])],
         },
         Block {
             ts: T2,
-            items: vec![Item::Tx {
-                nonce: 0,
-                value: TOO_MUCH,
-            }],
+            items: vec![Item::Skip(0)],
         },
         Block {
             ts: T3,
-            items: vec![
-                Item::Tx { nonce: 0, value: 7 },
-                Item::Tx {
-                    nonce: 1,
-                    value: TOO_MUCH,
-                },
-            ],
+            items: vec![Item::Tx { nonce: 0, value: 7 }, Item::Skip(1)],
         },
     ]);
     let live = chain.live(Mode::Streaming);
@@ -52,5 +43,6 @@ fn a_replay_burns_only_where_the_live_chain_burns() {
         (2, U256::from(7u64)),
         "nonce 0 executes in block 3, and nonce 1 burns"
     );
+    assert_eq!(live.burns, [vec![], vec![false], vec![false, true]]);
     assert_eq!(chain.replayed(), live);
 }

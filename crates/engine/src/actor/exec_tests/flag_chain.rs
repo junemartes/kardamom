@@ -1,18 +1,20 @@
 //! A chain with the chain-state predeploy and one poor sender, whose
 //! upgrade transactions schedule `FEATURE_SEALER_V3`. It runs through the
 //! live exec thread (streaming or whole-block) and the offline replay,
-//! each on libMDBX with the trie on, and reports what each run leaves.
+//! each on libMDBX with the trie on, and reports what each run leaves:
+//! the root, the nonce of the poor sender, and which transfers of each
+//! block burned their nonce.
 
-use alloy_primitives::{Address, B256, U256, address, keccak256};
+use alloy_primitives::{Address, B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
-use kardamom_types::epoch::{LockboxLog, UpgradeLog, derive_epoch};
-use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
+use kardamom_types::upgrades::FEATURE_SEALER_V3;
 use kardamom_types::{
     AccountChange, EpochRecord, StateDatabase, TxEnvelope, TxRef, delta::CodeEntry,
 };
 
 use crate::actor::StateWriterSignal;
+use crate::actor::fixtures::ChainStatePredeploy;
 use crate::actor::test_hooks::SequentialBlockExec;
 use crate::actor::test_support::{
     ExecRig, boundary_msg, feed, fresh_env, genesis_for, legacy, pos,
@@ -22,18 +24,21 @@ use crate::reader::ReaderToExec;
 use crate::replay::{CanonicalEnd, ReplayBlock, ReplayGenesis, replay_blocks};
 
 /// The balance of the poor sender, and a value above it.
-pub(super) const POOR_FUNDS: u64 = 1_000;
-pub(super) const TOO_MUCH: u64 = 10_000;
-pub(super) const PAYEE: Address = address!("00000000000000000000000000000000000E0002");
-/// The L1 block of the first upgrade transaction. Each later one takes
-/// the next L1 block.
+const POOR_FUNDS: u64 = 1_000;
+const TOO_MUCH: u64 = 10_000;
+const PAYEE: Address = address!("00000000000000000000000000000000000E0002");
+/// The L1 block of the first upgrade epoch. Each later one takes the next
+/// L1 block.
 const FIRST_L1: u64 = 40;
 
 /// One record of a block on the canonical stream.
 pub(super) enum Item {
-    /// An L1 epoch whose upgrade transaction schedules
-    /// `FEATURE_SEALER_V3` at this time, in ms.
-    Schedule(u64),
+    /// An L1 epoch whose upgrade transactions schedule `FEATURE_SEALER_V3`
+    /// at these times, in ms, in log order.
+    Schedule(Vec<u64>),
+    /// A transfer of the poor sender at `nonce` that it cannot pay: a skip
+    /// at that nonce. Each skip has its own value, so its own hash.
+    Skip(u64),
     /// A transfer of the poor sender at `nonce`, of `value`.
     Tx { nonce: u64, value: u64 },
 }
@@ -59,6 +64,8 @@ pub(super) struct Rebuilt {
     pub(super) root: B256,
     pub(super) poor_nonce: u64,
     pub(super) payee_balance: U256,
+    /// For each block, whether each of its transfers burned its nonce.
+    pub(super) burns: Vec<Vec<bool>>,
 }
 
 /// One record of a block, resolved: an epoch, or a signed transfer.
@@ -130,18 +137,7 @@ pub(super) struct FlagChain {
 impl FlagChain {
     pub(super) fn new(blocks: Vec<Block>) -> Self {
         let poor = PrivateKeySigner::random();
-        let chain: kardamom_types::Genesis =
-            toml::from_str(include_str!("../../../../../chains/dev-withdrawals.toml"))
-                .expect("parse the genesis");
-        let (alloc, all_code) = chain.to_alloc();
-        let predeploy = alloc
-            .into_iter()
-            .find(|a| a.address == CHAIN_STATE)
-            .expect("the genesis holds the chain-state predeploy");
-        let code = all_code
-            .into_iter()
-            .filter(|c| c.code_hash == predeploy.code_hash)
-            .collect();
+        let predeploy = ChainStatePredeploy::dev();
         let mut accounts = genesis_for(Address::repeat_byte(0x01));
         accounts.extend([
             AccountChange {
@@ -150,12 +146,19 @@ impl FlagChain {
                 balance: U256::from(POOR_FUNDS),
                 code_hash: B256::ZERO,
             },
-            predeploy,
+            predeploy.account,
         ]);
         let mut l1 = FIRST_L1..;
+        let mut skips = 0u64..;
         let mut resolve = |item: Item| match item {
-            Item::Schedule(at) => {
-                Record::Epoch(Self::schedule(l1.next().expect("an L1 block"), at))
+            Item::Schedule(times) => Record::Epoch(ChainStatePredeploy::upgrade_epoch(
+                l1.next().expect("an L1 block"),
+                FEATURE_SEALER_V3,
+                &times,
+            )),
+            Item::Skip(nonce) => {
+                let value = TOO_MUCH + skips.next().expect("a skip");
+                Record::Tx(legacy(&poor, PAYEE, nonce, value))
             }
             Item::Tx { nonce, value } => Record::Tx(legacy(&poor, PAYEE, nonce, value)),
         };
@@ -171,23 +174,9 @@ impl FlagChain {
         Self {
             poor,
             accounts,
-            code,
+            code: vec![predeploy.code],
             blocks,
         }
-    }
-
-    /// The epoch of L1 block `l1_number`, with one upgrade transaction
-    /// that schedules `FEATURE_SEALER_V3` at `activation_ms`.
-    fn schedule(l1_number: u64, activation_ms: u64) -> EpochRecord {
-        let l1_hash = keccak256(l1_number.to_be_bytes());
-        let upgrade = LockboxLog::Upgrade(UpgradeLog {
-            block_number: l1_number,
-            block_hash: l1_hash,
-            log_index: 0,
-            feature_id: U256::from(FEATURE_SEALER_V3),
-            activation_timestamp: activation_ms,
-        });
-        derive_epoch(l1_number, l1_hash, &[upgrade]).expect("one block's logs")
     }
 
     fn numbered(&self) -> impl Iterator<Item = Numbered<'_>> {
@@ -259,12 +248,35 @@ impl FlagChain {
             .collect()
     }
 
+    /// Whether the stored receipt of `tx` burns its nonce.
+    fn burns(snap: &StateSnapshot, tx: &TxEnvelope) -> bool {
+        let position = snap
+            .get_tx_position(tx.tx_hash)
+            .unwrap()
+            .expect("the transfer is stored");
+        snap.get_receipt(position)
+            .unwrap()
+            .expect("the receipt is stored")
+            .burns_nonce()
+    }
+
     fn rebuilt(&self, env: &StateEnv) -> Rebuilt {
         let snap = StateSnapshot::open(env).unwrap();
         Rebuilt {
             root: snap.state_root().unwrap().expect("the trie is on"),
             poor_nonce: snap.basic(self.poor.address()).unwrap().expect("poor").0,
             payee_balance: snap.basic(PAYEE).unwrap().map_or(U256::ZERO, |a| a.1),
+            burns: self
+                .blocks
+                .iter()
+                .map(|(_, records)| {
+                    records
+                        .iter()
+                        .filter_map(Record::tx)
+                        .map(|tx| Self::burns(&snap, tx))
+                        .collect()
+                })
+                .collect(),
         }
     }
 
