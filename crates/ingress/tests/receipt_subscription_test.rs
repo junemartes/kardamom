@@ -147,16 +147,16 @@ async fn subscription_streams_deduped_and_filtered_receipts() {
     let h_watch = B256::repeat_byte(0x02);
     let h_watch2 = B256::repeat_byte(0x03);
     mock.receipt_bus
-        .send(receipt(other, 0, h_other, 1))
+        .send(receipt(other, 0, h_other, 1).into())
         .unwrap();
     mock.receipt_bus
-        .send(receipt(watched, 0, h_watch, 2))
+        .send(receipt(watched, 0, h_watch, 2).into())
         .unwrap();
     mock.receipt_bus
-        .send(receipt(watched, 0, h_watch, 2))
+        .send(receipt(watched, 0, h_watch, 2).into())
         .unwrap(); // Replica duplicate.
     mock.receipt_bus
-        .send(receipt(watched, 1, h_watch2, 3))
+        .send(receipt(watched, 1, h_watch2, 3).into())
         .unwrap();
 
     let first = next_event(&mut sub, "first notification").await;

@@ -110,6 +110,14 @@ impl FeeHistory {
         Self::trim(&mut blocks);
     }
 
+    /// Drop every block above `to_block`. The blocks are in number order,
+    /// so the kept blocks are a prefix of the ring.
+    pub(crate) fn roll_back(&self, to_block: u64) {
+        let mut blocks = self.blocks.lock_ignore_poison();
+        let keep = blocks.partition_point(|b| b.number <= to_block);
+        blocks.truncate(keep);
+    }
+
     /// The entry of block `number`, opened at its place in number order
     /// when it is new. The order of arrival is not the order of the
     /// blocks: an executor streams a receipt when it executes the
@@ -297,6 +305,25 @@ mod tests {
         h.on_boundary(&boundary(1, 1, 0));
         assert!(h.query(1, 1, &[]).is_none());
         assert_eq!(h.query(1, 2, &[]).unwrap().oldest_block, 2);
+    }
+
+    /// A rollback drops the blocks above its block, with their tips. The
+    /// new stream then fills them again.
+    #[test]
+    fn a_rollback_drops_the_blocks_above_its_block() {
+        let h = FeeHistory::default();
+        h.on_receipt(1, 3);
+        h.on_boundary(&boundary(1, 1_000, 0));
+        h.on_receipt(2, 7);
+        h.on_boundary(&boundary(2, 875, 0));
+        h.on_receipt(3, 9);
+        h.roll_back(1);
+        assert_eq!(h.latest(), 1);
+        assert!(h.query(1, 2, &[]).is_none());
+        assert_eq!(h.suggested_tip(), 3);
+        h.on_receipt(2, 5);
+        h.on_boundary(&boundary(2, 875, 0));
+        assert_eq!(h.query(1, 2, &[50.0]).unwrap().reward, Some(vec![vec![5]]));
     }
 
     #[test]

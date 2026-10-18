@@ -21,6 +21,7 @@ pub mod live;
 pub mod metrics;
 pub mod query;
 pub mod reader;
+mod rollbacks;
 pub mod script;
 #[cfg(feature = "docker-e2e")]
 pub mod testing;
@@ -33,3 +34,4 @@ pub use error::CacheError;
 pub use live::{LiveAccounts, LiveAccountsWriter};
 pub use query::{ExecutorQuery, ExecutorQueryConfig, QueryAnswer, QueryError, QueryMethod};
 pub use reader::CacheReader;
+pub use rollbacks::AppliedRollbacks;

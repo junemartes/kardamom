@@ -20,6 +20,14 @@ pub enum ExecutorError {
     #[error("proven divergence: {0}")]
     Divergence(String),
 
+    /// A write to a local file that a published output depends on failed,
+    /// for example the receipt ledger of an executor. This error is fatal
+    /// and not retryable: a full or broken disk does not heal by a retry.
+    /// The commit thread's must-deliver retry must not retry it, so the run
+    /// ends and the process exits.
+    #[error("local write failed: {0}")]
+    LocalWrite(String),
+
     #[error("revm execution failure at tx {idx:?}: {detail}")]
     Execution { idx: TxIndex, detail: String },
 
@@ -73,6 +81,56 @@ pub enum ExecutorError {
         head_index: u64,
         head_block: u64,
     },
+
+    /// The canonical stream differs from the committed history of this
+    /// consumer. `block` and `index` name the first difference: the
+    /// divergence point. Every block below `block` is equal on both sides,
+    /// so a checkpoint below `block` is a valid restart point.
+    /// `stream` is the fingerprint of the first frame of `block` in the
+    /// stream. Every consumer of that stream has that frame, so every
+    /// consumer that finds one divergence gets the same fingerprint.
+    #[error(
+        "the canonical stream diverges from the committed history at block {block} (index {index})"
+    )]
+    StreamDiverged {
+        block: u64,
+        index: u64,
+        stream: B256,
+    },
+
+    /// The canonical stream differs from the receipts that this consumer
+    /// published above its committed block. The committed history is
+    /// equal, so the state stays. The receipts at and above `block` are
+    /// void. `index` and `stream` are as in [`Self::StreamDiverged`].
+    #[error(
+        "the canonical stream differs from the receipts published above the committed history at block {block} (index {index})"
+    )]
+    PublishedDiverged {
+        block: u64,
+        index: u64,
+        stream: B256,
+    },
+
+    /// The canonical stream differs from the committed history at the
+    /// floor of the compared window, so the divergence can be below the
+    /// window. With `widen`, a wider window can find it. Without it, the
+    /// floor is the first block of the chain or the retention of the
+    /// source, and the operator restores the consumer.
+    #[error(
+        "the canonical stream diverges from the committed history at or below block {floor_block}, the floor of the compared window (a wider window can find it: {widen})"
+    )]
+    DivergedBelowWindow { floor_block: u64, widen: bool },
+
+    /// The source of the canonical stream has a new connection, or its head
+    /// went below the delivery cursor, while this consumer has entries in
+    /// flight above its committed block. The stream of the new connection
+    /// can differ from the entries in flight, and only the committed
+    /// history can be compared. The pipeline starts again from the state
+    /// DB, and the comparison at the start runs again.
+    #[error(
+        "the stream source restarted (delivery cursor index {next_index}, block {next_block}): restart from the state DB"
+    )]
+    SourceRestarted { next_index: u64, next_block: u64 },
 
     /// `sequencer_id` is the `tx_data` lane index, `TxRef::shard_id`. It
     /// names the archive that holds the envelope, not the process that

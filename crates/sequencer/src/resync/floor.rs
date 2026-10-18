@@ -1,8 +1,10 @@
 //! The executed-truth observations the receipts stream gives the
-//! sequencer, and what each one proves about the nonce of its sender.
+//! sequencer, what each one proves about the nonce of its sender, and the
+//! rollback that voids the observations above a block.
 
 use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::wire::NonceRelease;
+use kardamom_types::ReceiptRollback;
 
 /// One executed-truth observation. Two sources produce it:
 ///
@@ -18,6 +20,46 @@ use kardamom_cluster_adapter::wire::NonceRelease;
 pub struct FloorUpdate {
     pub sender: Address,
     pub outcome: Outcome,
+    pub evidence: Evidence,
+}
+
+/// Where the evidence of a [`FloorUpdate`] comes from. A rollback voids it
+/// by its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence {
+    /// A receipt of `block`. A rollback below `block` voids it.
+    Receipt { block: u64 },
+    /// A lookup answer, asked while the controller had seen `generation`
+    /// rollbacks. The committed state of a source has no single block of
+    /// evidence, and a source can answer from a state that a rollback
+    /// voids. So every later rollback voids the answer, and an answer to a
+    /// request from before the latest rollback counts for nothing.
+    Lookup { generation: u64 },
+}
+
+impl Evidence {
+    /// Whether a rollback voids this evidence when the controller has
+    /// seen `generation` rollbacks: a lookup answer to a request from
+    /// before the latest of them.
+    pub(crate) fn stale_at(self, generation: u64) -> bool {
+        matches!(self, Self::Lookup { generation: asked } if asked < generation)
+    }
+}
+
+/// One item of the floor channel, in the order of the receipt stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorEvent {
+    /// One executed-truth observation.
+    Update(FloorUpdate),
+    /// An executor rolled its state back: the receipts above `to_block`
+    /// are void, and so is each floor that one of them set.
+    Rollback(ReceiptRollback),
+}
+
+impl From<FloorUpdate> for FloorEvent {
+    fn from(update: FloorUpdate) -> Self {
+        Self::Update(update)
+    }
 }
 
 /// What one [`FloorUpdate`] proves about its sender.
@@ -114,6 +156,9 @@ impl FloorUpdate {
         Self {
             sender: receipt.from,
             outcome,
+            evidence: Evidence::Receipt {
+                block: receipt.block_number,
+            },
         }
     }
 
@@ -123,6 +168,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Executed { nonce },
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 
@@ -141,7 +187,14 @@ impl FloorUpdate {
                 reason,
                 tx_hash,
             },
+            evidence: Evidence::Lookup { generation: 0 },
         }
+    }
+
+    /// The same update, with the evidence `evidence`.
+    #[must_use]
+    pub fn with_evidence(self, evidence: Evidence) -> Self {
+        Self { evidence, ..self }
     }
 
     /// The nonce release for the sealer's guard that this update proves,
@@ -192,6 +245,7 @@ impl FloorUpdate {
         Self {
             sender,
             outcome: Outcome::Deposit,
+            evidence: Evidence::Lookup { generation: 0 },
         }
     }
 }

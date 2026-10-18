@@ -163,6 +163,14 @@ pub(crate) struct Switch<F, S> {
     /// Whether each source had a connection in this run, as `[feed,
     /// service]`.
     seen: [bool; 2],
+    /// The connection of the latest request to each source, as `[feed,
+    /// service]`.
+    asked_on: [Option<u64>; 2],
+    /// A request went out on a connection of a source other than the
+    /// connection of its request before. The stream of a new connection
+    /// can differ from the one before, for example after a member lost
+    /// the tail of its log.
+    renewed: bool,
     back: Return,
     /// The id of the next request on either source. Ids are labels, so
     /// they wrap.
@@ -180,6 +188,8 @@ impl<F: Transport, S: Transport> Switch<F, S> {
             answer: Answer::new(timing, now),
             marks: Marks::default(),
             seen: [false; 2],
+            asked_on: [None; 2],
+            renewed: false,
             back: Return::default(),
             next_id: first_id,
         };
@@ -226,10 +236,20 @@ impl<F: Transport, S: Transport> Switch<F, S> {
         id
     }
 
+    /// Whether a request went out on a new connection of its source since
+    /// the last call. The flag clears.
+    pub(crate) fn take_renewed(&mut self) -> bool {
+        std::mem::take(&mut self.renewed)
+    }
+
     /// Send a new request from `cursor` to the active source.
     pub(crate) fn ask(&mut self, cursor: (u64, u64), now: Instant) {
         let id = self.take_id();
         let connection = self.connection();
+        if let Some(current) = connection {
+            let before = self.asked_on[self.active.slot()].replace(current);
+            self.renewed |= before.is_some_and(|before| before != current);
+        }
         *self.marks.slot(self.active) = None;
         let request = self.answer.ask(cursor, id, connection, now);
         tracing::debug!(

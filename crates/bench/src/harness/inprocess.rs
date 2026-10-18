@@ -87,7 +87,7 @@ pub async fn spawn_inprocess_ingress(
 async fn run_fake_executor(
     term_id: i32,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>,
-    receipt_tx: tokio::sync::broadcast::Sender<Receipt>,
+    receipt_tx: tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
 ) {
     let mut idx: i32 = 0;
     while let Some(env) = rx.recv().await {
@@ -105,7 +105,7 @@ fn reflect_receipt(
     term_id: i32,
     idx: i32,
     env: &kardamom_types::TxEnvelope,
-    receipt_tx: &tokio::sync::broadcast::Sender<Receipt>,
+    receipt_tx: &tokio::sync::broadcast::Sender<kardamom_ingress::ReceiptItem>,
 ) -> ControlFlow<()> {
     let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
     let receipt = Receipt {
@@ -120,7 +120,7 @@ fn reflect_receipt(
         from: env.sender,
         ..Default::default()
     };
-    if receipt_tx.send(receipt).is_err() {
+    if receipt_tx.send(receipt.into()).is_err() {
         return ControlFlow::Break(());
     }
     ControlFlow::Continue(())

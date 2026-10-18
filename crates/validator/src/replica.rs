@@ -94,6 +94,9 @@ pub(crate) enum Skip {
     Evicted,
     /// Its key is more than the reach above the consumer's cursor.
     Ahead,
+    /// The replica rolled its state back below the block of the result,
+    /// so the result can be gone from the chain.
+    Withdrawn,
 }
 
 impl Skip {
@@ -105,6 +108,7 @@ impl Skip {
             Self::Bound => "bound",
             Self::Evicted => "evicted",
             Self::Ahead => "ahead",
+            Self::Withdrawn => "withdrawn",
         }
     }
 }
