@@ -47,10 +47,9 @@ class SealerDecisionRulesTest {
 
     /**
      * What one entry did: the egress kinds that the sequencer got, without
-     * the status frames, the unknown-kind drops so far, and the decision
-     * version after the entry.
+     * the status frames, and the decision version after the entry.
      */
-    private record Outcome(String name, List<Byte> kinds, long unknownKinds, int decisionVersion) {
+    private record Outcome(String name, List<Byte> kinds, int decisionVersion) {
     }
 
     private final List<SealerClusteredService> started = new ArrayList<>();
@@ -117,6 +116,9 @@ class SealerDecisionRulesTest {
     /** A heap member on its own stub cluster, from {@code snapshot} or at genesis. */
     private Member member(final Optional<byte[]> snapshot) {
         final StubCluster cluster = new StubCluster();
+        // A follower asks for a snapshot through no control toggle; the
+        // stub has none. The snapshot notice still goes out.
+        cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = new SealerClusteredService(
             CAPACITY, 250, 0, Set.of(), VoidLedger.Config.DISABLED,
@@ -138,7 +140,7 @@ class SealerDecisionRulesTest {
                 .map(f -> f[0])
                 .filter(kind -> kind != SealerWire.EGRESS_KIND_STATUS)
                 .toList();
-            return new Outcome(entry.name(), kinds, svc.droppedUnknownKindCount(), svc.decisionVersion());
+            return new Outcome(entry.name(), kinds, svc.decisionRules().version());
         }
 
         List<Outcome> applyAll(final List<Entry> log) {
@@ -152,8 +154,8 @@ class SealerDecisionRulesTest {
         }
     }
 
-    private static Outcome outcome(final String name, final List<Byte> kinds, final long unknown, final int version) {
-        return new Outcome(name, kinds, unknown, version);
+    private static Outcome outcome(final String name, final List<Byte> kinds, final int version) {
+        return new Outcome(name, kinds, version);
     }
 
     private static final byte RELAYED = SealerWire.EGRESS_KIND_RELAYED;
@@ -165,20 +167,20 @@ class SealerDecisionRulesTest {
     void the_golden_stream_decides_by_version_two_before_the_activation_and_by_version_three_after_it() {
         final List<Outcome> outcomes = member(Optional.empty()).applyAll(goldenStream(true));
         assertEquals(List.of(
-            outcome("epoch-1", List.of(RELAYED), 0, 2),
-            outcome("nonce-0", List.of(RELAYED), 0, 2),
-            outcome("nonce-1", List.of(RELAYED), 0, 2),
-            outcome("tick-1", List.of(BOUNDARY), 0, 2),
-            outcome("release-v2", List.of(), 1, 2),
-            outcome("retry-v2", List.of(REJECT), 1, 2),
-            outcome("activation", List.of(), 1, 2),
-            outcome("epoch-2", List.of(RELAYED), 1, 2),
-            outcome("release-early", List.of(), 2, 2),
-            outcome("tick-at-activation", List.of(RULES, BOUNDARY), 2, 3),
-            outcome("release-v3", List.of(), 2, 3),
-            outcome("release-twin", List.of(), 2, 3),
-            outcome("retry-v3", List.of(RELAYED), 2, 3),
-            outcome("tick-2", List.of(BOUNDARY), 2, 3)), outcomes);
+            outcome("epoch-1", List.of(RELAYED), 2),
+            outcome("nonce-0", List.of(RELAYED), 2),
+            outcome("nonce-1", List.of(RELAYED), 2),
+            outcome("tick-1", List.of(BOUNDARY), 2),
+            outcome("release-v2", List.of(), 2),
+            outcome("retry-v2", List.of(REJECT), 2),
+            outcome("activation", List.of(), 2),
+            outcome("epoch-2", List.of(RELAYED), 2),
+            outcome("release-early", List.of(), 2),
+            outcome("tick-at-activation", List.of(RULES, BOUNDARY), 3),
+            outcome("release-v3", List.of(), 3),
+            outcome("release-twin", List.of(), 3),
+            outcome("retry-v3", List.of(RELAYED), 3),
+            outcome("tick-2", List.of(BOUNDARY), 3)), outcomes);
     }
 
     @Test
@@ -217,17 +219,10 @@ class SealerDecisionRulesTest {
         final byte[] snapshot = original.svc().snapshot();
         assertEquals(snapshotVersion, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
         final Member restored = member(Optional.of(snapshot));
-        assertEquals(original.svc().decisionVersion(), restored.svc().decisionVersion());
+        assertEquals(original.svc().decisionRules().version(), restored.svc().decisionRules().version());
         final List<Entry> rest = log.subList(cut, log.size());
-        assertEquals(
-            original.applyAll(rest).stream().map(SealerDecisionRulesTest::withoutDrops).toList(),
-            restored.applyAll(rest).stream().map(SealerDecisionRulesTest::withoutDrops).toList());
+        assertEquals(original.applyAll(rest), restored.applyAll(rest));
         assertArrayEquals(original.svc().snapshot(), restored.svc().snapshot());
-    }
-
-    /** An outcome without the drop count: the count is per process, not replicated state. */
-    private static Outcome withoutDrops(final Outcome outcome) {
-        return new Outcome(outcome.name(), outcome.kinds(), 0, outcome.decisionVersion());
     }
 
     @Test
@@ -252,10 +247,38 @@ class SealerDecisionRulesTest {
         member.svc().onSessionOpen(early, 0);
         assertTrue(early.offered.isEmpty(), "version 2 sends no rules frame");
         member.apply(Entry.frame("activation", activation(1, 0), 100L));
-        assertArrayEquals(new byte[] {RULES, 3, 7, 0, 0, 0, 0, 0, 0, 0}, early.offered.get(0),
+        assertArrayEquals(new byte[] {RULES, 3, 7, 0, 0, 0, 0, 0, 0, 0},
+            early.offered.stream().filter(f -> f[0] == RULES).findFirst().orElseThrow(),
             "an open session gets the rules frame at the switch");
         final StubSession late = member.cluster().addSession(8);
         member.svc().onSessionOpen(late, 200L);
         assertArrayEquals(new byte[] {RULES, 3, 8, 0, 0, 0, 0, 0, 0, 0}, late.offered.get(0));
+    }
+
+    @Test
+    void an_activation_that_applies_asks_for_a_snapshot() {
+        final Member member = member(Optional.empty());
+        member.apply(Entry.frame("epoch-1", epoch(1), 1_000L));
+        member.apply(Entry.frame("activation", activation(2, ACTIVATION_MS), 1_500L));
+        assertTrue(member.sequencer().offered.stream().anyMatch(f -> f[0] == SealerWire.EGRESS_KIND_STATUS
+                && f.length > SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET && f[SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET] == 1),
+            "the status with the snapshot notice goes out at the activation record");
+        assertEquals(new DecisionRules.View(2, 2L, ACTIVATION_MS), member.svc().decisionRules());
+    }
+
+    @Test
+    void a_new_term_offers_the_rules_frame_again_under_version_three() {
+        final Member member = member(Optional.empty());
+        newTerm(member);
+        assertTrue(member.sequencer().offered.stream().noneMatch(f -> f[0] == RULES), "version 2 sends none");
+        member.apply(Entry.frame("activation", activation(1, 0), 100L));
+        final long before = member.sequencer().offered.stream().filter(f -> f[0] == RULES).count();
+        newTerm(member);
+        assertEquals(before + 1, member.sequencer().offered.stream().filter(f -> f[0] == RULES).count(),
+            "a frame that a leader change lost goes out again");
+    }
+
+    private static void newTerm(final Member member) {
+        member.svc().onNewLeadershipTermEvent(1, 0, 0, 0, 0, 0, java.util.concurrent.TimeUnit.MILLISECONDS, 0);
     }
 }

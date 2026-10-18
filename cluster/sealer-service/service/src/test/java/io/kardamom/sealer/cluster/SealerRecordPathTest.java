@@ -291,15 +291,24 @@ class SealerRecordPathTest {
             sequencer.offered.get(0));
     }
 
+    /**
+     * A member without the file runs version 3 after the activation, and
+     * its snapshot, version 13, restores version 3. The member is a
+     * follower, so the snapshot request at the activation goes to no control
+     * toggle.
+     */
     @Test
-    void the_member_counts_the_releases_since_its_snapshot() {
+    void a_member_without_the_file_restores_version_three_from_its_snapshot() {
+        cluster.role = io.aeron.cluster.service.Cluster.Role.FOLLOWER;
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = member(Optional.empty(), Optional.empty());
         deliver(svc, sequencer, IngressFrames.featureActivationFrame(1, DecisionRules.FEATURE_SEALER_V3, 0));
         sameLog(svc, sequencer);
-        assertEquals(2L, svc.releasesSinceSnapshot(), "the release and its twin copy");
-        final SealerClusteredService restored = member(Optional.empty(), Optional.of(svc.snapshot()));
-        assertEquals(0L, restored.releasesSinceSnapshot());
+        assertEquals(3, svc.decisionRules().version());
+        final byte[] snapshot = svc.snapshot();
+        assertEquals(CanonicalSealerState.RULES_SNAPSHOT_VERSION, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
+        final SealerClusteredService restored = member(Optional.empty(), Optional.of(snapshot));
+        assertEquals(3, restored.decisionRules().version());
     }
 
     @Test

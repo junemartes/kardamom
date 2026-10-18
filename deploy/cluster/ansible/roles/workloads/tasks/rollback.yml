@@ -108,7 +108,6 @@
         revision: "{{ workloads_last_attempt.before.revision }}"
         manifest: "{{ workloads_last_attempt.before.manifest }}"
         formats: "{{ workloads_last_attempt.before.formats }}"
-        decision_version: "{{ workloads_last_attempt.before.decision_version | default('') }}"
       before: {manifest: {}, jobs: {}}
       changed: []
       rolled_back: []

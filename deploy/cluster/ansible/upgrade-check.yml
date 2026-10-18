@@ -1,5 +1,5 @@
 ---
-- name: Check that no sealer member replays a nonce release across a decision version
+- name: Check that every sealer member and every sequencer takes the sealer feature activation
   hosts: localhost
   connection: local
   become: false
@@ -7,7 +7,7 @@
   vars_files:
     - group_vars/all.yml
   tasks:
-    - name: Check the members and record the result
+    - name: Check the members and the sequencers
       ansible.builtin.include_role:
         name: workloads
-        tasks_from: quiesce
+        tasks_from: upgrade_check

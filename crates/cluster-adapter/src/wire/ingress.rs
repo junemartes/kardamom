@@ -21,7 +21,8 @@ use super::{
     KIND_INGRESS_RECORD, KIND_NONCE_RELEASE, KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR,
     KIND_RECORDED_CURSOR, KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE,
     KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError,
-    encode_kind_2u64, epoch_slots, rd_slice, rd_u64, rd_u128, remote_epoch_slots, too_short,
+    encode_kind_2u64, encode_kind_2u64_id, epoch_slots, rd_slice, rd_u64, rd_u128,
+    remote_epoch_slots, too_short,
 };
 
 /// The guard header of a kind-0 ingress frame: the fields the service
@@ -290,16 +291,16 @@ impl FeatureActivation {
             })
     }
 
-    /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`.
+    /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`:
+    /// the shape of the feed request.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        [
-            &[KIND_FEATURE_ACTIVATION][..],
-            &self.l1_origin.to_le_bytes(),
-            &self.feature_id.to_le_bytes(),
-            &self.activation_ms.to_le_bytes(),
-        ]
-        .concat()
+        encode_kind_2u64_id(
+            KIND_FEATURE_ACTIVATION,
+            self.l1_origin,
+            self.feature_id,
+            self.activation_ms,
+        )
     }
 }
 

@@ -162,6 +162,12 @@ impl ReleaseProbe {
         Ok(())
     }
 
+    /// The nonce releases that the sequencers sent.
+    async fn releases_sent(t: &Target) -> Result<f64> {
+        t.sequencer_metric_sum_where(NONCE_RELEASES, "outcome=\"sent\"")
+            .await
+    }
+
     /// The new transfer lands within `within`, with a successful receipt.
     async fn lands_after_release(&self, t: &Target, within: Duration) -> Result<()> {
         poll_until(
@@ -174,12 +180,6 @@ impl ReleaseProbe {
         let receipt = await_l2_receipt(t, self.retry.hash, "the new transfer at nonce 1").await?;
         assert_receipt_ok(&receipt, "the new transfer at nonce 1")
     }
-}
-
-/// The nonce releases that the sequencers sent.
-async fn releases_sent(t: &Target) -> Result<f64> {
-    t.sequencer_metric_sum_where(NONCE_RELEASES, "outcome=\"sent\"")
-        .await
 }
 
 /// A nonce release takes effect only after the upgrade transaction of
@@ -206,7 +206,7 @@ pub async fn release_takes_effect_only_after_the_upgrade(
     before.skip_nonce_one(t).await?;
     before.stays_refused(t, REFUSED_FOR).await?;
     anyhow::ensure!(
-        releases_sent(t).await? == 0.0,
+        ReleaseProbe::releases_sent(t).await? == 0.0,
         "a sequencer sent a nonce release to a sealer of version 2"
     );
 
@@ -225,7 +225,7 @@ pub async fn release_takes_effect_only_after_the_upgrade(
     after.skip_nonce_one(t).await?;
     after.lands_after_release(t, LANDS_WITHIN).await?;
     anyhow::ensure!(
-        releases_sent(t).await? > 0.0,
+        ReleaseProbe::releases_sent(t).await? > 0.0,
         "the new transfer landed with no nonce release sent"
     );
     Ok(())

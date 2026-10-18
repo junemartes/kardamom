@@ -184,18 +184,11 @@ public final class SealerClusteredService implements ClusteredService {
     private long releaseCount = 0;
 
     /**
-     * The nonce-release frames that this member applied from the log since
-     * its last snapshot, taken or restored. The admin thread reads it: a
-     * change of the decision version needs 0 on every member, so that no
-     * release replays under the other rules.
+     * The decision rules of the member, for the admin thread. The service
+     * thread sets them after the start and at each activation record that
+     * applies.
      */
-    private volatile long releasesSinceSnapshot = 0;
-
-    /**
-     * The decision version of the member, for the admin thread. The
-     * service thread sets it after the start and at the switch.
-     */
-    private volatile int publishedDecisionVersion = DecisionRules.START_VERSION;
+    private volatile DecisionRules.View publishedRules = DecisionRules.START_VIEW;
 
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
@@ -393,24 +386,30 @@ public final class SealerClusteredService implements ClusteredService {
             this.state = new CanonicalSealerState(
                 dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER, remoteOrigins, voids(),
                 inclusionHorizonBlocks, window.capacity(), budgets);
+            startRules();
             openEgress(Optional.empty());
             System.out.println("sealer state FRESH at genesis memberId=" + memberId);
         }
-        publishedDecisionVersion = rulesVersion();
-        System.out.println("sealer decision rules memberId=" + memberId + " version=" + publishedDecisionVersion);
+        publishedRules = state.decisionRules();
+        System.out.println("sealer decision rules memberId=" + memberId + " version=" + state.decisionVersion());
         // Do not call scheduleTimer here: Aeron rejects timer scheduling from
         // onStart. The boundary timer is armed from onNewLeadershipTermEvent,
         // which is log-driven.
     }
 
     /**
-     * The decision version of this member. A member with the retained file
-     * runs version 3 from its start: the setting comes with version 3, and
-     * every member must match it. Every other member runs the rules of its
-     * state.
+     * The rules of a state that starts at genesis or from a seed. A member
+     * with the retained file runs version 3 from its start: the setting
+     * comes with version 3, and every member must match it. Its snapshot,
+     * version 12, restores version 3.
      */
-    private int rulesVersion() {
-        return retainedFile.isPresent() ? DecisionRules.NEWEST_VERSION : state.decisionVersion();
+    private void startRules() {
+        retainedFile.ifPresent(file -> state.startOnNewestRules());
+    }
+
+    /** Whether this member runs version 3: it applies a nonce release and sends the rules frame. */
+    private boolean onNewestRules() {
+        return state.decisionVersion() == DecisionRules.NEWEST_VERSION;
     }
 
     /**
@@ -429,19 +428,29 @@ public final class SealerClusteredService implements ClusteredService {
      * gets the rules frame, so a sequencer starts to send nonce releases.
      */
     private void onRulesSwitch(final long timestamp) {
-        publishedDecisionVersion = rulesVersion();
+        publishedRules = state.decisionRules();
         System.out.println("cluster DECISION-VERSION memberId=" + memberId
-            + " version=" + publishedDecisionVersion + " at=" + timestamp + " block=" + state.blockNumber());
-        egress.offerSealerInfoToAll(publishedDecisionVersion);
+            + " version=" + state.decisionVersion() + " at=" + timestamp + " block=" + state.blockNumber());
+        egress.offerSealerInfoToAll(DecisionRules.NEWEST_VERSION);
+    }
+
+    /** Offer the rules frame to a session that opened. Under version 2 the member sends none. */
+    private void offerRules(final ClientSession session) {
+        if (onNewestRules()) {
+            egress.offerSealerInfo(session, DecisionRules.NEWEST_VERSION);
+        }
     }
 
     /**
-     * Offer the rules frame to a session that opened. Under version 2 the
-     * member sends none, as the previous release does.
+     * Offer the rules frame to every open session under version 3. A
+     * leader change can lose a frame that the old leader had not sent yet,
+     * and a sequencer holds its releases until it gets one. A new term is a
+     * log entry, so every member offers again at the same point, and a
+     * client takes a repeat as the same report.
      */
-    private void offerRules(final ClientSession session) {
-        if (rulesVersion() == DecisionRules.NEWEST_VERSION) {
-            egress.offerSealerInfo(session, DecisionRules.NEWEST_VERSION);
+    private void offerRulesAgain() {
+        if (onNewestRules()) {
+            egress.offerSealerInfoToAll(DecisionRules.NEWEST_VERSION);
         }
     }
 
@@ -512,6 +521,7 @@ public final class SealerClusteredService implements ClusteredService {
     private void startSeeded(final SealerSeed seed) {
         this.state = CanonicalSealerState.seeded(
             seed, dedupCapacity, voids(), inclusionHorizonBlocks, window.capacity(), budgets);
+        startRules();
         openEgress(Optional.empty());
         // The seed head is on L1, so the purge floor starts there. The first
         // snapshot after the seed confirmation is the first purge mark.
@@ -571,6 +581,7 @@ public final class SealerClusteredService implements ClusteredService {
         // Re-arming with the same correlation id is idempotent: Aeron replaces
         // the pending timer instead of scheduling a second one.
         scheduleBoundaryTimer();
+        offerRulesAgain();
         if (state.seedStatus() == CanonicalSealerState.SeedStatus.PENDING) {
             seedRecord.offer(state.seedDigest());
         }
@@ -655,11 +666,7 @@ public final class SealerClusteredService implements ClusteredService {
                     file -> onUnknownKind(kind, length), () -> onRecordedCursor(buffer, offset, length));
                 return;
             case SealerWire.KIND_NONCE_RELEASE:
-                if (rulesVersion() == DecisionRules.NEWEST_VERSION) {
-                    onNonceRelease(buffer, offset, length);
-                } else {
-                    onUnknownKind(kind, length);
-                }
+                onNonceRelease(buffer, offset, length);
                 return;
             case SealerWire.KIND_FEATURE_ACTIVATION:
                 retainedFile.ifPresentOrElse(
@@ -1087,10 +1094,10 @@ public final class SealerClusteredService implements ClusteredService {
      * Handle a {@link SealerWire#KIND_NONCE_RELEASE} frame: a sequencer saw
      * a skip receipt, and the guard goes back to the nonce that the chain
      * expects. A frame of another length drops as malformed. A release
-     * that does not apply prints nothing: both twins send each release.
+     * that does not apply prints nothing: both twins send each release, and
+     * under version 2 the state takes none.
      */
     private void onNonceRelease(final DirectBuffer buffer, final int offset, final int length) {
-        releasesSinceSnapshot++;
         if (length != SealerWire.NONCE_RELEASE_LEN) {
             onMalformedFrame("nonce-release", length);
             return;
@@ -1114,6 +1121,11 @@ public final class SealerClusteredService implements ClusteredService {
      * {@code timestamp}, the cluster time of the record. A frame of another
      * length drops as malformed. Every frame prints a line: an upgrade is
      * rare, and the line shows where the rules switch.
+     *
+     * <p>An activation that applies asks for a snapshot. The snapshot is
+     * version 13, so a member whose loader reads only up to version 12 stops
+     * on it at its next start, and does not replay the log after it with the
+     * rules of version 2.</p>
      */
     private void onFeatureActivation(
             final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
@@ -1125,12 +1137,17 @@ public final class SealerClusteredService implements ClusteredService {
             buffer.getLong(offset + SealerWire.ACTIVATION_ORIGIN_OFFSET, ByteOrder.LITTLE_ENDIAN),
             buffer.getLong(offset + SealerWire.ACTIVATION_FEATURE_OFFSET, ByteOrder.LITTLE_ENDIAN),
             buffer.getLong(offset + SealerWire.ACTIVATION_MS_OFFSET, ByteOrder.LITTLE_ENDIAN));
-        final boolean switched = state.onFeatureActivation(activation, timestamp);
+        final DecisionRules.Outcome outcome = state.onFeatureActivation(activation, timestamp);
         System.out.println("cluster FEATURE-ACTIVATION memberId=" + memberId
-            + " l1Origin=" + activation.l1Origin() + " feature=" + activation.featureId()
+            + " l1Origin=" + Long.toUnsignedString(activation.l1Origin()) + " feature=" + activation.featureId()
             + " activationMs=" + Long.toUnsignedString(activation.activationMs())
-            + " at=" + timestamp + " version=" + state.decisionVersion());
-        if (switched) {
+            + " at=" + timestamp + " outcome=" + outcome + " version=" + state.decisionVersion());
+        if (outcome == DecisionRules.Outcome.IGNORED) {
+            return;
+        }
+        publishedRules = state.decisionRules();
+        requestSnapshot();
+        if (outcome == DecisionRules.Outcome.SWITCHED) {
             onRulesSwitch(timestamp);
         }
     }
@@ -1374,7 +1391,6 @@ public final class SealerClusteredService implements ClusteredService {
         // window here, and the snapshot never has to carry held records.
         flushWindow();
         SnapshotIo.writeSnapshot(snapshotPublication, snapshot(), cluster.idleStrategy());
-        releasesSinceSnapshot = 0;
         latestSnapshotVersion = retainedFile.isPresent()
             ? CanonicalSealerState.RETAINED_FILE_SNAPSHOT_VERSION
             : state.snapshotVersion();
@@ -1434,14 +1450,9 @@ public final class SealerClusteredService implements ClusteredService {
         return latestSnapshotVersion;
     }
 
-    /** The nonce-release frames since the last snapshot, taken or restored. */
-    long releasesSinceSnapshot() {
-        return releasesSinceSnapshot;
-    }
-
-    /** The decision version of the member, for the admin thread. */
-    int decisionVersion() {
-        return publishedDecisionVersion;
+    /** The decision rules of the member, for the admin thread. */
+    DecisionRules.View decisionRules() {
+        return publishedRules;
     }
 
     /** Ingress frames of an unknown kind this member dropped. */

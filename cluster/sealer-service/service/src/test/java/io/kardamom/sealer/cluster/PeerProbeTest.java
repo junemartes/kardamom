@@ -18,7 +18,7 @@ final class PeerProbeTest {
     private static final MemberStatus.SnapshotVersions SNAPSHOT = MemberStatus.SnapshotVersions.of(0);
 
     private static MemberStatus status(final int memberId, final String role, final String election, final long commit) {
-        return new MemberStatus(memberId, role, election, commit, commit, SNAPSHOT, OptionalLong.empty());
+        return new MemberStatus(memberId, role, election, commit, commit, SNAPSHOT, io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.empty());
     }
 
     private static URI statusUri(final AdminServer admin) {

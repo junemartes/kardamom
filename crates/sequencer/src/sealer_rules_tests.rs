@@ -1,4 +1,8 @@
-use super::SealerRules;
+use std::time::{Duration, Instant};
+
+use kardamom_cluster_adapter::wire::FeatureActivation;
+
+use super::{ActivationWatch, RULES_AFTER, SealerRules};
 use crate::resync::SharedWatermark;
 
 fn rules() -> (SealerRules, SharedWatermark) {
@@ -56,4 +60,58 @@ fn a_session_with_no_report_takes_no_release_until_the_switch() {
     assert!(!shared.sealer_takes_releases());
     r.on_sealer_info(7, 3);
     assert!(shared.sealer_takes_releases());
+}
+
+fn activation(activation_ms: u64) -> FeatureActivation {
+    FeatureActivation {
+        l1_origin: 9,
+        feature_id: kardamom_types::upgrades::FEATURE_SEALER_V3,
+        activation_ms,
+    }
+}
+
+#[test]
+fn the_watch_warns_once_when_no_report_follows_an_activation() {
+    let shared = SharedWatermark::new();
+    let mut watch = ActivationWatch::new(0, shared);
+    let now = Instant::now();
+    watch.check(now + RULES_AFTER * 2);
+    assert!(watch.warn_at.is_none(), "no activation, no watch");
+    watch.on_offered(activation(0), now);
+    watch.check(now + Duration::from_secs(30));
+    assert!(watch.warn_at.is_some(), "the time has not passed yet");
+    watch.check(now + RULES_AFTER + Duration::from_secs(1));
+    assert!(watch.warn_at.is_none(), "warned once");
+}
+
+#[test]
+fn a_report_of_version_three_ends_the_watch() {
+    let shared = SharedWatermark::new();
+    let mut watch = ActivationWatch::new(0, shared.clone());
+    let now = Instant::now();
+    watch.on_offered(activation(0), now);
+    shared.set_sealer_version(3);
+    watch.check(now + Duration::from_secs(1));
+    assert!(watch.warn_at.is_none());
+}
+
+#[test]
+fn a_scheduled_activation_waits_for_its_time() {
+    let mut far = ActivationWatch::new(0, SharedWatermark::new());
+    let now = Instant::now();
+    far.on_offered(activation(u64::MAX), now);
+    far.check(now + RULES_AFTER * 2);
+    assert!(far.warn_at.is_some(), "a time far ahead has not passed");
+    let mut watch = ActivationWatch::new(0, SharedWatermark::new());
+    let in_an_hour = kardamom_types::time::duration_to_ms_saturating(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap(),
+    ) + 3_600_000;
+    watch.on_offered(activation(in_an_hour), now);
+    watch.check(now + RULES_AFTER * 2);
+    assert!(
+        watch.warn_at.is_some(),
+        "the activation time is an hour away"
+    );
 }

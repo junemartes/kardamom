@@ -19,20 +19,22 @@ import java.nio.ByteBuffer;
  * below the time of the activation record switches the rules at that
  * record. The switch is one way.</p>
  *
- * <p>An activation applies only when its L1 origin is at or above the
- * origin of the state, and above the origin of the pending activation. So
- * a copy of the record from a twin sequencer, or a record that a sequencer
- * sends again with its epoch, changes nothing, and the record of an older
- * epoch changes nothing. The copy of the twin still applies after the
- * epoch, so one lost record does not lose the activation. A later upgrade
- * before the switch replaces the activation time, as
- * {@code KardamomChainState.setFeature} does.</p>
+ * <p>An activation applies only when its L1 origin names the epoch that the
+ * record fronts: the next origin of the state, or the origin of the state
+ * when the epoch got in first. It must also be above the origin of the
+ * pending activation. So a copy of the record from a twin sequencer, or a
+ * record that a sequencer sends again with its epoch, changes nothing, and a
+ * record for an older or a later epoch changes nothing. The copy of the twin
+ * still applies after the epoch, so one lost record does not lose the
+ * activation. A later upgrade before the switch replaces the activation
+ * time, as {@code KardamomChainState.setFeature} does. The origins and the
+ * time are u64 values from the wire, so every comparison is unsigned.</p>
  */
 public final class DecisionRules {
-    /** The rules of a state that holds no activation. The job names this version. */
+    /** The rules of a state that holds no activation. Every member starts on it. */
     public static final int START_VERSION = 2;
 
-    /** The newest rules of this release: the nonce release applies. */
+    /** The newest rules: the nonce release applies. */
     public static final int NEWEST_VERSION = 3;
 
     /**
@@ -40,6 +42,9 @@ public final class DecisionRules {
      * Rust {@code kardamom_types::upgrades::FEATURE_SEALER_V3}.
      */
     public static final long FEATURE_SEALER_V3 = 2L;
+
+    /** The rules of a state that holds no activation, as a value. */
+    public static final View START_VIEW = new View(START_VERSION, 0L, 0L);
 
     /** The snapshot tail: {@code [version:u8][activation_origin:u64][activation_ms:u64]}. */
     static final int SNAPSHOT_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
@@ -63,6 +68,15 @@ public final class DecisionRules {
         return new DecisionRules(START_VERSION, 0L, 0L);
     }
 
+    /**
+     * Version 3 with no activation: the rules of a member that keeps its
+     * retained frames in a file. That setting comes with version 3, and every
+     * member must match it.
+     */
+    static DecisionRules newest() {
+        return new DecisionRules(NEWEST_VERSION, 0L, 0L);
+    }
+
     /** The version of the rules. */
     int version() {
         return version;
@@ -73,23 +87,30 @@ public final class DecisionRules {
         return activationOrigin != 0L;
     }
 
+    /** The rules as a value, for the admin endpoint. */
+    public View view() {
+        return new View(version, activationOrigin, activationMs);
+    }
+
     /**
      * Take a feature activation record at cluster time {@code nowMs}, with
      * {@code stateOrigin} the L1 origin of the state.
      *
-     * @return whether the rules switched to version 3 at this record
+     * @return what the record did
      */
-    boolean onActivation(final FeatureActivation activation, final long stateOrigin, final long nowMs) {
+    Outcome onActivation(final FeatureActivation activation, final long stateOrigin, final long nowMs) {
+        final long origin = activation.l1Origin();
+        final boolean frontsTheEpoch = origin == stateOrigin || origin == stateOrigin + 1;
         final boolean applies = activation.featureId() == FEATURE_SEALER_V3
             && version == START_VERSION
-            && activation.l1Origin() >= stateOrigin
-            && activation.l1Origin() > activationOrigin;
+            && frontsTheEpoch
+            && Long.compareUnsigned(origin, activationOrigin) > 0;
         if (!applies) {
-            return false;
+            return Outcome.IGNORED;
         }
-        activationOrigin = activation.l1Origin();
+        activationOrigin = origin;
         activationMs = activation.activationMs();
-        return switchAt(nowMs);
+        return switchAt(nowMs) ? Outcome.SWITCHED : Outcome.PENDING;
     }
 
     /**
@@ -124,10 +145,29 @@ public final class DecisionRules {
         return new DecisionRules(version, buf.getLong(), buf.getLong());
     }
 
+    /** What a feature activation record did. */
+    public enum Outcome {
+        /** The record changed nothing. */
+        IGNORED,
+        /** The state holds the activation, and its time is not due yet. */
+        PENDING,
+        /** The rules switched to version 3 at this record. */
+        SWITCHED
+    }
+
     /**
      * A feature activation record: the upgrade transaction of the epoch at
      * {@code l1Origin} schedules {@code featureId} at {@code activationMs}.
      */
     public record FeatureActivation(long l1Origin, long featureId, long activationMs) {
+    }
+
+    /**
+     * The rules as a value: the version, and the origin and the time of the
+     * activation, both 0 when the state holds none. A check outside the
+     * cluster compares the origin with the {@code setFeature} deposit of
+     * that epoch on L1.
+     */
+    public record View(int version, long activationOrigin, long activationMs) {
     }
 }

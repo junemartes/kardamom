@@ -366,6 +366,12 @@ impl ResyncWiring {
         // The epoch lane reads the same egress: the boundaries confirm its
         // epochs, and an origin-gap reject makes it offer them again.
         let (origins, epoch_lane) = kardamom_sequencer::epoch::EpochPump::new();
+        let epoch_lane = epoch_lane.with_activation_watch(
+            kardamom_sequencer::sealer_rules::ActivationWatch::new(
+                cfg.partition_index,
+                watermark.clone(),
+            ),
+        );
         let watermark_task = feeds::EgressWatermarkFeed::new(
             cfg.resync.boundary_silence_ms,
             cfg.partition_index,

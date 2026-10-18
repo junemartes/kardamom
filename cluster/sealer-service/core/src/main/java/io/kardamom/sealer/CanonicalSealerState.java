@@ -162,10 +162,9 @@ public final class CanonicalSealerState {
     /**
      * The version that {@link #takeSnapshot()} writes when the state holds
      * a feature activation: version 10, then the decision rules. A state
-     * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}, the bytes
-     * of the previous release. A member of a release that reads only up to
-     * version 12 refuses version 13, so the upgrade transaction comes only
-     * after every member runs this release.
+     * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}. A loader
+     * that reads only up to version 12 refuses version 13, so the upgrade
+     * transaction comes only after every member reads version 13.
      */
     public static final int RULES_SNAPSHOT_VERSION = 13;
 
@@ -1010,6 +1009,10 @@ public final class CanonicalSealerState {
      * @return whether the release applied
      */
     public boolean onRelease(byte[] sender20, long nonce, byte[] canonicalId32) {
+        if (rules.version() != DecisionRules.NEWEST_VERSION) {
+            // Version 2 takes no release.
+            return false;
+        }
         ByteBuffer key = idKey(canonicalId32);
         Long held = dedup.get(key);
         ByteBuffer mark = releaseMark(canonicalId32);
@@ -1031,12 +1034,27 @@ public final class CanonicalSealerState {
         return rules.version();
     }
 
+    /** The decision rules as a value, for the admin endpoint. */
+    public DecisionRules.View decisionRules() {
+        return rules.view();
+    }
+
+    /**
+     * Run version 3 from the start: the rules of a member that keeps its
+     * retained frames in a file. Call it only on a state that started at
+     * genesis or from a seed, before the first log entry.
+     */
+    public void startOnNewestRules() {
+        rules = DecisionRules.newest();
+    }
+
     /**
      * Take a feature activation record at cluster time {@code nowMs}.
      *
-     * @return whether the rules switched to version 3 at this record
+     * @return what the record did
      */
-    public boolean onFeatureActivation(final DecisionRules.FeatureActivation activation, final long nowMs) {
+    public DecisionRules.Outcome onFeatureActivation(
+            final DecisionRules.FeatureActivation activation, final long nowMs) {
         return rules.onActivation(activation, l1Origin, nowMs);
     }
 
@@ -1607,8 +1625,8 @@ public final class CanonicalSealerState {
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
      * neither, and 13 has the void ledger and the decision rules. A
-     * version-10 snapshot is the same bytes that the previous release
-     * writes for the same state.
+     * version-10 snapshot of a state is the same bytes in every release
+     * that writes version 10.
      *
      * @param version 10, 11, 12 or 13
      */
@@ -1908,6 +1926,11 @@ public final class CanonicalSealerState {
         if (version == RULES_SNAPSHOT_VERSION) {
             state.rules = DecisionRules.readFrom(buf);
         }
+        if (version == RETAINED_FILE_SNAPSHOT_VERSION) {
+            // Only a member with the retained file writes version 12, and
+            // such a member runs version 3 from its start.
+            state.rules = DecisionRules.newest();
+        }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
         // trust-on-first-sight, and it causes no false rejects. A version-1
@@ -1919,7 +1942,7 @@ public final class CanonicalSealerState {
         // peer's anchor with an unknown lane cursor. The cursor seeds from
         // the peer's next record. A version-10 or older snapshot restores
         // no recorded cursor, so the record-lag guard refuses nothing until
-        // the first cursor. A snapshot before version 13 restores the
+        // the first cursor. A snapshot before version 12 restores the
         // rules of a state with no activation.
         state.canonicalCount = canonicalCount;
         state.restoredSnapshotVersion = version;
