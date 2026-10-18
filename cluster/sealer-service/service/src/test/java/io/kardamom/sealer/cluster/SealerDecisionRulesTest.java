@@ -281,4 +281,26 @@ class SealerDecisionRulesTest {
     private static void newTerm(final Member member) {
         member.svc().onNewLeadershipTermEvent(1, 0, 0, 0, 0, 0, java.util.concurrent.TimeUnit.MILLISECONDS, 0);
     }
+
+    /**
+     * A frame that ends at the record type: version 2 relays it, as a member
+     * of version 2 always did, and version 3 drops it as malformed. Both
+     * rule sets decide one frame alike at one log index.
+     */
+    @Test
+    void a_frame_that_ends_at_the_record_type_relays_under_version_two_only() {
+        final byte[] shortEpoch = IngressFrames.originRecordFrame(IngressFrames.canonicalId(1001), 1, 1, new byte[0]);
+        final byte[] shortRecord = IngressFrames.exemptRecordFrame(IngressFrames.canonicalId(7), new byte[0]);
+        assertEquals(SealerWire.MIN_ORIGIN_RECORD_LEN, shortEpoch.length);
+        assertEquals(SealerWire.MIN_INGRESS_LEN, shortRecord.length);
+
+        final Member v2 = member(Optional.empty());
+        assertEquals(List.of(RELAYED), v2.apply(Entry.frame("short-epoch", shortEpoch, 100L)).kinds());
+        assertEquals(List.of(RELAYED), v2.apply(Entry.frame("short-record", shortRecord, 200L)).kinds());
+
+        final Member v3 = member(Optional.empty());
+        v3.apply(Entry.frame("activation", activation(1, 0), 50L));
+        assertEquals(List.of(), v3.apply(Entry.frame("short-epoch", shortEpoch, 100L)).kinds());
+        assertEquals(List.of(), v3.apply(Entry.frame("short-record", shortRecord, 200L)).kinds());
+    }
 }

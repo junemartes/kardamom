@@ -524,7 +524,8 @@ Every member applies the same log. Two members on two rule versions can decide o
   - The member takes the record only for the epoch that it fronts: its `l1_origin` is the L1 origin of the state, or that origin plus 1.
   - The member switches at the first log entry, an ingress frame or a timer, whose cluster time is at or above the activation time. An activation time at or below the time of the activation record switches at that record.
   - A replay from any snapshot switches at the same entry. Each kind-11 frame prints `cluster FEATURE-ACTIVATION` with its outcome. The switch prints `cluster DECISION-VERSION version=3`.
-  - An activation record that applies asks for a snapshot. The snapshot is version 13, so a member whose loader reads only up to version 12 stops on it at its next start. It does not replay the log after it with the rules of version 2.
+  - An activation record that applies asks for a snapshot. Each member writes its own snapshot: a member of this release writes version 13. So a member that ran this release at the activation and later rolls back to a release that reads only up to version 12 stops on its own snapshot, and does not replay the log with the rules of version 2.
+  - A member that runs an older release through the activation drops the record, writes version 10 and stays forked. No snapshot stops it. Only the upgrade check (`just sealer-upgrade-check`, below) guards that case.
   - The switch is one way.
 - Under version 2, the state takes no nonce release (ingress kind 10), and the member sends no sealer info (egress kind 17). A sequencer sends no nonce release meanwhile. It holds them in its queue, and sends them after the switch.
 - Under version 3, the state applies a nonce release. At the switch the member sends kind 17 to every open session. Then it sends kind 17 to each session when it opens, and to every open session at each new leadership term: a leader change can lose a frame of the old leader.
@@ -677,7 +678,7 @@ The chaos suite and operators read these lines. The admin server also exports on
 | `cluster DNS FAILED` / `cluster DNS RESOLVED` | A lookup of a member name failed, and the media driver uses the last address of the name. The second line shows the first good lookup after the outage. A name with no last address stays unresolved, and the Aeron add fails. See [Member names](#member-names). |
 | `cluster COMPONENT CLOSED` | The consensus module or the service container closed with no stop request, for example after an error in its start. The error log in the cluster directory holds the cause. The process halts with exit code 5. |
 | `cluster TERMINATION` | The consensus module or the service container asked for a shutdown. |
-| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster decision version`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
+| `cluster node up`, `cluster admin endpoint`, `cluster snapshot scheduler`, `cluster join watchdog`, `cluster da-lag budget`, `cluster record-lag budget`, `cluster ordering window`, `cluster remote-origin allowlist`, `cluster seed`, `cluster carry bytes`, `cluster void voters` | Start-up lines. They show the settings that the member uses. |
 
 - The lines `CONTIGUITY-REJECT`, `PAST-DEADLINE`, `DA-LAG-REJECT`, `RECORD-LAG-REJECT`, `WINDOW-FULL`, `REMOTE-ORIGIN-REJECT`, `NONCE-RELEASE` and `DROPPED` print when their count is a power of two (1, 2, 4, 8, and so on).
 - There is no Prometheus counter for these events.

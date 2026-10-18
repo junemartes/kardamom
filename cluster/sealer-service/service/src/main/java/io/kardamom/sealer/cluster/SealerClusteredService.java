@@ -732,9 +732,9 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onIngressRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < RelayShape.INGRESS_RECORD.minLength()) {
+        if (length < RelayShape.INGRESS_RECORD.minLength(state.decisionVersion())) {
             // Malformed or too-short envelope: it cannot hold the guard
-            // header, the id and the record type.
+            // header and the id, and under version 3 the record type.
             onMalformedFrame("ingress-envelope", length);
             return;
         }
@@ -769,7 +769,7 @@ public final class SealerClusteredService implements ClusteredService {
             }
             final int entryLen = buffer.getInt(pos, ByteOrder.LITTLE_ENDIAN);
             pos += 4;
-            if (entryLen < RelayShape.INGRESS_RECORD.minLength() || pos + entryLen > limit) {
+            if (entryLen < RelayShape.INGRESS_RECORD.minLength(state.decisionVersion()) || pos + entryLen > limit) {
                 onMalformedFrame("batch-entry", entryLen);
                 return;
             }
@@ -792,7 +792,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < RelayShape.ORIGIN_RECORD.minLength()) {
+        if (length < RelayShape.ORIGIN_RECORD.minLength(state.decisionVersion())) {
             onMalformedFrame("origin-record", length);
             return;
         }
@@ -866,7 +866,7 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onRemoteOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < RelayShape.REMOTE_ORIGIN_RECORD.minLength()) {
+        if (length < RelayShape.REMOTE_ORIGIN_RECORD.minLength(state.decisionVersion())) {
             onMalformedFrame("remote-origin-record", length);
             return;
         }
@@ -1122,10 +1122,13 @@ public final class SealerClusteredService implements ClusteredService {
      * length drops as malformed. Every frame prints a line: an upgrade is
      * rare, and the line shows where the rules switch.
      *
-     * <p>An activation that applies asks for a snapshot. The snapshot is
-     * version 13, so a member whose loader reads only up to version 12 stops
-     * on it at its next start, and does not replay the log after it with the
-     * rules of version 2.</p>
+     * <p>An activation that applies asks for a snapshot. Each member of
+     * this release then writes version 13, so a member that later rolls back
+     * to a release that reads only up to version 12 stops on its own
+     * snapshot, and does not replay the log after it with the rules of
+     * version 2. A member that runs an older release through the activation
+     * drops the record and writes version 10: only the upgrade check guards
+     * that case.</p>
      */
     private void onFeatureActivation(
             final DirectBuffer buffer, final int offset, final int length, final long timestamp) {

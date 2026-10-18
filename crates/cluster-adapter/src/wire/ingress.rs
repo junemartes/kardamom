@@ -291,8 +291,7 @@ impl FeatureActivation {
             })
     }
 
-    /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`:
-    /// the shape of the feed request.
+    /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         encode_kind_2u64_id(

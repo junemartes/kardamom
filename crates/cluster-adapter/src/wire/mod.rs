@@ -582,11 +582,12 @@ fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
     buf
 }
 
-/// The frame of [`encode_kind_2u64`] with a request id as its tail: the
-/// feed request, and the feed answers.
-fn encode_kind_2u64_id(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
+/// The frame of [`encode_kind_2u64`] with a third u64 as its tail: the
+/// request id of the feed request and the feed answers, or the activation
+/// time of the feature activation ([`KIND_FEATURE_ACTIVATION`]).
+fn encode_kind_2u64_id(kind: u8, a: u64, b: u64, tail: u64) -> Vec<u8> {
     let mut buf = encode_kind_2u64(kind, a, b);
-    buf.extend_from_slice(&request_id.to_le_bytes());
+    buf.extend_from_slice(&tail.to_le_bytes());
     buf
 }
 

@@ -92,6 +92,14 @@ class DecisionRulesTest {
     }
 
     @Test
+    void a_state_with_no_epoch_takes_the_activation_of_its_first_epoch() {
+        final CanonicalSealerState state = new CanonicalSealerState(8);
+        assertEquals(Outcome.SWITCHED, activate(state, 36, 0L, 1_000L),
+            "the first epoch can start at any L1 block");
+        assertEquals(new DecisionRules.View(3, 36L, 0L), state.decisionRules());
+    }
+
+    @Test
     void the_copy_of_the_twin_after_its_epoch_still_applies() {
         final CanonicalSealerState state = atOrigin(4);
         assertEquals(Outcome.SWITCHED, activate(state, 4, 0L, 1_000L),

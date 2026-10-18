@@ -8,6 +8,7 @@
 # 4. The formats of the target are safe against the accepted release.
 # 5. No sealer setting that every member must match changes in the
 #    rolling path.
+# 5a. The registered sealer job does not name decisionVersion=3.
 # 6. The shard map does not change in the rolling path.
 # The gate also reads the revision of the target tree, for the record.
 # The gate reads only, so it also runs in check mode.
@@ -367,6 +368,24 @@
     fail_msg: >-
       Refused: KARDAMOM_ALLOW_MUST_MATCH names {{ workloads_allow_must_match | difference(workloads_gate_sealer_changed) | join(', ') }},
       and the release does not change it. Unset it.
+
+# 5a. A registered sealer job that names decisionVersion=3 ran a build
+# that applied nonce releases from its start. This release starts every
+# member on version 2, so a member that restarts replays its log after its
+# snapshot with other rules and forks. The remedy is a rebuild of the
+# sealer from a seed, then the upgrade transaction.
+- name: Refuse a rolling deploy onto a sealer that started on decision version 3
+  ansible.builtin.assert:
+    that: >-
+      workloads_gate_cluster_job.status != 200
+      or workloads_gate_cluster_job.json.TaskGroups | map(attribute='Tasks') | map('first')
+         | map(attribute='Env.JAVA_TOOL_OPTIONS') | select('search', '-Dkardamom\.cluster\.decisionVersion=3(\s|$)')
+         | list | length == 0
+    fail_msg: >-
+      Refused: the registered sealer job names decisionVersion=3. Its members applied nonce releases from their
+      start, and this release replays their logs on decision version 2, so the state forks. Rebuild the sealer from
+      a seed with the operator's word (docs/runbooks/sealer-fleet-rebuild.md: purge the job and wipe the member
+      state), deploy, and send the upgrade transaction of FEATURE_SEALER_V3 after `just sealer-upgrade-check`.
 
 # 6. The shard map, by the registered ingress.
 - name: Refuse a shard map change in the rolling path

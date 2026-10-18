@@ -1182,6 +1182,17 @@ class RecordTest(Deploys):
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
+    def test_a_sealer_job_that_started_on_decision_version_three_is_refused(self):
+        """A cluster that ran a build with decisionVersion=3 must not roll onto version 2."""
+        self.run_deploy()
+        self.api.state['writes'] = []
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] += ' -Dkardamom.cluster.decisionVersion=3'
+        output = self.run_deploy(success=False)
+        self.assertIn('the registered sealer job names decisionVersion=3', output)
+        self.assertEqual(self.api.state['writes'], [])
+
     def test_the_upgrade_check_passes_on_a_release_that_takes_the_activation(self):
         self.run_deploy()
         output = self.run_deploy(playbook='upgrade-check.yml')

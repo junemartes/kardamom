@@ -21,8 +21,9 @@ import java.nio.ByteBuffer;
  *
  * <p>An activation applies only when its L1 origin names the epoch that the
  * record fronts: the next origin of the state, or the origin of the state
- * when the epoch got in first. It must also be above the origin of the
- * pending activation. So a copy of the record from a twin sequencer, or a
+ * when the epoch got in first. A state with no epoch yet (origin 0) takes
+ * any origin, because its first epoch can start at any L1 block. The
+ * activation must also be above the origin of the pending activation. So a copy of the record from a twin sequencer, or a
  * record that a sequencer sends again with its epoch, changes nothing, and a
  * record for an older or a later epoch changes nothing. The copy of the twin
  * still applies after the epoch, so one lost record does not lose the
@@ -100,7 +101,7 @@ public final class DecisionRules {
      */
     Outcome onActivation(final FeatureActivation activation, final long stateOrigin, final long nowMs) {
         final long origin = activation.l1Origin();
-        final boolean frontsTheEpoch = origin == stateOrigin || origin == stateOrigin + 1;
+        final boolean frontsTheEpoch = stateOrigin == 0L || origin == stateOrigin || origin == stateOrigin + 1;
         final boolean applies = activation.featureId() == FEATURE_SEALER_V3
             && version == START_VERSION
             && frontsTheEpoch
