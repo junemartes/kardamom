@@ -405,52 +405,50 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Whether this member runs version 3: it sends the rules frame, and a
-     * relayed frame needs its record type.
+     * After a log entry: when a block boundary of the entry switched the
+     * rules from {@code rulesBefore}, report the switch and ask for a
+     * snapshot, so a replay has a start point on each side of it.
      */
-    private boolean onNewestRules() {
-        return state.decisionVersion() == DecisionRules.NEWEST_VERSION;
-    }
-
-    /**
-     * Switch the rules when a pending activation is due at
-     * {@code timestamp}, the cluster time of the current log entry.
-     */
-    private void switchRulesAt(final long timestamp) {
-        if (state.switchRulesAt(timestamp)) {
+    private void afterEntry(final int rulesBefore, final long timestamp) {
+        if (state.decisionVersion() != rulesBefore) {
             onRulesSwitch(timestamp);
+            requestSnapshot();
         }
     }
 
     /**
-     * The rules switched to version 3 at the current log entry. Every
-     * member switches at the same entry, also on replay. Each open session
-     * gets the rules frame, so a sequencer reports version 3.
+     * A block boundary of the current log entry switched the rules, to
+     * version 3 or to version 2. Every member switches at the same
+     * boundary, also on replay. Each open session gets the rules frame with
+     * the new version.
      */
     private void onRulesSwitch(final long timestamp) {
         publishedRules = state.decisionRules();
         System.out.println("cluster DECISION-VERSION memberId=" + memberId
             + " version=" + state.decisionVersion() + " at=" + timestamp + " block=" + state.blockNumber());
-        egress.offerSealerInfoToAll(DecisionRules.NEWEST_VERSION);
+        egress.offerSealerInfoToAll(state.decisionVersion());
     }
 
-    /** Offer the rules frame to a session that opened. Under version 2 the member sends none. */
+    /**
+     * Offer the rules frame to a session that opened. A state with no
+     * activation sends none, as a member of version 2 always did.
+     */
     private void offerRules(final ClientSession session) {
-        if (onNewestRules()) {
-            egress.offerSealerInfo(session, DecisionRules.NEWEST_VERSION);
+        if (state.reportsDecisionRules()) {
+            egress.offerSealerInfo(session, state.decisionVersion());
         }
     }
 
     /**
-     * Offer the rules frame to every open session under version 3. A
-     * leader change can lose a frame that the old leader had not sent yet,
-     * and a sequencer reports version 2 until it gets one. A new term is a
-     * log entry, so every member offers again at the same point, and a
-     * client takes a repeat as the same report.
+     * Offer the rules frame to every open session again, once the member
+     * reports its rules. A leader change can lose a frame that the old
+     * leader had not sent yet, and a sequencer reports the version that it
+     * got last. A new term is a log entry, so every member offers again at
+     * the same point, and a client takes a repeat as the same report.
      */
     private void offerRulesAgain() {
-        if (onNewestRules()) {
-            egress.offerSealerInfoToAll(DecisionRules.NEWEST_VERSION);
+        if (state.reportsDecisionRules()) {
+            egress.offerSealerInfoToAll(state.decisionVersion());
         }
     }
 
@@ -633,8 +631,9 @@ public final class SealerClusteredService implements ClusteredService {
         // hold, so a back-pressured session catches up between frames, and
         // the stall deadline is checked at least once per tick.
         egress.drainBacklogs();
-        switchRulesAt(timestamp);
+        final int rulesBefore = state.decisionVersion();
         dispatchSessionMessage(session, timestamp, buffer, offset, length);
+        afterEntry(rulesBefore, timestamp);
         recordServicePosition();
     }
 
@@ -1091,15 +1090,9 @@ public final class SealerClusteredService implements ClusteredService {
      * Handle a {@link SealerWire#KIND_FEATURE_ACTIVATION} frame at
      * {@code timestamp}, the cluster time of the record. A frame of another
      * length drops as malformed. Every frame prints a line: an upgrade is
-     * rare, and the line shows where the rules switch.
-     *
-     * <p>An activation that applies asks for a snapshot. Each member of
-     * this release then writes version 13, so a member that later rolls back
-     * to a release that reads only up to version 12 stops on its own
-     * snapshot, and does not replay the log after it with the rules of
-     * version 2. A member that runs an older release through the activation
-     * drops the record and writes version 10: only the upgrade check guards
-     * that case.</p>
+     * rare, and the line shows what the record did. The record only stores
+     * the schedule; the rules switch at a block boundary, and the switch
+     * asks for a snapshot.
      */
     private void onFeatureActivation(
             final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
@@ -1111,18 +1104,13 @@ public final class SealerClusteredService implements ClusteredService {
             buffer.getLong(offset + SealerWire.ACTIVATION_ORIGIN_OFFSET, ByteOrder.LITTLE_ENDIAN),
             buffer.getLong(offset + SealerWire.ACTIVATION_FEATURE_OFFSET, ByteOrder.LITTLE_ENDIAN),
             buffer.getLong(offset + SealerWire.ACTIVATION_MS_OFFSET, ByteOrder.LITTLE_ENDIAN));
-        final DecisionRules.Outcome outcome = state.onFeatureActivation(activation, timestamp);
+        final DecisionRules.Outcome outcome = state.onFeatureActivation(activation);
         System.out.println("cluster FEATURE-ACTIVATION memberId=" + memberId
             + " l1Origin=" + Long.toUnsignedString(activation.l1Origin()) + " feature=" + activation.featureId()
             + " activationMs=" + Long.toUnsignedString(activation.activationMs())
             + " at=" + timestamp + " outcome=" + outcome + " version=" + state.decisionVersion());
-        if (outcome == DecisionRules.Outcome.IGNORED) {
-            return;
-        }
-        publishedRules = state.decisionRules();
-        requestSnapshot();
-        if (outcome == DecisionRules.Outcome.SWITCHED) {
-            onRulesSwitch(timestamp);
+        if (outcome == DecisionRules.Outcome.STORED) {
+            publishedRules = state.decisionRules();
         }
     }
 
@@ -1285,8 +1273,14 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
+        final int rulesBefore = state.decisionVersion();
+        onTimer(correlationId);
+        afterEntry(rulesBefore, timestamp);
+    }
+
+    /** One timer entry: the ordering window, or the boundary tick. */
+    private void onTimer(final long correlationId) {
         recordServicePosition();
-        switchRulesAt(timestamp);
         snapshots.onTimer(cluster.time(), state.blockNumber());
         egress.drainBacklogs();
         if (correlationId == WINDOW_TIMER_CORRELATION_ID) {

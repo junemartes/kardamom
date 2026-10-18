@@ -22,10 +22,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * The switch of the decision rules on driverless members: a member runs
- * version 2 until the feature activation of {@link DecisionRules#FEATURE_SEALER_V3}
- * is due, and version 3 after it. A replay from a snapshot at any point of
- * the log switches at the same entry and decides alike.
+ * The switch of the decision rules on driverless members. A feature
+ * activation of {@link DecisionRules#FEATURE_SEALER_V3} only stores its
+ * schedule. The rules switch at a block boundary: once the first block of
+ * the epoch of the activation is sealed, a boundary at or after its time
+ * sets version 3 for the next block, and a boundary before it sets version
+ * 2. So a later activation with a time ahead switches the rules off at the
+ * boundary that seals its epoch, and on again at its time. A replay from a
+ * snapshot at any point of the log switches at the same boundaries and
+ * decides alike.
  */
 class SealerDecisionRulesTest {
 
@@ -33,6 +38,8 @@ class SealerDecisionRulesTest {
     private static final byte[] SENDER = filled(CanonicalSealerState.SENDER_LEN, 0xAA);
     /** The activation time of the golden stream. */
     private static final long ACTIVATION_MS = 10_000L;
+    /** The time of the activation that switches the rules off: they switch on again at it. */
+    private static final long ON_AGAIN_MS = 30_000L;
 
     /** One log entry: an ingress frame, or a boundary tick when {@code frame} is empty. */
     private record Entry(String name, Optional<byte[]> frame, long timeMs) {
@@ -107,6 +114,36 @@ class SealerDecisionRulesTest {
         return log;
     }
 
+    /**
+     * The golden stream, then an activation of epoch 3 with a time ahead.
+     * The record and the block of the deposit keep version 3: a frame that
+     * ends at the record type drops as malformed. The tick that seals the
+     * epoch switches the rules off: the same shape relays, as under
+     * version 2. The first tick at the time switches them on again. The
+     * guard decides alike in both phases: nonces 4 and 5 get in.
+     */
+    private static List<Entry> onOffOnStream() {
+        final List<Entry> log = goldenStream(true);
+        log.addAll(List.of(
+            Entry.frame("off", activation(3, ON_AGAIN_MS), 10_300L),
+            Entry.frame("epoch-3", epoch(3), 10_400L),
+            Entry.frame("short-deposit-block", shortRecord(69), 10_450L),
+            Entry.frame("nonce-4", offer(7, 4), 10_500L),
+            Entry.tick("tick-3", 10_600L),
+            Entry.frame("short-off", shortRecord(70), 10_700L),
+            Entry.tick("tick-4", 10_800L),
+            Entry.tick("tick-at-on-again", ON_AGAIN_MS),
+            Entry.frame("short-on-again", shortRecord(71), 30_100L),
+            Entry.frame("nonce-5", offer(8, 5), 30_200L),
+            Entry.tick("tick-5", 30_250L)));
+        return log;
+    }
+
+    /** An exempt record frame that ends at the record type. */
+    private static byte[] shortRecord(final int n) {
+        return IngressFrames.exemptRecordFrame(IngressFrames.canonicalId(n), new byte[0]);
+    }
+
     /** A heap member on its own stub cluster, from {@code snapshot} or at genesis. */
     private Member member(final Optional<byte[]> snapshot) {
         final StubCluster cluster = new StubCluster();
@@ -128,6 +165,7 @@ class SealerDecisionRulesTest {
     private record Member(SealerClusteredService svc, StubCluster cluster, StubSession sequencer) {
         Outcome apply(final Entry entry) {
             final int before = sequencer.offered.size();
+            cluster.time = entry.timeMs();
             entry.frame().ifPresentOrElse(frame -> deliver(frame, entry.timeMs()), () -> svc.onTimerEvent(
                 SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, entry.timeMs()));
             final List<Byte> kinds = sequencer.offered.subList(before, sequencer.offered.size()).stream()
@@ -169,10 +207,37 @@ class SealerDecisionRulesTest {
             outcome("activation", List.of(), 2),
             outcome("epoch-2", List.of(RELAYED), 2),
             outcome("nonce-2-early", List.of(RELAYED), 2),
-            outcome("tick-at-activation", List.of(RULES, BOUNDARY), 3),
+            outcome("tick-at-activation", List.of(BOUNDARY, RULES), 3),
             outcome("retry-v3", List.of(REJECT), 3),
             outcome("nonce-3", List.of(RELAYED), 3),
             outcome("tick-2", List.of(BOUNDARY), 3)), outcomes);
+    }
+
+    @Test
+    void a_later_activation_switches_the_rules_off_when_its_epoch_is_sealed_and_on_again_at_its_time() {
+        final List<Outcome> outcomes = member(Optional.empty()).applyAll(onOffOnStream());
+        assertEquals(List.of(
+            outcome("off", List.of(), 3),
+            outcome("epoch-3", List.of(RELAYED), 3),
+            outcome("short-deposit-block", List.of(), 3),
+            outcome("nonce-4", List.of(RELAYED), 3),
+            outcome("tick-3", List.of(BOUNDARY, RULES), 2),
+            outcome("short-off", List.of(RELAYED), 2),
+            outcome("tick-4", List.of(BOUNDARY), 2),
+            outcome("tick-at-on-again", List.of(BOUNDARY, RULES), 3),
+            outcome("short-on-again", List.of(), 3),
+            outcome("nonce-5", List.of(RELAYED), 3),
+            outcome("tick-5", List.of(BOUNDARY), 3)), outcomes.subList(goldenStream(true).size(), outcomes.size()));
+    }
+
+    @Test
+    void each_switch_tells_the_session_the_new_version_and_asks_for_a_snapshot() {
+        final Member member = member(Optional.empty());
+        member.applyAll(onOffOnStream());
+        final List<Byte> reported = member.sequencer().offered.stream()
+            .filter(f -> f[0] == RULES).map(f -> f[1]).toList();
+        assertEquals(List.of((byte) 3, (byte) 2, (byte) 3), reported, "on, off, on");
+        assertEquals(3, notices(member), "one for each switch, none for a record");
     }
 
     @Test
@@ -204,18 +269,17 @@ class SealerDecisionRulesTest {
     }
 
     /**
-     * Run the golden stream up to {@code cut}, take the snapshot, restore a
-     * new member from it, and run the rest on both. The outcomes and the
-     * last snapshot match.
+     * Run {@code log} up to {@code cut}, take the snapshot, restore a new
+     * member from it, and run the rest on both. The outcomes and the last
+     * snapshot match.
      */
-    private void replayFrom(final int cut, final int snapshotVersion) {
-        final List<Entry> log = goldenStream(true);
+    private void replayFrom(final List<Entry> log, final int cut, final int snapshotVersion) {
         final Member original = member(Optional.empty());
         original.applyAll(log.subList(0, cut));
         final byte[] snapshot = original.svc().snapshot();
         assertEquals(snapshotVersion, ByteBuffer.wrap(snapshot).getInt(Integer.BYTES));
         final Member restored = member(Optional.of(snapshot));
-        assertEquals(original.svc().decisionRules().version(), restored.svc().decisionRules().version());
+        assertEquals(original.svc().decisionRules(), restored.svc().decisionRules());
         final List<Entry> rest = log.subList(cut, log.size());
         assertEquals(original.applyAll(rest), restored.applyAll(rest));
         assertArrayEquals(original.svc().snapshot(), restored.svc().snapshot());
@@ -223,55 +287,104 @@ class SealerDecisionRulesTest {
 
     @Test
     void a_replay_from_a_snapshot_before_the_activation_switches_at_the_same_entry() {
-        replayFrom(5, CanonicalSealerState.snapshotWriteVersion());
+        replayFrom(goldenStream(true), 5, CanonicalSealerState.snapshotWriteVersion());
     }
 
     @Test
     void a_replay_from_a_snapshot_with_a_pending_activation_switches_at_the_same_entry() {
-        replayFrom(7, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(goldenStream(true), 7, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
     }
 
     @Test
     void a_replay_from_a_snapshot_after_the_switch_keeps_version_three() {
-        replayFrom(9, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(goldenStream(true), 9, CanonicalSealerState.RULES_SNAPSHOT_VERSION);
     }
 
     @Test
-    void a_session_gets_the_rules_frame_only_under_version_three() {
+    void a_replay_from_a_snapshot_after_the_switch_off_switches_on_at_the_same_entry() {
+        final List<Entry> log = onOffOnStream();
+        replayFrom(log, indexOf(log, "epoch-3"), CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(log, indexOf(log, "short-off"), CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+        replayFrom(log, indexOf(log, "tick-at-on-again"), CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+    }
+
+    @Test
+    void a_replay_from_a_snapshot_after_the_switch_on_again_keeps_version_three() {
+        final List<Entry> log = onOffOnStream();
+        replayFrom(log, indexOf(log, "short-on-again"), CanonicalSealerState.RULES_SNAPSHOT_VERSION);
+    }
+
+    private static int indexOf(final List<Entry> log, final String name) {
+        return IntStream.range(0, log.size()).filter(i -> log.get(i).name().equals(name)).findFirst().orElseThrow();
+    }
+
+    /** Store the activation of epoch {@code origin} at once, order the epoch, and seal it at {@code ms}. */
+    private static void switchOn(final Member member, final long origin, final long ms) {
+        member.apply(Entry.frame("activation", activation(origin, 0), ms));
+        member.apply(Entry.frame("epoch", epoch(origin), ms + 10));
+        member.apply(Entry.tick("tick", ms + 250));
+    }
+
+    /** Store the activation of epoch {@code origin} for good off, order the epoch, and seal it at {@code ms}. */
+    private static void switchOff(final Member member, final long origin, final long ms) {
+        member.apply(Entry.frame("off", activation(origin, -1L), ms));
+        member.apply(Entry.frame("epoch", epoch(origin), ms + 10));
+        member.apply(Entry.tick("tick", ms + 250));
+    }
+
+    @Test
+    void a_session_gets_the_rules_frame_once_the_state_holds_an_activation() {
         final Member member = member(Optional.empty());
         final StubSession early = member.cluster().addSession(7);
         member.svc().onSessionOpen(early, 0);
-        assertTrue(early.offered.isEmpty(), "version 2 sends no rules frame");
-        member.apply(Entry.frame("activation", activation(1, 0), 100L));
+        assertTrue(early.offered.isEmpty(), "a state with no activation sends no rules frame");
+        switchOn(member, 1, 100L);
         assertArrayEquals(new byte[] {RULES, 3, 7, 0, 0, 0, 0, 0, 0, 0},
             early.offered.stream().filter(f -> f[0] == RULES).findFirst().orElseThrow(),
             "an open session gets the rules frame at the switch");
         final StubSession late = member.cluster().addSession(8);
-        member.svc().onSessionOpen(late, 200L);
+        member.svc().onSessionOpen(late, 500L);
         assertArrayEquals(new byte[] {RULES, 3, 8, 0, 0, 0, 0, 0, 0, 0}, late.offered.get(0));
+        switchOff(member, 2, 1_000L);
+        final StubSession afterOff = member.cluster().addSession(9);
+        member.svc().onSessionOpen(afterOff, 1_500L);
+        assertArrayEquals(new byte[] {RULES, 2, 9, 0, 0, 0, 0, 0, 0, 0}, afterOff.offered.get(0),
+            "after the switch off, a session that opens gets version 2");
     }
 
     @Test
-    void an_activation_that_applies_asks_for_a_snapshot() {
+    void a_stored_activation_asks_for_no_snapshot_and_the_switch_asks_for_one() {
         final Member member = member(Optional.empty());
         member.apply(Entry.frame("epoch-1", epoch(1), 1_000L));
-        member.apply(Entry.frame("activation", activation(2, ACTIVATION_MS), 1_500L));
-        assertTrue(member.sequencer().offered.stream().anyMatch(f -> f[0] == SealerWire.EGRESS_KIND_STATUS
-                && f.length > SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET && f[SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET] == 1),
-            "the status with the snapshot notice goes out at the activation record");
-        assertEquals(new DecisionRules.View(2, 2L, ACTIVATION_MS), member.svc().decisionRules());
+        member.apply(Entry.frame("activation", activation(2, 0), 1_500L));
+        assertEquals(0, notices(member), "the record only stores the schedule");
+        assertEquals(new DecisionRules.View(2, 2L, 0L), member.svc().decisionRules());
+        member.apply(Entry.frame("epoch-2", epoch(2), 1_600L));
+        member.apply(Entry.tick("tick", 2_000L));
+        assertEquals(1, notices(member), "the boundary that switches asks for a snapshot");
+        assertEquals(3, member.svc().decisionRules().version());
+    }
+
+    private static long notices(final Member member) {
+        return member.sequencer().offered.stream().filter(f -> f[0] == SealerWire.EGRESS_KIND_STATUS
+                && f.length > SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET && f[SealerWire.STATUS_SNAPSHOT_FLAG_OFFSET] == 1)
+            .count();
     }
 
     @Test
-    void a_new_term_offers_the_rules_frame_again_under_version_three() {
+    void a_new_term_offers_the_rules_frame_again_once_the_state_holds_an_activation() {
         final Member member = member(Optional.empty());
         newTerm(member);
         assertTrue(member.sequencer().offered.stream().noneMatch(f -> f[0] == RULES), "version 2 sends none");
-        member.apply(Entry.frame("activation", activation(1, 0), 100L));
+        switchOn(member, 1, 100L);
         final long before = member.sequencer().offered.stream().filter(f -> f[0] == RULES).count();
         newTerm(member);
         assertEquals(before + 1, member.sequencer().offered.stream().filter(f -> f[0] == RULES).count(),
             "a frame that a leader change lost goes out again");
+        switchOff(member, 2, 1_000L);
+        newTerm(member);
+        final List<byte[]> frames = member.sequencer().offered.stream().filter(f -> f[0] == RULES).toList();
+        assertEquals(2, frames.get(frames.size() - 1)[1], "the frame of the switch off goes out again");
     }
 
     private static void newTerm(final Member member) {
@@ -295,8 +408,11 @@ class SealerDecisionRulesTest {
         assertEquals(List.of(RELAYED), v2.apply(Entry.frame("short-record", shortRecord, 200L)).kinds());
 
         final Member v3 = member(Optional.empty());
-        v3.apply(Entry.frame("activation", activation(1, 0), 50L));
-        assertEquals(List.of(), v3.apply(Entry.frame("short-epoch", shortEpoch, 100L)).kinds());
-        assertEquals(List.of(), v3.apply(Entry.frame("short-record", shortRecord, 200L)).kinds());
+        switchOn(v3, 1, 0L);
+        assertEquals(3, v3.svc().decisionRules().version());
+        final byte[] shortNextEpoch =
+            IngressFrames.originRecordFrame(IngressFrames.canonicalId(1002), 2, 1, new byte[0]);
+        assertEquals(List.of(), v3.apply(Entry.frame("short-epoch", shortNextEpoch, 300L)).kinds());
+        assertEquals(List.of(), v3.apply(Entry.frame("short-record", shortRecord, 400L)).kinds());
     }
 }

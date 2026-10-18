@@ -59,56 +59,115 @@ fn a_session_with_no_report_runs_version_two_until_the_switch() {
     assert!(shared.sealer_runs_v3());
 }
 
-fn activation(activation_ms: u64) -> FeatureActivation {
+fn activation(l1_origin: u64, activation_ms: u64) -> FeatureActivation {
     FeatureActivation {
-        l1_origin: 9,
+        l1_origin,
         feature_id: kardamom_types::upgrades::FEATURE_SEALER_V3,
         activation_ms,
     }
 }
 
-#[test]
-fn the_watch_warns_once_when_no_report_follows_an_activation() {
+fn watch() -> (ActivationWatch, SharedWatermark) {
     let shared = SharedWatermark::new();
-    let mut watch = ActivationWatch::new(0, shared);
-    let now = Instant::now();
-    watch.check(now + RULES_AFTER * 2);
-    assert!(watch.warn_at.is_none(), "no activation, no watch");
-    watch.on_offered(activation(0), now);
-    watch.check(now + Duration::from_secs(30));
-    assert!(watch.warn_at.is_some(), "the time has not passed yet");
-    watch.check(now + RULES_AFTER + Duration::from_secs(1));
-    assert!(watch.warn_at.is_none(), "warned once");
+    (ActivationWatch::new(0, shared.clone()), shared)
 }
 
-#[test]
-fn a_report_of_version_three_ends_the_watch() {
-    let shared = SharedWatermark::new();
-    let mut watch = ActivationWatch::new(0, shared.clone());
-    let now = Instant::now();
-    watch.on_offered(activation(0), now);
-    shared.set_sealer_version(3);
-    watch.check(now + Duration::from_secs(1));
-    assert!(watch.warn_at.is_none());
+/// The last switch that the watch settled.
+fn settled(watch: &ActivationWatch) -> Option<Instant> {
+    watch.watched.as_ref().and_then(|w| w.settled)
 }
 
-#[test]
-fn a_scheduled_activation_waits_for_its_time() {
-    let mut far = ActivationWatch::new(0, SharedWatermark::new());
-    let now = Instant::now();
-    far.on_offered(activation(u64::MAX), now);
-    far.check(now + RULES_AFTER * 2);
-    assert!(far.warn_at.is_some(), "a time far ahead has not passed");
-    let mut watch = ActivationWatch::new(0, SharedWatermark::new());
-    let in_an_hour = kardamom_types::time::duration_to_ms_saturating(
+fn unix_ms() -> u64 {
+    kardamom_types::time::duration_to_ms_saturating(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap(),
-    ) + 3_600_000;
-    watch.on_offered(activation(in_an_hour), now);
+    )
+}
+
+#[test]
+fn the_watch_warns_once_when_no_report_follows_an_activation() {
+    let (mut watch, _shared) = watch();
+    let now = Instant::now();
     watch.check(now + RULES_AFTER * 2);
-    assert!(
-        watch.warn_at.is_some(),
-        "the activation time is an hour away"
+    assert!(watch.watched.is_none(), "no activation, no watch");
+    watch.on_offered(activation(9, 0), now);
+    watch.check(now + Duration::from_secs(30));
+    assert_eq!(settled(&watch), None, "the time has not passed yet");
+    watch.check(now + RULES_AFTER + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(now), "warned once for the switch");
+}
+
+#[test]
+fn a_report_of_version_three_settles_the_switch_on() {
+    let (mut watch, shared) = watch();
+    let now = Instant::now();
+    watch.on_offered(activation(9, 0), now);
+    shared.set_sealer_version(3);
+    watch.check(now + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(now));
+}
+
+/// An activation with a time ahead switches the rules off soon after the offer.
+/// A sealer that still reports version 3 past the grace gets a warning.
+#[test]
+fn the_watch_warns_when_the_sealer_keeps_version_three_after_a_switch_off() {
+    let (mut watch, shared) = watch();
+    let now = Instant::now();
+    shared.set_sealer_version(3);
+    watch.on_offered(activation(9, u64::MAX), now);
+    watch.check(now + Duration::from_secs(30));
+    assert_eq!(settled(&watch), None);
+    watch.check(now + RULES_AFTER + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(now), "warned for the switch off");
+}
+
+/// A report of version 2 settles the switch off. At its time the rules
+/// switch on again, and the watch waits for version 3.
+#[test]
+fn a_switch_off_settles_on_version_two_and_its_time_switches_on_again() {
+    let (mut watch, shared) = watch();
+    let now = Instant::now();
+    shared.set_sealer_version(2);
+    watch.on_offered(activation(9, unix_ms() + 3_600_000), now);
+    watch.check(now + Duration::from_secs(1));
+    assert_eq!(
+        settled(&watch),
+        Some(now),
+        "version 2 matches the switch off"
     );
+    let on_again = watch.watched.as_ref().and_then(|w| w.due).unwrap();
+    watch.check(on_again + Duration::from_secs(30));
+    assert_eq!(
+        settled(&watch),
+        Some(now),
+        "the grace of the switch on runs"
+    );
+    watch.check(on_again + RULES_AFTER + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(on_again), "warned for the switch on");
+}
+
+#[test]
+fn an_offer_of_the_same_epoch_again_keeps_the_watch() {
+    let (mut watch, _shared) = watch();
+    let now = Instant::now();
+    watch.on_offered(activation(9, 0), now);
+    watch.on_offered(activation(9, 0), now + Duration::from_secs(50));
+    watch.check(now + RULES_AFTER + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(now), "the first offer counts");
+}
+
+#[test]
+fn a_newer_activation_replaces_the_watch() {
+    let (mut watch, shared) = watch();
+    let now = Instant::now();
+    shared.set_sealer_version(3);
+    watch.on_offered(activation(9, 0), now);
+    watch.check(now);
+    let later = now + Duration::from_secs(5);
+    watch.on_offered(activation(10, u64::MAX), later);
+    assert_eq!(settled(&watch), None, "the switch off waits for its report");
+    shared.set_sealer_version(2);
+    watch.check(later + Duration::from_secs(1));
+    assert_eq!(settled(&watch), Some(later));
 }

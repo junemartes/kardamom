@@ -305,6 +305,7 @@ class SealerRecordPathTest {
         final StubSession sequencer = cluster.addSession(1);
         final SealerClusteredService svc = member(Optional.empty(), Optional.empty());
         deliver(svc, sequencer, IngressFrames.featureActivationFrame(1, DecisionRules.FEATURE_SEALER_V3, 0));
+        deliver(svc, sequencer, IngressFrames.originRecordFrame(IngressFrames.canonicalId(1001), 1, 1, new byte[] {1}));
         sameLog(svc, sequencer);
         assertEquals(3, svc.decisionRules().version());
         final byte[] snapshot = svc.snapshot();

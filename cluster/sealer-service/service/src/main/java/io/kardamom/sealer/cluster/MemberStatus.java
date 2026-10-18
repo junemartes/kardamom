@@ -28,8 +28,8 @@ final class MemberStatus {
      * restored or took ({@code latest}, 0 before either). A deploy refuses
      * a release whose read maximum is below {@code latest}: that member
      * could not restore its own snapshot after the roll. The upgrade check
-     * reads {@code readsMax}: a member that reads version 13 takes the
-     * feature activation.
+     * reads {@code readsMax}: a member that reads version 14 switches its
+     * rules at a block boundary, on and off.
      */
     record SnapshotVersions(int writes, int readsMin, int readsMax, int latest) {
         /** This release's constants, with the member's {@code latest}. */
@@ -48,7 +48,10 @@ final class MemberStatus {
     final long commitPosition;
     final long servicePosition;
     final SnapshotVersions snapshot;
-    /** The decision rules of the member: the version, and the origin and the time of the activation. */
+    /**
+     * The decision rules of the member: the version, and the origin and the
+     * time of the newest activation.
+     */
     final DecisionRules.View rules;
     /**
      * The bytes that the member can still write to the disk of its retained

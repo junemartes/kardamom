@@ -82,16 +82,6 @@ final class SealerStateFixtures {
         return out.array();
     }
 
-    /**
-     * Switch {@code state} to decision version 3 with an activation at once.
-     * The activation names the epoch after the origin of the state.
-     */
-    static CanonicalSealerState onVersionThree(CanonicalSealerState state) {
-        state.onFeatureActivation(new DecisionRules.FeatureActivation(
-                state.l1Origin() + 1, DecisionRules.FEATURE_SEALER_V3, 0L), 0L);
-        return state;
-    }
-
     static byte[] payload(String s) {
         return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }

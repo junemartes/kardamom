@@ -64,9 +64,9 @@ pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
 /// The decision version that the sealer reported for the current session,
 /// 0 before its report.
 pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
-/// The feature activations that this replica sent and for which the
-/// sealer reported no decision version 3 within 60 s of the activation
-/// time: a member of the sealer did not switch its rules. Alert on any
+/// The switches of the sealer rules, by the feature activations that this
+/// replica sent, that the sealer did not report within 60 s: no version 3
+/// after a switch on, or version 3 after a switch off. Alert on any
 /// increase.
 pub(crate) const SEALER_RULES_MISSING: &str = "kardamom_sequencer_sealer_rules_missing_total";
 /// Contiguity rejects whose expected nonce stays above the chain nonce

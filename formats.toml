@@ -27,20 +27,24 @@
 # The sealer's Aeron Cluster snapshot. The loader refuses a version outside
 # the read range, so a member that rolls back cannot load a newer
 # snapshot. A member that joins late can get a snapshot of another member,
-# so the format is shared. This release reads v13 and still writes v10.
+# so the format is shared. This release reads v14 and still writes v10.
 # With kardamom.cluster.carryBytes=true, the members write v12: the state
 # of v10 without the void ledger, then the index of the retained file in
 # place of the retained frames. A release that reads only up to v11
 # refuses v12 and stops, so switch the flag on only on a new chain or at a
 # coordinated cut-over. No release wrote v12 before this layout. After
 # the feature activation of FEATURE_SEALER_V3 (ingress kind 11) is in the
-# log, the members write v13: v10 with the decision rules after the seed
-# digest. A release that reads only up to v12 refuses v13 and stops, so
-# send the upgrade transaction only after every member runs this release.
+# log, the members write v14: v10 with the decision rules after the seed
+# digest: the version of the next block, and the up to three activations
+# that the state holds (the visible one and the ones whose epoch is not
+# sealed yet). The release before wrote v13, with one activation; this
+# release still reads it. A release that reads only up to v13 refuses v14
+# and stops, also one whose rules switch only on, so send the upgrade
+# transaction only after every member runs this release.
 [format.sealer-snapshot]
 writes = 10
 reads_min = 1
-reads_max = 13
+reads_max = 14
 shared = true
 activation = { flag = "kardamom.cluster.carryBytes", writes = 12 }
 code = [
@@ -57,8 +61,9 @@ code = [
 # feature activation) in front of an epoch that holds the upgrade
 # transaction of FEATURE_SEALER_V3. No writer sends kind 10. Every member
 # drops a frame of a kind it does not know, counts it, and never orders
-# it. Kind 11 switches the rules of a member that reads it, so send the
-# upgrade transaction only after every member runs this release.
+# it. Kind 11 switches the rules of a member that reads it on or off, so
+# send each upgrade transaction only after every member runs this
+# release.
 [format.sealer-ingress-kinds]
 writes = 8
 reads_min = 0
@@ -83,9 +88,9 @@ code = [
 # drops it as unknown. Kind 255 is local to the Rust client: the session
 # thread puts it on the consumer channel when a session opens. It is never
 # on the wire. The sealer sends kind 17 (its rules: the decision version)
-# only under decision version 3: to each open session at the switch, and
-# then to each session when it opens. An older reader drops kind 17 as an
-# unknown kind.
+# after the first feature activation, or under decision version 3: to each
+# open session at each switch and at each new term, and to each session
+# when it opens. An older reader drops kind 17 as an unknown kind.
 #
 # On the member feed, the answers (kinds 3, 4, 11 and 16) are 25 bytes:
 # the 17 bytes of the egress layout, then the request id. A reader reads

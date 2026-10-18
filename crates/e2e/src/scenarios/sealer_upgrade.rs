@@ -1,5 +1,5 @@
-//! S13d — a skipped transaction uses its nonce after the upgrade
-//! transaction of [`FEATURE_SEALER_V3`].
+//! S13d and S13e — a skipped transaction uses its nonce while
+//! [`FEATURE_SEALER_V3`] is on.
 //!
 //! The sealer's contiguity guard counts every ordered entry, skipped or
 //! not. Before the upgrade, a skip uses no nonce on the chain, so the
@@ -17,6 +17,11 @@
 //! - After the upgrade, the skip uses nonce 1. The chain expects nonce 2,
 //!   a new transfer at nonce 1 is refused, and a transfer at nonce 2
 //!   lands. The validator agrees with the executor.
+//!
+//! S13e sends three upgrade transactions: on at once, off for good, and on
+//! at once again. The sealer reports each switch, and a probe in each
+//! phase checks the skip: it uses its nonce while the feature is on, and
+//! uses none while it is off.
 
 use std::time::Duration;
 
@@ -26,7 +31,7 @@ use anyhow::{Context, Result};
 use kardamom_types::upgrades::FEATURE_SEALER_V3;
 
 use super::upgrade::upgrade_and_await;
-use super::{Target, assert_receipt_ok, await_l2_receipt, receipt_field};
+use super::{Target, assert_receipt_ok, await_l2_receipt, metric_u64, receipt_field};
 use crate::harness::l1::L1;
 use crate::harness::l2::{self, DerivedSigner, SignedTransfer};
 use crate::harness::metrics::poll_until;
@@ -154,7 +159,7 @@ impl SkipProbe {
                     .ok()
                     .flatten()
                     .is_none(),
-            "a transfer at the skipped nonce landed before the upgrade"
+            "a transfer at the skipped nonce landed while the feature was off"
         );
         anyhow::ensure!(
             Self::chain_nonce(t, self.sender.address).await? == 1,
@@ -172,6 +177,39 @@ impl SkipProbe {
             "the ingress must refuse a new transfer at the used nonce 1"
         );
         Self::lands(t, &self.transfer(t, 2, 1)?, "the transfer at nonce 2").await
+    }
+
+    /// Wait until every sequencer reports the decision version `version`.
+    async fn await_rules(t: &Target, version: u8) -> Result<()> {
+        poll_until(
+            "every sequencer gets the rules frame of the new version",
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            || async {
+                let versions = t
+                    .sequencer_metric_values_where(SEALER_VERSION, "")
+                    .await?
+                    .into_iter()
+                    .map(metric_u64)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(versions
+                    .iter()
+                    .all(|v| *v == u64::from(version))
+                    .then_some(()))
+            },
+        )
+        .await
+    }
+
+    /// A fresh probe on the key `seed` skips nonce 1 while the feature is
+    /// on: the skip uses the nonce, and the sender moves on.
+    async fn uses_its_nonce(t: &Target, funder: &DerivedSigner, seed: u8) -> Result<()> {
+        let probe = Self::funded(t, funder, seed).await?;
+        anyhow::ensure!(
+            probe.skip_nonce_one(t).await? == 2,
+            "a skip while the feature is on uses its nonce"
+        );
+        probe.moves_on(t).await
     }
 }
 
@@ -221,4 +259,39 @@ pub async fn skip_uses_its_nonce_only_after_the_upgrade(
     );
     after.moves_on(t).await?;
     t.assert_validator_verdict("S13d").await
+}
+
+/// A skipped transaction follows [`FEATURE_SEALER_V3`] on, off and on
+/// again: three upgrade transactions, at once, at the time `2^64 - 1` (off
+/// for good), and at once again.
+///
+/// # Errors
+/// Returns an error when an upgrade transaction fails, when a sequencer
+/// does not report the new version, when a skip uses no nonce while the
+/// feature is on, when a skip uses its nonce while it is off, or when the
+/// validator disagrees.
+pub async fn skip_follows_the_feature_on_off_and_on(t: &Target, l1: &L1, p: Params) -> Result<()> {
+    let signers = l2::dev_signers_through(p.funder)?;
+    let funder = &signers[p.funder];
+
+    // --- On: the skip uses its nonce. --------------------------------------
+    upgrade_and_await(t, l1, FEATURE_SEALER_V3, 0).await?;
+    SkipProbe::await_rules(t, 3).await?;
+    SkipProbe::uses_its_nonce(t, funder, 0x73).await?;
+
+    // --- Off for good: the skip uses no nonce. -----------------------------
+    upgrade_and_await(t, l1, FEATURE_SEALER_V3, u64::MAX).await?;
+    SkipProbe::await_rules(t, 2).await?;
+    let off = SkipProbe::funded(t, funder, 0x74).await?;
+    anyhow::ensure!(
+        off.skip_nonce_one(t).await? == 1,
+        "a skip while the feature is off uses no nonce"
+    );
+    off.stays_stuck(t, REFUSED_FOR).await?;
+
+    // --- On again: the skip uses its nonce. --------------------------------
+    upgrade_and_await(t, l1, FEATURE_SEALER_V3, 0).await?;
+    SkipProbe::await_rules(t, 3).await?;
+    SkipProbe::uses_its_nonce(t, funder, 0x75).await?;
+    t.assert_validator_verdict("S13e").await
 }

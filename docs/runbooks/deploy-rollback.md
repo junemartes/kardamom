@@ -109,12 +109,12 @@ deploy succeeded and the release degrades the chain after it.
 
 ### Rollback after the activation of the sealer rules
 
-The upgrade transaction of `FEATURE_SEALER_V3` switches the sealer to decision version 3 (`cluster/sealer-service/README.md`, "Decision version"). It is not a deploy, and it has no rollback.
+The upgrade transaction of `FEATURE_SEALER_V3` switches the sealer to decision version 3 (`cluster/sealer-service/README.md`, "Decision version"). It is not a deploy. The way back is a second upgrade transaction with a time ahead: it switches every member back to version 2 at one block boundary in the log, at the block where the executor switches. Run `just sealer-upgrade-check <env>` before it, as before the first one.
 
 - Before the activation record is in the log, a rollback of the sealer is a normal rolling rollback: the members write snapshot version 10.
   - A Nomad revert (`just rollback`) restores the old job versions, and no gate reads them.
   - A forward `just deploy` from the checkout of a release that names `decisionVersion` in its sealer job (`eebd7aa7a` and the releases before it) gets the must-match refusal of its own gate: the registered job names no `decisionVersion`. Pass `KARDAMOM_ALLOW_MUST_MATCH=decisionVersion` for that deploy. Use it only when the job of that release names `decisionVersion=2`, and only before the activation. Never deploy a build whose job names `decisionVersion=3`: it applies the releases of the log with other rules.
-- After it, the members write snapshot version 13, and a release that reads only up to version 12 stops on it. Do not roll the sealer back to such a release. Fix forward.
+- After it, the members write snapshot version 14, and a release that reads only up to version 13 stops on it. Do not roll the sealer back to such a release. Fix forward.
 
 ### Rollback after the activation of the nonce burn
 

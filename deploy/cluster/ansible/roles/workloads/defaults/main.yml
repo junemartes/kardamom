@@ -350,8 +350,8 @@ workloads_gate_manifest_types: >-
 # carry the job metas, and each live allocation must run that job version.
 workloads_upgrade_jobs:
   - name: sequencer
-    metas: [sealer_feature_activation, nonce_burn]
-    does: send the feature activation and take a skip that uses its nonce
+    metas: [sealer_feature_activation, sealer_feature_off, nonce_burn]
+    does: send the feature activation, watch the rules switch on and off, and take a skip that uses its nonce
   - name: executor
     metas: [nonce_burn]
     does: use the nonce of a skipped transaction
