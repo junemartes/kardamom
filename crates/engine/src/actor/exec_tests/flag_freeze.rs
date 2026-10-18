@@ -6,9 +6,11 @@
 #[path = "../../../../exec-core/tests/feature_table/mod.rs"]
 mod feature_table;
 
-use alloy_primitives::U256;
+use alloy_primitives::{U256, keccak256};
+use kardamom_types::upgrades::CHAIN_STATE_CODE;
 
 use super::flag_chain::{Block, FlagChain, Item, Mode};
+use crate::actor::fixtures::ChainStateGenesis;
 use feature_table::Row;
 
 /// An activation time that every block of these chains reaches.
@@ -32,10 +34,13 @@ fn schedule(at: u64) -> Item {
 /// block 2 burns.
 #[test]
 fn no_record_of_the_block_sees_its_own_set_feature() {
-    let chain = FlagChain::new(vec![
-        block(1_000, Vec::new()),
-        block(2_000, vec![Item::Skip(0), schedule(NOW), Item::Skip(0)]),
-    ]);
+    let chain = FlagChain::new(
+        ChainStateGenesis::Predeploy,
+        vec![
+            block(1_000, Vec::new()),
+            block(2_000, vec![Item::Skip(0), schedule(NOW), Item::Skip(0)]),
+        ],
+    );
     let streaming = chain.live(Mode::Streaming);
     assert_eq!(streaming.burns, [vec![], vec![false, false]]);
     assert_eq!(streaming.poor_nonce, 0);
@@ -46,11 +51,14 @@ fn no_record_of_the_block_sees_its_own_set_feature() {
 /// skip burns, and its transfer at the next nonce lands.
 #[test]
 fn a_set_feature_inside_a_block_switches_from_the_next_block() {
-    let chain = FlagChain::new(vec![
-        block(1_000, Vec::new()),
-        block(2_000, vec![Item::Skip(0), schedule(NOW), Item::Skip(0)]),
-        block(3_000, vec![Item::Skip(0), Item::Tx { nonce: 1, value: 7 }]),
-    ]);
+    let chain = FlagChain::new(
+        ChainStateGenesis::Predeploy,
+        vec![
+            block(1_000, Vec::new()),
+            block(2_000, vec![Item::Skip(0), schedule(NOW), Item::Skip(0)]),
+            block(3_000, vec![Item::Skip(0), Item::Tx { nonce: 1, value: 7 }]),
+        ],
+    );
     let streaming = chain.live(Mode::Streaming);
     assert_eq!(
         streaming.burns,
@@ -67,24 +75,32 @@ fn a_set_feature_inside_a_block_switches_from_the_next_block() {
 /// `FEATURE_SEALER_V3` turns on, off and on again. Each switch takes
 /// effect in the block after its deposit, and each on-phase has a burning
 /// skip. Every driver ends at the same root, with the same burns in every
-/// block.
+/// block. On a genesis without the chain-state predeploy, the first
+/// deposit installs the code, and the chain switches at the same blocks.
 #[test]
 fn every_driver_switches_at_the_same_block() {
-    let chain = FlagChain::new(vec![
-        // Off: the deposit turns the feature on from block 2.
-        block(1_000, vec![schedule(NOW), Item::Skip(0)]),
-        // On: the skip burns nonce 0.
-        block(2_000, vec![Item::Skip(0)]),
-        // Still on: the deposit turns the feature off from block 4, and
-        // the skip burns nonce 1.
-        block(3_000, vec![schedule(NEVER), Item::Skip(1)]),
-        // Off: the skip of nonce 2 burns nothing.
-        block(4_000, vec![Item::Skip(2)]),
-        // Still off: the deposit turns the feature on from block 6.
-        block(5_000, vec![schedule(NOW), Item::Skip(2)]),
-        // On: the skip burns nonce 2, and nonce 3 lands.
-        block(6_000, vec![Item::Skip(2), Item::Tx { nonce: 3, value: 7 }]),
-    ]);
+    ChainStateGenesis::ALL.into_iter().for_each(every_driver_on);
+}
+
+fn every_driver_on(genesis: ChainStateGenesis) {
+    let chain = FlagChain::new(
+        genesis,
+        vec![
+            // Off: the deposit turns the feature on from block 2.
+            block(1_000, vec![schedule(NOW), Item::Skip(0)]),
+            // On: the skip burns nonce 0.
+            block(2_000, vec![Item::Skip(0)]),
+            // Still on: the deposit turns the feature off from block 4, and
+            // the skip burns nonce 1.
+            block(3_000, vec![schedule(NEVER), Item::Skip(1)]),
+            // Off: the skip of nonce 2 burns nothing.
+            block(4_000, vec![Item::Skip(2)]),
+            // Still off: the deposit turns the feature on from block 6.
+            block(5_000, vec![schedule(NOW), Item::Skip(2)]),
+            // On: the skip burns nonce 2, and nonce 3 lands.
+            block(6_000, vec![Item::Skip(2), Item::Tx { nonce: 3, value: 7 }]),
+        ],
+    );
     let streaming = chain.live(Mode::Streaming);
     assert_eq!(
         streaming.burns,
@@ -95,15 +111,25 @@ fn every_driver_switches_at_the_same_block() {
             vec![false],
             vec![false],
             vec![true, false],
-        ]
+        ],
+        "{genesis:?}"
     );
     assert_eq!(
         (streaming.poor_nonce, streaming.payee_balance),
         (4, U256::from(7u64)),
-        "three burns, then nonce 3 executes"
+        "{genesis:?}: three burns, then nonce 3 executes"
     );
-    assert_eq!(chain.live(Mode::Whole), streaming, "whole-block");
-    assert_eq!(chain.replayed(), streaming, "replay");
+    assert_eq!(
+        streaming.chain_state_code,
+        Some(keccak256(CHAIN_STATE_CODE)),
+        "{genesis:?}: the chain-state code"
+    );
+    assert_eq!(
+        chain.live(Mode::Whole),
+        streaming,
+        "{genesis:?}: whole-block"
+    );
+    assert_eq!(chain.replayed(), streaming, "{genesis:?}: replay");
 }
 
 /// The blocks of `exec-core/testdata/feature_switch_blocks.txt`, the table
@@ -127,7 +153,7 @@ fn the_table_switches_where_the_chain_switches() {
             Some(block(row.ts, items))
         })
         .collect();
-    let chain = FlagChain::new(blocks);
+    let chain = FlagChain::new(ChainStateGenesis::Predeploy, blocks);
     let streaming = chain.live(Mode::Streaming);
     let expected: Vec<Vec<bool>> = rows.iter().map(|row| vec![row.v3]).collect();
     let numbered = |burns: &[Vec<bool>]| -> Vec<(u64, Vec<bool>)> {

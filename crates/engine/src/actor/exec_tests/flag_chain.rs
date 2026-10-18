@@ -1,20 +1,21 @@
-//! A chain with the chain-state predeploy and one poor sender, whose
-//! upgrade transactions schedule `FEATURE_SEALER_V3`. It runs through the
+//! A chain with one poor sender, with or without the chain-state
+//! predeploy in its genesis, whose upgrade transactions schedule
+//! `FEATURE_SEALER_V3`. It runs through the
 //! live exec thread (streaming or whole-block) and the offline replay,
 //! each on libMDBX with the trie on, and reports what each run leaves:
-//! the root, the nonce of the poor sender, and which transfers of each
-//! block burned their nonce.
+//! the root, the nonce of the poor sender, the code hash at the chain-state
+//! address, and which transfers of each block burned their nonce.
 
 use alloy_primitives::{Address, B256, U256, address};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_state::{StateEnv, StateSnapshot, StateWriter, TrieMode, seed_genesis};
-use kardamom_types::upgrades::FEATURE_SEALER_V3;
+use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 use kardamom_types::{
     AccountChange, EpochRecord, StateDatabase, TxEnvelope, TxRef, delta::CodeEntry,
 };
 
 use crate::actor::StateWriterSignal;
-use crate::actor::fixtures::ChainStatePredeploy;
+use crate::actor::fixtures::{ChainStateGenesis, ChainStatePredeploy};
 use crate::actor::test_hooks::SequentialBlockExec;
 use crate::actor::test_support::{
     ExecRig, boundary_msg, feed, fresh_env, genesis_for, legacy, pos,
@@ -64,6 +65,9 @@ pub(super) struct Rebuilt {
     pub(super) root: B256,
     pub(super) poor_nonce: u64,
     pub(super) payee_balance: U256,
+    /// The code hash at the chain-state address, or `None` without an
+    /// account there.
+    pub(super) chain_state_code: Option<B256>,
     /// For each block, whether each of its transfers burned its nonce.
     pub(super) burns: Vec<Vec<bool>>,
 }
@@ -135,19 +139,17 @@ pub(super) struct FlagChain {
 }
 
 impl FlagChain {
-    pub(super) fn new(blocks: Vec<Block>) -> Self {
+    pub(super) fn new(genesis: ChainStateGenesis, blocks: Vec<Block>) -> Self {
         let poor = PrivateKeySigner::random();
-        let predeploy = ChainStatePredeploy::dev();
+        let predeploy = genesis.predeploy();
         let mut accounts = genesis_for(Address::repeat_byte(0x01));
-        accounts.extend([
-            AccountChange {
-                address: poor.address(),
-                nonce: 0,
-                balance: U256::from(POOR_FUNDS),
-                code_hash: B256::ZERO,
-            },
-            predeploy.account,
-        ]);
+        accounts.push(AccountChange {
+            address: poor.address(),
+            nonce: 0,
+            balance: U256::from(POOR_FUNDS),
+            code_hash: B256::ZERO,
+        });
+        accounts.extend(predeploy.as_ref().map(|p| p.account.clone()));
         let mut l1 = FIRST_L1..;
         let mut skips = 0u64..;
         let mut resolve = |item: Item| match item {
@@ -174,7 +176,7 @@ impl FlagChain {
         Self {
             poor,
             accounts,
-            code: vec![predeploy.code],
+            code: predeploy.into_iter().map(|p| p.code).collect(),
             blocks,
         }
     }
@@ -266,6 +268,7 @@ impl FlagChain {
             root: snap.state_root().unwrap().expect("the trie is on"),
             poor_nonce: snap.basic(self.poor.address()).unwrap().expect("poor").0,
             payee_balance: snap.basic(PAYEE).unwrap().map_or(U256::ZERO, |a| a.1),
+            chain_state_code: snap.basic(CHAIN_STATE).unwrap().map(|a| a.2),
             burns: self
                 .blocks
                 .iter()

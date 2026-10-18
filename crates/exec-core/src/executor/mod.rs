@@ -28,6 +28,8 @@
 //!   skip receipt).
 //! - `burn`: the nonce burn of a skipped transaction.
 //! - `deposit`: OP-aligned deposit execution.
+//! - `install`: the install of the chain state code by the first
+//!   `setFeature` system deposit on a genesis without it.
 //! - `xchain`: cross-chain message delivery execution.
 //! - `write_set`: `WriteSet` extraction from revm state, and BAL recording.
 
@@ -35,6 +37,7 @@ mod burn;
 mod db;
 mod deposit;
 mod derived;
+mod install;
 mod scope;
 mod scope_derived;
 mod skip;

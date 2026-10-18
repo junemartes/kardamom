@@ -7,6 +7,7 @@
 use alloy_primitives::U256;
 
 use super::flag_chain::{Block, FlagChain, Item, Mode};
+use crate::actor::fixtures::ChainStateGenesis;
 
 /// The header times of blocks 1, 2 and 3. Block 2 executes with `T1`, and
 /// block 3 with `T2`.
@@ -23,20 +24,23 @@ const ACTIVATION: u64 = 1_500;
 /// nonce 1 uses the nonce. The replay ends at the live root.
 #[test]
 fn a_replay_burns_only_where_the_live_chain_burns() {
-    let chain = FlagChain::new(vec![
-        Block {
-            ts: T1,
-            items: vec![Item::Schedule(vec![ACTIVATION])],
-        },
-        Block {
-            ts: T2,
-            items: vec![Item::Skip(0)],
-        },
-        Block {
-            ts: T3,
-            items: vec![Item::Tx { nonce: 0, value: 7 }, Item::Skip(1)],
-        },
-    ]);
+    let chain = FlagChain::new(
+        ChainStateGenesis::Predeploy,
+        vec![
+            Block {
+                ts: T1,
+                items: vec![Item::Schedule(vec![ACTIVATION])],
+            },
+            Block {
+                ts: T2,
+                items: vec![Item::Skip(0)],
+            },
+            Block {
+                ts: T3,
+                items: vec![Item::Tx { nonce: 0, value: 7 }, Item::Skip(1)],
+            },
+        ],
+    );
     let live = chain.live(Mode::Streaming);
     assert_eq!(
         (live.poor_nonce, live.payee_balance),

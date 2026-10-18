@@ -17,13 +17,20 @@
 //! fixed point must pull the off-path sibling), and another that writes
 //! a fresh slot.
 //!
+//! A second block runs on a genesis without the chain-state predeploy: its
+//! `setFeature` system deposit installs the code. The witness proves that
+//! the address has no account, and the guest installs the code as the
+//! capture did.
+//!
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_engine::actor::{BlockExecOutput, BufferedRecord};
+use kardamom_engine::features::activation_slot;
 use kardamom_engine::stateless::AnchoredBlockOutput;
 use kardamom_engine::{ExecEnv, MockStateDatabase};
 use kardamom_state::trie::{TrieTables, update_for_block};
 use kardamom_state::{Durability, StateEnv, StateEnvBuilder};
+use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FEATURE_SEALER_V3};
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundaryStart, BlockDelta, BlockRecordsDigest, ExecutionWitness,
     ProverInput, ProverRecord, PublicOutputs, StorageChange, WitnessProofs,
@@ -287,10 +294,7 @@ fn export_prover_fixture_if_requested(
 fn commit_live_and_get_root(env: &StateEnv, out: &BlockExecOutput) -> B256 {
     let txn = env.raw().begin_rw_sync().unwrap();
     let tables = TrieTables::open(&txn).unwrap();
-    // `finalize` sorts accounts and storage (and would emit `code`, but
-    // this block's records are all `Call`s to already-deployed
-    // contracts, so `out.delta.code` is empty here — not a deliberate
-    // omission, just this test's actual data). Receipts are not needed
+    // `finalize` sorts accounts, storage and code. Receipts are not needed
     // for the trie-commit step, so `Vec::new()`.
     let delta = out.delta.clone().finalize(1, Vec::new());
     let root = update_for_block(&txn, &tables, &delta).unwrap();
@@ -367,4 +371,76 @@ fn capture_anchor_guest_and_live_trie_agree() {
     );
 
     assert_tamper_rejected(&witness, &proofs, &records, &bal);
+}
+
+/// The system deposit of an upgrade transaction that schedules
+/// `FEATURE_SEALER_V3` at once.
+fn upgrade_record() -> BufferedRecord {
+    use kardamom_types::epoch::{UpgradeLog, upgrade_from_log};
+    BufferedRecord::Deposit {
+        tx_idx: kardamom_engine::exec_types::TxIndex(0),
+        deposit: upgrade_from_log(&UpgradeLog {
+            block_number: 40,
+            block_hash: B256::repeat_byte(0x40),
+            log_index: 0,
+            feature_id: U256::from(FEATURE_SEALER_V3),
+            activation_timestamp: 0,
+        }),
+        position: BPosition::from_index(0),
+    }
+}
+
+#[test]
+fn the_guest_installs_the_chain_state_code_with_the_first_upgrade() {
+    let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x5B)).unwrap();
+    let sender = signer.address();
+    let seed = seed_delta(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
+    let snap = seed_mock(sender, keccak256(ZEROER_CODE), keccak256(WRITER_CODE));
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path())
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    let pre_root = commit_seed(&env, &seed);
+
+    let records = vec![upgrade_record(), tx(&signer, RECIPIENT, 0, 1_000, 1)];
+    let (out, mut witness, bal) =
+        capture_block_witness(&snap, None, &records, exec_env()).expect("capture");
+    assert!(out.receipts.iter().all(|r| r.status), "{:?}", out.receipts);
+    let code_hash = keccak256(CHAIN_STATE_CODE);
+    assert_eq!(
+        out.delta.accounts.get(&CHAIN_STATE).map(|a| a.code_hash),
+        Some(code_hash),
+        "the deposit installs the code"
+    );
+    assert_eq!(
+        out.delta
+            .storage
+            .get(&(CHAIN_STATE, activation_slot(FEATURE_SEALER_V3))),
+        Some(&U256::from(1_700_000_000u64)),
+        "the deposit writes the word"
+    );
+    assert!(
+        witness
+            .accounts
+            .iter()
+            .any(|a| a.address == CHAIN_STATE && !a.exists),
+        "the witness proves that the chain-state address has no account"
+    );
+
+    let (proofs, post_root) = {
+        let ro = env.raw().begin_ro_sync().unwrap();
+        let tables = TrieTables::open(&ro).unwrap();
+        anchor_block_witness(&ro, &tables, pre_root, &mut witness, &out.delta).expect("anchor")
+    };
+    let guest = guest_reverify(&witness, &proofs, &records, &bal, pre_root, post_root, &out);
+    assert_eq!(
+        guest.out.delta.code.get(&code_hash).map(AsRef::as_ref),
+        Some(CHAIN_STATE_CODE)
+    );
+    assert_eq!(
+        commit_live_and_get_root(&env, &out),
+        post_root,
+        "the guest and the live trie agree"
+    );
 }

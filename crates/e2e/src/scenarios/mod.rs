@@ -562,6 +562,9 @@ pub struct ChainStateView {
     pub activation: U256,
     /// Health beacon, unpacked from its storage word.
     pub beacon: kardamom_exec_core::features::Beacon,
+    /// The code hash of the predeploy, or `None` when the address has no
+    /// account.
+    pub code_hash: Option<alloy_primitives::B256>,
 }
 
 impl ChainStateView {
@@ -598,10 +601,15 @@ pub fn read_chain_state(state_dir: &Path) -> Result<ChainStateView> {
         snap.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)
             .context("read beacon slot")?,
     );
+    let code_hash = snap
+        .basic(CHAIN_STATE)
+        .context("read the predeploy account")?
+        .map(|(_, _, code_hash)| code_hash);
     Ok(ChainStateView {
         block_number,
         activation,
         beacon,
+        code_hash,
     })
 }
 

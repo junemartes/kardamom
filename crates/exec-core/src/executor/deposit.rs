@@ -5,8 +5,6 @@
 use kardamom_types::{Deposit, Receipt, StateDatabase};
 use revm::state::AccountInfo;
 
-use alloc::format;
-
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
@@ -14,6 +12,7 @@ use crate::exec_types::TxSlot;
 
 use super::db::seed_composed_cache;
 use super::derived::{CallOutcome, DerivedCall, DerivedOutcome};
+use super::install::ChainStateInstall;
 use super::scope::Executor;
 use super::skip::{DerivedTxIdentity, Rejection};
 use super::tx_env::tx_env_from_deposit;
@@ -28,37 +27,34 @@ use super::write_set::{retain_changed, write_set_from_cache};
 pub(super) struct DepositFailure;
 
 impl DepositFailure {
-    /// Read `deposit.from`'s current info from `cache`, build the
-    /// mint-only write set, and the deterministic failed receipt.
+    /// Read `deposit.from`'s current info from the cache of `call`, build
+    /// the mint-only write set with the install of the chain state code
+    /// when the deposit did one, and the deterministic failed receipt.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorError::Execution`] when the account read fails.
+    /// Returns [`ExecutorError::Execution`] when an account read fails.
     pub(super) fn from_validation<S, D>(
-        cache: &mut D,
+        call: &mut DerivedCall<'_, D>,
         deposit: &Deposit,
-        slot: TxSlot,
-        block_number: u64,
-        reason: kardamom_types::SkipReason,
-        detail: &str,
+        rejection: &Rejection,
+        install: Option<&ChainStateInstall>,
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
     ) -> Result<(Receipt, WriteSet), ExecutorError>
     where
         S: StateDatabase,
-        D: revm::Database,
+        D: revm::Database + revm::DatabaseCommit,
         <D as revm::Database>::Error: core::fmt::Debug,
     {
-        let info = revm::Database::basic(cache, deposit.from)
-            .map_err(|e| ExecutorError::Execution {
-                idx: slot.tx_idx,
-                detail: format!("basic({:?}): {e:?}", deposit.from),
-            })?
-            .unwrap_or_default();
-        let ws = Executor::<S>::mint_only_write_set(deposit, &info);
+        let info = call.account(deposit.from)?;
+        let mut ws = Executor::<S>::mint_only_write_set(deposit, &info);
+        if let Some(install) = install {
+            install.add_to(&mut ws, call)?;
+        }
         Ok(Executor::<S>::failed_deposit_receipt(
-            reason,
-            detail,
-            super::skip::SkipContext::new(slot, block_number),
+            rejection.reason,
+            &rejection.detail,
+            super::skip::SkipContext::new(call.slot, call.env.block_number),
             deposit,
             ws,
             bal,
@@ -176,8 +172,10 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     let mut call = DerivedCall::new(&mut cache, &env, slot);
 
     // (1) Mint pre-credit, committed unconditionally: the mint is durable
-    // no matter the inner-call outcome.
+    // no matter the inner-call outcome. The install of the chain state
+    // code follows the same rule.
     call.credit_mint(deposit)?;
+    let install = call.install_chain_state(deposit)?;
 
     // (2) Inner EVM call. Disable the nonce check, since deposits do not
     // carry a nonce.
@@ -185,14 +183,12 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         DerivedOutcome::Ran(o) => o,
         // Deterministic input invalidity: the mint stays, the inner call
         // never ran. Same artifact as the scope path.
-        DerivedOutcome::Rejected(Rejection { reason, detail }) => {
+        DerivedOutcome::Rejected(rejection) => {
             return DepositFailure::from_validation::<S, _>(
-                &mut cache,
+                &mut call,
                 deposit,
-                slot,
-                env.block_number,
-                reason,
-                &detail,
+                &rejection,
+                install.as_ref(),
                 bal,
             );
         }
@@ -204,6 +200,8 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // pre-credit and any inner-call writes add touched accounts. Layer-
     // seeded entries this deposit did not change are then filtered out
     // (see `retain_changed`); capture must not depend on commit timing.
+    // The install of the chain state code is a cache write too, so the
+    // set holds it.
     let ws = write_set_from_cache(&cache.cache);
     let ws = retain_changed(ws, snapshot, parent, delta, slot.tx_idx)?;
     if let Some((bal, bal_index)) = bal {

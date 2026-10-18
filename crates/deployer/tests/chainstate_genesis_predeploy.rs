@@ -1,7 +1,9 @@
 //! Checks the `KardamomChainState` predeploy in `chains/dev-withdrawals.toml`.
 //! The predeploy:
 //!   * exists at the canonical chain-state address,
-//!   * has runtime bytecode that is byte-equal to the forge-compiled artifact,
+//!   * has runtime bytecode that is byte-equal to the forge-compiled artifact
+//!     and to `CHAIN_STATE_CODE`, the code that the first upgrade deposit
+//!     installs on a genesis without the predeploy,
 //!   * and matches the compiled ABI for the Rust constants the derivation
 //!     rule uses (`SYSTEM_UPGRADER`, the `setFeature` selector).
 //!
@@ -13,7 +15,9 @@ use std::path::PathBuf;
 
 use alloy_primitives::{Address, Bytes, hex};
 use kardamom_types::Genesis;
-use kardamom_types::upgrades::{CHAIN_STATE, SET_FEATURE_SELECTOR, SYSTEM_UPGRADER};
+use kardamom_types::upgrades::{
+    CHAIN_STATE, CHAIN_STATE_CODE, SET_FEATURE_SELECTOR, SYSTEM_UPGRADER,
+};
 
 /// Read the forge artifact, or `None` when `contracts/out/` has not been built.
 fn artifact() -> Option<serde_json::Value> {
@@ -40,6 +44,11 @@ fn dev_withdrawals_genesis_predeploys_chain_state_with_artifact_bytecode() {
         .iter()
         .find(|e| e.address == CHAIN_STATE)
         .unwrap_or_else(|| panic!("no alloc for chain state {CHAIN_STATE}"));
+    assert_eq!(
+        entry.code.as_ref().map(AsRef::as_ref),
+        Some(CHAIN_STATE_CODE),
+        "the chain-state code of chains/dev-withdrawals.toml differs from CHAIN_STATE_CODE",
+    );
 
     let Some(v) = artifact() else { return };
     let hex_str = v["deployedBytecode"]["object"]
@@ -51,6 +60,12 @@ fn dev_withdrawals_genesis_predeploys_chain_state_with_artifact_bytecode() {
         entry.code.as_ref(),
         Some(&expected),
         "chains/dev-withdrawals.toml chain-state bytecode is stale; regenerate with \
+         `forge inspect --root contracts KardamomChainState deployedBytecode`",
+    );
+    assert_eq!(
+        expected.as_ref(),
+        CHAIN_STATE_CODE,
+        "kardamom_types::upgrades::CHAIN_STATE_CODE is stale; regenerate it from \
          `forge inspect --root contracts KardamomChainState deployedBytecode`",
     );
 }
