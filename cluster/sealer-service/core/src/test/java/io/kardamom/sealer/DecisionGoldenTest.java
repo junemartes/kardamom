@@ -29,11 +29,11 @@ import org.junit.jupiter.api.Test;
  *
  * <p>A seeded random stream drives a small window with both lag guards on
  * and three void voters. Each kind of input occurs often: relays,
- * duplicates, nonce gaps, passed deadlines, the zero sender, nonce
- * releases, void votes, origin records with and without a gap, posted and
- * recorded cursors, and ticks. A feature activation in the middle of the
- * stream switches the decision rules to version 3: before it, no release
- * applies, and after it, releases apply and the snapshot is version 13. The window fills, so it also refuses records,
+ * duplicates, nonce gaps, passed deadlines, the zero sender, void votes,
+ * origin records with and without a gap, posted and recorded cursors, and
+ * ticks. A feature activation in the middle of the stream switches the
+ * decision rules to version 3, and after it the snapshot is version 13.
+ * The window fills, so it also refuses records,
  * and the least recently used sender is evicted. The test checks that every
  * record outcome occurs, so the stream keeps its coverage.
  *
@@ -58,7 +58,7 @@ final class DecisionGoldenTest {
     private static final VoidLedger.Config VOIDS = new VoidLedger.Config(256, 0b111L);
     /** Both lag guards on, with budgets that the stream crosses now and then. */
     private static final LagBudgets BUDGETS = new LagBudgets(6L, 120L);
-    /** The relayed records that a release or a void vote can name. */
+    /** The relayed records that a void vote can name. */
     private static final int RECENT = 64;
     private static final int SNAPSHOT_EVERY = 5_000;
     /** The step of the feature activation: the middle of the stream. */
@@ -87,7 +87,7 @@ final class DecisionGoldenTest {
         }
     }
 
-    /** One relayed record: what a release and a void vote name. */
+    /** One relayed record: what a void vote names. */
     private record Entry(byte[] id, int sender, long nonce, long index) {
     }
 
@@ -105,9 +105,6 @@ final class DecisionGoldenTest {
         private int relayed;
         private long clock;
         private long l1Origin;
-        private int releases;
-        /** The releases that applied before the activation: none may. */
-        private int releasesBeforeActivation;
         private int voids;
         private int originGaps;
 
@@ -131,16 +128,14 @@ final class DecisionGoldenTest {
             return digest.digest();
         }
 
-        /** Every record outcome, an applied release, a decided void and an origin gap occurred. */
+        /** Every record outcome, a decided void and an origin gap occurred. */
         void checkCoverage() {
-            System.out.printf("decision golden stream: %s, applied releases %d, decided voids %d, origin gaps %d%n",
-                    kinds, releases, voids, originGaps);
+            System.out.printf("decision golden stream: %s, decided voids %d, origin gaps %d%n",
+                    kinds, voids, originGaps);
             for (Kind kind : Kind.values()) {
                 assertTrue(kinds.getOrDefault(kind, 0) > 0, "the stream has no " + kind + " outcome: " + kinds);
             }
-            assertTrue(releases > 0 && voids > 0 && originGaps > 0,
-                    "releases " + releases + ", decided voids " + voids + ", origin gaps " + originGaps);
-            assertEquals(0, releasesBeforeActivation, "version 2 applies no release");
+            assertTrue(voids > 0 && originGaps > 0, "decided voids " + voids + ", origin gaps " + originGaps);
             assertEquals(3, state.decisionVersion());
             assertEquals(CanonicalSealerState.RULES_SNAPSHOT_VERSION, state.snapshotVersion());
         }
@@ -157,8 +152,6 @@ final class DecisionGoldenTest {
                 pastDeadline();
             } else if (roll < 820) {
                 zeroSender();
-            } else if (roll < 850) {
-                release();
             } else if (roll < 910) {
                 voteVoid();
             } else if (roll < 930) {
@@ -174,10 +167,9 @@ final class DecisionGoldenTest {
 
         /**
          * At {@link #ACTIVATION_STEP}, the activation of version 3 for the
-         * next epoch, due at once. Before it, count every applied release.
+         * next epoch, due at once.
          */
         private void activateAt(int step) {
-            releasesBeforeActivation = step <= ACTIVATION_STEP ? releases : releasesBeforeActivation;
             if (step != ACTIVATION_STEP) {
                 return;
             }
@@ -221,14 +213,6 @@ final class DecisionGoldenTest {
         private void zeroSender() {
             byte[] id = freshId();
             hashRecord(state.onRecord(id, new byte[CanonicalSealerState.SENDER_LEN], 0L, deadline(), id));
-        }
-
-        /** Release the nonce of a recent entry, as the sequencer does for a skip receipt. */
-        private void release() {
-            Entry e = recent[random.nextInt(RECENT)];
-            boolean applied = state.onRelease(distinctSender(e.sender()), e.nonce(), e.id());
-            releases += applied ? 1 : 0;
-            hashLong(applied ? 1L : 0L);
         }
 
         private void voteVoid() {

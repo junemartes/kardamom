@@ -3,8 +3,7 @@
 //!
 //! The sealer sends kind 17 only under decision version 3: to each open
 //! session when its rules switch, and then to each session when it opens.
-//! A session with no report runs version 2, the rules with no nonce
-//! release. The session thread puts a session-start marker on the egress
+//! A session with no report runs version 2. The session thread puts a session-start marker on the egress
 //! channel when a session opens, and the two can arrive in either order, so
 //! each carries the cluster session id: a kind 17 that arrives before its
 //! marker waits for it, and a kind 17 of an older session never counts.
@@ -78,11 +77,11 @@ impl SealerRules {
 
 /// The epoch lane's watch over the feature activations that it offered.
 /// The sealer sends its rules (egress kind 17) to each open session at the
-/// switch, and again at each new leadership term. The sequencer holds its
-/// nonce releases until it gets them. When no report of version 3 comes
-/// [`RULES_AFTER`] past the activation time, the lane warns and counts it,
-/// so a release queue that waits for ever is visible. One owner: the epoch
-/// lane. It reads the version that the egress feed thread publishes.
+/// switch, and again at each new leadership term. When no report of
+/// version 3 comes [`RULES_AFTER`] past the activation time, the lane warns
+/// and counts it, so a sealer that did not switch is visible. One owner:
+/// the epoch lane. It reads the version that the egress feed thread
+/// publishes.
 pub struct ActivationWatch {
     partition: u32,
     shared: SharedWatermark,
@@ -120,7 +119,7 @@ impl ActivationWatch {
         let Some(warn_at) = self.warn_at else {
             return;
         };
-        if self.shared.sealer_takes_releases() {
+        if self.shared.sealer_runs_v3() {
             self.warn_at = None;
             return;
         }
@@ -132,7 +131,7 @@ impl ActivationWatch {
         tracing::warn!(
             partition = self.partition,
             "the sealer reported no decision version 3 (egress kind 17) 60 s after the activation time of a \
-             feature activation that this replica sent; the nonce releases wait in the queue"
+             feature activation that this replica sent"
         );
     }
 }

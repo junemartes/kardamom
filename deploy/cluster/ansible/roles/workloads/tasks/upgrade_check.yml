@@ -2,7 +2,8 @@
 # The check before the upgrade transaction of FEATURE_SEALER_V3: the
 # decision rules version 3 of the sealer. A sealer member of an older
 # release drops the feature activation (ingress kind 11) and keeps
-# version 2, so the replicated state forks at the first nonce release.
+# version 2, so the replicated state forks at the first frame that the two
+# versions decide differently: a frame that ends at its record type.
 # So every configured member must run a release that reads snapshot
 # version 13, the layout that carries the rules. Every sequencer must
 # run a release that sends the activation, or no member gets it.

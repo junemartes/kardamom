@@ -180,9 +180,6 @@ public final class SealerClusteredService implements ClusteredService {
     private long pastDeadlineCount = 0;
     private long windowFullCount = 0;
 
-    /** Nonce releases applied (logged at power-of-two counts). */
-    private long releaseCount = 0;
-
     /**
      * The decision rules of the member, for the admin thread. The service
      * thread sets them after the start and at each activation record that
@@ -224,8 +221,8 @@ public final class SealerClusteredService implements ClusteredService {
     private final OrderingWindow<HeldRecord> window;
 
     /**
-     * Scratch buffer for the id of an origin, remote-origin, void, or
-     * release frame.
+     * Scratch buffer for the id of an origin, remote-origin, or void
+     * frame.
      * Reused to avoid a per-message allocation on the single cluster
      * service thread. A held record copies its id instead.
      */
@@ -407,7 +404,10 @@ public final class SealerClusteredService implements ClusteredService {
         retainedFile.ifPresent(file -> state.startOnNewestRules());
     }
 
-    /** Whether this member runs version 3: it applies a nonce release and sends the rules frame. */
+    /**
+     * Whether this member runs version 3: it sends the rules frame, and a
+     * relayed frame needs its record type.
+     */
     private boolean onNewestRules() {
         return state.decisionVersion() == DecisionRules.NEWEST_VERSION;
     }
@@ -425,7 +425,7 @@ public final class SealerClusteredService implements ClusteredService {
     /**
      * The rules switched to version 3 at the current log entry. Every
      * member switches at the same entry, also on replay. Each open session
-     * gets the rules frame, so a sequencer starts to send nonce releases.
+     * gets the rules frame, so a sequencer reports version 3.
      */
     private void onRulesSwitch(final long timestamp) {
         publishedRules = state.decisionRules();
@@ -444,7 +444,7 @@ public final class SealerClusteredService implements ClusteredService {
     /**
      * Offer the rules frame to every open session under version 3. A
      * leader change can lose a frame that the old leader had not sent yet,
-     * and a sequencer holds its releases until it gets one. A new term is a
+     * and a sequencer reports version 2 until it gets one. A new term is a
      * log entry, so every member offers again at the same point, and a
      * client takes a repeat as the same report.
      */
@@ -664,9 +664,6 @@ public final class SealerClusteredService implements ClusteredService {
             case SealerWire.KIND_RECORDED_CURSOR:
                 retainedFile.ifPresentOrElse(
                     file -> onUnknownKind(kind, length), () -> onRecordedCursor(buffer, offset, length));
-                return;
-            case SealerWire.KIND_NONCE_RELEASE:
-                onNonceRelease(buffer, offset, length);
                 return;
             case SealerWire.KIND_FEATURE_ACTIVATION:
                 retainedFile.ifPresentOrElse(
@@ -1088,32 +1085,6 @@ public final class SealerClusteredService implements ClusteredService {
                 + " totalAdvances=" + recordedAdvanceCount);
         }
         egress.offerStatus(status());
-    }
-
-    /**
-     * Handle a {@link SealerWire#KIND_NONCE_RELEASE} frame: a sequencer saw
-     * a skip receipt, and the guard goes back to the nonce that the chain
-     * expects. A frame of another length drops as malformed. A release
-     * that does not apply prints nothing: both twins send each release, and
-     * under version 2 the state takes none.
-     */
-    private void onNonceRelease(final DirectBuffer buffer, final int offset, final int length) {
-        if (length != SealerWire.NONCE_RELEASE_LEN) {
-            onMalformedFrame("nonce-release", length);
-            return;
-        }
-        final byte[] sender = new byte[CanonicalSealerState.SENDER_LEN];
-        buffer.getBytes(offset + SealerWire.RELEASE_SENDER_OFFSET, sender);
-        final long nonce = buffer.getLong(offset + SealerWire.RELEASE_NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN);
-        buffer.getBytes(offset + SealerWire.RELEASE_ID_OFFSET, canonicalIdScratch);
-        if (!state.onRelease(sender, nonce, canonicalIdScratch)) {
-            return;
-        }
-        releaseCount++;
-        if (Long.bitCount(releaseCount) == 1) {
-            System.out.println("cluster NONCE-RELEASE memberId=" + memberId
-                + " nonce=" + nonce + " totalReleased=" + releaseCount);
-        }
     }
 
     /**

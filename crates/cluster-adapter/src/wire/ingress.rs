@@ -4,7 +4,7 @@
 //! splitters used by tests and the in-Rust service mock. Frame layouts
 //! are documented on the `KIND_*` constants in the parent module.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 #[cfg(any(test, feature = "testing"))]
 use kardamom_types::DepositRef;
 use kardamom_types::TxRef;
@@ -18,11 +18,10 @@ use super::RT_DEPOSITREF;
 use super::{
     CANONICAL_ID_LEN, INGRESS_CANONICAL_ID_OFFSET, INGRESS_DEADLINE_OFFSET, INGRESS_NONCE_OFFSET,
     INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_FEATURE_ACTIVATION,
-    KIND_INGRESS_RECORD, KIND_NONCE_RELEASE, KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR,
-    KIND_RECORDED_CURSOR, KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE,
-    KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError,
-    encode_kind_2u64, encode_kind_2u64_id, epoch_slots, rd_slice, rd_u64, rd_u128,
-    remote_epoch_slots, too_short,
+    KIND_INGRESS_RECORD, KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR, KIND_RECORDED_CURSOR,
+    KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH,
+    RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError, encode_kind_2u64, encode_kind_2u64_id,
+    epoch_slots, rd_slice, rd_u64, rd_u128, remote_epoch_slots, too_short,
 };
 
 /// The guard header of a kind-0 ingress frame: the fields the service
@@ -230,32 +229,6 @@ pub fn encode_ingress_posted_cursor(posted_head: u64) -> Vec<u8> {
     b.push(KIND_POSTED_CURSOR);
     b.extend_from_slice(&posted_head.to_le_bytes());
     b
-}
-
-/// A nonce release (ingress kind [`KIND_NONCE_RELEASE`]): an executor
-/// skipped the ordered entry `tx_hash` of `sender`, and the chain expects
-/// `nonce` of the sender next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonceRelease {
-    pub sender: Address,
-    pub nonce: u64,
-    pub tx_hash: B256,
-}
-
-impl NonceRelease {
-    /// The length of the frame.
-    pub const LEN: usize = 1 + SENDER_LEN + 8 + CANONICAL_ID_LEN;
-
-    /// The frame `[kind:u8 = 10][sender:20][nonce:u64][tx_hash:32]`.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(Self::LEN);
-        b.push(KIND_NONCE_RELEASE);
-        b.extend_from_slice(self.sender.as_slice());
-        b.extend_from_slice(&self.nonce.to_le_bytes());
-        b.extend_from_slice(self.tx_hash.as_slice());
-        b
-    }
 }
 
 /// A feature activation (ingress kind [`KIND_FEATURE_ACTIVATION`]): the

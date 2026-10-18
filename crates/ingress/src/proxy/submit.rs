@@ -10,7 +10,8 @@
 //! gets its receipt, across an ingress restart when Redis holds it;
 //! another tx at a nonce that a receipt proves used is `Duplicate`. A
 //! skip receipt proves no used nonce, so another tx at its nonce
-//! publishes. With no receipt in either index, it publishes and the
+//! publishes, unless the skip burned its nonce
+//! (`Receipt::burns_nonce`). With no receipt in either index, it publishes and the
 //! sequencer decides. An unfunded sender rejects as `InsufficientFunds`,
 //! only when the balance is fresh. Each refusal is counted by reason and
 //! logged at debug level with the sender and the nonce.
@@ -399,9 +400,10 @@ impl ValidatedSubmission {
 
     /// The answer a receipt at the submission's `(sender, nonce)` gives.
     /// The same tx gets the receipt. Another tx at a nonce that the
-    /// receipt proves used is `Duplicate`. A skip receipt, or a deposit's,
-    /// proves no used nonce: the chain still expects the nonce, so another
-    /// tx at it gets `None` and publishes.
+    /// receipt proves used is `Duplicate`: an executed tx, or a skip that
+    /// burned its nonce. Any other skip receipt, or a deposit's, proves no
+    /// used nonce: the chain still expects the nonce, so another tx at it
+    /// gets `None` and publishes.
     fn answer_from(&self, prev: &Receipt) -> Option<Result<Receipt, IngressError>> {
         if prev.tx_hash == self.tx_hash {
             // Count it, so received == accepted + rejected holds on every

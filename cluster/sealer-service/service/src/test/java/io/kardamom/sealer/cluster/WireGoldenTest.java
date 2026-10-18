@@ -119,17 +119,6 @@ final class WireGoldenTest {
     }
 
     @Test
-    void theNonceReleaseHasItsFieldsAtTheServiceOffsets() {
-        final UnsafeBuffer release = new UnsafeBuffer(golden.get("nonce_release"));
-        assertEquals(SealerWire.NONCE_RELEASE_LEN, release.capacity());
-        assertEquals(SealerWire.KIND_NONCE_RELEASE, release.getByte(SealerWire.KIND_OFFSET));
-        assertEquals((byte) 0x11, release.getByte(SealerWire.RELEASE_SENDER_OFFSET + 19));
-        assertEquals(7, release.getLong(SealerWire.RELEASE_NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN));
-        assertEquals((byte) 0xAB, release.getByte(SealerWire.RELEASE_ID_OFFSET));
-        assertEquals((byte) 0xAB, release.getByte(SealerWire.NONCE_RELEASE_LEN - 1));
-    }
-
-    @Test
     void theFeatureActivationHasItsFieldsAtTheServiceOffsets() {
         final byte[] frame = golden.get("feature_activation");
         final UnsafeBuffer activation = new UnsafeBuffer(frame);

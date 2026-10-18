@@ -196,16 +196,6 @@ impl Rig {
         self.refs.offers.lock().unwrap().clone()
     }
 
-    /// Every nonce release the sequencer sent to the sealer, in order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the releases mutex is poisoned.
-    #[must_use]
-    pub fn releases(&self) -> Vec<kardamom_cluster_adapter::wire::NonceRelease> {
-        self.refs.releases.lock().unwrap().clone()
-    }
-
     /// A cloned snapshot of every error emitted so far, in arrival order.
     ///
     /// # Panics

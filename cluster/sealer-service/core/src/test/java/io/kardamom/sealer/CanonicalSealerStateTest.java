@@ -287,9 +287,7 @@ class CanonicalSealerStateTest {
     @Test
     void load_rejects_id_count_above_capacity() {
         int slack = CanonicalSealerState.MARKER_SLACK;
-        // A window holds one release mark for each ordered id, and the
-        // epoch slack, above its capacity.
-        int taken = 2 * (4 + slack) + 1;
+        int taken = 4 + slack + 1;
         CanonicalSealerState original = new CanonicalSealerState(taken, 1);
         for (int i = 1; i <= taken; i++) {
             byte[] distinct = id(0);

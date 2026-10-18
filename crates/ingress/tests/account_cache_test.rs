@@ -182,9 +182,9 @@ async fn the_receipt_cache_answers_a_retry_before_the_nonce_check() {
     assert!(matches!(err, IngressError::Duplicate(_)), "{err:?}");
 }
 
-/// A skip receipt at the nonce proves that the chain did not use it. The
-/// same tx gets its skip receipt, and another tx at the nonce publishes:
-/// it is not a duplicate.
+/// A skip receipt with no write set at the nonce proves that the chain
+/// did not use it. The same tx gets its skip receipt, and another tx at
+/// the nonce publishes: it is not a duplicate.
 #[tokio::test]
 async fn a_skip_receipt_leaves_its_nonce_open() {
     let f = Fixture::new();
@@ -211,6 +211,37 @@ async fn a_skip_receipt_leaves_its_nonce_open() {
         .await
         .expect("another tx at a skipped nonce publishes");
     assert_eq!(got, alloy_primitives::keccak256(&other));
+}
+
+/// A skip receipt that burned its nonce (its write set holds the new
+/// nonce) proves the nonce used. The same tx gets its skip receipt, and
+/// another tx at the nonce is a duplicate.
+#[tokio::test]
+async fn a_burning_skip_receipt_uses_its_nonce() {
+    let f = Fixture::new();
+    let (p, mock) = (&f.proxy, &f.mock);
+    let signer = PrivateKeySigner::random();
+    let raw = sign_legacy(&signer, 0);
+    let tx_hash = alloy_primitives::keccak256(&raw);
+    let burn = kardamom_types::Receipt {
+        status: false,
+        gas_used: 0,
+        skip_reason: Some(kardamom_types::SkipReason::InsufficientFunds),
+        write_set_hash: alloy_primitives::B256::repeat_byte(0xB0),
+        ..receipt(signer.address(), 0, tx_hash, 1)
+    };
+    mock.receipt_bus.send(burn.into()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let got = p
+        .submit_raw_async(IP, raw)
+        .await
+        .expect("the same tx gets its skip receipt");
+    assert_eq!(got, tx_hash);
+    let err = p
+        .submit_raw_async(IP, sign_legacy_value(&signer, 0, 1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IngressError::Duplicate(_)), "{err:?}");
 }
 
 /// An executor query stub: it answers a balance query with `balance_hex`

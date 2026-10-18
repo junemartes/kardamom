@@ -26,10 +26,12 @@
 //!   both entry-point pairs) share.
 //! - `skip`: the deterministic skip path (reason classification and the
 //!   skip receipt).
+//! - `burn`: the nonce burn of a skipped transaction.
 //! - `deposit`: OP-aligned deposit execution.
 //! - `xchain`: cross-chain message delivery execution.
 //! - `write_set`: `WriteSet` extraction from revm state, and BAL recording.
 
+mod burn;
 mod db;
 mod deposit;
 mod derived;
@@ -40,10 +42,11 @@ mod tx_env;
 mod write_set;
 mod xchain;
 
+pub use burn::NonceBurn;
 pub use db::{SnapshotDb, SnapshotRef, StateRefError, account_info};
 pub use deposit::execute_deposit_tx;
 pub use scope::{Executor, TouchSet};
-pub use skip::skip_reason_of_tx;
+pub use skip::{Skip, skip_reason_of_tx};
 pub use tx_env::DecodedTx;
 pub use xchain::{XChainDelivery, execute_xchain_tx, xchain_gas_budget};
 

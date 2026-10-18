@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use alloy_primitives::Address;
 use kardamom_cache::AppliedRollbacks;
-use kardamom_cluster_adapter::wire::{NonceRelease, RELEASE_DECISION_VERSION};
+use kardamom_cluster_adapter::wire::SEALER_V3_DECISION_VERSION;
 use kardamom_types::ReceiptRollback;
 use serde::{Deserialize, Serialize};
 
@@ -79,8 +79,8 @@ pub struct SharedWatermark {
     count: Arc<AtomicU64>,
     lag_gap_ms: Arc<AtomicU64>,
     /// The decision version that the sealer reported on the current
-    /// session, 0 before its report. The feed thread writes it; the publish
-    /// loop reads it before it sends a nonce release.
+    /// session, 0 before its report. The feed thread writes it; the epoch
+    /// lane reads it to see the switch of the sealer rules.
     sealer_version: Arc<AtomicU8>,
 }
 
@@ -107,12 +107,11 @@ impl SharedWatermark {
         self.sealer_version.store(version, Ordering::Release);
     }
 
-    /// Whether the sealer of the current session applies a nonce release.
-    /// A sealer of an older decision version drops the frame, and its log
-    /// would replay the frame under the new rules after a restart.
+    /// Whether the sealer of the current session reported the rules of
+    /// [`kardamom_types::upgrades::FEATURE_SEALER_V3`] or newer.
     #[must_use]
-    pub fn sealer_takes_releases(&self) -> bool {
-        self.sealer_version.load(Ordering::Acquire) >= RELEASE_DECISION_VERSION
+    pub fn sealer_runs_v3(&self) -> bool {
+        self.sealer_version.load(Ordering::Acquire) >= SEALER_V3_DECISION_VERSION
     }
 
     /// Controller: consume the pending lag flag, if any.
@@ -424,10 +423,6 @@ pub struct ReceiptDrain {
     /// request voided. Their floor is still unknown, and nothing else asks
     /// the lookup again for a parked sender, so the caller asks again.
     pub stale_lookups: Vec<Address>,
-    /// The nonce releases for the sealer's guard: one for each skip
-    /// receipt that proves the chain nonce. See
-    /// [`FloorUpdate::sealer_release`].
-    pub sealer: Vec<NonceRelease>,
 }
 
 impl ResyncController {
@@ -473,12 +468,6 @@ impl ResyncController {
     #[must_use]
     pub fn active(&self) -> bool {
         self.active
-    }
-
-    /// Whether the sealer of the current session applies a nonce release.
-    #[must_use]
-    pub fn sealer_takes_releases(&self) -> bool {
-        self.watermark.sealer_takes_releases()
     }
 
     /// The rollback events seen so far. A lookup request carries it.
@@ -615,9 +604,6 @@ impl ResyncController {
         let known = self.floor(u.sender);
         if let Some(chain) = u.outcome.released(known.unwrap_or(0)) {
             drain.released.push((u.sender, chain));
-        }
-        if let Some(release) = u.sealer_release(known) {
-            drain.sealer.push(release);
         }
         let Some(floor) = u.outcome.floor() else {
             return drain;

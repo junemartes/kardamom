@@ -190,26 +190,6 @@ public final class SealerWire {
     static final int RECORDED_CURSOR_LEN = RECORDED_THROUGH_OFFSET + Long.BYTES;
 
     /**
-     * Nonce release, a sequencer's system record:
-     * {@code [kind:10][sender:20][nonce:u64 LE][canonical_id:32]}
-     * ({@link #NONCE_RELEASE_LEN} bytes). An executor skipped the ordered
-     * entry {@code canonical_id} of {@code sender}, and the chain expects
-     * {@code nonce} of the sender next. See
-     * {@link CanonicalSealerState#onRelease}. A member under decision
-     * version 2, and a member that does not know the kind, drops the frame
-     * as an unknown kind. Matches Rust {@code KIND_NONCE_RELEASE}.
-     */
-    public static final byte KIND_NONCE_RELEASE = 10;
-    /** Offset of the 20-byte sender within a {@link #KIND_NONCE_RELEASE} frame. */
-    static final int RELEASE_SENDER_OFFSET = KIND_OFFSET + Byte.BYTES;
-    /** Offset of the u64 LE nonce within a {@link #KIND_NONCE_RELEASE} frame. */
-    static final int RELEASE_NONCE_OFFSET = RELEASE_SENDER_OFFSET + CanonicalSealerState.SENDER_LEN;
-    /** Offset of the 32-byte canonical id within a {@link #KIND_NONCE_RELEASE} frame. */
-    static final int RELEASE_ID_OFFSET = RELEASE_NONCE_OFFSET + Long.BYTES;
-    /** Exact length of a {@link #KIND_NONCE_RELEASE} frame. */
-    static final int NONCE_RELEASE_LEN = RELEASE_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
-
-    /**
      * Feature activation, a sequencer's system record:
      * {@code [kind:11][l1_origin:u64 LE][feature_id:u64 LE][activation_ms:u64 LE]}
      * ({@link #FEATURE_ACTIVATION_LEN} bytes). The upgrade transaction of the
@@ -432,9 +412,9 @@ public final class SealerWire {
      * each session when the session opens. It carries the id of that
      * session, so a client ties it to its session whatever the order of its
      * own session events. Under version 2 the service sends no frame of this
-     * kind. A sequencer sends a nonce release only after it got version 3 or
-     * above on its current session. A reader that does not know the kind
-     * drops it. Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
+     * kind. A sequencer reports the version it got for its current
+     * session. A reader that does not know the kind drops it. Matches Rust
+     * {@code EGRESS_KIND_SEALER_INFO}.
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */

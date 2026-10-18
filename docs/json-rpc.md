@@ -48,7 +48,7 @@ receipt fields, the errors and the limits.
   6. Decode: the bytes must be an EIP-2718 transaction.
   7. Protocol limits: refuse a blob transaction (type `0x03`). Refuse a gas limit above 16777216 (the EIP-7825 cap).
   8. Signature: recover the sender.
-  9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error. A skip receipt (`status=false`, `gas_used=0`) uses no nonce, so a different transaction at its nonce goes on.
+  9. Known receipt: a resubmission of a transaction with a receipt answers with its hash. A different transaction at a nonce with a receipt is a `Duplicate` error. A skip receipt (`status=false`, `gas_used=0`) uses no nonce, so a different transaction at its nonce goes on. After the activation of `FEATURE_SEALER_V3`, a skip at the chain nonce uses its nonce, and a different transaction at it is a `Duplicate` error.
   10. Balance: if the ingress knows a fresh balance below `gas_limit * max_fee_per_gas + value`, it refuses with `insufficient funds`. For a sender that no cache layer holds, the ingress asks an executor once and keeps the answer for 30 s. Only an answer within `max_stale_txs` of the newest position can refuse. A stale, failed or shed query lets the transaction go on.
 - The ingress publishes the transaction with an inclusion deadline: the newest block it has seen plus `--inclusion-horizon-blocks` (default 64).
   - The sealer refuses the transaction after that block. See `past deadline` in [Errors](#errors).
@@ -152,7 +152,7 @@ A receipt is an Ethereum receipt with two more fields.
 - A client that ignores unknown fields reads the receipt as an Ethereum receipt.
 - `blockHash` is always `null`. The chain has no block hash in the receipt.
 - A deposit receipt has the legacy receipt type.
-- A skipped transaction has `status` `0x0` and `gasUsed` `0x0`. The transaction did not happen and used no nonce.
+- A skipped transaction has `status` `0x0` and `gasUsed` `0x0`. The transaction did not run, and it paid no fee. It used no nonce, except after the activation of `FEATURE_SEALER_V3`: then a skip at the chain nonce of the sender uses that nonce, and the sender sends the next nonce. See "A skipped transaction and its nonce" in [`failure-modes.md`](failure-modes.md).
 
 ### Receipt lookup
 
@@ -244,7 +244,7 @@ An error has a JSON-RPC `code` and a `message`. Most errors have no `data` field
 | `-32000` | `max fee per gas less than block base fee` | The fee cap is below the base fee. | Sign again with a higher cap. |
 | `-32000` | `account state unavailable` | No read layer could answer. | Yes. |
 | `-32000` | `nonce in flight: the sealer refused` | The sealer nonce guard is ahead of the chain nonce, and an earlier transaction of the sender can still be in flight. | Yes, after the receipt of the earlier transaction. |
-| `-32000` | `sender nonce stuck: the sealer expects nonce E ... but the chain expects nonce C` | An executor skipped an earlier transaction of the sender. The sealer nonce guard counted it, and it refuses every lower nonce. See "A skipped transaction leaves its nonce open" in [`failure-modes.md`](failure-modes.md). | No. An operator must act, or the sender moves to a new key. |
+| `-32000` | `sender nonce stuck: the sealer expects nonce E ... but the chain expects nonce C` | An executor skipped an earlier transaction of the sender. The sealer nonce guard counted it, and it refuses every lower nonce. See "A skipped transaction and its nonce" in [`failure-modes.md`](failure-modes.md). | No. An operator must act, or the sender moves to a new key. |
 | `-32000` | `block N is not in the fee history` | `eth_feeHistory` asked for a block that the ring does not hold. | Ask for a newer block. |
 | `-32010` | `chain halted: <cause> at <service> (<detail>)` | A halt upstream (the sealer or an executor) stops the chain. The ingress pauses submits. The sealer refuses user records on a DA lag. | Yes, after the root clears. The ingress resumes by itself. |
 | `-32010` | `ingress paused by an operator (<note>)` | An operator paused this ingress. | Yes, after the operator resumes it. |

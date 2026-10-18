@@ -22,7 +22,6 @@
 # txref_ingress     ingress kind 0, record type 0 (reference)
 # txref_egress      egress kind 1, index 5, record type 0
 # sealer_info       egress kind 17, decision version 3, session 0x0102
-# nonce_release     ingress kind 10, nonce 7, for the skipped entry 0xab..
 # feature_activation  ingress kind 11: the epoch at L1 origin 5 schedules
 #                   feature 2 at 1700000000250 ms
 tx_offer_ingress 0011111111111111111111111111111111111111110700000000000000921000000000000002010000000000000000000000000000abababababababababababababababababababababababababababababababab050302f86b01800000000807060504030201f0ffffff050000001111111111111111111111111111111111111111abababababababababababababababababababababababababababababababab000000009210000000000000
@@ -38,5 +37,4 @@ status_67 096400000000000000a000000000000000320000000000000000581b00000000000090
 txref_ingress 0011111111111111111111111111111111111111110700000000000000921000000000000002010000000000000000000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0003070000000f27000005000000
 txref_egress 0105000000000000002e000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0003070000000f27000005000000
 sealer_info 11030201000000000000
-nonce_release 0a11111111111111111111111111111111111111110700000000000000abababababababababababababababababababababababababababababababab
 feature_activation 0b05000000000000000200000000000000fa68e5cf8b010000

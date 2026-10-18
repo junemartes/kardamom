@@ -248,10 +248,7 @@ impl EgressWatermarkFeed {
     }
 
     /// Handle the sealer's rules and the start of a session. Returns `true`
-    /// when `frame` was either. The publish loop sends a nonce release only
-    /// while the sealer of the current session reported decision version 3
-    /// or above. A sealer under version 2 sends no report, and drops the
-    /// frame as an unknown kind.
+    /// when `frame` was either. A sealer under version 2 sends no report.
     fn on_rules_frame(&mut self, frame: &[u8]) -> bool {
         if !matches!(
             frame.first(),

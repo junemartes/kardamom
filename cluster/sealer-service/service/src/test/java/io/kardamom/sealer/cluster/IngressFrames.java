@@ -173,17 +173,6 @@ final class IngressFrames {
             .array();
     }
 
-    /** A {@code KIND_NONCE_RELEASE} frame: {@code [kind:10][sender:20][nonce:u64 LE][canonical_id:32]}. */
-    static byte[] nonceReleaseFrame(final byte[] sender20, final long nonce, final byte[] canonicalId32) {
-        return java.nio.ByteBuffer.allocate(SealerWire.NONCE_RELEASE_LEN)
-            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            .put(SealerWire.KIND_NONCE_RELEASE)
-            .put(sender20)
-            .putLong(nonce)
-            .put(canonicalId32)
-            .array();
-    }
-
     /**
      * A {@code KIND_FEATURE_ACTIVATION} frame:
      * {@code [kind:11][l1_origin:u64 LE][feature_id:u64 LE][activation_ms:u64 LE]}.
