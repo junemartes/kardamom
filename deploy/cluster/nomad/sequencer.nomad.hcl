@@ -125,6 +125,13 @@ locals {
 }
 
 job "sequencer" {
+  # The sequencer of this release sends the feature activation (ingress
+  # kind 11) in front of the epoch of an upgrade transaction. The upgrade
+  # check (`just sealer-upgrade-check <env>`) reads this meta.
+  meta {
+    sealer_feature_activation = "true"
+  }
+
   datacenters = [var.datacenter]
   type        = "service"
   node_pool   = var.node_pool

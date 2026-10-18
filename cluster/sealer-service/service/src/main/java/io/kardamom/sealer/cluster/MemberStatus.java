@@ -1,6 +1,7 @@
 package io.kardamom.sealer.cluster;
 
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.DecisionRules;
 import java.util.OptionalLong;
 
 /**
@@ -26,25 +27,18 @@ final class MemberStatus {
      * the range it reads, and the version of the newest snapshot the member
      * restored or took ({@code latest}, 0 before either). A deploy refuses
      * a release whose read maximum is below {@code latest}: that member
-     * could not restore its own snapshot after the roll.
+     * could not restore its own snapshot after the roll. The upgrade check
+     * reads {@code readsMax}: a member that reads version 13 takes the
+     * feature activation.
      */
-    record SnapshotVersions(int writes, int readsMin, int readsMax, int latest, long releasesSince) {
-        /** This release's constants, with the member's {@code latest} and no release since it. */
+    record SnapshotVersions(int writes, int readsMin, int readsMax, int latest) {
+        /** This release's constants, with the member's {@code latest}. */
         static SnapshotVersions of(final int latest) {
-            return of(latest, 0L);
-        }
-
-        /**
-         * This release's constants, with the member's {@code latest}, and the
-         * nonce-release frames it applied since its last snapshot.
-         */
-        static SnapshotVersions of(final int latest, final long releasesSince) {
             return new SnapshotVersions(
                 CanonicalSealerState.snapshotWriteVersion(),
                 CanonicalSealerState.SNAPSHOT_READ_MIN_VERSION,
                 CanonicalSealerState.snapshotReadMaxVersion(),
-                latest,
-                releasesSince);
+                latest);
         }
     }
 
@@ -54,6 +48,8 @@ final class MemberStatus {
     final long commitPosition;
     final long servicePosition;
     final SnapshotVersions snapshot;
+    /** The decision rules of the member: the version, and the origin and the time of the activation. */
+    final DecisionRules.View rules;
     /**
      * The bytes that the member can still write to the disk of its retained
      * file and its log, or empty when the disk cannot be read.
@@ -67,6 +63,7 @@ final class MemberStatus {
             final long commitPosition,
             final long servicePosition,
             final SnapshotVersions snapshot,
+            final DecisionRules.View rules,
             final OptionalLong diskFreeBytes) {
         this.memberId = memberId;
         this.role = role;
@@ -74,6 +71,7 @@ final class MemberStatus {
         this.commitPosition = commitPosition;
         this.servicePosition = servicePosition;
         this.snapshot = snapshot;
+        this.rules = rules;
         this.diskFreeBytes = diskFreeBytes;
     }
 
@@ -100,8 +98,9 @@ final class MemberStatus {
             + ",\"snapshotReadsMin\":" + snapshot.readsMin()
             + ",\"snapshotReadsMax\":" + snapshot.readsMax()
             + ",\"snapshotLatest\":" + snapshot.latest()
-            + ",\"releasesSinceSnapshot\":" + snapshot.releasesSince()
-            + ",\"decisionVersion\":" + CanonicalSealerState.DECISION_VERSION
+            + ",\"decisionVersion\":" + rules.version()
+            + ",\"decisionActivationOrigin\":" + Long.toUnsignedString(rules.activationOrigin())
+            + ",\"decisionActivationMs\":" + Long.toUnsignedString(rules.activationMs())
             + ",\"diskFreeBytes\":" + diskFree("null")
             + ",\"ready\":" + isReady(lagBytes)
             + "}";

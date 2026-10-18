@@ -225,9 +225,9 @@ These settings have the same risk, but they are not formats. The release
 gate refuses to roll them:
 
 - The sealer settings that every member must match. See `cluster/sealer-service/README.md`.
-- The rules that decide the sealer's replicated state. A change raises the
-  decision version, a setting that every member must match, and needs the
-  coordinated restart of the sealer. See "Decision version" in
+- The rules that decide the sealer's replicated state. A new rule ships
+  behind a feature flag, and an upgrade transaction turns it on at one
+  record in the log of the sealer. See "Decision version" in
   `cluster/sealer-service/README.md`.
 - The shard map. Use the resize playbook.
 - The L1 contracts. Their upgrades go forward only.

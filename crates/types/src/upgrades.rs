@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 use alloy_primitives::{Address, U256, address};
 use bytes::Bytes;
 
+use crate::deposit::Deposit;
+
 /// Canonical L2 address of the `KardamomChainState` predeploy. This is the
 /// feature-flag store. It is seeded into genesis; see `chains/dev-withdrawals.toml`.
 pub const CHAIN_STATE: Address = address!("0x4200000000000000000000000000000000000017");
@@ -47,6 +49,49 @@ pub const UPGRADE_TX_GAS_LIMIT: u64 = 1_000_000;
 
 /// Selector of `KardamomChainState.setFeature(uint256,uint64)`.
 pub const SET_FEATURE_SELECTOR: [u8; 4] = [0x8a, 0xfd, 0xb8, 0x54];
+
+/// Decision rules version 3 of the sealer: the nonce release. The sealer
+/// reads this feature from the feature activation record that the
+/// sequencer sends in front of the epoch. No block-close action reads it.
+/// It must match Java `DecisionRules.FEATURE_SEALER_V3`.
+pub const FEATURE_SEALER_V3: u64 = 2;
+
+/// The length of `setFeature` calldata: the selector and two words.
+const SET_FEATURE_LEN: usize = 4 + 32 + 32;
+
+/// A `setFeature(featureId, activationTimestamp)` call that a system
+/// deposit carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureSchedule {
+    pub feature_id: U256,
+    /// Epoch milliseconds. `0` means "activate immediately".
+    pub activation_timestamp: u64,
+}
+
+impl FeatureSchedule {
+    /// The schedule of `deposit`: a system deposit to [`CHAIN_STATE`] with
+    /// `setFeature` calldata. Any other deposit gives `None`.
+    #[must_use]
+    pub fn of_deposit(deposit: &Deposit) -> Option<Self> {
+        (deposit.is_system_transaction && deposit.to == Some(CHAIN_STATE))
+            .then(|| Self::decode(&deposit.input))
+            .flatten()
+    }
+
+    /// Decode the calldata that [`encode_set_feature`] writes. A word of
+    /// `activationTimestamp` above `u64` gives `None`.
+    #[must_use]
+    pub fn decode(calldata: &[u8]) -> Option<Self> {
+        let words = calldata
+            .strip_prefix(&SET_FEATURE_SELECTOR)
+            .filter(|_| calldata.len() == SET_FEATURE_LEN)?;
+        let (feature, timestamp) = words.split_at(32);
+        Some(Self {
+            feature_id: U256::from_be_slice(feature),
+            activation_timestamp: u64::try_from(U256::from_be_slice(timestamp)).ok()?,
+        })
+    }
+}
 
 /// ABI-encode `setFeature(featureId, activationTimestamp)`.
 ///
@@ -105,6 +150,49 @@ mod tests {
         let mut word = [0u8; 32];
         word[24..].copy_from_slice(&ts.to_be_bytes());
         assert_eq!(&calldata[36..68], &word);
+    }
+
+    #[test]
+    fn a_schedule_decodes_from_the_calldata_that_encode_writes() {
+        let calldata = encode_set_feature(U256::from(FEATURE_SEALER_V3), 1_700_000_000_250);
+        assert_eq!(
+            FeatureSchedule::decode(&calldata),
+            Some(FeatureSchedule {
+                feature_id: U256::from(FEATURE_SEALER_V3),
+                activation_timestamp: 1_700_000_000_250,
+            })
+        );
+        assert_eq!(FeatureSchedule::decode(&calldata[..67]), None);
+        let mut wide = calldata.to_vec();
+        wide[36] = 1;
+        assert_eq!(FeatureSchedule::decode(&wide), None, "a time above u64");
+        wide[..4].copy_from_slice(&[0; 4]);
+        assert_eq!(FeatureSchedule::decode(&wide), None, "another selector");
+    }
+
+    #[test]
+    fn only_a_system_deposit_to_the_chain_state_carries_a_schedule() {
+        let system = Deposit {
+            source_hash: alloy_primitives::B256::ZERO,
+            from: SYSTEM_UPGRADER,
+            to: Some(CHAIN_STATE),
+            mint: 0,
+            value: U256::ZERO,
+            gas_limit: UPGRADE_TX_GAS_LIMIT,
+            is_system_transaction: true,
+            input: encode_set_feature(U256::from(FEATURE_SEALER_V3), 0),
+        };
+        assert!(FeatureSchedule::of_deposit(&system).is_some());
+        let user = Deposit {
+            is_system_transaction: false,
+            ..system.clone()
+        };
+        assert_eq!(FeatureSchedule::of_deposit(&user), None);
+        let elsewhere = Deposit {
+            to: Some(SYSTEM_UPGRADER),
+            ..system
+        };
+        assert_eq!(FeatureSchedule::of_deposit(&elsewhere), None);
     }
 
     #[test]

@@ -154,6 +154,15 @@ impl Fixture {
                 }
                 .encode(),
             ),
+            (
+                "feature_activation",
+                FeatureActivation {
+                    l1_origin: 5,
+                    feature_id: 2,
+                    activation_ms: 1_700_000_000_250,
+                }
+                .encode(),
+            ),
         ]
     }
 }

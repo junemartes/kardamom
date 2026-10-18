@@ -65,6 +65,10 @@ pub(crate) const RECEIPT_FLOORS_FORGOTTEN: &str =
 /// 0 before its report. The sequencer sends a nonce release only at 3 or
 /// above.
 pub(crate) const SEALER_VERSION: &str = "kardamom_sequencer_sealer_version";
+/// The feature activations that this replica sent and for which the
+/// sealer reported no decision version 3 within 60 s of the activation
+/// time. The nonce releases then wait in the queue. Alert on any increase.
+pub(crate) const SEALER_RULES_MISSING: &str = "kardamom_sequencer_sealer_rules_missing_total";
 /// The nonce releases for the sealer, by outcome: `sent` to the sealer,
 /// `duplicate` for a skipped entry that already has a release, `dropped`
 /// when the bounded queue was full or the transport refused the frame.
@@ -253,6 +257,10 @@ pub(crate) fn record_floor_forgotten(partition: u32) {
 
 pub(crate) fn record_sealer_version(partition: u32, version: u8) {
     set(SEALER_VERSION, partition, f64::from(version));
+}
+
+pub(crate) fn record_sealer_rules_missing(partition: u32) {
+    bump(SEALER_RULES_MISSING, partition, 1);
 }
 
 pub(crate) fn record_nonce_release(partition: u32, outcome: &'static str) {

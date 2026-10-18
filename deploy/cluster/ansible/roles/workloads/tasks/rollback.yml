@@ -108,8 +108,7 @@
       # carries the text; the gate reads it in place of the revision.
       target: >-
         {{ {'revision': workloads_last_attempt.before.revision,
-            'manifest': workloads_last_attempt.before.manifest,
-            'decision_version': workloads_last_attempt.before.decision_version | default('')}
+            'manifest': workloads_last_attempt.before.manifest}
            | combine({'formats': workloads_last_attempt.before.formats}
                      if workloads_last_attempt.before.formats | default('') | length > 0 else {}) }}
       before: {manifest: {}, jobs: {}}

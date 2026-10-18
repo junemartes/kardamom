@@ -35,15 +35,12 @@
       target:
         revision: "{{ workloads_target_revision }}"
         manifest: "{{ workloads_image_refs }}"
-        decision_version: "{{ workloads_gate_decision_version | default('') }}"
       # A new record holds no formats text: Nomad limits the variable to
       # 64 KiB. A before written while the accepted release held the text
       # carries it, so a rollback restores a release that the gate can
       # compare with.
       before: >-
         {{ {'revision': workloads_accepted.target.revision | default(''),
-            'decision_version': (workloads_accepted.target.decision_version | default('')
-                                 if workloads_accepted | length > 0 else workloads_gate_decision_version | default('')),
             'manifest': workloads_accepted.target.manifest | default({}),
             'jobs': workloads_record_versions.results | map(attribute='json.ID')
                     | zip(workloads_record_versions.results | map(attribute='json.Version')

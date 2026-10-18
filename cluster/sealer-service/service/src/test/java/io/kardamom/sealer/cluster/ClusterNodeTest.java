@@ -176,36 +176,17 @@ final class ClusterNodeTest {
             1L, io.kardamom.sealer.CanonicalSealerState.snapshotKeepsRecordedCursors()));
     }
 
-    @Test
-    void theDecisionVersionMustBeTheVersionOfTheImage() {
-        final int image = io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION;
-        assertEquals(image, ClusterNode.requireDecisionVersion(null), "an absent setting is the image version");
-        assertEquals(image, ClusterNode.requireDecisionVersion(Integer.toString(image)));
-        assertThrows(IllegalStateException.class,
-            () -> ClusterNode.requireDecisionVersion(Integer.toString(image - 1)));
-        assertThrows(NumberFormatException.class, () -> ClusterNode.requireDecisionVersion(""));
-    }
-
     /**
-     * The move to version 3 is a coordinated restart: a member of this image
-     * stops at start under a job of version 2, so no member of version 3
-     * runs beside one of version 2. The restart restores the version-10
-     * snapshot of the old members (see {@link SealerRecordPathTest}).
+     * The job names no decision version: every member starts on version 2,
+     * and only an upgrade transaction in the log switches it to version 3
+     * ({@link SealerDecisionRulesTest}). A job spec that names a version is
+     * replaced by a rolling deploy.
      */
     @Test
-    void thisImageRunsVersionThreeAndRefusesAJobOfVersionTwo() {
-        assertEquals(3, io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION);
-        assertThrows(IllegalStateException.class, () -> ClusterNode.requireDecisionVersion("2"));
-    }
-
-    @Test
-    void theSealerJobPassesTheDecisionVersionOfTheCode() throws IOException {
+    void theSealerJobNamesNoDecisionVersion() throws IOException {
         final String job = Files.readString(Path.of(System.getProperty("kardamom.sealerJob")));
-        final Matcher setting =
-            Pattern.compile("-D" + Pattern.quote(ClusterNode.DECISION_VERSION_SETTING) + "=(\\d+)").matcher(job);
-        assertTrue(setting.find(), "the sealer job passes the decision version");
-        assertEquals(io.kardamom.sealer.CanonicalSealerState.DECISION_VERSION, Integer.parseInt(setting.group(1)));
-        assertFalse(setting.find(), "the sealer job passes the decision version once");
+        assertFalse(job.contains("decisionVersion"), "the job names no decision version");
+        assertEquals(2, io.kardamom.sealer.DecisionRules.START_VERSION);
     }
 
     /** Member names under the reserved .invalid domain: no lookup can resolve them. */

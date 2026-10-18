@@ -4,22 +4,24 @@
 //! splitters used by tests and the in-Rust service mock. Frame layouts
 //! are documented on the `KIND_*` constants in the parent module.
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 #[cfg(any(test, feature = "testing"))]
 use kardamom_types::DepositRef;
 use kardamom_types::TxRef;
 use kardamom_types::VoidRecord;
 use kardamom_types::epoch::EpochRecord;
+use kardamom_types::upgrades::{FEATURE_SEALER_V3, FeatureSchedule};
 use kardamom_types::xchain::RemoteEpochRecord;
 
 #[cfg(any(test, feature = "testing"))]
 use super::RT_DEPOSITREF;
 use super::{
     CANONICAL_ID_LEN, INGRESS_CANONICAL_ID_OFFSET, INGRESS_DEADLINE_OFFSET, INGRESS_NONCE_OFFSET,
-    INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_INGRESS_RECORD, KIND_NONCE_RELEASE,
-    KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR, KIND_RECORDED_CURSOR, KIND_REMOTE_ORIGIN_RECORD,
-    KIND_REPLAY_REQUEST, KIND_SUBSCRIBE, KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF,
-    SENDER_LEN, WireError, encode_kind_2u64, epoch_slots, rd_slice, rd_u64, rd_u128,
+    INGRESS_SENDER_OFFSET, INGRESS_TIP_OFFSET, KIND_BATCH, KIND_FEATURE_ACTIVATION,
+    KIND_INGRESS_RECORD, KIND_NONCE_RELEASE, KIND_ORIGIN_RECORD, KIND_POSTED_CURSOR,
+    KIND_RECORDED_CURSOR, KIND_REMOTE_ORIGIN_RECORD, KIND_REPLAY_REQUEST, KIND_SUBSCRIBE,
+    KIND_VOID_REQUEST, RT_EPOCH, RT_REMOTE_EPOCH, RT_TXREF, SENDER_LEN, WireError,
+    encode_kind_2u64, encode_kind_2u64_id, epoch_slots, rd_slice, rd_u64, rd_u128,
     remote_epoch_slots, too_short,
 };
 
@@ -253,6 +255,51 @@ impl NonceRelease {
         b.extend_from_slice(&self.nonce.to_le_bytes());
         b.extend_from_slice(self.tx_hash.as_slice());
         b
+    }
+}
+
+/// A feature activation (ingress kind [`KIND_FEATURE_ACTIVATION`]): the
+/// upgrade transaction of the epoch at `l1_origin` schedules `feature_id`
+/// at `activation_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureActivation {
+    pub l1_origin: u64,
+    pub feature_id: u64,
+    pub activation_ms: u64,
+}
+
+impl FeatureActivation {
+    /// The length of the frame.
+    pub const LEN: usize = 1 + 8 + 8 + 8;
+
+    /// The activation of [`FEATURE_SEALER_V3`] that `epoch` carries: the
+    /// last schedule of the feature in the epoch, because the last
+    /// `setFeature` call wins on L2. `None` when the epoch schedules no
+    /// such feature.
+    #[must_use]
+    pub fn sealer_rules_of(epoch: &EpochRecord) -> Option<Self> {
+        epoch
+            .deposits
+            .iter()
+            .rev()
+            .filter_map(FeatureSchedule::of_deposit)
+            .find(|schedule| schedule.feature_id == U256::from(FEATURE_SEALER_V3))
+            .map(|schedule| Self {
+                l1_origin: epoch.l1_number,
+                feature_id: FEATURE_SEALER_V3,
+                activation_ms: schedule.activation_timestamp,
+            })
+    }
+
+    /// The frame `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        encode_kind_2u64_id(
+            KIND_FEATURE_ACTIVATION,
+            self.l1_origin,
+            self.feature_id,
+            self.activation_ms,
+        )
     }
 }
 

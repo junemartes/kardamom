@@ -101,21 +101,6 @@ public final class CanonicalSealerState {
     public static final long DEFAULT_INCLUSION_HORIZON_BLOCKS = 64L;
 
     /**
-     * The version of the rules that decide the replicated state. Two members
-     * on two versions can decide one log entry differently, and the state
-     * forks. A change that decides an ordered entry differently raises the
-     * version. The deploy passes it in {@code kardamom.cluster.decisionVersion},
-     * a setting that every member must match, so a new version needs a
-     * coordinated restart of the sealer.
-     *
-     * <p>Version 3 adds the nonce release ({@link #onRelease}). A member that
-     * keeps its retained frames in a file also orders full entries and takes
-     * no void request; that choice is a setting that every member must
-     * match, and the snapshot version carries it.</p>
-     */
-    public static final int DECISION_VERSION = 3;
-
-    /**
      * Default ordering window: off. The deploy sets {@code 20} together with
      * the sequencer's priority-fee setting, and every member must run the
      * same value: the window decides the relay order inside the replicated
@@ -166,12 +151,22 @@ public final class CanonicalSealerState {
      * retained file after it: the service writes it only when the member
      * keeps its retained frames in a file, and such a member takes no void
      * request and no recorded cursor. A member that cannot read the file
-     * section must not load the snapshot.
+     * section must not load the snapshot. Version 13 is version 10 with the
+     * decision rules after the seed digest: see {@link DecisionRules}.
      *
      * <p>This is the newest version that {@link #load} reads. The writer
      * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 12;
+    private static final int SNAPSHOT_READ_VERSION = 13;
+
+    /**
+     * The version that {@link #takeSnapshot()} writes when the state holds
+     * a feature activation: version 10, then the decision rules. A state
+     * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}. A loader
+     * that reads only up to version 12 refuses version 13, so the upgrade
+     * transaction comes only after every member reads version 13.
+     */
+    public static final int RULES_SNAPSHOT_VERSION = 13;
 
     /**
      * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
@@ -374,6 +369,9 @@ public final class CanonicalSealerState {
 
     /** The SHA-256 of the seed file this state started from; zeros at genesis. */
     private byte[] seedDigest;
+
+    /** The decision rules. Replicated state: see {@link DecisionRules}. */
+    private DecisionRules rules = DecisionRules.start();
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -1011,6 +1009,10 @@ public final class CanonicalSealerState {
      * @return whether the release applied
      */
     public boolean onRelease(byte[] sender20, long nonce, byte[] canonicalId32) {
+        if (rules.version() != DecisionRules.NEWEST_VERSION) {
+            // Version 2 takes no release.
+            return false;
+        }
         ByteBuffer key = idKey(canonicalId32);
         Long held = dedup.get(key);
         ByteBuffer mark = releaseMark(canonicalId32);
@@ -1025,6 +1027,45 @@ public final class CanonicalSealerState {
         insertFresh(mark, held);
         expectedNonce.put(senderKey, nonce);
         return true;
+    }
+
+    /** The version of the decision rules: see {@link DecisionRules}. */
+    public int decisionVersion() {
+        return rules.version();
+    }
+
+    /** The decision rules as a value, for the admin endpoint. */
+    public DecisionRules.View decisionRules() {
+        return rules.view();
+    }
+
+    /**
+     * Run version 3 from the start: the rules of a member that keeps its
+     * retained frames in a file. Call it only on a state that started at
+     * genesis or from a seed, before the first log entry.
+     */
+    public void startOnNewestRules() {
+        rules = DecisionRules.newest();
+    }
+
+    /**
+     * Take a feature activation record at cluster time {@code nowMs}.
+     *
+     * @return what the record did
+     */
+    public DecisionRules.Outcome onFeatureActivation(
+            final DecisionRules.FeatureActivation activation, final long nowMs) {
+        return rules.onActivation(activation, l1Origin, nowMs);
+    }
+
+    /**
+     * Switch the rules when a pending activation is due at {@code nowMs},
+     * the cluster time of a log entry. Call it before each log entry.
+     *
+     * @return whether the rules switched at this entry
+     */
+    public boolean switchRulesAt(final long nowMs) {
+        return rules.switchAt(nowMs);
     }
 
     /** The release mark of an id: the id with its first byte inverted. */
@@ -1554,12 +1595,22 @@ public final class CanonicalSealerState {
      * {@link SeedStatus} ordinal) and the seed digest (32) after it.
      * Version 11 adds the recorded cursors after the seed digest: see
      * {@link RecordedCursors#writeTo}. Version 12 is version 10 without the
-     * void ledger.</p>
+     * void ledger. Version 13 is version 10 with the decision rules after
+     * the seed digest: see {@link DecisionRules#writeTo}.</p>
      *
-     * <p>The writer writes {@link #SNAPSHOT_WRITE_VERSION}.</p>
+     * <p>The writer writes {@link #snapshotVersion()}.</p>
      */
     public byte[] takeSnapshot() {
-        return takeSnapshot(SNAPSHOT_WRITE_VERSION);
+        return takeSnapshot(snapshotVersion());
+    }
+
+    /**
+     * The version that {@link #takeSnapshot()} writes now:
+     * {@link #RULES_SNAPSHOT_VERSION} when the state holds a feature
+     * activation, else {@link #SNAPSHOT_WRITE_VERSION}.
+     */
+    public int snapshotVersion() {
+        return rules.holdsActivation() ? RULES_SNAPSHOT_VERSION : SNAPSHOT_WRITE_VERSION;
     }
 
     /**
@@ -1573,14 +1624,16 @@ public final class CanonicalSealerState {
     /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
-     * neither. A version-10 snapshot is the same bytes that the previous
-     * release writes for the same state.
+     * neither, and 13 has the void ledger and the decision rules. A
+     * version-10 snapshot of a state is the same bytes in every release
+     * that writes version 10.
      *
-     * @param version 10, 11 or 12
+     * @param version 10, 11, 12 or 13
      */
     byte[] takeSnapshot(int version) {
-        boolean withVoids = version < RETAINED_FILE_SNAPSHOT_VERSION;
+        boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
         boolean withCursors = version == 11;
+        boolean withRules = version == RULES_SNAPSHOT_VERSION;
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int remoteCount = remoteOrigins.size();
@@ -1592,7 +1645,8 @@ public final class CanonicalSealerState {
                 + 4
                 + 8
                 + 1 + SealerSeed.HASH_LEN
-                + (withCursors ? recorded.snapshotLen() : 0);
+                + (withCursors ? recorded.snapshotLen() : 0)
+                + (withRules ? DecisionRules.SNAPSHOT_LEN : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(version);
@@ -1631,7 +1685,7 @@ public final class CanonicalSealerState {
             buf.put(e.getValue().nextSeqKnown ? (byte) 1 : (byte) 0);
             buf.putLong(e.getValue().nextSeq);
         }
-        // v6 to v11: the void window, then the open votes.
+        // v6 to v11 and v13: the void window, then the open votes.
         if (withVoids) {
             voids.writeTo(buf, canonicalCount);
         }
@@ -1645,6 +1699,10 @@ public final class CanonicalSealerState {
         // v11 only: the recorded cursors, in executor-id order.
         if (withCursors) {
             recorded.writeTo(buf);
+        }
+        // v13 only: the decision rules.
+        if (withRules) {
+            rules.writeTo(buf);
         }
         return buf.array();
     }
@@ -1843,7 +1901,7 @@ public final class CanonicalSealerState {
                 state.remoteOrigins.put(originChainId, new RemotePeer(anchorNumber, nextSeqKnown, nextSeq));
             }
         }
-        if (version >= 6 && version < RETAINED_FILE_SNAPSHOT_VERSION) {
+        if (version >= 6 && version != RETAINED_FILE_SNAPSHOT_VERSION) {
             state.voids = VoidLedger.readFrom(buf, voidConfig);
         }
         if (version >= 8) {
@@ -1865,6 +1923,14 @@ public final class CanonicalSealerState {
             state.recorded = RecordedCursors.readFrom(
                 buf, budgets.recordLagRecords(), state.voids::isVoter);
         }
+        if (version == RULES_SNAPSHOT_VERSION) {
+            state.rules = DecisionRules.readFrom(buf);
+        }
+        if (version == RETAINED_FILE_SNAPSHOT_VERSION) {
+            // Only a member with the retained file writes version 12, and
+            // such a member runs version 3 from its start.
+            state.rules = DecisionRules.newest();
+        }
         // A version-1 snapshot (before the guard existed) restores an empty
         // guard map, so every sender re-seeds on its next record. This is
         // trust-on-first-sight, and it causes no false rejects. A version-1
@@ -1876,7 +1942,8 @@ public final class CanonicalSealerState {
         // peer's anchor with an unknown lane cursor. The cursor seeds from
         // the peer's next record. A version-10 or older snapshot restores
         // no recorded cursor, so the record-lag guard refuses nothing until
-        // the first cursor.
+        // the first cursor. A snapshot before version 12 restores the
+        // rules of a state with no activation.
         state.canonicalCount = canonicalCount;
         state.restoredSnapshotVersion = version;
         return state;

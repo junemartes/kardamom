@@ -22,6 +22,7 @@ pub mod nonce_unordered;
 pub mod resize;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
+pub mod sealer_upgrade;
 pub mod sequencer_restart;
 pub mod tx_status;
 pub mod upgrade;

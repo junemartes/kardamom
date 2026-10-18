@@ -152,7 +152,7 @@ class NomadAPI(BaseHTTPRequestHandler):
         # of a job.
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         path = self.path.split('?')[0].removeprefix('/v1/var/')
-        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/', '/v1/var/kardamom/quiesce/')) \
+        assert self.path.startswith(('/v1/var/nomad/jobs/', '/v1/var/kardamom/deploys/')) \
             and body['Path'] == path, (self.path, body)
         # Nomad refuses a variable over 64 KiB.
         assert len(json.dumps(body['Items'])) <= 64 * 1024, (path, len(json.dumps(body['Items'])))
@@ -250,8 +250,7 @@ class NomadAPI(BaseHTTPRequestHandler):
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'decisionVersion': state.get('decision_version', 3),
-                          'releasesSinceSnapshot': state.get('releases', {}).get(node, 0)})
+                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 13)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -1246,15 +1245,15 @@ class RecordTest(Deploys):
         self.run_deploy({'workloads_da_lag_budget_blocks': '5000'}, environ={'KARDAMOM_ALLOW_MUST_MATCH': 'daLagBudgetBlocks'})
         self.assertEqual(self.api.state['writes'], ['cluster', 'cluster', 'cluster', 'batcher'])
 
-    def test_a_new_sealer_decision_version_refuses_the_rolling_path(self):
+    def test_a_sealer_job_that_names_a_decision_version_rolls(self):
+        """The job of the release before names decisionVersion; this release names none."""
         self.deploy()
         self.api.state['writes'] = []
         for group in self.api.state['jobs']['cluster']['TaskGroups']:
             env = group['Tasks'][0]['Env']
-            env['JAVA_TOOL_OPTIONS'] = env['JAVA_TOOL_OPTIONS'].replace(' -Dkardamom.cluster.decisionVersion=3', '')
-        output = self.run_deploy(success=False)
-        self.assertIn('every member must match: decisionVersion.', output)
-        self.assertEqual(self.api.state['writes'], [])
+            env['JAVA_TOOL_OPTIONS'] += ' -Dkardamom.cluster.decisionVersion=2'
+        self.run_deploy()
+        self.assertEqual(self.api.state['writes'].count('cluster'), 3, 'the sealer rolls member by member')
 
     def test_a_carry_bytes_flip_refuses_the_rolling_path(self):
         self.deploy()
@@ -1266,66 +1265,43 @@ class RecordTest(Deploys):
         self.assertIn('every member must match: carryBytes.', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def to_version_two(self):
-        """Deploy, then stand for an accepted release of decision version 2."""
+    def test_a_sealer_job_that_started_on_decision_version_three_is_refused(self):
+        """A cluster that ran a build with decisionVersion=3 must not roll onto version 2."""
         self.deploy()
-        del self.api.state['records']['kardamom/deploys/local']['accepted']['target']['decision_version']
-        self.api.state['decision_version'] = 2
-
-    def coordinated_restart(self, success):
-        """Stop the sealer, and deploy the release of decision version 3."""
-        del self.api.state['jobs']['cluster']
-        self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.api.state['writes'] = []
-        return self.run_deploy(success=success)
-
-    def test_a_quiesce_check_refuses_a_release_after_a_snapshot(self):
-        self.to_version_two()
-        del self.api.state['jobs']['sequencer']
-        self.api.state['releases'] = {'node-cluster-1': 1}
-        output = self.run_deploy(playbook='quiesce.yml', success=False)
-        self.assertIn('a member applied a nonce release after its last snapshot', output)
-        output = self.coordinated_restart(success=False)
-        self.assertIn('changes the sealer decision version from 2 to 3', output)
+        for group in self.api.state['jobs']['cluster']['TaskGroups']:
+            env = group['Tasks'][0]['Env']
+            env['JAVA_TOOL_OPTIONS'] += ' -Dkardamom.cluster.decisionVersion=3'
+        output = self.run_deploy(success=False)
+        self.assertIn('the registered sealer job names decisionVersion=3', output)
         self.assertEqual(self.api.state['writes'], [])
 
-    def test_a_quiesce_check_refuses_a_running_sequencer_and_a_member_that_is_down(self):
-        self.to_version_two()
-        output = self.run_deploy(playbook='quiesce.yml', success=False)
-        self.assertIn('a sequencer allocation still runs', output)
-        del self.api.state['jobs']['sequencer']
+    def test_the_upgrade_check_passes_on_a_release_that_takes_the_activation(self):
+        self.deploy()
+        output = self.run_deploy(playbook='upgrade-check.yml')
+        self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 13', output)
+
+    def test_the_upgrade_check_refuses_a_member_of_an_older_release(self):
+        self.deploy()
+        self.api.state['reads_max'] = {'node-cluster-1': 12}
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('a sealer member reads only up to snapshot version 12', output)
+
+    def test_the_upgrade_check_refuses_a_member_that_is_down(self):
+        self.deploy()
         self.api.state['down_groups'] = ['cluster-2']
-        output = self.run_deploy(playbook='quiesce.yml', success=False)
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('the sealer members cluster-2 do not run', output)
 
-    def test_a_stale_quiesce_check_is_refused(self):
-        self.to_version_two()
-        del self.api.state['jobs']['sequencer']
-        self.run_deploy(playbook='quiesce.yml')
-        check = self.api.state['variables']['kardamom/quiesce/local']
-        check['checked_unix'] = str(int(check['checked_unix']) - 601)
-        output = self.coordinated_restart(success=False)
-        self.assertIn('within the last 600 s', output)
-
-    def test_the_age_of_a_quiesce_check_is_capped_at_an_hour(self):
-        self.to_version_two()
-        del self.api.state['jobs']['sequencer']
-        self.run_deploy(playbook='quiesce.yml')
-        check = self.api.state['variables']['kardamom/quiesce/local']
-        check['checked_unix'] = str(int(check['checked_unix']) - 3700)
-        del self.api.state['jobs']['cluster']
-        self.api.state['chain_status'] = NO_QUORUM_CHAIN
-        output = self.run_deploy(success=False, environ={'KARDAMOM_QUIESCE_MAX_AGE_S': '86400'})
-        self.assertIn('within the last 3600 s', output)
-
-    def test_a_passing_quiesce_check_lets_the_decision_version_change(self):
-        self.to_version_two()
-        del self.api.state['jobs']['sequencer']
-        self.run_deploy(playbook='quiesce.yml')
-        check = self.api.state['variables']['kardamom/quiesce/local']
-        self.assertEqual((check['decision_version'], check['sequencers_stopped']), ('2', 'true'))
-        self.coordinated_restart(success=True)
-        self.assertEqual(str(self.record()['accepted']['target']['decision_version']), '3')
+    def test_the_upgrade_check_refuses_a_sequencer_of_an_older_release(self):
+        self.deploy()
+        meta = self.api.state['jobs']['sequencer'].pop('Meta')
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('the sequencer job does not send the feature activation', output)
+        self.api.state['jobs']['sequencer']['Meta'] = meta
+        self.api.state['missing_replica'] = 'sequencer'
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('an allocation of an older job version still runs', output)
 
     def test_a_shard_map_change_refuses_the_rolling_path(self):
         self.deploy()
@@ -1418,9 +1394,9 @@ class RollbackTest(Deploys):
         output = self.run_rollback(success=False)
         self.assertIn('is already rolled back', output)
 
-    def test_a_return_across_a_decision_version_starts_the_sealer_before_the_ingress(self):
+    def test_a_return_after_a_purge_of_the_sealer_starts_the_sealer_before_the_ingress(self):
         self.run_deploy()
-        # The coordinated restart into release b.
+        # A purge of the sealer, then release b.
         del self.api.state['jobs']['cluster']
         self.api.state['chain_status'] = NO_QUORUM_CHAIN
         self.repin('b')

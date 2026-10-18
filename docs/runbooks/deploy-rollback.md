@@ -107,33 +107,14 @@ deploy succeeded and the release degrades the chain after it.
    another controller writes the record of the environment at the same
    time. Let it finish, then read the record again.
 
-### Rollback across a decision version
+### Rollback after the activation of the sealer rules
 
-A release that raises the sealer decision version (`cluster/sealer-service/README.md`, "Decision version") deploys through a purge of the sealer job. Do not run `just rollback` for it:
+The upgrade transaction of `FEATURE_SEALER_V3` switches the sealer to decision version 3 (`cluster/sealer-service/README.md`, "Decision version"). It is not a deploy, and it has no rollback.
 
-- Its record holds no sealer version before it, so `just rollback` stops the sealer job and does not start the release before.
-- `just rollback` reverts the jobs in reverse deploy order. The ingress restarts before the sealer stops, and a restart drops an operator pause. Submits then reach the sealer of the new rules after the snapshot check.
-
-> **Required: the quiesce check.** No gate guards a rollback from decision version 3 to 2: the
-> gate of the release before does not know the check. A nonce release in the log after the last
-> snapshot forks the members of the release before from the state that the executors read. Do not
-> purge the sealer before this command passes, run from the checkout of the newer release:
->
-> ```sh
-> just sealer-quiesce-check <env>
-> ```
-
-Do a coordinated restart into the release before instead. The deploy order starts the sealer before the services that wait on it.
-
-1. Pause the submits on every ingress, as in step 1 of the coordinated restart in the sealer README.
-2. Stop the sequencers: `nomad job stop sequencer`. A stopped sequencer sends no nonce release.
-3. Wait until no void vote is open, then wait one inclusion horizon (`inclusionHorizonBlocks`, 64 blocks). The release marks of version 3 then leave the dedup window: a member of version 2 refuses a snapshot whose window holds more than `dedupCapacity + 4096` ids.
-4. Wait for a snapshot after the last decided void.
-5. **Required.** Run `just sealer-quiesce-check <env>` from the checkout of the newer release. It must pass. It refuses when a member applied a nonce release after its last snapshot, when a configured member is down, or when a sequencer still runs. On a refusal, fix the cause, wait for the next snapshot, and run it again.
-6. Purge the sealer job (`nomad job stop -purge cluster`). The members of the release before replay the log after their snapshot with the old rules. After the purge no void can be decided, so a lost pause does no harm.
-7. Purge the ingress job: `nomad job stop -purge ingress`. The gate of a release before the decision version does not excuse the `sealer_no_quorum` halt of a purged sealer. Without an ingress job the gate reads no chain status. The ingress keeps no state.
-8. Check out the release before, and run `just deploy` from that checkout. The role registers all sealer members in one step, before the ingress. Each member starts from its own snapshot and log.
-9. Do not deploy the new checkout with the old images. A member stops at start when the job spec and the code disagree on the decision version.
+- Before the activation record is in the log, a rollback of the sealer is a normal rolling rollback: the members write snapshot version 10.
+  - A Nomad revert (`just rollback`) restores the old job versions, and no gate reads them.
+  - A forward `just deploy` from the checkout of a release that names `decisionVersion` in its sealer job (`eebd7aa7a` and the releases before it) gets the must-match refusal of its own gate: the registered job names no `decisionVersion`. Pass `KARDAMOM_ALLOW_MUST_MATCH=decisionVersion` for that deploy. Use it only when the job of that release names `decisionVersion=2`, and only before the activation. Never deploy a build whose job names `decisionVersion=3`: it applies the releases of the log with other rules.
+- After it, the members write snapshot version 13, and a release that reads only up to version 12 stops on it. Do not roll the sealer back to such a release. Fix forward.
 
 ## Clear
 
@@ -163,6 +144,5 @@ with `Refused:`.
 | `KARDAMOM_ALLOW_ONE_WAY names <ids>, and the release has no one-way change of it` | A stale allowance. | Unset it. |
 | `a rolling deploy cannot carry a coordinated format change: <ids>`, with `set KARDAMOM_ALLOW_RETIRED=<ids>` | The release retires a format that is neither shared nor permanent. | Only when the release removes the service that owned the format: `KARDAMOM_ALLOW_RETIRED=<ids> just deploy`. For a renamed format of a running service, take the coordinated path. See `docs/formats.md`. |
 | `KARDAMOM_ALLOW_RETIRED names <ids>, and the release retires no format of that id ...` | A stale allowance, or a shared or permanent format. | Unset it, or remove the id. |
-| `the release changes the sealer decision version from <a> to <b>, and no quiesce check ... passed` | A coordinated restart into another decision version, with no passing `just sealer-quiesce-check <env>` of the members of version `<a>` after the accepted release. | Follow "Decision version" in `cluster/sealer-service/README.md`. If the members are already stopped, start the release that ran, stop the sequencers, wait for a snapshot, run the check, and stop the sealer again. |
-| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow`, `decisionVersion` or another setting of the list. A `decisionVersion` change comes with the image. | A coordinated restart of the sealer. For `decisionVersion`, follow "Decision version" in `cluster/sealer-service/README.md`, and "Rollback across a decision version" above for a rollback. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
+| `a rolling deploy cannot change a sealer setting that every member must match: <settings>` | A change of `daLagBudgetBlocks`, `voidVoters`, `remoteOrigins`, `orderingWindow` or another setting of the list. | A coordinated restart of the sealer. A documented procedure, such as the return from a seeded start, names the settings in `KARDAMOM_ALLOW_MUST_MATCH=<settings>`. |
 | `config/shard-map.toml ... differs from the shard map of the registered ingress` | A routing change in the rolling path. | `kardamom-cluster scale-sequencers`. |

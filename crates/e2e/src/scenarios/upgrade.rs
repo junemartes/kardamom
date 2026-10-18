@@ -45,7 +45,8 @@ use crate::harness::metrics::poll_until;
 const FEATURE_HEALTH_CHECK: u64 = 1;
 
 /// A feature id that is never scheduled, used by the negative controls.
-const FEATURE_UNUSED: u64 = 2;
+/// Feature 2 is `kardamom_types::upgrades::FEATURE_SEALER_V3`.
+const FEATURE_UNUSED: u64 = 1_000;
 
 /// How far ahead of "now" a scheduled activation is set. Blocks close every
 /// 250 ms, so this leaves several blocks provably inactive before T while
@@ -166,7 +167,7 @@ async fn assert_validator_agrees(
 
 /// Send an upgrade transaction and wait for its system deposit to execute on
 /// L2. Returns the block the `setFeature` landed in.
-async fn upgrade_and_await(
+pub(super) async fn upgrade_and_await(
     t: &Target,
     l1: &L1,
     feature_id: u64,

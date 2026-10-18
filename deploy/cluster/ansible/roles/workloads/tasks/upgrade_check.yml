@@ -1,0 +1,122 @@
+---
+# The check before the upgrade transaction of FEATURE_SEALER_V3: the
+# decision rules version 3 of the sealer. A sealer member of an older
+# release drops the feature activation (ingress kind 11) and keeps
+# version 2, so the replicated state forks at the first nonce release.
+# So every configured member must run a release that reads snapshot
+# version 13, the layout that carries the rules. Every sequencer must
+# run a release that sends the activation, or no member gets it.
+# cluster/sealer-service/README.md ("Decision version") is the procedure.
+- name: Read the registered sealer
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: cluster
+
+- name: Refuse a check without a registered sealer
+  ansible.builtin.assert:
+    that: workloads_registered_job.status == 200
+    fail_msg: "Refused: Nomad does not know the sealer job. Deploy the release, then run the check."
+
+- name: Keep the configured sealer members
+  ansible.builtin.set_fact:
+    workloads_upgrade_groups: "{{ workloads_registered_job.json.TaskGroups | map(attribute='Name') | list }}"
+
+- name: Read the sealer allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/cluster/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  register: workloads_upgrade_allocs
+
+# A member that is down runs its release again at its next start, so the
+# check must read every configured member.
+- name: Keep the running node of each member
+  ansible.builtin.set_fact:
+    workloads_upgrade_nodes: >-
+      {{ workloads_upgrade_allocs.json | selectattr('ClientStatus', 'equalto', 'running')
+         | selectattr('TaskGroup', 'in', workloads_upgrade_groups) | map(attribute='NodeID') | unique | list }}
+    workloads_upgrade_down: >-
+      {{ workloads_upgrade_groups | difference(workloads_upgrade_allocs.json
+         | selectattr('ClientStatus', 'equalto', 'running') | map(attribute='TaskGroup') | list) }}
+
+- name: Refuse a check while a configured member is down
+  ansible.builtin.assert:
+    that: workloads_upgrade_down | length == 0
+    fail_msg: >-
+      Refused: the sealer members {{ workloads_upgrade_down | join(', ') }} do not run. The check must read every
+      configured member. Start it and let it catch up, then run the check again.
+
+- name: Read the node of each member
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/node/{{ item }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+  loop: "{{ workloads_upgrade_nodes }}"
+  register: workloads_upgrade_node
+
+- name: Read the status of each member
+  ansible.builtin.uri:
+    url: "http://{{ item.json.HTTPAddr | regex_replace(':[0-9]+$', '') }}:{{ workloads_sealer_admin_port }}/status"
+    return_content: true
+  loop: "{{ workloads_upgrade_node.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: workloads_upgrade_status
+
+# The release that takes the activation reads snapshot version 13. An older
+# member reports a lower snapshotReadsMax.
+- name: Keep the snapshot read maximum of each member
+  ansible.builtin.set_fact:
+    workloads_upgrade_reads_max: >-
+      {{ workloads_upgrade_status.results | map(attribute='json')
+         | map(attribute='snapshotReadsMax', default=0) | list }}
+
+- name: Refuse a member of an older release
+  ansible.builtin.assert:
+    that: workloads_upgrade_reads_max | min >= 13
+    fail_msg: >-
+      Refused: a sealer member reads only up to snapshot version {{ workloads_upgrade_reads_max | min }}
+      ({{ workloads_upgrade_reads_max }}). A member of an older release drops the feature activation and forks
+      the state. Deploy the release that reads version 13 to every member, then run the check again.
+
+- name: Read the registered sequencer
+  ansible.builtin.include_tasks: read_job.yml
+  vars:
+    workloads_read_job: sequencer
+
+- name: Read the sequencer allocations
+  ansible.builtin.uri:
+    url: "{{ workloads_nomad_addr }}/v1/job/sequencer/allocations?namespace={{ workloads_namespace | urlencode }}"
+    headers:
+      X-Nomad-Token: "{{ workloads_nomad_token }}"
+    status_code: [200, 404]
+  register: workloads_upgrade_sequencers
+
+# The job meta sealer_feature_activation comes with the release whose
+# sequencer sends the activation. A live allocation of an older job version
+# can run an older sequencer.
+- name: Keep the live sequencer allocations
+  ansible.builtin.set_fact:
+    workloads_upgrade_live: >-
+      {{ (workloads_upgrade_sequencers.json | default([], true))
+         | selectattr('ClientStatus', 'in', ['running', 'pending']) | list }}
+
+- name: Refuse a sequencer of an older release
+  ansible.builtin.assert:
+    that:
+      - workloads_registered_job.status == 200
+      - (workloads_registered_job.json.Meta | default({}, true)).sealer_feature_activation | default('') == 'true'
+      - workloads_upgrade_live | length > 0
+      - workloads_upgrade_live | map(attribute='JobVersion') | unique | list == [workloads_registered_job.json.Version]
+    fail_msg: >-
+      Refused: no sequencer runs, the sequencer job does not send the feature activation (job meta
+      sealer_feature_activation), or an allocation of an older job version still runs
+      ({{ workloads_upgrade_live | map(attribute='JobVersion') | unique | list }}). Deploy the release to every
+      sequencer, then run the check again.
+
+- name: Report the passing check
+  ansible.builtin.debug:
+    msg: >-
+      The upgrade check passed: {{ workloads_upgrade_groups | length }} sealer members read snapshot version 13,
+      and {{ workloads_upgrade_live | length }} sequencer allocations send the feature activation. The upgrade
+      transaction of FEATURE_SEALER_V3 may go to the Safe.

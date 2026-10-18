@@ -40,6 +40,25 @@ where
     scenario(&t, l1, &exec_dir, &val_dir).await.expect(what);
 }
 
+/// S13d: the sealer starts on decision version 2, and a nonce release
+/// takes effect only after the upgrade transaction of the sealer rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13d_a_nonce_release_takes_effect_only_after_the_sealer_upgrade() {
+    upgrade_case(
+        async |t, l1, _exec_dir, _val_dir| {
+            sealer_upgrade::release_takes_effect_only_after_the_upgrade(
+                t,
+                l1,
+                sealer_upgrade::Params::default(),
+            )
+            .await
+        },
+        "S13d",
+    )
+    .await;
+}
+
 /// S13a: an upgrade transaction with no activation timestamp turns the
 /// feature on immediately, starting with the block that carried it. It
 /// keeps firing in every later block, on both the executor and the

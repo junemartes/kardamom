@@ -2,6 +2,7 @@ package io.kardamom.sealer;
 
 import static io.kardamom.sealer.SealerStateFixtures.NO_DEADLINE;
 import static io.kardamom.sealer.SealerStateFixtures.id;
+import static io.kardamom.sealer.SealerStateFixtures.onVersionThree;
 import static io.kardamom.sealer.SealerStateFixtures.payload;
 import static io.kardamom.sealer.SealerStateFixtures.sender;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -22,9 +23,19 @@ import org.junit.jupiter.params.provider.ValueSource;
  */
 class NonceReleaseTest {
 
+    @Test
+    void version_two_takes_no_release() {
+        CanonicalSealerState state = new CanonicalSealerState(8);
+        state.onRecord(id(1), sender(1), 0, NO_DEADLINE, payload("t"));
+        state.onRecord(id(2), sender(1), 1, NO_DEADLINE, payload("t"));
+        assertFalse(state.onRelease(sender(1), 1, id(2)));
+        assertEquals(Optional.of(2L), state.expectedNonceOf(sender(1)));
+        assertEquals(2, state.dedupSize(), "no mark");
+    }
+
     /** A state that ordered nonces 0, 1 and 2 of sender 1, as ids 1, 2 and 3. */
     private static CanonicalSealerState orderedThree() {
-        CanonicalSealerState state = new CanonicalSealerState(8);
+        CanonicalSealerState state = onVersionThree(new CanonicalSealerState(8));
         for (int n = 0; n < 3; n++) {
             assertEquals(Kind.RELAYED, state.onRecord(id(n + 1), sender(1), n, NO_DEADLINE, payload("t")).kind);
         }
@@ -62,7 +73,7 @@ class NonceReleaseTest {
 
     @Test
     void a_release_after_the_deadline_drops() {
-        CanonicalSealerState state = new CanonicalSealerState(8);
+        CanonicalSealerState state = onVersionThree(new CanonicalSealerState(8));
         long deadline = state.blockNumber();
         state.onRecord(id(1), sender(1), 0, deadline, payload("t"));
         state.onTick(250);
@@ -73,7 +84,7 @@ class NonceReleaseTest {
 
     @Test
     void the_mark_leaves_with_its_entry() {
-        CanonicalSealerState state = new CanonicalSealerState(8);
+        CanonicalSealerState state = onVersionThree(new CanonicalSealerState(8));
         long deadline = state.blockNumber();
         state.onRecord(id(1), sender(1), 0, deadline, payload("t"));
         assertTrue(state.onRelease(sender(1), 0, id(1)));
@@ -98,7 +109,7 @@ class NonceReleaseTest {
      */
     @Test
     void a_run_of_skips_recovers_with_the_release_of_its_first_entry() {
-        CanonicalSealerState state = new CanonicalSealerState(8);
+        CanonicalSealerState state = onVersionThree(new CanonicalSealerState(8));
         state.onRecord(id(1), sender(1), 5, NO_DEADLINE, payload("n"));
         state.onRecord(id(2), sender(1), 6, NO_DEADLINE, payload("n+1"));
         assertTrue(state.onRelease(sender(1), 5, id(1)));
@@ -119,16 +130,20 @@ class NonceReleaseTest {
 
     @Test
     void the_mark_skips_the_capacity_check() {
-        CanonicalSealerState state = new CanonicalSealerState(2);
+        CanonicalSealerState state = onVersionThree(new CanonicalSealerState(2));
         state.onRecord(id(1), sender(1), 0, NO_DEADLINE, payload("t"));
         state.onRecord(id(2), sender(1), 1, NO_DEADLINE, payload("t"));
         assertTrue(state.onRelease(sender(1), 1, id(2)), "a full window still takes the mark");
         assertEquals(3, state.dedupSize());
     }
 
-    /** Both snapshot layouts of this release carry the mark, with equal bytes on every member. */
+    /**
+     * The snapshot layouts of version 3 carry the mark, with equal bytes on
+     * every member: version 12 (the retained file) and version 13 (the
+     * rules).
+     */
     @ParameterizedTest
-    @ValueSource(ints = {10, 12})
+    @ValueSource(ints = {12, 13})
     void the_snapshot_carries_the_mark(final int version) {
         CanonicalSealerState a = orderedThree();
         CanonicalSealerState b = orderedThree();

@@ -43,6 +43,8 @@ use kardamom_cluster_client::bytes;
 use kardamom_types::epoch::EpochRecord;
 use thiserror::Error;
 
+#[cfg(test)]
+mod activation_tests;
 mod egress;
 mod egress_encode;
 mod entry;
@@ -71,7 +73,7 @@ pub use entry::{TxOffer, encode_feed_answer, encode_feed_gap};
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::encode_ingress_depositref;
 pub use ingress::{
-    GuardHeader, NonceRelease, encode_ingress_batch, encode_ingress_epoch,
+    FeatureActivation, GuardHeader, NonceRelease, encode_ingress_batch, encode_ingress_epoch,
     encode_ingress_posted_cursor, encode_ingress_recorded_cursor, encode_ingress_remote_epoch,
     encode_ingress_txref, encode_replay_request, encode_subscribe, encode_void_request,
     ingress_deadline, ingress_sender_nonce, ingress_tip, split_ingress,
@@ -194,6 +196,16 @@ pub const KIND_RECORDED_CURSOR: u8 = 9;
 /// does not know the kind drops the frame. Matches Java
 /// `KIND_NONCE_RELEASE`.
 pub const KIND_NONCE_RELEASE: u8 = 10;
+/// Ingress kind: a sequencer's feature activation, a system record:
+/// `[kind:u8 = 11][l1_origin:u64][feature_id:u64][activation_ms:u64]`, 25
+/// bytes. The upgrade transaction of the epoch at `l1_origin` schedules
+/// `feature_id` at `activation_ms`. The sequencer sends it in front of
+/// that epoch, on the same session, each time it offers the epoch. For
+/// [`kardamom_types::upgrades::FEATURE_SEALER_V3`], the sealer switches its
+/// decision rules to version 3 at the first log entry at or after
+/// `activation_ms`. A sealer that does not know the kind drops the frame.
+/// Matches Java `KIND_FEATURE_ACTIVATION`.
+pub const KIND_FEATURE_ACTIVATION: u8 = 11;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >=
 /// from_index` or `boundary.block_number >= from_block`, to the
@@ -343,12 +355,14 @@ pub const EGRESS_KIND_FEED_GAP: u8 = 16;
 
 /// Egress kind: the sealer's rules:
 /// `[kind:u8 = 17][decision_version:u8][cluster_session_id:i64]`
-/// ([`SEALER_INFO_LEN`] bytes). The sealer sends it to each session when
-/// the session opens, with the id of that session. A sequencer sends a
-/// nonce release ([`KIND_NONCE_RELEASE`]) only after it got version 3 or
-/// above for its current session. The id ties the frame to its session, so
-/// a frame that arrives before the client's session-start marker still
-/// counts. Matches Java `EGRESS_KIND_SEALER_INFO`.
+/// ([`SEALER_INFO_LEN`] bytes). The sealer sends it only under decision
+/// version 3: to each open session at the switch, and then to each session
+/// when the session opens, with the id of that session. Under version 2 it
+/// sends none. A sequencer sends a nonce release ([`KIND_NONCE_RELEASE`])
+/// only after it got version 3 or above for its current session. The id
+/// ties the frame to its session, so a frame that arrives before the
+/// client's session-start marker still counts. Matches Java
+/// `EGRESS_KIND_SEALER_INFO`.
 pub const EGRESS_KIND_SEALER_INFO: u8 = 17;
 /// Length of an [`EGRESS_KIND_SEALER_INFO`] frame.
 pub const SEALER_INFO_LEN: usize = 1 + 1 + 8;
@@ -568,11 +582,12 @@ fn encode_kind_2u64(kind: u8, a: u64, b: u64) -> Vec<u8> {
     buf
 }
 
-/// The frame of [`encode_kind_2u64`] with a request id as its tail: the
-/// feed request, and the feed answers.
-fn encode_kind_2u64_id(kind: u8, a: u64, b: u64, request_id: u64) -> Vec<u8> {
+/// The frame of [`encode_kind_2u64`] with a third u64 as its tail: the
+/// request id of the feed request and the feed answers, or the activation
+/// time of the feature activation ([`KIND_FEATURE_ACTIVATION`]).
+fn encode_kind_2u64_id(kind: u8, a: u64, b: u64, tail: u64) -> Vec<u8> {
     let mut buf = encode_kind_2u64(kind, a, b);
-    buf.extend_from_slice(&request_id.to_le_bytes());
+    buf.extend_from_slice(&tail.to_le_bytes());
     buf
 }
 
