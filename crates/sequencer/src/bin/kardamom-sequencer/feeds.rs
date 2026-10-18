@@ -29,8 +29,8 @@ use kardamom_cluster_adapter::LiveEgress;
 use kardamom_cluster_adapter::live::EgressPoll;
 use kardamom_cluster_adapter::wire::{self, EgressItem};
 use kardamom_log::aeron_live::{
-    TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsBoundarySubscriberHandle,
-    TxRemoteEpochsSubscriberHandle,
+    IdleCap, TxDataSubscriberHandle, TxDepositsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_obs::halt::{HaltCause, HaltRef};
 use kardamom_obs::lifecycle::process;
@@ -570,6 +570,8 @@ pub(crate) struct PublishLoops<P> {
     /// `None` when the binary has no executor endpoints.
     pub(crate) lookup: Option<LookupRequester>,
     pub(crate) shutdown: Shutdown,
+    /// The idle cap of the process, for the main sequencer loop.
+    pub(crate) idle_cap: IdleCap,
 }
 
 impl<P> PublishLoops<P>
@@ -601,6 +603,7 @@ where
             resync,
             lookup,
             shutdown,
+            idle_cap,
         } = self;
 
         // The sequencer main loop is sync (it uses std::thread and
@@ -622,7 +625,7 @@ where
                 refs: &mut main_pub,
                 errors: &mut side,
             };
-            sequencer.run(&mut ports, &shutdown_for_main)
+            sequencer.run(&mut ports, &shutdown_for_main, idle_cap)
         });
 
         // Independent pump for tx_deposits to epoch on tx_ordering. The
