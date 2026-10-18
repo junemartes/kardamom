@@ -8,7 +8,7 @@
   vars:
     workloads_read_job: "{{ workloads_upgrade_job.name }}"
 
-- name: Read the {{ workloads_upgrade_job.name }} allocations
+- name: Read the allocations of {{ workloads_upgrade_job.name }}
   ansible.builtin.uri:
     url: "{{ workloads_nomad_addr }}/v1/job/{{ workloads_upgrade_job.name }}/allocations?namespace={{ workloads_namespace | urlencode }}"
     headers:
@@ -16,7 +16,7 @@
     status_code: [200, 404]
   register: workloads_upgrade_allocations
 
-- name: Keep the live {{ workloads_upgrade_job.name }} allocations and the missing metas
+- name: Keep the live allocations and the missing metas of {{ workloads_upgrade_job.name }}
   ansible.builtin.set_fact:
     workloads_upgrade_live: >-
       {{ (workloads_upgrade_allocations.json | default([], true))
@@ -26,7 +26,7 @@
          | default({}, true) | dict2items | selectattr('value', 'equalto', 'true') | map(attribute='key') | list)
          | list }}
 
-- name: Refuse a {{ workloads_upgrade_job.name }} of an older release
+- name: Refuse an older release of {{ workloads_upgrade_job.name }}
   ansible.builtin.assert:
     that:
       - workloads_registered_job.status == 200
