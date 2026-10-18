@@ -12,8 +12,8 @@ final class MemberStatusTest {
 
     private static final MemberStatus.SnapshotVersions SNAPSHOT =
         new MemberStatus.SnapshotVersions(10, 1, 11, 9);
-    private static final io.kardamom.sealer.DecisionRules.View RULES =
-        new io.kardamom.sealer.DecisionRules.View(3, 36L, 0L);
+    private static final MemberStatus.Rules RULES =
+        new MemberStatus.Rules(new io.kardamom.sealer.DecisionRules.View(3, 36L, 0L), 2L);
 
     private static MemberStatus sample(
             final String role, final String election, final long commit, final long applied) {
@@ -57,7 +57,7 @@ final class MemberStatusTest {
                 + "\"commitPosition\":5000,\"servicePosition\":4000,"
                 + "\"snapshotWrites\":10,\"snapshotReadsMin\":1,\"snapshotReadsMax\":11,"
                 + "\"snapshotLatest\":9,\"decisionVersion\":3,\"decisionActivationOrigin\":36,"
-                + "\"decisionActivationMs\":0,\"diskFreeBytes\":0,\"ready\":true}",
+                + "\"decisionActivationMs\":0,\"decisionActivationsLate\":2,\"diskFreeBytes\":0,\"ready\":true}",
             sample("LEADER", "CLOSED", 5000, 4000).toJson(LAG));
     }
 
@@ -66,7 +66,11 @@ final class MemberStatusTest {
         assertEquals(
             "# HELP kardamom_sealer_disk_free_bytes The free bytes of the disk of the member state.\n"
                 + "# TYPE kardamom_sealer_disk_free_bytes gauge\n"
-                + "kardamom_sealer_disk_free_bytes{member_id=\"1\"} 0\n",
+                + "kardamom_sealer_disk_free_bytes{member_id=\"1\"} 0\n"
+                + "# HELP kardamom_sealer_feature_activation_late_total The feature activation records that the "
+                + "decision rules follow late or not at all. Alert on any increase.\n"
+                + "# TYPE kardamom_sealer_feature_activation_late_total counter\n"
+                + "kardamom_sealer_feature_activation_late_total{member_id=\"1\"} 2\n",
             sample("LEADER", "CLOSED", 5000, 4000).toMetrics());
     }
 

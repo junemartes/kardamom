@@ -52,7 +52,7 @@ enum RelayShape {
      * decision rules {@code decisionVersion} of the state. Version 3 takes
      * everything up to the record type, and the record type, so every
      * relayed frame holds its record type. Version 2 takes a frame that
-     * ends at the record type, as a member of version 2 always did: both
+     * ends at the record type: both
      * rule sets must decide one frame alike at one log index.
      */
     int minLength(final int decisionVersion) {

@@ -237,7 +237,7 @@ class SealerDecisionRulesTest {
         final List<Byte> reported = member.sequencer().offered.stream()
             .filter(f -> f[0] == RULES).map(f -> f[1]).toList();
         assertEquals(List.of((byte) 3, (byte) 2, (byte) 3), reported, "on, off, on");
-        assertEquals(3, notices(member), "one for each switch, none for a record");
+        assertEquals(5, notices(member), "one for each stored record and one for each switch");
     }
 
     @Test
@@ -318,18 +318,25 @@ class SealerDecisionRulesTest {
         return IntStream.range(0, log.size()).filter(i -> log.get(i).name().equals(name)).findFirst().orElseThrow();
     }
 
-    /** Store the activation of epoch {@code origin} at once, order the epoch, and seal it at {@code ms}. */
-    private static void switchOn(final Member member, final long origin, final long ms) {
-        member.apply(Entry.frame("activation", activation(origin, 0), ms));
-        member.apply(Entry.frame("epoch", epoch(origin), ms + 10));
-        member.apply(Entry.tick("tick", ms + 250));
+    /**
+     * Close the open block at {@code ms}, store the activation of epoch
+     * {@code origin} at {@code time}, order the epoch, and seal its first
+     * block. The first block of the epoch is then not block 1, which
+     * executes with time 0.
+     */
+    private static void activateAndSeal(final Member member, final long origin, final long time, final long ms) {
+        member.apply(Entry.tick("tick", ms));
+        member.apply(Entry.frame("activation", activation(origin, time), ms + 10));
+        member.apply(Entry.frame("epoch", epoch(origin), ms + 20));
+        member.apply(Entry.tick("tick", ms + 500));
     }
 
-    /** Store the activation of epoch {@code origin} for good off, order the epoch, and seal it at {@code ms}. */
+    private static void switchOn(final Member member, final long origin, final long ms) {
+        activateAndSeal(member, origin, 0, ms);
+    }
+
     private static void switchOff(final Member member, final long origin, final long ms) {
-        member.apply(Entry.frame("off", activation(origin, -1L), ms));
-        member.apply(Entry.frame("epoch", epoch(origin), ms + 10));
-        member.apply(Entry.tick("tick", ms + 250));
+        activateAndSeal(member, origin, -1L, ms);
     }
 
     @Test
@@ -353,16 +360,39 @@ class SealerDecisionRulesTest {
     }
 
     @Test
-    void a_stored_activation_asks_for_no_snapshot_and_the_switch_asks_for_one() {
+    void a_stored_activation_and_the_switch_each_ask_for_a_snapshot() {
         final Member member = member(Optional.empty());
         member.apply(Entry.frame("epoch-1", epoch(1), 1_000L));
+        member.apply(Entry.tick("tick", 1_250L));
         member.apply(Entry.frame("activation", activation(2, 0), 1_500L));
-        assertEquals(0, notices(member), "the record only stores the schedule");
+        assertEquals(1, notices(member), "a stored record asks for a snapshot");
         assertEquals(new DecisionRules.View(2, 2L, 0L), member.svc().decisionRules());
         member.apply(Entry.frame("epoch-2", epoch(2), 1_600L));
         member.apply(Entry.tick("tick", 2_000L));
-        assertEquals(1, notices(member), "the boundary that switches asks for a snapshot");
+        assertEquals(2, notices(member), "the boundary that switches asks for a snapshot");
         assertEquals(3, member.svc().decisionRules().version());
+    }
+
+    /**
+     * An origin record opens a block. When it forces the boundary that
+     * switches the rules, its shape follows the rules of the block that it
+     * opens: one version holds for each block.
+     */
+    @Test
+    void an_origin_record_that_forces_a_switch_is_checked_under_the_rules_of_its_block() {
+        final Member member = member(Optional.empty());
+        member.apply(Entry.frame("epoch-1", epoch(1), 1_000L));
+        member.apply(Entry.tick("tick-1", 1_250L));
+        member.apply(Entry.frame("activation", activation(2, 0), 1_300L));
+        member.apply(Entry.frame("epoch-2", epoch(2), 1_400L));
+        member.apply(Entry.frame("nonce-0", offer(1, 0), 1_500L));
+        final byte[] shortNextEpoch =
+            IngressFrames.originRecordFrame(IngressFrames.canonicalId(1003), 3, 1, new byte[0]);
+        assertEquals(outcome("short-epoch-3", List.of(), 2),
+            member.apply(Entry.frame("short-epoch-3", shortNextEpoch, 1_750L)),
+            "its forced boundary would set version 3, which needs the record type");
+        assertEquals(outcome("epoch-3", List.of(BOUNDARY, RELAYED, RULES), 3),
+            member.apply(Entry.frame("epoch-3", epoch(3), 1_800L)));
     }
 
     private static long notices(final Member member) {

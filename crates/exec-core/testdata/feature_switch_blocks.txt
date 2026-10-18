@@ -14,12 +14,14 @@
 #   set_feature  the activation times of the setFeature deposits of the
 #                feature in the block, in log order and separated by
 #                commas, or "-". Only the first block of an epoch holds
-#                them. 0 means at once. The last deposit of the block
-#                decides the next block.
+#                them. 0 stores the time that the block executes with:
+#                on from the next block, except in block 1, which executes
+#                with time 0, so its 0 means never (row 1). The last deposit
+#                of the block decides the next block.
 #   v3           1 when the block runs with the feature on, else 0
 #
 # block ts origin set_feature v3
-1 1000 1 - 0
+1 1000 1 0 0
 2 1250 1 - 0
 3 1500 2 0 0
 4 1750 2 - 1

@@ -983,7 +983,19 @@ public final class CanonicalSealerState {
      * @return what the record did
      */
     public DecisionRules.Outcome onFeatureActivation(final DecisionRules.FeatureActivation activation) {
-        return rules.onActivation(activation, l1Origin);
+        return rules.onActivation(activation, l1Origin, lastL2Timestamp);
+    }
+
+    /**
+     * The decision version of an origin-advancing record offered at
+     * {@code leaderClockMillis}. The record opens a new block: when the open
+     * block holds a record, the record forces a boundary first, and runs
+     * under the rules that the boundary sets. It changes nothing.
+     */
+    public int decisionVersionOfOriginRecord(final long leaderClockMillis) {
+        return canonicalCount > lastBoundaryCount
+            ? rules.versionAtBoundary(l1Origin, lastL2Timestamp, nextL2Timestamp(leaderClockMillis))
+            : rules.version();
     }
 
     /**
@@ -1033,19 +1045,25 @@ public final class CanonicalSealerState {
      * block runs under one version.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
+        long l2Timestamp = nextL2Timestamp(leaderClockMillis);
+        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
+        blockNumber++;
+        pruneExpired();
+        // The sealed block executed with the time of the boundary before it.
+        rules.atBoundary(l1Origin, lastL2Timestamp, l2Timestamp);
+        lastL2Timestamp = l2Timestamp;
+        lastBoundaryCount = canonicalCount;
+        return boundary;
+    }
+
+    /** The time of a boundary stamped at {@code leaderClockMillis}. */
+    private long nextL2Timestamp(final long leaderClockMillis) {
         long floored = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
         // Under a normal tick cadence, `floored` always exceeds the previous
         // stamp by a full interval, so this max() call has no effect. It
         // matters only after onOriginRecord forces an extra boundary in the
         // same window.
-        long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
-        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
-        blockNumber++;
-        pruneExpired();
-        lastL2Timestamp = l2Timestamp;
-        lastBoundaryCount = canonicalCount;
-        rules.atBoundary(l1Origin, l2Timestamp);
-        return boundary;
+        return Math.max(floored, lastL2Timestamp + 1);
     }
 
     /**

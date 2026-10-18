@@ -187,6 +187,13 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private volatile DecisionRules.View publishedRules = DecisionRules.START_VIEW;
 
+    /**
+     * The feature activation records that the rules follow late or not at
+     * all. The service thread writes it, and the admin thread reads it. It
+     * counts on replay too, as the log lines do.
+     */
+    private volatile long lateActivations;
+
     /** Remote-origin rejects emitted (logged at power-of-two counts). */
     private long remoteRejectedFrameCount = 0;
 
@@ -431,7 +438,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     /**
      * Offer the rules frame to a session that opened. A state with no
-     * activation sends none, as a member of version 2 always did.
+     * activation sends none.
      */
     private void offerRules(final ClientSession session) {
         if (state.reportsDecisionRules()) {
@@ -788,7 +795,8 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < RelayShape.ORIGIN_RECORD.minLength(state.decisionVersion())) {
+        // The record opens a block, so its shape follows the rules of that block.
+        if (length < RelayShape.ORIGIN_RECORD.minLength(state.decisionVersionOfOriginRecord(cluster.time()))) {
             onMalformedFrame("origin-record", length);
             return;
         }
@@ -862,7 +870,9 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void onRemoteOriginRecord(
             final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
-        if (length < RelayShape.REMOTE_ORIGIN_RECORD.minLength(state.decisionVersion())) {
+        // The record opens a block, so its shape follows the rules of that block.
+        if (length < RelayShape.REMOTE_ORIGIN_RECORD.minLength(
+                state.decisionVersionOfOriginRecord(cluster.time()))) {
             onMalformedFrame("remote-origin-record", length);
             return;
         }
@@ -1091,8 +1101,16 @@ public final class SealerClusteredService implements ClusteredService {
      * {@code timestamp}, the cluster time of the record. A frame of another
      * length drops as malformed. Every frame prints a line: an upgrade is
      * rare, and the line shows what the record did. The record only stores
-     * the schedule; the rules switch at a block boundary, and the switch
-     * asks for a snapshot.
+     * the schedule; the rules switch at a block boundary.
+     *
+     * <p>A stored record asks for a snapshot. Each member of this release
+     * then writes version 14, so a member that later rolls back to a
+     * release that reads only up to version 13 stops on its own snapshot,
+     * and does not replay the record by other rules. A record that the
+     * rules follow late or not at all ({@code STORED_LATE}, {@code MISSED},
+     * {@code FULL}) prints a second line and counts in
+     * {@code kardamom_sealer_feature_activation_late_total}: it is a lost
+     * first copy, or a fault of the sequencer.</p>
      */
     private void onFeatureActivation(
             final DirectBuffer buffer, final int offset, final int length, final long timestamp) {
@@ -1109,8 +1127,16 @@ public final class SealerClusteredService implements ClusteredService {
             + " l1Origin=" + Long.toUnsignedString(activation.l1Origin()) + " feature=" + activation.featureId()
             + " activationMs=" + Long.toUnsignedString(activation.activationMs())
             + " at=" + timestamp + " outcome=" + outcome + " version=" + state.decisionVersion());
-        if (outcome == DecisionRules.Outcome.STORED) {
+        if (outcome == DecisionRules.Outcome.STORED || outcome == DecisionRules.Outcome.STORED_LATE) {
             publishedRules = state.decisionRules();
+            requestSnapshot();
+        }
+        if (outcome != DecisionRules.Outcome.IGNORED && outcome != DecisionRules.Outcome.STORED) {
+            lateActivations++;
+            System.out.println("cluster FEATURE-ACTIVATION-LATE memberId=" + memberId
+                + " l1Origin=" + Long.toUnsignedString(activation.l1Origin())
+                + " stateOrigin=" + Long.toUnsignedString(state.l1Origin())
+                + " outcome=" + outcome + " block=" + state.blockNumber() + " total=" + lateActivations);
         }
     }
 
@@ -1421,6 +1447,11 @@ public final class SealerClusteredService implements ClusteredService {
     /** The decision rules of the member, for the admin thread. */
     DecisionRules.View decisionRules() {
         return publishedRules;
+    }
+
+    /** The feature activation records that the rules follow late or not at all, for the admin thread. */
+    long lateActivations() {
+        return lateActivations;
     }
 
     /** Ingress frames of an unknown kind this member dropped. */
