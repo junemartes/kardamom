@@ -34,7 +34,7 @@ fn nonce_too_low_skips_with_marker_receipt_and_chain_continues() {
         .account(from, U256::from(10u128.pow(18)), 5, KECCAK_EMPTY)
         .build();
     let delta = PendingDelta::new();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
     let stale = signed_transfer(&signer, to, 1_000, 3);
     let (receipt, ws) = run_once(
@@ -66,7 +66,7 @@ fn nonce_too_low_skips_with_marker_receipt_and_chain_continues() {
     assert!(ws.accounts.is_empty() && ws.storage.is_empty() && ws.code.is_empty());
 
     // The chain continues. The sender's real next tx, nonce 5, executes.
-    let env2 = ExecEnv::new(1, &boundary(1));
+    let env2 = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
     let live = signed_transfer(&signer, to, 1_000, 5);
     let (r2, _) = run_once(
         &snap,
@@ -87,7 +87,7 @@ fn undecodable_raw_tx_skips_with_marker_receipt() {
     let signer = PrivateKeySigner::random();
     let snap = MockStateDatabase::builder().build();
     let delta = PendingDelta::new();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
     let garbage = KtTxEnvelope {
         correlation_id: 9,
         raw_tx: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
@@ -121,7 +121,7 @@ fn simple_transfer_produces_write_set_and_success_receipt() {
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
     let delta = PendingDelta::new();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
     let env_tx = signed_transfer(&signer, to, 1_000, 0);
     let (receipt, ws) = run_once(
@@ -168,7 +168,7 @@ fn second_tx_sees_first_tx_balance_via_delta() {
     let snap = MockStateDatabase::builder()
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
     let mut delta = PendingDelta::new();
     // First transfer.
@@ -224,7 +224,7 @@ fn execute_tx_captures_into_the_block_bal() {
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
     let delta = PendingDelta::new();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
     let tx = signed_transfer(&signer, to, 1_000, 0);
 
     let mut bal = revm::state::bal::Bal::new();
@@ -269,7 +269,7 @@ fn execute_tx_captures_with_a_seeded_delta() {
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
     let mut delta = PendingDelta::new();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
     // tx1 populates the delta (as in a real block).
     let tx1 = signed_transfer(&signer, to, 1_000, 0);
@@ -322,7 +322,7 @@ fn deposit_validation_failure_on_the_scope_does_not_poison_the_block() {
     let snap = MockStateDatabase::builder()
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
     let mut scope = Executor::new(&snap, None, env).expect("scope");
 
     // `gas_limit: 0` is below the intrinsic cost: revm rejects it at

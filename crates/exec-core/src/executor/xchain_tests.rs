@@ -39,7 +39,7 @@ fn run_free(
         snap,
         None,
         delta,
-        ExecEnv::new(1, &boundary(1)),
+        ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE),
         slot(0, 0, 0, cumulative_before),
         XChainDelivery {
             origin_chain_id: ORIGIN_CHAIN,
@@ -259,7 +259,7 @@ fn xchain_validation_failure_is_a_failed_receipt_on_both_paths() {
     assert!(receipt.logs.is_empty());
     assert_eq!(ws, WriteSet::default());
 
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
     let mut scope = Executor::new(&snap, None, env).expect("scope");
     let mut new_bal = revm::state::bal::Bal::new();
     let (new_r, new_ws) = scope
@@ -433,7 +433,7 @@ fn old_and_new_xchain_paths_agree() {
         .build();
     // The local chain id must differ from the origin, or the Outbox
     // rejects the callback enqueue as a self-send.
-    let env = ExecEnv::new(1, &boundary(1));
+    let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
     let with_target = |seq: u64, target: Address| {
         let mut m = xmsg(seq, Bytes::from_static(&[0xCA, 0xFE]));

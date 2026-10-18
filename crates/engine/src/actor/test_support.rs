@@ -500,7 +500,10 @@ where
         rx: Receiver<ReaderToExec>,
     ) -> (Result<(), ExecutorError>, Receiver<ExecToCommit>) {
         let (inputs, rx_e2c) = self.into_inputs(rx);
-        (ExecState::new(inputs).run(), rx_e2c)
+        (
+            ExecState::new(inputs).and_then(|mut exec| exec.run()),
+            rx_e2c,
+        )
     }
 
     /// The rig's ports and hooks as `ExecInputs`, and the exec-to-commit

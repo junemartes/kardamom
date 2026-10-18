@@ -61,6 +61,7 @@ fn env() -> ExecEnv {
         block_number: 1,
         l2_timestamp: 0,
         fees: kardamom_types::BlockFees::NONE,
+        features: kardamom_exec_core::features::BlockFeatures::NONE,
     }
 }
 

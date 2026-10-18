@@ -102,6 +102,10 @@ mod exec_tests;
 /// default, so a production build never links a signer.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
+/// A test chain that switches a feature flag on, off and on again, for the
+/// block drivers of other crates. Behind `test-support`, as [`fixtures`].
+#[cfg(feature = "test-support")]
+pub mod flag_switches;
 #[cfg(test)]
 mod test_hooks;
 #[cfg(test)]

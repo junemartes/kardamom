@@ -5,6 +5,8 @@
 
 mod bal_shadow;
 mod block_close;
+mod flag_chain;
+mod flag_freeze;
 mod interop;
 mod replay_burn_parity;
 mod replay_parity;

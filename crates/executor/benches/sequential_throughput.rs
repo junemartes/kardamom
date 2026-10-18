@@ -119,6 +119,7 @@ fn bench_transfer_step(c: &mut Criterion) {
         block_number: 1,
         l2_timestamp: 0,
         fees: kardamom_types::BlockFees::NONE,
+        features: kardamom_engine::features::BlockFeatures::NONE,
     };
 
     TxBench {
@@ -145,6 +146,7 @@ fn bench_sstore_step(c: &mut Criterion) {
         block_number: 1,
         l2_timestamp: 0,
         fees: kardamom_types::BlockFees::NONE,
+        features: kardamom_engine::features::BlockFeatures::NONE,
     };
 
     TxBench {

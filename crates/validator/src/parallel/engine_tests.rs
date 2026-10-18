@@ -5,5 +5,6 @@
 mod burn;
 mod dispatch;
 mod fixtures;
+mod flag_freeze;
 mod forged;
 mod parity;

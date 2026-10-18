@@ -285,7 +285,7 @@ impl<S: StateDatabase> Executor<S> {
         touches: Option<&mut TouchSet>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         let db = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
-        let Some(state) = skip.burn_state(db, self.env.l2_timestamp)? else {
+        let Some(state) = skip.burn_state(db, self.env.features)? else {
             return Ok(Self::skip_receipt(skip, WriteSet::default()));
         };
         let ws = WriteSet::from_evm_state(&state);

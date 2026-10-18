@@ -246,6 +246,7 @@ fn receipt_mismatch_dumps_flight_ring() {
             block_number: 7,
             l2_timestamp: 1_700_000_000,
             fees: kardamom_types::BlockFees::NONE,
+            features: kardamom_engine::features::BlockFeatures::NONE,
         },
         &[BufferedRecord::Tx {
             tx_idx: TxIndex(0),

@@ -258,7 +258,7 @@ mod tests {
         let to = Address::from([0x22u8; 20]);
         let snap = MockStateDatabase::builder().build();
         let delta = PendingDelta::new();
-        let env = ExecEnv::new(1, &boundary(1));
+        let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
         let d = dep(from, Some(to), 1_000, 400, Bytes::new());
         let (receipt, ws) =
@@ -302,7 +302,7 @@ mod tests {
             )
             .build();
         let delta = PendingDelta::new();
-        let env = ExecEnv::new(1, &boundary(1));
+        let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
         let d = dep(from, Some(revert_addr), 1_000, 200, Bytes::new());
         let (receipt, ws) =
@@ -334,7 +334,7 @@ mod tests {
             .account(from, U256::MAX, 0, KECCAK_EMPTY)
             .build();
         let delta = PendingDelta::new();
-        let env = ExecEnv::new(1, &boundary(1));
+        let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
         let d = dep(from, Some(Address::from([0x22u8; 20])), 1, 0, Bytes::new());
         let err =
@@ -357,7 +357,7 @@ mod tests {
             .account(from, U256::from(5u64), 7, KECCAK_EMPTY)
             .build();
         let delta = PendingDelta::new();
-        let env = ExecEnv::new(1, &boundary(1));
+        let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
         for gas_limit in [0u64, 100] {
             let mut d = dep(from, Some(to), 1_000, 400, Bytes::new());
@@ -457,7 +457,7 @@ mod tests {
                 U256::from(77u64),
             )
             .build();
-        let env = ExecEnv::new(1, &boundary(1));
+        let env = ExecEnv::new(1, &boundary(1), crate::features::BlockFeatures::NONE);
 
         let mut below_intrinsic = dep(from, Some(plain_to), 1_000, 0, Bytes::new());
         below_intrinsic.gas_limit = 0;

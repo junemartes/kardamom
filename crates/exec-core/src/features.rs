@@ -3,31 +3,42 @@
 //! A feature flag lives in the `KardamomChainState` predeploy
 //! ([`kardamom_types::upgrades::CHAIN_STATE`]), as
 //! `featureId => activation timestamp (ms)`. Only a system deposit, derived
-//! from an L1 upgrade transaction, writes it. The protocol reads the flag at
-//! every block boundary, and acts on it. One action is per transaction: the
-//! nonce burn of a skipped transaction ([`crate::executor::Skip::burn_state`])
-//! reads `FEATURE_SEALER_V3` at the skip, with [`activation_slot`] and
-//! [`is_active`].
+//! from an L1 upgrade transaction, writes it.
 //!
-//! Every function here is pure. Given the same stored activation word and
-//! the same block header fields, every role computes the same actions. This
-//! makes an upgrade activate at the same block on every node, instead of
-//! whenever each operator restarts a binary.
+//! ## When a flag switches
+//!
+//! A flag changes only at a block boundary. The flags of block N come from
+//! two inputs:
+//!
+//! - the activation words in the state after block N-1, and
+//! - the time that block N executes with: the header time of block N-1, or
+//!   0 for the first block after genesis.
+//!
+//! A feature is active when its word is not 0 and is at most that time.
+//! [`BlockFeatures::read`] reads every flag once, before the first record of
+//! block N, into the block environment ([`crate::block_env::ExecEnv`]).
+//! Every transaction, every deposit and the block-close actions of block N
+//! use this one set. A `setFeature` deposit in block N changes the flags
+//! from block N+1 on. `setFeature(id, 0)` stores the time that its block
+//! executes with, so the feature is active from the next block.
+//!
+//! Every function here is pure. Given the same state and the same header
+//! times, every role and every block driver computes the same flags and
+//! the same actions. This makes an upgrade activate at the same block on
+//! every node, instead of whenever each operator restarts a binary.
 //!
 //! ## Why this lives in `exec-core`
 //!
 //! This workspace has more than one block driver: the live engine's exec
-//! thread, the validator's parallel path (which funnels back through the
-//! engine's boundary), the offline replay driver, and the stateless/zk guest
-//! shape. A block-close action implemented in only some of them causes a
-//! consensus divergence. [`apply_block_close_actions`] is the single
-//! implementation for all drivers. It takes the block's mutable delta, the
-//! unsettled parent layer, and the read-only snapshot, so a driver calls it
-//! with its own three layers and cannot get the semantics subtly wrong.
+//! thread, the Block-STM strategy, the validator's parallel path, the
+//! offline replay driver, and the stateless/zk guest shape. A flag read or
+//! a block-close action implemented in only some of them causes a
+//! consensus divergence. [`BlockFeatures::read`] and [`BlockClose::apply`]
+//! are the single implementation for all drivers.
 
 use alloy_primitives::{B256, U256, keccak256};
 use kardamom_types::StateDatabase;
-use kardamom_types::upgrades::CHAIN_STATE;
+use kardamom_types::upgrades::{CHAIN_STATE, FEATURE_SEALER_V3};
 
 use crate::delta::{ParentState, PendingDelta};
 use crate::error::ExecutorError;
@@ -56,21 +67,56 @@ pub fn activation_slot(feature_id: u64) -> B256 {
     keccak256(buf)
 }
 
-/// Check if a feature is active for a block, given its header timestamp
-/// `header_ts_ms`.
-///
-/// `stored == 0` means the feature is never scheduled. Activation is
-/// inclusive (`<=`), matching `KardamomChainState.isActive`.
-///
-/// This compares against the header timestamp of the block being closed,
-/// not the timestamp txs executed with (block N executes with boundary
-/// N-1's timestamp). Both values come from the canonical stream, so the
-/// check gives the same result on every replica. Using the header's own
-/// timestamp is what makes "active from the first block at or after T" a
-/// statement about the chain, not about execution plumbing.
-#[must_use]
-pub fn is_active(stored_activation: U256, header_ts_ms: u64) -> bool {
-    !stored_activation.is_zero() && stored_activation <= U256::from(header_ts_ms)
+/// The feature flags of one block, frozen before its first record. See the
+/// module doc for the rule.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockFeatures {
+    /// [`FEATURE_HEALTH_CHECK`]: the block records a health beacon.
+    pub(crate) health_check: bool,
+    /// [`FEATURE_SEALER_V3`]: a skip at the chain nonce of its sender uses
+    /// its nonce.
+    pub(crate) sealer_v3: bool,
+}
+
+impl BlockFeatures {
+    /// The flags of a block with no active feature.
+    pub const NONE: Self = Self {
+        health_check: false,
+        sealer_v3: false,
+    };
+
+    /// Read the flags of a block from the state before it: `snapshot` under
+    /// the unsettled `parent` layer, which together hold the state after
+    /// the previous block. `exec_ts_ms` is the time that the block executes
+    /// with (the header time of the previous block).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a state read fails.
+    pub fn read<S: StateDatabase>(
+        snapshot: &S,
+        parent: Option<&PendingDelta>,
+        exec_ts_ms: u64,
+    ) -> Result<Self, ExecutorError> {
+        let none = PendingDelta::new();
+        let state = ParentState::new(&none, parent, snapshot);
+        // Activation is inclusive (`<=`), as in `KardamomChainState.isActive`.
+        // A word of 0 means never scheduled.
+        let active = |feature_id: u64| -> Result<bool, ExecutorError> {
+            let word = state.storage(CHAIN_STATE, activation_slot(feature_id))?;
+            Ok(!word.is_zero() && word <= U256::from(exec_ts_ms))
+        };
+        Ok(Self {
+            health_check: active(FEATURE_HEALTH_CHECK)?,
+            sealer_v3: active(FEATURE_SEALER_V3)?,
+        })
+    }
+
+    /// `true` when [`FEATURE_SEALER_V3`] is on in the block.
+    #[must_use]
+    pub fn sealer_v3(self) -> bool {
+        self.sealer_v3
+    }
 }
 
 /// A health beacon: a heartbeat counter, the block it was last recorded
@@ -118,301 +164,69 @@ pub struct BlockCloseOutcome {
     pub health_beat: Option<u64>,
 }
 
-/// Apply every block-close protocol action into `delta`.
-///
-/// Call this at block close, after the block's records are folded into
-/// `delta` and before the delta goes to the writer. The actions must see the
-/// block's own writes (an upgrade deposit landing in this block activates a
-/// feature for this block), and their writes must go into the same delta.
-///
-/// `parent` and `snapshot` supply the state layers this function cannot see
-/// on its own: the caller's unsettled-parent layer, then its state
-/// snapshot. Together with `delta`, [`ParentState`] gives the same
-/// `delta -> parent -> snapshot` read order the EVM uses. Reading the
-/// snapshot alone would be wrong for two reasons: it lags by up to K
-/// unsettled blocks, and it cannot hold the current block's own writes.
-///
-/// Writes go into `delta` only, not into the block's EIP-7928 BAL. The BAL
-/// attributes accesses to transaction indices, and the validator verifies
-/// claims per tx-index range. A block-close action belongs to no
-/// transaction, so attributing it to one would misdescribe the block and
-/// cause a mismatch with a validator that recomputes claims from
-/// transactions. The write is still cross-checked between roles, because
-/// the validator compares the whole `BlockDelta`.
-///
-/// # Errors
-///
-/// Returns `Err` when a `ParentState` read fails.
-pub fn apply_block_close_actions<S: StateDatabase>(
-    delta: &mut PendingDelta,
-    block_number: u64,
-    header_ts_ms: u64,
-    parent: Option<&PendingDelta>,
-    snapshot: &S,
-) -> Result<BlockCloseOutcome, ExecutorError> {
-    let mut out = BlockCloseOutcome::default();
+/// The block-close pass of one block: its number, its own header time, and
+/// the flags that it froze before its first record.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockClose {
+    pub block_number: u64,
+    /// The header time of the block itself. The beacon records it. It
+    /// decides no flag: the flags of the block are `features`.
+    pub header_ts_ms: u64,
+    pub features: BlockFeatures,
+}
 
-    let read = ParentState::new(delta, parent, snapshot);
-    let activation = read.storage(CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK))?;
-    if is_active(activation, header_ts_ms) {
+impl BlockClose {
+    /// Apply every block-close protocol action into `delta`.
+    ///
+    /// Call this at block close, after the block's records are folded into
+    /// `delta` and before the delta goes to the writer. The actions read the
+    /// block's own writes, and their writes go into the same delta.
+    ///
+    /// `parent` and `snapshot` supply the state layers this function cannot
+    /// see on its own: the caller's unsettled-parent layer, then its state
+    /// snapshot. Together with `delta`, [`ParentState`] gives the same
+    /// `delta -> parent -> snapshot` read order the EVM uses. Reading the
+    /// snapshot alone would be wrong for two reasons: it lags by up to K
+    /// unsettled blocks, and it cannot hold the current block's own writes.
+    ///
+    /// Writes go into `delta` only, not into the block's EIP-7928 BAL. The
+    /// BAL attributes accesses to transaction indices, and the validator
+    /// verifies claims per tx-index range. A block-close action belongs to
+    /// no transaction, so attributing it to one would misdescribe the block
+    /// and cause a mismatch with a validator that recomputes claims from
+    /// transactions. The write is still cross-checked between roles,
+    /// because the validator compares the whole `BlockDelta`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a `ParentState` read fails.
+    pub fn apply<S: StateDatabase>(
+        self,
+        delta: &mut PendingDelta,
+        parent: Option<&PendingDelta>,
+        snapshot: &S,
+    ) -> Result<BlockCloseOutcome, ExecutorError> {
+        if !self.features.health_check {
+            return Ok(BlockCloseOutcome::default());
+        }
+        let read = ParentState::new(delta, parent, snapshot);
         let prior = Beacon::unpack(read.storage(CHAIN_STATE, HEALTH_BEACON_SLOT)?);
         let beat = prior.count.saturating_add(1);
         delta.storage.insert(
             (CHAIN_STATE, HEALTH_BEACON_SLOT),
             Beacon {
                 count: beat,
-                block_number,
-                timestamp_ms: header_ts_ms,
+                block_number: self.block_number,
+                timestamp_ms: self.header_ts_ms,
             }
             .pack(),
         );
-        out.health_beat = Some(beat);
+        Ok(BlockCloseOutcome {
+            health_beat: Some(beat),
+        })
     }
-
-    Ok(out)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::MockStateDatabase;
-    use alloy_primitives::Address;
-
-    /// A snapshot that errors on every storage read, to exercise
-    /// `apply_block_close_actions`'s error path. `basic`, `code_by_hash`,
-    /// and the receipt lookups are never called here; each returns its own
-    /// error too, so a future caller cannot get a silent default instead.
-    #[derive(Debug, thiserror::Error)]
-    #[error("db down")]
-    struct DbDownError;
-
-    impl kardamom_types::StateError for DbDownError {}
-
-    struct FailingDb;
-
-    impl StateDatabase for FailingDb {
-        type Error = DbDownError;
-
-        fn basic(&self, _address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
-            Err(DbDownError)
-        }
-
-        fn storage(&self, _address: Address, _key: B256) -> Result<U256, Self::Error> {
-            Err(DbDownError)
-        }
-
-        fn code_by_hash(&self, _code_hash: B256) -> Result<bytes::Bytes, Self::Error> {
-            Err(DbDownError)
-        }
-
-        fn get_receipt(
-            &self,
-            _pos: kardamom_types::BPosition,
-        ) -> Result<Option<kardamom_types::Receipt>, Self::Error> {
-            Err(DbDownError)
-        }
-
-        fn get_tx_position(
-            &self,
-            _tx_hash: B256,
-        ) -> Result<Option<kardamom_types::BPosition>, Self::Error> {
-            Err(DbDownError)
-        }
-    }
-
-    #[test]
-    fn activation_slot_matches_the_solidity_mapping_rule() {
-        // keccak256(pad32(key) ++ pad32(0)). Cross-checked against the
-        // contract by KardamomChainState.t.sol.
-        let mut expected_input = [0u8; 64];
-        expected_input[31] = 1;
-        assert_eq!(activation_slot(1), keccak256(expected_input));
-    }
-
-    #[test]
-    fn activation_slots_are_distinct_per_feature() {
-        assert_ne!(activation_slot(1), activation_slot(2));
-    }
-
-    #[test]
-    fn beacon_slot_is_slot_one() {
-        assert_eq!(HEALTH_BEACON_SLOT, B256::from(U256::from(1u64)));
-    }
-
-    #[test]
-    fn is_active_boundary_cases() {
-        assert!(!is_active(U256::ZERO, 0), "unscheduled is never active");
-        assert!(
-            !is_active(U256::ZERO, u64::MAX),
-            "unscheduled stays inactive at any time"
-        );
-        assert!(!is_active(U256::from(100u64), 99), "before T");
-        assert!(is_active(U256::from(100u64), 100), "exactly at T");
-        assert!(is_active(U256::from(100u64), 101), "after T");
-    }
-
-    #[test]
-    fn beacon_round_trips() {
-        let beacon = Beacon {
-            count: 42,
-            block_number: 1234,
-            timestamp_ms: 1_700_000_000_250,
-        };
-        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
-    }
-
-    #[test]
-    fn beacon_fields_do_not_bleed_at_maxima() {
-        let beacon = Beacon {
-            count: u64::MAX,
-            block_number: u64::MAX,
-            timestamp_ms: u64::MAX,
-        };
-        assert_eq!(Beacon::unpack(beacon.pack()), beacon);
-    }
-
-    #[test]
-    fn dormant_feature_writes_nothing() {
-        let mut delta = PendingDelta::new();
-        let snap = MockStateDatabase::builder().build();
-        let out = apply_block_close_actions(&mut delta, 5, 1_000, None, &snap).unwrap();
-        assert_eq!(out.health_beat, None);
-        assert!(
-            delta.storage.is_empty(),
-            "a dormant flag must not touch state"
-        );
-    }
-
-    #[test]
-    fn scheduled_but_not_yet_reached_writes_nothing() {
-        let mut delta = PendingDelta::new();
-        let snap = MockStateDatabase::builder()
-            .storage(
-                CHAIN_STATE,
-                activation_slot(FEATURE_HEALTH_CHECK),
-                U256::from(2_000u64),
-            )
-            .build();
-        let out = apply_block_close_actions(&mut delta, 5, 1_999, None, &snap).unwrap();
-        assert_eq!(out.health_beat, None);
-        assert!(delta.storage.is_empty());
-    }
-
-    #[test]
-    fn active_feature_records_the_beacon() {
-        let mut delta = PendingDelta::new();
-        let snap = MockStateDatabase::builder()
-            .storage(
-                CHAIN_STATE,
-                activation_slot(FEATURE_HEALTH_CHECK),
-                U256::from(1_000u64),
-            )
-            .build();
-        let out = apply_block_close_actions(&mut delta, 7, 1_500, None, &snap).unwrap();
-        assert_eq!(out.health_beat, Some(1));
-        let w = delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)];
-        assert_eq!(
-            Beacon::unpack(w),
-            Beacon {
-                count: 1,
-                block_number: 7,
-                timestamp_ms: 1_500
-            }
-        );
-    }
-
-    /// The layering that lets an immediate upgrade activate in its own
-    /// block. The `setFeature` write exists only in this block's delta,
-    /// nowhere else.
-    #[test]
-    fn activation_written_in_this_block_is_visible_to_this_block() {
-        let mut delta = PendingDelta::new();
-        delta.storage.insert(
-            (CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK)),
-            U256::from(900u64),
-        );
-
-        let snap = MockStateDatabase::builder().build();
-        let out = apply_block_close_actions(&mut delta, 3, 1_000, None, &snap).unwrap();
-        assert_eq!(
-            out.health_beat,
-            Some(1),
-            "a feature activated by this block's own deposit must fire here"
-        );
-    }
-
-    #[test]
-    fn beat_count_continues_from_prior_state() {
-        let mut delta = PendingDelta::new();
-        let snap = MockStateDatabase::builder()
-            .storage(
-                CHAIN_STATE,
-                activation_slot(FEATURE_HEALTH_CHECK),
-                U256::from(1u64),
-            )
-            .storage(
-                CHAIN_STATE,
-                HEALTH_BEACON_SLOT,
-                Beacon {
-                    count: 9,
-                    block_number: 100,
-                    timestamp_ms: 500,
-                }
-                .pack(),
-            )
-            .build();
-        let out = apply_block_close_actions(&mut delta, 101, 750, None, &snap).unwrap();
-        assert_eq!(out.health_beat, Some(10));
-        assert_eq!(
-            Beacon::unpack(delta.storage[&(CHAIN_STATE, HEALTH_BEACON_SLOT)]),
-            Beacon {
-                count: 10,
-                block_number: 101,
-                timestamp_ms: 750
-            }
-        );
-    }
-
-    /// A beacon already written into this block's delta. This case is not
-    /// possible today, but the read precedence must still be delta-first,
-    /// and this is what the increment builds on.
-    #[test]
-    fn delta_takes_precedence_over_the_backing_read() {
-        let mut delta = PendingDelta::new();
-        delta.storage.insert(
-            (CHAIN_STATE, activation_slot(FEATURE_HEALTH_CHECK)),
-            U256::from(1u64),
-        );
-        delta.storage.insert(
-            (CHAIN_STATE, HEALTH_BEACON_SLOT),
-            Beacon {
-                count: 4,
-                block_number: 1,
-                timestamp_ms: 1,
-            }
-            .pack(),
-        );
-        // Stale backing value that must not win.
-        let snap = MockStateDatabase::builder()
-            .storage(
-                CHAIN_STATE,
-                HEALTH_BEACON_SLOT,
-                Beacon {
-                    count: 99,
-                    block_number: 99,
-                    timestamp_ms: 99,
-                }
-                .pack(),
-            )
-            .build();
-        let out = apply_block_close_actions(&mut delta, 2, 2, None, &snap).unwrap();
-        assert_eq!(out.health_beat, Some(5));
-    }
-
-    #[test]
-    fn read_errors_propagate() {
-        let mut delta = PendingDelta::new();
-        let err = apply_block_close_actions(&mut delta, 1, 1, None, &FailingDb).unwrap_err();
-        assert!(matches!(err, ExecutorError::State(_)), "got {err:?}");
-    }
-}
+#[path = "features_tests.rs"]
+mod tests;
