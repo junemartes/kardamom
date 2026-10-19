@@ -15,8 +15,10 @@
 //! ([`ChainStateGenesis`]). Without it, the first `setFeature` deposit
 //! installs the code, and the chain switches at the same blocks.
 
-use alloy_primitives::{Address, U256, address, keccak256};
-use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FEATURE_SEALER_V3};
+use alloy_primitives::{Address, U256, address};
+use kardamom_types::upgrades::{
+    CHAIN_STATE, CHAIN_STATE_CODE, CHAIN_STATE_CODE_HASH, FEATURE_SEALER_V3,
+};
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, Receipt};
 use revm::primitives::KECCAK_EMPTY;
 
@@ -227,7 +229,7 @@ impl FlagSwitches {
     /// The writes of the chain (`parent`) install the code at
     /// [`CHAIN_STATE`] only on a genesis without it.
     fn assert_chain_state_code(&self, parent: &PendingDelta) {
-        let hash = keccak256(CHAIN_STATE_CODE);
+        let hash = CHAIN_STATE_CODE_HASH;
         let installed = parent
             .accounts
             .get(&CHAIN_STATE)

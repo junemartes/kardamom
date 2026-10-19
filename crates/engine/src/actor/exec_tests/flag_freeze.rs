@@ -6,8 +6,8 @@
 #[path = "../../../../exec-core/tests/feature_table/mod.rs"]
 mod feature_table;
 
-use alloy_primitives::{U256, keccak256};
-use kardamom_types::upgrades::CHAIN_STATE_CODE;
+use alloy_primitives::U256;
+use kardamom_types::upgrades::CHAIN_STATE_CODE_HASH;
 
 use super::flag_chain::{Block, FlagChain, Item, Mode};
 use crate::actor::fixtures::ChainStateGenesis;
@@ -121,7 +121,7 @@ fn every_driver_on(genesis: ChainStateGenesis) {
     );
     assert_eq!(
         streaming.chain_state_code,
-        Some(keccak256(CHAIN_STATE_CODE)),
+        Some(CHAIN_STATE_CODE_HASH),
         "{genesis:?}: the chain-state code"
     );
     assert_eq!(

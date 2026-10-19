@@ -2,10 +2,12 @@
 //! a `setFeature` system deposit, on the fresh-cache deposit path and on
 //! the block-scope deposit path.
 
-use alloy_primitives::{B256, U256, keccak256};
+use alloy_primitives::{B256, U256};
 use alloy_rlp::Encodable;
 use kardamom_types::epoch::{UpgradeLog, upgrade_from_log};
-use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FEATURE_SEALER_V3};
+use kardamom_types::upgrades::{
+    CHAIN_STATE, CHAIN_STATE_CODE, CHAIN_STATE_CODE_HASH, FEATURE_SEALER_V3,
+};
 use kardamom_types::{Deposit, Receipt};
 
 use crate::block_env::ExecEnv;
@@ -36,9 +38,12 @@ fn env() -> ExecEnv {
     ExecEnv::new(1, &start, BlockFeatures::NONE)
 }
 
-/// A chain with the canonical code at [`CHAIN_STATE`].
+/// A chain with the canonical code at [`CHAIN_STATE`]. The account has
+/// nonce 1, as the predeploy of `chains/dev-withdrawals.toml` (a contract
+/// account starts at nonce 1). An installed account keeps its nonce, so it
+/// has nonce 0 ([`assert_installed`]).
 fn with_contract() -> MockStateDatabase {
-    let hash = keccak256(CHAIN_STATE_CODE);
+    let hash = CHAIN_STATE_CODE_HASH;
     MockStateDatabase::builder()
         .account(CHAIN_STATE, U256::ZERO, 1, hash)
         .code(hash, bytes::Bytes::from_static(CHAIN_STATE_CODE))
@@ -76,13 +81,14 @@ fn both_paths(snap: &MockStateDatabase, deposit: &Deposit) -> (Receipt, WriteSet
 }
 
 /// The code entry and the account that an install puts in a write set.
-fn assert_installed(ws: &WriteSet) {
-    let hash = keccak256(CHAIN_STATE_CODE);
+/// The account keeps its nonce (0) and its `balance`.
+fn assert_installed(ws: &WriteSet, balance: U256) {
+    let hash = CHAIN_STATE_CODE_HASH;
     assert_eq!(
         ws.account(&CHAIN_STATE),
         Some(&AccountFields {
             nonce: 0,
-            balance: U256::ZERO,
+            balance,
             code_hash: hash,
         })
     );
@@ -100,7 +106,7 @@ fn the_first_upgrade_installs_the_code_and_writes_the_word() {
     let (receipt, ws) = both_paths(&snap, &upgrade());
     assert!(receipt.status, "{receipt:?}");
     assert_eq!(receipt.logs.len(), 1, "FeatureScheduled");
-    assert_installed(&ws);
+    assert_installed(&ws, U256::ZERO);
     assert_eq!(
         ws.storage.as_slice(),
         [(
@@ -161,12 +167,35 @@ fn a_rejected_upgrade_keeps_the_install() {
     };
     let (receipt, ws) = both_paths(&snap, &deposit);
     assert!(receipt.is_invalid_skip(), "{receipt:?}");
-    assert_installed(&ws);
+    assert_installed(&ws, U256::ZERO);
     assert_eq!(ws.storage.len(), 0);
 }
 
+/// An account at [`CHAIN_STATE`] with a balance and no code (someone sent
+/// ETH there) gets the code, and keeps its balance.
+#[test]
+fn an_account_with_a_balance_and_no_code_gets_the_code() {
+    let balance = U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64));
+    let snap = MockStateDatabase::builder()
+        .account(CHAIN_STATE, balance, 0, revm::primitives::KECCAK_EMPTY)
+        .build();
+    let (receipt, ws) = both_paths(&snap, &upgrade());
+    assert!(receipt.status, "{receipt:?}");
+    assert_installed(&ws, balance);
+    assert_eq!(
+        ws.storage.as_slice(),
+        [(
+            (CHAIN_STATE, activation_slot(FEATURE_SEALER_V3)),
+            U256::from(NOW_MS)
+        )]
+        .as_slice()
+    );
+}
+
 /// A later record of the same block sees the installed code: a second
-/// upgrade in the block installs nothing and writes its word.
+/// upgrade in the block installs nothing and writes its word. The block
+/// scope sees the first deposit in its cache; the fresh-cache path sees
+/// it in the block delta. Both give the same artifact.
 #[test]
 fn a_second_upgrade_in_the_block_sees_the_code() {
     let snap = MockStateDatabase::builder().build();
@@ -174,14 +203,21 @@ fn a_second_upgrade_in_the_block_sees_the_code() {
     let (_, first) = scope
         .execute_deposit(slot(0, 0, 0, 0), &upgrade(), None)
         .expect("first");
-    assert_installed(&first);
+    assert_installed(&first, U256::ZERO);
+    let mut delta = PendingDelta::new();
+    delta.apply(first);
     let second = Deposit {
         source_hash: B256::repeat_byte(0x41),
         ..upgrade()
     };
     let (receipt, ws) = scope
         .execute_deposit(slot(1, 1, 1, 0), &second, None)
-        .expect("second");
+        .expect("second, block scope");
+    let (fresh_receipt, fresh_ws) =
+        execute_deposit_tx(&snap, None, &delta, env(), slot(1, 1, 1, 0), &second, None)
+            .expect("second, fresh cache");
+    assert_eq!(fresh_ws, ws, "write sets");
+    assert_eq!(fresh_receipt, receipt, "receipts");
     assert!(receipt.status, "{receipt:?}");
     assert_eq!(receipt.logs.len(), 1);
     assert_eq!(ws.account(&CHAIN_STATE), None);

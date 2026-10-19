@@ -15,9 +15,10 @@
 //! Block-STM strategy (deposits run there as serial singletons), the
 //! validator, replay and the zk guest.
 
-use alloy_primitives::{B256, keccak256};
 use kardamom_types::Deposit;
-use kardamom_types::upgrades::{CHAIN_STATE, CHAIN_STATE_CODE, FeatureSchedule, SYSTEM_UPGRADER};
+use kardamom_types::upgrades::{
+    CHAIN_STATE, CHAIN_STATE_CODE, CHAIN_STATE_CODE_HASH, FeatureSchedule, SYSTEM_UPGRADER,
+};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::{AccountInfo, Bytecode};
 
@@ -26,11 +27,9 @@ use crate::error::ExecutorError;
 
 use super::derived::DerivedCall;
 
-/// The install of the canonical code at [`CHAIN_STATE`] that one deposit
-/// did before its call.
-pub(super) struct ChainStateInstall {
-    code_hash: B256,
-}
+/// The install of the canonical code at [`CHAIN_STATE`] by a deposit,
+/// before its call.
+pub(super) struct ChainStateInstall;
 
 impl ChainStateInstall {
     /// Add the account at [`CHAIN_STATE`] and the canonical code to `ws`
@@ -41,7 +40,6 @@ impl ChainStateInstall {
     ///
     /// Returns [`ExecutorError::Execution`] when the account read fails.
     pub(super) fn add_to<D>(
-        &self,
         ws: &mut WriteSet,
         call: &mut DerivedCall<'_, D>,
     ) -> Result<(), ExecutorError>
@@ -51,7 +49,10 @@ impl ChainStateInstall {
     {
         let info = call.account(CHAIN_STATE)?;
         ws.ensure_account(CHAIN_STATE, &info);
-        ws.ensure_code(self.code_hash, bytes::Bytes::from_static(CHAIN_STATE_CODE));
+        ws.ensure_code(
+            CHAIN_STATE_CODE_HASH,
+            bytes::Bytes::from_static(CHAIN_STATE_CODE),
+        );
         Ok(())
     }
 
@@ -70,34 +71,31 @@ where
 {
     /// Install the canonical code at [`CHAIN_STATE`] before `deposit`
     /// calls, when `deposit` is a `setFeature` system deposit and the
-    /// address has no code. See the module doc for the rule.
+    /// address has no code. See the module doc for the rule. Returns
+    /// `true` when it installed the code.
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorError::Execution`] when the account read fails.
-    pub(super) fn install_chain_state(
-        &mut self,
-        deposit: &Deposit,
-    ) -> Result<Option<ChainStateInstall>, ExecutorError> {
+    pub(super) fn install_chain_state(&mut self, deposit: &Deposit) -> Result<bool, ExecutorError> {
         if !ChainStateInstall::is_upgrade(deposit) {
-            return Ok(None);
+            return Ok(false);
         }
         let info = self.account(CHAIN_STATE)?;
         if crate::code_hash::to_revm_code_hash(info.code_hash) != KECCAK_EMPTY {
-            return Ok(None);
+            return Ok(false);
         }
-        let code_hash = keccak256(CHAIN_STATE_CODE);
         self.commit_account(
             CHAIN_STATE,
             AccountInfo {
-                code_hash,
+                code_hash: CHAIN_STATE_CODE_HASH,
                 code: Some(Bytecode::new_raw(alloy_primitives::Bytes::from_static(
                     CHAIN_STATE_CODE,
                 ))),
                 ..info
             },
         );
-        Ok(Some(ChainStateInstall { code_hash }))
+        Ok(true)
     }
 }
 
