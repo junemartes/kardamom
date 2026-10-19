@@ -52,7 +52,7 @@ contract KardamomL2Settlement is KardamomUUPSBase {
     error BadBlockRange();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(address factory_) KardamomUUPSBase(factory_) {
         _disableInitializers();
     }
 

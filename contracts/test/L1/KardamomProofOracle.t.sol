@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
+import {FACTORY} from "../TestFactory.sol";
 import {KardamomL2Settlement} from "../../src/L2/KardamomL2Settlement.sol";
 import {ISP1Verifier, KardamomProofOracle} from "../../src/L1/KardamomProofOracle.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -46,7 +47,7 @@ contract KardamomProofOracleTest is Test {
     bytes32 H0 = keccak256("honest-100");
 
     function setUp() public {
-        KardamomL2Settlement sImpl = new KardamomL2Settlement();
+        KardamomL2Settlement sImpl = new KardamomL2Settlement(FACTORY);
         settlement = KardamomL2Settlement(
             address(
                 new ERC1967Proxy(
@@ -62,7 +63,7 @@ contract KardamomProofOracleTest is Test {
     }
 
     function _deployOracle(address verifier) internal returns (KardamomProofOracle) {
-        KardamomProofOracle oImpl = new KardamomProofOracle();
+        KardamomProofOracle oImpl = new KardamomProofOracle(FACTORY);
         return KardamomProofOracle(
             address(
                 new ERC1967Proxy(
@@ -344,7 +345,7 @@ contract KardamomProofOracleTest is Test {
     }
 
     function test_unauthorized_upgrade_reverts() public {
-        KardamomProofOracle newImpl = new KardamomProofOracle();
+        KardamomProofOracle newImpl = new KardamomProofOracle(FACTORY);
         (bool ok,) = address(oracle)
             .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");

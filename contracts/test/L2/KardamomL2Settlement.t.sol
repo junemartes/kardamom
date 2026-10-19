@@ -2,7 +2,9 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
+import {FACTORY} from "../TestFactory.sol";
 import {KardamomL2Settlement} from "../../src/L2/KardamomL2Settlement.sol";
+import {KardamomUUPSBase} from "../../src/factory/KardamomUUPSBase.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 contract KardamomL2SettlementTest is Test {
@@ -20,7 +22,7 @@ contract KardamomL2SettlementTest is Test {
     );
 
     function setUp() public {
-        KardamomL2Settlement impl = new KardamomL2Settlement();
+        KardamomL2Settlement impl = new KardamomL2Settlement(FACTORY);
         bytes memory initData =
             abi.encodeWithSelector(KardamomL2Settlement.initialize.selector, BATCHER);
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
@@ -33,7 +35,7 @@ contract KardamomL2SettlementTest is Test {
     }
 
     function test_impl_cannot_be_initialized_directly() public {
-        KardamomL2Settlement impl = new KardamomL2Settlement();
+        KardamomL2Settlement impl = new KardamomL2Settlement(FACTORY);
         vm.expectRevert();
         impl.initialize(BATCHER);
     }
@@ -98,10 +100,29 @@ contract KardamomL2SettlementTest is Test {
     }
 
     function test_unauthorized_upgrade_reverts() public {
-        KardamomL2Settlement newImpl = new KardamomL2Settlement();
+        KardamomL2Settlement newImpl = new KardamomL2Settlement(FACTORY);
         (bool ok,) = address(settlement)
             .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");
+    }
+
+    function test_factory_returns_the_constructor_argument() public view {
+        assertEq(settlement.factory(), FACTORY);
+    }
+
+    function test_factory_of_the_new_implementation_can_upgrade() public {
+        KardamomL2Settlement newImpl = new KardamomL2Settlement(FACTORY);
+        vm.prank(FACTORY);
+        settlement.upgradeToAndCall(address(newImpl), "");
+        assertEq(settlement.l1Batcher(), BATCHER);
+    }
+
+    function test_other_factory_cannot_upgrade() public {
+        address otherFactory = address(0x0DD);
+        KardamomL2Settlement newImpl = new KardamomL2Settlement(otherFactory);
+        vm.prank(otherFactory);
+        vm.expectRevert(KardamomUUPSBase.NotFactory.selector);
+        settlement.upgradeToAndCall(address(newImpl), "");
     }
 
     function testFuzz_index_advances_on_each_post(uint8 n) public {

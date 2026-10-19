@@ -127,7 +127,7 @@ contract ETHLockbox is KardamomUUPSBase {
     error EgressCapExceeded();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(address factory_) KardamomUUPSBase(factory_) {
         _disableInitializers();
     }
 

@@ -50,7 +50,6 @@ async fn cross_chain_address_parity() {
 }
 
 #[tokio::test]
-#[ignore = "anvil flake: reverts intermittently with 'atomic multi-L2 upgrade: Reverted'; tracked separately"]
 async fn multi_l2_deploy_and_atomic_upgrade() {
     let Some(rig) = AnvilRig::spawn(
         alloy_node_bindings::Anvil::new(),

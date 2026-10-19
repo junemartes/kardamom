@@ -1,7 +1,7 @@
 //! Print the deterministic factory proxy address, derived from the embedded
 //! `KardamomFactoryV1` and `ERC1967Proxy` creation bytecode and the given
-//! owner. Run this after you pick a canonical owner, to bake the address
-//! into KardamomUUPSBase.sol.
+//! owner. Each app implementation that this factory deploys takes the
+//! factory proxy address as its constructor argument.
 
 use alloy_primitives::Address;
 use clap::Parser;
@@ -23,6 +23,6 @@ fn main() {
     let proxy_addr = factory_proxy_address(&proxy_initcode, impl_addr, args.owner);
 
     println!("KardamomFactoryV1 impl: {impl_addr:#x}");
-    println!("Factory proxy (FACTORY constant): {proxy_addr:#x}");
+    println!("Factory proxy: {proxy_addr:#x}");
     println!("(owner: {})", args.owner);
 }

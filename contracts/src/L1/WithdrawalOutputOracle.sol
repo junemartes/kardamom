@@ -78,7 +78,7 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     error NotPaused();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(address factory_) KardamomUUPSBase(factory_) {
         _disableInitializers();
     }
 

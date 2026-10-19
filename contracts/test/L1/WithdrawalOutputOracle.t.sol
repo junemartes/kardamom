@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
+import {FACTORY} from "../TestFactory.sol";
 import {WithdrawalOutputOracle} from "../../src/L1/WithdrawalOutputOracle.sol";
 import {KardamomUUPSBase} from "../../src/factory/KardamomUUPSBase.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -11,8 +12,6 @@ contract WithdrawalOutputOracleTest is Test {
     address constant ATTESTER = address(0xA77E);
     address constant CHALLENGER = address(0xC4A1);
     uint64 constant WINDOW = 1 days;
-    /// Must match KardamomUUPSBase.FACTORY (the rotation/upgrade authority).
-    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     event OutputProposed(
         uint256 indexed index,
@@ -23,7 +22,7 @@ contract WithdrawalOutputOracleTest is Test {
     event OutputDeleted(uint256 indexed index, bytes32 outputRoot);
 
     function setUp() public {
-        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle(FACTORY);
         bytes memory initData = abi.encodeWithSelector(
             WithdrawalOutputOracle.initialize.selector, ATTESTER, CHALLENGER, WINDOW
         );
@@ -167,19 +166,19 @@ contract WithdrawalOutputOracleTest is Test {
     }
 
     function test_initialize_rejects_zero_attester() public {
-        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle(FACTORY);
         vm.expectRevert(WithdrawalOutputOracle.ZeroAddress.selector);
         new ERC1967Proxy(address(impl), _initData(address(0), CHALLENGER, WINDOW));
     }
 
     function test_initialize_rejects_zero_challenger() public {
-        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle(FACTORY);
         vm.expectRevert(WithdrawalOutputOracle.ZeroAddress.selector);
         new ERC1967Proxy(address(impl), _initData(ATTESTER, address(0), WINDOW));
     }
 
     function test_initialize_rejects_zero_window() public {
-        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle(FACTORY);
         vm.expectRevert(WithdrawalOutputOracle.ZeroWindow.selector);
         new ERC1967Proxy(address(impl), _initData(ATTESTER, CHALLENGER, 0));
     }
@@ -250,14 +249,13 @@ contract WithdrawalOutputOracleRecoveryTest is Test {
     address constant CHALLENGER = address(0xC4A1);
     address constant RECOVERY = address(0x4EC0);
     uint64 constant WINDOW = 1 days;
-    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
 
     event OutputDeleted(uint256 indexed index, bytes32 outputRoot);
     event OutputsRolledBack(uint256 indexed fromIndex, uint256 count);
     event FinalizationResumed(uint64 timestamp, uint256 restarted);
 
     function setUp() public {
-        WithdrawalOutputOracle impl = new WithdrawalOutputOracle();
+        WithdrawalOutputOracle impl = new WithdrawalOutputOracle(FACTORY);
         bytes memory initData = abi.encodeWithSelector(
             WithdrawalOutputOracle.initialize.selector, ATTESTER, CHALLENGER, WINDOW
         );

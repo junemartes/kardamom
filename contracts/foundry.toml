@@ -7,8 +7,6 @@
 #   1. Bump the salt suffix in crates/deployer/src/addresses.rs
 #      (e.g. "kardamom.factory.proxy.v1" -> "v2")
 #   2. Regenerate contracts/expected_bytecode_hash.txt
-#   3. Re-run cargo test -p kardamom-deployer --test factory_address_sync and
-#      update KardamomUUPSBase.FACTORY with the new computed address.
 
 [profile.default]
 via_ir = true
@@ -23,7 +21,7 @@ optimizer_runs = 200
 # compiled bytecode is byte-identical across build hosts. Without this, solc
 # bakes in a hash that depends on absolute source paths — `/home/runner/...`
 # on CI vs `/home/dev/...` locally — and the deployer's CREATE2-derived
-# FACTORY address diverges, breaking `factory_address_sync`. Matches the
+# factory address differs between hosts. Matches the
 # embedded.rs doc comment ("both forge and the cargo-side `foundry-compilers`
 # compile with `bytecode_hash = none`").
 bytecode_hash = "none"
