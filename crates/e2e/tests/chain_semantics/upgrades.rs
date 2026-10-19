@@ -78,6 +78,27 @@ async fn s13d_the_first_upgrade_installs_the_chain_state() {
     s13d_on(e2e::harness::Genesis::ClusterDev).await;
 }
 
+/// S13e: three upgrade transactions switch `FEATURE_SEALER_V3` on, off
+/// and on again. The sealer reports each switch, and a skip uses its nonce
+/// only while the feature is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s13e_a_skip_follows_the_sealer_feature_on_off_and_on() {
+    upgrade_case(
+        e2e::harness::Genesis::DevWithdrawals,
+        async |t, l1, _exec_dir, _val_dir| {
+            sealer_upgrade::skip_follows_the_feature_on_off_and_on(
+                t,
+                l1,
+                sealer_upgrade::Params::default(),
+            )
+            .await
+        },
+        "S13e",
+    )
+    .await;
+}
+
 /// S13a: an upgrade transaction with no activation timestamp turns the
 /// feature on immediately, starting with the block after the one that
 /// carried it. It keeps firing in every later block, on both the executor

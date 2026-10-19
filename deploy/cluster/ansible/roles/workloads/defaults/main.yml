@@ -352,8 +352,8 @@ workloads_gate_manifest_types: >-
 # the first setFeature system deposit on a genesis without it.
 workloads_upgrade_jobs:
   - name: sequencer
-    metas: [sealer_feature_activation, nonce_burn]
-    does: send the feature activation and take a skip that uses its nonce
+    metas: [sealer_feature_activation, sealer_feature_off, nonce_burn]
+    does: send the feature activation, watch the rules switch on and off, and take a skip that uses its nonce
   - name: executor
     metas: [nonce_burn, chain_state_install]
     does: use the nonce of a skipped transaction and install the chain state code

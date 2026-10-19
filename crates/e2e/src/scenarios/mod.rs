@@ -329,12 +329,25 @@ impl Target {
     /// # Errors
     /// Returns an error when a scrape fails.
     pub async fn sequencer_metric_sum_where(&self, name: &str, label: &str) -> Result<f64> {
-        let mut sum = 0.0;
+        Ok(self
+            .sequencer_metric_values_where(name, label)
+            .await?
+            .iter()
+            .sum())
+    }
+
+    /// The value of `name` on each sequencer replica, over the samples
+    /// whose label block contains `label`. A missing value counts as 0.
+    ///
+    /// # Errors
+    /// Returns an error when a scrape fails.
+    pub async fn sequencer_metric_values_where(&self, name: &str, label: &str) -> Result<Vec<f64>> {
+        let mut values = Vec::with_capacity(self.sequencer_metrics.len());
         for addr in &self.sequencer_metrics {
             let s: Scrape = metrics::scrape(*addr).await?;
-            sum += s.value_where(name, label).unwrap_or(0.0);
+            values.push(s.value_where(name, label).unwrap_or(0.0));
         }
-        Ok(sum)
+        Ok(values)
     }
 
     /// The validator's verdict on the run so far — the interop scenarios'

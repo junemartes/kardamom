@@ -23,9 +23,9 @@ final class AdminServerTest {
 
     private static final MemberStatus.SnapshotVersions SNAPSHOT = MemberStatus.SnapshotVersions.of(0);
     private static final MemberStatus READY =
-        new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.of(4096));
+        new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, MemberStatus.Rules.START, OptionalLong.of(4096));
     private static final MemberStatus BEHIND =
-        new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT, io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.of(4096));
+        new MemberStatus(0, "FOLLOWER", "CLOSED", 5000, 10, SNAPSHOT, MemberStatus.Rules.START, OptionalLong.of(4096));
     private static final RetainedToken TOKEN = RetainedToken.of("s3cret").orElseThrow();
 
     private static HttpResponse<String> get(final AdminServer admin, final String path)
@@ -97,10 +97,10 @@ final class AdminServerTest {
 
     @Test
     void anUnreadableDiskReadsAsUnknownAndKeepsTheMemberReady() throws Exception {
-        final MemberStatus unknown = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, io.kardamom.sealer.DecisionRules.START_VIEW, OptionalLong.empty());
+        final MemberStatus unknown = new MemberStatus(0, "LEADER", "CLOSED", 10, 10, SNAPSHOT, MemberStatus.Rules.START, OptionalLong.empty());
         assertEquals(200, serve(() -> unknown, "/ready").statusCode());
         assertTrue(serve(() -> unknown, "/status").body().contains("\"diskFreeBytes\":null"));
-        assertTrue(serve(() -> unknown, "/metrics").body().endsWith("} NaN\n"));
+        assertTrue(serve(() -> unknown, "/metrics").body().contains("kardamom_sealer_disk_free_bytes{member_id=\"0\"} NaN\n"));
     }
 
     @Test

@@ -407,14 +407,15 @@ public final class SealerWire {
     /**
      * The sealer's rules:
      * {@code [kind:17][decision_version:u8][cluster_session_id:i64 LE]}
-     * ({@link #SEALER_INFO_LEN} bytes). The service sends it only under
-     * decision version 3: to every open session at the switch, and then to
-     * each session when the session opens. It carries the id of that
+     * ({@link #SEALER_INFO_LEN} bytes). The service sends it under decision
+     * version 3, and after an activation also under version 2: to every
+     * open session at each switch, to each session when the session opens,
+     * and to every open session at each new term. It carries the id of that
      * session, so a client ties it to its session whatever the order of its
-     * own session events. Under version 2 the service sends no frame of this
-     * kind. A sequencer reports the version it got for its current
-     * session. A reader that does not know the kind drops it. Matches Rust
-     * {@code EGRESS_KIND_SEALER_INFO}.
+     * own session events. A state with no activation sends no frame of this
+     * kind. A sequencer reports the version that it got last for its
+     * current session. A reader that does not know the kind drops it.
+     * Matches Rust {@code EGRESS_KIND_SEALER_INFO}.
      */
     public static final byte EGRESS_KIND_SEALER_INFO = 17;
     /** Length of an {@link #EGRESS_KIND_SEALER_INFO} frame. */

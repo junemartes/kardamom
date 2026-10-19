@@ -14,8 +14,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SplittableRandom;
@@ -31,9 +33,11 @@ import org.junit.jupiter.api.Test;
  * and three void voters. Each kind of input occurs often: relays,
  * duplicates, nonce gaps, passed deadlines, the zero sender, void votes,
  * origin records with and without a gap, posted and recorded cursors, and
- * ticks. A feature activation in the middle of the stream switches the
- * decision rules to version 3, and after it the snapshot is version 13.
- * The window fills, so it also refuses records,
+ * ticks. Four feature activations switch the decision rules at block
+ * boundaries: on at once, off with a time ahead that switches them on
+ * again, off for good, and on at once. After the first activation the
+ * snapshot is version 14. The
+ * window fills, so it also refuses records,
  * and the least recently used sender is evicted. The test checks that every
  * record outcome occurs, so the stream keeps its coverage.
  *
@@ -61,8 +65,16 @@ final class DecisionGoldenTest {
     /** The relayed records that a void vote can name. */
     private static final int RECENT = 64;
     private static final int SNAPSHOT_EVERY = 5_000;
-    /** The step of the feature activation: the middle of the stream. */
-    private static final int ACTIVATION_STEP = STEPS / 2;
+    /** The step of the activation that switches the rules on at once. */
+    private static final int ON_STEP = STEPS / 4;
+    /** The step of the activation with a time ahead: off at the record, on at the time. */
+    private static final int OFF_STEP = STEPS / 2;
+    /** The step of the activation at time {@code 2^64 - 1}: off for good. */
+    private static final int OFF_FOR_GOOD_STEP = 3 * STEPS / 4;
+    /** The step of the activation that switches the rules on again at once. */
+    private static final int ON_AGAIN_STEP = 7 * STEPS / 8;
+    /** How far ahead of its record the time of the {@link #OFF_STEP} activation is. */
+    private static final long OFF_FOR_MS = 400 * CanonicalSealerState.TICK_INTERVAL_MS;
     private static final String GOLDEN = "decision-golden.sha256";
 
     @Test
@@ -105,6 +117,10 @@ final class DecisionGoldenTest {
         private int relayed;
         private long clock;
         private long l1Origin;
+        /** The version after each switch of the rules, in log order. */
+        private final List<Integer> switches = new ArrayList<>();
+        /** The version that the stream saw last. */
+        private int version = DecisionRules.START_VERSION;
         private int voids;
         private int originGaps;
 
@@ -118,12 +134,13 @@ final class DecisionGoldenTest {
 
         byte[] run() {
             for (int step = 1; step <= STEPS; step++) {
-                activateAt(step);
+                rulesAt(step);
                 step(random.nextInt(1000));
                 if (step % SNAPSHOT_EVERY == 0) {
                     digest.update(state.takeSnapshot());
                 }
             }
+            rulesAt(STEPS + 1);
             digest.update(state.takeSnapshot());
             return digest.digest();
         }
@@ -136,6 +153,7 @@ final class DecisionGoldenTest {
                 assertTrue(kinds.getOrDefault(kind, 0) > 0, "the stream has no " + kind + " outcome: " + kinds);
             }
             assertTrue(voids > 0 && originGaps > 0, "decided voids " + voids + ", origin gaps " + originGaps);
+            assertEquals(List.of(3, 2, 3, 2, 3), switches, "on, off, on at the time, off, on");
             assertEquals(3, state.decisionVersion());
             assertEquals(CanonicalSealerState.RULES_SNAPSHOT_VERSION, state.snapshotVersion());
         }
@@ -166,17 +184,35 @@ final class DecisionGoldenTest {
         }
 
         /**
-         * At {@link #ACTIVATION_STEP}, the activation of version 3 for the
-         * next epoch, due at once.
+         * Count a switch of the rules: a boundary of the step before set a
+         * new version. Then, at the steps of the activations, store the
+         * activation for the next epoch.
          */
-        private void activateAt(int step) {
-            if (step != ACTIVATION_STEP) {
-                return;
+        private void rulesAt(int step) {
+            if (state.decisionVersion() != version) {
+                switched();
             }
+            switch (step) {
+                case ON_STEP, ON_AGAIN_STEP -> activate(0L);
+                case OFF_STEP -> activate(clock + OFF_FOR_MS);
+                case OFF_FOR_GOOD_STEP -> activate(-1L);
+                default -> {
+                }
+            }
+        }
+
+        /** Store an activation for the next epoch at {@code activationMs}; a later boundary switches the rules. */
+        private void activate(long activationMs) {
             DecisionRules.Outcome outcome = state.onFeatureActivation(new DecisionRules.FeatureActivation(
-                    l1Origin + 1, DecisionRules.FEATURE_SEALER_V3, 0L), clock);
-            assertEquals(DecisionRules.Outcome.SWITCHED, outcome);
+                    l1Origin + 1, DecisionRules.FEATURE_SEALER_V3, activationMs));
+            assertEquals(DecisionRules.Outcome.STORED, outcome);
             hashLong(outcome.ordinal());
+        }
+
+        private void switched() {
+            version = state.decisionVersion();
+            switches.add(version);
+            hashLong(version);
         }
 
         /** Offer a fresh id at a sender's next nonce; a relay moves the nonce and joins the recent entries. */

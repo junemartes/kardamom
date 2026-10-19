@@ -250,7 +250,7 @@ class NomadAPI(BaseHTTPRequestHandler):
             node = f'node-cluster-{octet - 1}'
             default = 'LEADER' if node.endswith('-0') else 'FOLLOWER'
             self.respond({'memberId': octet - 1, 'role': state['roles'].get(node, default), 'election': 'CLOSED',
-                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 13)})
+                          'snapshotReadsMax': state.get('reads_max', {}).get(node, 14)})
         elif parts[2] == 'job' and parts[4] == 'deployment':
             # A job with a scripted deployment gets one; every other job
             # has none, like a system job.
@@ -1279,14 +1279,21 @@ class RecordTest(Deploys):
     def test_the_upgrade_check_passes_on_a_release_that_takes_the_activation(self):
         self.deploy()
         output = self.run_deploy(playbook='upgrade-check.yml')
-        self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 13', output)
-        self.assertIn('the live allocations of sequencer, executor, validator, ingress run this release', output)
+        self.assertIn('The upgrade check passed: 3 sealer members read snapshot version 14', output)
+        self.assertIn('the live allocations of sequencer, executor, validator, ingress', output)
 
     def test_the_upgrade_check_refuses_a_member_of_an_older_release(self):
         self.deploy()
         self.api.state['reads_max'] = {'node-cluster-1': 12}
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('a sealer member reads only up to snapshot version 12', output)
+
+    def test_the_upgrade_check_refuses_a_member_whose_rules_switch_only_on(self):
+        """A member of the release that reads snapshot version 13 switches its rules only on."""
+        self.deploy()
+        self.api.state['reads_max'] = {'node-cluster-2': 13}
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('a sealer member reads only up to snapshot version 13', output)
 
     def test_the_upgrade_check_refuses_a_member_that_is_down(self):
         self.deploy()
@@ -1299,7 +1306,10 @@ class RecordTest(Deploys):
         meta = self.api.state['jobs']['sequencer'].pop('Meta')
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)
         self.assertIn('the sequencer job does not send the feature activation', output)
-        self.assertIn('sealer_feature_activation, nonce_burn', output)
+        self.assertIn('sealer_feature_activation, sealer_feature_off, nonce_burn', output)
+        self.api.state['jobs']['sequencer']['Meta'] = {'sealer_feature_activation': 'true', 'nonce_burn': 'true'}
+        output = self.run_deploy(playbook='upgrade-check.yml', success=False)
+        self.assertIn('(job meta sealer_feature_off)', output)
         self.api.state['jobs']['sequencer']['Meta'] = meta
         self.api.state['missing_replica'] = 'sequencer'
         output = self.run_deploy(playbook='upgrade-check.yml', success=False)

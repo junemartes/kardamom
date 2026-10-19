@@ -152,21 +152,26 @@ public final class CanonicalSealerState {
      * keeps its retained frames in a file, and such a member takes no void
      * request and no recorded cursor. A member that cannot read the file
      * section must not load the snapshot. Version 13 is version 10 with the
-     * decision rules after the seed digest: see {@link DecisionRules}.
+     * decision rules of one activation after the seed digest. Version 14 is
+     * version 10 with the decision rules of up to three activations after
+     * the seed digest: see {@link DecisionRules#writeTo}.
      *
      * <p>This is the newest version that {@link #load} reads. The writer
      * can be one version behind: see {@link #SNAPSHOT_WRITE_VERSION}.</p>
      */
-    private static final int SNAPSHOT_READ_VERSION = 13;
+    private static final int SNAPSHOT_READ_VERSION = 14;
 
     /**
      * The version that {@link #takeSnapshot()} writes when the state holds
      * a feature activation: version 10, then the decision rules. A state
      * with no activation writes {@link #SNAPSHOT_WRITE_VERSION}. A loader
-     * that reads only up to version 12 refuses version 13, so the upgrade
-     * transaction comes only after every member reads version 13.
+     * that reads only up to version 13 refuses version 14, so the upgrade
+     * transaction comes only after every member reads version 14.
      */
-    public static final int RULES_SNAPSHOT_VERSION = 13;
+    public static final int RULES_SNAPSHOT_VERSION = 14;
+
+    /** The version with the decision rules of one activation; {@link #load} still reads it. */
+    private static final int ONE_ACTIVATION_SNAPSHOT_VERSION = 13;
 
     /**
      * The version that {@link #takeSnapshotWithRetainedFile()} writes: the
@@ -972,23 +977,33 @@ public final class CanonicalSealerState {
     }
 
     /**
-     * Take a feature activation record at cluster time {@code nowMs}.
+     * Take a feature activation record. It only stores the schedule: the
+     * rules change at a block boundary ({@link #onTick}).
      *
      * @return what the record did
      */
-    public DecisionRules.Outcome onFeatureActivation(
-            final DecisionRules.FeatureActivation activation, final long nowMs) {
-        return rules.onActivation(activation, l1Origin, nowMs);
+    public DecisionRules.Outcome onFeatureActivation(final DecisionRules.FeatureActivation activation) {
+        return rules.onActivation(activation, l1Origin, lastL2Timestamp);
     }
 
     /**
-     * Switch the rules when a pending activation is due at {@code nowMs},
-     * the cluster time of a log entry. Call it before each log entry.
-     *
-     * @return whether the rules switched at this entry
+     * The decision version of an origin-advancing record offered at
+     * {@code leaderClockMillis}. The record opens a new block: when the open
+     * block holds a record, the record forces a boundary first, and runs
+     * under the rules that the boundary sets. It changes nothing.
      */
-    public boolean switchRulesAt(final long nowMs) {
-        return rules.switchAt(nowMs);
+    public int decisionVersionOfOriginRecord(final long leaderClockMillis) {
+        return canonicalCount > lastBoundaryCount
+            ? rules.versionAtBoundary(l1Origin, lastL2Timestamp, nextL2Timestamp(leaderClockMillis))
+            : rules.version();
+    }
+
+    /**
+     * Whether the member tells each session the version of its rules
+     * (egress kind 17): under version 3, and after an activation.
+     */
+    public boolean reportsDecisionRules() {
+        return rules.reports();
     }
 
     /**
@@ -1024,20 +1039,31 @@ public final class CanonicalSealerState {
      * <p>The block number advances after the stamp, so successive ticks
      * produce block numbers that increase by one each time, with no
      * gaps.</p>
+     *
+     * <p>The boundary closes its block and sets the decision rules of the
+     * next block: see {@link DecisionRules#atBoundary}. Every entry of a
+     * block runs under one version.</p>
      */
     public Boundary onTick(long leaderClockMillis) {
+        long l2Timestamp = nextL2Timestamp(leaderClockMillis);
+        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
+        blockNumber++;
+        pruneExpired();
+        // The sealed block executed with the time of the boundary before it.
+        rules.atBoundary(l1Origin, lastL2Timestamp, l2Timestamp);
+        lastL2Timestamp = l2Timestamp;
+        lastBoundaryCount = canonicalCount;
+        return boundary;
+    }
+
+    /** The time of a boundary stamped at {@code leaderClockMillis}. */
+    private long nextL2Timestamp(final long leaderClockMillis) {
         long floored = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
         // Under a normal tick cadence, `floored` always exceeds the previous
         // stamp by a full interval, so this max() call has no effect. It
         // matters only after onOriginRecord forces an extra boundary in the
         // same window.
-        long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
-        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
-        blockNumber++;
-        pruneExpired();
-        lastL2Timestamp = l2Timestamp;
-        lastBoundaryCount = canonicalCount;
-        return boundary;
+        return Math.max(floored, lastL2Timestamp + 1);
     }
 
     /**
@@ -1511,8 +1537,10 @@ public final class CanonicalSealerState {
      * {@link SeedStatus} ordinal) and the seed digest (32) after it.
      * Version 11 adds the recorded cursors after the seed digest: see
      * {@link RecordedCursors#writeTo}. Version 12 is version 10 without the
-     * void ledger. Version 13 is version 10 with the decision rules after
-     * the seed digest: see {@link DecisionRules#writeTo}.</p>
+     * void ledger. Version 13 is version 10 with the decision rules of one
+     * activation after the seed digest. Version 14 is version 10 with the
+     * decision rules of up to three activations after the seed digest: see
+     * {@link DecisionRules#writeTo}.</p>
      *
      * <p>The writer writes {@link #snapshotVersion()}.</p>
      */
@@ -1540,11 +1568,11 @@ public final class CanonicalSealerState {
     /**
      * {@link #takeSnapshot()} in the layout of {@code version}: 10 has the
      * void ledger, 11 has the void ledger and the recorded cursors, 12 has
-     * neither, and 13 has the void ledger and the decision rules. A
+     * neither, and 14 has the void ledger and the decision rules. A
      * version-10 snapshot of a state is the same bytes in every release
      * that writes version 10.
      *
-     * @param version 10, 11, 12 or 13
+     * @param version 10, 11, 12 or 14
      */
     byte[] takeSnapshot(int version) {
         boolean withVoids = version != RETAINED_FILE_SNAPSHOT_VERSION;
@@ -1562,7 +1590,7 @@ public final class CanonicalSealerState {
                 + 8
                 + 1 + SealerSeed.HASH_LEN
                 + (withCursors ? recorded.snapshotLen() : 0)
-                + (withRules ? DecisionRules.SNAPSHOT_LEN : 0);
+                + (withRules ? rules.snapshotLen() : 0);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(version);
@@ -1616,7 +1644,7 @@ public final class CanonicalSealerState {
         if (withCursors) {
             recorded.writeTo(buf);
         }
-        // v13 only: the decision rules.
+        // v14 only: the decision rules.
         if (withRules) {
             rules.writeTo(buf);
         }
@@ -1836,6 +1864,9 @@ public final class CanonicalSealerState {
         if (version == 11) {
             state.recorded = RecordedCursors.readFrom(
                 buf, budgets.recordLagRecords(), state.voids::isVoter);
+        }
+        if (version == ONE_ACTIVATION_SNAPSHOT_VERSION) {
+            state.rules = DecisionRules.readVersionThirteen(buf);
         }
         if (version == RULES_SNAPSHOT_VERSION) {
             state.rules = DecisionRules.readFrom(buf);
