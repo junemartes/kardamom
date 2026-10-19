@@ -5,6 +5,8 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
+use tracing::warn;
+
 use crate::error::LogError;
 
 /// The metadata schema this runtime writes and accepts. A record from
@@ -181,6 +183,41 @@ impl ServiceEntry {
         })
     }
 
+    /// The comma-separated topic list under `key`. An empty piece is
+    /// skipped. A piece that names no known topic is skipped with a
+    /// warning: an unfilled Nomad interpolation such as
+    /// `${meta.archive_topics_follower}` is one. A list with only such
+    /// pieces is an error, so the caller drops the record.
+    fn meta_topics(&self, key: &str) -> Result<Vec<Topic>, LogError> {
+        let raw = self.meta_str(key)?;
+        let pieces: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let topics: Vec<Topic> = pieces.iter().copied().filter_map(Topic::parse).collect();
+        let skipped: Vec<&str> = pieces
+            .iter()
+            .copied()
+            .filter(|t| Topic::parse(t).is_none())
+            .collect();
+        match (skipped.is_empty(), topics.is_empty()) {
+            (true, _) => Ok(topics),
+            (false, true) => Err(LogError::Discovery(format!(
+                "record {}: no known topic in {key}={raw}",
+                self.id
+            ))),
+            (false, false) => {
+                warn!(
+                    record = %self.id,
+                    ?skipped,
+                    "discovery: skipping unknown topics of an archive record"
+                );
+                Ok(topics)
+            }
+        }
+    }
+
     fn meta_optional<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>, LogError>
     where
         T::Err: std::fmt::Display,
@@ -324,26 +361,19 @@ pub struct ArchiveRecord {
 }
 
 impl ArchiveRecord {
+    /// Parse a catalog entry. An empty or unknown topic is skipped, and
+    /// the known topics stay.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a required field is missing or malformed.
+    /// Returns an error if a required field is missing or malformed, or
+    /// if the topic list names no known topic.
     pub fn from_entry(entry: &ServiceEntry) -> Result<Self, LogError> {
-        let topics = entry
-            .meta_str("topics")?
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| {
-                Topic::parse(t).ok_or_else(|| {
-                    LogError::Discovery(format!("record {}: unknown topic {t}", entry.id))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             id: entry.id.clone(),
             control: entry.socket_addr(),
             archive_id: entry.meta_str("archive_id")?.to_string(),
-            topics,
+            topics: entry.meta_topics("topics")?,
         })
     }
 
