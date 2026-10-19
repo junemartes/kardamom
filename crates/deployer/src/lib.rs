@@ -29,8 +29,8 @@ pub use deployer::{
 };
 pub use ids::ContractId;
 pub use spec::{
-    Action, DeploymentSpec, Op, ProofOracleInit, build_spec, encode_address_arg,
-    encode_address_pair, encode_init_calldata, encode_oracle_init_args,
+    Action, DeploymentSpec, Op, ProofOracleInit, encode_address_arg, encode_address_pair,
+    encode_init_calldata, encode_oracle_init_args,
 };
 
 /// Strip an optional `0x` prefix from a hex string. The prefix is

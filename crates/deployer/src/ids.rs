@@ -6,7 +6,7 @@
 //! To add a new L1 contract, add one variant and four match arms. No factory
 //! edit is needed.
 
-use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
 
 use crate::embedded;
@@ -106,11 +106,21 @@ impl ContractId {
         [h[0], h[1], h[2], h[3]]
     }
 
+    /// The implementation initcode for `factory`: the creation bytecode
+    /// and `abi.encode(factory)`, the constructor argument of
+    /// `KardamomUUPSBase`. Only `factory` can upgrade an implementation
+    /// built from it. The implementation address depends on `factory`.
+    #[must_use]
+    pub fn initcode(self, factory: Address) -> Bytes {
+        [&self.creation_bytecode()[..], &factory.abi_encode()]
+            .concat()
+            .into()
+    }
+
     /// Creation bytecode for this contract, embedded at build time. The
     /// `every_contract_id_has_nonempty_creation_bytecode` test catches a new
     /// variant that is not wired through `build.rs`.
-    #[must_use]
-    pub fn creation_bytecode(self) -> Bytes {
+    fn creation_bytecode(self) -> Bytes {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),
             ContractId::KardamomProofOracle => embedded::kardamom_proof_oracle_creation(),
@@ -193,6 +203,16 @@ mod tests {
                 "{id:?} has empty creation bytecode; wire it into build.rs"
             );
         }
+    }
+
+    #[test]
+    fn initcode_appends_the_abi_encoded_factory() {
+        let factory = Address::repeat_byte(0xFA);
+        let bytecode = ContractId::EthLockbox.creation_bytecode();
+        let initcode = ContractId::EthLockbox.initcode(factory);
+        assert_eq!(initcode.len(), bytecode.len() + 32);
+        assert_eq!(&initcode[..bytecode.len()], &bytecode[..]);
+        assert_eq!(&initcode[bytecode.len() + 12..], factory.as_slice());
     }
 
     #[test]

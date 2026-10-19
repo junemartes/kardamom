@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Test.sol";
+import {FACTORY} from "../TestFactory.sol";
 import {ETHLockbox} from "../../src/L1/ETHLockbox.sol";
 import {IWithdrawalOutputOracle} from "../../src/L1/ETHLockbox.sol";
 import {KardamomUUPSBase} from "../../src/factory/KardamomUUPSBase.sol";
@@ -51,7 +52,7 @@ contract ETHLockboxTest is Test {
 
     function setUp() public {
         oracle = new MockOracle();
-        ETHLockbox impl = new ETHLockbox();
+        ETHLockbox impl = new ETHLockbox(FACTORY);
         bytes memory initData =
             abi.encodeWithSelector(ETHLockbox.initialize.selector, L2_MINTER, address(oracle));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
@@ -64,7 +65,7 @@ contract ETHLockboxTest is Test {
     }
 
     function test_impl_cannot_be_initialized_directly() public {
-        ETHLockbox impl = new ETHLockbox();
+        ETHLockbox impl = new ETHLockbox(FACTORY);
         vm.expectRevert();
         impl.initialize(L2_MINTER, address(oracle));
     }
@@ -301,12 +302,9 @@ contract ETHLockboxTest is Test {
     // V2 migration (wire the oracle into a pre-off-ramp proxy)
     // ---------------------------------------------------------------------
 
-    /// Must match KardamomUUPSBase.FACTORY.
-    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
-
     function test_initializeV2_sets_oracle_factory_only() public {
         // A lockbox deployed deposit-only (zero oracle) — the pre-V2 fleet.
-        ETHLockbox impl = new ETHLockbox();
+        ETHLockbox impl = new ETHLockbox(FACTORY);
         ETHLockbox depositOnly = ETHLockbox(
             payable(address(
                     new ERC1967Proxy(
@@ -413,7 +411,7 @@ contract ETHLockboxTest is Test {
     }
 
     function test_unauthorized_upgrade_reverts() public {
-        ETHLockbox newImpl = new ETHLockbox();
+        ETHLockbox newImpl = new ETHLockbox(FACTORY);
         (bool ok,) = address(lockbox)
             .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");
@@ -428,8 +426,6 @@ contract ETHLockboxEgressTest is Test {
     ETHLockbox lockbox;
     MockOracle oracle;
     address constant L2_MINTER = address(0xBEEF);
-    /// Must match KardamomUUPSBase.FACTORY.
-    address constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
     uint8 constant OUTPUT_VERSION = 0;
     uint64 constant WINDOW = 1 days;
 
@@ -438,7 +434,7 @@ contract ETHLockboxEgressTest is Test {
     function setUp() public {
         oracle = new MockOracle();
         oracle.setFinalizationWindow(WINDOW);
-        ETHLockbox impl = new ETHLockbox();
+        ETHLockbox impl = new ETHLockbox(FACTORY);
         bytes memory initData =
             abi.encodeWithSelector(ETHLockbox.initialize.selector, L2_MINTER, address(oracle));
         lockbox = ETHLockbox(payable(address(new ERC1967Proxy(address(impl), initData))));

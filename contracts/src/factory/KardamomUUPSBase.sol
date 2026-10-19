@@ -6,16 +6,29 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 
 /// The base contract for all Kardamom L1 app implementations.
 /// It allows a UUPS upgrade only when `msg.sender == FACTORY`. FACTORY is
-/// the deterministic Kardamom factory proxy address, computed from the
-/// ERC-7955 CREATE2 factory, fixed salts, and the canonical dev owner. See
-/// `crates/deployer/src/addresses.rs` and the `factory_address_sync` test.
+/// the Kardamom factory proxy that deploys the implementation. The deployer
+/// appends `abi.encode(factory)` to the creation code, so each owner's
+/// factory builds implementations that only that factory can upgrade.
 abstract contract KardamomUUPSBase is Initializable, UUPSUpgradeable {
-    /// The Kardamom factory proxy address. It must match the address that
-    /// `kardamom_deployer::addresses::factory_proxy_address(...)` computes.
-    /// A cross-check test asserts this; if either value drifts, the test fails.
-    address internal constant FACTORY = 0x2e4925D28F5F52086ff20aAd4981D68B1C87676E;
+    /// The Kardamom factory proxy that has the upgrade authority. The
+    /// constructor sets it. It is part of the implementation code, so a
+    /// proxy reads the value of its current implementation.
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    address internal immutable FACTORY;
 
     error NotFactory();
+
+    constructor(address factory_) {
+        FACTORY = factory_;
+    }
+
+    /// @notice The Kardamom factory proxy that can upgrade this contract
+    ///         and call its factory-only setters. The deployer reads it
+    ///         after each deploy and each upgrade, and it compares it with
+    ///         the factory of its owner.
+    function factory() external view returns (address) {
+        return FACTORY;
+    }
 
     function _authorizeUpgrade(address) internal view override {
         if (msg.sender != FACTORY) revert NotFactory();
